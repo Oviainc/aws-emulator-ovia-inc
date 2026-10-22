@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDatasetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDatasetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDatasetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +167,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDatasetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{
+            active_at, dataset_group_arn, request_region, DatasetGroupRecord, MAX_DATASET_GROUPS,
+        };
+        use std::time::SystemTime;
+
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDatasetGroup",
+            ));
+        };
+
+        // `domain` carries the model's own enum constraint, so a value outside
+        // `DOMAIN_VALUES` is already refused by the boundary validator.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDatasetGroup"))
+        // The two key members are documented as a pair: "Supplying an IAM role is only
+        // valid when also specifying a KMS key", and "if you specify a KMS key, you must
+        // also include an Identity and Access Management (IAM) role that has permission
+        // to access the key".
+        match (input.role_arn.as_deref(), input.kms_key_arn.as_deref()) {
+            (Some(_), None) => {
+                return Err(invalid_input(
+                    "roleArn is only valid when kmsKeyArn is also specified.",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(invalid_input(
+                    "kmsKeyArn requires a roleArn with permission to access the key.",
+                ))
+            }
+            _ => {}
+        }
+
+        let region = request_region(ctx.parts());
+        // The ARN is derived from the name, so the name's uniqueness IS the ARN's.
+        let arn = dataset_group_arn(&region, &input.name);
+
+        let mut state = state.lock();
+        if state.dataset_groups.contains_key(&arn) {
+            return Err(
+                CreateDatasetGroupErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!("Dataset group {arn} already exists.")),
+                    },
+                )
+                .into(),
+            );
+        }
+        if state.dataset_groups.len() >= MAX_DATASET_GROUPS {
+            return Err(CreateDatasetGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator holds at most {MAX_DATASET_GROUPS} dataset groups; delete \
+                         one before creating another."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = SystemTime::now();
+        let record = DatasetGroupRecord {
+            name: input.name.clone(),
+            dataset_group_arn: arn.clone(),
+            region,
+            role_arn: input.role_arn.clone(),
+            kms_key_arn: input.kms_key_arn.clone(),
+            domain: input.domain.clone(),
+            creation_date_time: now,
+            last_updated_date_time: now,
+            // The group is NOT created ready: the documented progression is "CREATE
+            // PENDING > CREATE IN_PROGRESS > ACTIVE", and `DescribeDatasetGroup` derives
+            // which of those the clock has made due from this instant.
+            active_at: active_at(now),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+        // `domain` is answered from the STORED record, so the response and a later
+        // `DescribeDatasetGroup` cannot disagree.
+        let domain = record.domain.clone();
+        state.dataset_groups.insert(arn.clone(), record);
+
+        Ok(CreateDatasetGroupOutput {
+            dataset_group_arn: Some(arn),
+            domain,
+        })
     }
+}
+
+/// This operation's modelled `InvalidInputException`, carrying `message`.
+fn invalid_input(message: impl Into<String>) -> CreateDatasetGroupError {
+    CreateDatasetGroupErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSchema"))
+        use crate::state::{request_region, schema_arn, SchemaRecord, MAX_SCHEMAS};
+        use std::time::SystemTime;
+
+        // Mounted on an engine that holds no state this service can reach. Unreachable
+        // through the router (which mounts every service on one `InMemoryEngine`), and
+        // this operation models no server-side error to report it with, so the scaffold
+        // channel carries it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSchema",
+            ));
+        };
+
+        // `domain` carries the model's own enum constraint, so a value outside
+        // `DOMAIN_VALUES` is already refused by the boundary validator; what is left to
+        // check here is the schema document itself.
+        check_avro_schema(&input.schema)?;
+
+        // The ARN is derived from the name, so the name's uniqueness IS the ARN's.
+        let arn = schema_arn(&request_region(ctx.parts()), &input.name);
+
+        let mut state = state.lock();
+        if state.schemas.contains_key(&arn) {
+            return Err(CreateSchemaErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Schema {arn} already exists.")),
+                },
+            )
+            .into());
+        }
+        if state.schemas.len() >= MAX_SCHEMAS {
+            return Err(CreateSchemaErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator holds at most {MAX_SCHEMAS} schemas; delete one before \
+                         creating another."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = SystemTime::now();
+        state.schemas.insert(
+            arn.clone(),
+            SchemaRecord {
+                name: input.name.clone(),
+                schema_arn: arn.clone(),
+                // Stored verbatim: `DescribeSchema` returns the document the caller
+                // supplied, not a re-rendering of it.
+                schema: input.schema.clone(),
+                domain: input.domain.clone(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+            },
+        );
+
+        Ok(CreateSchemaOutput {
+            schema_arn: Some(arn),
+        })
     }
+}
+
+/// This operation's modelled `InvalidInputException`, carrying `message`.
+fn invalid_input(message: impl Into<String>) -> CreateSchemaError {
+    CreateSchemaErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Refuse a `schema` that is not an Avro record declaration.
+///
+/// "The schema you create must be in Avro JSON format", and a Personalize dataset schema
+/// is an Avro RECORD: the document is parsed as JSON (by `serde_json`, not by hand) and
+/// must be an object whose `type` is `record` and whose `fields` is a list. What each
+/// field must contain is per-dataset-type and is not checked here.
+fn check_avro_schema(schema: &str) -> Result<(), CreateSchemaError> {
+    let parsed: ::serde_json::Value = ::serde_json::from_str(schema)
+        .map_err(|error| invalid_input(format!("The schema is not valid JSON: {error}")))?;
+    let Some(object) = parsed.as_object() else {
+        return Err(invalid_input(
+            "The schema must be an Avro JSON object declaring a record.",
+        ));
+    };
+    if object.get("type").and_then(::serde_json::Value::as_str) != Some("record") {
+        return Err(invalid_input(
+            "The schema must declare an Avro record: expected \"type\": \"record\".",
+        ));
+    }
+    if !object
+        .get("fields")
+        .is_some_and(::serde_json::Value::is_array)
+    {
+        return Err(invalid_input(
+            "The schema must declare an Avro record: expected a \"fields\" list.",
+        ));
+    }
+    Ok(())
 }
