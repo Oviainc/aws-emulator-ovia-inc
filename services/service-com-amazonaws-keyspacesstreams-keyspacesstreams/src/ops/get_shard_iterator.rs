@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetShardIterator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetShardIterator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetShardIterator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the bookmark `GetRecords` reads from: it resolves the requested position
+//! against the shard's stored records and registers the (stream, shard, position) it
+//! resolved to in [`crate::state`], so the token carries nothing a caller could forge.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +109,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{SequenceLocation, SequenceLookupError, ShardEntry};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -187,18 +183,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetShardIterator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetShardIteratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetShardIterator"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        // A stream belongs to the region of the table it follows, so a stream of
+        // another region does not exist as far as this request is concerned.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut state = state.lock();
+        let Some(stream) = state.stream_in(region.as_deref(), &input.stream_arn) else {
+            return Err(no_such_stream(&input.stream_arn));
+        };
+        let Some(shard) = stream.shard(&input.shard_id) else {
+            return Err(no_such_shard(&input.shard_id, &input.stream_arn));
+        };
+        let next_index = resolve_position(
+            shard,
+            &input.shard_iterator_type,
+            input.sequence_number.as_deref(),
+        )?;
+
+        let shard_iterator =
+            state.mint_shard_iterator(&input.stream_arn, &input.shard_id, next_index);
+        Ok(GetShardIteratorOutput {
+            shard_iterator: Some(shard_iterator),
+        })
     }
+}
+
+/// The index in the shard's records the requested iterator type starts reading at.
+///
+/// "TRIM_HORIZON - Start reading at the last untrimmed record in the shard, which is
+/// the oldest data record in the shard. AT_SEQUENCE_NUMBER - Start reading exactly from
+/// the specified sequence number. AFTER_SEQUENCE_NUMBER - Start reading right after the
+/// specified sequence number. LATEST - Start reading just after the most recent record
+/// in the shard" (the `shardIteratorType` input doc).
+fn resolve_position(
+    shard: &ShardEntry,
+    shard_iterator_type: &str,
+    sequence_number: Option<&str>,
+) -> Result<usize, GetShardIteratorError> {
+    match shard_iterator_type {
+        "TRIM_HORIZON" => Ok(0),
+        "LATEST" => Ok(shard.records.len()),
+        at_or_after @ ("AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER") => {
+            // "Required if ShardIteratorType is AT_SEQUENCE_NUMBER or
+            // AFTER_SEQUENCE_NUMBER." (the `sequenceNumber` input doc.)
+            let Some(sequence_number) = sequence_number else {
+                return Err(validation(
+                    &format!(
+                        "sequenceNumber is required when shardIteratorType is {at_or_after}"
+                    ),
+                    "InvalidFormat",
+                ));
+            };
+            let located = shard.locate(sequence_number).map_err(|error| match error {
+                SequenceLookupError::Trimmed => validation(
+                    &format!(
+                        "sequenceNumber {sequence_number} is older than the oldest sequence number \
+                         shard {shard} retains",
+                        shard = shard.shard_id
+                    ),
+                    "TrimmedDataAccess",
+                ),
+                SequenceLookupError::NotInShard => validation(
+                    &format!(
+                        "sequenceNumber {sequence_number} is not a sequence number of shard {shard}",
+                        shard = shard.shard_id
+                    ),
+                    "InvalidFormat",
+                ),
+            })?;
+            Ok(match (located, at_or_after) {
+                // The shard's own starting sequence number precedes every record it
+                // holds, so reading at it and after it both start at the first record.
+                (SequenceLocation::ShardStart, _) => 0,
+                (SequenceLocation::Record(index), "AT_SEQUENCE_NUMBER") => index,
+                (SequenceLocation::Record(index), _) => index.saturating_add(1),
+            })
+        }
+        // The model declares no other `ShardIteratorType`, and the boundary refuses a
+        // value outside the enum before this handler runs.
+        other => Err(validation(
+            &format!("shardIteratorType {other} is not a supported iterator type"),
+            "InvalidFormat",
+        )),
+    }
+}
+
+/// The modelled 404 for a stream ARN this service holds no stream for.
+fn no_such_stream(stream_arn: &str) -> GetShardIteratorError {
+    GetShardIteratorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("stream {stream_arn} does not exist")),
+    })
+    .into()
+}
+
+/// The modelled 404 for a shard the stream does not hold.
+fn no_such_shard(shard_id: &str, stream_arn: &str) -> GetShardIteratorError {
+    GetShardIteratorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "shard {shard_id} does not exist in stream {stream_arn}"
+        )),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request this service refuses, carrying the
+/// `ValidationExceptionType` that says which kind of refusal it is.
+fn validation(message: &str, error_code: &str) -> GetShardIteratorError {
+    debug_assert!(
+        VALIDATION_EXCEPTION_TYPE_VALUES.contains(&error_code),
+        "{error_code} is not a ValidationExceptionType the model declares"
+    );
+    GetShardIteratorErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+        error_code: Some(error_code.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 500 for an engine this service cannot reach.
+fn store_unavailable() -> GetShardIteratorError {
+    GetShardIteratorErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the KeyspacesStreams store is unavailable".to_string()),
+    })
+    .into()
 }

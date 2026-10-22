@@ -33,6 +33,8 @@ mod iam_role_id_agrees_with_sts;
 mod iam_signing_name_routing;
 #[path = "all/ivs_signing_name_routing.rs"]
 mod ivs_signing_name_routing;
+#[path = "all/keyspaces_signing_name_routing.rs"]
+mod keyspaces_signing_name_routing;
 #[path = "all/marketplace_signing_name_routing.rs"]
 mod marketplace_signing_name_routing;
 #[path = "all/partnercentral_channel_target_routing.rs"]

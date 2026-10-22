@@ -74,11 +74,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // This service's SigV4 signing name, `cassandra`, is Amazon Keyspaces's too
+        // (`service-com-amazonaws-keyspaces-keyspacesservice`), so the default
+        // signing-name rule would have BOTH services claim every signed request —
+        // which the router answers for neither, rejecting the ambiguous claim. Claim
+        // instead a request that NAMES this service (the `X-Amz-Target` prefix an
+        // awsJson1_0 request carries, or this service's own endpoint host) AND whose
+        // resolved route key is one this service answers for. The second conjunct
+        // keeps the claim exclusive the other way round too: a request whose SigV4
+        // scope names some third service belongs to that service, however it is
+        // targeted.
+        if !names_keyspaces_streams(parts) {
+            return false;
+        }
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) => {
+                key == self.entry.identity().signing_name()
+                    || key == STREAMS_TARGET_PREFIX
+                    || key == STREAMS_ENDPOINT_PREFIX
+            }
+            // Unreachable in practice — `names_keyspaces_streams` returned true, so the
+            // target or the host named this service, and those are the very signals
+            // `resolve_route_key` falls back to — so fail closed rather than claim a
+            // request nothing identifies.
             None => false,
         }
     }
@@ -136,4 +154,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// This service's `X-Amz-Target` prefix, normalized (`sdkId` `KeyspacesStreams`).
+const STREAMS_TARGET_PREFIX: &str = "keyspacesstreams";
+/// This service's endpoint prefix, from its model's `endpointPrefix`.
+const STREAMS_ENDPOINT_PREFIX: &str = "cassandra-streams";
+
+/// Whether a request names KeyspacesStreams rather than Amazon Keyspaces, the other
+/// service that signs as `cassandra`.
+///
+/// The signals that name a service directly, in the order
+/// [`smithy_server_runtime::resolve_route_key`] reads them: the `X-Amz-Target` prefix
+/// (`KeyspacesStreams.GetRecords` -> `keyspacesstreams`), then the endpoint host's
+/// first label (`cassandra-streams.<region>.amazonaws.com` -> `cassandra-streams`).
+///
+/// The Keyspaces service holds the mirror image of this helper, in
+/// `services/service-com-amazonaws-keyspaces-keyspacesservice/src/service.rs`, where
+/// it DECLINES what this one claims. The two decide one split, so change them
+/// together.
+fn names_keyspaces_streams(parts: &http::request::Parts) -> bool {
+    let named = emulator_server::service_from_target(&parts.headers)
+        .or_else(|| emulator_server::service_from_host(&parts.headers))
+        .or_else(|| emulator_server::service_from_authority(&parts.uri));
+    named.is_some_and(|service| {
+        service == STREAMS_TARGET_PREFIX || service == STREAMS_ENDPOINT_PREFIX
+    })
 }

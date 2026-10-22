@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored stream and a page of its shards. Reporting only: every value
+//! comes from the stream record [`crate::state`] holds — none is echoed from the
+//! request or made up here — and the one write it makes is the status change the clock
+//! already owed the stream.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +130,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    resume_index, PageCursor, PageScope, PageTokenError, ShardEntry, ShardFilterScope,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -207,18 +206,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStream"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        // A stream belongs to the region of the table it follows, so a stream of
+        // another region does not exist as far as this request is concerned.
+        let region = crate::state::request_region(ctx.parts());
+
+        let scope = PageScope::Shards {
+            region: region.clone(),
+            stream_arn: input.stream_arn.clone(),
+            shard_filter: input.shard_filter.as_ref().map(|filter| ShardFilterScope {
+                filter_type: filter.r#type.clone(),
+                shard_id: filter.shard_id.clone(),
+            }),
+        };
+
+        let mut state = state.lock();
+        // A stream AWS has just created reports `ENABLING` and reaches `ENABLED` on
+        // the clock alone, so settle what is already due before reporting the status.
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        let resume_after = match state.resolve_page_token(input.next_token.as_deref(), &scope) {
+            Ok(resume_after) => resume_after,
+            Err(PageTokenError::NotIssued) => {
+                return Err(validation(
+                    "nextToken is not a pagination token this service issued",
+                    "InvalidFormat",
+                ))
+            }
+            Err(PageTokenError::Expired) => {
+                return Err(validation(
+                    "nextToken is no longer valid; start the enumeration again",
+                    "ExpiredNextToken",
+                ))
+            }
+            Err(PageTokenError::WrongQuery) => {
+                return Err(validation(
+                    "nextToken was issued for a different streamArn/shardFilter query",
+                    "InvalidFormat",
+                ))
+            }
+        };
+
+        let Some(stream) = state.stream_in(region.as_deref(), &input.stream_arn) else {
+            return Err(no_such_stream(&input.stream_arn));
+        };
+        let selected = select_shards(stream, input.shard_filter.as_ref())?;
+        // The page starts just after the shard the previous page ended at, so a shard
+        // the stream gains between two pages cannot shift what the next page returns.
+        let shard_ids: Vec<&str> = selected
+            .iter()
+            .map(|shard| shard.shard_id.as_str())
+            .collect();
+        let from = match resume_after {
+            None => 0,
+            Some(after) => match resume_index(&shard_ids, &after) {
+                Some(index) => index,
+                // The shard the token resumes after is gone, so there is no position
+                // to continue from that would neither skip nor repeat a shard.
+                None => {
+                    return Err(validation(
+                        "the shard this nextToken resumes after no longer exists",
+                        "ExpiredNextToken",
+                    ))
+                }
+            },
+        };
+        let page: Vec<Shard> = selected
+            .iter()
+            .copied()
+            .skip(from)
+            .take(page_size(input.max_results))
+            .map(described)
+            .collect();
+        let more_shards = from.saturating_add(page.len()) < selected.len();
+        let last_shard_id = page
+            .last()
+            .and_then(|shard| shard.shard_id.clone())
+            .unwrap_or_default();
+
+        let mut output = GetStreamOutput {
+            stream_arn: stream.stream_arn.clone(),
+            stream_label: stream.stream_label.clone(),
+            stream_status: stream.stream_status.clone(),
+            stream_view_type: stream.stream_view_type.clone(),
+            creation_request_date_time: ::aws_smithy_types::DateTime::from(
+                stream.creation_request_date_time,
+            ),
+            keyspace_name: stream.keyspace_name.clone(),
+            table_name: stream.table_name.clone(),
+            shards: Some(page),
+            next_token: None,
+        };
+        if more_shards {
+            output.next_token = Some(state.mint_page_token(PageCursor {
+                scope,
+                after: last_shard_id,
+            }));
+        }
+        Ok(output)
     }
+}
+
+/// The shards a request selects, in stream order.
+///
+/// `shardFilter` "can filter shards based on their parent shardID to get a list of
+/// children shards" (the `shardFilter` input doc), which is what the one modelled
+/// `ShardFilterType`, `CHILD_SHARDS`, asks for: the shards whose `parentShardIds`
+/// name the given shard.
+fn select_shards<'s>(
+    stream: &'s crate::state::StreamEntry,
+    filter: Option<&ShardFilter>,
+) -> Result<Vec<&'s ShardEntry>, GetStreamError> {
+    let Some(filter) = filter else {
+        return Ok(stream.shards.iter().collect());
+    };
+    match filter.r#type.as_deref() {
+        Some("CHILD_SHARDS") => {
+            let Some(parent_id) = filter.shard_id.as_deref() else {
+                return Err(validation(
+                    "shardFilter.shardId is required when shardFilter.type is CHILD_SHARDS",
+                    "InvalidFormat",
+                ));
+            };
+            if stream.shard(parent_id).is_none() {
+                return Err(no_such_shard(parent_id, &stream.stream_arn));
+            }
+            Ok(stream
+                .shards
+                .iter()
+                .filter(|shard| {
+                    shard
+                        .parent_shard_ids
+                        .iter()
+                        .any(|parent| parent == parent_id)
+                })
+                .collect())
+        }
+        // The model declares exactly one `ShardFilterType`, and the boundary refuses
+        // any other value before this handler runs; a filter with no type at all names
+        // no selection to make.
+        _ => Err(validation(
+            "shardFilter.type is required when shardFilter is specified",
+            "InvalidFormat",
+        )),
+    }
+}
+
+/// One stored shard as the model describes it: its id, the range of sequence numbers
+/// it holds (open-ended while the shard is open) and the shards it evolved from.
+fn described(shard: &ShardEntry) -> Shard {
+    Shard {
+        shard_id: Some(shard.shard_id.clone()),
+        sequence_number_range: Some(SequenceNumberRange {
+            starting_sequence_number: Some(shard.starting_sequence_number.clone()),
+            ending_sequence_number: shard.ending_sequence_number.clone(),
+        }),
+        parent_shard_ids: Some(shard.parent_shard_ids.clone()),
+    }
+}
+
+/// "The maximum number of shard objects to return in a single GetStream request. The
+/// default value is 100. The minimum value is 1 and the maximum value is 100." (the
+/// `maxResults` input doc.)
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// How many shards one page carries.
+fn page_size(max_results: Option<i32>) -> usize {
+    let requested = max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, DEFAULT_MAX_RESULTS);
+    usize::try_from(requested).unwrap_or(1)
+}
+
+/// The modelled 404 for a stream ARN this service holds no stream for.
+fn no_such_stream(stream_arn: &str) -> GetStreamError {
+    GetStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("stream {stream_arn} does not exist")),
+    })
+    .into()
+}
+
+/// The modelled 404 for a shard the stream does not hold.
+fn no_such_shard(shard_id: &str, stream_arn: &str) -> GetStreamError {
+    GetStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "shard {shard_id} does not exist in stream {stream_arn}"
+        )),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request this service refuses, carrying the
+/// `ValidationExceptionType` that says which kind of refusal it is.
+fn validation(message: &str, error_code: &str) -> GetStreamError {
+    debug_assert!(
+        VALIDATION_EXCEPTION_TYPE_VALUES.contains(&error_code),
+        "{error_code} is not a ValidationExceptionType the model declares"
+    );
+    GetStreamErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+        error_code: Some(error_code.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 500 for an engine this service cannot reach.
+fn store_unavailable() -> GetStreamError {
+    GetStreamErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the KeyspacesStreams store is unavailable".to_string()),
+    })
+    .into()
 }
