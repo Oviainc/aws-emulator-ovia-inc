@@ -4,7 +4,7 @@
 //! `UntagResource` and `ListTagsForResource`.
 //!
 //! Every case drives the same front door the production router does (the
-//! harness is `trace_ingest_and_groups::Xray`, reused rather than rebuilt), so
+//! harness is `xray_wire::Xray`, reused rather than rebuilt), so
 //! the assertions are about HTTP responses, not about internal state. The tests
 //! are tables, and each row differs along what the rule it checks generalises
 //! over — the number of tags, the character classes a key or a value carries,
@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_xray_awsxray::ops::list_tags_for_resource::TAGS_PAGE_SIZE;
 use service_com_amazonaws_xray_awsxray::state::MAX_TAGS_PER_RESOURCE;
 
-use crate::trace_ingest_and_groups::{Answer, Xray};
+use crate::xray_wire::{Answer, Xray};
 
 /// The `TagList` JSON body for a set of `(key, value)` pairs.
 fn tag_list<K: AsRef<str>, V: AsRef<str>>(tags: &[(K, V)]) -> Value {

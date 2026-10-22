@@ -409,15 +409,18 @@ impl Aggregate {
     /// Count one completed segment, whose request took `response_time` seconds.
     fn record(&mut self, segment: &crate::state::SegmentRecord, response_time: f64) {
         // A 429 is both a throttle and a 400-series error, and `ErrorStatistics`
-        // splits it out, so the throttle arm comes before the other-error one.
-        if segment.is_fault() {
-            self.fault_count += 1;
-        } else if segment.is_throttle() {
-            self.throttle_count += 1;
-        } else if segment.is_error() {
-            self.error_other_count += 1;
-        } else {
-            self.ok_count += 1;
+        // SPLITS the two counts (`$ThrottleCount` beside `$OtherCount`, with
+        // `$TotalCount` their sum), so a throttled request is counted under the
+        // throttle count and not also under the other-error count. That split is
+        // exactly the exclusive `crate::state::Classification` every counter of
+        // this state uses, read here rather than recomputed; the trace's
+        // `HasError` flag is a different question and a different rule (see
+        // `crate::state::recorded_error`), because the flags are not exclusive.
+        match segment.classification() {
+            crate::state::Classification::Fault => self.fault_count += 1,
+            crate::state::Classification::Throttle => self.throttle_count += 1,
+            crate::state::Classification::Error => self.error_other_count += 1,
+            crate::state::Classification::Ok => self.ok_count += 1,
         }
         self.total_response_time += response_time;
         #[allow(clippy::cast_possible_truncation)]

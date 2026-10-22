@@ -365,9 +365,18 @@ const AURORA_INSTANCE_CLASSES: &[InstanceClass] = &[
     },
 ];
 
+/// Whether `engine` is a CLUSTER engine, whose storage the cluster manages instead of an
+/// instance ordering it: the Aurora engines, and the Amazon DocumentDB and Amazon Neptune
+/// engines this same front door serves (`src/service.rs`).
+fn is_cluster_engine(engine: &str) -> bool {
+    crate::state::is_aurora(engine) || matches!(engine, "docdb" | "neptune")
+}
+
 /// The classes `engine` can be ordered in.
 fn instance_classes(engine: &str) -> &'static [InstanceClass] {
-    if crate::state::is_aurora(engine) {
+    if is_cluster_engine(engine) {
+        // A DocumentDB or Neptune instance is a cluster member ordered in the same
+        // memory-optimised and burstable families an Aurora one is.
         AURORA_INSTANCE_CLASSES
     } else {
         INSTANCE_CLASSES
@@ -382,6 +391,9 @@ fn license_models(engine: &str) -> &'static [&'static str] {
     match engine {
         "postgres" | "aurora-postgresql" => &["postgresql-license"],
         "mysql" | "mariadb" | "aurora-mysql" => &["general-public-license"],
+        // The licence setting "doesn't apply to" the Amazon DocumentDB and Amazon
+        // Neptune engines, whose orderable options carry `na`.
+        "docdb" | "neptune" => &["na"],
         // Oracle Enterprise Edition is BYOL only; Standard Edition Two is offered both
         // ways.
         "oracle-ee" | "oracle-ee-cdb" => &["bring-your-own-license"],
@@ -402,10 +414,16 @@ fn license_models(engine: &str) -> &'static [&'static str] {
 /// neither provisioned IOPS nor provisioned throughput.
 fn storage(engine: &str) -> (&'static str, bool) {
     if crate::state::is_aurora(engine) {
-        ("aurora", false)
-    } else {
-        ("gp3", true)
+        return ("aurora", false);
     }
+    if matches!(engine, "docdb" | "neptune") {
+        // `CreateDBClusterMessage$StorageType` in the DocumentDB and Neptune models:
+        // "Valid values for storage type - standard | iopt1 ... Default value is
+        // standard" — and the CLUSTER carries it, so an instance orders no IOPS of its
+        // own.
+        return ("standard", false);
+    }
+    ("gp3", true)
 }
 
 /// The lowest and highest `AllocatedStorage` an option accepts, in GiB, or `None` for an
@@ -415,7 +433,7 @@ fn storage(engine: &str) -> (&'static str, bool) {
 /// MariaDB, PostgreSQL and Oracle engines, 20–16,384 GiB for Microsoft SQL Server and
 /// 20–64,000 GiB for Db2.
 fn storage_size_range(engine: &str) -> Option<(i32, i32)> {
-    if crate::state::is_aurora(engine) {
+    if is_cluster_engine(engine) {
         return None;
     }
     if engine.starts_with("sqlserver") {

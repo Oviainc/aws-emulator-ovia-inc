@@ -279,6 +279,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // work that follows is bounded by constants rather than by the request body.
         clamped_lists(&input).map_err(lift)?;
 
+        // The tag set the table starts life with, refused by exactly the rules the
+        // tagging operations apply to a later edit: at most
+        // `MAX_TAGS_PER_TABLE` tags, and no key in the reserved `aws:` namespace.
+        let requested_tags: &[Tag] = input.tags.as_deref().unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_TABLE {
+            return Err(too_many_tags(requested_tags.len()));
+        }
+        let tags = crate::state::tag_set_from_request(requested_tags).map_err(lift)?;
+
         let key_schema = validated_key_schema(&input).map_err(lift)?;
         let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
         let region = crate::state::request_region(ctx.parts());
@@ -339,7 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             global_secondary_indexes,
             table_class: input.table_class.clone(),
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags,
             creation_date_time: now,
             active_at: now + crate::state::STATUS_TRANSITION,
             updated_at: None,
@@ -368,6 +377,18 @@ fn store_unavailable() -> CreateTableError {
 /// table up, so every refusal it can produce is a bad request.
 fn lift(error: crate::state::RequestError) -> CreateTableError {
     crate::scaffolded::Scaffolded::validation(error.message())
+}
+
+/// The modelled limit error for a create carrying more tags than a table may hold:
+/// "You can add up to 50 tags to a single DynamoDB table" (the `Tag` doc).
+fn too_many_tags(requested: usize) -> CreateTableError {
+    CreateTableErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(format!(
+            "Subscriber limit exceeded: a table may carry at most {} tags, got {requested}",
+            crate::state::MAX_TAGS_PER_TABLE
+        )),
+    })
+    .into()
 }
 
 /// The first input member present that this slice does not store, if any.

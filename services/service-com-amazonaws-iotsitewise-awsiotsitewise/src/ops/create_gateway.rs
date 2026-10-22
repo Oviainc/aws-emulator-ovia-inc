@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: creates a gateway from the request and persists it in this service's
+//! state; `DescribeGateway` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +166,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGateway"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGatewayError::Modeled(CreateGatewayErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "You can only specify one platform type in a gateway" (`GatewayPlatform`'s
+        // own documentation), so neither zero platforms nor two is a gateway this
+        // service can create.
+        let platforms = crate::state::gateway_platform_count(&input.gateway_platform);
+        if platforms != 1 {
+            return Err(invalid_request(format!(
+                "gatewayPlatform must specify exactly one platform \
+                 (greengrass, greengrassV2 or siemensIE), but specifies {platforms}."
+            )));
+        }
+
+        // "If not specified, the default is 2 (Classic streams, V2 gateway)".
+        let version = input
+            .gateway_version
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_GATEWAY_VERSION.to_string());
+
+        // "If creating a V3 gateway (gatewayVersion=3), you must also specify the
+        // coreDeviceOperatingSystem" — stated for the GreengrassV2 platform, so it is
+        // checked only there. Compared by NUMERIC value: `GatewayVersion` is modelled
+        // as `^[0-9]+$`, so "03" is the same version as "3".
+        if version_is(&version, crate::state::GATEWAY_VERSION_V3) {
+            if let Some(greengrass_v2) = input.gateway_platform.greengrass_v2.as_ref() {
+                if greengrass_v2.core_device_operating_system.is_none() {
+                    return Err(invalid_request(format!(
+                        "A gatewayVersion {} gateway on the greengrassV2 platform must also \
+                         specify coreDeviceOperatingSystem.",
+                        crate::state::GATEWAY_VERSION_V3
+                    )));
+                }
+            }
+        }
+
+        // The device this gateway would run on; `Some`, since exactly one platform is
+        // named by the time control reaches here.
+        let device = crate::state::gateway_device_key(&input.gateway_platform)
+            .ok_or_else(|| invalid_request("gatewayPlatform names no device.".to_string()))?;
+
+        let mut store = state.lock();
+
+        // The store is bounded: a create is the only thing that adds a gateway and
+        // nothing evicts one, so past the cap this is a quota refusal.
+        if store.gateways.len() >= crate::state::MAX_GATEWAYS {
+            return Err(CreateGatewayError::Modeled(
+                CreateGatewayErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} gateways.",
+                        crate::state::MAX_GATEWAYS
+                    ),
+                }),
+            ));
+        }
+
+        // One platform device hosts at most one gateway, so a create naming a device
+        // some gateway already runs on collides with THAT gateway.
+        if let Some(existing) = store
+            .gateway_devices
+            .get(&device)
+            .and_then(|id| store.gateways.get(id))
+        {
+            return Err(already_exists(existing));
+        }
+
+        // `gatewayName` is "A unique name for the gateway", so a second gateway may
+        // not take a name already in use.
+        if let Some(existing) = store
+            .gateways
+            .values()
+            .find(|record| record.name == input.gateway_name)
+        {
+            return Err(already_exists(existing));
+        }
+
+        let gateway_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.gateways.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::GatewayRecord {
+            id: gateway_id.clone(),
+            arn: crate::state::gateway_arn(&region, &gateway_id),
+            name: input.gateway_name.clone(),
+            platform: input.gateway_platform.clone(),
+            version,
+            // A new gateway has no capability configured yet: only
+            // `UpdateGatewayCapabilityConfiguration` adds one, so nothing is invented
+            // here.
+            capability_summaries: Vec::new(),
+            creation_date: now,
+            last_update_date: now,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateGatewayOutput {
+            gateway_id: record.id.clone(),
+            gateway_arn: record.arn.clone(),
+        };
+
+        store.gateway_devices.insert(device, record.id.clone());
+        store.gateways.insert(record.id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` naming the gateway the create collided
+/// with: its own stored id and the ARN it was minted with, never one rebuilt from
+/// this request's region.
+fn already_exists(existing: &crate::state::GatewayRecord) -> CreateGatewayError {
+    CreateGatewayError::Modeled(CreateGatewayErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message: format!("The gateway {} already exists.", existing.id),
+            resource_id: existing.id.clone(),
+            resource_arn: existing.arn.clone(),
+        },
+    ))
+}
+
+/// Whether `version` names the same `GatewayVersion` as `target`, which is modelled
+/// as a digit string (`^[0-9]+$`) and so carries no significant leading zeros.
+fn version_is(version: &str, target: &str) -> bool {
+    let digits = |value: &str| {
+        let trimmed = value.trim_start_matches('0');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    digits(version) == digits(target)
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateGatewayError {
+    CreateGatewayError::Modeled(CreateGatewayErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }

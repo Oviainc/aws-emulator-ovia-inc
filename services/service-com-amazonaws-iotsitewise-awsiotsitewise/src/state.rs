@@ -2,9 +2,9 @@
 
 //! Engine state for the com-amazonaws-iotsitewise-awsiotsitewise service.
 //!
-//! The asset-model / asset / property-value slice of IoT SiteWise lives here: one
-//! map per resource plus the indexes the modelled lookup forms need
-//! (`externalId:<id>` labels, property aliases). Every handler reads and writes
+//! The asset-model / asset / property-value and gateway slices of IoT SiteWise
+//! live here: one map per resource plus the indexes the modelled lookup forms need
+//! (`externalId:<id>` labels, property aliases, a gateway's platform device). Every handler reads and writes
 //! THIS struct through [`service_state`]; nothing in `src/ops/` keeps state of its
 //! own.
 
@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AssetHierarchy, AssetModelCompositeModel, AssetModelHierarchy, AssetModelProperty,
-    AssetModelStatus, AssetProperty, AssetPropertyValue, AssetStatus, AssetSummary, TimeInNanos,
+    AssetModelStatus, AssetProperty, AssetPropertyValue, AssetStatus, AssetSummary,
+    GatewayCapabilitySummary, GatewayPlatform, TimeInNanos,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -60,6 +61,23 @@ pub const MAX_ASSET_MODELS: usize = 1_000;
 
 /// See [`MAX_ASSET_MODELS`].
 pub const MAX_ASSETS: usize = 10_000;
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the gateway map. `CreateGateway`
+/// is the only thing that adds a gateway and it declares the modelled
+/// `LimitExceededException` (HTTP 410), so that is how this store refuses past the
+/// cap. The emulator's own bound, not a published AWS default.
+pub const MAX_GATEWAYS: usize = 1_000;
+
+/// The `gatewayVersion` a `CreateGateway` call that named none gets, as the member's
+/// own documentation states: "If not specified, the default is 2 (Classic streams, V2
+/// gateway)".
+pub const DEFAULT_GATEWAY_VERSION: &str = "2";
+
+/// The `gatewayVersion` whose GreengrassV2 platform must also carry
+/// `coreDeviceOperatingSystem`, as `GatewayPlatform`'s documentation states: "If
+/// creating a V3 gateway (gatewayVersion=3), you must also specify the
+/// coreDeviceOperatingSystem".
+pub const GATEWAY_VERSION_V3: &str = "3";
 
 /// How many samples one `(assetId, propertyId)` series keeps.
 ///
@@ -181,6 +199,60 @@ fn state_at(active_at: SystemTime, now: SystemTime) -> &'static str {
     }
 }
 
+/// A stored gateway: everything `DescribeGateway` reports, plus the `tags` the
+/// tagging operations read.
+///
+/// `capability_summaries` starts EMPTY: a freshly created gateway has no
+/// capability configured, and only `UpdateGatewayCapabilityConfiguration` adds one.
+#[derive(Debug, Clone)]
+pub struct GatewayRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub platform: GatewayPlatform,
+    pub version: String,
+    pub capability_summaries: Vec<GatewayCapabilitySummary>,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    pub tags: HashMap<String, String>,
+}
+
+/// The platform device a gateway runs on, as a single comparable key: the
+/// Greengrass V1 group ARN, the Greengrass V2 core device thing name or the Siemens
+/// Industrial Edge IoT Core thing name, whichever the platform names.
+///
+/// `None` when the platform names no device at all — a request
+/// [`GatewayPlatform`]'s documentation refuses, since one gateway specifies exactly
+/// one platform type.
+pub fn gateway_device_key(platform: &GatewayPlatform) -> Option<String> {
+    if let Some(greengrass) = platform.greengrass.as_ref() {
+        return Some(format!("greengrass:{}", greengrass.group_arn));
+    }
+    if let Some(greengrass_v2) = platform.greengrass_v2.as_ref() {
+        return Some(format!(
+            "greengrassV2:{}",
+            greengrass_v2.core_device_thing_name
+        ));
+    }
+    platform
+        .siemens_ie
+        .as_ref()
+        .map(|siemens| format!("siemensIE:{}", siemens.iot_core_thing_name))
+}
+
+/// How many platform types `platform` names. Exactly one is valid; see
+/// [`gateway_device_key`].
+pub fn gateway_platform_count(platform: &GatewayPlatform) -> usize {
+    [
+        platform.greengrass.is_some(),
+        platform.greengrass_v2.is_some(),
+        platform.siemens_ie.is_some(),
+    ]
+    .into_iter()
+    .filter(|named| *named)
+    .count()
+}
+
 /// Per-service state for com-amazonaws-iotsitewise-awsiotsitewise. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -205,6 +277,12 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub property_values: HashMap<String, HashMap<String, Vec<AssetPropertyValue>>>,
     /// `propertyAlias` -> `(assetId, propertyId)`, so alias lookups resolve.
     pub property_alias_index: HashMap<String, (String, String)>,
+    /// Gateways by `gatewayId`.
+    pub gateways: HashMap<String, GatewayRecord>,
+    /// [`gateway_device_key`] -> `gatewayId`: which gateway, if any, already runs
+    /// on a given platform device. One device hosts at most one gateway, so this
+    /// is what makes a second create naming the same device a conflict.
+    pub gateway_devices: HashMap<String, String>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -409,6 +487,12 @@ pub fn asset_model_arn(region: &str, asset_model_id: &str) -> String {
 /// The canonical ARN of an asset in `region`.
 pub fn asset_arn(region: &str, asset_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("asset/{asset_id}"))
+}
+
+/// The canonical ARN of a gateway in `region`, in the form `CreateGateway`
+/// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:gateway/${GatewayId}`.
+pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("gateway/{gateway_id}"))
 }
 
 /// The character joining the two ids a `TimeSeriesId` is built from; see

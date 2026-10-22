@@ -10,6 +10,10 @@ publish = false
 # which this crate narrows rather than replaces.
 emulator-server = { workspace = true }
 http = { workspace = true }
+# `stable_hex_id`'s mixing function: a maintained digest, so a derived id that
+# travels on the wire is reproducible across builds rather than tied to the
+# algorithm `std`'s default hasher happens to use.
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

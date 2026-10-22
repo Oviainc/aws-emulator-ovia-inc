@@ -181,6 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Err(failure) = crate::state::filter_expression::validate(expression) {
                 return Err(refuse(failure.message()));
             }
+            // And a comparison whose operands cannot be compared at all is
+            // refused HERE too, not only where the expression is evaluated
+            // (`crate::state::filter`): an expression that can never be true
+            // for any trace is a mistake in the request, and a group may not
+            // store one.
+            if let Err(error) = crate::state::filter::operand_check(expression) {
+                return Err(refuse(error.message));
+            }
         }
 
         // "Notifications can only be enabled on a group with InsightsEnabled set
@@ -204,8 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here is a request that names no group at all, one that supplies both
         // selectors, and one that names a group this emulator does not hold;
         // `GroupName`'s and `GroupARN`'s length bounds are modelled and already
-        // refused before this handler. The refusal happens before any write, so
-        // a refused update leaves every stored group as it was.
+        // refused before this handler. Every refusal happens before any write,
+        // so a refused update leaves every stored group as it was.
         //
         // Supplying BOTH selectors is refused in `resolve_group_name` itself,
         // which is also what settles a CONFLICTING pair: two selectors that name

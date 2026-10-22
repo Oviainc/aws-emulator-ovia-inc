@@ -26,6 +26,9 @@ mod group_identifier_exclusivity;
 #[path = "all/indexing_rules.rs"]
 mod indexing_rules;
 
+#[path = "all/request_deserialization.rs"]
+mod request_deserialization;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
@@ -47,6 +50,9 @@ mod telemetry_records;
 #[path = "all/time_series_service_statistics.rs"]
 mod time_series_service_statistics;
 
+#[path = "all/trace_data_plane_rules.rs"]
+mod trace_data_plane_rules;
+
 #[path = "all/trace_graph.rs"]
 mod trace_graph;
 
@@ -61,3 +67,6 @@ mod trace_segment_destination;
 
 #[path = "all/update_group.rs"]
 mod update_group;
+
+#[path = "all/xray_wire.rs"]
+mod xray_wire;
