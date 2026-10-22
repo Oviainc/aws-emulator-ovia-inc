@@ -31,5 +31,7 @@ mod replicator_lifecycle;
 mod replicator_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_updates.rs"]
+mod storage_updates;
 #[path = "all/topic_lifecycle.rs"]
 mod topic_lifecycle;

@@ -189,7 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // running on each Amazon EC2 instance." Nothing else about the
         // environment changes; its health checks are suspended until the restart
         // the clock owes completes.
-        environment.begin_app_server_restart();
+        let request_id = crate::state::new_request_id();
+        environment.begin_app_server_restart(&request_id);
+        let subject = environment.event_subject();
+        // The restart has STARTED here; the event for its completion is recorded
+        // when the clock makes that completion due.
+        store.record_event(
+            &request_id,
+            crate::state::SEVERITY_INFO,
+            "restartAppServer is starting.",
+            subject,
+        );
         Ok(RestartAppServerOutput)
     }
 }

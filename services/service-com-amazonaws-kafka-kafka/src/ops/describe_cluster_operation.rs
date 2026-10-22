@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one cluster operation: what an update call changed, and how far along it
+//! is.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only — every member is computed from the stored
+//! [`crate::state::ClusterOperation`] and the reading instant, so the operation's
+//! state moves because the clock moved, never because somebody polled it.
+//!
+//! A well-formed operation ARN this region holds no operation for is a
+//! `NotFoundException`; a value that is not an operation ARN at all is a
+//! `BadRequestException`.
+//!
+//! PARTIAL SCOPE, deliberately: the registry this reads
+//! ([`crate::state::ComAmazonawsKafkaKafkaState::cluster_operations`]) is written by
+//! `UpdateStorage` only, so an operation ARN minted by another path — the one
+//! `UpdateConnectivity` answers with, or the create operation ARN `CreateChannel`
+//! reports — is still answered `NotFoundException` here. Routing those through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::start_storage_update`]'s generalised
+//! form belongs with those operations' own files (`update_connectivity.rs`,
+//! `create_channel.rs`), which this change does not own; the registry and this reader
+//! are what they need.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +154,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterOperation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeClusterOperationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_cluster_operation_arn(&input.cluster_operation_arn) {
+            return Err(DescribeClusterOperationErrorModeled::BadRequestException(
+                BadRequestException {
+                    invalid_parameter: Some("ClusterOperationArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster operation ARN.",
+                        input.cluster_operation_arn
+                    )),
+                },
+            )
+            .into());
+        }
+        let now = std::time::SystemTime::now();
+        let state = state.lock();
+        let Some(operation) =
+            state.cluster_operation_in(&region, &input.cluster_operation_arn)
+        else {
+            return Err(DescribeClusterOperationErrorModeled::NotFoundException(
+                NotFoundException {
+                    invalid_parameter: Some("ClusterOperationArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(DescribeClusterOperationOutput {
+            cluster_operation_info: Some(operation.to_cluster_operation_info(now)),
+        })
     }
 }

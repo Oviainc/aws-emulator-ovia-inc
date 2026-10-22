@@ -193,7 +193,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deletes and recreates all of the Amazon Web Services resources … for
         // a specified environment and forces a restart": the environment
         // re-enters its deployment and the clock owes the move back to `Ready`.
-        environment.begin_rebuild();
+        let request_id = crate::state::new_request_id();
+        environment.begin_rebuild(&request_id);
+        let subject = environment.event_subject();
+        // The rebuild has STARTED here; the event for its completion is recorded
+        // when the clock makes that completion due.
+        store.record_event(
+            &request_id,
+            crate::state::SEVERITY_INFO,
+            "rebuildEnvironment is starting.",
+            subject,
+        );
         Ok(RebuildEnvironmentOutput)
     }
 }
