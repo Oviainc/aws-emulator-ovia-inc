@@ -177,6 +177,119 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code this service answers an authorization refusal with.
+///
+/// NOT a shape in this service's model (`smithy_query(query="operation",
+/// operation="AssociateUser")` lists only AccessDeniedException / ConflictException /
+/// InternalServerException / ResourceNotFoundException / ServiceQuotaExceededException /
+/// ThrottlingException / ValidationException), so it cannot be a variant of any
+/// generated error enum — hence [`ServiceRefusal`] below. It is the code the recorded
+/// wire carries for a request this service will not confirm the caller's ownership of.
+pub const UNAUTHORIZED_EXCEPTION_CODE: &str = "UnauthorizedException";
+
+/// The FIXED sentence that travels with [`UNAUTHORIZED_EXCEPTION_CODE`].
+///
+/// One sentence for every such refusal, carrying nothing from the request: a fail-closed
+/// refusal must not disclose whether the identifier it was asked about names anything.
+pub const UNAUTHORIZED_EXCEPTION_MESSAGE: &str =
+    "Unauthorized. Please check the request and access policy and try again.";
+
+/// The wire error code this service's TAGGING surface answers an unresolvable
+/// `ResourceArn` with — also not a shape in this service's model (`UntagResource` models
+/// only InternalServerException and ResourceNotFoundException).
+pub const BAD_REQUEST_EXCEPTION_CODE: &str = "BadRequestException";
+
+/// The FIXED sentence that travels with [`BAD_REQUEST_EXCEPTION_CODE`] for a
+/// `ResourceArn` naming no resource this service holds.
+pub const INVALID_INPUT_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
+
+/// The HTTP status every [`ServiceRefusal`] is reported with.
+///
+/// 400, the status this service's model gives its own client errors
+/// (`AccessDeniedException`, `ValidationException` and the rest are `@httpError 400`),
+/// and a client-fault status rather than a 5xx an SDK retry classifier would retry: both
+/// refusals are terminal — the caller has to change the request.
+pub const SERVICE_REFUSAL_STATUS: u16 = 400;
+
+/// The `message` member of the synthetic shape a [`ServiceRefusal`] renders through.
+static SERVICE_REFUSAL_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ServiceRefusal$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for a refusal this service answers with an error code its model does NOT
+/// declare.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// the shape is in no service's model, so it must not collide with a modeled one. The
+/// wire error code travels beside it, from [`ServiceRefusal::code`], so ONE schema serves
+/// every such refusal — the body is a `message` either way.
+pub static SERVICE_REFUSAL_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ServiceRefusal",
+        "smithy.framework",
+        "ServiceRefusal",
+    ),
+    ShapeType::Structure,
+    &[&SERVICE_REFUSAL_MESSAGE],
+);
+
+/// A refusal whose error code this service's model does not declare: the code a client
+/// branches on, plus the sentence that travels with it.
+///
+/// Both refusals this carries are recorded behaviour of the real service, and neither is
+/// expressible as a modeled variant — the model has no shape for either code. The code is
+/// `&'static str` because [`OperationError::shape_name`] vends a `&'static str`, so a
+/// refusal can only name one of the constants above.
+#[derive(Debug, Clone)]
+pub struct ServiceRefusal {
+    /// The wire error code (`__type` / `x-amzn-errortype`).
+    pub code: &'static str,
+    /// The sentence the body carries.
+    pub message: String,
+}
+
+impl ServiceRefusal {
+    /// Fail closed: the caller's ownership of the resource the request names could not be
+    /// established, so the request is refused without disclosing anything about it.
+    pub fn unauthorized() -> Self {
+        Self {
+            code: UNAUTHORIZED_EXCEPTION_CODE,
+            message: UNAUTHORIZED_EXCEPTION_MESSAGE.to_string(),
+        }
+    }
+
+    /// The tagging surface's refusal of a `ResourceArn` that resolves to no resource.
+    pub fn invalid_input_resource_arn() -> Self {
+        Self {
+            code: BAD_REQUEST_EXCEPTION_CODE,
+            message: INVALID_INPUT_RESOURCE_ARN_MESSAGE.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServiceRefusal {}
+
+impl SerializableStruct for ServiceRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&SERVICE_REFUSAL_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +298,9 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A refusal this service answers with an error code its model does not declare —
+    /// see [`ServiceRefusal`]. Renders as [`SERVICE_REFUSAL_STATUS`] with that code.
+    ServiceRefusal(ServiceRefusal),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +337,23 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Fail closed on the authorization gate: HTTP 400 with the
+    /// [`UNAUTHORIZED_EXCEPTION_CODE`] code and its fixed sentence.
+    ///
+    /// Answer it where the caller's ownership of the resource the request names cannot
+    /// be established — an EC2 instance this service has no record of, an ARN of one of
+    /// its own ownership-scoped resources that state does not hold — INSTEAD of a
+    /// not-found: the refusal must not disclose whether the identifier names anything.
+    pub fn unauthorized() -> Self {
+        Self::ServiceRefusal(ServiceRefusal::unauthorized())
+    }
+
+    /// The tagging surface's refusal of a `ResourceArn` that resolves to no resource:
+    /// HTTP 400 with the [`BAD_REQUEST_EXCEPTION_CODE`] code and its fixed sentence.
+    pub fn invalid_input_resource_arn() -> Self {
+        Self::ServiceRefusal(ServiceRefusal::invalid_input_resource_arn())
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +361,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::ServiceRefusal(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +374,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::ServiceRefusal(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +389,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::ServiceRefusal(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +398,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::ServiceRefusal(_) => &SERVICE_REFUSAL_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +411,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The code the refusal itself names; see `ServiceRefusal`.
+            Self::ServiceRefusal(e) => e.code,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +425,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::ServiceRefusal(_) => SERVICE_REFUSAL_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,7 +437,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // Same reason for both synthetic shapes: neither carries an `awsQueryError`
+            // trait, because neither is in the model.
+            Self::ServiceRefusal(_) => None,
             Self::ValidationException(_) => None,
         }
     }
