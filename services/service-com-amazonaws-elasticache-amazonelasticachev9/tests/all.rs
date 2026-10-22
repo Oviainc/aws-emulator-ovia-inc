@@ -15,5 +15,7 @@
 mod cache_cluster_lifecycle;
 #[path = "all/service_updates.rs"]
 mod service_updates;
+#[path = "all/snapshots.rs"]
+mod snapshots;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
