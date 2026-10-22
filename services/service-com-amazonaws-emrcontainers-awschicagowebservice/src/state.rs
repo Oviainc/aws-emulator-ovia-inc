@@ -2,10 +2,11 @@
 
 //! Engine state for the com-amazonaws-emrcontainers-awschicagowebservice service.
 //!
-//! This holds the virtual-cluster / job-run core loop of EMR on EKS, plus the
-//! security-configuration templates a virtual cluster can reference. Every field a
-//! describe or a list answers with is read back out of one of these records: nothing
-//! is echoed from the request that asked for it, and nothing is canned.
+//! This holds the virtual-cluster / job-run core loop of EMR on EKS, the job templates
+//! `StartJobRun` values are stored in, plus the security-configuration templates a
+//! virtual cluster can reference. Every field a describe or a list answers with is read
+//! back out of one of these records: nothing is echoed from the request that asked for
+//! it, and nothing is canned.
 //!
 //! Two things live here beside the records because several operations need them and a
 //! second copy would let two operations disagree:
@@ -17,12 +18,16 @@
 //!   reporting or mutating, calls it first, so a reader never has to know which other
 //!   call started the transition.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 use crate::ops::types::{
-    ConfigurationOverrides, ContainerProvider, JobDriver, JobRun, RetryPolicyConfiguration,
-    SchedulerConfiguration, SecurityConfiguration, SecurityConfigurationData, VirtualCluster,
+    Configuration, ConfigurationOverrides, ContainerProvider, JobDriver, JobRun, JobTemplate,
+    JobTemplateData, ParametricConfigurationOverrides, RetryPolicyConfiguration,
+    SchedulerConfiguration, SecurityConfiguration, SecurityConfigurationData,
+    TemplateParameterConfiguration, VirtualCluster,
 };
 
 /// The ARN namespace this service's ARNs carry (`OPERATIONS.md`: ARN namespace
@@ -96,6 +101,14 @@ pub const MAX_VIRTUAL_CLUSTERS: usize = 200;
 /// `StartJobRun` is refused once every slot holds a run that has not finished.
 pub const MAX_JOB_RUNS: usize = 2_000;
 
+/// The most job templates this emulator keeps at once.
+///
+/// Not an AWS quota: the emulator's own retention cap, so the store cannot grow with the
+/// number of requests served. A job template has no lifecycle state, so nothing about it
+/// is ever "retired" and there is nothing to reclaim: once every slot is taken,
+/// `CreateJobTemplate` is refused until a caller releases one with `DeleteJobTemplate`.
+pub const MAX_JOB_TEMPLATES: usize = 500;
+
 /// The most security configurations this emulator keeps at once.
 ///
 /// Not an AWS quota: the emulator's own retention cap, so the store cannot grow with the
@@ -122,6 +135,11 @@ pub const CREATE_SECURITY_CONFIGURATION_SCOPE: &str = "CreateSecurityConfigurati
 pub fn start_job_run_scope(virtual_cluster_id: &str) -> String {
     format!("StartJobRun:{virtual_cluster_id}")
 }
+
+/// The idempotency scope `CreateJobTemplate` remembers a `clientToken` under. A job
+/// template is account-and-region wide (`POST /jobtemplates` names no parent resource),
+/// so the operation alone scopes the token.
+pub const CREATE_JOB_TEMPLATE_SCOPE: &str = "CreateJobTemplate";
 
 /// Wall-clock milliseconds since the epoch, the unit every stored timestamp uses.
 pub fn now_millis() -> i64 {
@@ -159,6 +177,12 @@ pub fn job_run_arn(region: &str, virtual_cluster_id: &str, id: &str) -> String {
         region,
         &format!("/virtualclusters/{virtual_cluster_id}/jobruns/{id}"),
     )
+}
+
+/// `arn:aws:emr-containers:{region}:{account}:/jobtemplates/{id}` — the
+/// `JobTemplateArn` shape's pattern.
+pub fn job_template_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("/jobtemplates/{id}"))
 }
 
 /// `arn:aws:emr-containers:{region}:{account}:/securityconfigurations/{id}` — the
@@ -327,6 +351,231 @@ impl JobRunRecord {
     }
 }
 
+/// Append one component of a fingerprint rendering, behind its own byte length.
+///
+/// The length prefix is what keeps the rendering UNAMBIGUOUS: without it a value could
+/// run into its neighbour (`"a" + "bc"` and `"ab" + "c"` render alike) and two different
+/// requests would fingerprint the same, so a changed parameter could be answered as a
+/// replay.
+fn push_part(rendered: &mut String, part: &str) {
+    rendered.push_str(&part.len().to_string());
+    rendered.push(':');
+    rendered.push_str(part);
+    rendered.push(';');
+}
+
+/// Append an optional component, with a present/absent marker of its own, so an absent
+/// member and a member whose value is the empty string are told apart.
+fn push_option(rendered: &mut String, part: Option<&str>) {
+    match part {
+        Some(value) => {
+            push_part(rendered, "1");
+            push_part(rendered, value);
+        }
+        None => push_part(rendered, "0"),
+    }
+}
+
+/// Append a `TagMap`-shaped member, its entries in key order so the fingerprint does not
+/// depend on hash iteration order. An absent map and an empty one render alike, because
+/// they persist the same record.
+fn push_string_map(rendered: &mut String, map: Option<&HashMap<String, String>>) {
+    let sorted: BTreeMap<&str, &str> = map
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    push_part(rendered, &sorted.len().to_string());
+    for (key, value) in sorted {
+        push_part(rendered, key);
+        push_part(rendered, value);
+    }
+}
+
+/// Append a `ConfigurationList`. A list is ORDER-SIGNIFICANT, so it renders in request
+/// order.
+///
+/// `Configuration` NESTS ITSELF and this list comes straight from request input, so the
+/// walk is driven by an explicit worklist rather than by recursion: nesting depth then
+/// costs heap — which the server's request-body cap bounds — instead of one stack frame
+/// per level. A Rust stack overflow aborts the process rather than raising a catchable
+/// panic, so one deeply nested request must not be able to reach it.
+///
+/// The rendering stays unambiguous because every list is framed by its own length and
+/// every item contributes exactly its classification, its properties and one child list,
+/// visited depth-first in list order.
+fn push_configurations(rendered: &mut String, list: Option<&[Configuration]>) {
+    let mut worklist: Vec<&[Configuration]> = vec![list.unwrap_or_default()];
+    while let Some(items) = worklist.pop() {
+        push_part(rendered, &items.len().to_string());
+        for item in items {
+            push_part(rendered, &item.classification);
+            push_string_map(rendered, item.properties.as_ref());
+        }
+        // Pushed in reverse, so the next list popped is the FIRST item's children and the
+        // walk stays depth-first in list order.
+        for item in items.iter().rev() {
+            worklist.push(item.configurations.as_deref().unwrap_or_default());
+        }
+    }
+}
+
+/// Append a `ParametricConfigurationOverrides`, member by member.
+fn push_parametric_overrides(
+    rendered: &mut String,
+    overrides: Option<&ParametricConfigurationOverrides>,
+) {
+    let Some(overrides) = overrides else {
+        push_part(rendered, "0");
+        return;
+    };
+    push_part(rendered, "1");
+    push_configurations(rendered, overrides.application_configuration.as_deref());
+    match overrides.monitoring_configuration.as_ref() {
+        None => push_part(rendered, "0"),
+        Some(monitoring) => {
+            push_part(rendered, "1");
+            push_option(rendered, monitoring.persistent_app_ui.as_deref());
+            match monitoring.cloud_watch_monitoring_configuration.as_ref() {
+                None => push_part(rendered, "0"),
+                Some(cloud_watch) => {
+                    push_part(rendered, "1");
+                    push_option(rendered, cloud_watch.log_group_name.as_deref());
+                    push_option(rendered, cloud_watch.log_stream_name_prefix.as_deref());
+                }
+            }
+            match monitoring.s3_monitoring_configuration.as_ref() {
+                None => push_part(rendered, "0"),
+                Some(s3) => {
+                    push_part(rendered, "1");
+                    push_option(rendered, s3.log_uri.as_deref());
+                }
+            }
+        }
+    }
+}
+
+/// Append a `JobDriver`: both union-shaped members, each present or absent.
+fn push_job_driver(rendered: &mut String, driver: &JobDriver) {
+    match driver.spark_submit_job_driver.as_ref() {
+        None => push_part(rendered, "0"),
+        Some(spark_submit) => {
+            push_part(rendered, "1");
+            push_part(rendered, &spark_submit.entry_point);
+            let arguments = spark_submit.entry_point_arguments.as_deref().unwrap_or(&[]);
+            push_part(rendered, &arguments.len().to_string());
+            for argument in arguments {
+                push_part(rendered, argument);
+            }
+            push_option(rendered, spark_submit.spark_submit_parameters.as_deref());
+        }
+    }
+    match driver.spark_sql_job_driver.as_ref() {
+        None => push_part(rendered, "0"),
+        Some(spark_sql) => {
+            push_part(rendered, "1");
+            push_option(rendered, spark_sql.entry_point.as_deref());
+            push_option(rendered, spark_sql.spark_sql_parameters.as_deref());
+        }
+    }
+}
+
+/// Append a `TemplateParameterConfigurationMap`, its entries in key order.
+fn push_parameter_configuration(
+    rendered: &mut String,
+    map: Option<&HashMap<String, TemplateParameterConfiguration>>,
+) {
+    let sorted: BTreeMap<&str, &TemplateParameterConfiguration> = map
+        .into_iter()
+        .flatten()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    push_part(rendered, &sorted.len().to_string());
+    for (key, value) in sorted {
+        push_part(rendered, key);
+        push_option(rendered, value.r#type.as_deref());
+        push_option(rendered, value.default_value.as_deref());
+    }
+}
+
+/// A fixed-size fingerprint of EVERY parameter a job template is built from.
+///
+/// `clientToken` is `@idempotencyToken`, which means "the same token names the same
+/// request": a second call carrying a token already spent is a replay only when it
+/// really is the same request. This digest is how that is decided, so it has to cover
+/// every member that ends up on the stored record — `name`, the whole
+/// `jobTemplateData` tree, `tags` and `kmsKeyArn` — and nothing that does not.
+///
+/// SHA-256, so the size is fixed however large the request was, and a map's entries are
+/// rendered in key order so one request never fingerprints two ways.
+pub fn job_template_fingerprint(
+    name: &str,
+    data: &JobTemplateData,
+    tags: Option<&HashMap<String, String>>,
+    kms_key_arn: Option<&str>,
+) -> String {
+    let mut rendered = String::new();
+    push_part(&mut rendered, name);
+    push_part(&mut rendered, &data.execution_role_arn);
+    push_part(&mut rendered, &data.release_label);
+    push_parametric_overrides(&mut rendered, data.configuration_overrides.as_ref());
+    push_job_driver(&mut rendered, &data.job_driver);
+    push_parameter_configuration(&mut rendered, data.parameter_configuration.as_ref());
+    push_string_map(&mut rendered, data.job_tags.as_ref());
+    push_string_map(&mut rendered, tags);
+    push_option(&mut rendered, kms_key_arn);
+
+    let mut hasher = Sha256::new();
+    hasher.update(rendered.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// One job template, as `CreateJobTemplate` persisted it.
+///
+/// A job template has no lifecycle state: EMR on EKS stores the `StartJobRun` values and
+/// nothing about it transitions, so there is no `state` member and no pending transition
+/// here.
+#[derive(Debug, Clone)]
+pub struct JobTemplateRecord {
+    pub id: String,
+    pub name: String,
+    pub arn: String,
+    pub created_at_millis: i64,
+    pub tags: HashMap<String, String>,
+    pub job_template_data: JobTemplateData,
+    pub kms_key_arn: Option<String>,
+    pub client_token: String,
+    /// [`job_template_fingerprint`] of the request that minted this template, so a later
+    /// call carrying the same `clientToken` is answered as a replay only when it is the
+    /// same request.
+    pub request_fingerprint: String,
+    /// Creation sequence, so templates minted within one millisecond still have a total
+    /// order for `ListJobTemplates` to page through.
+    pub sequence: u64,
+}
+
+impl JobTemplateRecord {
+    /// The modelled `JobTemplate` this record represents.
+    ///
+    /// `createdBy` stays absent: no IAM identity created this template — the emulator
+    /// verifies a signature but mints no `RequestIdentityUserArn` to attribute it to.
+    /// `decryptionError` stays absent too: a `kmsKeyArn` is persisted as submitted and
+    /// nothing is encrypted, so no decryption ever failed.
+    pub fn to_job_template(&self) -> JobTemplate {
+        JobTemplate {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(date_time(self.created_at_millis)),
+            created_by: None,
+            tags: Some(self.tags.clone()),
+            job_template_data: self.job_template_data.clone(),
+            kms_key_arn: self.kms_key_arn.clone(),
+            decryption_error: None,
+        }
+    }
+}
+
 /// One security configuration, as `CreateSecurityConfiguration` persisted it.
 ///
 /// It carries no state member: EMR on EKS models a security configuration as a template,
@@ -387,6 +636,9 @@ pub struct ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub security_configurations: HashMap<String, SecurityConfigurationRecord>,
     /// Job-run ids per virtual cluster, in creation order.
     pub job_runs_by_cluster: HashMap<String, Vec<String>>,
+    /// Job templates by `id`. Capped by [`MAX_JOB_TEMPLATES`]; a template leaves only
+    /// when `DeleteJobTemplate` removes it.
+    pub job_templates: HashMap<String, JobTemplateRecord>,
     /// `(idempotency scope, clientToken) -> minted resource id`, so a replayed
     /// `@idempotencyToken` returns the resource the first call minted instead of a
     /// second one. One entry per stored record, inserted and reclaimed with it, so this
@@ -566,6 +818,55 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             record.id.clone(),
         );
         self.job_runs.insert(record.id.clone(), record);
+    }
+
+    /// Make room for one more job template.
+    ///
+    /// `false` once every slot is taken: a job template has no lifecycle state, so none
+    /// of them is ever retired and there is nothing to reclaim — the caller must refuse
+    /// the create rather than grow the store, and a `DeleteJobTemplate` is what frees a
+    /// slot.
+    pub fn reserve_job_template(&self) -> bool {
+        self.job_templates.len() < MAX_JOB_TEMPLATES
+    }
+
+    /// Store a freshly minted job template, with the idempotency entry its `clientToken`
+    /// earns. One function, so a record can never be stored without it.
+    pub fn insert_job_template(&mut self, record: JobTemplateRecord) {
+        self.idempotency.insert(
+            (
+                CREATE_JOB_TEMPLATE_SCOPE.to_string(),
+                record.client_token.clone(),
+            ),
+            record.id.clone(),
+        );
+        self.job_templates.insert(record.id.clone(), record);
+    }
+
+    /// Remove a stored job template and the idempotency entry that named it. `None` when
+    /// the id names no template.
+    ///
+    /// The entry goes WITH the record, so this emulator's token index holds exactly one
+    /// entry per stored template and is bounded by [`MAX_JOB_TEMPLATES`] — the same terms
+    /// [`Self::reserve_virtual_cluster`] reclaims a virtual cluster's entry on. The
+    /// consequence is that a create retried with the same `clientToken` AFTER its
+    /// template was deleted mints a new one rather than replaying: EMR on EKS documents
+    /// no retention window for a spent `clientToken`, so how long a token outlives the
+    /// resource it named is not a modelled behaviour, and bounding the index is the
+    /// emulator's own choice. While the template exists — the whole window the dedup
+    /// contract is about — the token never mints a second one.
+    pub fn remove_job_template(&mut self, id: &str) -> Option<JobTemplateRecord> {
+        let record = self.job_templates.remove(id)?;
+        self.idempotency.remove(&(
+            CREATE_JOB_TEMPLATE_SCOPE.to_string(),
+            record.client_token.clone(),
+        ));
+        Some(record)
+    }
+
+    /// The modelled `JobTemplate` for this id.
+    pub fn job_template_view(&self, id: &str) -> Option<JobTemplate> {
+        Some(self.job_templates.get(id)?.to_job_template())
     }
 
     /// Move a stored virtual cluster into `now_state` with `next_state` owed to the

@@ -17,6 +17,14 @@ mod apigateway_signing_name_routing;
 mod appconfig_signing_name_routing;
 #[path = "all/aws_marketplace_signing_name_routing.rs"]
 mod aws_marketplace_signing_name_routing;
+// These two sit in the SORTED block rather than being appended below, deliberately: the
+// appended region at the end of this file is where every concurrent suite lands, so a
+// line added there conflicts with every other suite in the same window. Here the
+// neighbouring lines are stable.
+#[path = "all/bedrock_agentcore_gateway_lambda_target.rs"]
+mod bedrock_agentcore_gateway_lambda_target;
+#[path = "all/bedrock_agentcore_signing_name_routing.rs"]
+mod bedrock_agentcore_signing_name_routing;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]

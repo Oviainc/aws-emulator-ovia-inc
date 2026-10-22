@@ -33,6 +33,8 @@ mod lifecycle;
 mod operations_role;
 #[path = "all/platform_branches.rs"]
 mod platform_branches;
+#[path = "all/platform_versions.rs"]
+mod platform_versions;
 #[path = "all/request_refusals.rs"]
 mod request_refusals;
 #[path = "all/resource_tags.rs"]

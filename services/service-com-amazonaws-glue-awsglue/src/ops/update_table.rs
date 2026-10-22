@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +171,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTable"))
+        let _ = ctx;
+        // An Iceberg/open-table-format update needs the table-metadata layer this
+        // emulator does not maintain, the same layer `CreateTable` refuses its
+        // `OpenTableFormatInput` for.
+        if input.update_open_table_format_input.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateTable with UpdateOpenTableFormatInput",
+            ));
+        }
+        // A transactional update needs a transaction log this emulator does not keep.
+        if input.transaction_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateTable with TransactionId",
+            ));
+        }
+        // "The version ID at which to update the table contents": writing against one
+        // named version needs the table-version history this emulator does not keep
+        // (`GetTableVersion`/`GetTableVersions` are unimplemented), and applying the
+        // write to the latest version instead would be the wrong write, so a request
+        // that names a version is refused.
+        if input.version_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateTable with VersionId",
+            ));
+        }
+        // `ViewUpdateAction` is "the operation to be performed when updating the view",
+        // over the view representations this slice does not store (`Table`'s
+        // `ViewDefinition` is never reported), so asking for one is refused.
+        if input.view_update_action.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateTable with ViewUpdateAction",
+            ));
+        }
+
+        let Some(table_input) = input.table_input.as_ref() else {
+            return Err(UpdateTableErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "TableInput is required unless UpdateOpenTableFormatInput is supplied"
+                            .into(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        if table_input.view_definition.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateTable with TableInput.ViewDefinition",
+            ));
+        }
+        // The table a `TableInput` updates is the one it names; `Name` is how a request
+        // that carries no `TableInput` (an open-table-format update) addresses a table.
+        // `UpdateTable` does not move a table to another name, so when both are present
+        // they must name the same table rather than one silently winning.
+        let folded_table = crate::state::fold_name(&table_input.name);
+        if let Some(named) = input.name.as_ref() {
+            let folded_named = crate::state::fold_name(named);
+            if folded_named != folded_table {
+                return Err(UpdateTableErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Name {folded_named} and TableInput.Name {folded_table} must name \
+                             the same table"
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+        // `SkipArchive` and `Force` are inert here, and neither changes what this
+        // update writes: the archived previous version `SkipArchive` suppresses is read
+        // back only through the unimplemented table-version operations, and `Force`
+        // "ignore[s] matching storage descriptor and subobject matching requirements"
+        // over subobjects (partitions, column statistics) this slice stores none of, so
+        // there is no stored subobject the new storage descriptor could disagree with.
+        let _ = (input.skip_archive, input.force);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateTableErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(UpdateTableErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Database {} not found in catalog {catalog_id}",
+                        crate::state::fold_name(&input.database_name)
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let database_name = database.name.clone();
+        let Some(entry) = database.tables.get_mut(&folded_table) else {
+            return Err(UpdateTableErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Table {folded_table} not found in database {database_name}"
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Write the submitted definition into the stored record the read path serves,
+        // so the next `GetTable`/`GetTables` reports what this request sent.
+        entry.apply_input(table_input, ::std::time::SystemTime::now());
+        ::tracing::info!(
+            operation = "UpdateTable",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %folded_table,
+            version_id = %entry.version_id,
+            "updated a Data Catalog table"
+        );
+
+        Ok(UpdateTableOutput {})
     }
 }

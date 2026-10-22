@@ -15,7 +15,8 @@
 //! * `@paginated(items: customerAgreements)`: a page is cut at `maxResults`, a `nextToken`
 //!   arrives exactly when agreements remain, and it resumes where the previous page
 //!   ended — so walking the pages at ANY admissible page size enumerates the whole set
-//!   once, and a token this service never issued is refused;
+//!   once; the token is an OPAQUE cursor rather than an agreement id, and one this
+//!   service never issued is refused;
 //! * `customerAgreements` is `@required`, so it is serialized even when nothing is
 //!   active.
 
@@ -25,7 +26,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use serde_json::Value;
 use service_com_amazonaws_artifact_artifact::state::{
-    ComAmazonawsArtifactArtifactState, CustomerAgreement,
+    customer_agreements_page_token, ComAmazonawsArtifactArtifactState, CustomerAgreement,
 };
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -624,9 +625,11 @@ async fn max_results_outside_the_modelled_range_is_refused() {
 #[tokio::test]
 async fn a_next_token_this_service_did_not_issue_is_refused() {
     let router = emulator();
-    // The token is the customer-agreement id the next page resumes at, so every row here
-    // is a value that is not one: a made-up string, a token of another operation, and an
-    // id whose suffix is the wrong length or carries characters the pattern excludes.
+    // A `nextToken` is an OPAQUE cursor this operation cut, so every row here is a value
+    // that is not one: a made-up string, a token of another operation, an id whose suffix
+    // is the wrong length or carries characters the pattern excludes, and — the case this
+    // operation used to serve — a BARE customer-agreement id, which is a resource
+    // identifier rather than a cursor and so was never issued as a token.
     for token in [
         "not-a-token",
         "0",
@@ -636,6 +639,8 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         "customer-agreement-not_alphanumeric",
         "report-cloudsecalliance",
         "compliance-inquiry-abcdefghij123456",
+        ACTIVE[0].id,
+        ACTIVE[1].id,
     ] {
         let refused = list(&router, &format!("?nextToken={token}")).await;
         assert_eq!(
@@ -651,33 +656,67 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         );
     }
 
-    // A well-shaped token naming no stored agreement still resumes: the page starts at
-    // the first id at or after it, so a set that changed between pages is still served.
-    for (token, expected) in [
-        (
-            "customer-agreement-aaaaaaaaaaaaaaaa",
-            ACTIVE.iter().map(|row| row.id.to_string()).collect::<Vec<_>>(),
-        ),
-        (
-            "customer-agreement-czzzzzzzzzzzzzzz",
-            ACTIVE
-                .iter()
-                .skip(1)
-                .map(|row| row.id.to_string())
-                .collect::<Vec<_>>(),
-        ),
-        ("customer-agreement-zzzzzzzzzzzzzzzz", Vec::new()),
-    ] {
+    // The token this operation DOES issue carries none of the set's identifiers in the
+    // clear, and stays inside `NextTokenAttribute`'s `@length(1..2048)`.
+    let issued = list(&router, "?maxResults=1")
+        .await
+        .next_token()
+        .expect("a set of several active agreements must page");
+    assert!(
+        !issued.is_empty() && issued.len() <= 2048,
+        "case \"the issued token\": NextTokenAttribute is @length(1..2048), got {} bytes",
+        issued.len()
+    );
+    for row in ACTIVE {
+        assert!(
+            issued != row.id && !issued.contains(row.id),
+            "case \"the issued token\": a pagination token must not be or carry the \
+             identifier {:?}, got {issued:?}",
+            row.id
+        );
+    }
+
+    // And the token taken from an ACTUAL page resumes at the agreement after that page,
+    // so the cursor rows below cannot pass on a symmetric encode/decode defect.
+    let resumed = list(&router, &format!("?nextToken={issued}")).await;
+    assert_eq!(
+        resumed.status, 200,
+        "case \"the issued token\": a token this operation cut must be served, got {} with {:?}",
+        resumed.status, resumed.body
+    );
+    assert_eq!(
+        resumed.ids(),
+        ACTIVE
+            .iter()
+            .skip(1)
+            .map(|row| row.id.to_string())
+            .collect::<Vec<_>>(),
+        "case \"the issued token\": expected the agreements after the first page, got {:?}",
+        resumed.body
+    );
+
+    // A cursor this operation cut resumes the listing at the POSITION it carries, so the
+    // page after a cursor is exactly the tail of the reported order behind it — including
+    // one position past the last agreement, which serves an empty page rather than
+    // refusing.
+    for position in 0..=ACTIVE.len() {
+        let expected: Vec<String> = ACTIVE
+            .iter()
+            .skip(position)
+            .map(|row| row.id.to_string())
+            .collect();
+        let token = customer_agreements_page_token(position);
         let answer = list(&router, &format!("?nextToken={token}")).await;
         assert_eq!(
             answer.status, 200,
-            "case {token:?}: a well-shaped token must be served, got {} with {:?}",
+            "case position={position}: a cursor this operation cut must be served, got {} \
+             with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.ids(),
             expected,
-            "case {token:?}: expected the agreements at or after the token, got {:?}",
+            "case position={position}: expected the agreements after the cursor, got {:?}",
             answer.body
         );
     }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListShareInvitations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListShareInvitations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListShareInvitations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the share invitations addressed to the calling principal from
+//! [`crate::state`] — one per share of a resource whose `SharedWith` names that
+//! principal and whose share is still waiting to be answered — in `ShareInvitationId`
+//! order, narrowed by `ShareResourceType` and by the one name prefix a request may name,
+//! and paged by `MaxResults`/`NextToken`. A reporting operation: it writes nothing. Two
+//! or more of the mutually exclusive name prefixes, or a `NextToken` this service did
+//! not issue, is `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListShareInvitations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListShareInvitationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListShareInvitations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListShareInvitationsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `ShareResourceType` is a modelled enum, so the boundary validator normally
+        // refuses an out-of-set value before this handler runs; checking it here keeps
+        // the refusal correct for any path that does not.
+        if let Some(resource_type) = input
+            .share_resource_type
+            .as_deref()
+            .filter(|resource_type| !SHARE_RESOURCE_TYPE_VALUES.contains(resource_type))
+        {
+            return Err(field_validation(
+                "ShareResourceType",
+                &format!(
+                    "Member must satisfy enum value set: [{}], got {resource_type}",
+                    SHARE_RESOURCE_TYPE_VALUES.join(", ")
+                ),
+            ));
+        }
+
+        // "WorkloadNamePrefix, LensNamePrefix, ProfileNamePrefix, and TemplateNamePrefix
+        // are mutually exclusive. Use the parameter that matches your ShareResourceType"
+        // (this operation's doc): a request may name at most ONE of them, and the one it
+        // names selects invitations of the resource kind whose name it filters.
+        let prefixes: Vec<(&'static str, &'static str, &str)> = NAME_PREFIXES
+            .into_iter()
+            .zip([
+                input.workload_name_prefix.as_deref(),
+                input.lens_name_prefix.as_deref(),
+                input.profile_name_prefix.as_deref(),
+                input.template_name_prefix.as_deref(),
+            ])
+            .filter_map(|((member, resource_type), prefix)| {
+                prefix.map(|prefix| (member, resource_type, prefix))
+            })
+            .collect();
+        if prefixes.len() > 1 {
+            let named: Vec<&str> = prefixes.iter().map(|(member, _, _)| *member).collect();
+            // The sentence is built from the request: it names the members this request
+            // set, which is what the caller has to change. A cross-member rule states
+            // the same sentence for every member it covers.
+            let sentence = format!(
+                "{} are mutually exclusive; the request set {}.",
+                NAME_PREFIXES
+                    .iter()
+                    .map(|(member, _)| *member)
+                    .collect::<Vec<&str>>()
+                    .join(", "),
+                named.join(", ")
+            );
+            let fields: Vec<(String, String)> = named
+                .iter()
+                .map(|member| ((*member).to_string(), sentence.clone()))
+                .collect();
+            return Err(ListShareInvitationsErrorModeled::ValidationException(
+                crate::state::field_validation_exception(&fields),
+            )
+            .into());
+        }
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default. The clamp restates that
+        // bound in the handler, so the page size is in 1..=50 whatever reaches here.
+        let clamped = input
+            .max_results
+            .unwrap_or(MAX_RESULTS_CEILING)
+            .clamp(1, MAX_RESULTS_CEILING);
+        let page_size = usize::try_from(clamped)
+            .expect("MaxResults is clamped into 1..=50, which always fits in a usize");
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // rather than as a field rule to fix — exactly as the other paged reads word it.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_share_invitation_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListShareInvitationsErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // An invitation is offered to the principal a resource was shared WITH, so this
+        // reports what the CALLER has been offered and never what the caller shared out.
+        // Every request this emulator serves is attributed to its one account, which is
+        // therefore the principal the invitations are resolved for — never a literal
+        // account id, and never a value read off the request.
+        let invitations = state
+            .lock()
+            .pending_share_invitations_for(::engine::emulator_account_id());
+
+        let matching: Vec<ShareInvitationSummary> = invitations
+            .into_iter()
+            // The cursor is start-EXCLUSIVE: the page resumes just past the last
+            // invitation already returned, so every invitation is enumerated exactly
+            // once across pages.
+            .filter(|invitation| {
+                cursor.as_deref().is_none_or(|resume_after| {
+                    invitation
+                        .share_invitation_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        > resume_after
+                })
+            })
+            .filter(|invitation| {
+                input
+                    .share_resource_type
+                    .as_deref()
+                    .is_none_or(|resource_type| {
+                        invitation.share_resource_type.as_deref() == Some(resource_type)
+                    })
+            })
+            // A name prefix filters the summary member it names, so it selects
+            // invitations of that resource kind alone: a workload invitation carries no
+            // lens name for a `LensNamePrefix` to match, and vice versa.
+            .filter(|invitation| {
+                prefixes.first().is_none_or(|(_, resource_type, prefix)| {
+                    invitation.share_resource_type.as_deref() == Some(*resource_type)
+                        && shared_resource_name(invitation, resource_type)
+                            .is_some_and(|name| name.starts_with(*prefix))
+                })
+            })
+            .collect();
+
+        // A `NextToken` is owed only when invitations were left out of this page; the
+        // cursor is the last invitation the page served. `matching.len() > page_len`
+        // means the page is full, so `page_len` is at least 1.
+        let page_len = matching.len().min(page_size);
+        let next_token = if matching.len() > page_len {
+            matching
+                .get(page_len - 1)
+                .and_then(|last| last.share_invitation_id.as_deref())
+                .map(crate::state::encode_share_invitation_next_token)
+        } else {
+            None
+        };
+
+        Ok(ListShareInvitationsOutput {
+            share_invitation_summaries: Some(matching.into_iter().take(page_len).collect()),
+            next_token,
+        })
     }
+}
+
+/// The largest page `ListShareInvitations` serves, and the page size a request that omits
+/// `MaxResults` gets: the modelled `MaxResults` `@range(min: 1, max: 50)` maximum
+/// (`smithy_query(query="operation", operation="ListShareInvitations")`).
+const MAX_RESULTS_CEILING: i32 = 50;
+
+/// The four mutually exclusive name-prefix inputs, each paired with the
+/// `ShareResourceType` member whose invitations it narrows — "Use the parameter that
+/// matches your ShareResourceType" (this operation's doc). The resource types are the
+/// members `smithy_query(query="shape", shape="ShareResourceType")` publishes, named
+/// through `crate::state` so one spelling serves the whole service; the integration test
+/// walks every published member against this table.
+const NAME_PREFIXES: [(&str, &str); 4] = [
+    ("WorkloadNamePrefix", crate::state::WORKLOAD_RESOURCE_TYPE),
+    ("LensNamePrefix", crate::state::LENS_RESOURCE_TYPE),
+    ("ProfileNamePrefix", crate::state::PROFILE_RESOURCE_TYPE),
+    (
+        "TemplateNamePrefix",
+        crate::state::TEMPLATE_SHARE_RESOURCE_TYPE,
+    ),
+];
+
+/// The name of the shared resource an invitation of `resource_type` is for: the member of
+/// `ShareInvitationSummary` that kind of invitation fills (`smithy_query(query="shape",
+/// shape="ShareInvitationSummary")`), which is the member a name prefix narrows. `None`
+/// when the invitation does not carry it.
+fn shared_resource_name<'a>(
+    invitation: &'a ShareInvitationSummary,
+    resource_type: &str,
+) -> Option<&'a str> {
+    let name = match resource_type {
+        crate::state::WORKLOAD_RESOURCE_TYPE => &invitation.workload_name,
+        crate::state::LENS_RESOURCE_TYPE => &invitation.lens_name,
+        crate::state::PROFILE_RESOURCE_TYPE => &invitation.profile_name,
+        crate::state::TEMPLATE_SHARE_RESOURCE_TYPE => &invitation.template_name,
+        _ => &None,
+    };
+    name.as_deref()
+}
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — preferred over the scaffold's synthetic one
+/// because the modelled shape carries `Reason` and `Fields`, which a client reads.
+fn field_validation(member: &str, constraint: &str) -> ListShareInvitationsError {
+    ListShareInvitationsErrorModeled::ValidationException(
+        crate::state::member_constraint_exception(member, constraint),
+    )
+    .into()
 }

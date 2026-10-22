@@ -247,6 +247,68 @@ impl Client {
         };
         self.send("GET", &uri, None).await
     }
+
+    /// `ListShareInvitations`: `GET /shareInvitations`, with every filter and paging
+    /// member bound to the query string. `query` is passed as sent, empty for a request
+    /// that names none.
+    pub(crate) async fn list_share_invitations(&self, query: &str) -> Answer {
+        let uri = if query.is_empty() {
+            "/shareInvitations".to_string()
+        } else {
+            format!("/shareInvitations?{query}")
+        };
+        self.send("GET", &uri, None).await
+    }
+
+    /// Record a share of `workload_id` with `shared_with` at `status` straight through
+    /// the shared state, and answer its `(ShareId, ShareInvitationId)`.
+    ///
+    /// A share invitation is offered to the principal a resource was shared WITH, so a
+    /// test of the invitation reads needs a share whose recipient is the CALLER — and
+    /// that share has no HTTP path here: `CreateWorkloadShare` refuses a `SharedWith`
+    /// naming the principal doing the sharing, and this emulator attributes every
+    /// request to its one account, so the other account that would offer the share
+    /// cannot sign a request. The seed records exactly what `CreateWorkloadShare`
+    /// records — `shared_by` is the stored workload's owning account — and the READ
+    /// under test still crosses the HTTP boundary.
+    pub(crate) fn record_workload_share(
+        &self,
+        workload_id: &str,
+        shared_with: &str,
+        permission_type: &str,
+        status: &str,
+    ) -> (String, String) {
+        let state = self
+            .engine
+            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let mut store = state.lock();
+        let shared_by = store
+            .workloads
+            .get(workload_id)
+            .expect("the workload under test must exist")
+            .owner
+            .clone();
+        let share_id = store.mint_share_id();
+        let share_invitation_id = store.mint_share_invitation_id();
+        store
+            .workload_shares
+            .entry(workload_id.to_string())
+            .or_default()
+            .insert(
+                share_id.clone(),
+                service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::WorkloadShareRecord {
+                    share_id: share_id.clone(),
+                    share_invitation_id: share_invitation_id.clone(),
+                    workload_id: workload_id.to_string(),
+                    shared_by,
+                    shared_with: shared_with.to_string(),
+                    permission_type: permission_type.to_string(),
+                    status: status.to_string(),
+                    status_message: None,
+                },
+            );
+        (share_id, share_invitation_id)
+    }
 }
 
 /// Percent-encode a value so it survives as ONE path segment: everything RFC 3986 does

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadLayerPart
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadLayerPart`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadLayerPart::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends ONE layer part to an in-flight upload [`crate::ops::initiate_layer_upload`]
+//! opened: the part is accepted only when the request is self-consistent (the blob
+//! carries exactly the bytes its declared `partFirstByte`..`partLastByte` range spans)
+//! and its first byte is consecutive to the last byte the upload already received, so the
+//! bytes held for an upload are always the layer's leading bytes in layer order. An
+//! accepted part reports the position of its last byte; a part that does not fit is
+//! refused with the modelled `InvalidLayerPartException`, which carries the last byte
+//! that IS valid, and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +184,207 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadLayerPart` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadLayerPartErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadLayerPart"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UploadLayerPartErrorModeled::ServerException(ServerException {
+                    message: Some(
+                        "The ECR Public emulator could not reach its state store.".to_string(),
+                    ),
+                })
+                .into(),
+            );
+        };
+        // Request metadata is used for the audit record only: the part is appended to the
+        // upload this registry holds, not to anything in the signing region.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        let mut store = state.lock();
+        let registry_id = store.registry_id.clone();
+
+        // "If you do not specify a registry, the default public registry is assumed"
+        // (`registryId`), and the only registry this emulator serves is its own — named
+        // either by account id or by registry alias, which is what `RegistryIdOrAlias`
+        // admits.
+        if let Some(requested_registry) = input.registry_id.as_deref() {
+            if !store.is_this_registry(requested_registry) {
+                return Err(UploadLayerPartErrorModeled::RegistryNotFoundException(
+                    RegistryNotFoundException {
+                        message: Some(format!(
+                            "The registry with id or alias '{requested_registry}' does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A layer part is uploaded INTO a repository, so there has to be one — a
+        // repository deleted while an upload against it was in flight included.
+        if !store.repositories.contains_key(&input.repository_name) {
+            return Err(UploadLayerPartErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(format!(
+                        "The repository with name '{}' does not exist in the registry with \
+                         id '{registry_id}'",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // What every in-flight upload of this registry holds between them, read before
+        // one of them is borrowed: it is what the store-wide byte ceiling below is
+        // measured against.
+        let in_flight_bytes = store.in_flight_layer_bytes();
+
+        // The upload id addresses an upload this registry opened, and an id is only valid
+        // for the repository it was issued for — "the upload can't be found, or the
+        // specified upload ID isn't valid for this repository"
+        // (`UploadNotFoundException`), which is the same answer for both.
+        let upload_not_found = || {
+            UploadLayerPartErrorModeled::UploadNotFoundException(UploadNotFoundException {
+                message: Some(format!(
+                    "The upload with ID '{}' does not exist for the repository with name \
+                     '{}' in the registry with id '{registry_id}'",
+                    input.upload_id, input.repository_name
+                )),
+            })
+        };
+        let Some(upload) = store.uploads.get_mut(&input.upload_id) else {
+            return Err(upload_not_found().into());
+        };
+        if upload.repository_name != input.repository_name {
+            return Err(upload_not_found().into());
+        }
+
+        let part_bytes = input.layer_part_blob.len();
+        let expected_first_byte = upload.next_part_first_byte();
+        // `lastValidByteReceived` is "the position of the last byte of the layer part"
+        // this upload last accepted, which an upload that has received nothing does not
+        // have yet — so the member is absent there rather than naming a byte 0 that was
+        // never received.
+        let last_valid_byte_received = upload.last_byte_received();
+        let invalid_part = |reason: String| {
+            UploadLayerPartErrorModeled::InvalidLayerPartException(InvalidLayerPartException {
+                registry_id: Some(registry_id.clone()),
+                repository_name: Some(input.repository_name.clone()),
+                upload_id: Some(input.upload_id.clone()),
+                last_valid_byte_received,
+                message: Some(reason),
+            })
+        };
+
+        // A part declares the range of the layer it carries, so the request has to agree
+        // with itself first: `partLastByte` is the position of the part's last byte, so
+        // the range spans `partLastByte - partFirstByte + 1` bytes and the blob must carry
+        // exactly that many. Checked arithmetic because both members are only bounded
+        // below (`PartSize`, range 0..), so a caller may name positions near `i64::MAX`.
+        let declared_bytes = input
+            .part_last_byte
+            .checked_sub(input.part_first_byte)
+            .and_then(|span| span.checked_add(1))
+            .filter(|declared| *declared > 0);
+        let Some(declared_bytes) = declared_bytes else {
+            return Err(invalid_part(format!(
+                "The layer part byte range '{}'-'{}' spans no bytes: partLastByte must be \
+                 at least partFirstByte",
+                input.part_first_byte, input.part_last_byte
+            ))
+            .into());
+        };
+        if declared_bytes > crate::state::MAX_LAYER_PART_BYTES {
+            return Err(invalid_part(format!(
+                "The layer part byte range '{}'-'{}' spans {declared_bytes} bytes, which is \
+                 more than the maximum of {} bytes for one layer part",
+                input.part_first_byte,
+                input.part_last_byte,
+                crate::state::MAX_LAYER_PART_BYTES
+            ))
+            .into());
+        }
+        // The blob is capped at `MAX_LAYER_PART_BYTES` by the model, so this conversion
+        // always succeeds; the fallback is a value no admissible range can equal.
+        if declared_bytes != i64::try_from(part_bytes).unwrap_or(i64::MAX) {
+            return Err(invalid_part(format!(
+                "The layer part carries {part_bytes} bytes, which is not the \
+                 {declared_bytes} bytes of the byte range '{}'-'{}' it declares",
+                input.part_first_byte, input.part_last_byte
+            ))
+            .into());
+        }
+
+        // "The first byte specified isn't consecutive to the last byte of a previous layer
+        // part upload" (`InvalidLayerPartException`): parts make up one layer, so each one
+        // begins exactly where the last accepted part ended, and the first part of an
+        // upload begins at byte 0. A part that leaves a gap, overlaps what was received or
+        // repeats it is refused, and the upload keeps the bytes it already had.
+        if input.part_first_byte != expected_first_byte {
+            return Err(invalid_part(format!(
+                "The layer part beginning at byte '{}' is not consecutive to the last byte \
+                 received for the upload with ID '{}': the next layer part must begin at \
+                 byte '{expected_first_byte}'",
+                input.part_first_byte, input.upload_id
+            ))
+            .into());
+        }
+
+        // The layer is held in memory until `CompleteLayerUpload` consumes it and a part
+        // upload is caller-driven, so both the bytes of this one upload and the bytes of
+        // every upload at once are bounded. Past either ceiling the part is refused with
+        // the `LimitExceededException` this operation models ("the operation didn't
+        // succeed because it would have exceeded a service limit") and nothing is stored.
+        let would_hold = upload.received.len().saturating_add(part_bytes);
+        let over_limit = if would_hold > crate::state::MAX_LAYER_UPLOAD_BYTES {
+            Some(format!(
+                "it would have exceeded the limit of {} bytes for one layer upload",
+                crate::state::MAX_LAYER_UPLOAD_BYTES
+            ))
+        } else if in_flight_bytes.saturating_add(part_bytes)
+            > crate::state::MAX_IN_FLIGHT_LAYER_BYTES
+        {
+            Some(format!(
+                "it would have exceeded the limit of {} layer bytes in flight in the \
+                 registry with id '{registry_id}'",
+                crate::state::MAX_IN_FLIGHT_LAYER_BYTES
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = over_limit {
+            return Err(
+                UploadLayerPartErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(format!("The operation didn't succeed because {reason}")),
+                })
+                .into(),
+            );
+        }
+
+        // The part's bytes, kept verbatim and in layer order: the layer this upload holds
+        // is exactly the concatenation of the parts it accepted.
+        upload.received.extend_from_slice(&input.layer_part_blob);
+        let last_byte_received = upload.last_byte_received();
+        drop(store);
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata, the server-minted upload id and byte counts.
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "UploadLayerPart",
+            outcome = "accepted",
+            caller_akid = %caller_akid,
+            registry_id = %registry_id,
+            upload_id = %input.upload_id,
+            part_bytes = part_bytes,
+            "layer part accepted"
+        );
+
+        Ok(UploadLayerPartOutput {
+            registry_id: Some(registry_id),
+            repository_name: Some(input.repository_name),
+            upload_id: Some(input.upload_id),
+            last_byte_received,
+        })
     }
 }

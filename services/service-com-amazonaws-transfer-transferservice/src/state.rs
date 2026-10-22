@@ -2255,6 +2255,59 @@ pub struct WebApp {
     /// which has no VPC endpoint to report.
     pub endpoint_details: Option<DescribedWebAppEndpointDetails>,
     pub tags: Vec<Tag>,
+    /// The branding `UpdateWebAppCustomization` assigns to this web app and
+    /// `DescribeWebAppCustomization` reports — see [`WebAppCustomization`]. It lives on
+    /// the web app rather than in a map of its own because a customization has no
+    /// identifier of its own: it is addressed by `WebAppId`, and
+    /// `DescribedWebAppCustomization.Arn` is documented as "the ARN for the web app",
+    /// i.e. [`Self::arn`]. A web app no customization was assigned to carries the
+    /// default (every member unset), which no `CreateWebApp` member can set.
+    pub customization: WebAppCustomization,
+}
+
+/// One web app's customization: the page title, logo and icon a caller assigned to it.
+///
+/// `UpdateWebAppCustomization` is documented as "assigns new customization properties
+/// to a web app. You can modify the icon file, logo file, and title", and models each
+/// of those three members OPTIONAL beside the `@required` `WebAppId` — so an update
+/// assigns the members it carries and leaves the others as they stand
+/// ([`Self::assign`]); removing a customization is what the service's own
+/// `DeleteWebAppCustomization` is for, not an omitted member. Each member is `None`
+/// until an update assigns it, and `DescribeWebAppCustomization` reports exactly the
+/// ones that were: `Title` is modelled `len 0..100`, so `Some(String::new())` is a
+/// title a caller really did assign (the empty one) and is distinct from never having
+/// assigned one, while `LogoFile`/`FaviconFile` are modelled `len 1..`, so no empty
+/// blob can be stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebAppCustomization {
+    pub title: Option<String>,
+    pub logo_file: Option<Vec<u8>>,
+    pub favicon_file: Option<Vec<u8>>,
+}
+
+impl WebAppCustomization {
+    /// Assign the customization members an update CARRIES, leaving the ones it omits
+    /// exactly as they stand.
+    ///
+    /// The one place this service applies the partial-update rule stated on
+    /// [`WebAppCustomization`], so an update and any later reader cannot disagree about
+    /// what an omitted member means.
+    pub fn assign(
+        &mut self,
+        title: Option<String>,
+        logo_file: Option<Vec<u8>>,
+        favicon_file: Option<Vec<u8>>,
+    ) {
+        if let Some(title) = title {
+            self.title = Some(title);
+        }
+        if let Some(logo_file) = logo_file {
+            self.logo_file = Some(logo_file);
+        }
+        if let Some(favicon_file) = favicon_file {
+            self.favicon_file = Some(favicon_file);
+        }
+    }
 }
 
 /// One workflow execution's custom-step callbacks, keyed by `(WorkflowId,

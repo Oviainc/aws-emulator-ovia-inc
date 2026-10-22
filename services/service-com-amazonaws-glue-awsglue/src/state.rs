@@ -252,6 +252,40 @@ impl DatabaseEntry {
         }
     }
 
+    /// Overwrite this database's definition with the one the client submitted.
+    ///
+    /// `DatabaseInput` is the WHOLE client-settable definition of a database — the
+    /// same shape a create submits — so an update writes every member it carries and
+    /// clears the ones it omits; what the client sent is exactly what the next read
+    /// reports. The members no `DatabaseInput` carries are left alone, because the
+    /// client cannot set them: `CatalogId` and `CreateTime` belong to the server, the
+    /// tags are written through the tagging operations, and the tables this database
+    /// owns are their own resources.
+    ///
+    /// The submitted `Name` is folded and written like any other member, so a request
+    /// that submits a different one has MOVED the database: its tables' reported
+    /// `DatabaseName` moves with it. Relocating the entry under its new key is the
+    /// caller's job, since the key lives in [`Catalog::databases`].
+    pub fn apply_input(&mut self, input: &DatabaseInput) {
+        let folded = fold_name(&input.name);
+        for table in self.tables.values_mut() {
+            table.database_name = folded.clone();
+        }
+        self.name = folded;
+        self.description = input.description.clone();
+        self.location_uri = input.location_uri.clone();
+        self.parameters = input.parameters.clone();
+        self.create_table_default_permissions = input
+            .create_table_default_permissions
+            .clone()
+            // An update that names no grants records the catalog's default, exactly as
+            // a create does: the stored list is always definite, and an EMPTY list is
+            // the opposite governance decision, so it is stored only when sent.
+            .unwrap_or_else(default_create_table_default_permissions);
+        self.target_database = input.target_database.clone();
+        self.federated_database = input.federated_database.clone();
+    }
+
     /// The stored tables ordered by folded name — the deterministic order
     /// `GetTables` pages over.
     pub fn tables_ordered(&self) -> Vec<&TableEntry> {
@@ -327,6 +361,45 @@ impl TableEntry {
             version_id: FIRST_TABLE_VERSION_ID.to_string(),
             created_by,
         }
+    }
+
+    /// Overwrite this table's definition with the one the client submitted.
+    ///
+    /// `TableInput` is the WHOLE client-settable definition of a table — the same
+    /// shape a create submits — so an update writes every member it carries and clears
+    /// the ones it omits; what the client sent is exactly what the next read reports.
+    /// The server-set members keep their own history: `CreateTime`, `CreatedBy`,
+    /// `CatalogId` and `DatabaseName` stay as the create left them, `UpdateTime` moves
+    /// to this write's instant, and `VersionId` advances to the next version, because
+    /// the update produced a new version of the table.
+    ///
+    /// `TableInput$ViewDefinition` is NOT carried here: this slice stores no view
+    /// representations, so an update that submits one is refused by the handler rather
+    /// than accepted and dropped.
+    ///
+    /// The submitted `Name` is folded and written like any other member, but it can
+    /// only ever be the name this table already has: `UpdateTable` refuses a request
+    /// whose `TableInput$Name` is not the table it addresses, so the entry's key in
+    /// [`DatabaseEntry::tables`] stays correct. A caller that ever applies an input
+    /// under a different name must relocate the entry under its new key, the way
+    /// `UpdateDatabase` does for [`DatabaseEntry::apply_input`].
+    pub fn apply_input(&mut self, input: &TableInput, now: SystemTime) {
+        self.name = fold_name(&input.name);
+        self.description = input.description.clone();
+        self.owner = input.owner.clone();
+        self.table_type = input.table_type.clone();
+        self.retention = input.retention;
+        self.parameters = input.parameters.clone();
+        self.storage_descriptor = input.storage_descriptor.clone();
+        self.partition_keys = input.partition_keys.clone();
+        self.view_original_text = input.view_original_text.clone();
+        self.view_expanded_text = input.view_expanded_text.clone();
+        self.target_table = input.target_table.clone();
+        self.federated_table = input.federated_table.clone();
+        self.last_access_time = input.last_access_time;
+        self.last_analyzed_time = input.last_analyzed_time;
+        self.update_time = now;
+        self.version_id = next_version_id(&self.version_id);
     }
 
     /// Rebuild the modelled `Table` output shape from what is stored.
@@ -539,6 +612,22 @@ pub fn is_cron_expression(expression: &str) -> bool {
 /// address its only version by — numbering the first version `"1"` left version `"0"`
 /// unfetchable. `VersionString` is a string, so the id is formatted as one.
 pub const FIRST_TABLE_VERSION_ID: &str = "0";
+
+/// The `VersionId` that follows `current`: the stored counter plus one.
+///
+/// Only the server ever writes a `VersionId`, and it writes a decimal counter, so a
+/// value that does not parse is treated as the version before the first one
+/// ([`FIRST_TABLE_VERSION_ID`] minus one, i.e. the id a fresh table advances FROM)
+/// rather than carried forward unchanged — a version must always move when the table
+/// does.
+pub fn next_version_id(current: &str) -> String {
+    current
+        .parse::<u64>()
+        // Explicitly the version before the first one, not a general-purpose default.
+        .unwrap_or(0)
+        .saturating_add(1)
+        .to_string()
+}
 
 /// Fold a database or table name the way the catalog stores it: ASCII-lowercased.
 /// Applied on both write and lookup, so a name is reachable by any casing the client

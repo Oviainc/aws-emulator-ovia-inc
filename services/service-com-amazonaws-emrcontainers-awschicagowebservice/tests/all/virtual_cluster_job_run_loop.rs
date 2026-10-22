@@ -776,14 +776,18 @@ async fn an_unresolvable_resource_is_refused_with_the_modelled_error() {
             .await
             .refused(label, 400, "ResourceNotFoundException");
     }
-    // StartJobRun: a job template is resolved too, and none exists in this slice; and
-    // template parameters have no meaning without one.
+    // StartJobRun: a job template id is resolved out of state too, so one naming no
+    // stored template is not found; and template parameters have no meaning without one.
     emr.start_job(
         &cluster,
         json!({"clientToken": "job-template", "jobTemplateId": "tmpl123"}),
     )
     .await
-    .refused("a job template id", 400, "ResourceNotFoundException");
+    .refused(
+        "a job template id naming no stored template",
+        400,
+        "ResourceNotFoundException",
+    );
     emr.start_job(
         &cluster,
         json!({"clientToken": "job-template-params", "jobTemplateParameters": {"rows": "10"}}),
@@ -1299,17 +1303,15 @@ async fn operations_outside_this_slice_still_answer_501() {
     let cases = [
         ("ListVirtualClusters", "GET", "/virtualclusters".to_string(), None),
         (
-            "CreateJobTemplate",
+            "CreateManagedEndpoint",
             "POST",
-            "/jobtemplates".to_string(),
+            "/virtualclusters/doesnotexist1/endpoints".to_string(),
             Some(json!({
-                "name": "tmpl",
-                "clientToken": "tmpl-tok",
-                "jobTemplateData": {
-                    "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
-                    "releaseLabel": "emr-6.10.0-latest",
-                    "jobDriver": {"sparkSubmitJobDriver": {"entryPoint": "s3://b/j.py"}},
-                },
+                "name": "endpoint",
+                "clientToken": "endpoint-tok",
+                "type": "JUPYTER_ENTERPRISE_GATEWAY",
+                "releaseLabel": "emr-6.10.0-latest",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/EMRJobRole",
             })),
         ),
         (
