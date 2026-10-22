@@ -90,6 +90,31 @@ pub fn validation_exception(
     }
 }
 
+/// The modelled `ValidationException` for policy content the policy store's
+/// SCHEMA refused: ONE `fieldList` entry per reason the Cedar validator raised,
+/// every one of them naming `path` — the request member whose CONTENT was
+/// validated.
+///
+/// A schema-validation refusal is not a request-SHAPE refusal: the member the
+/// caller sent is well formed, and what failed is the policy it describes, which
+/// Cedar can reject for several independent reasons at once
+/// (`ValidationException`'s own documentation enumerates them —
+/// `UnrecognizedEntityType`, `UnrecognizedActionId`, `InvalidActionApplication`
+/// and the rest). A client iterates `fieldList` to surface every reason, so each
+/// one gets its own entry rather than being concatenated into a single message,
+/// and `path` stays at the validated member rather than descending to a deeper
+/// one that was not at fault.
+pub fn schema_validation_exception(
+    path: &str,
+    reasons: impl IntoIterator<Item = String>,
+) -> types::ValidationException {
+    validation_exception(
+        reasons
+            .into_iter()
+            .map(|reason| InvalidInput::new(path, reason)),
+    )
+}
+
 /// The JSON-pointer path of every request member this service's own input checks
 /// can refuse — ONE home for the paths rule (b) names, so a member is spelled the
 /// same way wherever it is refused from. Each is the member's location in the
@@ -97,6 +122,21 @@ pub fn validation_exception(
 pub mod paths {
     /// `CreatePolicy`/`UpdatePolicy`'s Cedar policy text.
     pub const STATIC_STATEMENT: &str = "/definition/static/statement";
+    /// `CreatePolicy`/`UpdatePolicy`'s policy definition as a whole — the member
+    /// whose CONTENT the store's schema validates, whichever arm of the union it
+    /// carries. A refusal by that schema names this member; a refusal of the
+    /// statement's own text or size names [`STATIC_STATEMENT`].
+    pub const DEFINITION: &str = "/definition";
+    /// `CreatePolicy`'s template-linked definition.
+    pub const TEMPLATE_LINKED_DEFINITION: &str = "/definition/templateLinked";
+    /// The entity a template-linked definition binds `?principal` to.
+    pub const TEMPLATE_LINKED_PRINCIPAL: &str = "/definition/templateLinked/principal";
+    /// The entity a template-linked definition binds `?resource` to.
+    pub const TEMPLATE_LINKED_RESOURCE: &str = "/definition/templateLinked/resource";
+    /// `CreatePolicyTemplate`/`UpdatePolicyTemplate`'s Cedar template text, which
+    /// those operations carry as a top-level member rather than inside a
+    /// definition.
+    pub const TEMPLATE_STATEMENT: &str = "/statement";
     /// `PutSchema`'s Cedar schema JSON.
     pub const SCHEMA_CEDAR_JSON: &str = "/definition/cedarJson";
     /// The `policyStoreId` every operation in this service takes.
