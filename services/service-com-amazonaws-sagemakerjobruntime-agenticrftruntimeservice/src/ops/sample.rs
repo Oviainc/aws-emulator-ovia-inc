@@ -162,6 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A rollout belongs to a job, so resolving the `JobArn` comes first: a call for
+        // a job this runtime does not hold is refused as that, whatever else the request
+        // carries. The modelled errors list both `ValidationException` (400) and
+        // `ResourceNotFoundException` (404); the recorded service answers the 400 for a
+        // well-formed ARN naming no job, so that is what this refuses with.
+        if !state.lock().knows_job(&input.job_arn) {
+            return Err(validation(crate::state::job_not_found_message(
+                &input.job_arn,
+            )));
+        }
+
         // `Body` is `@required` and `@httpPayload`, so a request without one is
         // already refused at the boundary; a request WITH an empty payload gets
         // this far and carries no inference request to capture.
@@ -207,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .map_err(|refusal| {
-                let message = refusal.message(&trajectory_id);
+                let message = refusal.message(&job_arn, &trajectory_id);
                 if refusal.is_quota() {
                     SampleErrorModeled::ServiceQuotaExceededException(
                         ServiceQuotaExceededException { message },
@@ -222,8 +233,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(SampleOutput {
-            content_type: turn.response_content_type.clone(),
-            body: turn.response_body,
+            content_type: Some(turn.content_type),
+            body: turn.body,
         })
     }
 }

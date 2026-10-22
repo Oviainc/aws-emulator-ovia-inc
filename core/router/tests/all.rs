@@ -63,3 +63,10 @@ mod shared_signing_name_routing;
 mod transcribe_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]
 mod transfer_user_with_iam_role;
+
+// Declared last, out of the sorted order above, on purpose: every new router suite adds
+// a line to this file, and a line inserted in the middle of the list conflicts with
+// every other suite landing in the same window. Appending keeps this change out of that
+// contended region. The suite itself is an ordinary `tests/all/<name>.rs` file.
+#[path = "all/sagemaker_signing_name_routing.rs"]
+mod sagemaker_signing_name_routing;
