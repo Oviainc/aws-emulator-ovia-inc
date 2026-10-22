@@ -1037,11 +1037,10 @@ async fn an_id_the_catalog_does_not_hold_is_not_found() {
 #[tokio::test]
 async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     let router = router();
-    // SearchFacets and GetOfferSet are out of scope for this slice and must answer 501
-    // rather than an empty 200. `ListFulfillmentOptions` is implemented — its own suite is
-    // `tests/all/fulfillment_options.rs`.
-    let cases: [(&str, Value); 2] = [
-        ("searchFacets", json!({})),
+    // GetOfferSet is out of scope for this slice and must answer 501 rather than an empty
+    // 200. `SearchFacets` and `ListFulfillmentOptions` are implemented — their own suites
+    // are `tests/all/search_facets.rs` and `tests/all/fulfillment_options.rs`.
+    let cases: [(&str, Value); 1] = [
         ("getOfferSet", json!({ "offerSetId": "os-0001-analytics" })),
     ];
     for (operation, input) in cases {

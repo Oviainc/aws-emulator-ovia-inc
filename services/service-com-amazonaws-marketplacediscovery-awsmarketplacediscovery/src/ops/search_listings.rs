@@ -162,30 +162,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let needle = search_text.to_lowercase();
         let filters = input.filters.clone().unwrap_or_default();
 
-        // Narrow first, so `totalResults` counts MATCHES rather than the page.
-        let mut matches: Vec<(f64, &crate::state::Listing)> = Vec::new();
-        for listing in state.listings.values() {
-            let content_locale = listing.text.content_locale(locale);
-            let text = listing.text.text(content_locale);
-            let haystack =
-                format!("{} {}", text.name, text.short_description).to_lowercase();
-            if !needle.is_empty() && !haystack.contains(&needle) {
-                continue;
-            }
-            if !matches_every_filter(&state, listing, &filters)
-                .map_err(SearchListingsError::validation)?
-            {
-                continue;
-            }
-            let score = match input.sort_by.as_str() {
-                "AVERAGE_CUSTOMER_RATING" => {
-                    crate::state::average_customer_rating(listing.review_summary.as_ref())
-                }
-                // RELEVANCE, the model's default.
-                _ => relevance(&text.name.to_lowercase(), &haystack, &needle),
-            };
-            matches.push((score, listing));
-        }
+        // Narrow first, so `totalResults` counts MATCHES rather than the page. The match set
+        // is the shared one `SearchFacets` also answers from.
+        let mut matches: Vec<(f64, &crate::state::Listing)> = state
+            .search_matches(locale, &search_text, &filters)
+            .map_err(SearchListingsError::validation)?
+            .into_iter()
+            .map(|listing| {
+                let score = match input.sort_by.as_str() {
+                    "AVERAGE_CUSTOMER_RATING" => {
+                        crate::state::average_customer_rating(listing.review_summary.as_ref())
+                    }
+                    // RELEVANCE, the model's default.
+                    _ => relevance(listing, locale, &needle),
+                };
+                (score, listing)
+            })
+            .collect();
 
         // Order by the requested key, then by listing id so a page boundary is stable and
         // `nextToken` neither repeats nor skips an entry.
@@ -233,10 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `sortBy=RELEVANCE` has no documented scoring function, so this is the emulator's own
 /// ordering; what the model pins is that RELEVANCE is an ordering over the matches, and
 /// that `sortOrder` reverses it.
-fn relevance(name: &str, haystack: &str, needle: &str) -> f64 {
+fn relevance(listing: &crate::state::Listing, locale: &'static str, needle: &str) -> f64 {
     if needle.is_empty() {
         return 0.0;
     }
+    let content_locale = listing.text.content_locale(locale);
+    let name = listing.text.text(content_locale).name.to_lowercase();
+    let haystack = crate::state::search_haystack(listing, locale);
     let mut score = 0.0;
     if name.contains(needle) {
         score += 2.0;
@@ -267,94 +263,3 @@ fn query_identity(
     )
 }
 
-/// Whether a listing satisfies every filter (AND across filters, OR within one).
-///
-/// `Err` is the refusal message for a filter value the model's `SearchFilterType` enum
-/// cannot reject on its own — a range filter with more than one value, or a rating outside
-/// the documented 0.0–5.0 range.
-fn matches_every_filter(
-    state: &crate::state::ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState,
-    listing: &crate::state::Listing,
-    filters: &[SearchFilter],
-) -> Result<bool, String> {
-    for filter in filters {
-        let values = &filter.filter_values;
-        let matched = match filter.filter_type.as_str() {
-            "CATEGORY" => listing
-                .categories
-                .iter()
-                .any(|category| values.contains(&category.category_id)),
-            "PUBLISHER" => values.contains(&listing.publisher.seller_profile_id),
-            "FULFILLMENT_OPTION_TYPE" => state
-                .listing_fulfillment_option_summaries(listing)
-                .iter()
-                .any(|option| values.contains(&option.fulfillment_option_type)),
-            "PRICING_MODEL" => listing
-                .pricing_models
-                .iter()
-                .any(|model| values.contains(&model.pricing_model_type)),
-            "PRICING_UNIT" => listing
-                .pricing_units
-                .iter()
-                .any(|unit| values.contains(&unit.pricing_unit_type)),
-            "DEPLOYED_ON_AWS" => listing.product_ids.iter().any(|product_id| {
-                state
-                    .products
-                    .get(product_id)
-                    .is_some_and(|product| values.contains(&product.deployed_on_aws))
-            }),
-            "NUMBER_OF_PRODUCTS" => {
-                let products = listing.product_ids.len();
-                let mut matched = false;
-                for value in values {
-                    let count: usize = value.parse().map_err(|_| {
-                        format!(
-                            "filters: NUMBER_OF_PRODUCTS expects a non-negative integer, got '{value}'"
-                        )
-                    })?;
-                    matched |= count == products;
-                }
-                matched
-            }
-            // Range filters: "accept a single value between 0.0 and 5.0"
-            // (SearchFilter$filterValues documentation).
-            "MIN_AVERAGE_CUSTOMER_RATING" => {
-                let bound = rating_bound(&filter.filter_type, values)?;
-                crate::state::average_customer_rating(listing.review_summary.as_ref()) >= bound
-            }
-            "MAX_AVERAGE_CUSTOMER_RATING" => {
-                let bound = rating_bound(&filter.filter_type, values)?;
-                crate::state::average_customer_rating(listing.review_summary.as_ref()) <= bound
-            }
-            other => {
-                return Err(format!("filters: '{other}' is not a supported filterType"));
-            }
-        };
-        if !matched {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// The single rating a range filter carries, refusing a value list or a rating outside the
-/// documented 0.0–5.0 range.
-///
-/// Both refusals are built from the request and follow AWS's recorded template for a range
-/// filter: they name the offending `filterType`, and the out-of-range one also carries the
-/// offending value bare after `"got: "`. A value that is not a number at all is not a
-/// rating between 0.0 and 5.0 either, so it is refused by the same message.
-fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
-    let [value] = values else {
-        return Err(format!(
-            "Range filter {filter_type} requires exactly one value"
-        ));
-    };
-    let rating: f64 = value.parse().unwrap_or(f64::NAN);
-    if !(0.0..=5.0).contains(&rating) {
-        return Err(format!(
-            "Range filter {filter_type} value must be between 0.0 and 5.0, got: {value}"
-        ));
-    }
-    Ok(rating)
-}
