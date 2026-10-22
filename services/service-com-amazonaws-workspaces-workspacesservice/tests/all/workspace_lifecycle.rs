@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// case that needs a pre-populated store can reach the same state the handlers see.
 ///
 /// `pub(crate)` because `tests/all.rs` compiles every suite into ONE test crate, so the
-/// bundle suite beside this one shares this harness rather than copying it.
+/// suites beside this one share this harness rather than copying it.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();

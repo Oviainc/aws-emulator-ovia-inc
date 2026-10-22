@@ -8,6 +8,11 @@
 //! transitions live here rather than in one of the operation files because all
 //! four batch operations apply the same rules to the same records.
 //!
+//! It also owns the account-wide Bring Your Own License (BYOL) configuration
+//! ([`AccountByolConfig`]) that `ModifyAccount` changes and `DescribeAccount`
+//! reports: account-scoped rather than per-WorkSpace, so it is one value on the
+//! state struct rather than a map.
+//!
 //! It also owns the WorkSpace BUNDLE store `DescribeWorkspaceBundles` reports:
 //! the Amazon-provided catalog every account can create WorkSpaces from, which
 //! exists before any caller arrives and so is seeded when the store is built,
@@ -77,6 +82,76 @@ pub const MAX_STORED_WORKSPACES: usize = 2_000;
 /// Also the (code, message) pair the bundle store reports a refusal with, so a
 /// handler can lift it into the modelled error that code names.
 pub type ItemFailure = (&'static str, String);
+
+/// The `ENABLED` value of the model's `DedicatedTenancySupportResultEnum`
+/// (`ENABLED | DISABLED`), which also spells the SINGLE value of the input enum
+/// `DedicatedTenancySupportEnum` that `ModifyAccount` accepts.
+pub const BYOL_SUPPORT_ENABLED: &str = "ENABLED";
+
+/// The `DISABLED` value of `DedicatedTenancySupportResultEnum`.
+pub const BYOL_SUPPORT_DISABLED: &str = "DISABLED";
+
+/// The account-wide Bring Your Own License (BYOL) configuration.
+///
+/// `ModifyAccount` ("Modifies the configuration of Bring Your Own License (BYOL)
+/// for the specified account") is the only writer, and `DescribeAccount`
+/// ("Retrieves a list that describes the configuration of Bring Your Own License
+/// (BYOL) for the specified account") the reader. The fields are private so the
+/// only way to change them is [`ComAmazonawsWorkspacesWorkspacesserviceState::modify_byol`],
+/// which is where the rules about which combinations may be stored live.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AccountByolConfig {
+    /// Whether BYOL is turned on for this account.
+    enabled: bool,
+    /// The management network CIDR block, once one has been configured.
+    management_cidr_range: Option<String>,
+}
+
+impl AccountByolConfig {
+    /// The `DedicatedTenancySupportResultEnum` value this configuration reports.
+    ///
+    /// An account nobody has modified has BYOL off, so it reports `DISABLED`
+    /// rather than reporting nothing.
+    pub fn dedicated_tenancy_support(&self) -> &'static str {
+        if self.enabled {
+            BYOL_SUPPORT_ENABLED
+        } else {
+            BYOL_SUPPORT_DISABLED
+        }
+    }
+
+    /// The configured management network CIDR block, or `None` while no
+    /// `ModifyAccount` call has set one.
+    pub fn management_cidr_range(&self) -> Option<&str> {
+        self.management_cidr_range.as_deref()
+    }
+
+    /// Whether BYOL is turned on.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// A description of the BYOL status, for the `Message` member both
+    /// `DescribeAccount` ("The text message to describe the status of BYOL") and
+    /// `ModifyAccount` ("The text message to describe the status of BYOL
+    /// modification") carry.
+    ///
+    /// Computed from the stored configuration. AWS documents no wording for
+    /// either member, so this TEXT is this emulator's own; what is load-bearing
+    /// is that it describes the configuration this store holds.
+    pub fn status_message(&self) -> String {
+        match (self.enabled, self.management_cidr_range.as_deref()) {
+            (true, Some(range)) => format!(
+                "BYOL is enabled for this account; the management network interface uses the CIDR range {range}."
+            ),
+            (true, None) => "BYOL is enabled for this account.".to_string(),
+            (false, Some(range)) => format!(
+                "BYOL is not enabled for this account; the management network CIDR range {range} is reserved for it."
+            ),
+            (false, None) => "BYOL is not enabled for this account.".to_string(),
+        }
+    }
+}
 
 /// The `Owner` a bundle Amazon Web Services provides carries.
 ///
@@ -385,6 +460,10 @@ pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Monotonic counter behind both the minted `WorkspaceId` and the creation
     /// order [`Self::ordered_workspaces`] reports.
     pub next_workspace_seq: u64,
+    /// The account-wide BYOL configuration. Account-scoped, so one value rather
+    /// than a map: `ModifyAccount` writes it through [`Self::modify_byol`] and
+    /// `DescribeAccount` reads it through [`Self::byol`].
+    byol: AccountByolConfig,
     /// Every stored bundle by sequence number: the stable order
     /// [`Self::ordered_bundles`] reports and `DescribeWorkspaceBundles`
     /// paginates over. Never larger than [`MAX_STORED_BUNDLES`].
@@ -406,12 +485,15 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
     /// are AWS's own and are describable in a brand-new account, so reporting
     /// them must not be a write. Its `CreationTime` is the instant the store was
     /// built, which is stable for the life of the emulator.
+    ///
+    /// BYOL starts off, which is what an account nobody has modified reports.
     fn default() -> Self {
         let mut state = Self {
             workspaces: HashMap::new(),
             occupancy: HashMap::new(),
             order: BTreeMap::new(),
             next_workspace_seq: 0,
+            byol: AccountByolConfig::default(),
             bundles: BTreeMap::new(),
             bundle_ids: HashMap::new(),
             next_bundle_seq: 0,
@@ -466,6 +548,36 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     /// The stored WorkSpace `workspace_id` names, if any.
     pub fn workspace(&self, workspace_id: &str) -> Option<&WorkspaceRecord> {
         self.workspaces.get(workspace_id)
+    }
+
+    /// The account-wide BYOL configuration `DescribeAccount` reports.
+    pub fn byol(&self) -> &AccountByolConfig {
+        &self.byol
+    }
+
+    /// Apply a `ModifyAccount` change to the BYOL configuration and report what
+    /// is now stored.
+    ///
+    /// Every member the request omits LEAVES THE STORED VALUE ALONE — a
+    /// `ModifyAccount` request carries only the parts of the configuration it
+    /// changes. So `turn_on_byol` is "the request asked for BYOL to be ENABLED",
+    /// not "the request's support value": `false` means the request named no
+    /// support value and the stored flag is untouched, never that BYOL is turned
+    /// off. Nothing here can turn BYOL off, which matches the model's input enum
+    /// `DedicatedTenancySupportEnum` having the single value `ENABLED`. Which
+    /// combinations may be stored at all is decided before this is called.
+    pub fn modify_byol(
+        &mut self,
+        turn_on_byol: bool,
+        management_cidr_range: Option<&str>,
+    ) -> AccountByolConfig {
+        if turn_on_byol {
+            self.byol.enabled = true;
+        }
+        if let Some(range) = management_cidr_range {
+            self.byol.management_cidr_range = Some(range.to_string());
+        }
+        self.byol.clone()
     }
 
     /// Store `record` and point both indexes at it.
