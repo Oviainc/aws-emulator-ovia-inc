@@ -11,7 +11,8 @@
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetSandboxes`, `BatchGetReportGroups`, `ListProjects`,
-//! `ListBuildsForProject`, `ListSourceCredentials`) only read them.
+//! `ListBuildsForProject`, `ListSandboxes`, `ListSourceCredentials`) only read
+//! them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -288,6 +289,14 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     /// `ListSandboxesForProject` reports them in, so a list operation pages over
     /// this without re-reading every sandbox.
     pub sandboxes_by_project: BTreeMap<String, Vec<String>>,
+    /// Every sandbox id of the account, in request order (oldest first).
+    ///
+    /// `sandboxes` is keyed by id, and an id carries the project name and a
+    /// derived uuid, so key order is not request order. `ListSandboxes` reports
+    /// the account's sandboxes in request order, which only an explicit sequence
+    /// records: two sandboxes requested in the same millisecond are still
+    /// ordered, and the order survives an eviction round.
+    pub sandbox_order: Vec<String>,
     /// The next per-project sandbox sequence number to hand out. It is not a
     /// modelled member: it is what makes a sandbox's derived id unique when two
     /// sandboxes of one project are requested in the same millisecond.
@@ -673,6 +682,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 .or_default()
                 .push(id.clone());
         }
+        self.sandbox_order.push(id.clone());
         self.sandboxes.insert(id, stored);
         self.enforce_sandbox_ceiling();
     }
@@ -704,6 +714,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 .sandboxes
                 .remove(&id)
                 .and_then(|stored| stored.sandbox.project_name);
+            self.sandbox_order.retain(|held| held != &id);
             if let Some(project_name) = project_name {
                 if let Some(ids) = self.sandboxes_by_project.get_mut(&project_name) {
                     ids.retain(|held| held != &id);
@@ -1408,11 +1419,30 @@ pub fn merge_environment_variables(
 /// `None` means the token names nothing in the list, which is a refusable
 /// request rather than an empty page.
 pub fn page(items: &[String], next_token: Option<&str>) -> Option<(Vec<String>, Option<String>)> {
+    page_limited(items, next_token, None)
+}
+
+/// One page of `items` of at most `max_results` entries, resuming after the entry
+/// `next_token` names.
+///
+/// [`page`] with the page size a caller may ask for, for the list operations whose
+/// input models a `maxResults`. `None` leaves the page at this emulator's
+/// [`MAX_PAGE_SIZE`], which is also the ceiling a requested size is held to — the
+/// model's `PageSize` is `@range(min: 1, max: 100)`, so the boundary walk has
+/// already refused anything outside it and the clamp is only belt and braces.
+pub fn page_limited(
+    items: &[String],
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Option<(Vec<String>, Option<String>)> {
     let start = match next_token {
         None => 0,
         Some(token) => items.iter().position(|item| item == token)?,
     };
-    let end = (start + MAX_PAGE_SIZE).min(items.len());
+    let size = max_results.map_or(MAX_PAGE_SIZE, |requested| {
+        (requested.max(0) as usize).clamp(1, MAX_PAGE_SIZE)
+    });
+    let end = (start + size).min(items.len());
     let next = items.get(end).cloned();
     Some((items[start..end].to_vec(), next))
 }
