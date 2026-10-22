@@ -26,17 +26,21 @@ use smithy_server_runtime::MultiServiceRouter;
 const SETTLE: Duration = Duration::from_millis(900);
 
 /// One emulator: a router carrying only this service, over one shared engine.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite in this same test target (`tests/all/*.rs`)
+/// drives the service through the SAME wire path rather than building a second
+/// harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-east-1")
     }
 
-    fn in_region(region: &str) -> Self {
+    pub(crate) fn in_region(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -51,7 +55,7 @@ impl Emulator {
 
     /// `POST /` with the operation's `X-Amz-Target`, returning the status and the
     /// decoded JSON body.
-    async fn call(&self, target: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, target: &str, body: Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20260101/{}/directconnect/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0000",
@@ -111,7 +115,7 @@ fn is_minted_id(prefix: &str, id: &Value) -> bool {
 }
 
 /// The error code an awsJson1_1 error body carries in `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 

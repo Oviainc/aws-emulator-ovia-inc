@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDirectConnectGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDirectConnectGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDirectConnectGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDirectConnectGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDirectConnectGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDirectConnectGateway"))
+        // A Direct Connect gateway "is global and visible in any Amazon Web
+        // Services Region after it is created", so nothing about it comes from
+        // the request's endpoint.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateDirectConnectGatewayErrorModeled::DirectConnectServerException(
+                    DirectConnectServerException {
+                        message: Some(
+                            "the Direct Connect store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let client_error = |message: String| -> CreateDirectConnectGatewayError {
+            CreateDirectConnectGatewayErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // `directConnectGatewayName` is required, so a name made only of
+        // whitespace names nothing: refuse it rather than store an unnameable
+        // gateway.
+        let name = input.direct_connect_gateway_name;
+        if name.trim().is_empty() {
+            return Err(client_error(
+                "directConnectGatewayName must not be empty".to_string(),
+            ));
+        }
+
+        // "The ASN must be in the private range of 64,512 to 65,534 or
+        // 4,200,000,000 to 4,294,967,294. The default is 64512."
+        let amazon_side_asn = input
+            .amazon_side_asn
+            .unwrap_or(crate::state::DEFAULT_AMAZON_SIDE_ASN);
+        if !crate::state::amazon_side_asn_is_private(amazon_side_asn) {
+            return Err(client_error(format!(
+                "amazonSideAsn {amazon_side_asn} is not valid; the ASN must be in the private \
+                 range of 64,512 to 65,534 or 4,200,000,000 to 4,294,967,294"
+            )));
+        }
+
+        let tags = input.tags.unwrap_or_default();
+        // The tag-count ceiling is checked FIRST, so it bounds the per-tag work
+        // every later check does on a caller-chosen list length.
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(client_error(format!(
+                "{} tags were supplied; a Direct Connect resource accepts at most {}",
+                tags.len(),
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(client_error(format!(
+                "Tag key {duplicate} was specified more than once"
+            )));
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // The emulator's own memory ceiling for this store (not an AWS quota):
+        // reclaim what the clock has already torn down, and refuse rather than
+        // grow past the ceiling.
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.gateways.len(),
+        ) {
+            store.reclaim_deleted();
+        }
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.gateways.len(),
+        ) {
+            return Err(client_error(format!(
+                "this emulator holds at most {} Direct Connect gateways; delete one before \
+                 creating another",
+                crate::state::MAX_RECORDS_PER_STORE
+            )));
+        }
+
+        let gateway_id = store.next_gateway_id();
+        let gateway = crate::state::DirectConnectGateway {
+            direct_connect_gateway_id: gateway_id.clone(),
+            direct_connect_gateway_name: name,
+            amazon_side_asn,
+            owner_account: ::engine::emulator_account_id().to_string(),
+            // "pending: The initial state after calling
+            // CreateDirectConnectGateway"; "available: The Direct Connect gateway
+            // is ready for use" is what the clock owes from here.
+            direct_connect_gateway_state: "pending".to_string(),
+            state_change_error: None,
+            tags,
+            due: Some(crate::state::DueTransition {
+                at: std::time::Instant::now() + crate::state::TRANSITION_DELAY,
+                to: "available".to_string(),
+            }),
+        };
+
+        let output = store.gateway_output(&gateway);
+        store.gateways.insert(gateway_id.clone(), gateway);
+        store.gateway_order.push(gateway_id);
+        Ok(CreateDirectConnectGatewayOutput {
+            direct_connect_gateway: Some(output),
+        })
     }
 }

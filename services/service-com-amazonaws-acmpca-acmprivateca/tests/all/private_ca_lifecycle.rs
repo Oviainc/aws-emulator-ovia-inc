@@ -1069,6 +1069,7 @@ async fn ca_arns_are_refused_by_form_and_then_by_existence() {
         ("DescribeCertificateAuthority", json!({})),
         ("GetCertificateAuthorityCsr", json!({})),
         ("GetCertificateAuthorityCertificate", json!({})),
+        ("ListTags", json!({})),
         (
             "ImportCertificateAuthorityCertificate",
             json!({"Certificate": certificate}),

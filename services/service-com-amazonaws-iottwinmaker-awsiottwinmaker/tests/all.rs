@@ -17,6 +17,9 @@ mod harness;
 #[path = "all/reported_members.rs"]
 mod reported_members;
 
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

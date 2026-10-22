@@ -98,6 +98,16 @@ pub const FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED: &str =
 /// the store (see [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
 pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after the domain-validation email was last sent ACM will send it again.
+///
+/// A DOCUMENTED span, not a chosen one: "you can request that the mail be resent
+/// within 72 hours of requesting the ACM certificate. If more than 72 hours have
+/// elapsed since your original request or since your last attempt to resend
+/// validation mail, you must request a new certificate" (`ResendValidationEmail`
+/// doc). Past it there is no mail left to resend, which is the invalid state
+/// `ResendValidationEmail` reports.
+pub const RESEND_VALIDATION_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
+
 /// How long a certificate this emulator issues is valid for: ACM certificates are
 /// valid for 13 months (395 days) (ACM user guide, "Managed certificate renewal"),
 /// which is the span between the `NotBefore` and `NotAfter` of an issued record.
@@ -362,6 +372,12 @@ pub struct Certificate {
     /// may be revoked (`RevokeCertificate` doc: "You can only revoke certificates
     /// that have been previously exported").
     pub exported: bool,
+    /// When ACM last sent this certificate's domain-validation email: the instant the
+    /// certificate was requested for a request that asked for email validation, moved
+    /// forward by each `ResendValidationEmail`. `None` for a certificate ACM sends no
+    /// validation mail for at all. It is what the documented
+    /// [`RESEND_VALIDATION_WINDOW`] is measured from.
+    pub validation_email_sent_at: Option<SystemTime>,
     /// When the certificate was revoked, which "exists only when the certificate
     /// status is REVOKED" (`CertificateDetail$RevokedAt` doc).
     pub revoked_at: Option<SystemTime>,
@@ -660,6 +676,21 @@ pub fn validation_label(certificate_id: &str, domain_name: &str, purpose: &str) 
 /// `*.example.com` by proving control of `example.com`.
 pub fn validation_target(domain_name: &str) -> &str {
     domain_name.strip_prefix("*.").unwrap_or(domain_name)
+}
+
+/// The mailboxes ACM sends a domain's validation email to, at `mail_suffix`.
+///
+/// "ACM sends email to the the following five addresses:
+/// admin@<suffix> administrator@<suffix> hostmaster@<suffix> postmaster@<suffix>
+/// webmaster@<suffix>" (`ResendValidationEmailRequest$ValidationDomain` doc), i.e.
+/// [`VALIDATION_EMAIL_LOCAL_PARTS`] at the validation domain. Rendered here so the
+/// address set a `RequestCertificate` records and the one a `ResendValidationEmail`
+/// records cannot drift apart.
+pub fn validation_mailboxes(mail_suffix: &str) -> Vec<String> {
+    VALIDATION_EMAIL_LOCAL_PARTS
+        .iter()
+        .map(|local_part| format!("{local_part}@{mail_suffix}"))
+        .collect()
 }
 
 /// Whether two domain names name the same domain. DNS labels are case-insensitive,

@@ -34,7 +34,7 @@ use crate::certificate_lifecycle::{call, describe, request_certificate, router_w
 
 /// A private certificate authority ARN of the form `CertificateAuthorityArn`'s
 /// pattern requires (`^arn:[\w+=/,.@-]+:acm-pca:[\w+=/,.@-]*:[0-9]+:[\w+=,.@-]+(/[\w+=,.@-]+)*$`).
-const PRIVATE_CA_ARN: &str =
+pub(crate) const PRIVATE_CA_ARN: &str =
     "arn:aws:acm-pca:us-west-2:000000000000:certificate-authority/12345678-1234-1234-1234-123456789012";
 
 /// How long a certificate this emulator issues is valid: ACM certificates are valid
@@ -78,7 +78,7 @@ fn pending_due_in(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<Dur
 ///
 /// This writes only the due instant the emulator itself stores; the transition is
 /// still applied by `materialize_due` on the next call, exactly as in production.
-fn make_validation_due_now(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn make_validation_due_now(engine: &Arc<engine::InMemoryEngine>) {
     let store = engine.state::<ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     let past = SystemTime::now() - Duration::from_millis(1);

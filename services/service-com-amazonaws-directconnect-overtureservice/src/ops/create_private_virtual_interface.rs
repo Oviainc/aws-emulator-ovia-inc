@@ -348,18 +348,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "specify either virtualGatewayId or directConnectGatewayId".to_string(),
                 ))
             }
-            // A Direct Connect gateway is this service's own resource, so an id
-            // naming none in this store names nothing at all
-            // (`CreateDirectConnectGateway` is still scaffolded). A virtual
-            // private gateway belongs to Amazon EC2, so its id is carried as the
-            // caller supplied it.
-            (None, Some(gateway_id)) => {
-                return Err(client_error(format!(
-                    "Direct Connect gateway ID {gateway_id} does not exist"
-                )))
-            }
-            (Some(_), None) => {}
+            _ => {}
         }
+        let requested_gateway_id = requested.direct_connect_gateway_id.clone();
 
         let mut store = state.lock();
         store.settle_due_transitions();
@@ -387,6 +378,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        // A Direct Connect gateway is this service's own resource, so an id
+        // naming none in this store names nothing at all. A virtual private
+        // gateway belongs to Amazon EC2, so its id is carried as the caller
+        // supplied it.
+        //
+        // `amazonSideAsn` is the ASN of the Amazon side of the peering, which for
+        // an interface terminating on a Direct Connect gateway is that gateway's;
+        // for a virtual private gateway it belongs to that EC2 resource and is not
+        // this service's to report.
+        let amazon_side_asn = match &requested_gateway_id {
+            Some(gateway_id) => {
+                let Some(gateway) = store.gateways.get(gateway_id) else {
+                    return Err(client_error(format!(
+                        "Direct Connect gateway ID {gateway_id} does not exist"
+                    )));
+                };
+                if gateway.direct_connect_gateway_state == "deleting"
+                    || gateway.direct_connect_gateway_state == "deleted"
+                {
+                    return Err(client_error(format!(
+                        "Direct Connect gateway ID {gateway_id} is {} and cannot terminate a \
+                         virtual interface",
+                        gateway.direct_connect_gateway_state
+                    )));
+                }
+                Some(gateway.amazon_side_asn)
+            }
+            None => None,
+        };
 
         let Some(connection) = store.connections.get(&input.connection_id) else {
             return Err(client_error(format!(
@@ -465,7 +486,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vlan: requested.vlan,
             asn,
             asn_long,
-            amazon_side_asn: None,
+            amazon_side_asn,
             auth_key: requested.auth_key,
             amazon_address,
             customer_address,
@@ -473,7 +494,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             mtu,
             jumbo_frame_capable: jumbo,
             virtual_gateway_id: requested.virtual_gateway_id,
-            direct_connect_gateway_id: None,
+            direct_connect_gateway_id: requested_gateway_id,
             // Route filter prefixes are advertised on a PUBLIC virtual interface;
             // a private one carries none. BGP peers are minted by `CreateBgpPeer`,
             // which is still scaffolded, so none exists yet.

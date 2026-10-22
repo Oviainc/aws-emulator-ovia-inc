@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/connection_and_virtual_interface_lifecycle.rs"]
 mod connection_and_virtual_interface_lifecycle;
+#[path = "all/direct_connect_gateway_lifecycle.rs"]
+mod direct_connect_gateway_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

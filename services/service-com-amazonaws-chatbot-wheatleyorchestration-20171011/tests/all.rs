@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_preferences.rs"]
 mod account_preferences;
+#[path = "all/chime_webhook_configuration.rs"]
+mod chime_webhook_configuration;
 #[path = "all/microsoft_teams_configured_teams.rs"]
 mod microsoft_teams_configured_teams;
 #[path = "all/slack_channel_configuration.rs"]

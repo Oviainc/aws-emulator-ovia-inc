@@ -23,6 +23,9 @@ mod event_bridge_rule_template_groups;
 #[path = "all/event_bridge_rule_templates.rs"]
 mod event_bridge_rule_templates;
 
+#[path = "all/input_deletion.rs"]
+mod input_deletion;
+
 #[path = "all/input_lifecycle.rs"]
 mod input_lifecycle;
 

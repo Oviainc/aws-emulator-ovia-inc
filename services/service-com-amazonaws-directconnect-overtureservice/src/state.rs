@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-directconnect-overtureservice service.
 //!
-//! The connection + private virtual interface slice of Direct Connect lives here: a
+//! The connection + private virtual interface + Direct Connect gateway slice of
+//! Direct Connect lives here: a
 //! handler mints a record, stores it, and every later response is rendered FROM the
 //! stored record (see the [`connection_output!`] / [`virtual_interface_output!`]
 //! macros), so a create followed by a describe answers the same bytes.
@@ -47,6 +48,29 @@ pub const MAX_ASN_LONG: i64 = 4_294_967_294;
 /// reported back as `0` in `asn` "since 4-byte ASN values exceed the maximum
 /// supported value of 2,147,483,647".
 pub const MAX_LEGACY_ASN: i64 = 2_147_483_647;
+
+/// The `amazonSideAsn` a `CreateDirectConnectGateway` request that names none
+/// gets: `CreateDirectConnectGatewayRequest$amazonSideAsn` documents "The default
+/// is 64512."
+pub const DEFAULT_AMAZON_SIDE_ASN: i64 = 64_512;
+
+/// The ASN ranges `CreateDirectConnectGatewayRequest$amazonSideAsn` documents:
+/// "The ASN must be in the private range of 64,512 to 65,534 or 4,200,000,000 to
+/// 4,294,967,294." Each entry is an inclusive `(low, high)` pair.
+pub const PRIVATE_AMAZON_SIDE_ASN_RANGES: [(i64, i64); 2] =
+    [(64_512, 65_534), (4_200_000_000, 4_294_967_294)];
+
+/// Whether `asn` lies in one of the private ranges
+/// [`PRIVATE_AMAZON_SIDE_ASN_RANGES`] holds.
+pub fn amazon_side_asn_is_private(asn: i64) -> bool {
+    PRIVATE_AMAZON_SIDE_ASN_RANGES
+        .iter()
+        .any(|(low, high)| (*low..=*high).contains(&asn))
+}
+
+/// The largest page a `maxResults` of `MaxResultSetSize` can ask for: "If
+/// MaxResults is given a value larger than 100, only 100 results are returned."
+pub const MAX_RESULT_SET_SIZE: i32 = 100;
 
 /// The longest `virtualInterfaceName`
 /// `NewPrivateVirtualInterface$virtualInterfaceName` documents: "The name has a
@@ -141,6 +165,25 @@ pub struct Connection {
     pub due: Option<DueTransition>,
 }
 
+/// A stored Direct Connect gateway - the `DirectConnectGateway` shape's data.
+///
+/// A Direct Connect gateway "is global and visible in any Amazon Web Services
+/// Region after it is created", so unlike a [`Connection`] it holds no Region of
+/// its own.
+#[derive(Debug, Clone)]
+pub struct DirectConnectGateway {
+    pub direct_connect_gateway_id: String,
+    pub direct_connect_gateway_name: String,
+    pub amazon_side_asn: i64,
+    pub owner_account: String,
+    pub direct_connect_gateway_state: String,
+    /// `DirectConnectGateway$stateChangeError`: "the error message if the state
+    /// of an object failed to advance". `None` while no advance has failed.
+    pub state_change_error: Option<String>,
+    pub tags: Vec<Tag>,
+    pub due: Option<DueTransition>,
+}
+
 /// A stored private virtual interface — the `VirtualInterface` shape's data.
 ///
 /// Membership of a connection is held ONCE, here, as [`Self::connection_id`]:
@@ -189,6 +232,14 @@ pub struct ComAmazonawsDirectconnectOvertureserviceState {
     /// Stored virtual interfaces, keyed by `virtualInterfaceId`. Ordered for the
     /// same reason as [`Self::connections`].
     pub virtual_interfaces: BTreeMap<String, VirtualInterface>,
+    /// Stored Direct Connect gateways, keyed by `directConnectGatewayId`.
+    ///
+    /// A gateway id is a UUID rather than a monotonic suffix, so key order is NOT
+    /// creation order here: [`Self::gateway_order`] carries that, and
+    /// `DescribeDirectConnectGateways` answers through it.
+    pub gateways: BTreeMap<String, DirectConnectGateway>,
+    /// The keys of [`Self::gateways`] in creation order.
+    pub gateway_order: Vec<String>,
     /// Monotonic source of the `dxcon-`/`dxvif-` suffixes, so every minted id is
     /// unique and reproducible within a run.
     pub id_counter: u64,
@@ -200,6 +251,76 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
     pub fn next_id(&mut self, prefix: &str) -> String {
         self.id_counter += 1;
         format!("{prefix}-{:08x}", self.id_counter)
+    }
+
+    /// Mint the next `directConnectGatewayId`.
+    ///
+    /// A Direct Connect gateway id is not one of the `dxcon-`/`dxvif-` prefixed
+    /// ids: AWS hands out a version-4 UUID (`DirectConnectGatewayId` is an opaque
+    /// string), so the minted id has that shape. The low 12 hex digits ARE the
+    /// monotonic counter, so every minted id is unique within a run, and the rest
+    /// is derived from it, so it is reproducible.
+    pub fn next_gateway_id(&mut self) -> String {
+        self.id_counter += 1;
+        let seed = fnv1a64(&self.id_counter.to_be_bytes());
+        format!(
+            "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+            u32::try_from(seed >> 32).unwrap_or(0),
+            (seed >> 16) & 0xffff,
+            seed & 0x0fff,
+            0x8000 | ((seed >> 4) & 0x3fff),
+            self.id_counter & 0xffff_ffff_ffff,
+        )
+    }
+
+    /// Render a stored [`DirectConnectGateway`] into the generated
+    /// `DirectConnectGateway` output shape: the ONE rendering of a stored
+    /// gateway, so every operation answers the same field set.
+    ///
+    /// A method rather than a free function because
+    /// `DirectConnectGateway$totalPrefixPoolAllocations` ("the total number of
+    /// inbound route prefixes allocated to the attachments on the Direct Connect
+    /// gateway") is a property of the attachments, so it is counted from the
+    /// stored virtual interfaces rather than kept as a second copy on the gateway.
+    pub fn gateway_output(
+        &self,
+        gateway: &DirectConnectGateway,
+    ) -> crate::ops::types::DirectConnectGateway {
+        crate::ops::types::DirectConnectGateway {
+            direct_connect_gateway_id: Some(gateway.direct_connect_gateway_id.clone()),
+            direct_connect_gateway_name: Some(gateway.direct_connect_gateway_name.clone()),
+            amazon_side_asn: Some(gateway.amazon_side_asn),
+            owner_account: Some(gateway.owner_account.clone()),
+            direct_connect_gateway_state: Some(gateway.direct_connect_gateway_state.clone()),
+            state_change_error: gateway.state_change_error.clone(),
+            total_prefix_pool_allocations: Some(
+                self.gateway_prefix_allocations(&gateway.direct_connect_gateway_id),
+            ),
+            tags: (!gateway.tags.is_empty()).then(|| gateway.tags.clone()),
+        }
+    }
+
+    /// The inbound route prefixes allocated to the attachments on `gateway_id`,
+    /// combining both address families.
+    fn gateway_prefix_allocations(&self, gateway_id: &str) -> i32 {
+        let allocated: usize = self
+            .virtual_interfaces
+            .values()
+            .filter(|interface| {
+                interface.direct_connect_gateway_id.as_deref() == Some(gateway_id)
+                    && interface.virtual_interface_state != "deleted"
+            })
+            .map(|interface| interface.route_filter_prefixes.len())
+            .sum();
+        i32::try_from(allocated).unwrap_or(i32::MAX)
+    }
+
+    /// The stored gateways in creation order, newest last.
+    pub fn gateways_in_order(&self) -> Vec<&DirectConnectGateway> {
+        self.gateway_order
+            .iter()
+            .filter_map(|id| self.gateways.get(id))
+            .collect()
     }
 
     /// Apply every state change the clock has already made due.
@@ -225,6 +346,14 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
                 }
             }
         }
+        for gateway in self.gateways.values_mut() {
+            if let Some(due) = &gateway.due {
+                if now >= due.at {
+                    gateway.direct_connect_gateway_state = due.to.clone();
+                    gateway.due = None;
+                }
+            }
+        }
     }
 
     /// Reclaim the records the clock has already torn down.
@@ -239,6 +368,10 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
             .retain(|_, connection| connection.connection_state != "deleted");
         self.virtual_interfaces
             .retain(|_, interface| interface.virtual_interface_state != "deleted");
+        self.gateways
+            .retain(|_, gateway| gateway.direct_connect_gateway_state != "deleted");
+        self.gateway_order
+            .retain(|id| self.gateways.contains_key(id));
     }
 
     /// Whether `len` leaves room for one more record under
@@ -348,7 +481,11 @@ pub fn paginate<T>(
         items.drain(..=position);
     }
     let limit = match max_results {
-        Some(max) if max > 0 => usize::try_from(max).unwrap_or(usize::MAX),
+        // "If MaxResults is given a value larger than 100, only 100 results are
+        // returned."
+        Some(max) if max > 0 => {
+            usize::try_from(max.min(MAX_RESULT_SET_SIZE)).unwrap_or(usize::MAX)
+        }
         // `maxResults` absent, zero or negative asks for no window at all.
         _ => items.len(),
     };

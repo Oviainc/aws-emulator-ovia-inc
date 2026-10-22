@@ -12,7 +12,8 @@
 //! The tests assert RULES over a TABLE of inputs rather than one recorded call: the ARN
 //! form for every name shape and region, the create/describe round trip for every
 //! combination of `GitConfig`'s optional members, the refusal of a name already in use,
-//! the refusal of a name nothing created, and the modelled constraints on each bound.
+//! the refusal of a name nothing created — and the message that refusal carries, which
+//! the service builds from the request — and the modelled constraints on each bound.
 
 use serde_json::{json, Value};
 
@@ -375,6 +376,98 @@ async fn describing_a_repository_nothing_created_is_refused() {
              got {parsed:?}"
         );
     }
+}
+
+/// RULE: the refusal for a name no repository holds carries the message SageMaker builds
+/// from the request — `Cannot find CodeRepository: <arn>`, the ARN naming the requested
+/// name and the region the caller signed for (the emulator default when the request
+/// carries no usable credential scope).
+#[tokio::test]
+async fn the_refusal_names_the_repository_arn_the_request_asked_for() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateCodeRepository",
+            &json!({ "CodeRepositoryName": "present", "GitConfig": default_git_config() }),
+        )
+        .await;
+
+    // Rows differ along the signed region (including the 9-character lower bound of
+    // `CodeRepositoryArn`'s [a-z0-9\-]{9,16} region component) and the requested name's
+    // shape, so the message has to be built from the request rather than memorised.
+    let absent_names = [
+        "absent",
+        "present1",
+        "Present",
+        "p",
+        "9",
+        "a-name-with-hyphens",
+    ];
+    for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+        for name in absent_names {
+            let case = format!("region={region} name={name}");
+            let (status, parsed) = emulator
+                .call_in(
+                    region,
+                    "DescribeCodeRepository",
+                    &json!({ "CodeRepositoryName": name }),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected HTTP 400, got {status} {parsed}"
+            );
+            assert_eq!(
+                error_code(&parsed),
+                "ValidationException",
+                "case {case}: error code, got {parsed:?}"
+            );
+            assert_eq!(
+                message(&parsed),
+                format!(
+                    "Cannot find CodeRepository: \
+                     arn:aws:sagemaker:{region}:{ACCOUNT}:code-repository/{name}"
+                ),
+                "case {case}: refusal message, got {:?}",
+                message(&parsed)
+            );
+        }
+    }
+
+    // An unsigned request names no region, so the ARN in the message carries the
+    // emulator's default.
+    let (status, parsed) = emulator
+        .call_unsigned(
+            "DescribeCodeRepository",
+            &json!({ "CodeRepositoryName": "absent" }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case unsigned: expected HTTP 400, got {status} {parsed}"
+    );
+    assert_eq!(
+        message(&parsed),
+        format!(
+            "Cannot find CodeRepository: \
+             arn:aws:sagemaker:us-east-1:{ACCOUNT}:code-repository/absent"
+        ),
+        "case unsigned: refusal message, got {:?}",
+        message(&parsed)
+    );
+
+    // The stored repository is untouched by the refusals.
+    let described = emulator
+        .ok(
+            "DescribeCodeRepository",
+            &json!({ "CodeRepositoryName": "present" }),
+        )
+        .await;
+    assert_eq!(
+        str_field(&described, "CodeRepositoryName"),
+        "present",
+        "the stored repository must survive a refused read, got {described:?}"
+    );
 }
 
 /// RULE: a request outside a member's modelled constraint is refused with HTTP 400

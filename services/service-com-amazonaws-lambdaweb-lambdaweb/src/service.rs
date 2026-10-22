@@ -74,13 +74,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `lambda` — a signing name it SHARES with the Lambda
+        // control plane, Lambda Core and Lambda MicroVMs (`smithy_query(
+        // query="service_info")` gives all four `sigv4Name: lambda`). The router
+        // resolves a request's routing key from the SigV4 credential scope first, so all
+        // four see the key `lambda`: claiming on the signing name alone makes each one
+        // claim the others' traffic, which the router answers `500 AmbiguousService`
+        // instead of serving any of them.
+        //
+        // So the claim is narrowed to this service's own request space, by the one rule
+        // `service-common` states for a shared signing name: this model is `restJson1`
+        // (a REST protocol, so the `rpc_service_shape_id` argument is `None`), and a
+        // REST service's own surface is the modelled URI path space its generated
+        // `ROUTE_PATH_SEGMENTS` publishes — here the single API-date segment
+        // `2025-03-07` every web-function operation binds (its own tagging operations
+        // included), which no peer model binds.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            None,
+        )
     }
 
     fn override_operation(

@@ -8,14 +8,19 @@
 //! record below is the one copy of a component every one of those handlers
 //! reads and writes, plus the two projections the model asks for (`Component`
 //! and `ComponentSummary`).
+//!
+//! The form is the control plane's other app-environment resource, held the same
+//! way: `CreateForm` mints one and `GetForm` reports it from the single
+//! [`StoredForm`] record, keyed by the same (appId, environmentName) a component
+//! is keyed by.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
     Component, ComponentBindingPropertiesValue, ComponentChild, ComponentDataConfiguration,
-    ComponentEvent, ComponentProperty, ComponentSummary, ComponentVariant,
-    ResourceNotFoundException,
+    ComponentEvent, ComponentProperty, ComponentSummary, ComponentVariant, FieldConfig, Form,
+    FormCTA, FormDataTypeConfig, FormStyle, ResourceNotFoundException, SectionalElement,
 };
 
 /// The largest page `ListComponents` serves, and the page size it uses when the
@@ -42,6 +47,15 @@ pub const EXPORT_PAGE_LIMIT: usize = COMPONENT_PAGE_LIMIT as usize;
 /// released by `DeleteComponent`, which also forgets that component's client
 /// tokens, so the token map can never outgrow this bound either.
 pub const COMPONENT_QUOTA: usize = 1_000;
+
+/// How many forms the store holds before `CreateForm` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// Amplify UI Builder publishes no form quota this emulator can quote, so — like
+/// [`COMPONENT_QUOTA`] — this is the emulator's OWN bound on the store rather
+/// than a claim about any account's limit, set far above any workflow an
+/// emulator serves.
+pub const FORM_QUOTA: usize = 1_000;
 
 /// The map key a component's property maps may not carry.
 ///
@@ -137,6 +151,55 @@ impl StoredComponent {
     }
 }
 
+/// One Amplify UI Builder form, as this emulator persists it.
+///
+/// `Form` models no timestamps (`smithy_query(query="shape", shape="Form")`
+/// lists appId, environmentName, id, name, formActionType, style, dataType,
+/// fields, sectionalElements, schemaVersion, tags, cta and labelDecorator), so
+/// none is held: every field below is one the model reports.
+#[derive(Debug, Clone)]
+pub struct StoredForm {
+    pub app_id: String,
+    pub environment_name: String,
+    /// `Form$id` targets `Uuid`; minted by
+    /// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::mint_form_id`].
+    pub id: String,
+    pub name: String,
+    pub form_action_type: String,
+    pub style: FormStyle,
+    pub data_type: FormDataTypeConfig,
+    pub fields: HashMap<String, FieldConfig>,
+    pub sectional_elements: HashMap<String, SectionalElement>,
+    pub schema_version: String,
+    /// `Form$tags` is optional on both `CreateFormData` and `Form`, so the
+    /// absence of tags is held as an absence rather than as an empty map: a form
+    /// created without them reports no `tags` member at all.
+    pub tags: Option<HashMap<String, String>>,
+    pub cta: Option<FormCTA>,
+    pub label_decorator: Option<String>,
+}
+
+impl StoredForm {
+    /// The `Form` the create and get operations return.
+    pub fn to_form(&self) -> Form {
+        Form {
+            app_id: self.app_id.clone(),
+            environment_name: self.environment_name.clone(),
+            id: self.id.clone(),
+            name: self.name.clone(),
+            form_action_type: self.form_action_type.clone(),
+            style: self.style.clone(),
+            data_type: self.data_type.clone(),
+            fields: self.fields.clone(),
+            sectional_elements: self.sectional_elements.clone(),
+            schema_version: self.schema_version.clone(),
+            tags: self.tags.clone(),
+            cta: self.cta.clone(),
+            label_decorator: self.label_decorator.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-amplifyuibuilder-amplifyuibuilder. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
@@ -152,6 +215,14 @@ pub struct ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// own component rather than reporting a component the request does not
     /// address.
     pub component_tokens: HashMap<(EnvironmentKey, String), String>,
+    /// Every form, keyed by the (appId, environmentName) it belongs to and held
+    /// in creation order within that environment.
+    pub forms: HashMap<EnvironmentKey, Vec<StoredForm>>,
+    /// A `CreateForm` `clientToken` to the form that token created, so a retried
+    /// create reports the first form instead of minting a second. As for a
+    /// component, the key carries the (appId, environmentName) the create
+    /// addressed: a token is scoped to the environment it was used in.
+    pub form_tokens: HashMap<(EnvironmentKey, String), String>,
     /// The counter [`StoredComponent::cursor`] values are drawn from.
     pub cursor_seq: u64,
     /// The seed this store's component ids are minted from, drawn from the
@@ -258,16 +329,71 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         self.cursor_seq
     }
 
+    /// The forms stored for one app environment, in creation order.
+    pub fn forms_in(&self, app_id: &str, environment_name: &str) -> &[StoredForm] {
+        self.forms
+            .get(&(app_id.to_string(), environment_name.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The form `id` names in one app environment.
+    pub fn form(&self, app_id: &str, environment_name: &str, id: &str) -> Option<&StoredForm> {
+        self.forms_in(app_id, environment_name)
+            .iter()
+            .find(|form| form.id == id)
+    }
+
+    /// Store a form at the end of its environment's creation order.
+    pub fn insert_form(&mut self, form: StoredForm) {
+        self.forms
+            .entry((form.app_id.clone(), form.environment_name.clone()))
+            .or_default()
+            .push(form);
+    }
+
+    /// The form one `clientToken` already created in the app environment the
+    /// create addressed, if that token has been seen there.
+    pub fn replayed_form(&self, key: &EnvironmentKey, token: &str) -> Option<&StoredForm> {
+        let id = self.form_tokens.get(&(key.clone(), token.to_string()))?;
+        self.form(&key.0, &key.1, id)
+    }
+
+    /// Remember that `token` created the form `id` in that app environment.
+    pub fn remember_form_token(&mut self, key: EnvironmentKey, token: String, id: String) {
+        self.form_tokens.insert((key, token), id);
+    }
+
+    /// How many forms the whole store holds — what [`FORM_QUOTA`] bounds.
+    pub fn total_forms(&self) -> usize {
+        self.forms.values().map(Vec::len).sum()
+    }
+
     /// Mint an unused component id. `Component$id` targets `Uuid`, so the id is
     /// laid out as a version 4 UUID; the loop skips an id already taken in that
     /// environment.
     pub fn mint_component_id(&mut self, key: &EnvironmentKey) -> String {
         loop {
-            let id = self.next_component_id();
+            let id = self.next_uuid();
             if self
                 .components
                 .get(key)
                 .is_none_or(|components| components.iter().all(|c| c.id != id))
+            {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an unused form id. `Form$id` targets `Uuid`, so the id is laid out
+    /// as a version 4 UUID; the loop skips an id already taken in that
+    /// environment.
+    pub fn mint_form_id(&mut self, key: &EnvironmentKey) -> String {
+        loop {
+            let id = self.next_uuid();
+            if self
+                .forms
+                .get(key)
+                .is_none_or(|forms| forms.iter().all(|form| form.id != id))
             {
                 return id;
             }
@@ -282,7 +408,7 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// two ids of one run differ even on a seed collision. `sha2` does the
     /// hashing and `hex` the rendering — this only composes the input and sets
     /// the two nibbles RFC 4122 reserves.
-    fn next_component_id(&mut self) -> String {
+    fn next_uuid(&mut self) -> String {
         use sha2::{Digest, Sha256};
 
         let seed = *self.id_seed.get_or_insert_with(os_seed);
@@ -400,6 +526,16 @@ pub fn component_not_found(app_id: &str, environment_name: &str, id: &str) -> Re
     ResourceNotFoundException {
         message: Some(format!(
             "no component {id} in app {app_id} environment {environment_name}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an id that names no form in the
+/// app environment the request addressed.
+pub fn form_not_found(app_id: &str, environment_name: &str, id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "no form {id} in app {app_id} environment {environment_name}"
         )),
     }
 }

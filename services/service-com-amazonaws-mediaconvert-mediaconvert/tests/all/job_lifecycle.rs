@@ -630,33 +630,46 @@ async fn create_queue_persists_its_input_and_get_queue_reads_it_back() {
     );
 }
 
-/// A second `CreateQueue` for a name already in the store conflicts, and an unknown name
-/// is not found — for any name, not just the one the issue cited.
+/// A second `CreateQueue` for a name already in the store is IDEMPOTENT — the same 201
+/// with the queue that is already there, unchanged — while the name of the BUILT-IN queue
+/// is a conflict (no `CreateQueue` ever minted it), and an unknown name is not found.
 #[tokio::test]
-async fn queue_names_are_unique_and_unknown_queues_are_not_found() {
+async fn re_creating_a_queue_is_idempotent_and_unknown_queues_are_not_found() {
     let emulator = Emulator::new();
-    for name in ["alpha", "a-queue-with-a-much-longer-name", "Default"] {
-        if name != "Default" {
-            let first = emulator.create_queue(json!({ "name": name })).await;
-            assert_eq!(
-                first.status, 201,
-                "case {name:?}: expected the first CreateQueue to succeed, got {} with body {}",
-                first.status, first.body
-            );
-        }
+    for name in ["alpha", "a-queue-with-a-much-longer-name"] {
+        let first = emulator.create_queue(json!({ "name": name })).await;
+        assert_eq!(
+            first.status, 201,
+            "case {name:?}: expected the first CreateQueue to succeed, got {} with body {}",
+            first.status, first.body
+        );
         let again = emulator.create_queue(json!({ "name": name })).await;
         assert_eq!(
-            again.status, 409,
-            "case {name:?}: re-creating an existing queue must conflict, got {} with body {}",
+            again.status, 201,
+            "case {name:?}: re-creating an existing queue must succeed, got {} with body {}",
             again.status, again.body
         );
         assert_eq!(
-            again.error_type.as_deref(),
-            Some("ConflictException"),
-            "case {name:?}: expected ConflictException, got {:?}",
-            again.error_type
+            again.at("/queue"),
+            first.at("/queue"),
+            "case {name:?}: the repeat must return the stored queue unchanged, got {}",
+            again.body
         );
     }
+
+    // The built-in queue is not a resource any create produced, so its name conflicts.
+    let system = emulator.create_queue(json!({ "name": "Default" })).await;
+    assert_eq!(
+        system.status, 409,
+        "case \"Default\": re-creating the built-in queue must conflict, got {} with body {}",
+        system.status, system.body
+    );
+    assert_eq!(
+        system.error_type.as_deref(),
+        Some("ConflictException"),
+        "case \"Default\": expected ConflictException, got {:?}",
+        system.error_type
+    );
 
     for missing in ["nope", "also-missing"] {
         let reply = emulator.get_queue(missing).await;
@@ -1248,7 +1261,7 @@ async fn a_next_token_survives_the_anchor_job_leaving_the_result_set() {
 }
 
 /// `CancelJob` moves the stored job to `CANCELED`, which every later read observes, and
-/// a job that is no longer `SUBMITTED` cannot be cancelled again.
+/// cancelling an already-`CANCELED` job again succeeds and changes nothing.
 #[tokio::test]
 async fn cancel_job_moves_the_stored_job_to_canceled() {
     let emulator = Emulator::new();
@@ -1316,15 +1329,23 @@ async fn cancel_job_moves_the_stored_job_to_canceled() {
 
         let again = emulator.cancel_job(&id).await;
         assert_eq!(
-            again.status, 409,
-            "case {label:?}: cancelling a CANCELED job must conflict, got {} with body {}",
+            again.status, 202,
+            "case {label:?}: cancelling a CANCELED job again must succeed, got {} with body {}",
             again.status, again.body
         );
         assert_eq!(
-            again.error_type.as_deref(),
-            Some("ConflictException"),
-            "case {label:?}: expected ConflictException, got {:?}",
-            again.error_type
+            again.body,
+            json!({}),
+            "case {label:?}: the repeat cancel has no output members, got {}",
+            again.body
+        );
+        let after = emulator.get_job(&id).await;
+        assert_eq!(
+            after.at("/job"),
+            fetched.at("/job"),
+            "case {label:?}: the repeat cancel must change nothing, got {} after {}",
+            after.body,
+            fetched.body
         );
     }
 

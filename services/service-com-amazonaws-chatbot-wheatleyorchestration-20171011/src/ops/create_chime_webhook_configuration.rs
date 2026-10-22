@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChimeWebhookConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChimeWebhookConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: mints a `ChatConfigurationArn` for `ConfigurationName`, persists the
+//! whole webhook configuration in [`crate::state`], and answers with the stored record
+//! projected through [`crate::state::ChimeWebhookConfigRecord::view`]. A second create
+//! for a `ConfigurationName` that already exists in the request's region is a 409
+//! `ConflictException`, so a create never silently replaces a configuration.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChimeWebhookConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A create past [`crate::state::MAX_CHIME_WEBHOOK_CONFIGURATIONS`] is refused with
+//! `LimitExceededException`, so repeated creates cannot grow the store without bound.
+//!
+//! A created configuration is `ENABLED` ([`crate::state::STATE_ENABLED`]): AWS Chatbot
+//! reports no transient status for a chat configuration, so there is no later
+//! transition to make due.
+//!
+//! It returns the created configuration read back out of the store, so a later
+//! `DescribeChimeWebhookConfigurations` answers the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +171,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChimeWebhookConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChimeWebhookConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChimeWebhookConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChimeWebhookConfigurationErrorModeled::CreateChimeWebhookConfigurationException(
+                CreateChimeWebhookConfigurationException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Resources are regional, so a configuration name is unique per region and the
+        // minted ARN, which carries the region, is the store's key.
+        let region = crate::state::request_region(ctx.parts());
+        let chat_configuration_arn =
+            crate::state::chime_webhook_configuration_arn(&region, &input.configuration_name);
+
+        let mut store = state.lock();
+
+        if store
+            .chime_webhook_configurations
+            .contains_key(&chat_configuration_arn)
+        {
+            return Err(
+                CreateChimeWebhookConfigurationErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "a chat configuration named {} already exists",
+                        input.configuration_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The store is bounded: past the cap a create is refused rather than grown. The
+        // count is the WHOLE store's, not the region's, so signing for another region
+        // does not hand the caller a fresh budget.
+        if store.chime_webhook_configurations.len() >= crate::state::MAX_CHIME_WEBHOOK_CONFIGURATIONS
+        {
+            return Err(
+                CreateChimeWebhookConfigurationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} Amazon Chime webhook \
+                             configurations",
+                            crate::state::MAX_CHIME_WEBHOOK_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::ChimeWebhookConfigRecord {
+            chat_configuration_arn: chat_configuration_arn.clone(),
+            configuration_name: input.configuration_name,
+            region,
+            webhook_description: input.webhook_description,
+            webhook_url: input.webhook_url,
+            iam_role_arn: input.iam_role_arn,
+            sns_topic_arns: input.sns_topic_arns,
+            logging_level: input.logging_level,
+            state: crate::state::STATE_ENABLED.to_string(),
+            state_reason: None,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.tag_key, tag.tag_value))
+                .collect(),
+        };
+
+        let webhook_configuration = record.view();
+        store
+            .chime_webhook_configurations
+            .insert(chat_configuration_arn, record);
+
+        Ok(CreateChimeWebhookConfigurationOutput {
+            webhook_configuration: Some(webhook_configuration),
+        })
     }
 }

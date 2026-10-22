@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDirectConnectGateways
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDirectConnectGateways`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDirectConnectGateways::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +135,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDirectConnectGateways` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDirectConnectGatewaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDirectConnectGateways"))
+        // A Direct Connect gateway "is global and visible in any Amazon Web
+        // Services Region after it is created", so this listing is not windowed
+        // by the request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeDirectConnectGatewaysErrorModeled::DirectConnectServerException(
+                    DirectConnectServerException {
+                        message: Some(
+                            "the Direct Connect store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let client_error = |message: String| -> DescribeDirectConnectGatewaysError {
+            DescribeDirectConnectGatewaysErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let mut store = state.lock();
+        // Materialise only what the clock already made due: a gateway whose
+        // `pending` span has elapsed is `available` whether or not anybody asked.
+        store.settle_due_transitions();
+
+        // "Lists all your Direct Connect gateways or only the specified Direct
+        // Connect gateway. Deleted Direct Connect gateways are not returned."
+        let selected: Vec<&crate::state::DirectConnectGateway> = match &input
+            .direct_connect_gateway_id
+        {
+            Some(gateway_id) => match store
+                .gateways
+                .get(gateway_id)
+                .filter(|gateway| gateway.direct_connect_gateway_state != "deleted")
+            {
+                Some(gateway) => vec![gateway],
+                // An id that names nothing is a bad parameter, not an empty page.
+                None => {
+                    return Err(client_error(format!(
+                        "Direct Connect gateway ID {gateway_id} does not exist"
+                    )))
+                }
+            },
+            None => store
+                .gateways_in_order()
+                .into_iter()
+                .filter(|gateway| gateway.direct_connect_gateway_state != "deleted")
+                .collect(),
+        };
+
+        let Some(page) = crate::state::paginate(
+            selected,
+            input.max_results,
+            input.next_token.as_deref(),
+            |gateway| gateway.direct_connect_gateway_id.clone(),
+        ) else {
+            let token = input.next_token.unwrap_or_default();
+            return Err(client_error(format!(
+                "Pagination token {token} is not valid"
+            )));
+        };
+
+        Ok(DescribeDirectConnectGatewaysOutput {
+            direct_connect_gateways: Some(
+                page.items
+                    .into_iter()
+                    .map(|gateway| store.gateway_output(gateway))
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }

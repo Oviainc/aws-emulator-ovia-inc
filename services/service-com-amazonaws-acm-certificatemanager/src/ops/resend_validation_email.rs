@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResendValidationEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResendValidationEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: re-sends one domain's validation mail for the stored certificate named
+//! by `CertificateArn`, which means recording the mailboxes ACM wrote to at
+//! `ValidationDomain` on that domain's validation record — so `DescribeCertificate`
+//! reports the new `ValidationDomain` and `ValidationEmails` — and restarting the
+//! documented 72-hour resend window.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResendValidationEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The request's own values are checked first (`ValidationDomain` must be `Domain` or a
+//! superdomain of it, `Domain` must be a name the certificate covers): either is
+//! `InvalidDomainValidationOptionsException`, whatever state the certificate is in.
+//! Only then does the certificate's state decide: there is mail to resend only while
+//! the certificate is still `PENDING_VALIDATION`, that domain is still awaiting proof
+//! by EMAIL, and the 72-hour window has not elapsed — otherwise
+//! `InvalidStateException`.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +193,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResendValidationEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResendValidationEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResendValidationEmail"))
+        let _ = ctx;
+        // Unreachable in the assembled emulator (the engine is the shared store), and
+        // this operation models no server fault, so the modelled input error is the
+        // one honest answer left.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResendValidationEmailErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The model's `@pattern` already refused anything that is not an `acm` ARN;
+        // what is left is that the resource it names is a certificate.
+        if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
+            return Err(ResendValidationEmailErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
+                },
+            )
+            .into());
+        }
+
+        // "This must be the same as the Domain value or a superdomain of the Domain
+        // value" (`ResendValidationEmailRequest$ValidationDomain` doc): the validation
+        // domain is the suffix of the mailboxes ACM writes to, so a domain outside the
+        // named domain's own chain proves nothing about it. A check on the request's
+        // own two values, so it needs no certificate.
+        if !crate::state::is_validation_domain_for(&input.validation_domain, &input.domain) {
+            return Err(invalid_domain_validation_options(format!(
+                "The validation domain, {}, must be a superdomain of the requested domain, {}.",
+                input.validation_domain, input.domain
+            )));
+        }
+
+        // ONE instant answers the whole request: it materialises the validation
+        // outcomes the clock already owes and dates the mail this call sends.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // Every handler materialises what the clock already owes first, so a resend
+        // cannot hold back a validation outcome that was already due.
+        store.materialize_due(now);
+        let Some(certificate) = store.certificates.get_mut(&input.certificate_arn) else {
+            return Err(
+                ResendValidationEmailErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::certificate_not_found_message(
+                            &input.certificate_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Domain` is "the fully qualified domain name (FQDN) of the certificate that
+        // needs to be validated" (`ResendValidationEmailRequest$Domain` doc), so it
+        // must be a name this certificate covers: a name it does not cover has no
+        // validation to re-send, whatever the certificate's status.
+        let Some(index) = certificate
+            .domain_validations
+            .iter()
+            .position(|validation| crate::state::same_domain(&validation.domain_name, &input.domain))
+        else {
+            return Err(invalid_domain_validation_options(format!(
+                "The domain {} is not a domain name in the certificate {}.",
+                input.domain, input.certificate_arn
+            )));
+        };
+
+        // Beyond here the request is well formed and the only question is whether this
+        // certificate still has validation mail to send.
+        if certificate.status != crate::state::STATUS_PENDING_VALIDATION {
+            let status = certificate.status.clone();
+            return Err(invalid_state(format!(
+                "The certificate {} has status {status}, so it is no longer awaiting domain validation.",
+                input.certificate_arn
+            )));
+        }
+
+        let validation = &certificate.domain_validations[index];
+        if validation.validation_method != crate::state::VALIDATION_METHOD_EMAIL {
+            let method = validation.validation_method.clone();
+            return Err(invalid_state(format!(
+                "The domain {} of certificate {} is validated by {method}, not by email.",
+                input.domain, input.certificate_arn
+            )));
+        }
+        if validation.validation_status != crate::state::DOMAIN_STATUS_PENDING_VALIDATION {
+            let status = validation.validation_status.clone();
+            return Err(invalid_state(format!(
+                "The domain {} of certificate {} has validation status {status}, so it is not awaiting an approval mail.",
+                input.domain, input.certificate_arn
+            )));
+        }
+
+        // "If more than 72 hours have elapsed since your original request or since
+        // your last attempt to resend validation mail, you must request a new
+        // certificate" (`ResendValidationEmail` doc): past the window there is nothing
+        // left to resend.
+        let within_window = certificate
+            .validation_email_sent_at
+            .is_some_and(|sent_at| now <= sent_at + crate::state::RESEND_VALIDATION_WINDOW);
+        if !within_window {
+            return Err(invalid_state(format!(
+                "More than 72 hours have elapsed since the validation mail for certificate {} was last sent, so a new certificate must be requested.",
+                input.certificate_arn
+            )));
+        }
+
+        // The mail goes out: the validation domain the caller asked for becomes the
+        // suffix of the addresses ACM used, which is what `DescribeCertificate`
+        // reports for this domain from here on. A mail suffix carries no wildcard
+        // label — `*.example.com` is mailed at `example.com`, the domain ACM proves
+        // control of.
+        let mail_suffix = crate::state::validation_target(&input.validation_domain).to_string();
+        let validation = &mut certificate.domain_validations[index];
+        validation.validation_domain = Some(mail_suffix.clone());
+        validation.validation_emails = crate::state::validation_mailboxes(&mail_suffix);
+        // The resend window restarts from this attempt.
+        certificate.validation_email_sent_at = Some(now);
+
+        Ok(ResendValidationEmailOutput)
     }
+}
+
+/// `InvalidDomainValidationOptionsException` — "one or more values in the
+/// DomainValidationOption structure is incorrect", which is what a `Domain` /
+/// `ValidationDomain` pair this certificate cannot be validated through is.
+fn invalid_domain_validation_options(message: String) -> ResendValidationEmailError {
+    ResendValidationEmailErrorModeled::InvalidDomainValidationOptionsException(
+        InvalidDomainValidationOptionsException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// `InvalidStateException` — "processing has reached an invalid state": the request is
+/// well formed, but this certificate has no validation mail left to send.
+fn invalid_state(message: String) -> ResendValidationEmailError {
+    ResendValidationEmailErrorModeled::InvalidStateException(InvalidStateException {
+        message: Some(message),
+    })
+    .into()
 }
