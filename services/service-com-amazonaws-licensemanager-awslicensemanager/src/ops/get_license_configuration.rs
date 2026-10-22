@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLicenseConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLicenseConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLicenseConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one license configuration [`crate::state`] holds under the requested
+//! ARN, with the tags stored against that ARN. A pure read: it writes nothing, and
+//! an ARN the store does not hold is a modelled 400.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLicenseConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLicenseConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLicenseConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLicenseConfigurationErrorModeled::ServerInternalException(ServerInternalException {
+                message: Some("the license configuration store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        let configuration = store
+            .configuration(&input.license_configuration_arn)
+            .ok_or_else(|| {
+                GetLicenseConfigurationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "no license configuration exists with the ARN '{}'",
+                            input.license_configuration_arn
+                        )),
+                    },
+                )
+            })?;
+
+        // Every member is read off the stored record; `Tags` comes from the same
+        // ARN-keyed map the tagging operations write, so a create-time tag and a
+        // later `TagResource` are both reported here.
+        Ok(GetLicenseConfigurationOutput {
+            license_configuration_id: Some(configuration.id.clone()),
+            license_configuration_arn: Some(configuration.arn.clone()),
+            name: Some(configuration.name.clone()),
+            description: configuration.description.clone(),
+            license_counting_type: Some(configuration.license_counting_type.clone()),
+            license_rules: Some(configuration.license_rules.clone()),
+            license_count: configuration.license_count,
+            license_count_hard_limit: configuration.license_count_hard_limit,
+            consumed_licenses: Some(configuration.consumed_licenses),
+            status: Some(configuration.status.clone()),
+            owner_account_id: Some(configuration.owner_account_id.clone()),
+            consumed_license_summary_list: Some(
+                configuration.consumed_license_summary_list.clone(),
+            ),
+            managed_resource_summary_list: Some(
+                configuration.managed_resource_summary_list.clone(),
+            ),
+            tags: Some(store.tags_of(&input.license_configuration_arn)),
+            product_information_list: Some(configuration.product_information_list.clone()),
+            // Automated discovery is a service setting nothing in this slice turns
+            // on, so there is no last-run time to report.
+            automated_discovery_information: None,
+            disassociate_when_not_found: configuration.disassociate_when_not_found,
+            license_expiry: configuration.license_expiry,
+        })
     }
 }

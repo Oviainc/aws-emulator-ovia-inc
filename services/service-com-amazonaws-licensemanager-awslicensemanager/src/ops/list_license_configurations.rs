@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLicenseConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLicenseConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLicenseConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the license configurations [`crate::state`] holds, one page at a time,
+//! scoped by the requested ARNs and by the documented filters. A pure read: it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +80,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeSet;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -124,6 +119,236 @@ impl From<ListLicenseConfigurationsErrorModeled> for ListLicenseConfigurationsEr
     }
 }
 
+/// The names `Filters` accepts, and what each one scopes on.
+///
+/// The catalog comes from the `Filters` member's own documentation
+/// (`smithy_query(query="doc",shape="ListLicenseConfigurationsRequest",member="Filters")`),
+/// which lists exactly `licenseCountingType`, `enforceLicenseCount` and
+/// `usagelimitExceeded`, and states that filter names are case-sensitive and that
+/// one value may be given per filter.
+const FILTER_LICENSE_COUNTING_TYPE: &str = "licenseCountingType";
+const FILTER_ENFORCE_LICENSE_COUNT: &str = "enforceLicenseCount";
+const FILTER_USAGE_LIMIT_EXCEEDED: &str = "usagelimitExceeded";
+
+/// Every filter name this operation accepts, in the order the documentation lists
+/// them.
+const FILTER_NAMES: &[&str] = &[
+    FILTER_LICENSE_COUNTING_TYPE,
+    FILTER_ENFORCE_LICENSE_COUNT,
+    FILTER_USAGE_LIMIT_EXCEEDED,
+];
+
+/// The most filters one request may carry. Emulator resource guard: the model
+/// publishes no length for `Filters`, and there are only [`FILTER_NAMES`] names to
+/// scope on, so a request carrying more than one of each is refused with the
+/// modelled `FilterLimitExceededException` rather than walked.
+const MAX_FILTERS: usize = 8;
+
+/// The largest page this operation will build, and the page size applied when the
+/// request omits `MaxResults`.
+///
+/// `MaxResults` carries no modelled range, so the accepted range lives here: a
+/// request asking for a page outside `1..=MAX_PAGE_SIZE` is refused rather than
+/// quietly served a different size, and the page this handler allocates is therefore
+/// always one the server decided.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The page size the request asked for, refused when it is outside
+/// `1..=MAX_PAGE_SIZE`.
+fn page_size(max_results: Option<i32>) -> Result<usize, ListLicenseConfigurationsError> {
+    let Some(requested) = max_results else {
+        return Ok(MAX_PAGE_SIZE);
+    };
+    if requested < 1 || requested as usize > MAX_PAGE_SIZE {
+        return Err(invalid_parameter(format!(
+            "MaxResults must be between 1 and {MAX_PAGE_SIZE}, got {requested}"
+        )));
+    }
+    Ok(requested as usize)
+}
+
+/// A page token naming the ARN the NEXT page starts at, bound to the scope the page
+/// was issued under.
+///
+/// `NextToken` is modelled opaque, so the token is hex-encoded rather than handed
+/// back in the clear. That makes it opaque to a caller, not secret: hex is trivially
+/// reversible and the token carries nothing beyond a fingerprint of the request's
+/// own scope and an ARN the caller just saw. The fingerprint is what makes a page a
+/// continuation of THIS query: presenting the token with other `Filters` or
+/// `LicenseConfigurationArns` is refused rather than silently resuming a different
+/// walk at this ARN.
+fn encode_page_token(fingerprint: u64, arn: &str) -> String {
+    hex::encode(format!("{fingerprint:016x}:{arn}"))
+}
+
+/// The ARN a page token names, or a modelled 400 when the token is not one this
+/// operation issued for this scope.
+fn decode_page_token(
+    token: &str,
+    fingerprint: u64,
+) -> Result<String, ListLicenseConfigurationsError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            let (issued_for, arn) = decoded.split_once(':')?;
+            (issued_for == format!("{fingerprint:016x}") && arn.starts_with("arn:"))
+                .then(|| arn.to_string())
+        })
+        .ok_or_else(|| {
+            invalid_parameter(
+                "NextToken is not a pagination token ListLicenseConfigurations issued for this \
+                 combination of LicenseConfigurationArns and Filters",
+            )
+        })
+}
+
+/// A fingerprint of everything that scopes a walk, so a page token can be bound to
+/// the query it was issued for.
+///
+/// Only an equality check is ever made against it, and it travels inside a token the
+/// caller already holds the inputs of, so a non-cryptographic hash is what this
+/// needs; `DefaultHasher` is seeded identically on every call, so the same scope
+/// always fingerprints the same way within one emulator.
+fn scope_fingerprint(requested_arns: Option<&BTreeSet<String>>, filters: &[ScopedFilter]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    match requested_arns {
+        None => 0u8.hash(&mut hasher),
+        Some(arns) => {
+            1u8.hash(&mut hasher);
+            for arn in arns {
+                arn.hash(&mut hasher);
+            }
+        }
+    }
+    for filter in filters {
+        match filter {
+            ScopedFilter::LicenseCountingType(dimension) => (2u8, dimension).hash(&mut hasher),
+            ScopedFilter::EnforceLicenseCount(enforced) => (3u8, enforced).hash(&mut hasher),
+            ScopedFilter::UsageLimitExceeded(exceeded) => (4u8, exceeded).hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
+/// One filter, reduced to what it scopes on. A boolean filter is resolved to a
+/// `bool` here, so a value that spells no boolean cannot reach the walk.
+enum ScopedFilter {
+    /// `licenseCountingType`: the dimension licenses are counted for.
+    LicenseCountingType(String),
+    /// `enforceLicenseCount`: whether hard license enforcement is used.
+    EnforceLicenseCount(bool),
+    /// `usagelimitExceeded`: whether the available licenses have been exceeded.
+    UsageLimitExceeded(bool),
+}
+
+/// The requested filters, refused when a name is not in [`FILTER_NAMES`], when a
+/// filter does not carry exactly one value, or when a boolean filter's value spells
+/// no boolean.
+fn scoped_filters(
+    filters: Option<Vec<Filter>>,
+) -> Result<Vec<ScopedFilter>, ListLicenseConfigurationsError> {
+    let filters = filters.unwrap_or_default();
+    if filters.len() > MAX_FILTERS {
+        return Err(
+            ListLicenseConfigurationsErrorModeled::FilterLimitExceededException(
+                FilterLimitExceededException {
+                    message: Some(format!(
+                        "the request carries {} filters, more than the {MAX_FILTERS} this service accepts",
+                        filters.len()
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+
+    filters
+        .into_iter()
+        .map(|filter| {
+            let name = filter.name.unwrap_or_default();
+            if !FILTER_NAMES.contains(&name.as_str()) {
+                return Err(invalid_parameter(format!(
+                    "Filters Name must be one of [{}], got '{name}'",
+                    FILTER_NAMES.join(", ")
+                )));
+            }
+            // "You can only specify one value for the filter" — the `Values`
+            // member's own documentation.
+            let mut values = filter.values.unwrap_or_default();
+            if values.len() != 1 {
+                return Err(invalid_parameter(format!(
+                    "filter '{name}' must carry exactly one value, got {}",
+                    values.len()
+                )));
+            }
+            let value = values.remove(0);
+            // `enforceLicenseCount` and `usagelimitExceeded` are documented as
+            // Boolean values, so a value that is neither `true` nor `false` is a
+            // value the filter cannot be applied with — refused rather than read as
+            // one of the two, which would answer a plausible-looking wrong result
+            // with a 200.
+            let boolean = || {
+                match value.as_str() {
+                    "true" => Ok(true),
+                    "false" => Ok(false),
+                    other => Err(invalid_parameter(format!(
+                        "filter '{name}' takes a Boolean value, one of [true, false], got '{other}'"
+                    ))),
+                }
+            };
+            match name.as_str() {
+                FILTER_ENFORCE_LICENSE_COUNT => Ok(ScopedFilter::EnforceLicenseCount(boolean()?)),
+                FILTER_USAGE_LIMIT_EXCEEDED => Ok(ScopedFilter::UsageLimitExceeded(boolean()?)),
+                // `licenseCountingType` scopes on a dimension, and the member's own
+                // documentation publishes the dimensions it can name ("Possible
+                // values are vCPU | Instance | Core | Socket"), which is also the
+                // modelled `LicenseCountingType` catalog — so a value outside it is
+                // refused rather than quietly matching nothing.
+                _ => {
+                    if !LICENSE_COUNTING_TYPE_VALUES.contains(&value.as_str()) {
+                        return Err(invalid_parameter(format!(
+                            "filter '{name}' must name one of [{}], got '{value}'",
+                            LICENSE_COUNTING_TYPE_VALUES.join(", ")
+                        )));
+                    }
+                    Ok(ScopedFilter::LicenseCountingType(value))
+                }
+            }
+        })
+        .collect()
+}
+
+/// Whether `configuration` satisfies every requested filter.
+fn matches_filters(
+    configuration: &crate::state::StoredLicenseConfiguration,
+    filters: &[ScopedFilter],
+) -> bool {
+    filters.iter().all(|filter| match filter {
+        ScopedFilter::LicenseCountingType(dimension) => {
+            configuration.license_counting_type == *dimension
+        }
+        ScopedFilter::EnforceLicenseCount(enforced) => {
+            configuration.enforces_license_count() == *enforced
+        }
+        ScopedFilter::UsageLimitExceeded(exceeded) => {
+            configuration.usage_limit_exceeded() == *exceeded
+        }
+    })
+}
+
+/// The modelled 400 this service answers for a parameter value it will not accept.
+fn invalid_parameter(message: impl Into<String>) -> ListLicenseConfigurationsError {
+    ListLicenseConfigurationsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
 /// The `ListLicenseConfigurations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +385,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLicenseConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLicenseConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLicenseConfigurations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLicenseConfigurationsErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: Some("the license configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let filters = scoped_filters(input.filters)?;
+        // `LicenseConfigurationArns` scopes the result to the ARNs named; an empty
+        // or absent list scopes nothing.
+        let requested: Option<BTreeSet<String>> = input
+            .license_configuration_arns
+            .filter(|arns| !arns.is_empty())
+            .map(|arns| arns.into_iter().collect());
+        let fingerprint = scope_fingerprint(requested.as_ref(), &filters);
+
+        let page_size = page_size(input.max_results)?;
+        let start = input
+            .next_token
+            .as_deref()
+            .map(|token| decode_page_token(token, fingerprint))
+            .transpose()?;
+
+        let store = state.lock();
+        // One stable, total order on every call: the store is keyed by ARN, so a
+        // token naming the ARN the next page starts at resumes exactly where the
+        // page ended.
+        let mut walk = match &start {
+            Some(arn) => store.license_configurations.range(arn.clone()..),
+            None => store.license_configurations.range::<String, _>(..),
+        }
+        .filter(|(arn, configuration)| {
+            requested
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(arn.as_str()))
+                && matches_filters(configuration, &filters)
+        });
+
+        let mut license_configurations =
+            Vec::with_capacity(page_size.min(store.license_configurations.len()));
+        let mut next_token = None;
+        for (arn, configuration) in walk.by_ref() {
+            // The first configuration that does not fit becomes the next page's
+            // start, and only then is a `NextToken` emitted — the last page carries
+            // none.
+            if license_configurations.len() == page_size {
+                next_token = Some(encode_page_token(fingerprint, arn));
+                break;
+            }
+            license_configurations.push(configuration.wire());
+        }
+
+        Ok(ListLicenseConfigurationsOutput {
+            license_configurations: Some(license_configurations),
+            next_token,
+        })
     }
 }

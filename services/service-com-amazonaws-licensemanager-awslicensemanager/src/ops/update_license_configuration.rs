@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLicenseConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLicenseConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLicenseConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the one license configuration [`crate::state`] holds under the requested
+//! ARN, in place: a member the request carries replaces the stored one, a member it
+//! omits is left as it was, and the next Get or List reports the result. An ARN the
+//! store does not hold is a modelled 400.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLicenseConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLicenseConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLicenseConfiguration"))
+        // `LicenseConfigurationArn` is `@required` and `LicenseConfigurationStatus`
+        // targets a modelled enum, so the centralized walk has already refused a
+        // request that omits the ARN or names a status outside the catalog. The
+        // catalog check below is this handler's own guard, so no status outside it
+        // can reach the store; the model publishes no length for any string or list
+        // here, so those bounds live here too.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLicenseConfigurationErrorModeled::ServerInternalException(
+                ServerInternalException {
+                    message: Some("the license configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        if let Some(status) = input.license_configuration_status.as_deref() {
+            if !LICENSE_CONFIGURATION_STATUS_VALUES.contains(&status) {
+                return Err(invalid_parameter(format!(
+                    "LicenseConfigurationStatus must be one of [{}], got '{status}'",
+                    LICENSE_CONFIGURATION_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+
+        if let Some(why) = crate::state::configuration_input_rejection(
+            input.name.as_deref(),
+            input.description.as_deref(),
+            input.license_count,
+            input.license_expiry,
+            input.license_rules.as_deref(),
+            input.product_information_list.as_deref(),
+            None,
+        ) {
+            return Err(invalid_parameter(why));
+        }
+
+        let mut store = state.lock();
+        let configuration = store
+            .configuration_mut(&input.license_configuration_arn)
+            .ok_or_else(|| {
+                UpdateLicenseConfigurationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "no license configuration exists with the ARN '{}'",
+                            input.license_configuration_arn
+                        )),
+                    },
+                )
+            })?;
+
+        // Every member the request carries replaces the stored one; every member it
+        // omits is left exactly as it was.
+        if let Some(status) = input.license_configuration_status {
+            configuration.status = status;
+        }
+        if let Some(name) = input.name {
+            configuration.name = name;
+        }
+        if let Some(description) = input.description {
+            configuration.description = Some(description);
+        }
+        if let Some(license_count) = input.license_count {
+            configuration.license_count = Some(license_count);
+        }
+        if let Some(hard_limit) = input.license_count_hard_limit {
+            configuration.license_count_hard_limit = Some(hard_limit);
+        }
+        if let Some(license_rules) = input.license_rules {
+            configuration.license_rules = license_rules;
+        }
+        if let Some(product_information_list) = input.product_information_list {
+            configuration.product_information_list = product_information_list;
+        }
+        if let Some(disassociate) = input.disassociate_when_not_found {
+            configuration.disassociate_when_not_found = Some(disassociate);
+        }
+        if let Some(license_expiry) = input.license_expiry {
+            configuration.license_expiry = Some(license_expiry);
+        }
+
+        crate::state::record_mutation(Self::NAME, &input.license_configuration_arn, ctx.parts());
+        Ok(UpdateLicenseConfigurationOutput {})
     }
+}
+
+/// The modelled 400 this service answers for a parameter value it will not accept.
+fn invalid_parameter(message: impl Into<String>) -> UpdateLicenseConfigurationError {
+    UpdateLicenseConfigurationErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

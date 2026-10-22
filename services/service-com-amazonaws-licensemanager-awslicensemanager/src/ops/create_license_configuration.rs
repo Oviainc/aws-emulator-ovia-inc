@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLicenseConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLicenseConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLicenseConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one license configuration and PERSISTS it in [`crate::state`], keyed by the
+//! ARN it returns, so a later `GetLicenseConfiguration`, `ListLicenseConfigurations`
+//! or `ListTagsForResource` reports exactly what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLicenseConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLicenseConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLicenseConfiguration"))
+        // `Name` and `LicenseCountingType` are `@required` and the latter targets a
+        // modelled enum, so the centralized walk has already refused a request that
+        // omits either or names a dimension outside the catalog. The catalog check
+        // below is this handler's own guard, so nothing outside it can reach the
+        // store whatever the walk does; the model publishes no length for any string
+        // or list on this input, so those bounds live here too.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        if !LICENSE_COUNTING_TYPE_VALUES.contains(&input.license_counting_type.as_str()) {
+            return Err(invalid_parameter(format!(
+                "LicenseCountingType must be one of [{}], got '{}'",
+                LICENSE_COUNTING_TYPE_VALUES.join(", "),
+                input.license_counting_type
+            )));
+        }
+
+        if let Some(why) = crate::state::configuration_input_rejection(
+            Some(&input.name),
+            input.description.as_deref(),
+            input.license_count,
+            input.license_expiry,
+            input.license_rules.as_deref(),
+            input.product_information_list.as_deref(),
+            input.tags.as_deref(),
+        ) {
+            return Err(invalid_parameter(why));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let id = store.fresh_configuration_id();
+        let arn = crate::state::configuration_arn(&region, &id);
+        // The store is finite, and `insert_configuration` is what enforces that: a
+        // create that would take it past its cap stores nothing, and is refused the
+        // way the service refuses one past its resource limit.
+        let stored = store.insert_configuration(crate::state::StoredLicenseConfiguration {
+            id,
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            license_counting_type: input.license_counting_type,
+            license_count: input.license_count,
+            license_count_hard_limit: input.license_count_hard_limit,
+            license_rules: input.license_rules.unwrap_or_default(),
+            product_information_list: input.product_information_list.unwrap_or_default(),
+            disassociate_when_not_found: input.disassociate_when_not_found,
+            license_expiry: input.license_expiry,
+            // A configuration AWS hands back is usable at once, so it is created in
+            // the terminal `AVAILABLE` status and owes the clock no transition; only
+            // `UpdateLicenseConfiguration` moves it.
+            status: crate::state::STATUS_AVAILABLE.to_string(),
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+            // Nothing is associated with a configuration this call just minted.
+            consumed_licenses: 0,
+            consumed_license_summary_list: Vec::new(),
+            managed_resource_summary_list: Vec::new(),
+        });
+        if !stored {
+            return Err(
+                CreateLicenseConfigurationErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} license configurations",
+                            crate::state::MAX_LICENSE_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Tags supplied at create time go into the same ARN-keyed map the tagging
+        // operations use, so `ListTagsForResource` reports them. The list was
+        // already bounded above and the configuration is now stored, so the only way
+        // this can be refused is a bound; the half-made configuration goes with it.
+        if let Some(tags) = input.tags {
+            if let Err(why) = store.merge_tags(&arn, &tags) {
+                store.remove_configuration(&arn);
+                return Err(invalid_parameter(why));
+            }
+        }
+
+        crate::state::record_mutation(Self::NAME, &arn, ctx.parts());
+        Ok(CreateLicenseConfigurationOutput {
+            license_configuration_arn: Some(arn),
+        })
     }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn store_unavailable() -> CreateLicenseConfigurationError {
+    CreateLicenseConfigurationErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some("the license configuration store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The modelled 400 this service answers for a parameter value it will not accept.
+fn invalid_parameter(message: impl Into<String>) -> CreateLicenseConfigurationError {
+    CreateLicenseConfigurationErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }
