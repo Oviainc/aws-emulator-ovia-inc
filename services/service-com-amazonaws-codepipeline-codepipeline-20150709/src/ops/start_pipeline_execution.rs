@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an execution record for the named pipeline — a fresh id, the `InProgress`
+//! status, the start instant, the trigger that started it and the pipeline variables
+//! resolved for it — and persists it, so `GetPipelineExecution` and
+//! `ListPipelineExecutions` report the execution this call created.
+//!
+//! The execution stays `InProgress`: moving it on would mean running the stages'
+//! actions, which the action-execution plane (`PollForJobs`, `PutJobSuccessResult`,
+//! `GetPipelineState`) does, and those operations are still 501. Nothing here
+//! reports a status for work nothing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+        let mut state = state.lock();
+
+        let pipeline = state.pipelines.get(&input.name).ok_or_else(|| {
+            StartPipelineExecutionError::from(
+                StartPipelineExecutionErrorModeled::PipelineNotFoundException(
+                    PipelineNotFoundException {
+                        message: Some(format!("pipeline {} does not exist", input.name)),
+                    },
+                ),
+            )
+        })?;
+
+        // `@idempotencyToken`: the same token for the same pipeline names the same
+        // execution, so repeating the request returns the id it already minted
+        // instead of starting another execution.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(existing) = state
+                .idempotency
+                .get(&(input.name.clone(), token.to_string()))
+            {
+                return Ok(StartPipelineExecutionOutput {
+                    pipeline_execution_id: Some(existing.clone()),
+                });
+            }
+        }
+
+        // Resolve the execution's variables against the declaration: every declared
+        // variable takes the request's override if it has one, else its declared
+        // default. Two cases cannot be resolved at all, and each is refused with the
+        // modelled `ValidationException` naming the variable rather than quietly
+        // leaving a variable out of the execution:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPipelineExecution"))
+        // * an override naming a variable the declaration does not carry — there is
+        //   nothing for it to override;
+        // * a declared variable with neither a `defaultValue` nor an override — the
+        //   execution would have no value for a variable its pipeline declares.
+        let declared = pipeline.declaration.variables.clone().unwrap_or_default();
+        let overrides = input.variables.unwrap_or_default();
+        if let Some(unknown) = overrides
+            .iter()
+            .find(|variable| !declared.iter().any(|d| d.name == variable.name))
+        {
+            return Err(StartPipelineExecutionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "variables: pipeline {} declares no variable named {}",
+                        input.name, unknown.name
+                    )),
+                },
+            )
+            .into());
+        }
+        let mut variables: Vec<ResolvedPipelineVariable> = Vec::with_capacity(declared.len());
+        for declaration in &declared {
+            let Some(resolved) = overrides
+                .iter()
+                .find(|variable| variable.name == declaration.name)
+                .map(|variable| variable.value.clone())
+                .or_else(|| declaration.default_value.clone())
+            else {
+                return Err(StartPipelineExecutionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "variables: pipeline {} declares variable {} with no defaultValue, \
+                             so a value must be given for it",
+                            input.name, declaration.name
+                        )),
+                    },
+                )
+                .into());
+            };
+            variables.push(ResolvedPipelineVariable {
+                name: Some(declaration.name.clone()),
+                resolved_value: Some(resolved),
+            });
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::PipelineExecutionRecord {
+            // Minted against the store, so the id this call reports is the one the
+            // execution is filed under and no other execution can carry it.
+            pipeline_execution_id: state.new_execution_id(),
+            pipeline_name: input.name.clone(),
+            pipeline_version: pipeline.version,
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            status_summary: None,
+            start_time: now,
+            last_update_time: now,
+            trigger: ExecutionTrigger {
+                trigger_type: Some(
+                    crate::state::TRIGGER_TYPE_START_PIPELINE_EXECUTION.to_string(),
+                ),
+                // `ExecutionTrigger$triggerDetail` carries the ARN of the user who
+                // ran the command; this emulator does not resolve a caller identity,
+                // so the member is absent rather than invented.
+                trigger_detail: None,
+            },
+            execution_mode: crate::state::resolved_execution_mode(&pipeline.declaration),
+            execution_type: crate::state::EXECUTION_TYPE_STANDARD.to_string(),
+            variables,
+            source_revisions: input
+                .source_revisions
+                .unwrap_or_default()
+                .into_iter()
+                // `SourceRevisionOverride` carries a `revisionType` naming what kind
+                // of revision the value is (a commit id, an object version); the
+                // `SourceRevision` the listing reports models only the revision
+                // itself, so the override's value becomes the recorded revision id.
+                .map(|source_override| SourceRevision {
+                    action_name: source_override.action_name,
+                    revision_id: Some(source_override.revision_value),
+                    revision_summary: None,
+                    revision_url: None,
+                })
+                .collect(),
+        };
+
+        let execution_id = state.record_execution(record, input.client_request_token);
+
+        Ok(StartPipelineExecutionOutput {
+            pipeline_execution_id: Some(execution_id),
+        })
     }
 }

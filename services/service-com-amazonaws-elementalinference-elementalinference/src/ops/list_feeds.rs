@@ -134,9 +134,10 @@ const DEFAULT_MAX_RESULTS: usize = 10;
 ///
 /// The token is opaque to the caller: it is the hex encoding of the id, so a client
 /// cannot read a feed id out of it and the service can resume from the next id in
-/// order. Hex comes from the `hex` crate rather than being hand-rolled.
+/// order. [`crate::state::encode_page_token`] is the one codec every paginated
+/// operation of this service shares.
 fn encode_next_token(last_id: &str) -> String {
-    hex::encode(last_id.as_bytes())
+    crate::state::encode_page_token(last_id)
 }
 
 /// Decode a `nextToken` back into the feed id a page resumes after.
@@ -146,7 +147,7 @@ fn encode_next_token(last_id: &str) -> String {
 /// the id order rather than a feed that must still exist, so paging survives a feed
 /// deleted between two pages: the next page simply resumes at the next id.
 fn decode_next_token(token: &str) -> Option<String> {
-    String::from_utf8(hex::decode(token).ok()?).ok()
+    crate::state::decode_page_token(token)
 }
 
 /// The most feeds one page may carry, whatever the request asks for.

@@ -9,6 +9,34 @@ _Operation: service-com-amazonaws-neptunedata-amazonneptunedataplane | Class: st
 
 > _Note: this issue was identified against the code base at commit `95c91931c960f7f391e4448ce7f3ebc67d41fa17`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Four of the five operations this plan names are implemented over persisted state, in
+`services/service-com-amazonaws-neptunedata-amazonneptunedataplane/`:
+
+- **GetEngineStatus** (`GET /status`) — hand-authored (the scaffold generator declines a
+  `smithy.api#Unit` input), answered from the `EngineStatusRecord` built once at state
+  init, so `startTime` is stable across reads.
+- **ListGremlinQueries**, **GetGremlinQueryStatus**, **CancelGremlinQuery** — answered by
+  walking / mutating the `gremlin_queries` registry in `src/state.rs`; an unknown
+  `queryId` is the modelled `InvalidParameterException` (400), and a cancel keeps the
+  record so the status read reports `cancelled` and the repeat answers identically.
+- Test: `tests/all/neptune_data_plane.rs` drives all four over the router.
+
+**Still open, and deliberately NOT done here: ExecuteGremlinQuery** (and the other Gremlin
+execution endpoints, `ExecuteGremlinExplainQuery` / `ExecuteGremlinProfileQuery`) stay at
+HTTP 501 with their `//! SCAFFOLDED, NOT IMPLEMENTED:` headers intact, so the stub census
+still reports them. Evaluating a TinkerPop traversal needs a real in-process engine, and
+no maintained Rust crate provides one (the Gremlin crates are clients for an external
+Gremlin Server); a `requestId`, a `result` or a query record for a traversal nothing ran
+would be a fabrication. Because `ExecuteGremlinQuery` is the only path that admits a
+query record, the registry is empty for a client until that engine exists: the
+execute → list → get → cancel workflow this plan describes is reachable only once the
+admission path lands. `tests/all/neptune_data_plane.rs` pins the 501 and the empty
+registry so the gap cannot be closed with a fabricated result.
+
+Everything else named under "Everything else … stays at 501 for now" is unchanged.
+
 ## Description
 
 Every one of the 43 operations in this crate is an unmodified scaffold: each `src/ops/*.rs` carries the `//! SCAFFOLDED, NOT IMPLEMENTED:` header and returns `Err(crate::scaffolded::Scaffolded::not_implemented(..))`, i.e. HTTP 501, while holding zero state. No client workflow works at all.

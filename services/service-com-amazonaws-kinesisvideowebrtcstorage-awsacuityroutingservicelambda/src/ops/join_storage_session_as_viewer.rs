@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op JoinStorageSessionAsViewer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `JoinStorageSessionAsViewer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`JoinStorageSessionAsViewer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Joins the caller to a signaling channel's WebRTC storage session as a playback
+//! **viewer**, registered under its `clientId`. The session is the one
+//! `JoinStorageSession` created for that channel — the two operations share
+//! [`crate::state`] — and a channel this emulator has no registration for is
+//! reported as `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +175,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `JoinStorageSessionAsViewer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(JoinStorageSessionAsViewerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata; this operation reads the presented access
+        // key id from it for the audit record below, and decides everything else
+        // from the input and the shared store.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("JoinStorageSessionAsViewer"))
+        // The store is this service's slice of the shared engine. `None` means the
+        // emulator was assembled on an engine that holds no state for this service,
+        // so the operation cannot be served at all — answer the scaffold's 501
+        // rather than a success that persisted nothing.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "JoinStorageSessionAsViewer",
+            ));
+        };
+
+        // The modelled `@pattern`/`@length` constraints on both members are refused
+        // before `handle` runs; what is left is the semantic half the schema cannot
+        // express — that the ARN names a signaling channel at all.
+        let Some(arn) = crate::state::parse_channel_arn(&input.channel_arn) else {
+            return Err(
+                JoinStorageSessionAsViewerErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "channelArn '{}' is not a Kinesis Video signaling channel ARN",
+                            input.channel_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if arn.resource_type != crate::state::SIGNALING_CHANNEL_RESOURCE_TYPE {
+            return Err(
+                JoinStorageSessionAsViewerErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "channelArn must name a '{}' resource, but '{}' names a '{}' resource",
+                            crate::state::SIGNALING_CHANNEL_RESOURCE_TYPE,
+                            input.channel_arn,
+                            arn.resource_type
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A viewer join does not provide a signaling channel this emulator can
+        // learn about: the channel has to be one it already holds a registration
+        // for, or there is nothing to join.
+        if !store.knows_channel(&input.channel_arn) {
+            return Err(
+                JoinStorageSessionAsViewerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No signaling channel '{}' found in account {} for region {}",
+                            arn.name, arn.account_id, arn.region
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "If there's no existing session for the channel, create a new streaming
+        // session"; a repeat join with the same clientId takes precedence over the
+        // viewer's earlier join rather than adding a second entry. A join that
+        // would take the session past its viewer limit is refused instead.
+        let join_count = match store.join_as_viewer(&input.channel_arn, &input.client_id, now) {
+            Ok(join_count) => join_count,
+            Err(refused) => {
+                return Err(
+                    JoinStorageSessionAsViewerErrorModeled::ClientLimitExceededException(
+                        ClientLimitExceededException {
+                            message: Some(refused.message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        drop(store);
+
+        // Audit record for a state-changing call: who was presented, what was
+        // joined, and the outcome. The access key id is the one the request
+        // presented, never a secret.
+        tracing::info!(
+            operation = "JoinStorageSessionAsViewer",
+            channel_arn = %input.channel_arn,
+            client_id = %input.client_id,
+            access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            join_count,
+            outcome = "joined",
+            "a viewer joined the channel's storage session"
+        );
+
+        Ok(JoinStorageSessionAsViewerOutput)
     }
 }

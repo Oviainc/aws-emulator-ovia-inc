@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the tags added to the resource a resource ARN names.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +144,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Authorization is evaluated on the ARN BEFORE anything is looked up: an
+        // ARN that names no resource of this catalog in this account is one no
+        // identity or resource policy of this catalog can grant an action on, so
+        // the caller is not authorized to read it rather than it being absent.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
+                crate::state::access_denied(Self::NAME, &input.resource_arn),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A resource exists once the change set that creates it has succeeded,
+        // which is a change the clock owes rather than one a reader makes.
+        store.settle(now);
+
+        let (Some(arn), Some(tags)) = (
+            store.stored_resource_arn(&resource),
+            store.resource_tags(&resource),
+        ) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&resource),
+            )
+            .into());
+        };
+
+        Ok(ListTagsForResourceOutput {
+            // The ARN the stored record carries, not the one the request was
+            // written with.
+            resource_arn: Some(arn.to_string()),
+            // `TagList` is `@length(min: 1 …)`, so a resource carrying no tags
+            // reports no `Tags` member rather than an empty list that bound
+            // excludes.
+            tags: (!tags.is_empty()).then(|| tags.to_vec()),
+        })
     }
 }

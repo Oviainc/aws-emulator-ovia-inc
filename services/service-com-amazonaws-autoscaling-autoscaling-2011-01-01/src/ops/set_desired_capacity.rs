@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetDesiredCapacity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetDesiredCapacity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetDesiredCapacity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets a group's desired capacity and moves its instances to match, recording a
+//! scaling activity for each instance launched or terminated. With
+//! `HonorCooldown` the change waits for the group's cooldown to elapse, as the
+//! model documents, instead of being applied at once.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetDesiredCapacity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetDesiredCapacityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetDesiredCapacity"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetDesiredCapacityErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let desired_capacity = input.desired_capacity;
+        let honor_cooldown = input.honor_cooldown.unwrap_or(false);
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(group) = state.groups.get(&name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AutoScalingGroup name not found - AutoScalingGroup: {name} not found"
+            )));
+        };
+        let (min_size, max_size, current) = (group.min_size, group.max_size, group.desired_capacity);
+        let cooldown_until = group.cooldown_until;
+        let in_cooldown = group.in_cooldown(now);
+
+        if desired_capacity < min_size {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "New SetDesiredCapacity value {desired_capacity} is below min value {min_size} \
+                 for the AutoScalingGroup: {name}"
+            )));
+        }
+        if desired_capacity > max_size {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "New SetDesiredCapacity value {desired_capacity} is above max value {max_size} \
+                 for the AutoScalingGroup: {name}"
+            )));
+        }
+        // The check above is against the group's own stored maximum, so it is
+        // relative: the absolute ceiling is what bounds the instances this call
+        // materialises, and it is checked before anything is allocated.
+        if let Some(size) = crate::state::size_past_ceiling(&[desired_capacity]) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "New SetDesiredCapacity value {size} exceeds the limit of {} instances per Auto \
+                 Scaling group",
+                crate::state::MAX_GROUP_CAPACITY
+            )));
+        }
+        // An instance is reported in the Availability Zone it runs in, and
+        // resolving that zone from a subnet id needs EC2's own state (see
+        // `CreateAutoScalingGroup`), so capacity this service cannot place is
+        // refused rather than reported short.
+        if group.availability_zones.is_empty() && desired_capacity > 0 {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "launching instances for a group that names only VPCZoneIdentifier \
+                              needs each subnet's Availability Zone, which this emulator does not \
+                              hold: pass AvailabilityZones as well"
+                        .to_string(),
+                },
+            ));
+        }
+        // Instances from an earlier change are stored until they finish
+        // terminating, and they occupy the group's ceiling while they do. A change
+        // whose launches would not fit beside them cannot be started yet.
+        if group.launches_needed(desired_capacity) > group.launch_headroom() {
+            return Err(
+                SetDesiredCapacityErrorModeled::ScalingActivityInProgressFault(
+                    ScalingActivityInProgressFault {
+                        message: Some(format!(
+                            "The AutoScalingGroup {name} still holds instances from an earlier \
+                             scaling activity: retry once they have finished terminating"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cause = crate::state::AutoScalingState::capacity_change_cause(
+            "a user request explicitly set group desired capacity",
+            current,
+            desired_capacity,
+        );
+
+        // `HonorCooldown` asks the service to wait for the cooldown period to
+        // complete before initiating the scaling activity, so the change is held
+        // until the cooldown's own end instant and materialised then.
+        if honor_cooldown && in_cooldown {
+            let due = cooldown_until.expect("in_cooldown implies a cooldown end instant");
+            let group = state
+                .groups
+                .get_mut(&name)
+                .expect("the group was present a moment ago");
+            group.pending_capacity = Some(crate::state::PendingCapacity {
+                desired_capacity,
+                due,
+                cause,
+            });
+            crate::state::audit(
+                ctx.parts(),
+                "SetDesiredCapacity",
+                &name,
+                "capacity change deferred until the cooldown has elapsed",
+            );
+            return Ok(SetDesiredCapacityOutput);
+        }
+        state.apply_capacity(&name, desired_capacity, &cause, now);
+
+        crate::state::audit(ctx.parts(), "SetDesiredCapacity", &name, "capacity set");
+        Ok(SetDesiredCapacityOutput)
     }
 }

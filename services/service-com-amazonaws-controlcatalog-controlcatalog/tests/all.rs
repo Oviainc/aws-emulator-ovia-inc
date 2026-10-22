@@ -19,6 +19,8 @@ mod control_catalog;
 mod control_mappings;
 #[path = "all/ontology_listing.rs"]
 mod ontology_listing;
+#[path = "all/published_ontology.rs"]
+mod published_ontology;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_messages.rs"]

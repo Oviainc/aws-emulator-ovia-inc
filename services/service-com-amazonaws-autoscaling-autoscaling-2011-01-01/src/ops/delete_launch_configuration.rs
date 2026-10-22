@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLaunchConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLaunchConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLaunchConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored launch configuration. A configuration an Auto Scaling group
+//! still references is `ResourceInUseFault`; a name that names nothing is
+//! refused.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLaunchConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLaunchConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLaunchConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteLaunchConfigurationErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.launch_configuration_name;
+        let mut state = state.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        if !state.launch_configurations.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Launch configuration name not found - No launch configuration found with the name {name}"
+            )));
+        }
+
+        // A launch configuration an Auto Scaling group launches from cannot be
+        // deleted while that group exists.
+        if let Some(group) = state.groups.values().find(|group| {
+            group
+                .launch_configuration_name
+                .as_deref()
+                .is_some_and(|configured| configured == name)
+        }) {
+            return Err(DeleteLaunchConfigurationErrorModeled::ResourceInUseFault(
+                ResourceInUseFault {
+                    message: Some(format!(
+                        "Cannot delete launch configuration {name} because it is attached to AutoScalingGroup {}",
+                        group.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        state.launch_configurations.remove(&name);
+
+        crate::state::audit(
+            ctx.parts(),
+            "DeleteLaunchConfiguration",
+            &name,
+            "deleted",
+        );
+        Ok(DeleteLaunchConfigurationOutput)
     }
 }

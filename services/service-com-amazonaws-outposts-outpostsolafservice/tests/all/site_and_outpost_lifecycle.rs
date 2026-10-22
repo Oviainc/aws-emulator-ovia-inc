@@ -44,18 +44,18 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// The ARN prefix every site this emulator mints must carry, from the modelled
 /// `SiteArn` pattern `^arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:site/(os-[a-f0-9]{17})$`
 /// plus the canonical emulator account id.
-const SITE_ARN_PREFIX: &str = "arn:aws:outposts:us-east-1:000000000000:site/";
+pub(crate) const SITE_ARN_PREFIX: &str = "arn:aws:outposts:us-east-1:000000000000:site/";
 /// The same, for the modelled `OutpostArn` pattern.
-const OUTPOST_ARN_PREFIX: &str = "arn:aws:outposts:us-east-1:000000000000:outpost/";
+pub(crate) const OUTPOST_ARN_PREFIX: &str = "arn:aws:outposts:us-east-1:000000000000:outpost/";
 /// The account id every generated emulator presents, which `Site$AccountId` and
 /// `Outpost$OwnerId` (both `^\d{12}$`) carry.
 const ACCOUNT_ID: &str = "000000000000";
 
 /// An id this emulator never mints, used wherever a case needs an identifier that is
 /// well formed (so the boundary accepts it) but names nothing.
-const ABSENT_SITE_ID: &str = "os-00000000000000000";
+pub(crate) const ABSENT_SITE_ID: &str = "os-00000000000000000";
 /// See [`ABSENT_SITE_ID`].
-const ABSENT_OUTPOST_ID: &str = "op-00000000000000000";
+pub(crate) const ABSENT_OUTPOST_ID: &str = "op-00000000000000000";
 
 /// One Outposts emulator over one shared engine, reached the way the router reaches it.
 pub(crate) struct Outposts {

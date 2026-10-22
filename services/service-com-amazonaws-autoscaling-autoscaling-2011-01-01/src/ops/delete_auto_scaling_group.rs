@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAutoScalingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAutoScalingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAutoScalingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored group and its instances. A group that still holds instances
+//! or capacity is `ResourceInUseFault` unless `ForceDelete` is set, and a group
+//! whose deletion protection forbids the delete is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAutoScalingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAutoScalingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAutoScalingGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAutoScalingGroupErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let force_delete = input.force_delete.unwrap_or(false);
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(group) = state.groups.get(&name) else {
+            crate::state::audit(
+                ctx.parts(),
+                "DeleteAutoScalingGroup",
+                &name,
+                "refused: no such group",
+            );
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AutoScalingGroup name not found - AutoScalingGroup: {name} not found"
+            )));
+        };
+        let arn = group.arn.clone();
+        let instance_count = group.instances.len();
+        let desired_capacity = group.desired_capacity;
+        let protection = group.deletion_protection.clone().unwrap_or_default();
+
+        // Deletion protection controls whether this operation is allowed at all:
+        // `prevent-all-deletion` forbids the delete, `prevent-force-deletion`
+        // forbids only the forcing form.
+        if protection == PREVENT_ALL_DELETION
+            || (force_delete && protection == PREVENT_FORCE_DELETION)
+        {
+            crate::state::audit(
+                ctx.parts(),
+                "DeleteAutoScalingGroup",
+                &name,
+                "refused: deletion protection",
+            );
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Cannot delete AutoScalingGroup {name} because its DeletionProtection is set to \
+                 {protection}"
+            )));
+        }
+
+        // A group that still has instances, or still asks for capacity, is in use:
+        // only `ForceDelete` terminates what is left along with the group.
+        if (instance_count > 0 || desired_capacity > 0) && !force_delete {
+            crate::state::audit(
+                ctx.parts(),
+                "DeleteAutoScalingGroup",
+                &name,
+                "refused: the group is still in use",
+            );
+            return Err(DeleteAutoScalingGroupErrorModeled::ResourceInUseFault(
+                ResourceInUseFault {
+                    message: Some(format!(
+                        "You cannot delete an AutoScalingGroup while there are instances or \
+                         pending Spot instance request(s) still in the group: {name}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        state.groups.remove(&name);
+        state.record_activity(
+            &name,
+            &arn,
+            format!("Deleting the Auto Scaling group: {name}"),
+            format!(
+                "a user request deleted the AutoScalingGroup, terminating {instance_count} \
+                 instance(s)."
+            ),
+            crate::state::GROUP_STATE_DELETED,
+            now,
+            None,
+        );
+
+        crate::state::audit(ctx.parts(), "DeleteAutoScalingGroup", &name, "deleted");
+        Ok(DeleteAutoScalingGroupOutput)
     }
 }
+
+// The `DeletionProtection` values that forbid a delete, from the model's
+// `com.amazonaws.autoscaling#DeletionProtection` enum.
+const PREVENT_ALL_DELETION: &str = "prevent-all-deletion";
+const PREVENT_FORCE_DELETION: &str = "prevent-force-deletion";
