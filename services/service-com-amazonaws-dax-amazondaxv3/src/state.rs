@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     Cluster, ClusterNotFoundFault, Endpoint, Event, InvalidClusterStateFault,
     InvalidParameterCombinationException, InvalidParameterValueException, Node,
-    NotificationConfiguration, ParameterGroup, ParameterGroupNotFoundFault,
+    NotificationConfiguration, Parameter, ParameterGroup, ParameterGroupNotFoundFault,
     ParameterGroupStatus, SSEDescription, SecurityGroupMembership, Subnet, SubnetGroup,
     SubnetGroupNotFoundFault,
 };
@@ -560,6 +560,133 @@ impl SubnetGroupRecord {
         zones.dedup();
         zones
     }
+}
+
+// ---------------------------------------------------------------------------
+// The system-defined parameter catalog.
+// ---------------------------------------------------------------------------
+
+/// `Parameter$Source` for a value no caller has overridden: "How the parameter is
+/// defined. For example, `system` denotes a system-defined parameter."
+pub const PARAMETER_SOURCE_SYSTEM: &str = "system";
+
+/// `Parameter$ParameterType` (`ParameterType` enum) for a parameter that applies to
+/// "any nodes" rather than only nodes of a particular type.
+pub const PARAMETER_TYPE_DEFAULT: &str = "DEFAULT";
+
+/// `Parameter$ParameterType` for a parameter that carries per-node-type values.
+pub const PARAMETER_TYPE_NODE_TYPE_SPECIFIC: &str = "NODE_TYPE_SPECIFIC";
+
+/// `Parameter$IsModifiable` (`IsModifiable` enum) for a parameter "the customer is
+/// allowed to modify".
+pub const IS_MODIFIABLE_TRUE: &str = "TRUE";
+
+/// `Parameter$ChangeType` (`ChangeType` enum) for a parameter whose new value takes
+/// effect without rebooting a node.
+pub const CHANGE_TYPE_IMMEDIATE: &str = "IMMEDIATE";
+
+/// `Parameter$DataType` of a parameter whose value is a whole number ("The data type
+/// of the parameter. For example, `integer`").
+pub const DATA_TYPE_INTEGER: &str = "integer";
+
+/// One system-defined DAX parameter: the definition behind every `Parameter` this
+/// service reports, independent of which group is being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterDefinition {
+    /// `Parameter$ParameterName`.
+    pub name: &'static str,
+    /// The value the system defines for it — what a group that has never been updated
+    /// reports.
+    pub default_value: &'static str,
+    /// `Parameter$Description`.
+    pub description: &'static str,
+    /// `Parameter$DataType`.
+    pub data_type: &'static str,
+    /// `Parameter$AllowedValues`: "A range of values within which the parameter can be
+    /// set", in the AWS range notation (`<min>-` is "`min` and above").
+    pub allowed_values: &'static str,
+    /// `Parameter$IsModifiable`, one of [`crate::ops::types::IS_MODIFIABLE_VALUES`].
+    pub is_modifiable: &'static str,
+    /// `Parameter$ChangeType`, one of [`crate::ops::types::CHANGE_TYPE_VALUES`].
+    pub change_type: &'static str,
+}
+
+impl ParameterDefinition {
+    /// The modelled `Parameter` for this definition carrying `value`, reported as
+    /// coming from `source`. `ParameterType` is DERIVED: this emulator models no
+    /// per-node-type override, so every parameter "can be applied to any nodes" and
+    /// reports [`PARAMETER_TYPE_DEFAULT`] with an empty `NodeTypeSpecificValues`.
+    pub fn view(&self, value: &str, source: &str) -> Parameter {
+        Parameter {
+            parameter_name: Some(self.name.to_string()),
+            // Nothing in this emulator overrides a parameter for one node type, so
+            // every parameter applies to any node: `DEFAULT`, with an empty
+            // `NodeTypeSpecificValues`. One that carried such values would report
+            // [`PARAMETER_TYPE_NODE_TYPE_SPECIFIC`] instead.
+            parameter_type: Some(PARAMETER_TYPE_DEFAULT.to_string()),
+            parameter_value: Some(value.to_string()),
+            node_type_specific_values: Some(Vec::new()),
+            description: Some(self.description.to_string()),
+            source: Some(source.to_string()),
+            data_type: Some(self.data_type.to_string()),
+            allowed_values: Some(self.allowed_values.to_string()),
+            is_modifiable: Some(self.is_modifiable.to_string()),
+            change_type: Some(self.change_type.to_string()),
+        }
+    }
+
+    /// This parameter as the SYSTEM defines it: its default value, sourced
+    /// [`PARAMETER_SOURCE_SYSTEM`]. This is the view `DescribeDefaultParameters`
+    /// reports, and the one a group that has never been updated carries.
+    pub fn default_view(&self) -> Parameter {
+        self.view(self.default_value, PARAMETER_SOURCE_SYSTEM)
+    }
+}
+
+/// The parameters the DAX caching software defines, sorted by name (so [`page`] can
+/// page them) and unique — the catalog `DescribeDefaultParameters` reports and the
+/// values any parameter group starts from.
+///
+/// Source: the Amazon DAX Developer Guide's parameter-group / TTL settings, which
+/// document exactly two DAX cluster parameters — `query-ttl-millis`, the time to live
+/// for the query cache, and `record-ttl-millis`, the time to live for the item cache —
+/// each a duration in milliseconds, each defaulting to 300000 (five minutes), each
+/// modifiable by the customer and applied to the cluster without a node reboot.
+pub const DEFAULT_PARAMETERS: &[ParameterDefinition] = &[
+    ParameterDefinition {
+        name: "query-ttl-millis",
+        default_value: "300000",
+        description: "Duration in milliseconds for queries to remain cached",
+        data_type: DATA_TYPE_INTEGER,
+        allowed_values: "0-",
+        is_modifiable: IS_MODIFIABLE_TRUE,
+        change_type: CHANGE_TYPE_IMMEDIATE,
+    },
+    ParameterDefinition {
+        name: "record-ttl-millis",
+        default_value: "300000",
+        description: "Duration in milliseconds for records to remain cached",
+        data_type: DATA_TYPE_INTEGER,
+        allowed_values: "0-",
+        is_modifiable: IS_MODIFIABLE_TRUE,
+        change_type: CHANGE_TYPE_IMMEDIATE,
+    },
+];
+
+/// The names of [`DEFAULT_PARAMETERS`], in the order they page in.
+pub fn default_parameter_names() -> Vec<&'static str> {
+    DEFAULT_PARAMETERS
+        .iter()
+        .map(|parameter| parameter.name)
+        .collect()
+}
+
+/// The system definition of the parameter called `name`, or `None` when DAX defines no
+/// such parameter.
+pub fn default_parameter(name: &str) -> Option<&'static ParameterDefinition> {
+    DEFAULT_PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name == name)
 }
 
 /// One recorded DAX event: what happened to which resource, and when.
