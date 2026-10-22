@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUserId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUserId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUserId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the primary identifiers of the user a NON-primary unique identifier names:
+//! the stored user is looked up through the identity store's own indexes and its
+//! persisted `UserId` / `UserArn` are reported. Nothing is echoed from the request and
+//! no user is created — the operation is `@readonly`.
 //!
 //! ## Shape of an operation
 //!
@@ -101,11 +97,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `GetUserIdError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#GetUserId")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#GetUserId",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetUserIdErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -157,20 +160,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUserId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUserIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUserId"))
+        // The identifier is understood BEFORE any state is touched: a path this service
+        // resolves no user by is a syntax error in the request, which is a 400 whether
+        // or not the identity store exists.
+        let selector = UserSelector::from_identifier(&input.alternate_identifier)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetUserIdErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        // A read: the store is looked up rather than vivified, so resolving a user id
+        // can never change what a later caller sees.
+        let state = state.lock();
+        let store = state
+            .store(&input.identity_store_id)
+            .ok_or_else(|| selector.not_found())?;
+        let user = selector.find(store).ok_or_else(|| selector.not_found())?;
+
+        Ok(GetUserIdOutput {
+            identity_store_id: store.identity_store_id.clone(),
+            user_id: user.user_id.clone(),
+            user_arn: user.user_arn.clone(),
+        })
+    }
+}
+
+/// The unique-attribute paths this operation resolves a user by.
+///
+/// From the modelled doc of `GetUserIdRequest$AlternateIdentifier`
+/// (`smithy_query(query="doc",shape="GetUserIdRequest",member="AlternateIdentifier")`):
+/// "For the unique attribute, the only valid paths are `userName` and `emails.value`."
+/// Any other path — a group's `displayName`, a user member that is not a uniqueness
+/// claim — is refused rather than searched.
+const USER_UNIQUE_ATTRIBUTE_PATHS: &[&str] = &["userName", "emails.value"];
+
+/// What a request's `AlternateIdentifier` resolves a user by, once it is understood.
+///
+/// Holding the value here (rather than re-reading the union at each use) is what lets
+/// the "not found" answer name the attribute without ever naming the value: `UserName`
+/// and an `Email`'s `Value` are `@sensitive` in the model, so neither belongs in an
+/// error message. It derives no `Debug` for the same reason: the values it holds are
+/// sensitive, so there is deliberately no way to format them.
+enum UserSelector {
+    /// The user whose stored `UserName` is exactly this value.
+    UserName(String),
+    /// The user one of whose stored `Emails` carries exactly this `Value`.
+    EmailValue(String),
+    /// The user carrying this external identifier (issuer, then id).
+    ExternalId(String, String),
+}
+
+impl UserSelector {
+    /// The selector a request's `AlternateIdentifier` names, or the modelled
+    /// `ValidationException` when this service resolves no user by it.
+    fn from_identifier(identifier: &AlternateIdentifier) -> Result<Self, GetUserIdError> {
+        match identifier {
+            AlternateIdentifier::ExternalId(external) => {
+                Ok(Self::ExternalId(external.issuer.clone(), external.id.clone()))
+            }
+            AlternateIdentifier::UniqueAttribute(attribute) => {
+                // SCIM attribute NAMES are case-insensitive (RFC 7643 §2.1, the schema
+                // these attributes come from), so the path is compared ignoring case
+                // while the VALUE is compared exactly — a value is data, not a name.
+                let path = USER_UNIQUE_ATTRIBUTE_PATHS
+                    .iter()
+                    .find(|supported| supported.eq_ignore_ascii_case(&attribute.attribute_path))
+                    .ok_or_else(|| {
+                        Self::validation(format!(
+                            "AlternateIdentifier.UniqueAttribute.AttributePath must be one of {}",
+                            USER_UNIQUE_ATTRIBUTE_PATHS.join(", ")
+                        ))
+                    })?;
+                // Both supported attributes are string-typed in the model (`UserName`,
+                // `Email$Value`), so the document carrying the value has to be a
+                // string: a number, a boolean or a nested document names no user.
+                let ::aws_smithy_types::Document::String(value) = &attribute.attribute_value else {
+                    return Err(Self::validation(format!(
+                        "AlternateIdentifier.UniqueAttribute.AttributeValue must be a string for \
+                         AttributePath {path}, got {}",
+                        document_kind(&attribute.attribute_value)
+                    )));
+                };
+                Ok(if path.eq_ignore_ascii_case("userName") {
+                    Self::UserName(value.clone())
+                } else {
+                    Self::EmailValue(value.clone())
+                })
+            }
+        }
+    }
+
+    /// Which identifier this selector used, for the not-found message: the identifier
+    /// and the attribute it named, never the value, which is `@sensitive` in every
+    /// form.
+    fn subject(&self) -> &'static str {
+        match self {
+            Self::UserName(_) => "UniqueAttribute userName",
+            Self::EmailValue(_) => "UniqueAttribute emails.value",
+            Self::ExternalId(..) => "ExternalId",
+        }
+    }
+
+    /// The user `store` holds for this selector, or `None` when it holds none.
+    ///
+    /// The three lookups live in THIS file rather than in `state.rs`: they are reached
+    /// by this operation alone, and the crate's shared state module is the file every
+    /// other identity-store operation also edits. `userName` goes through the store's
+    /// `user_name_index` — the same index `CreateUser` enforces its uniqueness claim
+    /// with — so a name resolves to the one user that currently holds it and never to a
+    /// stale one. The other two are not indexed uniqueness claims in this slice, so
+    /// they scan and take the EARLIEST-created match (ties broken by `UserId`): a store
+    /// that does hold two matches answers the same user on every call instead of
+    /// following the hash map's iteration order.
+    fn find<'store>(
+        &self,
+        store: &'store crate::state::IdentityStoreData,
+    ) -> Option<&'store crate::state::User> {
+        match self {
+            Self::UserName(user_name) => store
+                .user_name_index
+                .get(user_name)
+                .and_then(|user_id| store.users.get(user_id)),
+            Self::EmailValue(value) => earliest_user(store.users.values().filter(|user| {
+                user.emails
+                    .iter()
+                    .any(|email| email.value.as_deref() == Some(value.as_str()))
+            })),
+            // No modelled operation of this slice writes a user's external ids (they
+            // come from an identity provider's provisioning), so today this resolves
+            // nothing — but it is the lookup, not a hard-coded refusal, so it starts
+            // answering the moment a provisioning path stores one.
+            Self::ExternalId(issuer, id) => earliest_user(store.users.values().filter(|user| {
+                user.external_ids
+                    .iter()
+                    .any(|external| external.issuer == *issuer && external.id == *id)
+            })),
+        }
+    }
+
+    /// The modelled `ResourceNotFoundException` for a store that holds no such user:
+    /// the shared shaping of that error, so this operation and `GetGroupId` answer one
+    /// form of it.
+    fn not_found(&self) -> GetUserIdErrorModeled {
+        GetUserIdErrorModeled::ResourceNotFoundException(
+            crate::state::not_found_by_alternate_identifier(
+                crate::state::ResourceKind::User,
+                self.subject(),
+            ),
+        )
+    }
+
+    /// The modelled `ValidationException` (HTTP 400) for an identifier this service
+    /// resolves no user by. The model declares that shape on this operation, so the
+    /// modelled error is used rather than the scaffold's synthetic one. `Reason` is
+    /// left unset: every modelled `ValidationExceptionReason` value is about a KMS key
+    /// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), none of which
+    /// is this.
+    fn validation(message: String) -> GetUserIdError {
+        GetUserIdErrorModeled::ValidationException(ValidationException {
+            message: Some(message),
+            ..Default::default()
+        })
+        .into()
+    }
+}
+
+/// The earliest-created user of `candidates`, ties broken by `UserId` so the choice is
+/// total and independent of the order a hash map is walked in.
+fn earliest_user<'store>(
+    candidates: impl Iterator<Item = &'store crate::state::User>,
+) -> Option<&'store crate::state::User> {
+    candidates.min_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.user_id.cmp(&right.user_id))
+    })
+}
+
+/// The kind of a document, for the message of a refusal that must not quote the value
+/// itself.
+fn document_kind(document: &::aws_smithy_types::Document) -> &'static str {
+    match document {
+        ::aws_smithy_types::Document::Object(_) => "an object",
+        ::aws_smithy_types::Document::Array(_) => "a list",
+        ::aws_smithy_types::Document::Number(_) => "a number",
+        ::aws_smithy_types::Document::String(_) => "a string",
+        ::aws_smithy_types::Document::Bool(_) => "a boolean",
+        ::aws_smithy_types::Document::Null => "null",
     }
 }
