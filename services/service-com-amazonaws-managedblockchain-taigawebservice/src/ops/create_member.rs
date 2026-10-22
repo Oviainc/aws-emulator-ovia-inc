@@ -195,13 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // copied out here, so the write path can take the single mutable borrow it needs.
         let Some(network) = guard.networks.get(&input.network_id) else {
             return Err(CreateMemberErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Network {} not found.", input.network_id)),
-                    // `ResourceNotFoundException$ResourceName` is an `ArnString`
-                    // (`^arn:.+:.+:.+:.+:.+$`), so it names the requested resource in ARN
-                    // form rather than by bare id.
-                    resource_name: Some(crate::state::network_arn(&region, &input.network_id)),
-                },
+                // `crate::state::not_found` is the one construction for a resource this
+                // request named BY ID and this service does not hold: the identification
+                // travels in `Message` and `ResourceName` is OMITTED, because a lookup
+                // that found nothing has no stored ARN to report.
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
             .into());
         };
@@ -255,16 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             invitation.principal == account && invitation.network_id == input.network_id
         }) else {
             return Err(CreateMemberErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Invitation {} not found for network {}.",
-                        input.invitation_id, input.network_id
-                    )),
-                    resource_name: Some(crate::state::invitation_arn(
-                        &region,
-                        &input.invitation_id,
-                    )),
-                },
+                // The invitation is named by id, so — exactly as for the network above —
+                // `ResourceName` is left absent rather than defaulted to the ARN of some
+                // other resource (the path-bound network, which exists).
+                crate::state::not_found(crate::state::RESOURCE_INVITATION, &input.invitation_id),
             )
             .into());
         };

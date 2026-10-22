@@ -1091,6 +1091,15 @@ async fn create_member_refuses_an_unresolvable_network_or_invitation() {
             "case {case}: a refusal mints no member, got {:?}",
             answer.body
         );
+        // The resource the request named by id was not found, so there is no ARN to
+        // report: `ResourceNotFoundException$ResourceName` stays absent rather than
+        // carrying the ARN of some other resource the request mentioned.
+        assert_eq!(
+            answer.body.get("ResourceName"),
+            None,
+            "case {case}: expected no ResourceName member, got {:?}",
+            answer.body
+        );
     }
 
     // Nothing was created by any refusal: the unknown network is still unknown, and the
