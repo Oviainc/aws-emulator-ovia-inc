@@ -142,7 +142,7 @@ pub mod paths {
     /// The `policyStoreId` every operation in this service takes.
     pub const POLICY_STORE_ID: &str = "/policyStoreId";
     /// The pagination cursor a `@paginated` list operation of this service takes
-    /// (`ListPolicies`, `ListIdentitySources`).
+    /// (`ListPolicies`, `ListIdentitySources`, `ListPolicyStoreAliases`).
     pub const NEXT_TOKEN: &str = "/nextToken";
     /// `CreatePolicyStoreAlias`' alias name.
     pub const ALIAS_NAME: &str = "/aliasName";
