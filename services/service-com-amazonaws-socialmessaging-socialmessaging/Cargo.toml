@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Digest behind the minted waba-/phone-number-id-/message ids, so each one is
+# unique per call without hand-rolling a hash.
+sha2 = { workspace = true }
+# Renders that digest as the lowercase hex the model's id patterns expect.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
