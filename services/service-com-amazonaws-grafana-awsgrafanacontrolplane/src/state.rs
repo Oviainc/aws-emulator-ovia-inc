@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AuthenticationSummary, NetworkAccessConfiguration, ResourceNotFoundException, VpcConfiguration,
-    WorkspaceDescription, WorkspaceSummary,
+    AuthenticationDescription, AuthenticationSummary, AwsSsoAuthentication,
+    NetworkAccessConfiguration, ResourceNotFoundException, SamlAuthentication, SamlConfiguration,
+    VpcConfiguration, WorkspaceDescription, WorkspaceSummary,
 };
 
 /// The Grafana versions this emulator supports, OLDEST FIRST.
@@ -50,6 +51,22 @@ pub const DEFAULT_WORKSPACE_CONFIGURATION: &str = "{}";
 /// The region a workspace endpoint is built for when the request carries no
 /// SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The `AuthenticationProviderTypes` value naming SAML 2.0 authentication, one
+/// of the two that enum admits (`AWS_SSO`, `SAML`).
+pub const SAML_PROVIDER: &str = "SAML";
+
+/// The `AuthenticationProviderTypes` value naming IAM Identity Center
+/// authentication.
+pub const AWS_SSO_PROVIDER: &str = "AWS_SSO";
+
+/// `SamlConfigurationStatus$CONFIGURED`: "SAML on an AMG workspace is enabled
+/// and has been configured".
+pub const SAML_CONFIGURED: &str = "CONFIGURED";
+
+/// `SamlConfigurationStatus$NOT_CONFIGURED`: "SAML on an AMG workspace is
+/// enabled but has not been configured".
+pub const SAML_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
 
 /// The `resourceType` a `ResourceNotFoundException` reports for a workspace id
 /// that names no workspace.
@@ -124,6 +141,12 @@ pub struct Workspace {
     /// The `OverridableConfigurationJson` document the workspace was created or
     /// updated with.
     pub configuration: String,
+    /// The SAML configuration stored for this workspace, if one has been
+    /// stored. `UpdateWorkspaceAuthentication` is the only operation that
+    /// carries a `samlConfiguration`, so this is unset until it is called —
+    /// which is what makes a SAML workspace's `samlConfigurationStatus`
+    /// `NOT_CONFIGURED` until then.
+    pub saml_configuration: Option<SamlConfiguration>,
     /// Set by `AssociateLicense`; unset until then.
     pub license_type: Option<String>,
     pub tags: BTreeMap<String, String>,
@@ -149,18 +172,63 @@ impl Workspace {
         self.pending = None;
     }
 
+    /// True when `provider` is one of this workspace's stored authentication
+    /// providers.
+    fn authenticates_with(&self, provider: &str) -> bool {
+        self.authentication_providers.iter().any(|p| p == provider)
+    }
+
+    /// `SamlConfigurationStatus` for this workspace: "whether the workspace's
+    /// SAML configuration is complete", which it is exactly once a SAML
+    /// configuration has been stored for it.
+    fn saml_configuration_status(&self) -> String {
+        if self.saml_configuration.is_some() {
+            SAML_CONFIGURED.to_string()
+        } else {
+            SAML_NOT_CONFIGURED.to_string()
+        }
+    }
+
     /// `AuthenticationSummary` for this workspace.
     ///
-    /// `samlConfigurationStatus` reports "whether the workplace's user
-    /// authentication method is fully configured", so it is reported only for a
-    /// workspace that authenticates with SAML at all. A SAML configuration can
-    /// only arrive through `UpdateWorkspaceAuthentication`, which is still a
-    /// stub (its own gap issue), so a SAML workspace is never configured yet.
+    /// `samlConfigurationStatus` reports whether the workspace's SAML
+    /// configuration is complete, so it is reported only for a workspace that
+    /// authenticates with SAML at all.
     fn authentication(&self) -> AuthenticationSummary {
-        let uses_saml = self.authentication_providers.iter().any(|p| p == "SAML");
         AuthenticationSummary {
             providers: self.authentication_providers.clone(),
-            saml_configuration_status: uses_saml.then(|| "NOT_CONFIGURED".to_string()),
+            saml_configuration_status: self
+                .authenticates_with(SAML_PROVIDER)
+                .then(|| self.saml_configuration_status()),
+        }
+    }
+
+    /// The `AuthenticationDescription` `DescribeWorkspaceAuthentication` and
+    /// `UpdateWorkspaceAuthentication` return.
+    ///
+    /// `providers` is the stored provider list; `saml` describes "how this
+    /// workspace works with SAML" and `awsSso` "how this workspace works with
+    /// IAM Identity Center", so each is reported exactly when the workspace
+    /// authenticates with that provider.
+    pub fn to_authentication_description(&self) -> AuthenticationDescription {
+        AuthenticationDescription {
+            providers: self.authentication_providers.clone(),
+            saml: self
+                .authenticates_with(SAML_PROVIDER)
+                .then(|| SamlAuthentication {
+                    status: self.saml_configuration_status(),
+                    configuration: self.saml_configuration.clone(),
+                }),
+            aws_sso: self
+                .authenticates_with(AWS_SSO_PROVIDER)
+                .then_some(AwsSsoAuthentication {
+                    // `ssoClientId` is "the ID of the IAM Identity Center-managed
+                    // application that is created by Amazon Managed Grafana".
+                    // That application is minted in IAM Identity Center, which
+                    // this emulator does not model, so the optional member is
+                    // omitted rather than invented.
+                    sso_client_id: None,
+                }),
         }
     }
 

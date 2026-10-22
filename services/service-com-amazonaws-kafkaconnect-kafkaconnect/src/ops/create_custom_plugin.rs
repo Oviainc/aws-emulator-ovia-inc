@@ -176,6 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
+        // The plugin's file is named by an S3 bucket ARN plus a key; a
+        // `bucketArn` that is not an ARN at all names no bucket, so the request
+        // is refused rather than stored. The model types the member as a plain
+        // `__string`, so the framework cannot refuse it at the boundary.
+        if !crate::state::is_arn_for(
+            &input.location.s3_location.bucket_arn,
+            crate::state::S3_ARN_SERVICE,
+        ) {
+            return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "bucketArn",
+                    crate::state::INVALID_ARN,
+                )),
+            })
+            .into());
+        }
+
         if let Some(existing) = state.custom_plugin_named(&input.name) {
             return Err(CreateCustomPluginErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
