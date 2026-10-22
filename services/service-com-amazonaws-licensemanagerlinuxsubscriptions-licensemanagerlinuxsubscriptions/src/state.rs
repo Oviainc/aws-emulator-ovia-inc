@@ -122,6 +122,24 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         })
     }
 
+    /// The metadata tags of the resource `arn` addresses, or `None` when this account
+    /// holds no such resource.
+    ///
+    /// The tag APIs accept a `SubscriptionProviderArn`, so a registered subscription
+    /// provider is the only resource of this service they can address: every tag
+    /// operation resolves its `resourceArn` through this one lookup (and
+    /// [`resource_tags_mut`](Self::resource_tags_mut)) rather than reaching into
+    /// `providers` itself, so what one of them writes is what the next one reports.
+    pub fn resource_tags(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        self.providers.get(arn).map(|record| &record.tags)
+    }
+
+    /// The metadata tags of the resource `arn` addresses, for a tag write to modify in
+    /// place; `None` when this account holds no such resource.
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        self.providers.get_mut(arn).map(|record| &mut record.tags)
+    }
+
     /// Remove a registration from the store and from every index that reaches it.
     pub fn remove_provider(&mut self, arn: &str) -> Option<SubscriptionProviderRecord> {
         let record = self.providers.remove(arn)?;
@@ -162,6 +180,14 @@ pub const MAX_PROVIDERS: usize = 5_000;
 /// The largest number of home Regions the settings may aggregate data in: the modelled
 /// `HomeRegions` list is `len 1..100`, so a 101st home Region could not be reported.
 pub const MAX_HOME_REGIONS: usize = 100;
+
+/// The largest number of metadata tags one of this service's resources carries.
+///
+/// The modelled `Tags` map is `len 0..50` — both as `TagResource`'s input and as
+/// `ListTagsForResource`'s output — so a resource holding a 51st tag could not be
+/// reported by the operation that lists its tags. A tag write whose RESULTANT set would
+/// pass this bound is therefore refused instead of being stored.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// What `GetServiceSettings` and `UpdateServiceSettings` report for this account.
 ///
