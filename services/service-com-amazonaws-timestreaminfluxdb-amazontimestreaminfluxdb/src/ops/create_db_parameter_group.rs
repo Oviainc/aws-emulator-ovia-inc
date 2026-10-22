@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDbParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDbParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDbParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a DB parameter group, mints its id and ARN, and persists it in this
+//! service's state so `GetDbParameterGroup` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +161,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDbParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDbParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDbParameterGroup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateDbParameterGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+
+        // The store is bounded: past the emulator's own cardinality bound a create is
+        // refused with the modelled quota error instead of growing the state without end.
+        if state.db_parameter_groups.len() >= st::DB_PARAMETER_GROUP_QUOTA {
+            return Err(
+                CreateDbParameterGroupErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the maximum of {} DB parameter groups for this account and \
+                             Region has been reached",
+                            st::DB_PARAMETER_GROUP_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A parameter group name is unique per customer and PER REGION (see `name` in
+        // the modeled contract above), so a second create under a taken name in the same
+        // region conflicts, while the same name in another region is a new group.
+        if let Some(existing_id) = state.db_parameter_group_id_for_name(&region, &input.name) {
+            return Err(CreateDbParameterGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!("DB parameter group {} already exists", input.name),
+                    resource_id: existing_id.clone(),
+                    resource_type: st::RESOURCE_TYPE_DB_PARAMETER_GROUP.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_db_parameter_group_id(&input.name, &region);
+        let record = st::DbParameterGroup {
+            arn: st::db_parameter_group_arn(&region, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            region: region.clone(),
+            description: input.description,
+            parameters: input.parameters,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+        };
+
+        let output = record.to_create_output();
+        state.claim_db_parameter_group_name(&region, &input.name, id.clone());
+        state.db_parameter_groups.insert(id, record);
+        Ok(output)
     }
 }

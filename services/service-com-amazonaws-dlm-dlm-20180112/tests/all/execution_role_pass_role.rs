@@ -10,8 +10,8 @@
 //! > — one in another account, or one that is not a role — is refused with the
 //! > error code `AccessDeniedException` (HTTP 403) and changes no state, while a
 //! > value that is not a well-formed IAM ARN at all names no principal to
-//! > authorize and stays the member's own shape refusal (`ValidationException`,
-//! > HTTP 400).
+//! > authorize and stays the member's own shape refusal (this service's modelled
+//! > `InvalidRequestException`, HTTP 400).
 //!
 //! Every row goes through the router, so each case exercises routing, the
 //! authorization step, the member-constraint walk and the handler — the same path
@@ -32,10 +32,10 @@ const REGION: &str = "eu-west-1";
 const ACCESS_DENIED: &str = "AccessDeniedException";
 const ACCESS_DENIED_STATUS: u16 = 403;
 
-/// The error code the framework refuses a value outside a modelled constraint
-/// with, and its status.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
-const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+/// The error code this service refuses a value outside a modelled constraint
+/// with, and the status its `@httpError` declares.
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+const INVALID_REQUEST_EXCEPTION_STATUS: u16 = 400;
 
 /// What the service must answer for one `ExecutionRoleArn`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,16 +320,22 @@ async fn create_authorizes_the_execution_role_it_is_given() {
             }
             Expected::Malformed => {
                 assert_eq!(
-                    answer.status, VALIDATION_EXCEPTION_STATUS,
-                    "case {case:?} ({role}): expected HTTP {VALIDATION_EXCEPTION_STATUS}, got {} \
-                     with {:?}",
+                    answer.status, INVALID_REQUEST_EXCEPTION_STATUS,
+                    "case {case:?} ({role}): expected HTTP {INVALID_REQUEST_EXCEPTION_STATUS}, \
+                     got {} with {:?}",
                     answer.status, answer.body
                 );
                 assert_eq!(
                     answer.error_code(),
-                    VALIDATION_EXCEPTION,
-                    "case {case:?} ({role}): expected {VALIDATION_EXCEPTION}, got {:?}",
+                    INVALID_REQUEST_EXCEPTION,
+                    "case {case:?} ({role}): expected {INVALID_REQUEST_EXCEPTION}, got {:?}",
                     answer.error_code()
+                );
+                assert_eq!(
+                    answer.body["Code"],
+                    json!("InvalidParameter"),
+                    "case {case:?} ({role}): the refusal must carry the modelled Code, got {:?}",
+                    answer.body
                 );
                 assert_eq!(
                     after, before,
@@ -376,7 +382,10 @@ async fn update_authorizes_the_execution_role_it_is_given() {
         let (status, code) = match expected {
             Expected::Passed => (200, ""),
             Expected::Denied => (ACCESS_DENIED_STATUS, ACCESS_DENIED),
-            Expected::Malformed => (VALIDATION_EXCEPTION_STATUS, VALIDATION_EXCEPTION),
+            Expected::Malformed => (
+                INVALID_REQUEST_EXCEPTION_STATUS,
+                INVALID_REQUEST_EXCEPTION,
+            ),
         };
         assert_eq!(
             answer.status, status,

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateThingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateThingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateThingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +143,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateThingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateThingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateThingGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateThingGroupErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // Everything about the group that is NOT its name, in the form the registry
+        // keeps it and compares it: absent properties (or properties carrying no
+        // `attributePayload`, or a payload carrying no `attributes`) are the empty
+        // attribute map, which is what the group then has.
+        let properties = input.thing_group_properties.unwrap_or_default();
+        let requested = crate::state::ThingGroupConfiguration {
+            parent_group_name: input.parent_group_name,
+            description: properties.thing_group_description,
+            attributes: properties
+                .attribute_payload
+                .and_then(|payload| payload.attributes)
+                .map(|attributes| attributes.into_iter().collect())
+                .unwrap_or_default(),
+        };
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value
+        // given for a key is the one the resource carries.
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+
+        // A group's place in the hierarchy is a reference to another group, so the
+        // parent has to be a group that EXISTS, and a group cannot be its own parent.
+        // `CreateThingGroup` models no `ResourceNotFoundException`
+        // (`smithy_query(query="operation",operation="CreateThingGroup")` lists
+        // InternalFailure, InvalidRequest, ResourceAlreadyExists and Throttling), so
+        // an unresolvable hierarchy is refused with the modelled
+        // `InvalidRequestException` ("The request is not valid", HTTP 400) naming the
+        // member at fault.
+        if let Some(parent_group_name) = &requested.parent_group_name {
+            if *parent_group_name == input.thing_group_name {
+                return Err(CreateThingGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "parentGroupName {parent_group_name} cannot name the thing group being created"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !store.thing_groups.contains_key(parent_group_name) {
+                return Err(CreateThingGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Thing group {parent_group_name} named by parentGroupName does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // What is already registered under this name decides the call, per the
+        // operation's own documentation: "If the ThingGroup that you create has the
+        // exact same attributes as an existing ThingGroup, you will get a 200 success
+        // response." A name taken by a group configured differently is the modelled
+        // `ResourceAlreadyExistsException` (HTTP 409).
+        if let Some(existing) = store.thing_groups.get(&input.thing_group_name) {
+            if existing.configuration != requested {
+                return Err(CreateThingGroupErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "Thing group {} already exists with a different configuration",
+                            existing.thing_group_name
+                        )),
+                        resource_id: Some(existing.thing_group_name.clone()),
+                        resource_arn: Some(existing.thing_group_arn.clone()),
+                    },
+                )
+                .into());
+            }
+            // The repeat create names the SAME group: it mints no new identity and
+            // writes nothing, and answers from the stored record — so a client that
+            // retried a create keeps the id and ARN it was handed the first time.
+            return Ok(CreateThingGroupOutput {
+                thing_group_name: Some(existing.thing_group_name.clone()),
+                thing_group_arn: Some(existing.thing_group_arn.clone()),
+                thing_group_id: Some(existing.thing_group_id.clone()),
+            });
+        }
+
+        let thing_group_arn = crate::state::thing_group_arn(&region, &input.thing_group_name);
+        let group = crate::state::RegisteredThingGroup::new(
+            input.thing_group_name,
+            store.mint_thing_group_id(),
+            thing_group_arn,
+            requested,
+            tags,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The response is built from the record that is about to be persisted, so
+        // what this call reports and what the next `DescribeThingGroup` reads are one
+        // value, not two that could drift.
+        let output = CreateThingGroupOutput {
+            thing_group_name: Some(group.thing_group_name.clone()),
+            thing_group_arn: Some(group.thing_group_arn.clone()),
+            thing_group_id: Some(group.thing_group_id.clone()),
+        };
+        store
+            .thing_groups
+            .insert(group.thing_group_name.clone(), group);
+        Ok(output)
     }
 }

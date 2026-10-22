@@ -229,16 +229,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Every branch below records the call through `crate::state::audit`, so one log
+        // reader sees the whole slice's traffic and not only its state changes.
         // Same rule as `GetWorkflow`: no object store means no export to sign, so the
         // request is refused rather than answered 200 with the member unset.
         if input.export.as_deref().is_some_and(|export| !export.is_empty()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotImplemented,
+                Some(&input.id),
+            );
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "GetRun with an export requested",
             ));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
             GetRunErrorModeled::InternalServerException(InternalServerException {
                 message: "the omics run store is unavailable".to_string(),
             })
@@ -249,10 +262,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now_ms);
 
         let run = store.run(&input.id).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
             GetRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: format!("no run with id {} exists in this region", input.id),
             })
         })?;
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&run.id),
+        );
 
         Ok(GetRunOutput {
             arn: Some(run.arn.clone()),

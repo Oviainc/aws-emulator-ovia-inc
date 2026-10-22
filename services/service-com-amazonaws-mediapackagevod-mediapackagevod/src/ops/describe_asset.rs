@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = store.lock();
         let Some(stored) = state.assets.get(&input.id) else {
             return Err(DescribeAssetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Asset with Id {} does not exist.", input.id)),
+                message: Some(crate::scaffolded::not_found_message("Asset", &input.id)),
             })
             .into());
         };

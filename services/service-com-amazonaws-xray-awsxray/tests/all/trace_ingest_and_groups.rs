@@ -36,163 +36,16 @@
 //!   `LimitExceeded`, or as an eviction — never silently exceeded.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// One emulator with an empty store. `pub(crate)` so a sibling suite in this
-/// same test target drives the one front door rather than standing up a second
-/// copy of it.
-pub(crate) struct Xray {
-    router: MultiServiceRouter,
-}
-
-/// The region every unsigned-scope call lands in, which is also the region the
-/// service falls back to when a request names none.
-pub(crate) const DEFAULT_REGION: &str = "us-east-1";
-
-/// What one call answered.
-#[derive(Debug)]
-pub(crate) struct Answer {
-    pub(crate) status: u16,
-    /// restJson1 resolves an error shape from `x-amzn-errortype`.
-    pub(crate) error_type: Option<String>,
-    pub(crate) body: Value,
-}
-
-impl Answer {
-    /// A member of the response body, or `Value::Null`.
-    pub(crate) fn get(&self, member: &str) -> &Value {
-        self.body.get(member).unwrap_or(&Value::Null)
-    }
-}
-
-impl Xray {
-    pub(crate) fn new() -> Self {
-        Self::with_engine().0
-    }
-
-    /// One emulator and the engine it was mounted on, for a test that has to
-    /// seed state no operation in the API writes.
-    pub(crate) fn with_engine() -> (Self, Arc<engine::InMemoryEngine>) {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.register_service(service_com_amazonaws_xray_awsxray::EmulatedService::new(
-            Arc::clone(&engine),
-        ));
-        // These tests exercise handlers, not SigV4; the signing name still has to
-        // route, which the `Host` header below does.
-        router.set_request_authentication(false);
-        (Self { router }, engine)
-    }
-
-    pub(crate) async fn call(&self, path: &str, body: &Value) -> Answer {
-        self.call_in_region(DEFAULT_REGION, path, body).await
-    }
-
-    /// The same call, signed for `region`.
-    ///
-    /// The region a handler works in comes from the request's SigV4 credential
-    /// scope, so this is how a case addresses another region: the `Authorization`
-    /// header carries the scope even though signature verification is off.
-    pub(crate) async fn call_in_region(&self, region: &str, path: &str, body: &Value) -> Answer {
-        let request = ::http::Request::builder()
-            .method("POST")
-            .uri(format!("https://xray.{region}.amazonaws.com{path}"))
-            .header("host", format!("xray.{region}.amazonaws.com"))
-            .header("content-type", "application/json")
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/{region}/xray/aws4_request, \
-                     SignedHeaders=host, Signature=not-verified"
-                ),
-            )
-            .body(::bytes::Bytes::from(body.to_string()))
-            .expect("the request builds");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_type = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-        Answer {
-            status,
-            error_type,
-            body,
-        }
-    }
-
-    pub(crate) async fn put_segments(&self, documents: &[String]) -> Answer {
-        self.call("/TraceSegments", &json!({ "TraceSegmentDocuments": documents }))
-            .await
-    }
-
-    async fn summaries(&self, start: f64, end: f64, token: Option<&str>) -> Answer {
-        let mut body = json!({ "StartTime": start, "EndTime": end });
-        if let Some(token) = token {
-            body["NextToken"] = json!(token);
-        }
-        self.call("/TraceSummaries", &body).await
-    }
-
-    async fn batch_get(&self, ids: &[String], token: Option<&str>) -> Answer {
-        let mut body = json!({ "TraceIds": ids });
-        if let Some(token) = token {
-            body["NextToken"] = json!(token);
-        }
-        self.call("/Traces", &body).await
-    }
-
-    async fn get_groups(&self, token: Option<&str>) -> Answer {
-        let mut body = json!({});
-        if let Some(token) = token {
-            body["NextToken"] = json!(token);
-        }
-        self.call("/Groups", &body).await
-    }
-}
-
-/// Floating-point seconds compare: the values travel as JSON doubles.
-pub(crate) fn close(actual: f64, expected: f64) -> bool {
-    (actual - expected).abs() < 1e-6
-}
-
-/// A 35-character X-Ray trace id (version, 8 hex, 24 hex), distinct per `n`.
-///
-/// The widths are fixed, so the id stays inside `TraceId`'s modelled `@length`
-/// 1..35 for every `n`, and sorting the ids orders them by `n` — which is what
-/// the pagination cases below rely on.
-pub(crate) fn trace_id(n: u32) -> String {
-    format!("1-{n:08x}-{n:024x}")
-}
-
-/// The JSON array member of `value`, or an empty slice. `pub(crate)` for the
-/// same reason as [`Xray`]: a sibling suite reads responses the same way.
-pub(crate) fn array<'a>(value: &'a Value, member: &str) -> &'a [Value] {
-    value
-        .get(member)
-        .and_then(Value::as_array)
-        .map_or(&[], Vec::as_slice)
-}
-
-/// A root segment document with the given times and optional HTTP status.
-pub(crate) fn root_document(id: &str, trace: &str, name: &str, start: f64, end: Option<f64>) -> Value {
-    let mut document = json!({
-        "trace_id": trace,
-        "id": id,
-        "name": name,
-        "start_time": start,
-    });
-    match end {
-        Some(end) => document["end_time"] = json!(end),
-        None => document["in_progress"] = json!(true),
-    }
-    document
-}
+// The wire harness lives ONCE, in `xray_wire`. Every item it owns is
+// re-exported here as well, so a suite that reaches the harness through this
+// module keeps finding that one definition instead of standing up a second copy
+// of the front door.
+pub(crate) use crate::xray_wire::{
+    array, close, root_document, trace_id, Answer, Xray, DEFAULT_REGION,
+};
 
 // =============================================================================
 // 1. Every TraceSummary / Trace field is recomputed from the stored segments
@@ -327,6 +180,11 @@ fn trace_cases() -> Vec<TraceCase> {
             annotation_keys: vec![],
         },
         TraceCase {
+            // 429 is IN the 400 series, so a throttled request is reported by
+            // both flags: `$HasThrottle` ("a 429 throttling error") and
+            // `$HasError` ("a 400 series error"), which the model does not make
+            // exclusive. Only the COUNTERS split it
+            // (`ErrorStatistics$ThrottleCount` rather than `$OtherCount`).
             case: "a 429 response is a throttle and a 400-series error",
             trace: five.clone(),
             documents: vec![json!({
@@ -607,8 +465,9 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
         .to_string();
 
     // Each row is a different way of being unreadable; the expected ErrorCode
-    // comes from `crate::state`'s three codes, and the reported Id is the
-    // document's own `id` when it carried one.
+    // is X-Ray's own (`ParseError`, or `Missing`/`Invalid` plus the member in
+    // PascalCase), and the reported Id is the document's own `id` when it
+    // carried one.
     let rows: Vec<(&str, String, &str, Option<&str>)> = vec![
         (
             "not JSON at all",
@@ -632,40 +491,54 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
             "missing trace_id",
             json!({"id": "cccccccccccccccc", "name": "x", "start_time": 1.0_f64})
                 .to_string(),
-            "MissingRequiredField",
+            "MissingTraceId",
             Some("cccccccccccccccc"),
         ),
         (
             "missing id",
             json!({"trace_id": trace_id(21), "name": "x", "start_time": 1.0_f64}).to_string(),
-            "MissingRequiredField",
+            "MissingId",
             None,
         ),
         (
             "missing name",
             json!({"trace_id": trace_id(22), "id": "dddddddddddddddd", "start_time": 1.0_f64})
                 .to_string(),
-            "MissingRequiredField",
+            "MissingName",
             Some("dddddddddddddddd"),
         ),
         (
             "missing start_time",
             json!({"trace_id": trace_id(23), "id": "eeeeeeeeeeeeeeee", "name": "x"}).to_string(),
-            "MissingRequiredField",
+            "MissingStartTime",
             Some("eeeeeeeeeeeeeeee"),
         ),
         (
             "trace_id of the wrong JSON type",
             json!({"trace_id": 7, "id": "ffffffffffffffff", "name": "x", "start_time": 1.0_f64})
                 .to_string(),
-            "InvalidField",
+            "InvalidTraceId",
             Some("ffffffffffffffff"),
+        ),
+        (
+            "a trace_id that is not of the documented form",
+            json!({"trace_id": "not-a-trace-id", "id": "1212121212121212", "name": "x", "start_time": 1.0_f64})
+                .to_string(),
+            "InvalidTraceId",
+            Some("1212121212121212"),
+        ),
+        (
+            "a trace_id of the right shape but the wrong lengths",
+            json!({"trace_id": "1-581cf7-a006649127e371903a2de9", "id": "1313131313131313", "name": "x", "start_time": 1.0_f64})
+                .to_string(),
+            "InvalidTraceId",
+            Some("1313131313131313"),
         ),
         (
             "start_time of the wrong JSON type",
             json!({"trace_id": trace_id(24), "id": "0000000000000000", "name": "x", "start_time": "soon"})
                 .to_string(),
-            "InvalidField",
+            "InvalidStartTime",
             Some("0000000000000000"),
         ),
         (
@@ -675,21 +548,21 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
             "start_time further from the epoch than a recorded time can be",
             json!({"trace_id": trace_id(25), "id": "1111000000000000", "name": "x", "start_time": 1e300_f64})
                 .to_string(),
-            "InvalidField",
+            "InvalidStartTime",
             Some("1111000000000000"),
         ),
         (
             "a negative start_time further from the epoch than a recorded time can be",
             json!({"trace_id": trace_id(26), "id": "2222000000000000", "name": "x", "start_time": -1e300_f64})
                 .to_string(),
-            "InvalidField",
+            "InvalidStartTime",
             Some("2222000000000000"),
         ),
         (
             "end_time further from the epoch than a recorded time can be",
             json!({"trace_id": trace_id(27), "id": "3333000000000000", "name": "x", "start_time": 1.0_f64, "end_time": 1e300_f64})
                 .to_string(),
-            "InvalidField",
+            "InvalidEndTime",
             Some("3333000000000000"),
         ),
     ];
@@ -719,12 +592,10 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
             "case {label:?}: expected the reported Id {expected_id:?}, got {:?}",
             unprocessed[0]
         );
-        assert!(
-            unprocessed[0]
-                .get("Message")
-                .and_then(Value::as_str)
-                .is_some_and(|message| !message.is_empty()),
-            "case {label:?}: the rejection must say what was wrong, got {:?}",
+        assert_eq!(
+            unprocessed[0].get("Message").and_then(Value::as_str),
+            Some(format!("Invalid segment. ErrorCode: {expected_code}").as_str()),
+            "case {label:?}: the rejection's Message restates its ErrorCode, got {:?}",
             unprocessed[0]
         );
 
@@ -1261,14 +1132,19 @@ async fn a_next_token_appears_only_when_truncated_and_resumes_exactly_once() {
         "paging GetTraceSummaries must yield every trace exactly once, got {seen:?}"
     );
 
-    // BatchGetTraces over every stored id plus three that were never ingested.
-    let mut requested = stored.clone();
-    let missing: Vec<String> = vec![
-        "1-00000000-000000000000000000000000".to_string(),
-        "1-00000000-000000000000000000000001".to_string(),
-        "1-00000000-000000000000000000000002".to_string(),
-    ];
-    requested.extend(missing.clone());
+    // The same contract over BatchGetTraces, where one call carries at most
+    // `MAX_TRACE_IDS_PER_CALL` ids: the stored ones come back and the ones that
+    // were never ingested are simply not answered for.
+    let requested: Vec<String> = stored
+        .iter()
+        .take(2)
+        .cloned()
+        .chain(vec![
+            "1-00000000-000000000000000000000000".to_string(),
+            "1-00000000-000000000000000000000001".to_string(),
+            "1-00000000-000000000000000000000002".to_string(),
+        ])
+        .collect();
 
     let mut found: Vec<String> = Vec::new();
     let mut unprocessed: Vec<String> = Vec::new();
@@ -1297,12 +1173,13 @@ async fn a_next_token_appears_only_when_truncated_and_resumes_exactly_once() {
         }
     }
     assert_eq!(
-        found, stored,
-        "paging BatchGetTraces must return every stored trace exactly once, got {found:?}"
+        found,
+        stored[..2].to_vec(),
+        "BatchGetTraces must return every stored trace it was asked for exactly once, got {found:?}"
     );
-    assert_eq!(
-        unprocessed, missing,
-        "an id with no stored segments belongs in UnprocessedTraceIds, got {unprocessed:?}"
+    assert!(
+        unprocessed.is_empty(),
+        "a well-formed id with no stored segments is a miss, not an unprocessed id, got {unprocessed:?}"
     );
 }
 
@@ -1441,11 +1318,24 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
             "ValidationException",
         ),
         // Behaviour this slice does not implement is refused, not answered with
-        // an unfiltered 200.
+        // an unfiltered 200, and so is a request that cannot be satisfied at
+        // all.
         (
-            "a FilterExpression this slice does not evaluate",
+            "a FilterExpression that is not of the language",
             "/TraceSummaries",
-            json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "FilterExpression": "fault = true"}),
+            json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "FilterExpression": "fault = true AND ("}),
+            "InvalidRequestException",
+        ),
+        (
+            "an EndTime that precedes StartTime",
+            "/TraceSummaries",
+            json!({"StartTime": 2.0_f64, "EndTime": 1.0_f64}),
+            "InvalidRequestException",
+        ),
+        (
+            "a trace id that is not of the documented form",
+            "/Traces",
+            json!({"TraceIds": ["not-a-trace-id"]}),
             "InvalidRequestException",
         ),
         (
@@ -1591,8 +1481,9 @@ async fn the_options_this_slice_does_serve_are_accepted() {
     let put = xray.put_segments(std::slice::from_ref(&document)).await;
     assert_eq!(put.status, 200, "seeding must succeed, got {put:?}");
 
-    // Rows: the one supported TimeRangeType, sampling explicitly declined, and
-    // an empty FilterExpression — each selects the stored trace.
+    // Rows: the one supported TimeRangeType, sampling explicitly declined, an
+    // empty FilterExpression, and one that selects the stored trace — each
+    // selects it.
     let rows: Vec<(&str, Value)> = vec![
         (
             "the supported TimeRangeType",
@@ -1605,6 +1496,10 @@ async fn the_options_this_slice_does_serve_are_accepted() {
         (
             "an empty FilterExpression",
             json!({"StartTime": 7_999.0_f64, "EndTime": 8_001.0_f64, "FilterExpression": ""}),
+        ),
+        (
+            "a FilterExpression the stored trace satisfies",
+            json!({"StartTime": 7_999.0_f64, "EndTime": 8_001.0_f64, "FilterExpression": "service(\"svc\")"}),
         ),
     ];
 
@@ -1761,19 +1656,24 @@ async fn the_trace_store_evicts_its_least_recently_ingested_trace_when_full() {
         .iter()
         .filter_map(|trace| trace.get("Id").and_then(Value::as_str))
         .collect();
-    let unprocessed: Vec<&str> = array(&read.body, "UnprocessedTraceIds")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
     assert_eq!(
         returned,
         vec![last.as_str()],
         "the most recently ingested trace must still be stored, got {returned:?}"
     );
+    assert!(
+        array(&read.body, "UnprocessedTraceIds").is_empty(),
+        "an evicted trace is a miss like any other, not an unprocessed id, got {:?}",
+        read.get("UnprocessedTraceIds")
+    );
+    let summaries = xray.summaries(10_999.0, 11_001.0, None).await;
+    let count = summaries.get("TracesProcessedCount").as_i64();
+    #[allow(clippy::cast_possible_wrap)]
+    let expected = MAX_TRACES as i64;
     assert_eq!(
-        unprocessed,
-        vec![first.as_str()],
-        "ingesting past {MAX_TRACES} traces evicts the least recently ingested one, got {unprocessed:?}"
+        count,
+        Some(expected),
+        "ingesting past {MAX_TRACES} traces evicts the least recently ingested one, so {MAX_TRACES} remain, got {count:?}"
     );
 }
 

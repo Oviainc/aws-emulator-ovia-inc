@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new template under an existing connector and returns only its ARN.
+//! The per-connector template store is bounded at
+//! [`crate::state::MAX_TEMPLATES_PER_CONNECTOR`] and the idempotency store at
+//! [`crate::state::MAX_IDEMPOTENCY_RECORDS`]; past the template cap the create is
+//! refused with the modelled `ServiceQuotaExceededException` rather than growing
+//! the store.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +174,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTemplate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the pca-connector-ad state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The parent is resolved FIRST, so a request naming a connector this
+        // service does not hold is a 404 whatever else it carries.
+        if !store.connectors.contains_key(&input.connector_arn) {
+            return Err(CreateTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Connector {} not found", input.connector_arn),
+                    resource_id: input.connector_arn.clone(),
+                    resource_type: "Connector".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // @idempotencyToken: a retry carrying an earlier call's ClientToken names
+        // the template that call minted. The key carries the PARENT connector too,
+        // so one token reused against a different connector cannot answer with an
+        // ARN belonging to a resource the caller did not address.
+        let token_key = input.client_token.as_ref().map(|token| {
+            format!("{}:{}:{token}", Self::NAME, input.connector_arn)
+        });
+        if let Some(arn) = token_key.as_ref().and_then(|key| store.idempotency.get(key)) {
+            return Ok(CreateTemplateOutput {
+                template_arn: Some(arn.clone()),
+            });
+        }
+
+        // Template names are unique per connector.
+        if let Some(existing) = store.template_by_name(&input.connector_arn, &input.name) {
+            let resource_id = existing.arn.clone();
+            return Err(CreateTemplateErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Template {} already exists on connector {}",
+                    input.name, input.connector_arn
+                ),
+                resource_id,
+                resource_type: "Template".to_string(),
+            })
+            .into());
+        }
+
+        // The store is bounded per connector: past the cap the create is refused
+        // with the modelled quota error rather than growing the map, so an
+        // unlimited number of distinct names cannot grow this process without
+        // limit.
+        if store.template_count(&input.connector_arn) >= crate::state::MAX_TEMPLATES_PER_CONNECTOR {
+            return Err(CreateTemplateErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "connector {} has reached its bound of {} templates",
+                        input.connector_arn,
+                        crate::state::MAX_TEMPLATES_PER_CONNECTOR
+                    ),
+                    resource_id: input.connector_arn.clone(),
+                    // The resource that HOLDS the exhausted bound is the
+                    // connector named by `resource_id`; no template exists to name.
+                    resource_type: "Connector".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                    quota_code: crate::state::QUOTA_CODE_TEMPLATES_PER_CONNECTOR.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The template schema version is the version of the definition union the
+        // caller supplied: v2, v3 or v4.
+        let policy_schema = match &input.definition {
+            TemplateDefinition::TemplateV2(_) => 2,
+            TemplateDefinition::TemplateV3(_) => 3,
+            TemplateDefinition::TemplateV4(_) => 4,
+        };
+
+        let template_id = crate::state::new_resource_id();
+        let arn = crate::state::template_arn(&input.connector_arn, &template_id);
+        let seq = store.next_seq();
+        let record = crate::state::TemplateRecord {
+            arn: arn.clone(),
+            connector_arn: input.connector_arn,
+            name: input.name,
+            definition: input.definition,
+            object_identifier: crate::state::template_object_identifier(&template_id),
+            policy_schema,
+            // TemplateStatus models only ACTIVE and DELETING, so a created
+            // template is already ACTIVE and the clock owes it no transition.
+            status: crate::state::TEMPLATE_STATUS_ACTIVE.to_string(),
+            // A template starts at its first major revision with no minor edits;
+            // an update increments the minor revision, re-enrolling the major one.
+            revision: TemplateRevision {
+                major_revision: 1,
+                minor_revision: 0,
+            },
+            created_at: now,
+            updated_at: now,
+            tags: input.tags.unwrap_or_default(),
+            seq,
+        };
+        store.templates.insert(arn.clone(), record);
+        if let Some(key) = token_key {
+            store.record_idempotency(key, arn.clone());
+        }
+
+        Ok(CreateTemplateOutput {
+            template_arn: Some(arn),
+        })
     }
 }

@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AdConfiguration, Channel, MultitrackInputConfiguration, RecordingConfiguration,
-    RenditionConfiguration, StreamKey, ThumbnailConfiguration,
+    RenditionConfiguration, Stream, StreamKey, ThumbnailConfiguration,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -30,6 +30,24 @@ pub struct ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// a key to its channel: `ListStreamKeys` filters on it and `DeleteChannel`
     /// drops every key that names the channel it removed.
     pub stream_keys: BTreeMap<String, StreamKey>,
+    /// The stream each channel carries, keyed by the ARN of that channel: a
+    /// channel ingests at most one stream at a time, so its ARN identifies the
+    /// stream. A channel with no entry here — or one whose entry has left the
+    /// `LIVE` state — is not broadcasting, which is the whole distinction
+    /// `GetStream`'s `ChannelNotBroadcasting` answer carries. An entry is only
+    /// ever reported through its channel, and `DeleteChannel` drops it with the
+    /// channel it belongs to.
+    pub streams: BTreeMap<String, Stream>,
+    /// Every viewer-session revocation this store has started, keyed by the
+    /// `(channelArn, viewerId)` pair it names and holding the HIGHEST viewer
+    /// session version revoked for that pair so far. A `BTreeMap` for the same
+    /// reason as the other two: one stable order over the pairs.
+    ///
+    /// `viewerId` comes from the request, so the live channel set does NOT bound
+    /// this map's key space: one channel admits as many pairs as a caller invents
+    /// viewer ids. [`MAX_VIEWER_SESSION_REVOCATIONS`] is what bounds it, enforced
+    /// by [`start_viewer_session_revocation`] — the only writer.
+    pub viewer_session_revocations: BTreeMap<(String, String), i32>,
     /// Every persisted ad configuration, keyed by its ARN. A `BTreeMap` for the
     /// same reason as `channels`: `ListAdConfigurations` is paginated, so the one
     /// stable order is what lets a `nextToken` resume where a page stopped.
@@ -265,6 +283,19 @@ pub const MAX_CHANNELS: usize = 5_000;
 /// See [`MAX_CHANNELS`].
 pub const MAX_STREAM_KEYS_PER_CHANNEL: usize = 100;
 
+/// The ceiling on how many `(channelArn, viewerId)` pairs this store tracks a
+/// viewer-session revocation for — a caller-driven growth path bounded for the same
+/// reason as [`MAX_CHANNELS`]: the store has neither a TTL nor an eviction policy,
+/// and a pair's `viewerId` comes from the request, so nothing else bounds how many
+/// pairs a caller can name. IVS publishes no quota for revocations, so like the
+/// others this number is the emulator's own bound, set high enough that no ordinary
+/// workflow meets it.
+///
+/// [`start_viewer_session_revocation`] enforces it: past the ceiling a pair that is
+/// not already tracked is REFUSED rather than recorded, and the batch form reports
+/// that refusal as the per-item failure it is.
+pub const MAX_VIEWER_SESSION_REVOCATIONS: usize = 10_000;
+
 /// The ceiling on how many ad configurations this store holds. See [`MAX_CHANNELS`]
 /// for why a cap exists at all: `CreateAdConfiguration` is the only thing that adds
 /// one, it never expires, and past the cap the operation answers the
@@ -307,6 +338,147 @@ pub fn mint_stream_key(
     };
     state.stream_keys.insert(arn, key.clone());
     key
+}
+
+/// The `StreamState` of a channel that is ingesting, from the modelled
+/// `StreamState` enum (`LIVE | OFFLINE`, see
+/// [`crate::ops::types::STREAM_STATE_VALUES`]).
+pub const STREAM_STATE_LIVE: &str = "LIVE";
+
+/// The `StreamHealth` of a stream whose ingest session is connected and
+/// delivering, from the modelled `StreamHealth` enum (`HEALTHY | STARVING |
+/// UNKNOWN`, see [`crate::ops::types::STREAM_HEALTH_VALUES`]).
+pub const STREAM_HEALTH_HEALTHY: &str = "HEALTHY";
+
+/// A fresh `StreamId`.
+///
+/// The modelled shape is exactly 26 characters and matches `^st-[a-zA-Z0-9]+$`,
+/// so an id is the `st-` prefix plus 23 characters from that alphabet; hex is a
+/// subset of it, and [`ComAmazonawsIvsAmazoninteractivevideoserviceState::mint_hex`]
+/// never repeats a value.
+fn mint_stream_id(state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState) -> String {
+    let digest = state.mint_hex("stream", 12);
+    format!("st-{}", &digest[..23])
+}
+
+/// The LIVE stream `channel_arn` is currently ingesting, or `None` when that
+/// channel is not broadcasting.
+///
+/// Only a stream in the `LIVE` state is an active one: an entry that has left
+/// that state is a channel whose broadcast has ended, which every operation
+/// about the active stream must treat exactly like a channel that never had one.
+pub fn live_stream(
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+) -> Option<Stream> {
+    state
+        .streams
+        .get(channel_arn)
+        .filter(|stream| stream.state.as_deref() == Some(STREAM_STATE_LIVE))
+        .cloned()
+}
+
+/// Start the stream an ingest session has brought up on `channel_arn`, persist it
+/// and return it.
+///
+/// One place mints a stream, so every operation that reports one answers the same
+/// representation: the stream is bound to the channel it is ingested on, is played
+/// back from that channel's own `playbackUrl`, and starts at the instant the
+/// ingest connected. `viewerCount` is 0 because no playback session is attached to
+/// it yet, and `health` is `HEALTHY` because an ingest session is connected and
+/// delivering — a measurement that would move it to `STARVING` belongs to whoever
+/// is feeding the ingest. A channel that is ALREADY broadcasting keeps the stream
+/// it has: IVS holds one stream per channel, so a second ingest cannot mint a
+/// second stream id for the same channel.
+pub fn start_stream(
+    state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+) -> Stream {
+    if let Some(live) = live_stream(state, channel_arn) {
+        return live;
+    }
+    let playback_url = state
+        .channels
+        .get(channel_arn)
+        .and_then(|channel| channel.playback_url.clone());
+    let stream_id = mint_stream_id(state);
+    let stream = Stream {
+        channel_arn: Some(channel_arn.to_string()),
+        stream_id: Some(stream_id),
+        playback_url,
+        start_time: Some(::aws_smithy_types::DateTime::from(
+            std::time::SystemTime::now(),
+        )),
+        state: Some(STREAM_STATE_LIVE.to_string()),
+        health: Some(STREAM_HEALTH_HEALTHY.to_string()),
+        viewer_count: 0,
+    };
+    state.streams.insert(channel_arn.to_string(), stream.clone());
+    stream
+}
+
+/// The one way [`start_viewer_session_revocation`] can fail: the store is at
+/// [`MAX_VIEWER_SESSION_REVOCATIONS`] and the pair is not one it already tracks.
+///
+/// A type rather than a message, so each caller words the refusal the way its own
+/// response shape needs and the store holds no wire text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewerSessionRevocationCapReached {
+    /// The cap that was reached, so a caller can name it.
+    pub cap: usize,
+}
+
+/// Start revoking `viewer_id`'s sessions on `channel_arn` up to and including
+/// `versions_less_than_or_equal_to`, and answer the version threshold now in force
+/// for that pair — or [`ViewerSessionRevocationCapReached`] when tracking a NEW pair
+/// would take this store past [`MAX_VIEWER_SESSION_REVOCATIONS`], which is the only
+/// way this can fail.
+///
+/// From the model doc on `viewerSessionVersionsLessThanOrEqualTo`: "An optional
+/// filter on which versions of the viewer session to revoke. All versions less than
+/// or equal to the specified version will be revoked." A later call naming a LOWER
+/// version therefore cannot un-revoke what an earlier call already revoked, so the
+/// stored threshold is the maximum over the calls — which also makes a repeated call
+/// idempotent.
+///
+/// Raising an EXISTING pair's threshold adds no entry, so it is never refused: the
+/// cap bounds how many pairs are tracked, not how often one is revoked.
+///
+/// Shared so that every operation that starts a revocation (the single-pair
+/// `StartViewerSessionRevocation` and the batch form that the model documents as
+/// "performs StartViewerSessionRevocation on multiple channel ARN and viewer ID
+/// pairs") writes one record of one form and honours one cap.
+pub fn start_viewer_session_revocation(
+    state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+    viewer_id: &str,
+    versions_less_than_or_equal_to: i32,
+) -> Result<i32, ViewerSessionRevocationCapReached> {
+    let key = (channel_arn.to_string(), viewer_id.to_string());
+    if !state.viewer_session_revocations.contains_key(&key)
+        && state.viewer_session_revocations.len() >= MAX_VIEWER_SESSION_REVOCATIONS
+    {
+        // A record whose channel is gone can never be revoked against again — this
+        // service mints a fresh random id for every channel, so a deleted ARN never
+        // comes back — so those dead records are dropped before the cap is weighed.
+        let ComAmazonawsIvsAmazoninteractivevideoserviceState {
+            channels,
+            viewer_session_revocations,
+            ..
+        } = state;
+        viewer_session_revocations.retain(|(arn, _), _| channels.contains_key(arn));
+        if state.viewer_session_revocations.len() >= MAX_VIEWER_SESSION_REVOCATIONS {
+            return Err(ViewerSessionRevocationCapReached {
+                cap: MAX_VIEWER_SESSION_REVOCATIONS,
+            });
+        }
+    }
+    let threshold = state
+        .viewer_session_revocations
+        .entry(key)
+        .or_insert(versions_less_than_or_equal_to);
+    *threshold = (*threshold).max(versions_less_than_or_equal_to);
+    Ok(*threshold)
 }
 
 /// The `preset` a channel of `channel_type` carries, given the `requested` value.

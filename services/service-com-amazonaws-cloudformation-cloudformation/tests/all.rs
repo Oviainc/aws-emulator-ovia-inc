@@ -23,3 +23,5 @@ mod stack_outputs;
 mod stack_reported_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unprovisioned_resources.rs"]
+mod unprovisioned_resources;

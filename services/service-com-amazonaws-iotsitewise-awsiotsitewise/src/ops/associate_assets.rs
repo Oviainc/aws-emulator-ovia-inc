@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation records a parent -> child association under one of the
+//! parent asset model's hierarchies in the shared engine store (`crate::state`); this is
+//! the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -198,20 +192,222 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateAssets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable")
+        })?;
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> outcome mapping, so a retry with the same token is judged on the
+        // state it finds, exactly like a first call. Deliberately left to the
+        // idempotency issue rather than half-done here, as `CreateAsset` leaves it.
+        let mut store = state.lock();
+
+        // Each of the three ids is a `CustomID` label: the raw UUID or the
+        // `externalId:<externalId>` alias form. A label that names no stored resource
+        // is a modelled refusal, never an unwind.
+        let parent_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
+            not_found(format!("The asset {} could not be found.", input.asset_id))
+        })?;
+        let child_id = store.resolve_asset_id(&input.child_asset_id).ok_or_else(|| {
+            not_found(format!(
+                "The asset {} could not be found.",
+                input.child_asset_id
+            ))
+        })?;
+
+        // The hierarchy is defined by the PARENT asset's model: it is the model that
+        // says which groupings exist and which asset model their members instantiate.
+        let parent_model_id = store
+            .assets
+            .get(&parent_id)
+            .map(|asset| asset.asset_model_id.clone())
+            .ok_or_else(|| not_found(format!("The asset {parent_id} could not be found.")))?;
+        let hierarchy = store
+            .asset_models
+            .get(&parent_model_id)
+            .ok_or_else(|| {
+                not_found(format!(
+                    "The asset model {parent_model_id} could not be found."
+                ))
+            })?
+            .hierarchies
+            .iter()
+            .find(|hierarchy| matches_label(hierarchy, &input.hierarchy_id))
+            .ok_or_else(|| {
+                not_found(format!(
+                    "The hierarchy {} could not be found in the asset model {parent_model_id}.",
+                    input.hierarchy_id
+                ))
+            })?;
+        // `childAssetModelId` is stored resolved to the actual asset model id, so the
+        // comparison below is id-to-id whatever label the model was defined with. A
+        // hierarchy with no id is not addressable, so it is no hierarchy this call can
+        // associate under.
+        let hierarchy_id = hierarchy.id.clone().ok_or_else(|| {
+            not_found(format!(
+                "The hierarchy {} could not be found in the asset model {parent_model_id}.",
+                input.hierarchy_id
+            ))
+        })?;
+        let child_asset_model_id = hierarchy.child_asset_model_id.clone();
+
+        // Every asset in a hierarchy is an instance of that hierarchy's child asset
+        // model, so an asset of any other model cannot go in it.
+        let child_model_id = store
+            .assets
+            .get(&child_id)
+            .map(|asset| asset.asset_model_id.clone())
+            .ok_or_else(|| not_found(format!("The asset {child_id} could not be found.")))?;
+        if child_model_id != child_asset_model_id {
+            return Err(invalid_request(format!(
+                "The asset {child_id} is an instance of the asset model {child_model_id}, \
+                 but the hierarchy {hierarchy_id} accepts only instances of the asset \
+                 model {child_asset_model_id}."
+            )));
+        }
+
+        // The association already recorded under this exact hierarchy is the resource
+        // this call would create, so a repeat of it is a conflict rather than a
+        // silently-ignored no-op.
+        if children_of(&store, &parent_id, &hierarchy_id)
+            .iter()
+            .any(|child| child == &child_id)
+        {
+            let child_arn = store
+                .assets
+                .get(&child_id)
+                .map(|asset| asset.arn.clone())
+                .unwrap_or_default();
+            return Err(AssociateAssetsErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: format!(
+                        "The asset {child_id} is already associated with the asset \
+                         {parent_id} through the hierarchy {hierarchy_id}."
+                    ),
+                    resource_id: child_id.clone(),
+                    resource_arn: child_arn,
+                },
+            )
+            .into());
+        }
+
+        // Asset hierarchies form a tree: an asset has at most one parent, so a child
+        // that is already associated somewhere has to be disassociated before it can
+        // be associated again.
+        if let Some((existing_parent, existing_hierarchy)) = parent_association(&store, &child_id) {
+            return Err(invalid_request(format!(
+                "The asset {child_id} is already associated with the asset \
+                 {existing_parent} through the hierarchy {existing_hierarchy}. \
+                 Disassociate it before associating it with another parent asset."
+            )));
+        }
+
+        // The other half of "the hierarchies form a tree": the child must not already
+        // be an ancestor of the parent (nor be the parent itself), which would close a
+        // cycle. The visited set keeps this walk finite whatever the store holds.
+        let mut cursor = Some(parent_id.clone());
+        let mut walked: ::std::collections::HashSet<String> = ::std::collections::HashSet::new();
+        while let Some(current) = cursor {
+            if current == child_id {
+                return Err(invalid_request(format!(
+                    "Associating the asset {child_id} with the asset {parent_id} would \
+                     make the asset an ancestor of itself."
+                )));
+            }
+            if !walked.insert(current.clone()) {
+                break;
+            }
+            cursor = parent_association(&store, &current).map(|(parent, _)| parent.to_string());
+        }
+
+        record_association(&mut store, &parent_id, &hierarchy_id, &child_id);
+
+        Ok(AssociateAssetsOutput)
     }
+}
+
+/// The children already associated under `(parent_asset_id, hierarchy_id)`, in the
+/// order they were associated. Empty for a hierarchy nothing is associated under,
+/// so the caller never has to tell "no entry" from "no children".
+fn children_of<'a>(
+    store: &'a crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    parent_asset_id: &str,
+    hierarchy_id: &str,
+) -> &'a [String] {
+    match store
+        .asset_hierarchy_children
+        .get(&(parent_asset_id.to_string(), hierarchy_id.to_string()))
+    {
+        Some(children) => children.as_slice(),
+        None => &[],
+    }
+}
+
+/// The association `child_asset_id` is a child through, as
+/// `(parentAssetId, hierarchyId)`, or `None` when the asset is nobody's child.
+///
+/// Single-valued because this operation is the only thing that records an
+/// association and it refuses one for a child that already has a parent. It lives
+/// here rather than on the state struct because WHICH parent and WHICH hierarchy is
+/// what this operation's refusal reports; `ListAssets` only needs "is it a child"
+/// and asks its own predicate.
+fn parent_association<'a>(
+    store: &'a crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    child_asset_id: &str,
+) -> Option<(&'a str, &'a str)> {
+    store
+        .asset_hierarchy_children
+        .iter()
+        .find(|(_, children)| children.iter().any(|child| child == child_asset_id))
+        .map(|((parent, hierarchy), _)| (parent.as_str(), hierarchy.as_str()))
+}
+
+/// Record `child_asset_id` as a child of `parent_asset_id` under `hierarchy_id`,
+/// after the children already associated there. The list stays a set: a child
+/// already in that hierarchy is not added twice (the duplicate is refused above,
+/// so this is belt-and-braces for the stored invariant).
+fn record_association(
+    store: &mut crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    parent_asset_id: &str,
+    hierarchy_id: &str,
+    child_asset_id: &str,
+) {
+    let children = store
+        .asset_hierarchy_children
+        .entry((parent_asset_id.to_string(), hierarchy_id.to_string()))
+        .or_default();
+    if !children.iter().any(|child| child == child_asset_id) {
+        children.push(child_asset_id.to_string());
+    }
+}
+
+/// Whether `hierarchy` is the one a `CustomID` label names: the raw hierarchy id, or
+/// `externalId:` followed by the hierarchy's external id.
+fn matches_label(hierarchy: &AssetModelHierarchy, label: &str) -> bool {
+    match label.strip_prefix(crate::state::EXTERNAL_ID_PREFIX) {
+        Some(external) => hierarchy.external_id.as_deref() == Some(external),
+        None => hierarchy.id.as_deref() == Some(label),
+    }
+}
+
+/// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
+fn internal_failure(message: &str) -> AssociateAssetsError {
+    AssociateAssetsErrorModeled::InternalFailureException(InternalFailureException {
+        message: message.to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a label that names no stored resource.
+fn not_found(message: String) -> AssociateAssetsError {
+    AssociateAssetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 400 `InvalidRequestException`: the request is well-formed but asks for an
+/// association the hierarchy rules do not allow.
+fn invalid_request(message: String) -> AssociateAssetsError {
+    AssociateAssetsErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
 }

@@ -2,9 +2,9 @@
 
 //! Engine state for the com-amazonaws-iotsitewise-awsiotsitewise service.
 //!
-//! The asset-model / asset / property-value slice of IoT SiteWise lives here: one
-//! map per resource plus the indexes the modelled lookup forms need
-//! (`externalId:<id>` labels, property aliases). Every handler reads and writes
+//! The asset-model / asset / property-value and gateway slices of IoT SiteWise
+//! live here: one map per resource plus the indexes the modelled lookup forms need
+//! (`externalId:<id>` labels, property aliases, a gateway's platform device). Every handler reads and writes
 //! THIS struct through [`service_state`]; nothing in `src/ops/` keeps state of its
 //! own.
 
@@ -12,8 +12,10 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AssetHierarchy, AssetModelCompositeModel, AssetModelHierarchy, AssetModelProperty,
-    AssetModelStatus, AssetProperty, AssetPropertyValue, AssetStatus, AssetSummary, TimeInNanos,
+    AssetHierarchy, AssetModelCompositeModel, AssetModelCompositeModelPathSegment,
+    AssetModelCompositeModelSummary, AssetModelHierarchy, AssetModelProperty,
+    AssetModelPropertyDefinition, AssetModelStatus, AssetProperty, AssetPropertyValue, AssetStatus,
+    AssetSummary, GatewayCapabilitySummary, GatewayPlatform, TimeInNanos,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -23,22 +25,63 @@ pub const ARN_SERVICE: &str = "iotsitewise";
 /// credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How long after the creating call this emulator takes to move a new asset or
-/// asset model from `CREATING` to `ACTIVE`.
+/// How long after the call that starts it this emulator takes to settle a
+/// resource's owed transition — `CREATING` -> `ACTIVE` after a create, and
+/// `UPDATING` -> `ACTIVE` after an update.
 ///
-/// CHOSEN, not documented: AWS publishes no duration for this transition, only
-/// that `CreateAsset`/`CreateAssetModel` answer with the resource in `CREATING`
-/// and that it becomes `ACTIVE` later. The span is deliberately non-zero so a
-/// caller that reads the resource straight after creating it still observes the
-/// transient state the real service reports.
+/// CHOSEN, not documented: AWS publishes no duration for these transitions, only
+/// that `CreateAsset`/`CreateAssetModel` answer with the resource in `CREATING`,
+/// that `UpdateAsset` answers with it in `UPDATING`, and that it becomes `ACTIVE`
+/// later. The span is deliberately non-zero so a caller that reads the resource
+/// straight after the call still observes the transient state the real service
+/// reports.
 pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
 /// `AssetState`/`AssetModelState` value a freshly created resource reports.
 pub const STATE_CREATING: &str = "CREATING";
 /// `AssetState`/`AssetModelState` value a settled resource reports.
 pub const STATE_ACTIVE: &str = "ACTIVE";
+/// `AssetState`/`AssetModelState` value a resource reports while a mutating call
+/// it already accepted settles.
+pub const STATE_UPDATING: &str = "UPDATING";
 /// `AssetState`/`AssetModelState` value a deleted resource's last answer carries.
 pub const STATE_DELETING: &str = "DELETING";
+
+/// How many characters an `ETag` carries: the modelled type is
+/// `^[\w-]{43}$`, so every tag this service reports is exactly this long.
+pub const ETAG_LENGTH: usize = 43;
+
+/// The composite model types `assetModelCompositeModelType` accepts.
+///
+/// The member is modelled as a free `Name` string rather than an enum, so the
+/// catalog comes from its documentation, which both
+/// `CreateAssetModelCompositeModel` and `DescribeAssetModelCompositeModel` state
+/// as "The composite model type. Valid values are AWS/ALARM, CUSTOM, or
+/// AWS/L4E_ANOMALY".
+pub const COMPOSITE_MODEL_TYPES: [&str; 3] = ["AWS/ALARM", "CUSTOM", "AWS/L4E_ANOMALY"];
+
+/// The `AssetModelType` value an asset model must carry to be reused as the
+/// component of a component-model-based composite model, as
+/// `CreateAssetModelCompositeModel` documents it: "specify the
+/// composedAssetModelId of an existing asset model with assetModelType of
+/// COMPONENT_MODEL".
+pub const MODEL_TYPE_COMPONENT: &str = "COMPONENT_MODEL";
+
+/// How many property definitions one composite model may carry.
+///
+/// A PUBLISHED AWS quota, stated by `assetModelCompositeModelProperties`: "You
+/// can specify up to 200 properties per composite model."
+pub const MAX_PROPERTIES_PER_COMPOSITE_MODEL: usize = 200;
+
+/// The ceiling on how many composite models one asset model holds.
+///
+/// The same bound, and for the same reason, as [`MAX_ASSET_MODELS`]: a create is
+/// the only thing that adds a composite model and nothing evicts one, so the
+/// per-model list needs a maximum entry count. The emulator's own bound, not a
+/// published AWS default, and high enough that no ordinary workflow meets it;
+/// `CreateAssetModelCompositeModel` refuses past it with the modelled
+/// `LimitExceededException` (HTTP 410).
+pub const MAX_COMPOSITE_MODELS_PER_ASSET_MODEL: usize = 100;
 
 /// The prefix a `CustomID` label uses to name a resource by its external id.
 pub const EXTERNAL_ID_PREFIX: &str = "externalId:";
@@ -60,6 +103,23 @@ pub const MAX_ASSET_MODELS: usize = 1_000;
 
 /// See [`MAX_ASSET_MODELS`].
 pub const MAX_ASSETS: usize = 10_000;
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the gateway map. `CreateGateway`
+/// is the only thing that adds a gateway and it declares the modelled
+/// `LimitExceededException` (HTTP 410), so that is how this store refuses past the
+/// cap. The emulator's own bound, not a published AWS default.
+pub const MAX_GATEWAYS: usize = 1_000;
+
+/// The `gatewayVersion` a `CreateGateway` call that named none gets, as the member's
+/// own documentation states: "If not specified, the default is 2 (Classic streams, V2
+/// gateway)".
+pub const DEFAULT_GATEWAY_VERSION: &str = "2";
+
+/// The `gatewayVersion` whose GreengrassV2 platform must also carry
+/// `coreDeviceOperatingSystem`, as `GatewayPlatform`'s documentation states: "If
+/// creating a V3 gateway (gatewayVersion=3), you must also specify the
+/// coreDeviceOperatingSystem".
+pub const GATEWAY_VERSION_V3: &str = "3";
 
 /// How many samples one `(assetId, propertyId)` series keeps.
 ///
@@ -85,22 +145,171 @@ pub struct AssetModelRecord {
     pub properties: Vec<AssetModelProperty>,
     pub hierarchies: Vec<AssetModelHierarchy>,
     pub composite_models: Vec<AssetModelCompositeModel>,
+    /// `assetModelCompositeModelId` -> the links the modelled
+    /// `AssetModelCompositeModel` shape has no member for: the composite model
+    /// it is nested inside, and the component model it reuses. Absent for a
+    /// top-level, inline composite model, which is what every composite model
+    /// defined by `CreateAssetModel` is.
+    pub composite_model_links: HashMap<String, CompositeModelLink>,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
-    /// The instant the `CREATING` -> `ACTIVE` transition the clock owes falls due.
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
     pub active_at: SystemTime,
+    /// The `AssetModelState` this model reports until [`Self::active_at`] falls
+    /// due: [`STATE_CREATING`] for a freshly created model, [`STATE_UPDATING`]
+    /// while a mutating call it already accepted settles.
+    pub settling_state: String,
     pub version: u32,
     pub tags: HashMap<String, String>,
 }
 
+/// What a composite model is attached to, beside the asset model that holds it.
+#[derive(Debug, Clone, Default)]
+pub struct CompositeModelLink {
+    /// The `assetModelCompositeModelId` of the composite model this one is
+    /// nested inside, when it is not top-level.
+    pub parent_id: Option<String>,
+    /// The `assetModelId` of the `COMPONENT_MODEL` this composite model reuses,
+    /// for a component-model-based composite model. An inline one has none.
+    pub composed_asset_model_id: Option<String>,
+}
+
 impl AssetModelRecord {
-    /// The model's status as of `now`: `CREATING` until the owed transition falls
-    /// due, `ACTIVE` from then on. Derived, so a read never has to write.
+    /// The model's status as of `now`: its [`Self::settling_state`] until the
+    /// owed transition falls due, `ACTIVE` from then on. Derived, so a read
+    /// never has to write.
     pub fn status(&self, now: SystemTime) -> AssetModelStatus {
         AssetModelStatus {
-            state: state_at(self.active_at, now).to_string(),
+            state: self.state(now).to_string(),
             error: None,
         }
+    }
+
+    /// The model's `AssetModelState` as of `now`.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// Record that a mutating call — a composite model added to this model, say
+    /// — landed at `now`: the definition carries a new version, and the model
+    /// reports `UPDATING` until the transition that call owes falls due.
+    ///
+    /// The due instant is STORED, never slept on, exactly as
+    /// [`AssetRecord::begin_update`] does it for an asset. A model that had not
+    /// finished being created keeps reporting `CREATING`: the pending transition
+    /// it already owed is the one that settles, and it is the same one.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_date = now;
+        self.version += 1;
+        if self.state(now) != STATE_CREATING {
+            self.settling_state = STATE_UPDATING.to_string();
+        }
+        self.active_at = now + ACTIVATION_DELAY;
+    }
+
+    /// The composite model stored under `id`, if this model holds one.
+    pub fn composite_model(&self, id: &str) -> Option<&AssetModelCompositeModel> {
+        self.composite_models
+            .iter()
+            .find(|composite| composite.id.as_deref() == Some(id))
+    }
+
+    /// Resolve a `CustomID` label — a raw id or `externalId:<externalId>` — to
+    /// the `assetModelCompositeModelId` of a composite model of THIS model.
+    pub fn resolve_composite_model_id(&self, label: &str) -> Option<String> {
+        match label.strip_prefix(EXTERNAL_ID_PREFIX) {
+            Some(external) => self
+                .composite_models
+                .iter()
+                .find(|composite| composite.external_id.as_deref() == Some(external))
+                .and_then(|composite| composite.id.clone()),
+            None => self.composite_model(label).and_then(|composite| composite.id.clone()),
+        }
+    }
+
+    /// The id of the composite model `id` is nested inside, if any.
+    pub fn composite_model_parent(&self, id: &str) -> Option<&str> {
+        self.composite_model_links
+            .get(id)?
+            .parent_id
+            .as_deref()
+    }
+
+    /// The `COMPONENT_MODEL` asset model composite model `id` reuses, if it is
+    /// component-model-based.
+    pub fn composed_asset_model_id(&self, id: &str) -> Option<&str> {
+        self.composite_model_links
+            .get(id)?
+            .composed_asset_model_id
+            .as_deref()
+    }
+
+    /// The ids of the composite models nested DIRECTLY inside `id`.
+    pub fn composite_model_children(&self, id: &str) -> Vec<String> {
+        self.composite_models
+            .iter()
+            .filter_map(|composite| {
+                let child = composite.id.as_deref()?;
+                (self.composite_model_parent(child) == Some(id)).then(|| child.to_string())
+            })
+            .collect()
+    }
+
+    /// The ids of the composite models this model holds directly: the ones that
+    /// are nested inside no other composite model.
+    pub fn top_level_composite_model_ids(&self) -> Vec<String> {
+        self.composite_models
+            .iter()
+            .filter_map(|composite| {
+                let id = composite.id.as_deref()?;
+                self.composite_model_parent(id)
+                    .is_none()
+                    .then(|| id.to_string())
+            })
+            .collect()
+    }
+
+    /// The `AssetModelCompositeModelPath` of composite model `id`: one segment
+    /// per composite model from the outermost ancestor down to `id` itself, so
+    /// the path of a top-level composite model is the composite model alone.
+    pub fn composite_model_path(&self, id: &str) -> Vec<AssetModelCompositeModelPathSegment> {
+        let mut path = Vec::new();
+        let mut at = Some(id.to_string());
+        // Bounded by the number of stored composite models, so a link that
+        // somehow pointed into a cycle cannot spin here.
+        while let Some(current) = at.take() {
+            let Some(composite) = self.composite_model(&current) else {
+                break;
+            };
+            path.push(AssetModelCompositeModelPathSegment {
+                id: Some(current.clone()),
+                name: Some(composite.name.clone()),
+            });
+            if path.len() >= self.composite_models.len() {
+                break;
+            }
+            at = self
+                .composite_model_parent(&current)
+                .map(ToString::to_string);
+        }
+        path.reverse();
+        path
+    }
+
+    /// Composite model `id` as the summary both `DescribeAssetModel` and
+    /// `DescribeAssetModelCompositeModel` report it as, so the two views of one
+    /// stored composite model cannot disagree.
+    pub fn composite_model_summary(&self, id: &str) -> Option<AssetModelCompositeModelSummary> {
+        let composite = self.composite_model(id)?;
+        Some(AssetModelCompositeModelSummary {
+            id: id.to_string(),
+            external_id: composite.external_id.clone(),
+            name: composite.name.clone(),
+            r#type: composite.r#type.clone(),
+            description: composite.description.clone(),
+            path: Some(self.composite_model_path(id)),
+        })
     }
 }
 
@@ -118,8 +327,13 @@ pub struct AssetRecord {
     pub hierarchies: Vec<AssetHierarchy>,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
-    /// The instant the `CREATING` -> `ACTIVE` transition the clock owes falls due.
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
     pub active_at: SystemTime,
+    /// The `AssetState` this asset reports until [`Self::active_at`] falls due:
+    /// [`STATE_CREATING`] for a freshly created asset, [`STATE_UPDATING`] while a
+    /// mutating call it already accepted settles.
+    pub settling_state: String,
     pub tags: HashMap<String, String>,
 }
 
@@ -150,9 +364,28 @@ impl AssetRecord {
     /// The asset's status as of `now`; see [`AssetModelRecord::status`].
     pub fn status(&self, now: SystemTime) -> AssetStatus {
         AssetStatus {
-            state: state_at(self.active_at, now).to_string(),
+            state: self.state(now).to_string(),
             error: None,
         }
+    }
+
+    /// The asset's `AssetState` as of `now`: its [`Self::settling_state`] until
+    /// the owed transition falls due, `ACTIVE` from then on. Derived, so a read
+    /// never has to write.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// Record that a mutating call landed at `now`: the asset reports `UPDATING`
+    /// until the transition that call owes falls due, and `ACTIVE` after it.
+    ///
+    /// The due instant is STORED, never slept on, so the caller's own call
+    /// returns immediately and the transient state is still what a read taken
+    /// straight afterwards observes.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_date = now;
+        self.settling_state = STATE_UPDATING.to_string();
+        self.active_at = now + ACTIVATION_DELAY;
     }
 
     /// This asset as a `ListAssets` summary, as of `now`.
@@ -172,13 +405,67 @@ impl AssetRecord {
     }
 }
 
-/// `CREATING` before the owed transition falls due, `ACTIVE` once it has.
-fn state_at(active_at: SystemTime, now: SystemTime) -> &'static str {
+/// `settling` before the owed transition falls due, `ACTIVE` once it has.
+fn state_at(settling: &str, active_at: SystemTime, now: SystemTime) -> &str {
     if now < active_at {
-        STATE_CREATING
+        settling
     } else {
         STATE_ACTIVE
     }
+}
+
+/// A stored gateway: everything `DescribeGateway` reports, plus the `tags` the
+/// tagging operations read.
+///
+/// `capability_summaries` starts EMPTY: a freshly created gateway has no
+/// capability configured, and only `UpdateGatewayCapabilityConfiguration` adds one.
+#[derive(Debug, Clone)]
+pub struct GatewayRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub platform: GatewayPlatform,
+    pub version: String,
+    pub capability_summaries: Vec<GatewayCapabilitySummary>,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    pub tags: HashMap<String, String>,
+}
+
+/// The platform device a gateway runs on, as a single comparable key: the
+/// Greengrass V1 group ARN, the Greengrass V2 core device thing name or the Siemens
+/// Industrial Edge IoT Core thing name, whichever the platform names.
+///
+/// `None` when the platform names no device at all — a request
+/// [`GatewayPlatform`]'s documentation refuses, since one gateway specifies exactly
+/// one platform type.
+pub fn gateway_device_key(platform: &GatewayPlatform) -> Option<String> {
+    if let Some(greengrass) = platform.greengrass.as_ref() {
+        return Some(format!("greengrass:{}", greengrass.group_arn));
+    }
+    if let Some(greengrass_v2) = platform.greengrass_v2.as_ref() {
+        return Some(format!(
+            "greengrassV2:{}",
+            greengrass_v2.core_device_thing_name
+        ));
+    }
+    platform
+        .siemens_ie
+        .as_ref()
+        .map(|siemens| format!("siemensIE:{}", siemens.iot_core_thing_name))
+}
+
+/// How many platform types `platform` names. Exactly one is valid; see
+/// [`gateway_device_key`].
+pub fn gateway_platform_count(platform: &GatewayPlatform) -> usize {
+    [
+        platform.greengrass.is_some(),
+        platform.greengrass_v2.is_some(),
+        platform.siemens_ie.is_some(),
+    ]
+    .into_iter()
+    .filter(|named| *named)
+    .count()
 }
 
 /// Per-service state for com-amazonaws-iotsitewise-awsiotsitewise. A handler reaches it through [`service_state`].
@@ -205,6 +492,12 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub property_values: HashMap<String, HashMap<String, Vec<AssetPropertyValue>>>,
     /// `propertyAlias` -> `(assetId, propertyId)`, so alias lookups resolve.
     pub property_alias_index: HashMap<String, (String, String)>,
+    /// Gateways by `gatewayId`.
+    pub gateways: HashMap<String, GatewayRecord>,
+    /// [`gateway_device_key`] -> `gatewayId`: which gateway, if any, already runs
+    /// on a given platform device. One device hosts at most one gateway, so this
+    /// is what makes a second create naming the same device a conflict.
+    pub gateway_devices: HashMap<String, String>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -296,10 +589,25 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         true
     }
 
+    /// Whether ANY stored asset model holds a composite model under `id`.
+    ///
+    /// A composite model id is globally unique, so both the collision check on a
+    /// caller-supplied id and the mint draw ask this one question.
+    pub fn composite_model_id_taken(&self, id: &str) -> bool {
+        self.asset_models
+            .values()
+            .any(|model| model.composite_model(id).is_some())
+    }
+
     /// Append `value` to the `(asset_id, property_id)` series, keeping it sorted
-    /// ascending by timestamp. A value at an already-stored timestamp replaces
-    /// that sample rather than duplicating it, so "the latest value" stays
-    /// single-valued.
+    /// ascending by timestamp.
+    ///
+    /// A value at an already-stored timestamp is QUALITY-AWARE: "For each asset
+    /// property, IoT SiteWise overwrites TQVs with duplicate timestamps unless the
+    /// newer TQV has a different quality" (the `BatchPutAssetPropertyValue` model
+    /// doc), so the stored sample is replaced only when the two name the same
+    /// quality, and a differing quality leaves the series exactly as it was. Either
+    /// way the series stays single-valued at that timestamp.
     ///
     /// The series is BOUNDED at [`MAX_SAMPLES_PER_SERIES`]: past that many samples
     /// the oldest goes, so no sequence of writes can grow one series without
@@ -319,18 +627,23 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .entry(property_id.to_string())
             .or_default();
         let key = timestamp_key(&value.timestamp);
-        match series.last().map(|last| timestamp_key(&last.timestamp)) {
-            Some(newest) if newest < key => series.push(value),
-            Some(newest) if newest == key => {
-                let at = series.len() - 1;
-                series[at] = value;
-            }
-            _ => {
-                match series.binary_search_by(|existing| timestamp_key(&existing.timestamp).cmp(&key))
-                {
-                    Ok(at) => series[at] = value,
-                    Err(at) => series.insert(at, value),
+        if series
+            .last()
+            .is_none_or(|last| timestamp_key(&last.timestamp) < key)
+        {
+            series.push(value);
+        } else {
+            match series.binary_search_by(|existing| timestamp_key(&existing.timestamp).cmp(&key))
+            {
+                Ok(at) => {
+                    if quality_of(&series[at]) != quality_of(&value) {
+                        // Accepted and discarded: the stored TQV wins at a
+                        // timestamp a differing-quality TQV re-puts.
+                        return;
+                    }
+                    series[at] = value;
                 }
+                Err(at) => series.insert(at, value),
             }
         }
         if series.len() > MAX_SAMPLES_PER_SERIES {
@@ -379,6 +692,102 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     }
 }
 
+/// Turn `AssetModelPropertyDefinition`s into the stored `AssetModelProperty`s,
+/// minting an id for every definition that did not supply one.
+///
+/// Shared by every operation that takes property definitions, so one rule is
+/// enforced in one place. Two rules the shapes' own documentation states are
+/// enforced here: a property definition carries exactly ONE property type ("You
+/// can only specify one type in a property definition"), and a `STRUCT` property
+/// also carries `dataTypeSpec` ("This parameter is required on properties that
+/// have the STRUCT data type"). The `Err` carries the refusal message, which the
+/// calling operation lifts into its own modelled `InvalidRequestException`.
+pub fn property_definitions_to_properties(
+    definitions: &[AssetModelPropertyDefinition],
+) -> Result<Vec<AssetModelProperty>, String> {
+    let mut properties = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let kinds = [
+            definition.r#type.attribute.is_some(),
+            definition.r#type.measurement.is_some(),
+            definition.r#type.transform.is_some(),
+            definition.r#type.metric.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+        if kinds != 1 {
+            return Err(format!(
+                "The property definition {} must specify exactly one property type \
+                 (attribute, measurement, transform or metric), but specifies {kinds}.",
+                definition.name
+            ));
+        }
+        if definition.data_type == "STRUCT" && definition.data_type_spec.is_none() {
+            return Err(format!(
+                "The property definition {} has the STRUCT data type, so dataTypeSpec is required.",
+                definition.name
+            ));
+        }
+        properties.push(AssetModelProperty {
+            id: Some(definition.id.clone().unwrap_or_else(new_id)),
+            external_id: definition.external_id.clone(),
+            name: definition.name.clone(),
+            data_type: definition.data_type.clone(),
+            data_type_spec: definition.data_type_spec.clone(),
+            unit: definition.unit.clone(),
+            r#type: definition.r#type.clone(),
+            path: None,
+        });
+    }
+    Ok(properties)
+}
+
+/// The entity tag of an asset model's stored definition.
+///
+/// CONTENT-DERIVED, never minted: the SHA-256 digest of the fields a write to the
+/// model changes, rendered as hex and cut to the 43 characters the modelled
+/// `ETag` type fixes (`^[\w-]{43}$`, and a hex digit is a `\w`). Two reads of an
+/// unchanged model therefore report the same tag and any change to the definition
+/// reports a different one, which is what the `If-Match` / `If-None-Match`
+/// preconditions on the asset-model writes compare against. 43 hex characters
+/// carry 172 bits of the digest, and the tag is opaque to the caller: nothing but
+/// equality is ever asked of it. Hex because this crate already mints its ids and
+/// pagination tokens with `hex`, so the tag needs no further encoder.
+///
+/// The stored definition goes into the fingerprint through `{:?}`, which covers
+/// every member of these shapes — a hand-listed set of fields would silently stop
+/// covering a member the model later grows, and a tag that misses a change is the
+/// one failure mode a precondition cannot tolerate. The exact bytes are not a
+/// contract: a caller reads a tag and writes it back within one process.
+///
+/// This emulator keeps ONE version of each asset model, so its latest and its
+/// active version share this tag; while an owed transition is still pending the
+/// model has no active version at all (see [`AssetModelRecord::state`]).
+pub fn asset_model_etag(record: &AssetModelRecord) -> String {
+    // The links are a map, so they go into the fingerprint in key order: two
+    // models with the same definition must hash to the same tag whatever order
+    // their maps happen to iterate in.
+    let mut links: Vec<_> = record.composite_model_links.iter().collect();
+    links.sort_by_key(|(id, _)| *id);
+    let fingerprint = format!(
+        "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}",
+        record.id,
+        record.version,
+        record.name,
+        record.description.as_deref().unwrap_or(""),
+        record.model_type,
+        record.properties,
+        record.hierarchies,
+        record.composite_models,
+        links,
+    );
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(fingerprint.as_bytes());
+    let mut tag = ::hex::encode(digest);
+    tag.truncate(ETAG_LENGTH);
+    tag
+}
+
 /// Total order on a `TimeInNanos`: whole seconds first, then the nanosecond
 /// offset, exactly as the modelled members are defined.
 pub fn timestamp_key(timestamp: &TimeInNanos) -> (i64, i32) {
@@ -386,6 +795,23 @@ pub fn timestamp_key(timestamp: &TimeInNanos) -> (i64, i32) {
         timestamp.time_in_seconds,
         timestamp.offset_in_nanos.unwrap_or(0),
     )
+}
+
+/// The `Quality` a TQV that names none carries.
+///
+/// `AssetPropertyValue$quality` is optional and the enum's values are `GOOD`,
+/// `BAD` and `UNCERTAIN` (`smithy_query(query="shape", shape="Quality")`). An
+/// ordinary device reading is `GOOD`, so a TQV ingested without an explicit
+/// quality is treated as `GOOD`: an omitted quality and an explicit `GOOD` name
+/// the SAME quality, and neither can shadow the other at a timestamp the series
+/// already holds.
+pub const DEFAULT_QUALITY: &str = "GOOD";
+
+/// The quality `value` names, with [`DEFAULT_QUALITY`] standing in for an absent
+/// one. This is the comparison the quality-aware write in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::record_property_value`] makes.
+pub fn quality_of(value: &AssetPropertyValue) -> &str {
+    value.quality.as_deref().unwrap_or(DEFAULT_QUALITY)
 }
 
 /// A wall-clock instant as the modelled `Timestamp` type.
@@ -409,6 +835,12 @@ pub fn asset_model_arn(region: &str, asset_model_id: &str) -> String {
 /// The canonical ARN of an asset in `region`.
 pub fn asset_arn(region: &str, asset_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("asset/{asset_id}"))
+}
+
+/// The canonical ARN of a gateway in `region`, in the form `CreateGateway`
+/// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:gateway/${GatewayId}`.
+pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("gateway/{gateway_id}"))
 }
 
 /// The character joining the two ids a `TimeSeriesId` is built from; see

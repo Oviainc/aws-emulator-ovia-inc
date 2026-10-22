@@ -24,7 +24,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-type Router = MultiServiceRouter;
+pub(crate) type Router = MultiServiceRouter;
 
 /// A SigV4 `Authorization` header scoped to `guardduty` in `us-east-1`. The router
 /// resolves the target service from this scope, and the handlers read the Region the
@@ -42,7 +42,7 @@ fn auth_for(region: &str) -> String {
 const ABSENT_DETECTOR_ID: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
 
 /// A router carrying only this service, over its own engine.
-fn new_router() -> Router {
+pub(crate) fn new_router() -> Router {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -54,7 +54,7 @@ fn new_router() -> Router {
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` for an
 /// empty body).
-async fn call(router: &Router, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+pub(crate) async fn call(router: &Router, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
     call_signed(router, AUTH, method, path, body).await
 }
 
@@ -112,7 +112,7 @@ async fn call_signed(
 }
 
 /// The modelled error code an error response carries.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     for key in ["__errorType", "__type", "code"] {
         if let Some(value) = body.get(key).and_then(Value::as_str) {
             return value
@@ -128,13 +128,13 @@ fn error_code(body: &Value) -> String {
     String::new()
 }
 
-async fn create_detector(router: &Router, body: Value) -> (u16, Value) {
+pub(crate) async fn create_detector(router: &Router, body: Value) -> (u16, Value) {
     call(router, "POST", "/detector", Some(body)).await
 }
 
 /// Create an enabled detector and return its id, failing the test if the create did
 /// not succeed.
-async fn enabled_detector(router: &Router) -> String {
+pub(crate) async fn enabled_detector(router: &Router) -> String {
     let (status, body) = create_detector(router, json!({"enable": true})).await;
     assert_eq!(status, 200, "create-detector: expected 200, got {status} {body:?}");
     body["detectorId"]
@@ -360,15 +360,16 @@ async fn a_detector_reports_back_the_configuration_it_was_created_with() {
             json!(expected_frequency),
             "case {case:?}: expected frequency {expected_frequency}, got {got:?}"
         );
-        // A disabled detector ingests nothing, so every data source reports DISABLED;
-        // CloudTrail, VPC flow logs and DNS logs are the foundational sources an
-        // enabled detector always consumes.
-        let expected_source = expected_status;
+        // The detector's own `status` carries whether the detector is enabled; the
+        // dataSources view carries the CONFIGURATION, which survives disabling.
+        // CloudTrail management events, VPC flow logs and DNS logs have no switch at
+        // all — no `DetectorFeature` member and no `DataSourceConfigurations` member
+        // names them — so they report ENABLED for either value of `enable`.
         for source in ["cloudTrail", "dnsLogs", "flowLogs"] {
             assert_eq!(
                 got["dataSources"][source]["status"],
-                json!(expected_source),
-                "case {case:?}: dataSources.{source}.status expected {expected_source}, got {got:?}"
+                json!("ENABLED"),
+                "case {case:?}: dataSources.{source}.status expected ENABLED, got {got:?}"
             );
         }
     }
@@ -520,17 +521,21 @@ async fn a_feature_list_the_service_cannot_accept_is_refused() {
     );
 
     // "When you don't specify any features, with an exception to RUNTIME_MONITORING,
-    // all the optional features are enabled by default."
-    assert_eq!(
-        feature_status(&before, "RUNTIME_MONITORING"),
-        "DISABLED",
-        "RUNTIME_MONITORING is the one feature a bare create leaves off: got {before:?}"
-    );
+    // all the optional features are enabled by default." RDS Protection
+    // (RDS_LOGIN_EVENTS) is opt-in the same way RUNTIME_MONITORING is — see
+    // `crate::detector_data_sources_projection` for the default feature set as a
+    // whole.
+    for feature in ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"] {
+        assert_eq!(
+            feature_status(&before, feature),
+            "DISABLED",
+            "feature {feature} is opt-in, so a bare create leaves it off: got {before:?}"
+        );
+    }
     for feature in [
         "S3_DATA_EVENTS",
         "EKS_AUDIT_LOGS",
         "EBS_MALWARE_PROTECTION",
-        "RDS_LOGIN_EVENTS",
         "LAMBDA_NETWORK_LOGS",
         "EKS_RUNTIME_MONITORING",
         "AI_PROTECTION",
@@ -553,25 +558,28 @@ async fn a_feature_list_the_service_cannot_accept_is_refused() {
 const BAND_LOW: (f64, f64) = (1.0, 3.9);
 const BAND_MEDIUM: (f64, f64) = (4.0, 6.9);
 const BAND_HIGH: (f64, f64) = (7.0, 8.9);
+const BAND_CRITICAL: (f64, f64) = (9.0, 10.0);
 
 /// A finding type is `ThreatPurpose:ResourceTypeAffected/ThreatFamilyName…`, so the
-/// affected resource type and the severity band both follow from the type alone.
+/// affected resource type follows from the type alone, and the severity is the one
+/// GuardDuty publishes for that very type (see `sample_finding_catalog.rs`).
 ///
 /// The rows span the threat purposes and the resource-type abbreviations, and include
 /// types the issue did not cite.
 #[tokio::test]
 async fn a_sample_finding_is_derived_from_its_finding_type() {
     // (finding type, expected resource.resourceType, expected severity band)
-    let cases: [(&str, &str, (f64, f64)); 9] = [
+    let cases: [(&str, &str, (f64, f64)); 10] = [
         ("Recon:EC2/PortProbeUnprotectedPort", "Instance", BAND_LOW),
         ("Policy:IAMUser/RootCredentialUsage", "AccessKey", BAND_LOW),
-        ("Discovery:S3/MaliciousIPCaller", "S3Bucket", BAND_MEDIUM),
-        ("UnauthorizedAccess:EC2/SSHBruteForce", "Instance", BAND_MEDIUM),
+        ("Discovery:S3/MaliciousIPCaller", "S3Bucket", BAND_HIGH),
+        ("UnauthorizedAccess:EC2/SSHBruteForce", "Instance", BAND_LOW),
         ("Backdoor:EC2/C&CActivity.B", "Instance", BAND_HIGH),
         ("CryptoCurrency:EC2/BitcoinTool.B", "Instance", BAND_HIGH),
         ("Exfiltration:S3/ObjectRead.Unusual", "S3Bucket", BAND_HIGH),
-        ("Execution:Kubernetes/ExecInKubeSystemPod", "EKSCluster", BAND_HIGH),
-        ("Impact:Lambda/AbusedDomainRequest.Reputation", "Lambda", BAND_HIGH),
+        ("Execution:Kubernetes/ExecInKubeSystemPod", "EKSCluster", BAND_MEDIUM),
+        ("Impact:Lambda/AbusedDomainRequest.Reputation", "Lambda", BAND_MEDIUM),
+        ("AttackSequence:IAM/CompromisedCredentials", "AccessKey", BAND_CRITICAL),
     ];
 
     let router = new_router();
@@ -844,7 +852,7 @@ async fn a_repeated_sample_of_one_finding_type_aggregates_into_one_finding() {
 // Rule 5: paging with any maxResults yields each item exactly once, in order.
 // ---------------------------------------------------------------------------
 /// Walk every page of `ListFindings` and return the ids in order.
-async fn all_finding_ids(router: &Router, detector_id: &str, page_size: i64) -> Vec<String> {
+pub(crate) async fn all_finding_ids(router: &Router, detector_id: &str, page_size: i64) -> Vec<String> {
     let mut ids = Vec::new();
     let mut token: Option<String> = None;
     // Bounded so a token the service never advances cannot loop forever.
@@ -992,8 +1000,10 @@ async fn list_findings_applies_the_finding_criteria_it_is_given() {
         (json!({"type": {"notEquals": ["Recon:EC2/PortProbeUnprotectedPort"]}}), 2),
         (json!({"resource.resourceType": {"equals": ["Instance"]}}), 2),
         (json!({"resource.resourceType": {"equals": ["S3Bucket"]}}), 1),
-        (json!({"severity": {"greaterThanOrEqual": 7}}), 1),
-        (json!({"severity": {"lessThan": 7}}), 2),
+        // Of the three types, only `Recon:EC2/PortProbeUnprotectedPort` is published
+        // below the High band.
+        (json!({"severity": {"greaterThanOrEqual": 7}}), 2),
+        (json!({"severity": {"lessThan": 7}}), 1),
         (json!({"type": {"matches": ["Recon:*"]}}), 1),
         (json!({"type": {"matches": ["*S3*"]}}), 1),
         (json!({"type": {"notMatches": ["Recon:*"]}}), 2),

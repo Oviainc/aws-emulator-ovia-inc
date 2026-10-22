@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchStartViewerSessionRevocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchStartViewerSessionRevocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchStartViewerSessionRevocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Performs `StartViewerSessionRevocation` for each `(channelArn, viewerId)` pair the
+//! request carries: a pair naming a channel this service holds has its revocation
+//! recorded, and a pair naming a channel it does not hold is reported as a PER-ITEM
+//! failure in `errors` while the call itself succeeds with HTTP 200. That is what the
+//! batch form is for — one bad pair does not fail the others — so the response is
+//! computed from the persisted channel set, pair by pair, never from the request alone.
+//! A pair the store cannot track because it is at its revocation cap
+//! ([`crate::state::MAX_VIEWER_SESSION_REVOCATIONS`]) is reported the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -94,10 +94,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `BatchStartViewerSessionRevocationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#BatchStartViewerSessionRevocation")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#BatchStartViewerSessionRevocation",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum BatchStartViewerSessionRevocationErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -154,18 +158,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchStartViewerSessionRevocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchStartViewerSessionRevocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchStartViewerSessionRevocation"))
+        // Every modelled constraint on the request — the 1..20 list length, each
+        // pair's `ChannelArn` pattern, its `ViewerId` length and the non-negative
+        // version — is refused with a 400 `ValidationException` before `handle`
+        // runs, so reaching here means every pair is individually well formed.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchStartViewerSessionRevocationErrorModeled::InternalServerException(
+                InternalServerException {
+                    exception_message: Some("the IVS store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        let mut errors = Vec::new();
+        for session in &input.viewer_sessions {
+            if !store.channels.contains_key(&session.channel_arn) {
+                // The single-pair `StartViewerSessionRevocation` answers a channel
+                // that does not exist with its modelled `ResourceNotFoundException`;
+                // the batch form reports that same failure against the one pair it
+                // belongs to, as that error's code plus a message naming the channel.
+                errors.push(BatchStartViewerSessionRevocationError2 {
+                    channel_arn: session.channel_arn.clone(),
+                    viewer_id: session.viewer_id.clone(),
+                    code: Some("ResourceNotFoundException".to_string()),
+                    message: Some(format!("channel {} does not exist", session.channel_arn)),
+                });
+                continue;
+            }
+            // Past the store's revocation cap a pair it does not already track is
+            // refused rather than recorded; that is a failure of this one pair, so
+            // it is reported the same way, with the quota error IVS models.
+            if let Err(reached) = crate::state::start_viewer_session_revocation(
+                &mut store,
+                &session.channel_arn,
+                &session.viewer_id,
+                session.viewer_session_versions_less_than_or_equal_to,
+            ) {
+                errors.push(BatchStartViewerSessionRevocationError2 {
+                    channel_arn: session.channel_arn.clone(),
+                    viewer_id: session.viewer_id.clone(),
+                    code: Some("ServiceQuotaExceededException".to_string()),
+                    message: Some(format!(
+                        "the number of tracked viewer session revocations would exceed the limit of {}",
+                        reached.cap
+                    )),
+                });
+            }
+        }
+
+        // `errors` is always present, empty when every pair was accepted: the list
+        // reports this call's per-pair outcome, and an absent list would be
+        // indistinguishable from an operation that reports nothing at all. The
+        // header-bound members carry no value this service can derive — the model
+        // documents each only by pointing at its MDN entry — so they stay unset
+        // rather than invented.
+        Ok(BatchStartViewerSessionRevocationOutput {
+            errors: Some(errors),
+            ..Default::default()
+        })
     }
 }

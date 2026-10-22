@@ -19,6 +19,8 @@ mod application_projection;
 mod idempotency_and_idle_lifecycle;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/session_lifecycle.rs"]

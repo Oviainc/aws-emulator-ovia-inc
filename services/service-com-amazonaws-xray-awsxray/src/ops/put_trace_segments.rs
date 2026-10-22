@@ -4,10 +4,14 @@
 //!
 //! Stores each submitted segment document VERBATIM under its trace, so
 //! `BatchGetTraces` can return it byte-for-byte and `GetTraceSummaries` can
-//! recompute a summary from it. A document this handler cannot read is reported
-//! as one `UnprocessedTraceSegment` instead of failing the whole call; a batch
-//! larger than `crate::state::MAX_SEGMENT_DOCUMENTS_PER_CALL`, and a segment
-//! past a trace's segment cap, are refused.
+//! recompute a summary from it, together with the segments the service infers
+//! from it for the downstream services it only called
+//! (`crate::state::inferred_segments`). A document this handler cannot read —
+//! unparseable, missing a documented required member, or naming a `trace_id`
+//! that is not of the documented form — is reported as one
+//! `UnprocessedTraceSegment` instead of failing the whole call; a batch larger
+//! than `crate::state::MAX_SEGMENT_DOCUMENTS_PER_CALL`, and a segment past a
+//! trace's segment cap, are refused.
 //!
 //! ## Shape of an operation
 //!
@@ -222,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into_iter()
                     .map(|rejection| UnprocessedTraceSegment {
                         id: rejection.id,
-                        error_code: Some(rejection.error_code.to_string()),
+                        error_code: Some(rejection.error_code),
                         message: Some(rejection.message),
                     })
                     .collect(),

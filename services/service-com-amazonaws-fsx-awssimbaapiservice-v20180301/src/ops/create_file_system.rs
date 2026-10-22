@@ -7,6 +7,11 @@
 //! clock owing it a transition to `AVAILABLE`, which is what AWS documents: "The
 //! CreateFileSystem call returns while the file system's lifecycle state is still CREATING."
 //!
+//! Two guards run BEFORE anything is allocated, so a request AWS refuses outright stores
+//! nothing here either: the documented client request token must be present
+//! (`BadRequest`), and every subnet identifier the request names must name a subnet the
+//! account has in the signed Region (`InvalidNetworkSettings`, naming the offending id).
+//!
 //! The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -182,11 +187,11 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::state::{
-    file_system_dns_name, file_system_type_version, fsx_arn, stored_lustre_configuration,
-    stored_ontap_configuration, stored_open_zfs_configuration, stored_windows_configuration,
-    FileSystemRecord, IdempotentCreate, PendingTransition, TransitionTarget,
-    DEFAULT_NETWORK_TYPE, DEFAULT_STORAGE_TYPE, FILE_SYSTEM_RESOURCE_TYPE, LIFECYCLE_CREATING,
-    MAX_FILE_SYSTEMS, SERVICE_LIMIT_FILE_SYSTEM_COUNT,
+    file_system_dns_name, file_system_type_version, fsx_arn, resolve_requested_subnets,
+    stored_lustre_configuration, stored_ontap_configuration, stored_open_zfs_configuration,
+    stored_windows_configuration, FileSystemRecord, IdempotentCreate, PendingTransition,
+    TransitionTarget, DEFAULT_NETWORK_TYPE, DEFAULT_STORAGE_TYPE, FILE_SYSTEM_RESOURCE_TYPE,
+    LIFECYCLE_CREATING, MAX_FILE_SYSTEMS, SERVICE_LIMIT_FILE_SYSTEM_COUNT,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -273,6 +278,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // AWS documents the token as a REQUIREMENT of this operation, not an option:
+        // "This operation requires a client request token in the request that Amazon FSx
+        // uses to ensure idempotent creation" — it is what makes a retried create
+        // idempotent, so a request that carries none is refused before anything is
+        // stored. The modelled `@idempotencyToken` trait is what fills it in for an SDK
+        // caller; it does not make the member optional on the wire.
+        let Some(client_request_token) = input.client_request_token.clone() else {
+            return Err(CreateFileSystemErrorModeled::BadRequest(BadRequest {
+                message: Some("A client request token must be specified.".to_string()),
+            })
+            .into());
+        };
+
         // The modelled `SubnetIds` list declares `length min 0`, so an EMPTY list satisfies
         // the boundary validator and reaches here, but a file system has to be reachable
         // from at least one subnet.
@@ -288,6 +306,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every ARN and DNS name is built for the region the caller signed for.
         let region = crate::state::request_region(&ctx.parts().headers);
+
+        // A file system lives in the subnets the request names, so each identifier has to
+        // name a subnet the account HAS in that Region before anything is allocated: one
+        // that names nothing is `InvalidNetworkSettings`, carrying the offending id in
+        // `InvalidSubnetId`. The resolution also yields the VPC the file system reports.
+        let resolved_subnets = match resolve_requested_subnets(&region, &named_subnet_ids(&input)) {
+            Ok(resolved) => resolved,
+            Err(invalid) => return Err(subnet_does_not_exist(&invalid)),
+        };
+
         let fingerprint = create_parameter_fingerprint(&input);
 
         let mut store = state.lock();
@@ -298,31 +326,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // CreateFileSystem returns the description of the existing file system. If a file
         // system with the specified client request token exists and the parameters don't
         // match, this call returns IncompatibleParameterError."
-        if let Some(token) = input.client_request_token.clone() {
-            if let Some(previous) = store.idempotency_tokens.get(&token).cloned() {
-                match store.file_systems.get(&previous.file_system_id) {
-                    Some(_) if previous.fingerprint != fingerprint => {
-                        return Err(CreateFileSystemErrorModeled::IncompatibleParameterError(
-                            IncompatibleParameterError {
-                                parameter: "ClientRequestToken".to_string(),
-                                message: Some(format!(
-                                    "the client request token {token} was already used to create {} with different parameters",
-                                    previous.file_system_id
-                                )),
-                            },
-                        )
-                        .into());
-                    }
-                    Some(record) => {
-                        return Ok(CreateFileSystemOutput {
-                            file_system: Some(record.to_file_system()),
-                        });
-                    }
-                    // The file system that token created is gone, so the token replays
-                    // nothing: drop it and create a new file system below.
-                    None => {
-                        store.forget_idempotency_token(&token);
-                    }
+        if let Some(previous) = store
+            .idempotency_tokens
+            .get(&client_request_token)
+            .cloned()
+        {
+            match store.file_systems.get(&previous.file_system_id) {
+                Some(_) if previous.fingerprint != fingerprint => {
+                    return Err(CreateFileSystemErrorModeled::IncompatibleParameterError(
+                        IncompatibleParameterError {
+                            parameter: "ClientRequestToken".to_string(),
+                            message: Some(format!(
+                                "the client request token {client_request_token} was already used to create {} with different parameters",
+                                previous.file_system_id
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(record) => {
+                    return Ok(CreateFileSystemOutput {
+                        file_system: Some(record.to_file_system()),
+                    });
+                }
+                // The file system that token created is gone, so the token replays
+                // nothing: drop it and create a new file system below.
+                None => {
+                    store.forget_idempotency_token(&client_request_token);
                 }
             }
         }
@@ -347,7 +377,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .storage_type
                 .clone()
                 .unwrap_or_else(|| DEFAULT_STORAGE_TYPE.to_string()),
-            vpc_id: None,
+            // The VPC the resolved subnets sit in, so `FileSystem$VpcId` reports the
+            // network the file system was actually placed in.
+            vpc_id: resolved_subnets.first().map(|subnet| subnet.vpc_id.clone()),
             subnet_ids: input.subnet_ids.clone(),
             security_group_ids: input.security_group_ids.clone().unwrap_or_default(),
             network_interface_ids: Vec::new(),
@@ -396,20 +428,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.insert_file_system(record).is_err() {
             return Err(file_system_count_limit_exceeded());
         }
-        if let Some(token) = input.client_request_token.clone() {
-            store.remember_idempotent_create(
-                token,
-                IdempotentCreate {
-                    file_system_id,
-                    fingerprint,
-                },
-            );
-        }
+        store.remember_idempotent_create(
+            client_request_token,
+            IdempotentCreate {
+                file_system_id,
+                fingerprint,
+            },
+        );
 
         Ok(CreateFileSystemOutput {
             file_system: Some(file_system),
         })
     }
+}
+
+/// Every subnet identifier the request names, in the order it names them: the required
+/// `SubnetIds`, then the `PreferredSubnetId` of whichever per-type configuration the
+/// request carries.
+///
+/// A `PreferredSubnetId` is one of the subnets the file system is placed in — AWS
+/// documents it as "one of these subnets ... the preferred subnet" of `SubnetIds` — so it
+/// is a subnet identifier the request names and is resolved by the same rule.
+fn named_subnet_ids(input: &CreateFileSystemInput) -> Vec<&str> {
+    let mut named: Vec<&str> = input.subnet_ids.iter().map(String::as_str).collect();
+    named.extend(
+        [
+            input
+                .windows_configuration
+                .as_ref()
+                .and_then(|config| config.preferred_subnet_id.as_deref()),
+            input
+                .ontap_configuration
+                .as_ref()
+                .and_then(|config| config.preferred_subnet_id.as_deref()),
+            input
+                .open_zfs_configuration
+                .as_ref()
+                .and_then(|config| config.preferred_subnet_id.as_deref()),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    named
+}
+
+/// The modelled refusal for a request naming a subnet the account does not have:
+/// `InvalidNetworkSettings` (client, HTTP 400) carrying the offending identifier in
+/// `InvalidSubnetId` ("The subnet ID that is either invalid or not part of the VPC
+/// specified") and a `Message` built from it, so the caller learns WHICH id was wrong.
+fn subnet_does_not_exist(subnet_id: &str) -> CreateFileSystemError {
+    CreateFileSystemErrorModeled::InvalidNetworkSettings(InvalidNetworkSettings {
+        message: Some(format!("The subnet ID '{subnet_id}' does not exist")),
+        invalid_subnet_id: Some(subnet_id.to_string()),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The modelled refusal for a create that would take the account past

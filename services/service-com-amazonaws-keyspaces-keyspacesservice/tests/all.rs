@@ -15,9 +15,13 @@
 mod get_keyspace;
 #[path = "all/keyspace_table_lifecycle.rs"]
 mod keyspace_table_lifecycle;
+#[path = "all/list_keyspaces.rs"]
+mod list_keyspaces;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/type_lifecycle.rs"]
+mod type_lifecycle;
 #[path = "all/update_table.rs"]
 mod update_table;

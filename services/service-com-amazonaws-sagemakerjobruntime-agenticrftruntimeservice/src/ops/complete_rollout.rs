@@ -135,6 +135,38 @@ fn validation(message: String) -> CompleteRolloutError {
     CompleteRolloutErrorModeled::ValidationException(ValidationException { message }).into()
 }
 
+/// The wire values `CompletionStatus` declares, in the order the model declares them
+/// (`smithy_query(query="shape",shape="CompletionStatus")`: members `READY` then
+/// `FAILED`).
+///
+/// The generated `COMPLETION_STATUS_VALUES` carries the same two values SORTED, which is
+/// what a lookup needs; a refusal states the set in the model's own declaration order,
+/// the way a service's validation message does, which is the one thing that list cannot
+/// give. `completion_status_set_holds_every_modelled_value` below pins the two against
+/// each other, so a value added to or renamed in the model fails loudly here rather than
+/// leaving this order-carrying copy to drift.
+const COMPLETION_STATUS_SET: [&str; 2] = ["ready", "failed"];
+
+/// The refusal for a `Status` outside the modelled `CompletionStatus` enum.
+///
+/// The clause is built by the framework's own constraint renderer
+/// (`aws_smithy_schema_server::envelope` over a `ViolationKind::EnumValue`), so an enum
+/// value the model declines is worded exactly as every other constraint violation this
+/// emulator refuses — `1 validation error detected: Value '<value>' at 'status' failed
+/// to satisfy constraint: Member must satisfy enum value set: [...]`.
+fn enum_violation(value: &str) -> CompleteRolloutError {
+    let violation = ::aws_smithy_schema_server::Violation {
+        path: "status".to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::EnumValue(
+            COMPLETION_STATUS_SET.iter().map(|v| (*v).to_string()).collect(),
+        ),
+        value: Some(value.to_string()),
+    };
+    let message = ::aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
+        .unwrap_or_else(|| violation.message());
+    validation(message)
+}
+
 /// This operation's own modelled 409 `ConflictException`.
 fn conflict(message: String) -> CompleteRolloutError {
     CompleteRolloutErrorModeled::ConflictException(ConflictException { message }).into()
@@ -186,12 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => DEFAULT_COMPLETION_STATUS,
             Some(value) => match crate::state::CompletionStatus::from_wire(value) {
                 Some(status) => status,
-                None => {
-                    return Err(validation(format!(
-                        "Status {value} is not one of {}.",
-                        COMPLETION_STATUS_VALUES.join(", ")
-                    )))
-                }
+                None => return Err(enum_violation(value)),
             },
         };
 
@@ -200,10 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(trajectory) = guard.trajectory_mut(&input.job_arn, &input.trajectory_id) else {
             return Err(CompleteRolloutErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Trajectory {} was not found for job {}.",
-                        input.trajectory_id, input.job_arn
-                    ),
+                    message: crate::state::trajectory_not_found_message(&input.trajectory_id),
                 },
             )
             .into());
@@ -231,6 +255,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sealed.as_str(),
                 requested.as_str()
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::COMPLETION_STATUS_SET;
+    use crate::ops::types::COMPLETION_STATUS_VALUES;
+
+    /// The order-carrying set this operation states a refusal with must hold EXACTLY the
+    /// values the generated model data carries, so neither copy can drift from the model.
+    #[test]
+    fn completion_status_set_holds_every_modelled_value() {
+        let mut stated: Vec<&str> = COMPLETION_STATUS_SET.to_vec();
+        stated.sort_unstable();
+        let mut modelled: Vec<&str> = COMPLETION_STATUS_VALUES.to_vec();
+        modelled.sort_unstable();
+        assert_eq!(
+            stated, modelled,
+            "the stated CompletionStatus set must be the modelled one: expected {modelled:?}, \
+             got {stated:?}"
+        );
+    }
+
+    /// Every value the model declares must resolve to a status, which is what makes the
+    /// refusal above reachable only for a value the model does NOT declare.
+    #[test]
+    fn every_modelled_completion_status_resolves() {
+        for value in COMPLETION_STATUS_VALUES {
+            assert!(
+                crate::state::CompletionStatus::from_wire(value).is_some(),
+                "case {value:?}: expected a modelled CompletionStatus to resolve"
+            );
         }
     }
 }

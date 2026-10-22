@@ -25,6 +25,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_ivs_amazoninteractivevideoservice::state::{
+    service_state, ComAmazonawsIvsAmazoninteractivevideoserviceState,
+};
 use service_com_amazonaws_ivs_amazoninteractivevideoservice::EmulatedService;
 
 /// A SigV4 `Authorization` header is how a request names the service and the region
@@ -44,10 +47,14 @@ pub(crate) const STREAM_KEY_ARN_PREFIX: &str = "arn:aws:ivs:us-east-1:0000000000
 /// One IVS emulator over one shared engine, reached the way the router reaches it.
 pub(crate) struct Ivs {
     router: MultiServiceRouter,
+    /// The engine the service was built on, kept so a suite can read this service's
+    /// store for state no operation reports back.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 /// One answer from the emulator: the status, the wire error code (the restJson1
 /// `__type` discriminator) and the parsed body.
+#[derive(Debug)]
 pub(crate) struct Reply {
     pub(crate) status: u16,
     pub(crate) error_code: String,
@@ -58,8 +65,33 @@ impl Ivs {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Read this service's store, the way a handler reaches it.
+    ///
+    /// For state no operation reports back — a started viewer-session revocation,
+    /// say — reading the store is the only way to assert what a call persisted.
+    pub(crate) fn with_store<T>(
+        &self,
+        read: impl FnOnce(&ComAmazonawsIvsAmazoninteractivevideoserviceState) -> T,
+    ) -> T {
+        let state = service_state(&*self.engine).expect("the IVS store is reachable");
+        let store = state.lock();
+        read(&store)
+    }
+
+    /// Write this service's store, for the state no operation can create yet: an
+    /// ingest session bringing a channel live (see `live_stream_reads.rs`) has no
+    /// control-plane operation behind it until the filed RTMPS listener lands.
+    pub(crate) fn with_store_mut<T>(
+        &self,
+        write: impl FnOnce(&mut ComAmazonawsIvsAmazoninteractivevideoserviceState) -> T,
+    ) -> T {
+        let state = service_state(&*self.engine).expect("the IVS store is reachable");
+        let mut store = state.lock();
+        write(&mut store)
     }
 
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> Reply {

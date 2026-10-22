@@ -205,17 +205,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             referenced.extend(edge.iter().map(|arn| (arn, None)));
         }
         for (arn, required_type) in referenced {
-            let resolved = guard.config_by_arn(arn);
-            let matches = resolved.is_some_and(|config| {
-                required_type.is_none_or(|wanted| config.config_type == wanted)
-            });
-            if !matches {
+            if !guard.resolves_config(arn, required_type) {
                 return Err(CreateMissionProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(match required_type {
-                            Some(wanted) => format!("No {wanted} config exists with ARN {arn}"),
-                            None => format!("No config exists with ARN {arn}"),
-                        }),
+                        message: Some(crate::state::config_reference_not_found_message(
+                            arn,
+                            required_type,
+                        )),
                     },
                 )
                 .into());

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSqlInjectionMatchSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSqlInjectionMatchSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSqlInjectionMatchSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -173,6 +164,29 @@ impl From<UpdateSqlInjectionMatchSetErrorModeled> for UpdateSqlInjectionMatchSet
     }
 }
 
+/// A `WAFInvalidParameterException` naming the member AWS WAF did not recognise.
+///
+/// `field` is a `ParameterExceptionField` value and `reason` a
+/// `ParameterExceptionReason` value (the model's `PARAMETER_EXCEPTION_FIELD_VALUES` /
+/// `PARAMETER_EXCEPTION_REASON_VALUES`), so a client branching on them sees what the
+/// real service sends. Unlike the `XssMatchSet` twin, the model DOES declare a field
+/// value for this resource's match field (`SQL_INJECTION_MATCH_FIELD_TYPE`), so a
+/// refusal about the filter's `FieldToMatch` can name it.
+fn invalid_parameter(
+    field: &str,
+    parameter: &str,
+    reason: &str,
+) -> UpdateSqlInjectionMatchSetError {
+    UpdateSqlInjectionMatchSetErrorModeled::WAFInvalidParameterException(
+        WAFInvalidParameterException {
+            field: Some(field.to_string()),
+            parameter: Some(parameter.to_string()),
+            reason: Some(reason.to_string()),
+        },
+    )
+    .into()
+}
+
 /// The `UpdateSqlInjectionMatchSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -209,18 +223,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSqlInjectionMatchSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSqlInjectionMatchSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSqlInjectionMatchSet"))
+        let _ = ctx;
+        // The number of updates one request carries is the caller's choice, so it is
+        // bounded BEFORE the shared store's lock is taken: no request can make the
+        // service do an amount of work it picked, nor hold the lock for it.
+        if input.updates.len() > crate::state::MAX_SQL_INJECTION_MATCH_SET_UPDATES_PER_REQUEST {
+            return Err(
+                UpdateSqlInjectionMatchSetErrorModeled::WAFLimitsExceededException(
+                    WAFLimitsExceededException {
+                        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSqlInjectionMatchSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // The match set is the CONTAINER the filters go into, and the model reserves
+        // `WAFNonexistentContainerException` for exactly this: "You tried to add an
+        // object to or delete an object from another object that doesn't exist."
+        let Some(stored) = state
+            .sql_injection_match_sets
+            .get(&input.sql_injection_match_set_id)
+        else {
+            return Err(
+                UpdateSqlInjectionMatchSetErrorModeled::WAFNonexistentContainerException(
+                    WAFNonexistentContainerException {
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request refused
+        // part-way through leaves the stored match set (and the change token) exactly
+        // as they were.
+        let mut working = stored.clone();
+        for update in &input.updates {
+            let tuple = &update.sql_injection_match_tuple;
+            let field_type = tuple.field_to_match.r#type.as_str();
+            // `ChangeAction`, `MatchFieldType` and `TextTransformation` are enum shapes,
+            // so a value outside their sets is refused before this handler runs. What is
+            // NOT modelled is the pairing of `Type` with `Data`: `Data` names the header
+            // or query-string parameter for `HEADER` and `SINGLE_QUERY_ARG` ("You tried
+            // to update a ByteMatchSet with a Field of HEADER but no value for Data"),
+            // and "if the value of Type is any other value, omit Data".
+            if crate::state::match_field_takes_data(field_type)
+                != tuple.field_to_match.data.is_some()
+            {
+                return Err(invalid_parameter(
+                    "SQL_INJECTION_MATCH_FIELD_TYPE",
+                    field_type,
+                    "ILLEGAL_COMBINATION",
+                ));
+            }
+
+            let changed = match update.action.as_str() {
+                crate::state::CHANGE_ACTION_INSERT => {
+                    // One match set holds at most `MAX_SQL_INJECTION_MATCH_TUPLES`
+                    // filters, so the filter state a caller can accumulate over many
+                    // requests is bounded, not just the number of updates one request
+                    // may carry.
+                    if working.tuples.len() >= crate::state::MAX_SQL_INJECTION_MATCH_TUPLES {
+                        return Err(
+                            UpdateSqlInjectionMatchSetErrorModeled::WAFLimitsExceededException(
+                                WAFLimitsExceededException {
+                                    message: Some(
+                                        crate::state::MESSAGE_LIMITS_EXCEEDED.to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    working.insert_tuple(tuple)
+                }
+                crate::state::CHANGE_ACTION_DELETE => working.remove_tuple(tuple),
+                // `ChangeAction` is {INSERT, DELETE} and a value outside it is refused
+                // at the boundary, so this arm is reachable only if the model grows a
+                // third action: an action this operation does not know is the
+                // unrecognised parameter the model names, never a guessed INSERT or
+                // DELETE.
+                other => return Err(invalid_parameter("CHANGE_ACTION", other, "INVALID_OPTION")),
+            };
+            // "The operation failed because there was nothing to do" covers both ways an
+            // update can leave the set as it was: deleting a filter the set does not
+            // hold, and inserting one it already holds. "To change a
+            // SqlInjectionMatchTuple, you delete the existing object and add a new one."
+            if !changed {
+                return Err(
+                    UpdateSqlInjectionMatchSetErrorModeled::WAFInvalidOperationException(
+                        WAFInvalidOperationException {
+                            message: Some(crate::state::MESSAGE_INVALID_OPERATION.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token, which
+        // must be one `GetChangeToken` minted and no other mutating call has used, since
+        // "each create, update, or delete request must use a unique change token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(
+                UpdateSqlInjectionMatchSetErrorModeled::WAFStaleDataException(
+                    WAFStaleDataException {
+                        message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let set_id = working.sql_injection_match_set_id.clone();
+        state.sql_injection_match_sets.insert(set_id, working);
+
+        Ok(UpdateSqlInjectionMatchSetOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

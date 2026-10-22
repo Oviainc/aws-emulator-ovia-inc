@@ -159,10 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .mission_profile_by_arn(&input.mission_profile_arn)
             .ok_or_else(|| {
                 ReserveContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "No mission profile exists with ARN {}",
-                        input.mission_profile_arn
-                    )),
+                    // The service's mission-profile literal: it does not echo the ARN
+                    // the request gave back at the caller.
+                    message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
                 })
             })?
             .clone();

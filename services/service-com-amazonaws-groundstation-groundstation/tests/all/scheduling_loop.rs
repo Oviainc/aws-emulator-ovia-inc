@@ -18,6 +18,10 @@
 //! * a listing returns exactly the resources matching its filters, one page at a time;
 //! * a listing is bounded to one page even when the caller names no page size, and a
 //!   store that reached its bound refuses the next create.
+//!
+//! The harness at the top of this file (`harness`, `send`, `Reply` and the create
+//! helpers) is `pub(crate)`, so a sibling suite under `tests/all/` reuses it rather than
+//! standing up a second copy of the same router.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,24 +35,24 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A SigV4 `Authorization` header in the `groundstation` scope: the routing signal the
 /// emulator reads first, and the source of the region every minted ARN carries.
-const AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTGROUNDSTATION/20260101/us-east-1/\
+pub(crate) const AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTGROUNDSTATION/20260101/us-east-1/\
                     groundstation/aws4_request, SignedHeaders=host, Signature=abcdef";
 
 /// The region the header above signs for; the ARNs this service mints carry it.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// A well-formed `ConfigArn` (model pattern) for a config that was never created.
-const ABSENT_CONFIG_ARN: &str =
+pub(crate) const ABSENT_CONFIG_ARN: &str =
     "arn:aws:groundstation:us-east-1:000000000000:config/tracking/\
      00000000-0000-0000-0000-000000000000";
 
 /// A well-formed `MissionProfileArn` for a mission profile that was never created.
-const ABSENT_MISSION_PROFILE_ARN: &str =
+pub(crate) const ABSENT_MISSION_PROFILE_ARN: &str =
     "arn:aws:groundstation:us-east-1:000000000000:mission-profile/\
      00000000-0000-0000-0000-000000000000";
 
 /// A well-formed `Uuid` that names nothing.
-const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+pub(crate) const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Longer than this service's chosen `SCHEDULING` -> `SCHEDULED` settle span, so a read
 /// taken after it observes the move the scheduler owed.
@@ -59,16 +63,16 @@ const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 const AFTER_SETTLE: Duration = Duration::from_millis(600);
 
 /// One HTTP answer, reduced to what these tests assert on.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header, present only on an error answer.
-    error_type: Option<String>,
-    body: Value,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The error shape this answer names, from the header or the body's `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.error_type
             .clone()
             .or_else(|| {
@@ -80,11 +84,11 @@ impl Reply {
             .unwrap_or_default()
     }
 
-    fn field(&self, name: &str) -> &Value {
+    pub(crate) fn field(&self, name: &str) -> &Value {
         self.body.get(name).unwrap_or(&Value::Null)
     }
 
-    fn string(&self, name: &str) -> String {
+    pub(crate) fn string(&self, name: &str) -> String {
         self.field(name)
             .as_str()
             .unwrap_or_else(|| panic!("response has no string member {name}: {}", self.body))
@@ -96,7 +100,7 @@ impl Reply {
 /// `core/router/src/lib.rs` builds, minus every other service. The engine comes back
 /// too, so a test can read the store directly where that is the only way to observe a
 /// state transition without racing the clock.
-fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -105,11 +109,16 @@ fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// A router holding only this service, over one shared engine.
-fn harness() -> MultiServiceRouter {
+pub(crate) fn harness() -> MultiServiceRouter {
     harness_with_engine().0
 }
 
-async fn send(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Reply {
+pub(crate) async fn send(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Reply {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://groundstation.{REGION}.amazonaws.com{path}"))
@@ -147,7 +156,7 @@ async fn send(router: &MultiServiceRouter, method: &str, path: &str, body: Optio
 /// A spectral config with every optional member set, so a response that echoes it back
 /// is comparable to the request verbatim (`polarization` carries a modelled default,
 /// which an omitted member would materialise).
-fn spectrum_config(center_mhz: f64, bandwidth_mhz: f64) -> Value {
+pub(crate) fn spectrum_config(center_mhz: f64, bandwidth_mhz: f64) -> Value {
     json!({
         "centerFrequency": {"value": center_mhz, "units": "MHz"},
         "bandwidth": {"value": bandwidth_mhz, "units": "MHz"},
@@ -156,7 +165,7 @@ fn spectrum_config(center_mhz: f64, bandwidth_mhz: f64) -> Value {
 }
 
 /// An `antennaUplinkConfig` body — also the config an `uplinkEchoConfig` must point at.
-fn antenna_uplink_config_data() -> Value {
+pub(crate) fn antenna_uplink_config_data() -> Value {
     json!({
         "transmitDisabled": false,
         "spectrumConfig": {
@@ -172,7 +181,7 @@ fn antenna_uplink_config_data() -> Value {
 /// Source: `smithy_query(query="shape", shape="ConfigTypeData")` for the union's eight
 /// members and `shape="ConfigCapabilityType"` for the eight enum values — the mapping
 /// under test, so the table lists all of them, not only the two the issue cited.
-fn config_data_table(antenna_uplink_arn: &str) -> Vec<(&'static str, Value)> {
+pub(crate) fn config_data_table(antenna_uplink_arn: &str) -> Vec<(&'static str, Value)> {
     vec![
         (
             "antenna-downlink",
@@ -229,7 +238,7 @@ fn config_data_table(antenna_uplink_arn: &str) -> Vec<(&'static str, Value)> {
 
 /// `CreateConfig`, asserting it succeeded, and answering `(configId, configType,
 /// configArn)`.
-async fn create_config(
+pub(crate) async fn create_config(
     router: &MultiServiceRouter,
     name: &str,
     config_data: Value,
@@ -253,7 +262,7 @@ async fn create_config(
 }
 
 /// A tracking config, the one every mission profile needs, plus its ARN.
-async fn create_tracking_config(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_tracking_config(router: &MultiServiceRouter, name: &str) -> String {
     let (_, _, arn) = create_config(
         router,
         name,
@@ -871,7 +880,7 @@ async fn list_mission_profiles_pages_through_every_profile_once() {
 }
 
 /// Create a mission profile and answer its ARN.
-async fn create_mission_profile(
+pub(crate) async fn create_mission_profile(
     router: &MultiServiceRouter,
     name: &str,
     minimum_seconds: i64,

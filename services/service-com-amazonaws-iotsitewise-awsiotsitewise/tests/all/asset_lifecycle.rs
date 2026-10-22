@@ -154,6 +154,19 @@ pub(crate) async fn create_asset(
         .to_string()
 }
 
+/// The property id of `name` in a `DescribeAssetModel` / `DescribeAsset` body.
+pub(crate) fn property_id(properties: &Value, name: &str) -> String {
+    properties
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a property list, got {properties}"))
+        .iter()
+        .find(|property| property["name"] == name)
+        .unwrap_or_else(|| panic!("no property named {name} in {properties}"))["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("property {name} has no id in {properties}"))
+        .to_string()
+}
+
 /// One measurement property per `PropertyDataType` a measurement can carry, plus
 /// one attribute. Source: `smithy_query(query="shape", shape="PropertyDataType")`
 /// — STRING | INTEGER | DOUBLE | BOOLEAN | STRUCT | VIDEO | ANNOTATION | JSON,
@@ -166,19 +179,6 @@ pub(crate) fn property_catalog() -> Value {
         {"name": "Running", "dataType": "BOOLEAN", "type": {"measurement": {}}},
         {"name": "Serial", "dataType": "STRING", "type": {"attribute": {"defaultValue": "unset"}}},
     ])
-}
-
-/// The property id of `name` in a `DescribeAssetModel` / `DescribeAsset` body.
-pub(crate) fn property_id(properties: &Value, name: &str) -> String {
-    properties
-        .as_array()
-        .unwrap_or_else(|| panic!("expected a property list, got {properties}"))
-        .iter()
-        .find(|property| property["name"] == name)
-        .unwrap_or_else(|| panic!("no property named {name} in {properties}"))["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("property {name} has no id in {properties}"))
-        .to_string()
 }
 
 #[tokio::test]
@@ -373,11 +373,13 @@ async fn the_asset_model_asset_and_property_value_slice_round_trips() {
     let cycles = property_id(&asset["assetProperties"], "Cycles");
     let status_property = property_id(&asset["assetProperties"], "Status");
     let running = property_id(&asset["assetProperties"], "Running");
+    // Anchored a minute in the past, inside the window IoT SiteWise ingests.
+    let base = super::support::now_seconds() - 60;
     let rows = [
-        ("Temperature", &temperature, "doubleValue", json!(42.5), 1_700_000_000_i64),
-        ("Cycles", &cycles, "integerValue", json!(7), 1_700_000_001),
-        ("Status", &status_property, "stringValue", json!("NOMINAL"), 1_700_000_002),
-        ("Running", &running, "booleanValue", json!(true), 1_700_000_003),
+        ("Temperature", &temperature, "doubleValue", json!(42.5), base),
+        ("Cycles", &cycles, "integerValue", json!(7), base + 1),
+        ("Status", &status_property, "stringValue", json!("NOMINAL"), base + 2),
+        ("Running", &running, "booleanValue", json!(true), base + 3),
     ];
     let entries: Vec<Value> = rows
         .iter()
@@ -591,22 +593,36 @@ async fn the_latest_value_is_the_highest_timestamp_whatever_the_write_order() {
     // latest value is the sample with the highest (timeInSeconds, offsetInNanos).
     /// One sample: `(timeInSeconds, offsetInNanos, doubleValue)`.
     type Sample = (i64, i32, f64);
+    // Anchored inside the `[now - 7 days, now + 10 minutes]` ingest window.
+    let base = super::support::now_seconds() - 10_000;
     let cases: [(&str, Vec<Sample>, Sample); 4] = [
-        ("one sample", vec![(1_000, 0, 1.0)], (1_000, 0, 1.0)),
+        ("one sample", vec![(base + 1_000, 0, 1.0)], (base + 1_000, 0, 1.0)),
         (
             "ascending",
-            vec![(2_000, 0, 1.0), (2_001, 0, 2.0), (2_002, 0, 3.0)],
-            (2_002, 0, 3.0),
+            vec![
+                (base + 2_000, 0, 1.0),
+                (base + 2_001, 0, 2.0),
+                (base + 2_002, 0, 3.0),
+            ],
+            (base + 2_002, 0, 3.0),
         ),
         (
             "descending",
-            vec![(3_002, 0, 3.0), (3_001, 0, 2.0), (3_000, 0, 1.0)],
-            (3_002, 0, 3.0),
+            vec![
+                (base + 3_002, 0, 3.0),
+                (base + 3_001, 0, 2.0),
+                (base + 3_000, 0, 1.0),
+            ],
+            (base + 3_002, 0, 3.0),
         ),
         (
             "same second, different nanos",
-            vec![(4_000, 999, 1.0), (4_000, 1, 2.0), (4_000, 500, 3.0)],
-            (4_000, 999, 1.0),
+            vec![
+                (base + 4_000, 999, 1.0),
+                (base + 4_000, 1, 2.0),
+                (base + 4_000, 500, 3.0),
+            ],
+            (base + 4_000, 999, 1.0),
         ),
     ];
 
@@ -671,7 +687,7 @@ async fn the_latest_value_is_the_highest_timestamp_whatever_the_write_order() {
             "propertyId": speed,
             "propertyValues": [{
                 "value": {"doubleValue": 99.5},
-                "timestamp": {"timeInSeconds": 4_000, "offsetInNanos": 999},
+                "timestamp": {"timeInSeconds": base + 4_000, "offsetInNanos": 999},
             }],
         }]})),
     )
@@ -842,7 +858,7 @@ async fn batch_put_reports_one_error_entry_per_entry_it_cannot_resolve() {
     let rpm = property_id(&asset["assetProperties"], "Rpm");
     let label = property_id(&asset["assetProperties"], "Label");
 
-    let timestamp = json!({"timeInSeconds": 1_700_000_000_i64});
+    let timestamp = json!({"timeInSeconds": super::support::now_seconds() - 60});
     // Rows span the ways an entry fails to resolve, and one that succeeds: the
     // response must carry an error entry for exactly the failing ones.
     let cases: Vec<(&str, Value, Option<&str>)> = vec![
@@ -1567,6 +1583,8 @@ async fn a_batch_put_request_is_bounded_at_ten_entries_of_ten_values() {
 
     // Rows span the published bounds and one past each: "You can specify up to 10
     // entries per request" and "up to 10 propertyValues array elements".
+    // Anchored inside the ingest window; see `super::support::now_seconds`.
+    let base = super::support::now_seconds() - 10_000;
     let entry_counts = [(1_usize, true), (10, true), (11, false)];
     for (count, accepted) in entry_counts {
         let entries: Vec<Value> = (0..count)
@@ -1575,7 +1593,7 @@ async fn a_batch_put_request_is_bounded_at_ten_entries_of_ten_values() {
                     &format!("e{at}"),
                     &asset_id,
                     &force,
-                    2_000_000 + at as i64 * 100,
+                    base + at as i64 * 100,
                     1,
                 )
             })
@@ -1611,7 +1629,7 @@ async fn a_batch_put_request_is_bounded_at_ten_entries_of_ten_values() {
             "POST",
             "/properties",
             Some(json!({"entries": [
-                entry("v", &asset_id, &force, 3_000_000 + count as i64 * 100, count)
+                entry("v", &asset_id, &force, base + 2_000 + count as i64 * 100, count)
             ]})),
         )
         .await;
@@ -1661,12 +1679,14 @@ async fn a_property_series_is_bounded_and_keeps_the_newest_samples() {
     // Write past the cap, ten samples per request (the modelled per-entry maximum),
     // with ascending timestamps 1..=overflow.
     let overflow = MAX_SAMPLES_PER_SERIES + 20;
+    // Anchored so the whole ascending run lands inside the ingest window.
+    let base = super::support::now_seconds() - overflow as i64 - 10;
     for chunk in (0..overflow).step_by(10) {
         let values: Vec<Value> = (chunk..(chunk + 10).min(overflow))
             .map(|at| {
                 json!({
                     "value": {"integerValue": at as i64},
-                    "timestamp": {"timeInSeconds": at as i64 + 1},
+                    "timestamp": {"timeInSeconds": base + at as i64 + 1},
                 })
             })
             .collect();
@@ -1714,11 +1734,12 @@ async fn a_property_series_is_bounded_and_keeps_the_newest_samples() {
     );
     assert_eq!(
         oldest_second,
-        (overflow - MAX_SAMPLES_PER_SERIES) as i64 + 1,
+        base + (overflow - MAX_SAMPLES_PER_SERIES) as i64 + 1,
         "the oldest kept sample must be the one just past the evicted window, got {oldest_second}"
     );
     assert_eq!(
-        newest_second, overflow as i64,
+        newest_second,
+        base + overflow as i64,
         "the newest kept sample must be the last one written, got {newest_second}"
     );
 
@@ -1733,8 +1754,9 @@ async fn a_property_series_is_bounded_and_keeps_the_newest_samples() {
     assert_eq!(status, 200, "latest after the cap: got {status} {latest}");
     assert_eq!(
         latest["propertyValue"]["timestamp"]["timeInSeconds"].as_i64(),
-        Some(overflow as i64),
-        "latest after the cap: expected timeInSeconds {overflow}, got {latest}"
+        Some(base + overflow as i64),
+        "latest after the cap: expected timeInSeconds {}, got {latest}",
+        base + overflow as i64
     );
     assert_eq!(
         latest["propertyValue"]["value"]["integerValue"].as_i64(),

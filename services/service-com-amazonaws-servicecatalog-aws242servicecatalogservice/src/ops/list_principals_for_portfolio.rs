@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPrincipalsForPortfolio
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPrincipalsForPortfolio`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPrincipalsForPortfolio::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPrincipalsForPortfolio` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPrincipalsForPortfolioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPrincipalsForPortfolio"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: the associations are reported, never changed, by listing them,
+        // page tokens included — a token is derived from the ARN the next page resumes
+        // at, so handing one back records nothing.
+        let state = state.lock();
+
+        // The associations live ON the portfolio, so a portfolio this account does not
+        // hold has no principal list to report: that is the not-found case, not an
+        // empty page.
+        let Some(portfolio) = state.portfolios.get(&input.portfolio_id) else {
+            return Err(
+                ListPrincipalsForPortfolioErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Portfolio not found: {}",
+                            input.portfolio_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A page token is this service's own opaque cursor — encoded and decoded by
+        // the crate-shared codec in `crate::state` — carrying the position in the
+        // reported order the next page resumes AT. Anything that is not one of ours is
+        // a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => match decode_page_token(token) {
+                Some(sequence) => Some(sequence),
+                None => {
+                    return Err(
+                        ListPrincipalsForPortfolioErrorModeled::InvalidParametersException(
+                            InvalidParametersException {
+                                message: Some("PageToken is not a valid page token.".to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining set is returned, which the stored
+        // association count bounds — `crate::state::MAX_PRINCIPALS_PER_PORTFOLIO` is a
+        // FINITE cap of one hundred associations per portfolio, enforced by
+        // `AssociatePrincipalWithPortfolio` before it stores one.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_PRINCIPALS_PER_PORTFOLIO
+        };
+
+        // The associations are reported in the order they were made, and the cursor
+        // is a position in that order, so a resumed walk skips exactly the pages
+        // already handed out.
+        let mut principals = Vec::new();
+        let mut next_page_token = None;
+        for (arn, association) in portfolio
+            .principals_in_association_order()
+            .into_iter()
+            .filter(|(_, association)| {
+                resume_at.is_none_or(|resume| association.sequence >= resume)
+            })
+        {
+            if principals.len() == page_size {
+                // More remain: hand back a cursor that resumes at this association.
+                next_page_token = Some(encode_page_token(association.sequence));
+                break;
+            }
+            principals.push(Principal {
+                // The ARN is reported exactly as it was associated: it is the
+                // caller's own value, and it is what addresses the association.
+                principal_arn: Some(arn.clone()),
+                principal_type: Some(association.principal_type.clone()),
+            });
+        }
+
+        Ok(ListPrincipalsForPortfolioOutput {
+            principals: Some(principals),
+            next_page_token,
+        })
     }
+}
+
+/// The position a page resumes at, through the crate-shared cursor codec
+/// (`crate::state::encode_page_cursor`): the position is rendered as its decimal
+/// digits, which the codec's `Id`-pattern check admits, so every paged list in this
+/// service mints tokens of one shape.
+fn encode_page_token(sequence: u64) -> String {
+    crate::state::encode_page_cursor(&sequence.to_string())
+}
+
+/// The inverse of [`encode_page_token`]. `None` for anything this service did not
+/// mint: not one of its cursors, or not a position.
+fn decode_page_token(token: &str) -> Option<u64> {
+    crate::state::decode_page_cursor(token)?.parse().ok()
 }

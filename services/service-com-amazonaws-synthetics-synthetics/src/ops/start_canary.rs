@@ -62,7 +62,8 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::{
-    new_uuid, CanaryRunState, CanaryState, StoredRun, RUN_SETTLE, STORE_UNAVAILABLE,
+    new_uuid, CanaryRunState, CanaryState, StoredRun, CANARY_NOT_FOUND, RUN_SETTLE,
+    STORE_UNAVAILABLE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -151,7 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let canary = guard.canaries.get_mut(&input.name).ok_or_else(|| {
             StartCanaryError::from(StartCanaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Canary {} not found", input.name)),
+                    // The missing-canary message is a fixed sentence, not built from
+                    // the lookup key: see `state::CANARY_NOT_FOUND`.
+                    message: Some(CANARY_NOT_FOUND.to_string()),
                 },
             ))
         })?;

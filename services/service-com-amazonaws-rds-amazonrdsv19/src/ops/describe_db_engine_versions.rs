@@ -187,19 +187,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeDBEngineVersionsError::validation)?;
 
-        let mut matching: Vec<(String, CreateCustomDBEngineVersionOutput)> = catalogue()
-            .filter(|(_, entry, facts)| matches_request(entry, facts, &input, &filters))
-            .map(|(index, entry, facts)| {
-                (
-                    format!("{}#{}", entry.engine, entry.engine_version),
-                    to_wire(entry, facts, index, &input),
-                )
-            })
+        // `catalogue()` yields the rows in catalogue order, so the keys below ascend and
+        // `paginate` can cut a page from them directly.
+        let matching: Vec<(String, CreateCustomDBEngineVersionOutput)> = catalogue()
+            .filter(|(_, entry, _)| matches_request(entry, &input, &filters))
+            .map(|(index, entry, facts)| (page_key(index), to_wire(entry, facts, index, &input)))
             .collect();
-        // `paginate` resumes at the first key at or past the `Marker`, so the report is
-        // cut from ONE total order over `(Engine, EngineVersion)`: a page boundary
-        // cannot drift between calls.
-        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
+        // `DefaultOnly` reports "only the default version of the specified engine or the
+        // engine and major version combination" — so there has to BE a specified engine
+        // whose default to report, and this service has to publish a default for it. A
+        // request that names no engine at all, or one this service publishes no default
+        // version for, resolves to no default: it is refused as the parameter
+        // combination it is, rather than answered with an arbitrary version or with an
+        // empty list that would read as "this engine has no default".
+        if input.default_only == Some(true) {
+            let engine_named = input.engine.is_some()
+                || input.db_parameter_group_family.is_some()
+                || filters.iter().any(|filter| {
+                    matches!(filter.name.as_str(), "engine" | "db-parameter-group-family")
+                });
+            if !engine_named || matching.is_empty() {
+                return Err(
+                    DescribeDBEngineVersionsError::invalid_parameter_combination(format!(
+                        "RDS can't find a default engine version for {}",
+                        requested_engine(&input, &filters)
+                    )),
+                );
+            }
+        }
 
         let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
         Ok(DescribeDBEngineVersionsOutput {
@@ -207,6 +222,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_engine_versions: Some(page.items),
         })
     }
+}
+
+/// The pagination key of the catalogue row at `index`.
+///
+/// `Marker` is an opaque pagination token, so what it owes a caller is that it is STABLE
+/// and ORDERED: `paginate` resumes at the first key at or past it, so paging walks one
+/// total order and a page boundary cannot drift between calls. The catalogue POSITION is
+/// both, and it keeps the report in the catalogue's own order — grouped by engine,
+/// ascending by version — rather than in the lexicographic order of version strings,
+/// under which `10.11.9` would be reported before the EARLIER `10.5.28`. Zero-padded so
+/// that lexicographic key order is numeric position order.
+fn page_key(index: usize) -> String {
+    format!("{index:06}")
 }
 
 /// The filter names this operation's `Filters` member documents: "`db-parameter-group-family`",
@@ -239,18 +267,50 @@ fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
 /// exactly two valid statuses, "`available`" and "`deprecated`".
 pub(crate) const STATUS_AVAILABLE: &str = "available";
 
+/// How the request named the engine whose DEFAULT version it asked for — what the
+/// refusal of an unresolvable `DefaultOnly` request quotes back, so the caller can see
+/// which combination resolved to no default version.
+fn requested_engine(input: &DescribeDBEngineVersionsInput, filters: &[Filter]) -> String {
+    let mut named: Vec<String> = Vec::new();
+    if let Some(engine) = &input.engine {
+        named.push(format!("Engine={engine}"));
+    }
+    if let Some(version) = &input.engine_version {
+        named.push(format!("EngineVersion={version}"));
+    }
+    if let Some(family) = &input.db_parameter_group_family {
+        named.push(format!("DBParameterGroupFamily={family}"));
+    }
+    for filter in filters {
+        named.push(format!(
+            "Filters[{}]={}",
+            filter.name,
+            filter.values.join(",")
+        ));
+    }
+    if named.is_empty() {
+        return "a request naming no engine".to_string();
+    }
+    named.join(", ")
+}
+
 /// An engine version AWS no longer offers for a new instance. `IncludeAll` is what asks
 /// for these: "Specifies whether to also list the engine versions that aren't available.
 /// The default is to list only available engine versions."
 const STATUS_DEPRECATED: &str = "deprecated";
 
-/// The `SupportedEngineModes` of a non-Aurora engine. The `engine-mode` filter's member
-/// documents the five valid modes (`global`, `multimaster`, `parallelquery`,
-/// `provisioned`, `serverless`); an RDS DB instance engine runs only `provisioned`.
+/// The `SupportedEngineModes` of a DB engine version that runs as a provisioned engine
+/// only. The `engine-mode` filter's member documents the five valid modes (`global`,
+/// `multimaster`, `parallelquery`, `provisioned`, `serverless`); every RDS DB instance
+/// engine and every modern Aurora version runs `provisioned`.
 const PROVISIONED_ONLY: &[&str] = &["provisioned"];
 
-/// The `SupportedEngineModes` of an Aurora engine, which also runs Aurora Serverless.
-const AURORA_MODES: &[&str] = &["provisioned", "serverless"];
+/// The `SupportedEngineModes` of an Aurora version that ALSO runs Aurora Serverless v1.
+///
+/// Serverless v1 is a property of the VERSION, not of the engine: it is offered on a few
+/// legacy Aurora versions and on none of the later ones, which run provisioned (with
+/// Aurora Serverless v2 reported through `ServerlessV2FeaturesSupport` instead).
+const PROVISIONED_AND_SERVERLESS: &[&str] = &["provisioned", "serverless"];
 
 /// Whether an entry is the default version of its engine, of its major version only, or
 /// of neither.
@@ -283,6 +343,12 @@ impl DefaultLevel {
 
 /// What this service reports about one DB engine, shared by every version of it.
 ///
+/// Only the facts that CANNOT differ between two versions of one engine live here: the
+/// product and description text, the log types that engine can export, and the character
+/// sets and time zones `CreateDBInstance` takes for it. Everything a client gates a
+/// version on — the engine modes it runs and the `Supports*` capability flags — is a
+/// property of the VERSION and lives in [`VersionProfile`].
+///
 /// `pub(crate)` because `DescribeOrderableDBInstanceOptions` reports on the same engines
 /// and must not disagree with this report about them.
 pub(crate) struct EngineFacts {
@@ -292,16 +358,6 @@ pub(crate) struct EngineFacts {
     pub(crate) product: &'static str,
     /// `DBEngineDescription`.
     pub(crate) description: &'static str,
-    /// `SupportedEngineModes`.
-    pub(crate) engine_modes: &'static [&'static str],
-    /// `SupportsReadReplica`.
-    pub(crate) supports_read_replica: bool,
-    /// `SupportsGlobalDatabases` — an Aurora global database.
-    pub(crate) supports_global_databases: bool,
-    /// `SupportsParallelQuery` — Aurora MySQL's parallel query.
-    pub(crate) supports_parallel_query: bool,
-    /// `SupportsBabelfish` — Babelfish for Aurora PostgreSQL.
-    pub(crate) supports_babelfish: bool,
     /// `ExportableLogTypes`, and so `SupportsLogExportsToCloudwatchLogs` when non-empty.
     pub(crate) exportable_log_types: &'static [&'static str],
     /// `(name, description)` pairs for `SupportedCharacterSets`, whose first entry is
@@ -311,11 +367,313 @@ pub(crate) struct EngineFacts {
     pub(crate) timezones: &'static [&'static str],
 }
 
+/// The capability facts of ONE engine version.
+///
+/// AWS reports these per engine VERSION rather than per engine — `SupportedEngineModes`,
+/// `SupportsReadReplica` and each `Supports*` flag answer "what can THIS version do" —
+/// which is why two versions of one engine can disagree about them, and why a client
+/// gating on them has to read the version it is about to use.
+///
+/// `pub(crate)` for the same reason as [`EngineFacts`]: an orderable DB instance option
+/// repeats some of these, and the two reports must not disagree.
+pub(crate) struct VersionProfile {
+    /// `SupportedEngineModes` — the modes THIS version runs.
+    pub(crate) engine_modes: &'static [&'static str],
+    /// `SupportedFeatureNames`.
+    pub(crate) feature_names: &'static [&'static str],
+    /// `ServerlessV2FeaturesSupport` as `(MinCapacity, MaxCapacity)` in Aurora Capacity
+    /// Units, for a version that runs Aurora Serverless v2; `None` for one that does not,
+    /// which reports no Serverless v2 limits at all.
+    pub(crate) serverless_v2_capacity: Option<(f64, f64)>,
+    /// `SupportsReadReplica`.
+    pub(crate) supports_read_replica: bool,
+    /// `SupportsGlobalDatabases` — an Aurora global database.
+    pub(crate) supports_global_databases: bool,
+    /// `SupportsParallelQuery` — Aurora MySQL's parallel query.
+    pub(crate) supports_parallel_query: bool,
+    /// `SupportsBabelfish` — Babelfish for Aurora PostgreSQL.
+    pub(crate) supports_babelfish: bool,
+    /// `SupportsLimitlessDatabase` — Aurora Limitless Database.
+    pub(crate) supports_limitless_database: bool,
+    /// `SupportsLocalWriteForwarding` — forwarding writes from a reader to the writer.
+    pub(crate) supports_local_write_forwarding: bool,
+    /// `SupportsIntegrations` — a zero-ETL integration with Amazon Redshift.
+    pub(crate) supports_integrations: bool,
+    /// `SupportsCertificateRotationWithoutRestart`.
+    pub(crate) supports_certificate_rotation_without_restart: bool,
+}
+
+impl VersionProfile {
+    /// The base profile: a provisioned DB engine version with no read replica, no
+    /// Aurora-only capability, no engine-integration feature and no certificate rotation
+    /// without a restart. Every profile below is this one plus what that version adds,
+    /// so a capability is claimed only where it is written down.
+    const fn provisioned() -> Self {
+        Self {
+            engine_modes: PROVISIONED_ONLY,
+            feature_names: &[],
+            serverless_v2_capacity: None,
+            supports_read_replica: false,
+            supports_global_databases: false,
+            supports_parallel_query: false,
+            supports_babelfish: false,
+            supports_limitless_database: false,
+            supports_local_write_forwarding: false,
+            supports_integrations: false,
+            supports_certificate_rotation_without_restart: false,
+        }
+    }
+
+    /// This version serves an RDS read replica (`SupportsReadReplica`).
+    const fn read_replica(mut self) -> Self {
+        self.supports_read_replica = true;
+        self
+    }
+
+    /// This version's certificate can be rotated without rebooting the DB instance.
+    const fn certificate_rotation_without_restart(mut self) -> Self {
+        self.supports_certificate_rotation_without_restart = true;
+        self
+    }
+
+    /// The `SupportedFeatureNames` of this version.
+    const fn features(mut self, names: &'static [&'static str]) -> Self {
+        self.feature_names = names;
+        self
+    }
+
+    /// This version also runs Aurora Serverless v1, so it reports the `serverless`
+    /// engine mode beside `provisioned`.
+    const fn serverless_v1(mut self) -> Self {
+        self.engine_modes = PROVISIONED_AND_SERVERLESS;
+        self
+    }
+
+    /// This version runs Aurora Serverless v2 between `min` and `max` ACUs.
+    const fn serverless_v2(mut self, min: f64, max: f64) -> Self {
+        self.serverless_v2_capacity = Some((min, max));
+        self
+    }
+
+    /// This version can join an Aurora global database.
+    const fn global_databases(mut self) -> Self {
+        self.supports_global_databases = true;
+        self
+    }
+
+    /// This version runs Aurora parallel query.
+    const fn parallel_query(mut self) -> Self {
+        self.supports_parallel_query = true;
+        self
+    }
+
+    /// This version runs Babelfish for Aurora PostgreSQL.
+    const fn babelfish(mut self) -> Self {
+        self.supports_babelfish = true;
+        self
+    }
+
+    /// This version runs Aurora Limitless Database.
+    const fn limitless_database(mut self) -> Self {
+        self.supports_limitless_database = true;
+        self
+    }
+
+    /// This version forwards writes from a reader to the writer of its cluster.
+    const fn local_write_forwarding(mut self) -> Self {
+        self.supports_local_write_forwarding = true;
+        self
+    }
+
+    /// This version supports a zero-ETL integration with Amazon Redshift.
+    const fn integrations(mut self) -> Self {
+        self.supports_integrations = true;
+        self
+    }
+}
+
+/// `SupportedCACertificateIdentifiers`: the CA certificates a DB instance of an engine
+/// version can be given through `CreateDBInstance`'s `CACertificateIdentifier`.
+///
+/// The member's own documentation points at "Using SSL/TLS to encrypt a connection to a
+/// DB instance"; these are the Amazon RDS certificate authorities that page publishes —
+/// one ECDSA and two RSA CAs — which every engine version in this catalogue supports.
+const CA_CERTIFICATE_IDENTIFIERS: &[&str] = &[
+    "rds-ca-ecc384-g1",
+    "rds-ca-rsa2048-g1",
+    "rds-ca-rsa4096-g1",
+];
+
+/// The `SupportedFeatureNames` of an RDS for MySQL version.
+///
+/// `SupportedFeatureNames` is the list a caller reads to find the `FeatureName` values
+/// `AddRoleToDBInstance` takes for that engine version (the member's documentation
+/// states the list "vary[ies] by DB engine and DB engine version"), so each list below is
+/// the IAM-role features this emulator publishes for that engine.
+const MYSQL_FEATURE_NAMES: &[&str] = &["s3Import"];
+
+/// The `SupportedFeatureNames` of an Aurora MySQL version, which loads from and unloads
+/// to Amazon S3.
+const AURORA_MYSQL_FEATURE_NAMES: &[&str] = &["s3Import", "s3Export"];
+
+/// The `SupportedFeatureNames` of a PostgreSQL version, Aurora PostgreSQL included.
+const POSTGRESQL_FEATURE_NAMES: &[&str] = &["s3Import", "s3Export", "Lambda"];
+
+/// The `SupportedFeatureNames` of an Oracle version.
+const ORACLE_FEATURE_NAMES: &[&str] = &["S3_INTEGRATION"];
+
+/// The `SupportedFeatureNames` of a Microsoft SQL Server version.
+const SQLSERVER_FEATURE_NAMES: &[&str] = &["S3_INTEGRATION", "SQLSERVER_BACKUP_RESTORE"];
+
+// ---------------------------------------------------------------------------
+// The version profiles: one per (engine family, capability generation)
+// ---------------------------------------------------------------------------
+
+/// RDS for MySQL 5.7: read replicas and S3 import. The zero-ETL integration members
+/// arrived with 8.0, so a 5.7 version reports none.
+const MYSQL_5_7: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .certificate_rotation_without_restart()
+    .features(MYSQL_FEATURE_NAMES);
+
+/// RDS for MySQL 8.0 and later, which also supports a zero-ETL integration.
+const MYSQL_8: VersionProfile = MYSQL_5_7.integrations();
+
+/// RDS for MariaDB: read replicas, and no S3 or Lambda integration feature.
+const MARIADB: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .certificate_rotation_without_restart();
+
+/// RDS for PostgreSQL: read replicas and the S3 and Lambda features.
+const POSTGRES: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .certificate_rotation_without_restart()
+    .features(POSTGRESQL_FEATURE_NAMES);
+
+/// RDS for Oracle Enterprise Edition, which serves a read replica. Oracle and SQL Server
+/// pick up a rotated CA only after a restart, so neither reports certificate rotation
+/// without one.
+const ORACLE_EE: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .features(ORACLE_FEATURE_NAMES);
+
+/// RDS for Oracle Standard Edition Two, which serves no read replica.
+const ORACLE_SE2: VersionProfile = VersionProfile::provisioned().features(ORACLE_FEATURE_NAMES);
+
+/// A Microsoft SQL Server edition that serves a read replica (Enterprise and Standard).
+const SQLSERVER_WITH_REPLICA: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .features(SQLSERVER_FEATURE_NAMES);
+
+/// A Microsoft SQL Server edition that serves none (Express, Web and Developer).
+const SQLSERVER: VersionProfile =
+    VersionProfile::provisioned().features(SQLSERVER_FEATURE_NAMES);
+
+/// A Db2 edition that serves a read replica (Advanced and Standard).
+const DB2_WITH_REPLICA: VersionProfile = VersionProfile::provisioned().read_replica();
+
+/// Db2 Community Edition, which serves none.
+const DB2: VersionProfile = VersionProfile::provisioned();
+
+/// Amazon DocumentDB: a cluster engine, provisioned like Aurora, whose instances are
+/// cluster members (so `SupportsReadReplica` is reported, as that control plane's own
+/// read report does) and whose clusters join a global cluster
+/// (`CreateGlobalCluster` in the DocumentDB model). It publishes no serverless mode of
+/// its own and none of the Aurora-specific capabilities.
+const DOCDB: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .global_databases()
+    .certificate_rotation_without_restart();
+
+/// Amazon Neptune, the same kind of cluster engine with its own global database.
+const NEPTUNE: VersionProfile = DOCDB;
+
+/// Aurora capacity bounds for Serverless v2: "Aurora Capacity Units" from half an ACU to
+/// the largest capacity this emulator publishes.
+const SERVERLESS_V2_MIN_CAPACITY: f64 = 0.5;
+
+/// The upper Serverless v2 bound of a current Aurora version.
+const SERVERLESS_V2_MAX_CAPACITY: f64 = 256.0;
+
+/// The upper Serverless v2 bound of an earlier Aurora version, before the maximum was
+/// raised: a difference between versions is exactly what `ServerlessV2FeaturesSupport`
+/// exists to report ("any Aurora Serverless v2 properties or limits that differ between
+/// Aurora engine versions").
+const SERVERLESS_V2_EARLIER_MAX_CAPACITY: f64 = 128.0;
+
+/// Aurora MySQL 2 (MySQL 5.7 compatible): a cluster engine, so it serves cluster readers
+/// rather than RDS read replicas, with global databases and parallel query, and without
+/// Serverless v2.
+const AURORA_MYSQL_5_7: VersionProfile = VersionProfile::provisioned()
+    .global_databases()
+    .parallel_query()
+    .certificate_rotation_without_restart()
+    .features(AURORA_MYSQL_FEATURE_NAMES);
+
+/// An Aurora MySQL 2 version that also runs Aurora Serverless v1. A Serverless v1 cluster
+/// is single-region and has no parallel query, so this version reports neither.
+const AURORA_MYSQL_5_7_SERVERLESS_V1: VersionProfile = VersionProfile::provisioned()
+    .serverless_v1()
+    .certificate_rotation_without_restart()
+    .features(AURORA_MYSQL_FEATURE_NAMES);
+
+/// Aurora MySQL 3 (MySQL 8.0 compatible): Serverless v2, local write forwarding and a
+/// zero-ETL integration, beside the Aurora MySQL 2 capabilities.
+const AURORA_MYSQL_8: VersionProfile = AURORA_MYSQL_5_7
+    .serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY)
+    .local_write_forwarding()
+    .integrations();
+
+/// Aurora PostgreSQL 11: a provisioned cluster engine with global databases, before
+/// Babelfish and before Serverless v2.
+const AURORA_POSTGRESQL_11: VersionProfile = VersionProfile::provisioned()
+    .global_databases()
+    .certificate_rotation_without_restart()
+    .features(POSTGRESQL_FEATURE_NAMES);
+
+/// An Aurora PostgreSQL 11 version that also runs Aurora Serverless v1, which is
+/// single-region.
+const AURORA_POSTGRESQL_11_SERVERLESS_V1: VersionProfile = VersionProfile::provisioned()
+    .serverless_v1()
+    .certificate_rotation_without_restart()
+    .features(POSTGRESQL_FEATURE_NAMES);
+
+/// Aurora PostgreSQL 13 and 14: Babelfish and Serverless v2, at the earlier capacity
+/// maximum.
+const AURORA_POSTGRESQL_13: VersionProfile = AURORA_POSTGRESQL_11
+    .babelfish()
+    .serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_EARLIER_MAX_CAPACITY);
+
+/// Aurora PostgreSQL 15 and later: the current Serverless v2 maximum, local write
+/// forwarding and a zero-ETL integration.
+const AURORA_POSTGRESQL_15: VersionProfile = AURORA_POSTGRESQL_11
+    .babelfish()
+    .serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY)
+    .local_write_forwarding()
+    .integrations();
+
+/// An Aurora PostgreSQL version that runs Aurora Limitless Database, which is a separate
+/// version of its major version rather than a capability of every version in it.
+const AURORA_POSTGRESQL_LIMITLESS: VersionProfile = AURORA_POSTGRESQL_15.limitless_database();
+
 /// The character sets an Oracle engine reports: `CreateDBInstance`'s `CharacterSetName`
-/// is an Oracle-only member, and `AL32UTF8` is the engine's default.
+/// is an Oracle and SQL Server member, and `AL32UTF8` is the Oracle engine's default.
 const ORACLE_CHARACTER_SETS: &[(&str, &str)] = &[
     ("AL32UTF8", "Unicode 5.0 UTF-8 Universal character set"),
     ("WE8ISO8859P15", "ISO 8859-15 West European"),
+];
+
+/// The collations a Microsoft SQL Server engine reports for `CharacterSetName`, whose
+/// first entry is the engine's default server collation.
+const SQLSERVER_COLLATIONS: &[(&str, &str)] = &[
+    (
+        "SQL_Latin1_General_CP1_CI_AS",
+        "Latin1-General, case-insensitive, accent-sensitive",
+    ),
+    (
+        "SQL_Latin1_General_CP1_CS_AS",
+        "Latin1-General, case-sensitive, accent-sensitive",
+    ),
 ];
 
 /// The time zones a Microsoft SQL Server engine reports: `CreateDBInstance`'s `Timezone`
@@ -341,28 +699,36 @@ const SQLSERVER_LOG_TYPES: &[&str] = &["agent", "error"];
 /// The log types a Db2 engine can export to CloudWatch Logs.
 const DB2_LOG_TYPES: &[&str] = &["diag.log", "notify.log"];
 
+/// The log types an Amazon DocumentDB engine can export to CloudWatch Logs
+/// (`EnableCloudwatchLogsExports` in the DocumentDB model: the audit and profiler logs).
+const DOCDB_LOG_TYPES: &[&str] = &["audit", "profiler"];
+
 /// Every DB engine this service reports versions for.
 ///
 /// The engine names are exactly the `Engine` member's published "Valid Values"
 /// (`smithy_query(query="doc",shape="DescribeDBEngineVersionsMessage",member="Engine")`),
 /// minus the four `custom-oracle-*` engines: a custom engine version is a record the
 /// account creates with `CreateCustomDBEngineVersion`, so this service reports one only
-/// once that operation stores one, never as catalogue data.
+/// once that operation stores one, never as catalogue data. The same holds for any other
+/// RDS Custom engine, whose versions are created from customer-supplied installation
+/// media by that one operation.
 ///
-/// The per-engine facts (engine modes, read replica / global database / parallel query /
-/// Babelfish support, exportable log types, character sets and time zones) are this
+/// The per-engine facts (exportable log types, character sets and time zones) are this
 /// emulator's published reference data for those engines, as the RDS engine feature
 /// matrix states them. They are the same for every caller and no request changes them.
+///
+/// `docdb` and `neptune` are here as well, and they are NOT values this model's `Engine`
+/// member lists: this Query front door also serves the Amazon DocumentDB and Amazon
+/// Neptune control planes (`src/service.rs` — all three models publish this endpoint
+/// prefix, signing name, protocol and API version), and `aws docdb
+/// describe-db-engine-versions` is this same action on this same endpoint. Their engine
+/// names are the valid values documented on `CreateDBClusterMessage$Engine` in those two
+/// models (`docdb`: "Valid values: docdb"; `neptune`: "Valid values: neptune").
 pub(crate) const ENGINES: &[EngineFacts] = &[
     EngineFacts {
         engine: "aurora-mysql",
         product: "Aurora MySQL",
         description: "Aurora MySQL",
-        engine_modes: AURORA_MODES,
-        supports_read_replica: true,
-        supports_global_databases: true,
-        supports_parallel_query: true,
-        supports_babelfish: false,
         exportable_log_types: MYSQL_LOG_TYPES,
         character_sets: &[],
         timezones: &[],
@@ -371,11 +737,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "aurora-postgresql",
         product: "Aurora PostgreSQL",
         description: "Aurora PostgreSQL",
-        engine_modes: AURORA_MODES,
-        supports_read_replica: true,
-        supports_global_databases: true,
-        supports_parallel_query: false,
-        supports_babelfish: true,
         exportable_log_types: &["postgresql"],
         character_sets: &[],
         timezones: &[],
@@ -384,11 +745,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "db2-ae",
         product: "Db2",
         description: "Db2 Advanced Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: DB2_LOG_TYPES,
         character_sets: &[],
         timezones: &[],
@@ -397,11 +753,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "db2-ce",
         product: "Db2",
         description: "Db2 Community Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: false,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: DB2_LOG_TYPES,
         character_sets: &[],
         timezones: &[],
@@ -410,12 +761,15 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "db2-se",
         product: "Db2",
         description: "Db2 Standard Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: DB2_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "docdb",
+        product: "Amazon DocumentDB",
+        description: "Amazon DocumentDB (with MongoDB compatibility)",
+        exportable_log_types: DOCDB_LOG_TYPES,
         character_sets: &[],
         timezones: &[],
     },
@@ -423,11 +777,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "mariadb",
         product: "MariaDB",
         description: "MariaDB Community Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: MYSQL_LOG_TYPES,
         character_sets: &[],
         timezones: &[],
@@ -436,12 +785,15 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "mysql",
         product: "MySQL",
         description: "MySQL Community Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: MYSQL_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "neptune",
+        product: "Amazon Neptune",
+        description: "Amazon Neptune",
+        exportable_log_types: &["audit"],
         character_sets: &[],
         timezones: &[],
     },
@@ -449,11 +801,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "oracle-ee",
         product: "Oracle Database Enterprise Edition",
         description: "Oracle Database Enterprise Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
         timezones: &[],
@@ -462,11 +809,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "oracle-ee-cdb",
         product: "Oracle Database Enterprise Edition (CDB)",
         description: "Oracle Database Enterprise Edition (multi-tenant architecture)",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
         timezones: &[],
@@ -475,11 +817,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "oracle-se2",
         product: "Oracle Database Standard Edition Two",
         description: "Oracle Database Standard Edition Two",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: false,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
         timezones: &[],
@@ -488,11 +825,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "oracle-se2-cdb",
         product: "Oracle Database Standard Edition Two (CDB)",
         description: "Oracle Database Standard Edition Two (multi-tenant architecture)",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: false,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
         timezones: &[],
@@ -501,11 +833,6 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "postgres",
         product: "PostgreSQL",
         description: "PostgreSQL",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: &["postgresql", "upgrade"],
         character_sets: &[],
         timezones: &[],
@@ -514,65 +841,40 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         engine: "sqlserver-dev-ee",
         product: "Microsoft SQL Server Developer Edition",
         description: "Microsoft SQL Server Developer Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: false,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: SQLSERVER_LOG_TYPES,
-        character_sets: &[],
+        character_sets: SQLSERVER_COLLATIONS,
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
         engine: "sqlserver-ee",
         product: "Microsoft SQL Server Enterprise Edition",
         description: "Microsoft SQL Server Enterprise Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: SQLSERVER_LOG_TYPES,
-        character_sets: &[],
+        character_sets: SQLSERVER_COLLATIONS,
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
         engine: "sqlserver-ex",
         product: "Microsoft SQL Server Express Edition",
         description: "Microsoft SQL Server Express Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: false,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: SQLSERVER_LOG_TYPES,
-        character_sets: &[],
+        character_sets: SQLSERVER_COLLATIONS,
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
         engine: "sqlserver-se",
         product: "Microsoft SQL Server Standard Edition",
         description: "Microsoft SQL Server Standard Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: true,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: SQLSERVER_LOG_TYPES,
-        character_sets: &[],
+        character_sets: SQLSERVER_COLLATIONS,
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
         engine: "sqlserver-web",
         product: "Microsoft SQL Server Web Edition",
         description: "Microsoft SQL Server Web Edition",
-        engine_modes: PROVISIONED_ONLY,
-        supports_read_replica: false,
-        supports_global_databases: false,
-        supports_parallel_query: false,
-        supports_babelfish: false,
         exportable_log_types: SQLSERVER_LOG_TYPES,
-        character_sets: &[],
+        character_sets: SQLSERVER_COLLATIONS,
         timezones: SQLSERVER_TIMEZONES,
     },
 ];
@@ -596,12 +898,14 @@ pub(crate) struct CatalogVersion {
     /// Whether this is the default version of its engine, of its major version, or of
     /// neither — what `DefaultOnly` selects on.
     pub(crate) default_level: DefaultLevel,
+    /// What THIS version can do: its engine modes and capability flags.
+    pub(crate) profile: &'static VersionProfile,
 }
 
 /// One catalogue row, so the table below reads as a table.
 ///
 /// Columns, in order: engine, engine version, major engine version, DB parameter group
-/// family, status, default level.
+/// family, status, default level, version profile.
 const fn row(
     engine: &'static str,
     engine_version: &'static str,
@@ -609,6 +913,7 @@ const fn row(
     parameter_group_family: &'static str,
     status: &'static str,
     default_level: DefaultLevel,
+    profile: &'static VersionProfile,
 ) -> CatalogVersion {
     CatalogVersion {
         engine,
@@ -617,6 +922,7 @@ const fn row(
         parameter_group_family,
         status,
         default_level,
+        profile,
     }
 }
 
@@ -625,22 +931,108 @@ const fn row(
 /// Reference data, like the engine facts above: AWS publishes an engine-version list per
 /// engine and no request changes it, so this is the list this emulator publishes. It is
 /// NOT the real service's live list, which moves with every RDS release; what a caller
-/// can rely on is the shape of each entry, that one version per engine is that engine's
+/// can rely on is the shape of each entry, that every engine carries several versions
+/// across several major-version families, that one version per engine is that engine's
 /// default and one per major version is that major version's, that a deprecated version
-/// is reported only when `IncludeAll` asks for it, and that the `ValidUpgradeTarget` of
-/// an entry is the engine's own later versions.
+/// is reported only when `IncludeAll` asks for it, that the capability members of an
+/// entry are that VERSION's, and that the `ValidUpgradeTarget` of an entry is the
+/// engine's own later versions.
 ///
 /// Rows are grouped by engine and, WITHIN an engine, listed in ascending version order:
-/// `valid_upgrade_targets` reads that order to decide which versions an entry can be
-/// upgraded to.
+/// that order is the report's order (see [`page_key`]), and `valid_upgrade_targets` reads
+/// it to decide which versions an entry can be upgraded to.
 pub(crate) const CATALOG: &[CatalogVersion] = &[
+    // --- Aurora MySQL -----------------------------------------------------
+    row(
+        "aurora-mysql",
+        "5.7.mysql_aurora.2.07.1",
+        "5.7",
+        "aurora-mysql5.7",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_5_7_SERVERLESS_V1,
+    ),
+    row(
+        "aurora-mysql",
+        "5.7.mysql_aurora.2.11.1",
+        "5.7",
+        "aurora-mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_5_7,
+    ),
+    row(
+        "aurora-mysql",
+        "5.7.mysql_aurora.2.11.6",
+        "5.7",
+        "aurora-mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &AURORA_MYSQL_5_7,
+    ),
+    row(
+        "aurora-mysql",
+        "8.0.mysql_aurora.3.05.2",
+        "8.0",
+        "aurora-mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_8,
+    ),
     row(
         "aurora-mysql",
         "8.0.mysql_aurora.3.07.1",
         "8.0",
         "aurora-mysql8.0",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_8,
+    ),
+    row(
+        "aurora-mysql",
+        "8.0.mysql_aurora.3.08.0",
+        "8.0",
+        "aurora-mysql8.0",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &AURORA_MYSQL_8,
+    ),
+    // --- Aurora PostgreSQL ------------------------------------------------
+    row(
+        "aurora-postgresql",
+        "11.9",
+        "11",
+        "aurora-postgresql11",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_11_SERVERLESS_V1,
+    ),
+    row(
+        "aurora-postgresql",
+        "11.21",
+        "11",
+        "aurora-postgresql11",
+        STATUS_DEPRECATED,
+        DefaultLevel::Major,
+        &AURORA_POSTGRESQL_11,
+    ),
+    row(
+        "aurora-postgresql",
+        "13.15",
+        "13",
+        "aurora-postgresql13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &AURORA_POSTGRESQL_13,
+    ),
+    row(
+        "aurora-postgresql",
+        "14.12",
+        "14",
+        "aurora-postgresql14",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &AURORA_POSTGRESQL_13,
     ),
     row(
         "aurora-postgresql",
@@ -649,6 +1041,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "aurora-postgresql15",
         STATUS_AVAILABLE,
         DefaultLevel::Major,
+        &AURORA_POSTGRESQL_15,
     ),
     row(
         "aurora-postgresql",
@@ -656,15 +1049,54 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "16",
         "aurora-postgresql16",
         STATUS_AVAILABLE,
-        DefaultLevel::Engine,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_15,
     ),
+    row(
+        "aurora-postgresql",
+        "16.4-limitless",
+        "16",
+        "aurora-postgresql16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_LIMITLESS,
+    ),
+    row(
+        "aurora-postgresql",
+        "16.6",
+        "16",
+        "aurora-postgresql16",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &AURORA_POSTGRESQL_15,
+    ),
+    // --- Db2 --------------------------------------------------------------
     row(
         "db2-ae",
         "11.5.9.0",
         "11.5",
         "db2-ae-11.5",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &DB2_WITH_REPLICA,
+    ),
+    row(
+        "db2-ae",
+        "11.5.11.0",
+        "11.5",
+        "db2-ae-11.5",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &DB2_WITH_REPLICA,
+    ),
+    row(
+        "db2-ae",
+        "12.1.0.0",
+        "12.1",
+        "db2-ae-12.1",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &DB2_WITH_REPLICA,
     ),
     row(
         "db2-ce",
@@ -672,7 +1104,26 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "11.5",
         "db2-ce-11.5",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &DB2,
+    ),
+    row(
+        "db2-ce",
+        "11.5.11.0",
+        "11.5",
+        "db2-ce-11.5",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &DB2,
+    ),
+    row(
+        "db2-ce",
+        "12.1.0.0",
+        "12.1",
+        "db2-ce-12.1",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &DB2,
     ),
     row(
         "db2-se",
@@ -680,7 +1131,77 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "11.5",
         "db2-se-11.5",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &DB2_WITH_REPLICA,
+    ),
+    row(
+        "db2-se",
+        "11.5.11.0",
+        "11.5",
+        "db2-se-11.5",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &DB2_WITH_REPLICA,
+    ),
+    row(
+        "db2-se",
+        "12.1.0.0",
+        "12.1",
+        "db2-se-12.1",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &DB2_WITH_REPLICA,
+    ),
+    // --- Amazon DocumentDB ------------------------------------------------
+    // The Amazon DocumentDB engine versions this front door publishes: 3.6, 4.0 and
+    // 5.0 are DocumentDB's major versions, and 5.0 is the one a cluster created without
+    // an `EngineVersion` gets (`CreateDBClusterMessage$EngineVersion` in that model: "The
+    // --engine-version will default to the latest major engine version").
+    row(
+        "docdb",
+        "3.6.0",
+        "3.6",
+        "docdb3.6",
+        STATUS_DEPRECATED,
+        DefaultLevel::Major,
+        &DOCDB,
+    ),
+    row(
+        "docdb",
+        "4.0.0",
+        "4.0",
+        "docdb4.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &DOCDB,
+    ),
+    row(
+        "docdb",
+        "5.0.0",
+        "5.0",
+        "docdb5.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &DOCDB,
+    ),
+    // --- MariaDB ----------------------------------------------------------
+    row(
+        "mariadb",
+        "10.5.28",
+        "10.5",
+        "mariadb10.5",
+        STATUS_DEPRECATED,
+        DefaultLevel::Major,
+        &MARIADB,
+    ),
+    row(
+        "mariadb",
+        "10.6.20",
+        "10.6",
+        "mariadb10.6",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &MARIADB,
     ),
     row(
         "mariadb",
@@ -688,7 +1209,17 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "10.11",
         "mariadb10.11",
         STATUS_AVAILABLE,
-        DefaultLevel::Engine,
+        DefaultLevel::Neither,
+        &MARIADB,
+    ),
+    row(
+        "mariadb",
+        "10.11.10",
+        "10.11",
+        "mariadb10.11",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &MARIADB,
     ),
     row(
         "mariadb",
@@ -696,8 +1227,10 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "11.4",
         "mariadb11.4",
         STATUS_AVAILABLE,
-        DefaultLevel::Major,
+        DefaultLevel::Engine,
+        &MARIADB,
     ),
+    // --- MySQL ------------------------------------------------------------
     row(
         "mysql",
         "5.7.44",
@@ -705,6 +1238,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "mysql5.7",
         STATUS_DEPRECATED,
         DefaultLevel::Major,
+        &MYSQL_5_7,
     ),
     row(
         "mysql",
@@ -713,6 +1247,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "mysql8.0",
         STATUS_AVAILABLE,
         DefaultLevel::Neither,
+        &MYSQL_8,
     ),
     row(
         "mysql",
@@ -720,7 +1255,17 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "8.0",
         "mysql8.0",
         STATUS_AVAILABLE,
-        DefaultLevel::Engine,
+        DefaultLevel::Neither,
+        &MYSQL_8,
+    ),
+    row(
+        "mysql",
+        "8.0.40",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &MYSQL_8,
     ),
     row(
         "mysql",
@@ -728,7 +1273,47 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "8.4",
         "mysql8.4",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8,
+    ),
+    row(
+        "mysql",
+        "8.4.4",
+        "8.4",
+        "mysql8.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &MYSQL_8,
+    ),
+    // --- Amazon Neptune ---------------------------------------------------
+    // The Amazon Neptune engine versions this front door publishes.
+    row(
+        "neptune",
+        "1.2.1.0",
+        "1.2",
+        "neptune1.2",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.3.2.0",
+        "1.3",
+        "neptune1.3",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &NEPTUNE,
+    ),
+    // --- Oracle -----------------------------------------------------------
+    row(
+        "oracle-ee",
+        "19.0.0.0.ru-2024-07.rur-2024-07.r1",
+        "19",
+        "oracle-ee-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &ORACLE_EE,
     ),
     row(
         "oracle-ee",
@@ -737,6 +1322,16 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "oracle-ee-19",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &ORACLE_EE,
+    ),
+    row(
+        "oracle-ee-cdb",
+        "19.0.0.0.ru-2024-10.rur-2024-10.r1",
+        "19",
+        "oracle-ee-cdb-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &ORACLE_EE,
     ),
     row(
         "oracle-ee-cdb",
@@ -745,6 +1340,16 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "oracle-ee-cdb-21",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &ORACLE_EE,
+    ),
+    row(
+        "oracle-se2",
+        "19.0.0.0.ru-2024-07.rur-2024-07.r1",
+        "19",
+        "oracle-se2-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &ORACLE_SE2,
     ),
     row(
         "oracle-se2",
@@ -753,6 +1358,16 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "oracle-se2-19",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &ORACLE_SE2,
+    ),
+    row(
+        "oracle-se2-cdb",
+        "19.0.0.0.ru-2024-10.rur-2024-10.r1",
+        "19",
+        "oracle-se2-cdb-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &ORACLE_SE2,
     ),
     row(
         "oracle-se2-cdb",
@@ -761,6 +1376,35 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "oracle-se2-cdb-21",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &ORACLE_SE2,
+    ),
+    // --- PostgreSQL -------------------------------------------------------
+    row(
+        "postgres",
+        "11.22",
+        "11",
+        "postgres11",
+        STATUS_DEPRECATED,
+        DefaultLevel::Major,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "13.16",
+        "13",
+        "postgres13",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "14.13",
+        "14",
+        "postgres14",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &POSTGRES,
     ),
     row(
         "postgres",
@@ -769,6 +1413,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "postgres15",
         STATUS_AVAILABLE,
         DefaultLevel::Major,
+        &POSTGRES,
     ),
     row(
         "postgres",
@@ -777,6 +1422,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "postgres16",
         STATUS_AVAILABLE,
         DefaultLevel::Neither,
+        &POSTGRES,
     ),
     row(
         "postgres",
@@ -784,7 +1430,8 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "16",
         "postgres16",
         STATUS_AVAILABLE,
-        DefaultLevel::Engine,
+        DefaultLevel::Major,
+        &POSTGRES,
     ),
     row(
         "postgres",
@@ -792,7 +1439,18 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "17",
         "postgres17",
         STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &POSTGRES,
+    ),
+    // --- Microsoft SQL Server ---------------------------------------------
+    row(
+        "sqlserver-dev-ee",
+        "15.00.4385.2.v1",
+        "15.00",
+        "sqlserver-dev-ee-15.0",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
+        &SQLSERVER,
     ),
     row(
         "sqlserver-dev-ee",
@@ -801,6 +1459,16 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "sqlserver-dev-ee-16.0",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &SQLSERVER,
+    ),
+    row(
+        "sqlserver-ee",
+        "14.00.3465.1.v1",
+        "14.00",
+        "sqlserver-ee-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER_WITH_REPLICA,
     ),
     row(
         "sqlserver-ee",
@@ -808,7 +1476,8 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "15.00",
         "sqlserver-ee-15.0",
         STATUS_AVAILABLE,
-        DefaultLevel::Engine,
+        DefaultLevel::Major,
+        &SQLSERVER_WITH_REPLICA,
     ),
     row(
         "sqlserver-ee",
@@ -816,7 +1485,8 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "16.00",
         "sqlserver-ee-16.0",
         STATUS_AVAILABLE,
-        DefaultLevel::Major,
+        DefaultLevel::Engine,
+        &SQLSERVER_WITH_REPLICA,
     ),
     row(
         "sqlserver-ex",
@@ -824,7 +1494,26 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "15.00",
         "sqlserver-ex-15.0",
         STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER,
+    ),
+    row(
+        "sqlserver-ex",
+        "16.00.4165.4.v1",
+        "16.00",
+        "sqlserver-ex-16.0",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &SQLSERVER,
+    ),
+    row(
+        "sqlserver-se",
+        "14.00.3465.1.v1",
+        "14.00",
+        "sqlserver-se-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER_WITH_REPLICA,
     ),
     row(
         "sqlserver-se",
@@ -832,7 +1521,17 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "15.00",
         "sqlserver-se-15.0",
         STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER_WITH_REPLICA,
+    ),
+    row(
+        "sqlserver-se",
+        "16.00.4165.4.v1",
+        "16.00",
+        "sqlserver-se-16.0",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &SQLSERVER_WITH_REPLICA,
     ),
     row(
         "sqlserver-web",
@@ -840,7 +1539,17 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "15.00",
         "sqlserver-web-15.0",
         STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER,
+    ),
+    row(
+        "sqlserver-web",
+        "16.00.4165.4.v1",
+        "16.00",
+        "sqlserver-web-16.0",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &SQLSERVER,
     ),
 ];
 
@@ -850,13 +1559,94 @@ pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
     ENGINES.iter().find(|facts| facts.engine == engine)
 }
 
+/// The catalogue version this service would PROVISION for `engine` when a create or
+/// modify request names `requested`, or `Err` with the message to refuse the request
+/// with.
+///
+/// `DBInstance$EngineVersion` is "the version of the database engine" an instance RUNS,
+/// not the string a request carried: a request names a version to provision and the
+/// service answers with the version it provisioned, which is one of the versions it
+/// publishes as available. The resolution, against [`CATALOG`]:
+///
+/// * no value — the engine's own default version, which is what RDS provisions when a
+///   request names none;
+/// * a value naming an available version of that engine (case-insensitively) — that
+///   version;
+/// * any other value — read as the major version it starts with, longest prefix first,
+///   and resolved to that major version's default available version: this is what
+///   serves a request naming only a major version (`8.0`, `16`), and a value inside a
+///   major version this service does not publish resolves to the version it does;
+/// * a value no available major version prefixes — `Err`.
+///
+/// `Ok(None)` means the catalogue publishes no AVAILABLE version for `engine` at all
+/// (a `custom-*` engine, whose versions a customer creates, or a value that is not an
+/// engine): there is nothing to resolve against, so the caller keeps what the request
+/// named rather than moving it to another engine's version.
+pub(crate) fn resolve_version(
+    engine: &str,
+    requested: Option<&str>,
+) -> Result<Option<&'static CatalogVersion>, String> {
+    let available: Vec<&'static CatalogVersion> = CATALOG
+        .iter()
+        .filter(|entry| {
+            entry.engine.eq_ignore_ascii_case(engine) && entry.status == STATUS_AVAILABLE
+        })
+        .collect();
+    if available.is_empty() {
+        return Ok(None);
+    }
+    let Some(requested) = requested else {
+        return Ok(Some(default_version_of(&available)));
+    };
+    if let Some(exact) = available
+        .iter()
+        .find(|entry| entry.engine_version.eq_ignore_ascii_case(requested))
+    {
+        return Ok(Some(exact));
+    }
+    let mut prefix = Some(requested);
+    while let Some(candidate) = prefix {
+        let within: Vec<&'static CatalogVersion> = available
+            .iter()
+            .copied()
+            .filter(|entry| entry.major_engine_version.eq_ignore_ascii_case(candidate))
+            .collect();
+        if !within.is_empty() {
+            return Ok(Some(default_version_of(&within)));
+        }
+        prefix = candidate.rsplit_once('.').map(|(head, _)| head);
+    }
+    Err(format!(
+        "invalid value '{requested}' for EngineVersion: cannot find version \
+         '{requested}' for {engine}"
+    ))
+}
+
+/// The version `entries` resolves to: the engine's own default, else the default of the
+/// major version, else the last of them — [`CATALOG`] lists an engine's rows in
+/// ascending version order, so that is its latest.
+fn default_version_of(entries: &[&'static CatalogVersion]) -> &'static CatalogVersion {
+    entries
+        .iter()
+        .copied()
+        .find(|entry| entry.default_level.is_engine_default())
+        .or_else(|| {
+            entries
+                .iter()
+                .copied()
+                .find(|entry| entry.default_level.is_major_default())
+        })
+        .or_else(|| entries.iter().copied().next_back())
+        .expect("entries is never empty: the caller checks")
+}
+
 /// Every catalogue entry with its index and its engine's facts.
 ///
 /// A row naming an engine absent from [`ENGINES`] could not be projected onto the wire
-/// shape — there would be nothing to report for `DBEngineDescription` and the support
-/// members — so it is skipped rather than half-reported. The two tables are written
-/// together and no row does this today, which makes the skip a guard rather than a
-/// behaviour.
+/// shape — there would be nothing to report for `DBEngineDescription` and the log,
+/// character-set and time-zone members — so it is skipped rather than half-reported. The
+/// two tables are written together and no row does this today, which makes the skip a
+/// guard rather than a behaviour.
 pub(crate) fn catalogue() -> impl Iterator<Item = (usize, &'static CatalogVersion, &'static EngineFacts)>
 {
     CATALOG
@@ -868,7 +1658,6 @@ pub(crate) fn catalogue() -> impl Iterator<Item = (usize, &'static CatalogVersio
 /// Whether `entry` is in the report this request asks for.
 fn matches_request(
     entry: &CatalogVersion,
-    facts: &EngineFacts,
     input: &DescribeDBEngineVersionsInput,
     filters: &[Filter],
 ) -> bool {
@@ -916,21 +1705,20 @@ fn matches_request(
             return false;
         }
     }
-    filters
-        .iter()
-        .all(|filter| matches_filter(entry, facts, filter))
+    filters.iter().all(|filter| matches_filter(entry, filter))
 }
 
 /// Whether `entry` matches one filter: true when any of the filter's values matches the
 /// member that filter names. Filter values are case-sensitive.
-fn matches_filter(entry: &CatalogVersion, facts: &EngineFacts, filter: &Filter) -> bool {
+fn matches_filter(entry: &CatalogVersion, filter: &Filter) -> bool {
     filter
         .values
         .iter()
         .any(|wanted| match filter.name.as_str() {
             "db-parameter-group-family" => wanted == entry.parameter_group_family,
             "engine" => wanted == entry.engine,
-            "engine-mode" => facts.engine_modes.contains(&wanted.as_str()),
+            // The modes of THIS version, which is what the entry reports.
+            "engine-mode" => entry.profile.engine_modes.contains(&wanted.as_str()),
             "engine-version" => wanted == entry.engine_version,
             "status" => wanted == entry.status,
             _ => false,
@@ -945,8 +1733,16 @@ fn character_set((name, description): &(&str, &str)) -> CharacterSet {
     }
 }
 
+/// The modelled list of a `&[&str]` reference-data column.
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
 /// The versions `entry` can be upgraded to: the LATER versions of the same engine, which
 /// are the catalogue rows after it (each engine's rows ascend by version).
+///
+/// Every capability a target reports is the TARGET's own, read from its profile: a caller
+/// decides whether to take an upgrade by what it would be running afterwards.
 fn valid_upgrade_targets(
     entry: &CatalogVersion,
     facts: &EngineFacts,
@@ -966,17 +1762,15 @@ fn valid_upgrade_targets(
                 // and only onto that major version's default.
                 auto_upgrade: Some(within_one_major && target.default_level.is_major_default()),
                 is_major_version_upgrade: Some(!within_one_major),
-                supported_engine_modes: Some(
-                    facts
-                        .engine_modes
-                        .iter()
-                        .map(|mode| (*mode).to_string())
-                        .collect(),
+                supported_engine_modes: Some(strings(target.profile.engine_modes)),
+                supports_parallel_query: Some(target.profile.supports_parallel_query),
+                supports_global_databases: Some(target.profile.supports_global_databases),
+                supports_babelfish: Some(target.profile.supports_babelfish),
+                supports_limitless_database: Some(target.profile.supports_limitless_database),
+                supports_local_write_forwarding: Some(
+                    target.profile.supports_local_write_forwarding,
                 ),
-                supports_parallel_query: Some(facts.supports_parallel_query),
-                supports_global_databases: Some(facts.supports_global_databases),
-                supports_babelfish: Some(facts.supports_babelfish),
-                ..Default::default()
+                supports_integrations: Some(target.profile.supports_integrations),
             }
         })
         .collect()
@@ -987,13 +1781,15 @@ fn valid_upgrade_targets(
 /// `SupportedCharacterSets` and `SupportedTimezones` are reported only when the request
 /// asks for them: "Specifies whether to list the supported character sets for each
 /// engine version" / "… the supported time zones for each engine version", and only for
-/// an engine that has them.
+/// an engine that has them. Every other member the catalogue knows is reported on every
+/// entry, because a client reads them to choose a version and gate on its capabilities.
 fn to_wire(
     entry: &CatalogVersion,
     facts: &EngineFacts,
     index: usize,
     input: &DescribeDBEngineVersionsInput,
 ) -> CreateCustomDBEngineVersionOutput {
+    let profile = entry.profile;
     let supported_character_sets = (input.list_supported_character_sets == Some(true)
         && !facts.character_sets.is_empty())
     .then(|| facts.character_sets.iter().map(character_set).collect());
@@ -1019,25 +1815,30 @@ fn to_wire(
             facts.product, entry.engine_version
         )),
         status: Some(entry.status.to_string()),
-        supported_engine_modes: Some(
-            facts
-                .engine_modes
-                .iter()
-                .map(|mode| (*mode).to_string())
-                .collect(),
-        ),
-        exportable_log_types: Some(
-            facts
-                .exportable_log_types
-                .iter()
-                .map(|log_type| (*log_type).to_string())
-                .collect(),
-        ),
+        supported_engine_modes: Some(strings(profile.engine_modes)),
+        supported_feature_names: Some(strings(profile.feature_names)),
+        supported_ca_certificate_identifiers: Some(strings(CA_CERTIFICATE_IDENTIFIERS)),
+        exportable_log_types: Some(strings(facts.exportable_log_types)),
         supports_log_exports_to_cloudwatch_logs: Some(!facts.exportable_log_types.is_empty()),
-        supports_read_replica: Some(facts.supports_read_replica),
-        supports_global_databases: Some(facts.supports_global_databases),
-        supports_parallel_query: Some(facts.supports_parallel_query),
-        supports_babelfish: Some(facts.supports_babelfish),
+        supports_read_replica: Some(profile.supports_read_replica),
+        supports_global_databases: Some(profile.supports_global_databases),
+        supports_parallel_query: Some(profile.supports_parallel_query),
+        supports_babelfish: Some(profile.supports_babelfish),
+        supports_limitless_database: Some(profile.supports_limitless_database),
+        supports_local_write_forwarding: Some(profile.supports_local_write_forwarding),
+        supports_integrations: Some(profile.supports_integrations),
+        supports_certificate_rotation_without_restart: Some(
+            profile.supports_certificate_rotation_without_restart,
+        ),
+        // "Specifies any Aurora Serverless v2 properties or limits that differ between
+        // Aurora engine versions": reported for a version that runs Serverless v2, and
+        // absent — rather than zeroed — for one that does not.
+        serverless_v2_features_support: profile.serverless_v2_capacity.map(|(min, max)| {
+            ServerlessV2FeaturesSupport {
+                min_capacity: Some(min),
+                max_capacity: Some(max),
+            }
+        }),
         default_character_set: facts.character_sets.first().map(character_set),
         supported_character_sets,
         supported_timezones,
@@ -1050,3 +1851,4 @@ fn to_wire(
         ..Default::default()
     }
 }
+

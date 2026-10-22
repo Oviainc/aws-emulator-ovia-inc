@@ -193,9 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(connector) = state.connectors.get(&input.connector_arn) else {
             return Err(DescribeConnectorErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "No connector exists with the ARN {}.",
-                    input.connector_arn
+                message: Some(crate::state::invalid_parameter_because(
+                    "connectorArn",
+                    crate::state::RESOURCE_DOES_NOT_EXIST,
                 )),
             })
             .into());

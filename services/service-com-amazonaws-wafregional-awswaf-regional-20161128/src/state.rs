@@ -36,6 +36,9 @@ use crate::ops::types::{
 
 // The shapes the ByteMatchSet records at the end of this file project onto. A `use` of
 // their own, so the shared list above stays exactly as the other resource kinds leave it.
+// `FieldToMatch` comes in here for the whole module: beside the ByteMatchSet projections
+// it is what the shared match-filter identity keys the XssMatchSet and
+// SqlInjectionMatchSet filters on.
 use crate::ops::types::{ByteMatchSet, ByteMatchTuple, FieldToMatch};
 
 // The GeoMatchSet shapes, kept in their own `use` for the same reason: this list stays
@@ -123,6 +126,27 @@ pub const MAX_REGEX_PATTERN_SETS: usize = 10;
 /// account (100 conditions of each type, a `SqlInjectionMatchSet` being one condition),
 /// which keeps the match-set state a caller can grow bounded.
 pub const MAX_SQL_INJECTION_MATCH_SETS: usize = 100;
+
+/// The most `SqlInjectionMatchTuple`s one `SqlInjectionMatchSet` may hold.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes per SQL
+/// injection match condition (10 filters). Together with
+/// [`MAX_SQL_INJECTION_MATCH_SETS`] it bounds the filter state a caller can grow over
+/// many `UpdateSqlInjectionMatchSet` requests, not just the number of match sets.
+pub const MAX_SQL_INJECTION_MATCH_TUPLES: usize = 10;
+
+/// The most `SqlInjectionMatchSetUpdate`s one `UpdateSqlInjectionMatchSet` request may
+/// carry.
+///
+/// The model states no per-request quota for this operation, so this bound is CHOSEN,
+/// not cited, on the same reasoning as [`MAX_XSS_MATCH_SET_UPDATES_PER_REQUEST`]: a
+/// request can at most empty a set ([`MAX_SQL_INJECTION_MATCH_TUPLES`] deletes) and then
+/// fill it again ([`MAX_SQL_INJECTION_MATCH_TUPLES`] inserts), since a delete must name a
+/// filter the set holds and an insert one it does not, so no larger request can leave the
+/// set in a state a request of this size cannot. It caps the work one caller can ask for
+/// before the handler takes the shared store's lock.
+pub const MAX_SQL_INJECTION_MATCH_SET_UPDATES_PER_REQUEST: usize =
+    2 * MAX_SQL_INJECTION_MATCH_TUPLES;
 
 /// The most `RuleGroup`s this emulator stores for the account before
 /// `CreateRuleGroup` answers its modelled `WAFLimitsExceededException`.
@@ -705,34 +729,51 @@ impl WebACLEntry {
     }
 }
 
-/// One `XssMatchTuple`'s identity: the part of the request it inspects and the text
+/// One match filter's identity: the part of the request it inspects and the text
 /// transformation applied before inspecting it.
 ///
 /// `FieldToMatch`'s `Data` documentation states that the header name and the
 /// query-parameter name are "not case sensitive", so two spellings of one name are one
 /// filter; and that `Data` is omitted for every other `Type`, so a type that takes no
 /// `Data` has none in its identity.
+///
+/// Shared by the `XssMatchSet` and `SqlInjectionMatchSet` filters, whose modelled shapes
+/// are both a `FieldToMatch` plus a `TextTransformation` — one rule of identity, in one
+/// place, for both.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct XssMatchTupleKey {
+pub struct MatchFilterKey {
     pub field_type: String,
     pub data: Option<String>,
     pub text_transformation: String,
 }
 
-/// The identity of `tuple` — see [`XssMatchTupleKey`].
-pub fn xss_match_tuple_key(tuple: &XssMatchTuple) -> XssMatchTupleKey {
-    let field_type = tuple.field_to_match.r#type.clone();
-    let data = tuple
-        .field_to_match
+/// The identity of the filter `field_to_match` and `text_transformation` name — see
+/// [`MatchFilterKey`].
+pub fn match_filter_key(
+    field_to_match: &FieldToMatch,
+    text_transformation: &str,
+) -> MatchFilterKey {
+    let field_type = field_to_match.r#type.clone();
+    let data = field_to_match
         .data
         .as_deref()
         .filter(|_| match_field_takes_data(&field_type))
         .map(str::to_lowercase);
-    XssMatchTupleKey {
+    MatchFilterKey {
         field_type,
         data,
-        text_transformation: tuple.text_transformation.clone(),
+        text_transformation: text_transformation.to_string(),
     }
+}
+
+/// The identity of `tuple` — see [`MatchFilterKey`].
+pub fn xss_match_tuple_key(tuple: &XssMatchTuple) -> MatchFilterKey {
+    match_filter_key(&tuple.field_to_match, &tuple.text_transformation)
+}
+
+/// The identity of `tuple` — see [`MatchFilterKey`].
+pub fn sql_injection_match_tuple_key(tuple: &SqlInjectionMatchTuple) -> MatchFilterKey {
+    match_filter_key(&tuple.field_to_match, &tuple.text_transformation)
 }
 
 /// One stored `XssMatchSet`.
@@ -740,14 +781,14 @@ pub fn xss_match_tuple_key(tuple: &XssMatchTuple) -> XssMatchTupleKey {
 pub struct XssMatchSetEntry {
     pub xss_match_set_id: String,
     pub name: String,
-    /// The filters in insertion order, deduplicated by [`XssMatchTupleKey`]. The
+    /// The filters in insertion order, deduplicated by [`MatchFilterKey`]. The
     /// modelled shape is stored as it was accepted, so a read reports the stored record
     /// rather than a re-rendering of it.
     pub tuples: Vec<XssMatchTuple>,
-    /// Membership index over the [`XssMatchTupleKey`]s of `tuples`, kept in step with it
+    /// Membership index over the [`MatchFilterKey`]s of `tuples`, kept in step with it
     /// by [`XssMatchSetEntry::insert_tuple`] and [`XssMatchSetEntry::remove_tuple`], so
     /// deduplicating one update costs a lookup rather than a scan of the whole set.
-    keys: BTreeSet<XssMatchTupleKey>,
+    keys: BTreeSet<MatchFilterKey>,
 }
 
 impl XssMatchSetEntry {
@@ -994,11 +1035,19 @@ impl RateBasedRuleEntry {
 pub struct SqlInjectionMatchSetEntry {
     pub sql_injection_match_set_id: String,
     pub name: String,
-    /// The `SqlInjectionMatchTuple`s in insertion order. A newly created set holds
-    /// none: `CreateSqlInjectionMatchSet`'s documentation sends the caller to
+    /// The `SqlInjectionMatchTuple`s in insertion order, deduplicated by
+    /// [`MatchFilterKey`]. A newly created set holds none:
+    /// `CreateSqlInjectionMatchSet`'s documentation sends the caller to
     /// `UpdateSqlInjectionMatchSet` "to specify the parts of web requests in which you
-    /// want to allow, block, or count malicious SQL code".
+    /// want to allow, block, or count malicious SQL code". The modelled shape is stored
+    /// as it was accepted, so a read reports the stored record rather than a
+    /// re-rendering of it.
     pub tuples: Vec<SqlInjectionMatchTuple>,
+    /// Membership index over the [`MatchFilterKey`]s of `tuples`, kept in step with it
+    /// by [`SqlInjectionMatchSetEntry::insert_tuple`] and
+    /// [`SqlInjectionMatchSetEntry::remove_tuple`], so deduplicating one update costs a
+    /// lookup rather than a scan of the whole set.
+    keys: BTreeSet<MatchFilterKey>,
 }
 
 impl SqlInjectionMatchSetEntry {
@@ -1008,6 +1057,7 @@ impl SqlInjectionMatchSetEntry {
             sql_injection_match_set_id,
             name,
             tuples: Vec::new(),
+            keys: BTreeSet::new(),
         }
     }
 
@@ -1019,6 +1069,28 @@ impl SqlInjectionMatchSetEntry {
             name: Some(self.name.clone()),
             sql_injection_match_tuples: self.tuples.clone(),
         }
+    }
+
+    /// Add a filter, unless one with the same identity is already stored. Answers
+    /// whether the set changed.
+    pub fn insert_tuple(&mut self, tuple: &SqlInjectionMatchTuple) -> bool {
+        if !self.keys.insert(sql_injection_match_tuple_key(tuple)) {
+            return false;
+        }
+        self.tuples.push(tuple.clone());
+        true
+    }
+
+    /// Remove the filter whose identity equals `tuple`'s, if the set holds one. Answers
+    /// whether the set changed.
+    pub fn remove_tuple(&mut self, tuple: &SqlInjectionMatchTuple) -> bool {
+        let key = sql_injection_match_tuple_key(tuple);
+        if !self.keys.remove(&key) {
+            return false;
+        }
+        self.tuples
+            .retain(|stored| sql_injection_match_tuple_key(stored) != key);
+        true
     }
 }
 

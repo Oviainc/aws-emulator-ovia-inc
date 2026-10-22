@@ -7,6 +7,9 @@
 //! Every call goes through the same `MultiServiceRouter::dispatch` the emulator serves
 //! real requests with, as an awsJson1_1 `GameLift.<Operation>` request, so what these
 //! tests assert is the response body a client receives.
+//!
+//! The harness below (`GameLift` and the helpers under it) is shared with the other
+//! suites of this test target — see `unknown_resource_lookups.rs`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,16 +21,25 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for. The emulator serves a request in the
 /// region of its SigV4 credential scope, and the ARNs it mints name that region.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
+
+/// An ARN this service mints for `resource`, in [`REGION`] and carrying the one account
+/// every emulated response presents (`engine::emulator_account_id`).
+pub(crate) fn gamelift_arn(resource: &str) -> String {
+    format!(
+        "arn:aws:gamelift:{REGION}:{}:{resource}",
+        engine::emulator_account_id()
+    )
+}
 
 /// One emulator holding only the GameLift service, driven through the production
 /// dispatch path.
-struct GameLift {
+pub(crate) struct GameLift {
     router: MultiServiceRouter,
 }
 
 impl GameLift {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not signature verification, and send
@@ -40,7 +52,7 @@ impl GameLift {
     }
 
     /// Send `GameLift.<operation>` with `body` and return the status and parsed body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let credential =
             format!("AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/gamelift/aws4_request, SignedHeaders=host, Signature=00");
         let request = http::Request::builder()
@@ -64,7 +76,7 @@ impl GameLift {
     }
 
     /// The body of a call that must succeed.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, &body).await;
         assert_eq!(
             status, 200,
@@ -74,7 +86,7 @@ impl GameLift {
     }
 
     /// The HTTP status and wire error code of a call that must fail.
-    async fn err(&self, operation: &str, body: Value) -> (u16, String) {
+    pub(crate) async fn err(&self, operation: &str, body: Value) -> (u16, String) {
         let (status, parsed) = self.call(operation, &body).await;
         assert_ne!(
             status, 200,
@@ -85,7 +97,7 @@ impl GameLift {
 }
 
 /// The wire error code of an awsJson error body (`__type`), without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     let raw = body
         .get("__type")
         .and_then(Value::as_str)
@@ -95,12 +107,12 @@ fn error_code(body: &Value) -> String {
 
 /// Wait past the span the service's clock-owed status changes are due on, so the next
 /// read observes the state the service would be in whether or not anybody called.
-fn wait_for_due_transitions() {
+pub(crate) fn wait_for_due_transitions() {
     std::thread::sleep(WORKFLOW_DELAY + Duration::from_millis(250));
 }
 
 /// A managed EC2 fleet request that satisfies the documented required parameters.
-fn ec2_fleet(name: &str) -> Value {
+pub(crate) fn ec2_fleet(name: &str) -> Value {
     json!({
         "Name": name,
         "BuildId": "build-demo",
@@ -109,8 +121,21 @@ fn ec2_fleet(name: &str) -> Value {
     })
 }
 
+/// An Anywhere fleet request deployed to `locations`, which `CreateFleet` requires for
+/// this compute type.
+pub(crate) fn anywhere_fleet(name: &str, locations: &[&str]) -> Value {
+    json!({
+        "Name": name,
+        "ComputeType": "ANYWHERE",
+        "Locations": locations
+            .iter()
+            .map(|location| json!({"Location": location}))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// Create a fleet and return its `FleetId`.
-async fn create_fleet(gamelift: &GameLift, request: Value) -> String {
+pub(crate) async fn create_fleet(gamelift: &GameLift, request: Value) -> String {
     let created = gamelift.ok("CreateFleet", request).await;
     created["FleetAttributes"]["FleetId"]
         .as_str()
@@ -153,10 +178,11 @@ async fn the_hosting_loop_runs_end_to_end_against_stored_state() {
         fleet_id.starts_with("fleet-") && fleet_id.len() > "fleet-".len(),
         "CreateFleet: FleetId must match the modelled ^[a-z]*fleet-[a-zA-Z0-9\\-]+$, got {fleet_id}"
     );
-    // `FleetAttributes$FleetArn` doc: "Format is arn:aws:gamelift:<region>::fleet/fleet-…".
+    // `FleetAttributes$FleetArn` doc: "Format is arn:aws:gamelift:<region>::fleet/fleet-…",
+    // with the account segment populated (see `state::gamelift_arn`).
     assert_eq!(
         attributes["FleetArn"],
-        json!(format!("arn:aws:gamelift:{REGION}::fleet/{fleet_id}")),
+        json!(gamelift_arn(&format!("fleet/{fleet_id}"))),
         "CreateFleet: FleetArn must be the documented format, got {}",
         attributes["FleetArn"]
     );
@@ -176,7 +202,7 @@ async fn the_hosting_loop_runs_end_to_end_against_stored_state() {
     assert_eq!(attributes["BuildId"], json!("build-demo"));
     assert_eq!(
         attributes["BuildArn"],
-        json!(format!("arn:aws:gamelift:{REGION}::build/build-demo"))
+        json!(gamelift_arn("build/build-demo"))
     );
     assert_eq!(
         attributes["NewGameSessionProtectionPolicy"],
@@ -260,7 +286,7 @@ async fn the_hosting_loop_runs_end_to_end_against_stored_state() {
         .to_string();
     // `GameSession$GameSessionId` doc: "arn:aws:gamelift:<home_region>::gamesession/<fleet
     // ID>/<ID string>".
-    let home_prefix = format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/");
+    let home_prefix = gamelift_arn(&format!("gamesession/{fleet_id}/"));
     assert!(
         game_session_id.starts_with(&home_prefix)
             && game_session_id.len() > home_prefix.len(),
@@ -421,25 +447,26 @@ async fn the_hosting_loop_runs_end_to_end_against_stored_state() {
     );
 
     wait_for_due_transitions();
-    let (status, code) = gamelift
-        .err("DescribeFleetAttributes", json!({"FleetIds": [&fleet_id]}))
+    let purged = gamelift
+        .ok("DescribeFleetAttributes", json!({"FleetIds": [&fleet_id]}))
         .await;
     assert_eq!(
-        (status, code.as_str()),
-        (400, "NotFoundException"),
-        "DescribeFleetAttributes after the delete came due must not find the fleet: got {status} {code}"
+        purged["FleetAttributes"],
+        json!([]),
+        "DescribeFleetAttributes after the delete came due must report the fleet as gone \
+         with an empty page, got {purged}"
     );
     // The game sessions placed on the fleet, and the slots reserved in them, went with it.
-    let (status, code) = gamelift
-        .err(
+    let purged_sessions = gamelift
+        .ok(
             "DescribeGameSessions",
             json!({"GameSessionId": &game_session_id}),
         )
         .await;
     assert_eq!(
-        (status, code.as_str()),
-        (400, "NotFoundException"),
-        "a game session on a deleted fleet must be gone too: got {status} {code}"
+        purged_sessions["GameSessions"],
+        json!([]),
+        "a game session on a deleted fleet must be gone too, got {purged_sessions}"
     );
     let (status, code) = gamelift
         .err(
@@ -1272,9 +1299,9 @@ async fn a_remote_location_game_session_carries_the_location_in_its_id() {
             .expect("a created session has an id")
             .to_string();
         assert!(
-            id.starts_with(&format!(
-                "arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/{location}/"
-            )),
+            id.starts_with(&gamelift_arn(&format!(
+                "gamesession/{fleet_id}/{location}/"
+            ))),
             "case {location}: a remote-location session id must carry its location, got {id}"
         );
         assert_eq!(
@@ -1339,9 +1366,11 @@ async fn a_remote_location_game_session_carries_the_location_in_its_id() {
     );
 }
 
-/// Every way of naming a resource that is not there, across the slice, answers the
-/// modelled `NotFoundException`, and a request that names no selector at all is an
-/// invalid request rather than a silent full scan.
+/// Every way of naming a resource an operation must ACT ON that is not there, across
+/// the slice, answers the modelled `NotFoundException`, and a request that names no
+/// selector at all is an invalid request rather than a silent full scan. (A reporting
+/// operation's unknown selector is a 200 with an empty collection instead — see
+/// `unknown_resource_lookups.rs`.)
 #[tokio::test]
 async fn absent_resources_and_missing_selectors_are_refused() {
     let gamelift = GameLift::new();
@@ -1356,18 +1385,6 @@ async fn absent_resources_and_missing_selectors_are_refused() {
     }
 
     let cases = vec![
-        Case {
-            label: "describe an unknown fleet id",
-            operation: "DescribeFleetAttributes",
-            request: json!({"FleetIds": ["fleet-does-not-exist"]}),
-            expected: "NotFoundException",
-        },
-        Case {
-            label: "describe an unknown fleet ARN",
-            operation: "DescribeFleetAttributes",
-            request: json!({"FleetIds": [format!("arn:aws:gamelift:{REGION}::fleet/fleet-nope")]}),
-            expected: "NotFoundException",
-        },
         Case {
             label: "place a session on an unknown fleet",
             operation: "CreateGameSession",
@@ -1400,7 +1417,7 @@ async fn absent_resources_and_missing_selectors_are_refused() {
             label: "reserve a slot in an unknown session",
             operation: "CreatePlayerSession",
             request: json!({
-                "GameSessionId": format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/nope"),
+                "GameSessionId": gamelift_arn(&format!("gamesession/{fleet_id}/nope")),
                 "PlayerId": "player-1",
             }),
             expected: "NotFoundException",
@@ -1416,12 +1433,6 @@ async fn absent_resources_and_missing_selectors_are_refused() {
             operation: "DescribeGameSessions",
             request: json!({"FleetId": &fleet_id, "AliasId": "alias-unknown"}),
             expected: "InvalidRequestException",
-        },
-        Case {
-            label: "describe sessions of an unknown fleet",
-            operation: "DescribeGameSessions",
-            request: json!({"FleetId": "fleet-does-not-exist"}),
-            expected: "NotFoundException",
         },
         Case {
             label: "delete an unknown fleet",

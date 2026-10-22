@@ -255,12 +255,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused anything outside of. The `tags` map carries NO modelled length, so
         // its bound is checked here.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
             CreateWorkflowErrorModeled::InternalServerException(InternalServerException {
                 message: "the omics workflow store is unavailable".to_string(),
             })
         })?;
 
         if let Some(why) = crate::state::tag_bounds_rejection(input.tags.as_ref()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                None,
+            );
             return Err(
                 CreateWorkflowErrorModeled::ValidationException(ValidationException {
                     message: why,
@@ -284,10 +296,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.request_id,
         ) {
             let workflow = store.workflows.get(&key).ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::StoreUnavailable,
+                    None,
+                );
                 CreateWorkflowErrorModeled::InternalServerException(InternalServerException {
                     message: "the workflow this requestId created is no longer held".to_string(),
                 })
             })?;
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NoChange,
+                Some(&workflow.id),
+            );
             return Ok(CreateWorkflowOutput {
                 arn: Some(workflow.arn.clone()),
                 id: Some(workflow.id.clone()),
@@ -300,6 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is finite: a create that would take it past its cap is refused
         // rather than growing it, the way the service refuses one past its quota.
         if store.workflows.len() >= crate::state::MAX_WORKFLOWS {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                None,
+            );
             return Err(CreateWorkflowErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -355,6 +385,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::IdempotencyScope::CreateWorkflow,
             input.request_id,
             key,
+        );
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::WorkflowCreated,
+            Some(&id),
         );
 
         Ok(CreateWorkflowOutput {

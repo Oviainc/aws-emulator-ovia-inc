@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTS the challenge token `(AppId, SessionId)` addresses, exactly as `CreateToken`
+//! minted it: nothing about the token changes because it was read, so a later caller
+//! sees the same code. A session id this service holds no LIVE token for — never
+//! minted, already deleted, or past its `Ttl` — is the modelled `NotFoundException`
+//! (404).
+//!
+//! The one write it performs is the expiry the CLOCK already made due
+//! ([`crate::state::ComAmazonawsAmplifybackendAmplifybackendState::expire_challenge_tokens`]),
+//! which was owed at the token's own `expires_at` whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +150,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetToken"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTokenError::from(GetTokenErrorModeled::GatewayTimeoutException(
+                crate::state::store_unavailable(),
+            ))
+        })?;
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The expiry the clock already owes, materialised before the lookup, so an
+        // expired code is never reported as usable.
+        store.expire_challenge_tokens(now);
+
+        let token = store
+            .challenge_token(&input.app_id, &input.session_id)
+            .ok_or_else(|| {
+                GetTokenError::from(GetTokenErrorModeled::NotFoundException(
+                    crate::state::not_found(
+                        crate::state::RESOURCE_TYPE_CHALLENGE_TOKEN,
+                        format!(
+                            "no challenge token with session id {} exists for app {}",
+                            input.session_id, input.app_id
+                        ),
+                    ),
+                ))
+            })?;
+        Ok(GetTokenOutput {
+            app_id: Some(token.app_id.clone()),
+            challenge_code: Some(token.challenge_code.clone()),
+            session_id: Some(token.session_id.clone()),
+            ttl: Some(token.ttl()),
+        })
     }
 }

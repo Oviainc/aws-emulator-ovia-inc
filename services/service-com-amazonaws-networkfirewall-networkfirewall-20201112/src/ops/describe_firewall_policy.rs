@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFirewallPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFirewallPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFirewallPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the stored `FirewallPolicyRecord` back, resolved by name or
+//! ARN. A reporting operation: it does not change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +158,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFirewallPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFirewallPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFirewallPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeFirewallPolicyErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the firewall policy store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let key = state
+            .resolve_firewall_policy(
+                input.firewall_policy_name.as_deref(),
+                input.firewall_policy_arn.as_deref(),
+            )
+            .map_err(describe_lookup_error)?;
+        let record = state.firewall_policies.get(&key).ok_or_else(|| {
+            DescribeFirewallPolicyError::from(
+                DescribeFirewallPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Firewall policy {key} does not exist.")),
+                    },
+                ),
+            )
+        })?;
+
+        Ok(DescribeFirewallPolicyOutput {
+            update_token: record.update_token.clone(),
+            firewall_policy_response: record.to_response(),
+            firewall_policy: Some(record.policy.clone()),
+        })
     }
 }
+
+crate::state::impl_resolve_error!(
+    describe_lookup_error -> DescribeFirewallPolicyError, DescribeFirewallPolicyErrorModeled,
+    resource = "firewall policy", plural = "firewall policies",
+    name_member = "FirewallPolicyName", arn_member = "FirewallPolicyArn"
+);

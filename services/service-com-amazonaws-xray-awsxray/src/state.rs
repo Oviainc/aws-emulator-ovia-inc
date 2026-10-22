@@ -30,11 +30,29 @@
 //! documents (`smithy_query(query="doc",shape="PutTraceSegments")`): `name`,
 //! `id`, `trace_id` and `start_time` are required, `end_time`/`in_progress` say
 //! whether the segment is complete, and `error`/`fault`/`throttle`, `http`,
-//! `parent_id` and `annotations` are optional. Two more members come from the
-//! X-Ray Segment Documents reference that `PutTraceSegments` links to, because
-//! the service graph is derived from them: `type`, which is `subsegment` on a
-//! subsegment sent as its own document, and `namespace`, which is `aws` for an
-//! AWS SDK call and `remote` for any other call that left the process.
+//! `parent_id`, `annotations`, `cause` and `subsegments` are optional. Two more
+//! members come from the X-Ray Segment Documents reference that
+//! `PutTraceSegments` links to, because the service graph is derived from them:
+//! `type`, which is `subsegment` on a subsegment sent as its own document, and
+//! `namespace`, which is `aws` for an AWS SDK call and `remote` for any other
+//! call that left the process.
+//!
+//! Two things a reader reports are DERIVED from those documents rather than
+//! carried by them, and both are derived here so that `BatchGetTraces` and
+//! `GetTraceSummaries` cannot disagree:
+//!
+//! * a subsegment that names a downstream service (`namespace: "remote"`) gets
+//!   an INFERRED top-level segment synthesised for that downstream service
+//!   ([`inferred_segments`]), which is the service X-Ray attributes the call to;
+//! * every entity (a segment, or a subsegment inside one) records an
+//!   [`Outcome`], read from its own `fault`/`error`/`throttle` fields and
+//!   `http.response.status`: the one [`Classification`] a COUNTER splits it
+//!   into (a fault outranks a throttle, which outranks an error), and whether it
+//!   recorded a 400-series error at all — which a throttle's own 429 status also
+//!   is, because the model's `HasError` ("a 400 series error") and `HasThrottle`
+//!   ("a 429 throttling error") are not exclusive. The trace's
+//!   `HasFault`/`HasError`/`HasThrottle` flags and its root causes are read off
+//!   those outcomes.
 //!
 //! Daemon telemetry (`PutTelemetryRecords`, "used by the Amazon Web Services
 //! X-Ray daemon to upload telemetry") is kept the same way: each submitted
@@ -61,7 +79,9 @@
 //! can be a value a reader cannot convert to the modelled `Timestamp`; the
 //! conversion itself goes through [`timestamp_of`].
 
-use std::collections::BTreeMap;
+pub mod filter;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
@@ -78,22 +98,23 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// (`smithy_query(query="service_info")`).
 pub const ARN_NAMESPACE: &str = "xray";
 
-/// `UnprocessedTraceSegment$ErrorCode` for a document that is not parseable as a
-/// JSON segment object.
+/// `UnprocessedTraceSegment$ErrorCode` for a document that cannot be read as a
+/// JSON segment object at all.
 ///
 /// The model documents `ErrorCode` only as "The error that caused processing to
-/// fail" and publishes no value set, so these three are this emulator's stable
-/// codes; the `Message` beside them is built from the request and names the
-/// field at fault.
+/// fail" and publishes no value set, so the VALUES are X-Ray's own, as its
+/// recorded `PutTraceSegments` responses state them: a document that cannot be
+/// read is `ParseError`, and a required member that is absent is `Missing` plus
+/// that member's name in PascalCase (`MissingName` for an absent `name`). A
+/// member that is present but unusable — wrong JSON type, or a `trace_id` that
+/// is not a well-formed trace id — follows the same construction as `Invalid`
+/// plus the member name, and a document refused because its trace is full takes
+/// [`SEGMENT_ERROR_LIMIT_EXCEEDED`]. The `Message` beside the code RESTATES it,
+/// which is the one wording X-Ray uses for every per-document rejection:
+/// `Invalid segment. ErrorCode: <ErrorCode>`. So the code is where the fault is
+/// named, and [`segment_member_code`] is the single place a member's code is
+/// built.
 pub const SEGMENT_ERROR_PARSE: &str = "ParseError";
-
-/// `UnprocessedTraceSegment$ErrorCode` for a document missing a field the
-/// `PutTraceSegments` documentation lists as required.
-pub const SEGMENT_ERROR_MISSING_FIELD: &str = "MissingRequiredField";
-
-/// `UnprocessedTraceSegment$ErrorCode` for a document whose field is present but
-/// of the wrong JSON type.
-pub const SEGMENT_ERROR_INVALID_FIELD: &str = "InvalidField";
 
 // ---------------------------------------------------------------------------
 // Encryption configuration
@@ -278,6 +299,41 @@ impl EncryptionConfigRecord {
 /// already holds [`MAX_SEGMENTS_PER_TRACE`] segments.
 pub const SEGMENT_ERROR_LIMIT_EXCEEDED: &str = "LimitExceeded";
 
+/// The `ErrorCode` for one segment member at fault: `<prefix><Member>`, the
+/// member's snake_case document name rendered in PascalCase, as `MissingName`
+/// is built from `name`.
+fn segment_member_code(prefix: &str, member: &str) -> String {
+    let mut code = prefix.to_string();
+    for word in member.split('_') {
+        let mut characters = word.chars();
+        if let Some(first) = characters.next() {
+            code.extend(first.to_uppercase());
+            code.push_str(characters.as_str());
+        }
+    }
+    code
+}
+
+/// Whether `value` is a well-formed X-Ray trace id: `1-<8 hex>-<24 hex>`, the
+/// form `PutTraceSegments` documents for a segment's `trace_id` and the only
+/// form a stored trace is indexed under (`TraceId` is 1..=35 characters, which
+/// this form occupies exactly).
+pub fn is_trace_id(value: &str) -> bool {
+    let mut fields = value.split('-');
+    let (Some("1"), Some(epoch), Some(unique), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    let hex = |field: &str, width: usize| {
+        field.len() == width && field.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    hex(epoch, 8) && hex(unique, 24)
+}
+
 // ---------------------------------------------------------------------------
 // Bounds on caller-driven work and growth
 //
@@ -305,11 +361,6 @@ pub const MAX_SEGMENTS_PER_TRACE: usize = 1_000;
 /// of nesting, so one document can neither drive unbounded parsing nor hold
 /// unbounded state. Further ones are dropped.
 pub const MAX_SUBSEGMENTS_PER_SEGMENT: usize = 1_000;
-
-/// How deep into a document's nested `subsegments` arrays parsing walks, so a
-/// deeply nested document cannot drive unbounded recursion. Deeper levels are
-/// dropped.
-pub const MAX_SUBSEGMENT_DEPTH: usize = 16;
 
 /// The most traces the store keeps. Ingesting a new trace past this evicts the
 /// least recently ingested one.
@@ -408,16 +459,39 @@ pub const MAX_SAMPLING_PERCENTAGE: f64 = 100.0;
 
 /// The most trace ids one `BatchGetTraces` call accepts.
 ///
-/// `TraceIdList` carries no modelled length bound, and every requested id that
-/// is not stored costs one `UnprocessedTraceIds` entry, so the request is
-/// bounded here rather than letting it amplify into an unbounded response.
-pub const MAX_TRACE_IDS_PER_CALL: usize = 500;
+/// `TraceIdList` carries no modelled length bound, so the bound is the
+/// service's: X-Ray's `BatchGetTraces` "retrieves a list of traces specified by
+/// ID" five at a time, and a longer list is refused as an invalid request
+/// rather than partly served.
+pub const MAX_TRACE_IDS_PER_CALL: usize = 5;
 
 /// The most segment documents one `BatchGetTraces` response carries. A trace
 /// that does not fit in what is left of the budget is deferred to the next page
 /// rather than truncated, so a page always makes progress and a whole trace is
 /// always readable ([`MAX_SEGMENTS_PER_TRACE`] segments fit the budget exactly).
 pub const MAX_SEGMENTS_PER_BATCH_RESPONSE: usize = MAX_SEGMENTS_PER_TRACE;
+
+/// The deepest `subsegments` nesting one segment document may carry.
+///
+/// Every reader walks that tree RECURSIVELY — the classifications a summary
+/// unions, the frames a root cause names, the entity index an `edge(…)` filter
+/// resolves through — so its depth is caller-driven work on the read path, and
+/// the one kind a reader cannot recover from: exhausting the stack aborts the
+/// process instead of failing the request. A document nested deeper than this is
+/// therefore refused at ingest, like any other member it cannot use, and every
+/// walk is bounded by this constant by construction. Deep enough for the nesting
+/// an instrumented call tree produces (an SDK subsegment inside a handler
+/// subsegment inside a segment is three).
+pub const MAX_SUBSEGMENT_DEPTH: usize = 16;
+
+/// The most root causes one trace reports per class
+/// ([`TraceRecord::root_causes`]).
+///
+/// A root cause costs a walk of the trace, so without a cap a trace holding
+/// [`MAX_SEGMENTS_PER_TRACE`] failing segments would make one read do work in
+/// the square of its size. Past the cap the answer is the first causes derived,
+/// which degrades the answer rather than the service.
+pub const MAX_ROOT_CAUSES_PER_TRACE: usize = 32;
 
 /// The most sampling rules the store keeps; `CreateSamplingRule` past this is
 /// refused with the modelled `RuleLimitExceededException`.
@@ -921,6 +995,11 @@ pub struct SegmentRecord {
     pub origin: Option<String>,
     /// The segment's `account_id`, when it names one.
     pub account_id: Option<String>,
+    /// The segment's `user` — the authenticated user the request came from
+    /// (`TraceSummary$Users`).
+    pub user: Option<String>,
+    /// The segment's `resource_arn` (`TraceSummary$ResourceARNs`).
+    pub resource_arn: Option<String>,
     /// The document's `type`. `Some("subsegment")` marks a SUBSEGMENT sent as
     /// its own document: it records work inside its parent's service, so it
     /// reports no service of its own.
@@ -928,20 +1007,31 @@ pub struct SegmentRecord {
     /// The document's `namespace`: `aws` for an AWS SDK call, `remote` for any
     /// other call that left the process, absent for in-process work.
     pub namespace: Option<String>,
-    /// The `subsegments` this document carries inline, recursively, at most
+    /// The exceptions the segment's `cause` block carries.
+    pub exceptions: Vec<CauseException>,
+    /// The `subsegments` this document carries inline, recursively — the
+    /// entities inside it that a root cause walks — at most
     /// [`MAX_SUBSEGMENTS_PER_SEGMENT`] of them and at most
     /// [`MAX_SUBSEGMENT_DEPTH`] levels deep.
     pub subsegments: Vec<SubsegmentRecord>,
+    /// Whether this segment was SYNTHESISED by the service for a downstream
+    /// service a stored document only called (`namespace: "remote"`), rather than
+    /// submitted. Its document carries `"inferred": true`.
+    pub inferred: bool,
 }
 
-/// One subsegment, as carried inline in its segment's `subsegments` array.
+/// One subsegment, as carried inline in its segment's `subsegments` array, with
+/// the same fields a root cause and a filter expression read off a segment.
 ///
 /// A subsegment records work done INSIDE the segment's service, so — unlike a
 /// segment — it names a service of its own only when its `namespace` says the
 /// work left the process.
 #[derive(Debug, Clone, Default)]
 pub struct SubsegmentRecord {
-    /// The subsegment's `name`.
+    /// The subsegment's `id`, when it carries one.
+    pub id: Option<String>,
+    /// The subsegment's `name` — the operation, or the downstream service it
+    /// called.
     pub name: String,
     /// The subsegment's `namespace`: `aws`, `remote`, or absent.
     pub namespace: Option<String>,
@@ -949,6 +1039,8 @@ pub struct SubsegmentRecord {
     pub start_time: Option<f64>,
     /// `end_time`, absent while the subsegment is in progress.
     pub end_time: Option<f64>,
+    /// `in_progress`: started but not complete.
+    pub in_progress: bool,
     /// `error`: a client-side (400 series) error.
     pub error: bool,
     /// `fault`: a server-side (500 series) fault.
@@ -957,8 +1049,59 @@ pub struct SubsegmentRecord {
     pub throttle: bool,
     /// The subsegment's `http` block, when it carries one.
     pub http: Option<HttpRecord>,
+    /// The subsegment's `annotations`, as submitted.
+    pub annotations: BTreeMap<String, serde_json::Value>,
+    /// The exceptions this subsegment's `cause` block carries.
+    pub exceptions: Vec<CauseException>,
     /// The subsegments nested under this one.
     pub subsegments: Vec<SubsegmentRecord>,
+}
+
+/// One exception from an entity's `cause.exceptions` — the `type` X-Ray reports
+/// as `RootCauseException$Name`, and its `message`.
+#[derive(Debug, Clone, Default)]
+pub struct CauseException {
+    /// The exception's `type`.
+    pub name: Option<String>,
+    /// The exception's `message`.
+    pub message: Option<String>,
+}
+
+/// What one entity's outcome was. EXCLUSIVE: an entity is a fault, a throttle,
+/// an error or none of the three, never two at once — X-Ray reclassifies rather
+/// than unions, so a document carrying both `throttle` and `error` is a
+/// throttle, and one carrying `fault` is a fault. A trace's
+/// `HasFault`/`HasError`/`HasThrottle` are the union of its entities'
+/// classifications, so a trace can still report two of them when two entities
+/// were classified differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Classification {
+    /// Neither a fault, a throttle nor an error.
+    Ok,
+    /// A client-side (400 series) error that is not a throttle.
+    Error,
+    /// A throttling (429) error.
+    Throttle,
+    /// A server-side (500 series) fault.
+    Fault,
+}
+
+/// Classify one entity from its own flags and recorded HTTP status.
+///
+/// The flags come first and the status stands in for a flag the document did not
+/// set, which is what [`recorded_fault`] / [`recorded_throttle`] /
+/// [`recorded_error`] each state for one outcome; this is where the three become
+/// EXCLUSIVE, in the order X-Ray reclassifies them.
+fn classify(fault: bool, error: bool, throttle: bool, status: Option<i32>) -> Classification {
+    if recorded_fault(fault, status) {
+        Classification::Fault
+    } else if recorded_throttle(throttle, status) {
+        Classification::Throttle
+    } else if recorded_error(error, throttle, status) {
+        Classification::Error
+    } else {
+        Classification::Ok
+    }
 }
 
 /// The parts of a segment's `http` block a `TraceSummary` reports.
@@ -1250,78 +1393,44 @@ pub fn validate_tag(key: &str, value: &str) -> Result<(), TagRejection> {
 pub struct SegmentRejection {
     /// The rejected document's `id`, when it carried a usable one.
     pub id: Option<String>,
-    /// One of [`SEGMENT_ERROR_PARSE`], [`SEGMENT_ERROR_MISSING_FIELD`],
-    /// [`SEGMENT_ERROR_INVALID_FIELD`].
-    pub error_code: &'static str,
-    /// What was wrong, naming the field at fault.
+    /// [`SEGMENT_ERROR_PARSE`], [`SEGMENT_ERROR_LIMIT_EXCEEDED`], or a member
+    /// code built by [`segment_member_code`].
+    pub error_code: String,
+    /// The code, restated: `Invalid segment. ErrorCode: <ErrorCode>`.
     pub message: String,
 }
 
 impl SegmentRejection {
+    /// A rejection naming `error_code`, with the `Message` X-Ray states beside
+    /// every per-document rejection — the code, restated.
+    fn new(id: Option<&str>, error_code: String) -> Self {
+        Self {
+            id: id.map(str::to_string),
+            message: format!("Invalid segment. ErrorCode: {error_code}"),
+            error_code,
+        }
+    }
+
     /// A document that could not be read as a JSON segment object.
-    fn unparseable(message: impl Into<String>) -> Self {
-        Self {
-            id: None,
-            error_code: SEGMENT_ERROR_PARSE,
-            message: message.into(),
-        }
+    fn unparseable() -> Self {
+        Self::new(None, SEGMENT_ERROR_PARSE.to_string())
     }
 
-    /// A document missing a documented required field.
+    /// A document missing a documented required member.
     fn missing(id: Option<&str>, member: &str) -> Self {
-        Self {
-            id: id.map(str::to_string),
-            error_code: SEGMENT_ERROR_MISSING_FIELD,
-            message: format!("segment document is missing the required field `{member}`"),
-        }
+        Self::new(id, segment_member_code("Missing", member))
     }
 
-    /// A document whose field is present but of the wrong JSON type.
-    fn invalid(id: Option<&str>, member: &str, expected: &str, found: &serde_json::Value) -> Self {
-        Self {
-            id: id.map(str::to_string),
-            error_code: SEGMENT_ERROR_INVALID_FIELD,
-            message: format!(
-                "segment document field `{member}` must be {expected}, not {}",
-                json_kind(found)
-            ),
-        }
-    }
-
-    /// A document whose instant is not a time a trace could have been recorded
-    /// at. Its `ErrorCode` is the "present but unusable" one, and the message is
-    /// built from the request: it names the member and the value at fault.
-    fn not_an_instant(id: Option<&str>, member: &str, seconds: f64) -> Self {
-        Self {
-            id: id.map(str::to_string),
-            error_code: SEGMENT_ERROR_INVALID_FIELD,
-            message: format!(
-                "segment document field `{member}` ({seconds}) must be a finite time within {MAX_SEGMENT_EPOCH_SECONDS} seconds of the epoch, in seconds of epoch time"
-            ),
-        }
+    /// A document whose member is present but unusable — the wrong JSON type, a
+    /// value that is not of the form the member documents, or an instant no
+    /// trace could have been recorded at.
+    fn invalid(id: Option<&str>, member: &str) -> Self {
+        Self::new(id, segment_member_code("Invalid", member))
     }
 
     /// A document refused because its trace is full.
-    fn trace_full(id: &str, trace_id: &str) -> Self {
-        Self {
-            id: Some(id.to_string()),
-            error_code: SEGMENT_ERROR_LIMIT_EXCEEDED,
-            message: format!(
-                "trace `{trace_id}` already holds the maximum of {MAX_SEGMENTS_PER_TRACE} segments"
-            ),
-        }
-    }
-}
-
-/// The JSON type name of `value`, for a rejection message.
-fn json_kind(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
+    fn trace_full(id: &str) -> Self {
+        Self::new(Some(id), SEGMENT_ERROR_LIMIT_EXCEEDED.to_string())
     }
 }
 
@@ -1337,7 +1446,7 @@ fn required_string(
     match object.get(member) {
         None | Some(serde_json::Value::Null) => Err(SegmentRejection::missing(id, member)),
         Some(serde_json::Value::String(text)) => Ok(text.clone()),
-        Some(other) => Err(SegmentRejection::invalid(id, member, "a string", other)),
+        Some(_) => Err(SegmentRejection::invalid(id, member)),
     }
 }
 
@@ -1351,17 +1460,12 @@ fn required_seconds(
     match object.get(member) {
         None | Some(serde_json::Value::Null) => Err(SegmentRejection::missing(id, member)),
         Some(serde_json::Value::Number(number)) => {
-            let seconds = number.as_f64().ok_or_else(|| {
-                SegmentRejection::invalid(
-                    id,
-                    member,
-                    "a number",
-                    &serde_json::Value::Number(number.clone()),
-                )
-            })?;
+            let seconds = number
+                .as_f64()
+                .ok_or_else(|| SegmentRejection::invalid(id, member))?;
             epoch_instant(id, member, seconds)
         }
-        Some(other) => Err(SegmentRejection::invalid(id, member, "a number", other)),
+        Some(_) => Err(SegmentRejection::invalid(id, member)),
     }
 }
 
@@ -1371,10 +1475,12 @@ fn required_seconds(
 /// Checked HERE, where the document is read, so no unusable instant is ever
 /// stored: every reader converts a stored instant to the modelled `Timestamp`,
 /// and a value that is not finite, or is further from the epoch than
-/// [`MAX_SEGMENT_EPOCH_SECONDS`], has no `Timestamp` to convert to.
+/// [`MAX_SEGMENT_EPOCH_SECONDS`], has no `Timestamp` to convert to. It is the
+/// same per-document refusal as any other unusable member, so it takes the same
+/// `Invalid<Member>` code.
 fn epoch_instant(id: Option<&str>, member: &str, seconds: f64) -> Result<f64, SegmentRejection> {
     if !seconds.is_finite() || seconds.abs() > MAX_SEGMENT_EPOCH_SECONDS {
-        return Err(SegmentRejection::not_an_instant(id, member, seconds));
+        return Err(SegmentRejection::invalid(id, member));
     }
     Ok(seconds)
 }
@@ -1399,15 +1505,11 @@ fn flag(object: &JsonObject, member: &str) -> bool {
 /// Parse one submitted segment document into the trace it belongs to and the
 /// record stored under it. `document` is kept verbatim on the record.
 pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord), SegmentRejection> {
-    let value: serde_json::Value = serde_json::from_str(document).map_err(|err| {
-        SegmentRejection::unparseable(format!("segment document is not valid JSON: {err}"))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        SegmentRejection::unparseable(format!(
-            "segment document must be a JSON object, not {}",
-            json_kind(&value)
-        ))
-    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(document).map_err(|_| SegmentRejection::unparseable())?;
+    let object = value
+        .as_object()
+        .ok_or_else(SegmentRejection::unparseable)?;
 
     // The segment's own id first: a rejection reports it when the document
     // carried one, so a client can tell which document failed.
@@ -1423,6 +1525,13 @@ pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord),
     let name = required_string(object, "name", id_ref)?;
     let start_time = required_seconds(object, "start_time", id_ref)?;
 
+    // A `trace_id` that is not of the documented form names no trace X-Ray
+    // could index, so the document is refused per-document — the rest of the
+    // batch still lands — rather than stored under an id no reader can ask for.
+    if !is_trace_id(&trace_id) {
+        return Err(SegmentRejection::invalid(id_ref, "trace_id"));
+    }
+
     // "Specify either an end_time or in_progress" — a document with neither is
     // treated as in progress rather than refused, so a partial trace is still
     // readable.
@@ -1432,14 +1541,7 @@ pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord),
             Some(seconds) => Some(epoch_instant(id_ref, "end_time", seconds)?),
             None => None,
         },
-        Some(other) => {
-            return Err(SegmentRejection::invalid(
-                id_ref,
-                "end_time",
-                "a number",
-                other,
-            ))
-        }
+        Some(_) => return Err(SegmentRejection::invalid(id_ref, "end_time")),
     };
     let in_progress = flag(object, "in_progress") || end_time.is_none();
 
@@ -1455,68 +1557,112 @@ pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord),
         fault: flag(object, "fault"),
         throttle: flag(object, "throttle"),
         http: parse_http(object.get("http")),
-        annotations: object
-            .get("annotations")
-            .and_then(serde_json::Value::as_object)
-            .map(|annotations| {
-                annotations
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        annotations: parse_annotations(object),
         origin: optional_string(object, "origin"),
         account_id: optional_string(object, "account_id"),
+        user: optional_string(object, "user"),
+        resource_arn: optional_string(object, "resource_arn"),
         segment_type: optional_string(object, "type"),
         namespace: optional_string(object, "namespace"),
-        subsegments: parse_subsegments(object.get("subsegments"), 0, &mut 0),
+        exceptions: parse_cause(object.get("cause")),
+        subsegments: parse_subsegments(id_ref, object.get("subsegments"), 1, &mut 0)?,
+        // NOT read from the document: `inferred` is service-assigned, and the
+        // segment schema `PutTraceSegments` documents has no such member, so a
+        // submitted document cannot claim to be a service the trace only
+        // called. [`inferred_segment`] is the one place it is set.
+        inferred: false,
     };
     Ok((trace_id, segment))
 }
 
-/// Parse a document's inline `subsegments` array, recursively.
+/// An entity's `annotations`, as submitted.
+fn parse_annotations(object: &JsonObject) -> BTreeMap<String, serde_json::Value> {
+    object
+        .get("annotations")
+        .and_then(serde_json::Value::as_object)
+        .map(|annotations| {
+            annotations
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The exceptions an entity's `cause` block carries. `cause` is either an object
+/// with an `exceptions` array or a bare cause id, and only the former names
+/// exceptions.
+fn parse_cause(value: Option<&serde_json::Value>) -> Vec<CauseException> {
+    let Some(exceptions) = value
+        .and_then(serde_json::Value::as_object)
+        .and_then(|cause| cause.get("exceptions"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    exceptions
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .map(|exception| CauseException {
+            // X-Ray reports the exception's `type` as the root cause
+            // exception's `Name` (`RootCauseException$Name`).
+            name: optional_string(exception, "type"),
+            message: optional_string(exception, "message"),
+        })
+        .collect()
+}
+
+/// An entity's `subsegments`, recursively, at `depth` levels below the segment.
 ///
-/// Lenient where the segment itself is strict: a subsegment is part of an
-/// already accepted document, so an entry that is not an object, or carries no
-/// `name`, is dropped rather than failing the whole document. Bounded by
-/// [`MAX_SUBSEGMENTS_PER_SEGMENT`] entries (`budget`, shared across the whole
-/// nesting) and [`MAX_SUBSEGMENT_DEPTH`] levels.
+/// Lenient about one subsegment where the document itself is strict: a
+/// subsegment is part of an already accepted document, so an entry that is not
+/// an object, or carries no usable `name`, is dropped rather than refusing the
+/// whole document — only the segment's own members are documented as required.
+/// The COUNT one document contributes is bounded by
+/// [`MAX_SUBSEGMENTS_PER_SEGMENT`] (`budget`, shared across the whole nesting),
+/// and a tree DEEPER than [`MAX_SUBSEGMENT_DEPTH`] is refused per document,
+/// which is what bounds every later walk of it: the readers recurse once per
+/// level, and a stack this deep is the one caller-driven cost a reader cannot
+/// recover from.
 fn parse_subsegments(
+    id: Option<&str>,
     value: Option<&serde_json::Value>,
     depth: usize,
     budget: &mut usize,
-) -> Vec<SubsegmentRecord> {
-    if depth >= MAX_SUBSEGMENT_DEPTH {
-        return Vec::new();
-    }
-    let Some(entries) = value.and_then(serde_json::Value::as_array) else {
-        return Vec::new();
+) -> Result<Vec<SubsegmentRecord>, SegmentRejection> {
+    let Some(array) = value.and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
     };
-    let mut parsed = Vec::new();
-    for entry in entries {
+    if depth > MAX_SUBSEGMENT_DEPTH {
+        return Err(SegmentRejection::invalid(id, "subsegments"));
+    }
+    let mut out = Vec::new();
+    for object in array.iter().filter_map(serde_json::Value::as_object) {
         if *budget >= MAX_SUBSEGMENTS_PER_SEGMENT {
             break;
         }
-        let Some(object) = entry.as_object() else {
-            continue;
-        };
         let Some(name) = optional_string(object, "name") else {
             continue;
         };
         *budget += 1;
-        parsed.push(SubsegmentRecord {
+        let end_time = object.get("end_time").and_then(serde_json::Value::as_f64);
+        out.push(SubsegmentRecord {
+            id: optional_string(object, "id"),
             name,
             namespace: optional_string(object, "namespace"),
             start_time: object.get("start_time").and_then(serde_json::Value::as_f64),
-            end_time: object.get("end_time").and_then(serde_json::Value::as_f64),
+            end_time,
+            in_progress: flag(object, "in_progress") || end_time.is_none(),
             error: flag(object, "error"),
             fault: flag(object, "fault"),
             throttle: flag(object, "throttle"),
             http: parse_http(object.get("http")),
-            subsegments: parse_subsegments(object.get("subsegments"), depth + 1, budget),
+            annotations: parse_annotations(object),
+            exceptions: parse_cause(object.get("cause")),
+            subsegments: parse_subsegments(id, object.get("subsegments"), depth + 1, budget)?,
         });
     }
-    parsed
+    Ok(out)
 }
 
 /// Lift the `http.request` / `http.response` fields a `TraceSummary` reports.
@@ -1537,10 +1683,299 @@ fn parse_http(value: Option<&serde_json::Value>) -> Option<HttpRecord> {
     })
 }
 
-/// Whether a recorded outcome is a 400-series error: the `error` flag, or an
-/// `http.response.status` in the 400 series.
-fn recorded_error(error: bool, status: Option<i32>) -> bool {
-    error || status.is_some_and(|status| (400..500).contains(&status))
+/// The `namespace` that makes a subsegment a call OUT of the service it sits in,
+/// so the work it covers is a downstream service's.
+pub const REMOTE_NAMESPACE: &str = "remote";
+
+/// The id of the segment synthesised for the remote subsegment `remote_id` of
+/// `trace_id`: 16 hexadecimal digits, as a segment id is.
+///
+/// Service-assigned and derived only from what it identifies, so it is the same
+/// on every read and distinct per remote subsegment — re-submitting the same
+/// document replaces the inferred segment it already derived instead of adding a
+/// second one. The mixing is [`service_common::stable_hex_id`], the one
+/// deterministic id helper the service crates share: this id travels on the
+/// wire, so it has to be reproducible across builds as well as across reads,
+/// which `std`'s default hasher does not promise. It is still an opaque id, not
+/// a value to depend on.
+fn inferred_segment_id(trace_id: &str, remote_id: &str) -> String {
+    ::service_common::stable_hex_id(&["inferred", trace_id, remote_id])
+}
+
+/// The segments X-Ray synthesises for the downstream services `segment` only
+/// CALLED: one per subsegment in its tree whose `namespace` is
+/// [`REMOTE_NAMESPACE`] and that carries an id to parent the synthesised segment
+/// on.
+///
+/// Each is a top-level segment of the same trace whose `parent_id` is the remote
+/// subsegment's id and whose document carries `"inferred": true`, so a reader
+/// building a service map sees the downstream node the caller recorded. Its
+/// times, `http` block, outcome flags and `cause` are the subsegment's: the
+/// remote subsegment is the only record of what the downstream service did.
+pub fn inferred_segments(trace_id: &str, segment: &SegmentRecord) -> Vec<SegmentRecord> {
+    fn walk(
+        trace_id: &str,
+        subsegments: &[SubsegmentRecord],
+        timed_from: f64,
+        out: &mut Vec<SegmentRecord>,
+    ) {
+        for subsegment in subsegments {
+            if let (Some(remote_id), true) = (
+                subsegment.id.as_deref(),
+                subsegment.namespace.as_deref() == Some(REMOTE_NAMESPACE),
+            ) {
+                out.push(inferred_segment(trace_id, remote_id, subsegment, timed_from));
+            }
+            walk(trace_id, &subsegment.subsegments, timed_from, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    if segment.inferred {
+        // A synthesised segment never derives further segments from itself. It
+        // carries no subsegments either, so this is belt and braces: only
+        // `inferred_segment` sets the flag, never a submitted document.
+        return out;
+    }
+    walk(
+        trace_id,
+        &segment.subsegments,
+        segment.start_time,
+        &mut out,
+    );
+    out
+}
+
+/// One inferred segment: the record, and the document a reader returns for it.
+///
+/// `timed_from` is the calling segment's own `start_time`, which is when a
+/// remote subsegment that carries no `start_time` of its own is timed from: it
+/// is the only instant known for it.
+fn inferred_segment(
+    trace_id: &str,
+    remote_id: &str,
+    remote: &SubsegmentRecord,
+    timed_from: f64,
+) -> SegmentRecord {
+    let start_time = remote.start_time.unwrap_or(timed_from);
+    let id = inferred_segment_id(trace_id, remote_id);
+    let mut document = serde_json::Map::new();
+    document.insert("id".to_string(), serde_json::json!(id));
+    document.insert("name".to_string(), serde_json::json!(remote.name));
+    document.insert("trace_id".to_string(), serde_json::json!(trace_id));
+    document.insert("parent_id".to_string(), serde_json::json!(remote_id));
+    document.insert("start_time".to_string(), serde_json::json!(start_time));
+    match remote.end_time {
+        Some(end_time) => {
+            document.insert("end_time".to_string(), serde_json::json!(end_time));
+        }
+        None => {
+            document.insert("in_progress".to_string(), serde_json::json!(true));
+        }
+    }
+    document.insert("inferred".to_string(), serde_json::json!(true));
+    for (member, set) in [
+        ("fault", remote.fault),
+        ("error", remote.error),
+        ("throttle", remote.throttle),
+    ] {
+        if set {
+            document.insert(member.to_string(), serde_json::json!(true));
+        }
+    }
+    if let Some(http) = &remote.http {
+        document.insert("http".to_string(), http_document(http));
+    }
+    if !remote.exceptions.is_empty() {
+        document.insert("cause".to_string(), cause_document(&remote.exceptions));
+    }
+
+    SegmentRecord {
+        id,
+        parent_id: Some(remote_id.to_string()),
+        name: remote.name.clone(),
+        document: serde_json::Value::Object(document).to_string(),
+        start_time,
+        end_time: remote.end_time,
+        in_progress: remote.in_progress,
+        error: remote.error,
+        fault: remote.fault,
+        throttle: remote.throttle,
+        http: remote.http.clone(),
+        annotations: BTreeMap::new(),
+        origin: None,
+        account_id: None,
+        user: None,
+        resource_arn: None,
+        // An inferred segment stands for a downstream SERVICE, not for work
+        // inside one, so it is no `type: "subsegment"` document; and it carries
+        // no `namespace` of its own — the namespace that produced it was the
+        // remote subsegment's.
+        segment_type: None,
+        namespace: None,
+        exceptions: remote.exceptions.clone(),
+        subsegments: Vec::new(),
+        inferred: true,
+    }
+}
+
+/// An `http` block, as a segment document carries it.
+fn http_document(http: &HttpRecord) -> serde_json::Value {
+    let mut request = serde_json::Map::new();
+    for (member, value) in [
+        ("client_ip", &http.client_ip),
+        ("method", &http.http_method),
+        ("url", &http.url),
+        ("user_agent", &http.user_agent),
+    ] {
+        if let Some(value) = value {
+            request.insert(member.to_string(), serde_json::json!(value));
+        }
+    }
+    let mut block = serde_json::Map::new();
+    if !request.is_empty() {
+        block.insert("request".to_string(), serde_json::Value::Object(request));
+    }
+    if let Some(status) = http.response_status {
+        block.insert(
+            "response".to_string(),
+            serde_json::json!({ "status": status }),
+        );
+    }
+    serde_json::Value::Object(block)
+}
+
+/// A `cause` block, as a segment document carries it.
+fn cause_document(exceptions: &[CauseException]) -> serde_json::Value {
+    let exceptions: Vec<serde_json::Value> = exceptions
+        .iter()
+        .map(|exception| {
+            let mut entry = serde_json::Map::new();
+            if let Some(name) = &exception.name {
+                entry.insert("type".to_string(), serde_json::json!(name));
+            }
+            if let Some(message) = &exception.message {
+                entry.insert("message".to_string(), serde_json::json!(message));
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect();
+    serde_json::json!({ "exceptions": exceptions })
+}
+
+/// One entity's recorded outcome.
+///
+/// Two facts, because the model reports two: the EXCLUSIVE class the counters
+/// split a call into ([`Classification`]), and whether the entity recorded a
+/// 400-series error at all — which a throttle's own 429 status also is. They
+/// disagree exactly where X-Ray does: a throttled request is counted under
+/// `ErrorStatistics$ThrottleCount` rather than `$OtherCount`, and still reported
+/// by `TraceSummary$HasError` when its status says 429.
+#[derive(Debug, Clone, Copy)]
+pub struct Outcome {
+    /// The one class this entity is counted as.
+    pub class: Classification,
+    /// Whether it recorded a 400-series error ([`recorded_error`]).
+    pub error_400: bool,
+}
+
+impl SubsegmentRecord {
+    /// The `http.response.status` this subsegment recorded, if any.
+    pub fn http_status(&self) -> Option<i32> {
+        self.http.as_ref().and_then(|http| http.response_status)
+    }
+
+    /// This subsegment's outcome, from its own flags and recorded status.
+    pub fn classification(&self) -> Classification {
+        classify(self.fault, self.error, self.throttle, self.http_status())
+    }
+
+    /// Whether this subsegment recorded a 400-series error.
+    pub fn is_error(&self) -> bool {
+        recorded_error(self.error, self.throttle, self.http_status())
+    }
+
+    /// This subsegment's recorded outcome: its exclusive class, and whether it
+    /// recorded a 400-series error.
+    pub fn outcome(&self) -> Outcome {
+        Outcome {
+            class: self.classification(),
+            error_400: self.is_error(),
+        }
+    }
+
+    /// Whether this subsegment recorded a 500-series fault.
+    pub fn is_fault(&self) -> bool {
+        recorded_fault(self.fault, self.http_status())
+    }
+
+    /// Whether this subsegment recorded a throttling error.
+    pub fn is_throttle(&self) -> bool {
+        recorded_throttle(self.throttle, self.http_status())
+    }
+
+    /// Whether this subsegment is a call OUT of the service it sits in.
+    pub fn is_remote(&self) -> bool {
+        self.namespace.as_deref() == Some(REMOTE_NAMESPACE)
+    }
+
+    /// This subsegment as one frame of a root cause's entity path.
+    fn entity(&self) -> RootCauseEntityView {
+        RootCauseEntityView {
+            name: self.name.clone(),
+            exceptions: self.exceptions.clone(),
+            remote: self.is_remote(),
+        }
+    }
+
+    /// Every entity in this subsegment's tree, itself first.
+    ///
+    /// Recurses once per level of nesting, which the ingest bounds at
+    /// [`MAX_SUBSEGMENT_DEPTH`] — as every walk of a stored tree in this module
+    /// does, and relies on.
+    fn walk<'a>(&'a self, out: &mut Vec<&'a Self>) {
+        out.push(self);
+        for child in &self.subsegments {
+            child.walk(out);
+        }
+    }
+
+    /// The entity path from this subsegment down to the deepest entity inside it
+    /// classified `class`, or `None` when its tree holds none.
+    ///
+    /// A REMOTE subsegment is not walked: what happened on the other side of a
+    /// call out belongs to the downstream service, which is the inferred segment
+    /// synthesised for it ([`inferred_segments`]) and carries its own root cause.
+    fn root_cause_path(&self, class: Classification) -> Option<Vec<RootCauseEntityView>> {
+        if self.is_remote() {
+            return None;
+        }
+        for child in &self.subsegments {
+            if let Some(mut path) = child.root_cause_path(class) {
+                path.insert(0, self.entity());
+                return Some(path);
+            }
+        }
+        (self.classification() == class).then(|| vec![self.entity()])
+    }
+}
+
+/// Whether a recorded outcome is a 400-series error: the `error` flag the
+/// document set, or an `http.response.status` in the 400 series — which the 429
+/// of a throttled request is one of.
+///
+/// `throttle` is consulted for ONE case, the only one a recorded response pins:
+/// a document whose FLAGS say `throttle: true, error: true` and that recorded no
+/// status comes back as a throttle and NOT as an error (X-Ray reclassifies a
+/// declared throttle rather than unioning it). A 400-series STATUS stands on its
+/// own, because the model words `TraceSummary$HasError` as "The root segment
+/// document has a 400 series error" and `$HasThrottle` as "One or more of the
+/// segment documents has a 429 throttling error"
+/// (`smithy_query(query="doc",shape="TraceSummary",member="HasError")`) without
+/// making the two exclusive: a 429 IS a 400-series status, so a request the
+/// service throttled is reported as both.
+fn recorded_error(error: bool, throttle: bool, status: Option<i32>) -> bool {
+    (error && !throttle) || status.is_some_and(|status| (400..500).contains(&status))
 }
 
 /// Whether a recorded outcome is a 500-series fault: the `fault` flag, or an
@@ -1561,6 +1996,11 @@ impl SegmentRecord {
         self.http.as_ref().and_then(|http| http.response_status)
     }
 
+    /// This segment's own outcome, from its own flags and recorded status.
+    pub fn classification(&self) -> Classification {
+        classify(self.fault, self.error, self.throttle, self.http_status())
+    }
+
     /// How long this segment took, in seconds; `None` while it is in progress.
     pub fn duration(&self) -> Option<f64> {
         self.end_time.map(|end| end - self.start_time)
@@ -1572,20 +2012,49 @@ impl SegmentRecord {
         self.end_time.unwrap_or(self.start_time)
     }
 
+    /// The outcomes recorded anywhere in this segment's document — the segment
+    /// itself and every subsegment inside it.
+    pub fn outcomes(&self) -> Vec<Outcome> {
+        let mut entities = Vec::new();
+        for subsegment in &self.subsegments {
+            subsegment.walk(&mut entities);
+        }
+        let mut out = vec![self.outcome()];
+        out.extend(entities.iter().map(|entity| entity.outcome()));
+        out
+    }
+
+    /// Those outcomes' exclusive classes, which is what a counter reads.
+    pub fn classifications(&self) -> Vec<Classification> {
+        self.outcomes()
+            .into_iter()
+            .map(|outcome| outcome.class)
+            .collect()
+    }
+
     /// Whether this segment recorded a 400-series error — its `error` flag, or
-    /// an `http.response.status` in the 400 series (`TraceSummary$HasError`).
+    /// an `http.response.status` in the 400 series.
     pub fn is_error(&self) -> bool {
-        recorded_error(self.error, self.http_status())
+        recorded_error(self.error, self.throttle, self.http_status())
+    }
+
+    /// This segment's recorded outcome: its exclusive class, and whether it
+    /// recorded a 400-series error.
+    pub fn outcome(&self) -> Outcome {
+        Outcome {
+            class: self.classification(),
+            error_400: self.is_error(),
+        }
     }
 
     /// Whether this segment recorded a 500-series fault — its `fault` flag, or
-    /// an `http.response.status` of 500 or above (`TraceSummary$HasFault`).
+    /// an `http.response.status` of 500 or above.
     pub fn is_fault(&self) -> bool {
         recorded_fault(self.fault, self.http_status())
     }
 
     /// Whether this segment recorded a throttling error — its `throttle` flag,
-    /// or an `http.response.status` of 429 (`TraceSummary$HasThrottle`).
+    /// or an `http.response.status` of 429.
     pub fn is_throttle(&self) -> bool {
         recorded_throttle(self.throttle, self.http_status())
     }
@@ -1599,28 +2068,130 @@ impl SegmentRecord {
     pub fn is_subsegment(&self) -> bool {
         self.segment_type.as_deref() == Some("subsegment")
     }
+
+    /// This segment as one frame of a root cause's entity path. An inferred
+    /// segment stands for a service this trace only called, so its frame is
+    /// remote.
+    fn entity(&self) -> RootCauseEntityView {
+        RootCauseEntityView {
+            name: self.name.clone(),
+            exceptions: self.exceptions.clone(),
+            remote: self.inferred,
+        }
+    }
+
+    /// This segment's service identity, as a root cause reports it.
+    fn service(&self, entity_path: Vec<RootCauseEntityView>) -> RootCauseServiceView {
+        RootCauseServiceView {
+            name: self.name.clone(),
+            r#type: self.origin.clone(),
+            account_id: self.account_id.clone(),
+            inferred: self.inferred,
+            entity_path,
+        }
+    }
+
+    /// The entity path from this segment down to the deepest entity inside it
+    /// classified `class`, or `None` when it holds none.
+    fn root_cause_path(&self, class: Classification) -> Option<Vec<RootCauseEntityView>> {
+        for child in &self.subsegments {
+            if let Some(mut path) = child.root_cause_path(class) {
+                path.insert(0, self.entity());
+                return Some(path);
+            }
+        }
+        (self.classification() == class).then(|| vec![self.entity()])
+    }
+
+    /// The frames from this segment down to the entity with id `entity_id`, when
+    /// its tree holds one.
+    fn frames_to(&self, entity_id: &str) -> Option<Vec<RootCauseEntityView>> {
+        fn frames(
+            subsegments: &[SubsegmentRecord],
+            entity_id: &str,
+        ) -> Option<Vec<RootCauseEntityView>> {
+            for subsegment in subsegments {
+                if subsegment.id.as_deref() == Some(entity_id) {
+                    return Some(vec![subsegment.entity()]);
+                }
+                if let Some(mut path) = frames(&subsegment.subsegments, entity_id) {
+                    path.insert(0, subsegment.entity());
+                    return Some(path);
+                }
+            }
+            None
+        }
+
+        if self.id == entity_id {
+            return Some(vec![self.entity()]);
+        }
+        frames(&self.subsegments, entity_id).map(|mut path| {
+            path.insert(0, self.entity());
+            path
+        })
+    }
 }
 
-impl SubsegmentRecord {
-    /// The `http.response.status` this subsegment recorded, if any.
-    pub fn http_status(&self) -> Option<i32> {
-        self.http.as_ref().and_then(|http| http.response_status)
-    }
+/// One service of a root cause: the chain of them is the path through the
+/// service graph the fault travelled (`FaultRootCause$Services`).
+#[derive(Debug, Clone)]
+pub struct RootCauseServiceView {
+    /// The service's name.
+    pub name: String,
+    /// Its `origin`, which is what X-Ray reports as the service type.
+    pub r#type: Option<String>,
+    /// Its `account_id`, when the document named one.
+    pub account_id: Option<String>,
+    /// Whether this service was inferred from a call to it rather than
+    /// instrumented itself.
+    pub inferred: bool,
+    /// The frames inside this service the root cause ran through.
+    pub entity_path: Vec<RootCauseEntityView>,
+}
 
-    /// Whether this subsegment recorded a 400-series error.
-    pub fn is_error(&self) -> bool {
-        recorded_error(self.error, self.http_status())
-    }
+/// One frame of a root cause's entity path.
+#[derive(Debug, Clone)]
+pub struct RootCauseEntityView {
+    /// The entity's name.
+    pub name: String,
+    /// The exceptions this entity's own `cause` block carried.
+    pub exceptions: Vec<CauseException>,
+    /// Whether this entity is a call out of its service (a dependency frame)
+    /// rather than work inside it (a pipeline frame).
+    pub remote: bool,
+}
 
-    /// Whether this subsegment recorded a 500-series fault.
-    pub fn is_fault(&self) -> bool {
-        recorded_fault(self.fault, self.http_status())
-    }
+/// Which root causes a reader is asking for. X-Ray reports three lists on a
+/// `TraceSummary`; the two below are the ones a submitted document states an
+/// outcome for, and `ResponseTimeRootCauses` is derived from a response-time
+/// analysis this emulator does not perform, so it names no kind here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootCauseKind {
+    /// `TraceSummary$FaultRootCauses`.
+    Fault,
+    /// `TraceSummary$ErrorRootCauses`.
+    Error,
+}
 
-    /// Whether this subsegment recorded a throttling error.
-    pub fn is_throttle(&self) -> bool {
-        recorded_throttle(self.throttle, self.http_status())
+impl RootCauseKind {
+    /// The entity classification this kind of root cause is built from.
+    pub fn classification(self) -> Classification {
+        match self {
+            Self::Fault => Classification::Fault,
+            Self::Error => Classification::Error,
+        }
     }
+}
+
+/// One root cause: which services and entities the outcome travelled through,
+/// and whether the trace's client saw it.
+#[derive(Debug, Clone)]
+pub struct RootCauseView {
+    /// Root first, the service that recorded the outcome last.
+    pub services: Vec<RootCauseServiceView>,
+    /// Whether the trace's own root segment recorded the same outcome, which is
+    /// what makes a root cause client-impacting.
+    pub client_impacting: bool,
 }
 
 impl TraceRecord {
@@ -1688,24 +2259,162 @@ impl TraceRecord {
         Some(root.end_time? - root.start_time)
     }
 
-    /// Whether any segment recorded a 400-series error.
+    /// Whether any entity of this trace was classified `class`.
+    ///
+    /// An entity is a segment or a subsegment inside one, and each is classified
+    /// EXCLUSIVELY ([`Classification`]), so a document carrying both `throttle`
+    /// and `error` contributes a throttle and no error.
+    pub fn has(&self, class: Classification) -> bool {
+        self.segments
+            .iter()
+            .flat_map(SegmentRecord::classifications)
+            .any(|recorded| recorded == class)
+    }
+
+    /// Whether the ROOT segment document recorded `class` — the root segment
+    /// itself, or an entity inside the document that carried it.
+    ///
+    /// The scope matters, and it is the model's: `TraceSummary$HasFault` is
+    /// documented as "The root segment document has a 500 series error" and
+    /// `$HasError` as "…a 400 series error"
+    /// (`smithy_query(query="doc",shape="TraceSummary",member="HasFault")`),
+    /// while `$HasThrottle` is "One or more of the segment documents has a 429
+    /// throttling error" — so the first two are read off the root document and
+    /// only the third is a union over the trace.
+    pub fn root_document_has(&self, class: Classification) -> bool {
+        self.root()
+            .is_some_and(|root| root.classifications().contains(&class))
+    }
+
+    /// Whether the root segment document recorded a 400-series error
+    /// (`TraceSummary$HasError`): the root segment itself, or an entity inside
+    /// its document.
+    ///
+    /// Read off each entity's [`Outcome::error_400`] rather than its exclusive
+    /// class, because the two differ for a throttled request: a 429 is a
+    /// 400-series status, so the request is reported here AND by
+    /// [`has_throttle`](Self::has_throttle), while the counters still split it
+    /// under `ErrorStatistics$ThrottleCount` ([`recorded_error`]).
     pub fn has_error(&self) -> bool {
-        self.segments.iter().any(SegmentRecord::is_error)
+        self.root().is_some_and(|root| {
+            root.outcomes().iter().any(|outcome| outcome.error_400)
+        })
     }
 
-    /// Whether any segment recorded a 500-series fault.
+    /// Whether the root segment document recorded a 500-series fault
+    /// (`TraceSummary$HasFault`).
     pub fn has_fault(&self) -> bool {
-        self.segments.iter().any(SegmentRecord::is_fault)
+        self.root_document_has(Classification::Fault)
     }
 
-    /// Whether any segment recorded a throttling error.
+    /// Whether ANY segment document recorded a throttling error
+    /// (`TraceSummary$HasThrottle`).
     pub fn has_throttle(&self) -> bool {
-        self.segments.iter().any(SegmentRecord::is_throttle)
+        self.has(Classification::Throttle)
     }
 
     /// Whether any segment is still in progress (`TraceSummary$IsPartial`).
     pub fn is_partial(&self) -> bool {
         self.segments.iter().any(|segment| segment.in_progress)
+    }
+
+    /// The root causes of `kind` this trace recorded
+    /// (`TraceSummary$FaultRootCauses` / `$ErrorRootCauses`).
+    ///
+    /// One per segment whose own tree recorded the outcome: its `Services` are
+    /// the chain of services from the trace's root down to that segment, each
+    /// carrying the frames inside it the outcome ran through — the frame that
+    /// called out (a dependency frame, `Remote`) or the work it did itself (a
+    /// pipeline frame) — and the deepest frame carries the exceptions its own
+    /// `cause` block named.
+    ///
+    /// Bounded in both dimensions a trace can grow in: at most
+    /// [`MAX_ROOT_CAUSES_PER_TRACE`] causes are derived, and each chain walks
+    /// each of the trace's segments at most once, resolving every hop through
+    /// one entity index built here rather than by re-scanning the segments per
+    /// hop. A trace that recorded more outcomes than the cap therefore reports
+    /// the first of them rather than making one read do super-linear work.
+    pub fn root_causes(&self, kind: RootCauseKind) -> Vec<RootCauseView> {
+        let class = kind.classification();
+        let client_impacting = self
+            .root()
+            .is_some_and(|root| root.classification() == class);
+        let owners = self.entity_owners();
+        let mut causes = Vec::new();
+        for (index, segment) in self.segments.iter().enumerate() {
+            if causes.len() >= MAX_ROOT_CAUSES_PER_TRACE {
+                break;
+            }
+            if let Some(path) = segment.root_cause_path(class) {
+                causes.push(RootCauseView {
+                    services: self.service_chain(index, path, &owners),
+                    client_impacting,
+                });
+            }
+        }
+        causes
+    }
+
+    /// Every entity id in this trace — each segment's own, and each id in its
+    /// `subsegments` tree — mapped to the segment that holds it.
+    ///
+    /// Built once per derivation, so resolving a `parent_id` to the service it
+    /// belongs to is a lookup rather than a scan of every segment's tree. The
+    /// filter language's `edge(…)` scope reads the same index for the same
+    /// reason ([`filter`]).
+    pub fn entity_owners(&self) -> BTreeMap<&str, usize> {
+        fn walk<'a>(
+            at: usize,
+            subsegments: &'a [SubsegmentRecord],
+            out: &mut BTreeMap<&'a str, usize>,
+        ) {
+            for subsegment in subsegments {
+                if let Some(id) = subsegment.id.as_deref() {
+                    out.entry(id).or_insert(at);
+                }
+                walk(at, &subsegment.subsegments, out);
+            }
+        }
+
+        let mut owners = BTreeMap::new();
+        for (at, segment) in self.segments.iter().enumerate() {
+            owners.entry(segment.id.as_str()).or_insert(at);
+            walk(at, &segment.subsegments, &mut owners);
+        }
+        owners
+    }
+
+    /// The services a root cause recorded at `index` travelled through, root
+    /// first: each ancestor segment contributes the frames from itself down to
+    /// the entity the next segment hangs off, and `path` is the frames inside the
+    /// segment that recorded the outcome.
+    fn service_chain(
+        &self,
+        index: usize,
+        path: Vec<RootCauseEntityView>,
+        owners: &BTreeMap<&str, usize>,
+    ) -> Vec<RootCauseServiceView> {
+        let mut chain = vec![self.segments[index].service(path)];
+        let mut seen = BTreeSet::from([index]);
+        let mut current = index;
+        // One hop per segment at most: a hop that lands on a segment already
+        // walked ends the chain, so a `parent_id` cycle cannot loop here, and
+        // each segment's subsegment tree is walked at most once per chain.
+        while let Some(parent_id) = self.segments[current].parent_id.as_deref() {
+            let Some(&at) = owners.get(parent_id) else {
+                break;
+            };
+            if !seen.insert(at) {
+                break;
+            }
+            let Some(frames) = self.segments[at].frames_to(parent_id) else {
+                break;
+            };
+            chain.push(self.segments[at].service(frames));
+            current = at;
+        }
+        chain.reverse();
+        chain
     }
 
     /// This trace with only the segments whose `start_time` falls in the
@@ -1811,16 +2520,39 @@ impl ComAmazonawsXrayAwsxrayState {
         self.encryption.to_config(now)
     }
 
-    /// Store one parsed segment under its trace, replacing a segment already
-    /// held under the same id — which is how an in-progress segment is
-    /// overwritten by the completed one.
+    /// Store one parsed segment under its trace, together with the segments
+    /// X-Ray infers from it for the downstream services it called
+    /// ([`inferred_segments`]).
     ///
     /// Bounded in both directions: a trace holds at most
     /// [`MAX_SEGMENTS_PER_TRACE`] segments (a further new one is refused, and
     /// marks the trace `limit_exceeded`), and the store holds at most
     /// [`MAX_TRACES`] traces (a new trace past that evicts the least recently
     /// ingested one).
+    ///
+    /// An inferred segment that does not fit marks the trace `limit_exceeded`
+    /// like any other refused segment, but is not reported as an
+    /// `UnprocessedTraceSegment`: the caller submitted no such document.
     pub fn ingest_segment(
+        &mut self,
+        trace_id: &str,
+        segment: SegmentRecord,
+    ) -> Result<(), SegmentRejection> {
+        let inferred = inferred_segments(trace_id, &segment);
+        self.store_segment(trace_id, segment)?;
+        for extra in inferred {
+            // The rejection is dropped deliberately: `store_segment` has
+            // already recorded it on the trace as `limit_exceeded`.
+            let _ = self.store_segment(trace_id, extra);
+        }
+        Ok(())
+    }
+
+    /// Store one segment under its trace, replacing a segment already held under
+    /// the same id — which is how an in-progress segment is overwritten by the
+    /// completed one, and how a re-submitted document replaces the inferred
+    /// segment it already derived rather than adding a second one.
+    fn store_segment(
         &mut self,
         trace_id: &str,
         segment: SegmentRecord,
@@ -1846,7 +2578,7 @@ impl ComAmazonawsXrayAwsxrayState {
             None => {
                 if trace.segments.len() >= MAX_SEGMENTS_PER_TRACE {
                     trace.limit_exceeded = true;
-                    return Err(SegmentRejection::trace_full(&segment.id, trace_id));
+                    return Err(SegmentRejection::trace_full(&segment.id));
                 }
                 trace
                     .segment_index
@@ -2262,9 +2994,17 @@ pub struct GroupRecordDraft {
     pub tags: BTreeMap<String, String>,
 }
 
-/// X-Ray's filter-expression language, as `CreateGroup` and `UpdateGroup` see
-/// it: an expression is parsed before anything is written, so an unparseable one
-/// never reaches the store.
+/// X-Ray's filter-expression language: the ONE place this crate reads it.
+///
+/// Every surface that takes a `FilterExpression` goes through [`parse`] — the
+/// grammar, the catalog of fields X-Ray indexes, the bounds on an expression's
+/// length and nesting, and the wording of every refusal that follows from them
+/// live here and nowhere else. A surface that only STORES an expression
+/// (`CreateGroup`, `UpdateGroup`) calls [`validate`], which is `parse` with the
+/// tree thrown away; `GetTraceSummaries` hands the tree to
+/// [`crate::state::filter`], which compiles it into what it can answer from the
+/// stored segment documents and evaluates it. So an expression is parsed once,
+/// by one parser, however it arrives.
 ///
 /// The language is proprietary to X-Ray — no crates.io crate parses it — so the
 /// grammar is written here as a tokenizer plus a recursive-descent parser. Both
@@ -2332,7 +3072,20 @@ pub mod filter_expression {
 
     /// The comparison operators written as words, from the same reference's
     /// string operators. They sit beside `=`, `!=`, `<`, `<=`, `>` and `>=`.
-    const WORD_COMPARISONS: &[&str] = &["contains", "beginswith", "startswith", "endswith"];
+    const WORD_COMPARISONS: &[(&str, Operator)] = &[
+        ("contains", Operator::Contains),
+        ("beginswith", Operator::BeginsWith),
+        ("startswith", Operator::BeginsWith),
+        ("endswith", Operator::EndsWith),
+    ];
+
+    /// The operator `word` names, when it names one of the word comparisons.
+    fn word_comparison(word: &str) -> Option<Operator> {
+        WORD_COMPARISONS
+            .iter()
+            .find(|(name, _)| word.eq_ignore_ascii_case(name))
+            .map(|(_, operator)| *operator)
+    }
 
     /// Whether `path` names a field a filter expression may address.
     #[must_use]
@@ -2371,8 +3124,7 @@ pub mod filter_expression {
         }
     }
 
-    /// One lexical item. The six comparison operators collapse into one token:
-    /// which comparison it is does not change whether the expression parses.
+    /// One lexical item.
     #[derive(Debug, Clone, PartialEq)]
     enum Token {
         /// A bare word: a keyword path, or a label inside a keyword's arguments.
@@ -2388,15 +3140,89 @@ pub mod filter_expression {
         Not,
         /// One of `=`, `!=`, `<`, `<=`, `>`, `>=`, or one of the string
         /// operators the same reference lists (`CONTAINS`, `BEGINSWITH`,
-        /// `STARTSWITH`, `ENDSWITH`): which comparison it is does not change
-        /// whether the expression parses.
-        Comparison,
+        /// `STARTSWITH`, `ENDSWITH`). WHICH comparison it is does not change
+        /// whether the expression parses, but it does change what the
+        /// expression MEANS, so the operator travels on the token for whoever
+        /// evaluates the parsed tree.
+        Comparison(Operator),
         OpenParen,
         CloseParen,
         OpenBrace,
         CloseBrace,
         Comma,
         Colon,
+    }
+
+    /// Which comparison a predicate makes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Operator {
+        /// `=`
+        Equal,
+        /// `!=`
+        NotEqual,
+        /// `<`
+        Less,
+        /// `<=`
+        LessOrEqual,
+        /// `>`
+        Greater,
+        /// `>=`
+        GreaterOrEqual,
+        /// `CONTAINS`
+        Contains,
+        /// `BEGINSWITH` / `STARTSWITH` — the same operator under two names.
+        BeginsWith,
+        /// `ENDSWITH`
+        EndsWith,
+    }
+
+    /// One value a comparison or an argument carries.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Operand {
+        /// A quoted string.
+        Text(String),
+        /// A number.
+        Number(f64),
+        /// `true` / `false`.
+        Boolean(bool),
+        /// Another indexed field, as `id(name: …)`'s arguments may name.
+        Field(String),
+    }
+
+    /// One argument of a complex keyword, labelled as in `id(name: "svc")` or
+    /// positional as in `service("svc", "AWS::EC2::Instance")`.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Argument {
+        /// The member the argument names, when it was labelled.
+        pub label: Option<String>,
+        /// The value it carries.
+        pub value: Operand,
+    }
+
+    /// A parsed expression.
+    ///
+    /// This is the ONE tree the crate parses this language into: `validate`
+    /// answers from it, and `crate::state::filter` evaluates it. `AND` binds
+    /// tighter than `OR`, and each associates left to right.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Node {
+        /// `left AND right`.
+        And(Box<Node>, Box<Node>),
+        /// `left OR right`.
+        Or(Box<Node>, Box<Node>),
+        /// `NOT inner`.
+        Not(Box<Node>),
+        /// `keyword [ ( arguments ) ] [ { block } | comparison operand ]`.
+        Predicate {
+            /// The keyword's path, which [`is_indexed_field`] accepted.
+            path: String,
+            /// Its arguments, when it is a complex keyword.
+            arguments: Vec<Argument>,
+            /// The expression its `{ … }` block scopes, when it carries one.
+            block: Option<Box<Node>>,
+            /// The comparison it makes, when it makes one.
+            comparison: Option<(Operator, Operand)>,
+        },
     }
 
     /// How a token reads in a refusal message.
@@ -2409,7 +3235,7 @@ pub mod filter_expression {
             Token::And => "`AND`".to_string(),
             Token::Or => "`OR`".to_string(),
             Token::Not => "`NOT`".to_string(),
-            Token::Comparison => "a comparison operator".to_string(),
+            Token::Comparison(_) => "a comparison operator".to_string(),
             Token::OpenParen => "`(`".to_string(),
             Token::CloseParen => "`)`".to_string(),
             Token::OpenBrace => "`{`".to_string(),
@@ -2484,12 +3310,18 @@ pub mod filter_expression {
                     at += 1;
                 }
                 '=' => {
-                    tokens.push(Token::Comparison);
+                    tokens.push(Token::Comparison(Operator::Equal));
                     at += 1;
                 }
                 '<' | '>' => {
-                    at += usize::from(characters.get(at + 1) == Some(&'=')) + 1;
-                    tokens.push(Token::Comparison);
+                    let inclusive = characters.get(at + 1) == Some(&'=');
+                    at += usize::from(inclusive) + 1;
+                    tokens.push(Token::Comparison(match (character, inclusive) {
+                        ('<', false) => Operator::Less,
+                        ('<', true) => Operator::LessOrEqual,
+                        (_, false) => Operator::Greater,
+                        (_, true) => Operator::GreaterOrEqual,
+                    }));
                 }
                 '!' => {
                     if characters.get(at + 1) != Some(&'=') {
@@ -2497,7 +3329,7 @@ pub mod filter_expression {
                             "`!` is only valid as part of `!=`".to_string(),
                         ));
                     }
-                    tokens.push(Token::Comparison);
+                    tokens.push(Token::Comparison(Operator::NotEqual));
                     at += 2;
                 }
                 digit
@@ -2538,11 +3370,8 @@ pub mod filter_expression {
                         Token::Boolean(true)
                     } else if word.eq_ignore_ascii_case("false") {
                         Token::Boolean(false)
-                    } else if WORD_COMPARISONS
-                        .iter()
-                        .any(|operator| word.eq_ignore_ascii_case(operator))
-                    {
-                        Token::Comparison
+                    } else if let Some(operator) = word_comparison(&word) {
+                        Token::Comparison(operator)
                     } else {
                         Token::Field(word)
                     });
@@ -2606,26 +3435,32 @@ pub mod filter_expression {
             Err(Error::Syntax(format!("expected {what}{}", self.found())))
         }
 
-        fn expression(&mut self, depth: usize) -> Result<(), Error> {
-            self.term(depth)?;
+        fn expression(&mut self, depth: usize) -> Result<Node, Error> {
+            // The terms and the operators between them, folded below so `AND`
+            // binds tighter than `OR` while the WALK stays exactly what it was:
+            // which expressions parse does not depend on the fold.
+            let mut terms = vec![self.term(depth)?];
+            let mut operators: Vec<Token> = Vec::new();
             while matches!(self.peek(), Some(Token::And | Token::Or)) {
-                self.at += 1;
-                self.term(depth)?;
+                let operator = self.take().expect("the token was just peeked");
+                operators.push(operator);
+                terms.push(self.term(depth)?);
             }
-            Ok(())
+            Ok(fold(terms, &operators))
         }
 
-        fn term(&mut self, depth: usize) -> Result<(), Error> {
+        fn term(&mut self, depth: usize) -> Result<Node, Error> {
             if depth > MAX_DEPTH {
                 return Err(Error::Syntax(format!(
                     "nested more than {MAX_DEPTH} levels deep"
                 )));
             }
             match self.take() {
-                Some(Token::Not) => self.term(depth + 1),
+                Some(Token::Not) => Ok(Node::Not(Box::new(self.term(depth + 1)?))),
                 Some(Token::OpenParen) => {
-                    self.expression(depth + 1)?;
-                    self.expect(&Token::CloseParen, "a closing `)`")
+                    let inner = self.expression(depth + 1)?;
+                    self.expect(&Token::CloseParen, "a closing `)`")?;
+                    Ok(inner)
                 }
                 Some(Token::Field(path)) => self.predicate(path, depth),
                 Some(other) => Err(Error::Syntax(format!(
@@ -2638,47 +3473,74 @@ pub mod filter_expression {
             }
         }
 
-        fn predicate(&mut self, path: String, depth: usize) -> Result<(), Error> {
+        fn predicate(&mut self, path: String, depth: usize) -> Result<Node, Error> {
             if !is_indexed_field(&path) {
                 return Err(Error::UnknownField(path));
             }
-            if self.eat(&Token::OpenParen) {
-                self.arguments()?;
-            }
+            let arguments = if self.eat(&Token::OpenParen) {
+                self.arguments()?
+            } else {
+                Vec::new()
+            };
             if self.eat(&Token::OpenBrace) {
-                self.expression(depth + 1)?;
-                return self.expect(&Token::CloseBrace, "a closing `}`");
+                let block = self.expression(depth + 1)?;
+                self.expect(&Token::CloseBrace, "a closing `}`")?;
+                return Ok(Node::Predicate {
+                    path,
+                    arguments,
+                    block: Some(Box::new(block)),
+                    comparison: None,
+                });
             }
-            if self.eat(&Token::Comparison) {
-                return self.operand();
-            }
-            Ok(())
+            let comparison = match self.peek() {
+                Some(Token::Comparison(operator)) => {
+                    let operator = *operator;
+                    self.at += 1;
+                    Some((operator, self.operand()?))
+                }
+                _ => None,
+            };
+            Ok(Node::Predicate {
+                path,
+                arguments,
+                block: None,
+                comparison,
+            })
         }
 
-        fn arguments(&mut self) -> Result<(), Error> {
+        fn arguments(&mut self) -> Result<Vec<Argument>, Error> {
+            let mut arguments = Vec::new();
             loop {
                 // A labelled argument, as in `id(name: "svc", type: "AWS::EC2")`.
                 // The label is a member of the keyword, not a field of its own,
                 // so it is not looked up in the catalog.
-                if matches!(self.peek(), Some(Token::Field(_)))
-                    && self.tokens.get(self.at + 1) == Some(&Token::Colon)
+                let mut label = None;
+                if let (Some(Token::Field(name)), Some(&Token::Colon)) =
+                    (self.peek(), self.tokens.get(self.at + 1))
                 {
+                    label = Some(name.clone());
                     self.at += 2;
                 }
-                self.operand()?;
+                arguments.push(Argument {
+                    label,
+                    value: self.operand()?,
+                });
                 if !self.eat(&Token::Comma) {
                     break;
                 }
             }
-            self.expect(&Token::CloseParen, "a closing `)`")
+            self.expect(&Token::CloseParen, "a closing `)`")?;
+            Ok(arguments)
         }
 
-        fn operand(&mut self) -> Result<(), Error> {
+        fn operand(&mut self) -> Result<Operand, Error> {
             match self.take() {
-                Some(Token::Text(_) | Token::Number(_) | Token::Boolean(_)) => Ok(()),
+                Some(Token::Text(text)) => Ok(Operand::Text(text)),
+                Some(Token::Number(number)) => Ok(Operand::Number(number)),
+                Some(Token::Boolean(value)) => Ok(Operand::Boolean(value)),
                 Some(Token::Field(path)) => {
                     if is_indexed_field(&path) {
-                        return Ok(());
+                        return Ok(Operand::Field(path));
                     }
                     Err(Error::UnknownField(path))
                 }
@@ -2693,12 +3555,49 @@ pub mod filter_expression {
         }
     }
 
-    /// Parse `expression`, answering `Ok(())` only for one X-Ray would accept.
+    /// Fold a flat `term (AND|OR term)*` sequence into a tree in which `AND`
+    /// binds tighter than `OR`, each associating left to right.
+    fn fold(terms: Vec<Node>, operators: &[Token]) -> Node {
+        let mut disjuncts: Vec<Node> = Vec::new();
+        let mut conjunct: Option<Node> = None;
+        for (at, term) in terms.into_iter().enumerate() {
+            match at.checked_sub(1).map(|before| &operators[before]) {
+                // The first term opens the first conjunction.
+                None => conjunct = Some(term),
+                Some(Token::And) => {
+                    conjunct = Some(match conjunct.take() {
+                        Some(left) => Node::And(Box::new(left), Box::new(term)),
+                        None => term,
+                    });
+                }
+                // An `OR` closes the conjunction built so far.
+                _ => {
+                    if let Some(left) = conjunct.take() {
+                        disjuncts.push(left);
+                    }
+                    conjunct = Some(term);
+                }
+            }
+        }
+        if let Some(last) = conjunct {
+            disjuncts.push(last);
+        }
+        let mut walk = disjuncts.into_iter();
+        let first = walk
+            .next()
+            .expect("a parsed expression holds at least one term");
+        walk.fold(first, |left, right| {
+            Node::Or(Box::new(left), Box::new(right))
+        })
+    }
+
+    /// Parse `expression` into the one tree this crate reads it as, answering
+    /// `Ok` only for an expression X-Ray would accept.
     ///
     /// An ABSENT expression is the same refusal as an empty one — X-Ray treats
     /// the two identically — so a handler passes `unwrap_or_default()` here
     /// rather than skipping the check when the member is `None`.
-    pub fn validate(expression: &str) -> Result<(), Error> {
+    pub fn parse(expression: &str) -> Result<Node, Error> {
         if expression.trim().is_empty() {
             return Err(Error::Empty);
         }
@@ -2711,14 +3610,20 @@ pub mod filter_expression {
             tokens: tokenize(expression)?,
             at: 0,
         };
-        parser.expression(0)?;
+        let node = parser.expression(0)?;
         if let Some(trailing) = parser.peek() {
             return Err(Error::Syntax(format!(
                 "unexpected trailing {}",
                 describe(trailing)
             )));
         }
-        Ok(())
+        Ok(node)
+    }
+
+    /// Whether `expression` is one X-Ray would accept, for a surface that only
+    /// STORES it: [`parse`] with the tree thrown away.
+    pub fn validate(expression: &str) -> Result<(), Error> {
+        parse(expression).map(drop)
     }
 }
 
@@ -3411,18 +4316,20 @@ struct CallStatistics {
 impl CallStatistics {
     /// Count one call. A fault outranks an error (a 500-series answer is not
     /// also a 400-series one), a throttled error is counted as a throttle rather
-    /// than as "other", and a call that recorded neither is OK — the same
-    /// classification `TraceSummary$HasFault` / `HasError` / `HasThrottle` use.
+    /// than as "other", and a call that recorded neither is OK — which is
+    /// exactly the exclusive [`Classification`] every other reader of this
+    /// state uses, read here rather than recomputed.
     fn record(&mut self, call: Call) {
         self.total_count += 1;
-        if call.fault {
-            self.fault_count += 1;
-        } else if call.throttle {
-            self.throttle_count += 1;
-        } else if call.error {
-            self.error_other_count += 1;
-        } else {
-            self.ok_count += 1;
+        // The call's flags already fold in the recorded `http.response.status`
+        // ([`Call::of_segment`] / [`Call::of_subsegment`] read them through
+        // `is_fault`/`is_throttle`/`is_error`), so the status is not consulted
+        // a second time here.
+        match classify(call.fault, call.error, call.throttle, None) {
+            Classification::Fault => self.fault_count += 1,
+            Classification::Throttle => self.throttle_count += 1,
+            Classification::Error => self.error_other_count += 1,
+            Classification::Ok => self.ok_count += 1,
         }
         self.total_response_time += call.duration().unwrap_or(0.0);
     }
@@ -3725,7 +4632,12 @@ pub fn service_graph<'a>(
     let mut subsegment_budget = MAX_GRAPH_SUBSEGMENT_VISITS;
     for trace in traces {
         for segment in &trace.segments {
-            if !selects(segment) || segment.is_subsegment() {
+            // An inferred segment is not one a service REPORTED: it is this
+            // service's own projection of a remote subsegment
+            // ([`inferred_segments`]), and the downstream node that subsegment
+            // names is derived from the subsegment itself below — so counting
+            // the projection too would report one downstream call as two nodes.
+            if !selects(segment) || segment.is_subsegment() || segment.inferred {
                 continue;
             }
             let call = Call::of_segment(segment);
@@ -3785,7 +4697,7 @@ pub fn service_graph<'a>(
         // documents is.
         let reporting = reporting_segments(trace);
         for segment in &trace.segments {
-            if !selects(segment) {
+            if !selects(segment) || segment.inferred {
                 continue;
             }
             // The service that recorded this segment's parent: a `parent_id`

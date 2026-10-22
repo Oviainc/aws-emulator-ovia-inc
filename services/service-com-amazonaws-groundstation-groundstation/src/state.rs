@@ -8,9 +8,15 @@
 //! `trackingConfigArn` / `missionProfileArn` reference resolves without scanning a map.
 //!
 //! The helpers beside the struct are the pieces every handler of this service needs —
-//! the request's region, the union-member-to-`ConfigCapabilityType` mapping, uuid
-//! minting and the opaque pagination token codec — so they are written once here rather
-//! than in each `src/ops/<operation>.rs`.
+//! the request's region, the union-member-to-`ConfigCapabilityType` mapping, the
+//! capability's user-facing spelling, the `ConfigArn` reader, uuid minting and the
+//! opaque pagination token codec — so they are written once here rather than in each
+//! `src/ops/<operation>.rs`.
+//!
+//! Error TEXT, on the other hand, is per operation: this service answers a
+//! `ResourceNotFoundException` with the text of the operation that raised it, so each
+//! `src/ops/<operation>.rs` carries its own (see [`MISSION_PROFILE_NOT_FOUND`] for the
+//! one literal two operations genuinely share).
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -54,6 +60,57 @@ pub fn config_type_of(config_data: &ConfigTypeData) -> &'static str {
         ConfigTypeData::uplinkEchoConfig(_) => "uplink-echo",
     }
 }
+
+/// The capability's name as this service spells it in user-facing text: the
+/// UpperCamelCase form of a `ConfigCapabilityType` token.
+///
+/// That form is not a second naming scheme — it is exactly the name of the shape the
+/// matching `ConfigTypeData` member targets, minus its `Config` suffix:
+/// `antenna-uplink` -> `AntennaUplinkConfig` -> `AntennaUplink`, `s3-recording` ->
+/// `S3RecordingConfig` -> `S3Recording`, `antenna-downlink-demod-decode` ->
+/// `AntennaDownlinkDemodDecodeConfig` -> `AntennaDownlinkDemodDecode`. Source:
+/// `smithy_query(query="shape", shape="ConfigTypeData,ConfigCapabilityType")` lists the
+/// eight member targets beside the eight tokens, and the two agree segment for segment —
+/// so the spelling is DERIVED from the token rather than tabulated here, and holds for
+/// every capability type including any the model gains later.
+pub fn capability_display_name(config_type: &str) -> String {
+    config_type
+        .split('-')
+        .map(|segment| {
+            let mut characters = segment.chars();
+            match characters.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// The `(configType, configId)` pair a `ConfigArn` addresses, or `None` when `arn` is
+/// not one of this service's config ARNs.
+///
+/// The modelled `ConfigArn` pattern ends in `config/<type>/<uuid>(/<suffix>)?` (it is on
+/// `configArn` in `smithy_query(query="operation", operation="GetConfig")`), so the two
+/// segments after `:config/` are the very pair [`ComAmazonawsGroundstationGroundstationState::configs`]
+/// is keyed on — which is what lets an ARN-valued reference be reported by the id and
+/// type it names rather than echoed back whole.
+pub fn config_arn_parts(arn: &str) -> Option<(String, String)> {
+    let (_, resource) = arn.split_once(":config/")?;
+    let mut segments = resource.split('/');
+    let config_type = segments.next()?;
+    let config_id = segments.next()?;
+    (!config_type.is_empty() && !config_id.is_empty())
+        .then(|| (config_type.to_string(), config_id.to_string()))
+}
+
+/// What this service answers when a mission profile a request names does not exist: a
+/// fixed literal that discloses neither the id nor the ARN that was asked for.
+///
+/// It lives here rather than in one handler because BOTH operations that resolve a
+/// mission profile answer it — `GetMissionProfile`, which resolves one by
+/// `{missionProfileId}`, and `ReserveContact`, which resolves one by `missionProfileArn`
+/// — so it is one text of the service, not one text per operation.
+pub const MISSION_PROFILE_NOT_FOUND: &str = "MissionProfile not found";
 
 /// The region to mint this request's ARNs in: the SigV4 credential scope's region,
 /// which is the region the caller addressed, falling back to [`DEFAULT_REGION`].
@@ -330,16 +387,63 @@ impl Contact {
         }
     }
 
-    /// `tags` the way a response carries them: absent when the resource has none.
+    /// `tags` the way a response carries them: always the map, empty when the
+    /// resource carries no tag.
     pub fn response_tags(&self) -> Option<HashMap<String, String>> {
         response_tags(&self.tags)
     }
 }
 
-/// `tags` the way a response carries them: absent when the resource was created
-/// without any, rather than an empty map the caller never sent.
+/// `tags` the way a response of this service carries them: the resource's tag map,
+/// SERIALIZED even when the resource carries no tag — `{}` then, never an omitted
+/// member.
+///
+/// A `TagsMap`-targeting response member of this service reports how a resource is
+/// tagged, and "no tags" is a map with no entry, not the absence of an answer: a client
+/// that diffs or iterates tags reads a map in both cases. Every read that reports tags
+/// goes through here, so the whole service answers the same way.
 pub fn response_tags(tags: &HashMap<String, String>) -> Option<HashMap<String, String>> {
-    (!tags.is_empty()).then(|| tags.clone())
+    Some(tags.clone())
+}
+
+/// The message every operation addressed at a config by its `(configType, configId)`
+/// pair carries when that pair names no config — built from the two `@httpLabel`
+/// members of the request, id before type, which is the rule the recorded corpus shows
+/// for this service's config reads.
+///
+/// It lives here rather than in one handler because every operation that addresses a
+/// config by that pair answers it — `GetConfig`, `DeleteConfig` and `UpdateConfig` —
+/// so it is one text of the service, not one text per operation.
+pub fn config_not_found_message(config_type: &str, config_id: &str) -> String {
+    format!("No config found with id {config_id} and type {config_type}")
+}
+
+/// The message an operation that resolves a config BY ARN — a mission profile's
+/// `trackingConfigArn`, `telemetrySinkConfigArn` or a `dataflowEdges` endpoint — carries
+/// when that reference resolves to nothing.
+///
+/// It identifies the config the lookup looked FOR: its id, the config type it searched
+/// under, and the account the search was scoped to, rather than echoing the ARN back.
+/// The id and the fallback type come from the ARN the request gave
+/// ([`config_arn_parts`]); `required_type` is the type the member itself requires, which
+/// is `None` for a dataflow edge, whose endpoints may be of any type. An ARN that is not
+/// one of this service's config ARNs names no id to report, so the ARN is all there is
+/// to say.
+///
+/// Shared by every operation that takes such a reference, so a create and an update of
+/// the same profile answer one text.
+pub fn config_reference_not_found_message(arn: &str, required_type: Option<&str>) -> String {
+    let from_arn = config_arn_parts(arn);
+    let searched_type = required_type
+        .map(str::to_string)
+        .or_else(|| from_arn.as_ref().map(|(config_type, _)| config_type.clone()));
+    match (&from_arn, &searched_type) {
+        (Some((_, config_id)), Some(config_type)) => format!(
+            "No config found with ID {config_id} and config type: {config_type} for customer {}",
+            ::engine::emulator_account_id()
+        ),
+        _ => format!("Unable to find Config with ARN: {arn}"),
+    }
 }
 
 /// Per-service state for com-amazonaws-groundstation-groundstation. A handler reaches it through [`service_state`].
@@ -365,6 +469,40 @@ impl ComAmazonawsGroundstationGroundstationState {
             } => self.configs.get(&(config_type.clone(), config_id.clone())),
             _ => None,
         }
+    }
+
+    /// Whether `arn` resolves to a config this service still holds, of `required_type`
+    /// when the member that carries the reference is for one config type only.
+    ///
+    /// Shared by every operation that takes a config reference, so a reference to a
+    /// config that was never created and one to a config that has since been DELETED
+    /// are refused the same way.
+    pub fn resolves_config(&self, arn: &str, required_type: Option<&str>) -> bool {
+        self.config_by_arn(arn)
+            .is_some_and(|config| required_type.is_none_or(|wanted| config.config_type == wanted))
+    }
+
+    /// Remove the config the `(configType, configId)` pair addresses, along with the ARN
+    /// index entry that resolved to it, and answer it; `None` when the pair addresses no
+    /// config.
+    ///
+    /// Dropping the index entry is what makes the deletion complete: an ARN-valued
+    /// reference to a deleted config then resolves to nothing, exactly as a reference to
+    /// one that never existed does.
+    pub fn remove_config(&mut self, config_type: &str, config_id: &str) -> Option<Config> {
+        let removed = self
+            .configs
+            .remove(&(config_type.to_string(), config_id.to_string()))?;
+        self.arn_index.remove(&removed.config_arn);
+        Some(removed)
+    }
+
+    /// Remove the mission profile `mission_profile_id` addresses, along with its ARN
+    /// index entry, and answer it; `None` when no profile has that id.
+    pub fn remove_mission_profile(&mut self, mission_profile_id: &str) -> Option<MissionProfile> {
+        let removed = self.mission_profiles.remove(mission_profile_id)?;
+        self.arn_index.remove(&removed.mission_profile_arn);
+        Some(removed)
     }
 
     /// The mission profile `arn` names, if it names one.

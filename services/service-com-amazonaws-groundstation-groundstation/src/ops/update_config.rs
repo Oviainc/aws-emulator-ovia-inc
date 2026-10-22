@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +142,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConfigErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The config's type is implied by whichever member of the `ConfigTypeData` union
+        // the caller set, and the `{configType}` label is part of the config's address:
+        // an update whose `configData` selects another type would change the config's
+        // type and its ARN, which this URI cannot address, so it is refused as a bad
+        // parameter rather than silently retyping the config.
+        let data_type = crate::state::config_type_of(&input.config_data);
+        if data_type != input.config_type {
+            return Err(UpdateConfigErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "configData selects config type {data_type}, but this config is of type {}",
+                        input.config_type
+                    )),
+                    parameter_name: Some("configData".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+
+        // A config is addressed by BOTH labels, so an id whose stored type is not the
+        // `{configType}` label names no config to update — just as an unknown id does
+        // not. Checked before the body's references, so what the caller hears first is
+        // that the config it addressed is not there.
+        let key = (input.config_type.clone(), input.config_id.clone());
+        if !guard.configs.contains_key(&key) {
+            return Err(UpdateConfigErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::config_not_found_message(
+                        &input.config_type,
+                        &input.config_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
+        // the update is held to the same reference rule, and answers the same text, as
+        // the create, so an echo config cannot be pointed at a config that does not
+        // exist or is of another type.
+        if let ConfigTypeData::uplinkEchoConfig(echo) = &input.config_data {
+            // The one capability type an `uplinkEchoConfig`'s reference may name — the
+            // member's own name and the `antenna-uplink` segment of a `ConfigArn` are
+            // what say so.
+            const ECHOED_TYPE: &str = "antenna-uplink";
+
+            if !guard.resolves_config(&echo.antenna_uplink_config_arn, Some(ECHOED_TYPE)) {
+                return Err(UpdateConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Unable to find {} Config with ARN: {}",
+                            crate::state::capability_display_name(ECHOED_TYPE),
+                            echo.antenna_uplink_config_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let stored = guard
+            .configs
+            .get_mut(&key)
+            .expect("the config whose presence was just checked under this lock");
+
+        // Both members are required, so an update REPLACES the config's name and its
+        // parameters; its id, type and ARN are its address and do not move.
+        stored.name = input.name;
+        stored.config_data = input.config_data;
+
+        Ok(UpdateConfigOutput {
+            config_id: Some(stored.config_id.clone()),
+            config_type: Some(stored.config_type.clone()),
+            config_arn: Some(stored.config_arn.clone()),
+        })
     }
 }

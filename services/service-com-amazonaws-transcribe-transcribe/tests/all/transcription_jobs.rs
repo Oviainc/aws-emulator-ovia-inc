@@ -24,79 +24,99 @@ use smithy_server_runtime::MultiServiceRouter;
 const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 
 /// One emulator: the service mounted on a single shared engine behind the router.
-struct Transcribe {
-    router: MultiServiceRouter,
+///
+/// `pub(crate)`, like [`Reply`] and [`dispatch`] below it: the vocabulary suite in this
+/// same test crate drives its requests through this harness instead of standing up a
+/// second one. The router is behind an `Arc` so a test that needs several concurrent
+/// callers can hand each one a clone.
+pub(crate) struct Transcribe {
+    pub(crate) router: Arc<MultiServiceRouter>,
 }
 
 /// One answer: the HTTP status and the parsed JSON body.
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Transcribe {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
             service_com_amazonaws_transcribe_transcribe::EmulatedService::new(engine),
         );
-        Self { router }
+        Self {
+            router: Arc::new(router),
+        }
     }
 
     /// Call one operation in the service's own wire envelope (awsJson1_1: the
     /// operation in `X-Amz-Target`, the input as the JSON body).
-    async fn call(&self, operation: &str, input: Value) -> Reply {
+    pub(crate) async fn call(&self, operation: &str, input: Value) -> Reply {
         self.call_in_region(operation, input, None).await
     }
 
     /// The same call, signed for `region` when one is given, so the handler sees a
     /// SigV4 credential scope.
-    async fn call_in_region(
+    pub(crate) async fn call_in_region(
         &self,
         operation: &str,
         input: Value,
         region: Option<&str>,
     ) -> Reply {
-        let mut builder = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("x-amz-target", format!("Transcribe.{operation}"))
-            .header("content-type", "application/x-amz-json-1.1");
-        if let Some(region) = region {
-            builder = builder.header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/transcribe/\
-                     aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef"
-                ),
-            );
-        }
-        let request = builder
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(&input).expect("serializable input"),
-            ))
-            .expect("valid request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let body = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or_else(|e| {
-                panic!(
-                    "{operation} answered {status} with a body that is not JSON ({e}): {:?}",
-                    String::from_utf8_lossy(response.body())
-                )
-            })
-        };
-        Reply { status, body }
+        dispatch(&self.router, operation, input, region).await
     }
+}
+
+/// One awsJson1_1 call through `router`, signed for `region` when one is given.
+///
+/// A free function rather than only a method, so a test driving several concurrent
+/// callers can hand each one a cloned `Arc<MultiServiceRouter>`.
+pub(crate) async fn dispatch(
+    router: &MultiServiceRouter,
+    operation: &str,
+    input: Value,
+    region: Option<&str>,
+) -> Reply {
+    let mut builder = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("x-amz-target", format!("Transcribe.{operation}"))
+        .header("content-type", "application/x-amz-json-1.1");
+    if let Some(region) = region {
+        builder = builder.header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/transcribe/\
+                 aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef"
+            ),
+        );
+    }
+    let request = builder
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&input).expect("serializable input"),
+        ))
+        .expect("valid request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
+            panic!(
+                "{operation} answered {status} with a body that is not JSON ({e}): {:?}",
+                String::from_utf8_lossy(response.body())
+            )
+        })
+    };
+    Reply { status, body }
 }
 
 impl Reply {
     /// The body of a successful call.
-    fn ok(&self, case: &str) -> &Value {
+    pub(crate) fn ok(&self, case: &str) -> &Value {
         assert_eq!(
             self.status, 200,
             "case {case:?}: expected HTTP 200, got {} with body {:?}",
@@ -105,8 +125,66 @@ impl Reply {
         &self.body
     }
 
+    /// Assert a successful call that answers one of the modelled success statuses
+    /// other than 200 (`201` for `CreateVocabularyFilter`, `204` for the deletes).
+    pub(crate) fn ok_status(&self, case: &str, expected: u16) {
+        assert_eq!(
+            self.status, expected,
+            "case {case:?}: expected HTTP {expected}, got {} with body {:?}",
+            self.status, self.body
+        );
+    }
+
+    /// Assert a successful call that answers the modelled `204 No Content`.
+    pub(crate) fn ok_no_content(&self, case: &str) {
+        self.ok_status(case, 204);
+    }
+
+    /// Assert this answer is the modelled refusal `code` with HTTP `status`.
+    pub(crate) fn refused(&self, case: &str, status: u16, code: &str) {
+        assert_eq!(
+            self.status, status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
+            self.status, self.body
+        );
+        assert_eq!(
+            self.error_code(),
+            code,
+            "case {case:?}: expected the modelled {code}, got {:?}",
+            self.body
+        );
+    }
+
+    /// One string member of a successful body.
+    pub(crate) fn member(&self, case: &str, name: &str) -> String {
+        self.body
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a string {name} in the answer, got {:?}",
+                    self.body
+                )
+            })
+            .to_string()
+    }
+
+    /// One timestamp member of a successful body, as the epoch seconds awsJson1_1
+    /// renders a `DateTime` as.
+    pub(crate) fn timestamp(&self, case: &str, name: &str) -> f64 {
+        self.body
+            .get(name)
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a numeric {name} in the answer, got {:?}",
+                    self.body
+                )
+            })
+    }
+
     /// The awsJson error code (`__type`), or `""` when the body carries none.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -772,13 +850,17 @@ async fn the_store_is_bounded_by_the_account_job_quota() {
     );
 
     // Deleting a job makes room again: the quota bounds what is STORED, it is not
-    // a one-way door.
+    // a one-way door. The wait is what makes the job deletable: a job the service is
+    // still working on is in a non-terminal state, which `DeleteTranscriptionJob`
+    // refuses.
+    std::thread::sleep(PAST_EVERY_TRANSITION);
     transcribe
         .call(
             "DeleteTranscriptionJob",
             json!({"TranscriptionJobName": "quota-0"}),
         )
-        .await;
+        .await
+        .ok_no_content("delete a completed job to free quota");
     let after_delete = start("quota-100".to_string()).await;
     assert_eq!(
         after_delete.status, 200,
@@ -822,6 +904,33 @@ async fn an_unknown_job_is_not_found_and_delete_removes_a_known_one() {
         .await
         .ok("start the job to delete");
 
+    // A job the service is still working on is in a non-terminal state, and a delete
+    // of such a resource is refused (`BadRequestException`: "This can occur when the
+    // entity you're trying to delete doesn't exist or if it's in a non-terminal state
+    // (such as IN PROGRESS)").
+    let while_in_progress = transcribe
+        .call(
+            "DeleteTranscriptionJob",
+            json!({"TranscriptionJobName": "demo-job"}),
+        )
+        .await;
+    assert_eq!(
+        while_in_progress.status, 400,
+        "deleting a job that is still being processed must be HTTP 400, got {} with \
+         body {:?}",
+        while_in_progress.status, while_in_progress.body
+    );
+    assert_eq!(
+        while_in_progress.error_code(),
+        "BadRequestException",
+        "deleting a job that is still being processed must be a BadRequestException, \
+         got {:?}",
+        while_in_progress.body
+    );
+
+    // Once every clock-owed transition has fallen due the job is COMPLETED — a
+    // terminal state — and the same delete goes through.
+    std::thread::sleep(PAST_EVERY_TRANSITION);
     let deleted = transcribe
         .call(
             "DeleteTranscriptionJob",

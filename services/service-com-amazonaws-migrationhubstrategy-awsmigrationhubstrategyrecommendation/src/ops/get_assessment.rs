@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 assessment_targets: Some(assessment.assessment_targets.clone()),
             }),
             None => Err(GetAssessmentErrorModeled::ResourceNotFoundException(
-                crate::state::assessment_not_found(&input.id),
+                crate::state::assessment_not_found(),
             )
             .into()),
         }

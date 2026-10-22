@@ -195,21 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Encode the id a page resumes at as an opaque token: hex, so a client cannot
-/// read it as an id and the value stays inside the modelled `PageToken` pattern
-/// and its 0..2024 length.
+/// Encode the id a page resumes at as an opaque token, through the crate-shared
+/// cursor codec in `crate::state`: hex, so a client cannot read it as an id and the
+/// value stays inside the modelled `PageToken` pattern and its 0..2024 length.
 fn encode_page_token(id: &str) -> String {
-    hex::encode(id)
+    crate::state::encode_page_cursor(id)
 }
 
 /// The inverse of [`encode_page_token`]. `None` for anything this service did not
 /// mint: not hex, not UTF-8, or not a value the modelled `Id` pattern
 /// `^[a-zA-Z0-9_\-]*$` allows.
 fn decode_page_token(token: &str) -> Option<String> {
-    let id = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    let well_formed = !id.is_empty()
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    well_formed.then_some(id)
+    crate::state::decode_page_cursor(token)
 }

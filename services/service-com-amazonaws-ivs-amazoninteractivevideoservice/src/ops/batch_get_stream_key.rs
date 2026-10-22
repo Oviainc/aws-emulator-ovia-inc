@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetStreamKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetStreamKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetStreamKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read, `@readonly` in the model: it answers the stream keys persisted
+//! under the requested ARNs and writes nothing. One result per requested ARN, in
+//! request order — a persisted key joins `streamKeys`, an ARN that names none joins
+//! `errors` — so the batch answers 200 even when only some ARNs resolve.
+//!
+//! The modelled `AccessDeniedException` (HTTP 403) is unreachable here on purpose:
+//! this emulator verifies a request's signature but models no IAM policy, so no
+//! operation in this service has a principal's permissions to consult. An
+//! authorization-denial path is not something a caller can drive against it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +151,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetStreamKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetStreamKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetStreamKey"))
+        // A malformed ARN never reaches here: every member of
+        // `BatchGetStreamKeyRequest$arns` carries the modelled `StreamKeyArn` pattern
+        // and the list its `length(1..50)` bound, both refused by the framework's
+        // constraint walk with a 400 `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetStreamKeyErrorModeled::ServiceUnavailable(ServiceUnavailable {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let store = state.lock();
+        // One result per requested ARN, in the order the request listed them: a found
+        // key joins `streamKeys`, a missing one joins `errors`. The batch itself
+        // succeeds either way, which is what makes a partial failure a 200.
+        let mut stream_keys = Vec::with_capacity(input.arns.len());
+        let mut errors = Vec::new();
+        for arn in &input.arns {
+            match store.stream_keys.get(arn) {
+                Some(key) => stream_keys.push(key.clone()),
+                None => errors.push(BatchError {
+                    arn: Some(arn.clone()),
+                    code: Some(NOT_FOUND_CODE.to_string()),
+                    message: Some(format!("stream key {arn} does not exist")),
+                }),
+            }
+        }
+
+        Ok(BatchGetStreamKeyOutput {
+            // Both lists are always present, even when one is empty: `BatchErrors`
+            // and `StreamKeys` are plain (non-sparse) lists the model marks neither
+            // required nor defaulted, so a client reads an absent list and an empty
+            // one the same way, and always sending both keeps one response shape
+            // instead of a shape that depends on how the batch happened to resolve.
+            stream_keys: Some(stream_keys),
+            errors: Some(errors),
+            ..Default::default()
+        })
     }
 }
+
+/// The `BatchError$code` an ARN that names no stream key carries.
+///
+/// The model documents this operation as "Performs GetStreamKey on multiple ARNs
+/// simultaneously", so a per-ARN failure reports what the single-ARN operation
+/// would have raised for that ARN, named by its modelled error shape —
+/// `GetStreamKey` declares `ResourceNotFoundException` (HTTP 404) for "Request
+/// references a resource which does not exist". `BatchError$code` is an
+/// unconstrained string in the model, and the accompanying `message` is "determined
+/// by the application", so the shape name is the one part of it the model pins down.
+const NOT_FOUND_CODE: &str = "ResourceNotFoundException";

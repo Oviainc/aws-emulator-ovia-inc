@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConstraint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConstraint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConstraint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +158,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConstraint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConstraintErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConstraint"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // `IdempotencyToken` is `@idempotencyToken`: a token already spent on a
+        // constraint replays that constraint instead of minting a second one. A token
+        // whose constraint has since been deleted is no longer a replay and falls
+        // through to a fresh create.
+        if let Some(constraint) = state.replayed_constraint(&input.idempotency_token) {
+            return Ok(CreateConstraintOutput {
+                constraint_detail: Some(constraint.detail()),
+                constraint_parameters: Some(constraint.parameters.clone()),
+                status: Some(constraint.status(std::time::SystemTime::now()).to_string()),
+            });
+        }
+
+        // "A constraint applies to a specific instance of a product within a certain
+        // portfolio" (`ConstraintDetail$ProductId`), so both resources it names must
+        // exist for the constraint to be about anything.
+        if !state.portfolios.contains_key(&input.portfolio_id) {
+            return Err(CreateConstraintErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Portfolio {} not found.", input.portfolio_id)),
+                },
+            )
+            .into());
+        }
+        if !state.products.contains_key(&input.product_id) {
+            return Err(CreateConstraintErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Product {} not found.", input.product_id)),
+                },
+            )
+            .into());
+        }
+
+        // `Parameters` is "the constraint parameters, in JSON format" and the model
+        // constrains it no further, so a value that is not a JSON object is a
+        // parameter this operation cannot act on.
+        if !serde_json::from_str::<serde_json::Value>(&input.parameters)
+            .is_ok_and(|parameters| parameters.is_object())
+        {
+            return Err(CreateConstraintErrorModeled::InvalidParametersException(
+                InvalidParametersException {
+                    message: Some(
+                        "Package properties validation failed: Could not read package properties \
+                         from JSON."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // One product in one portfolio carries at most one constraint of a given
+        // type, which is what makes a second create of the same triple the duplicate
+        // this operation models.
+        if let Some(existing) = state.constraints.values().find(|constraint| {
+            constraint.portfolio_id == input.portfolio_id
+                && constraint.product_id == input.product_id
+                && constraint.constraint_type == input.r#type
+        }) {
+            return Err(CreateConstraintErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!(
+                        "Constraint {} of type {} already exists for product {} in portfolio {}",
+                        existing.id, existing.constraint_type, existing.product_id,
+                        existing.portfolio_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's constraint quota. Refused before anything is stored, so a
+        // caller cannot grow the store past it by repeating the call.
+        if state.constraints.len() >= crate::state::MAX_CONSTRAINTS {
+            return Err(CreateConstraintErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "An account cannot hold more than {} constraints.",
+                        crate::state::MAX_CONSTRAINTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.next_constraint_id();
+        let created_at = std::time::SystemTime::now();
+        let constraint = crate::state::Constraint {
+            id: id.clone(),
+            constraint_type: input.r#type,
+            description: input.description,
+            parameters: input.parameters,
+            portfolio_id: input.portfolio_id,
+            product_id: input.product_id,
+            // The clock owes the move out of `CREATING`; this is the instant it
+            // falls due, which nothing sleeps for.
+            available_at: created_at + crate::state::CONSTRAINT_AVAILABLE_AFTER,
+        };
+
+        let detail = constraint.detail();
+        let parameters = constraint.parameters.clone();
+        let status = constraint.status(created_at);
+        state.constraints.insert(id.clone(), constraint);
+        state.remember_constraint_token(input.idempotency_token, id);
+
+        Ok(CreateConstraintOutput {
+            constraint_detail: Some(detail),
+            constraint_parameters: Some(parameters),
+            // Creation has started and the constraint is not yet in its terminal
+            // status, which is what this operation reports: the status is derived
+            // from the stored due instant, so a describe in the same window reports
+            // the same thing.
+            status: Some(status.to_string()),
+        })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a page of the users this identity store holds, read from persisted
+//! state. The walk order is derived from the records (creation instant, ties broken by
+//! `UserId` — [`crate::state::IdentityStoreData::users_in_order`]) so the same page
+//! boundary is reported twice, and `NextToken` is this service's own opaque cursor
+//! naming the user the next page starts at.
 //!
 //! ## Shape of an operation
 //!
@@ -109,11 +106,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `ListUsersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#ListUsers")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#ListUsers",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListUsersErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,20 +169,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsers"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListUsersErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        // `@readonly`: it looks the store up rather than vivifying one, so listing users
+        // can never change what a later caller sees.
+        let state = state.lock();
+        let store = state.store(&input.identity_store_id).ok_or_else(|| {
+            ListUsersErrorModeled::ResourceNotFoundException(
+                crate::state::identity_store_not_found(&input.identity_store_id),
+            )
+        })?;
+
+        // The (deprecated) `Filters` member carries at most one filter — the modelled
+        // `Filters` list is `length 0..1` — which restricts the listing to the users
+        // whose named attribute equals the filter's value exactly. `UserName` is the
+        // only attribute path `ListUsers` searches, so a filter naming another one is a
+        // syntax error in the request rather than a listing of nothing. SCIM attribute
+        // names are case-insensitive (RFC 7643 §2.1), as the sibling `ListGroups` and
+        // `GetGroupId` already read theirs, so `username` names the same attribute as
+        // `UserName`.
+        let filter = input.filters.as_deref().unwrap_or_default().first();
+        if let Some(filter) = filter {
+            if !filter
+                .attribute_path
+                .eq_ignore_ascii_case(crate::state::USER_FILTER_ATTRIBUTE_PATH)
+            {
+                return Err(ListUsersErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "AttributePath {:?} is not an attribute ListUsers can filter on; \
+                             the supported attribute path is {}",
+                            filter.attribute_path,
+                            crate::state::USER_FILTER_ATTRIBUTE_PATH
+                        )),
+                        request_id: None,
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Filtering happens before paging, so a page is `MaxResults` MATCHING users
+        // rather than a page of the store sliced down to the matches.
+        let users: Vec<&crate::state::User> = store
+            .users_in_order()
+            .into_iter()
+            .filter(|user| {
+                filter.is_none_or(|filter| {
+                    user.attribute(&filter.attribute_path) == Some(filter.attribute_value.as_str())
+                })
+            })
+            .collect();
+
+        // The model declares `MaxResults` `@default: 100` with range 1..100, so an
+        // absent member asks for the largest page the service answers with. A value
+        // outside that range is refused rather than coerced into it, as `ListGroups`
+        // does: the modelled constraint is checked before this handler runs, so this
+        // cannot be reached from the wire today, and refusing keeps it a refusal rather
+        // than a silently resized page if it ever is.
+        let requested = input.max_results.unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+        if !(1..=crate::state::MAX_MAX_RESULTS).contains(&requested) {
+            return Err(ListUsersErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "MaxResults must be between 1 and {}, got {requested}",
+                    crate::state::MAX_MAX_RESULTS
+                )),
+                request_id: None,
+                reason: None,
+            })
+            .into());
+        }
+        let page_size = requested as usize;
+
+        // A `NextToken` is this service's own opaque cursor: it names the user the next
+        // page starts at. One this service did not mint, or one naming a user this
+        // listing does not reach, is refused rather than silently restarting the walk.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume_at = crate::state::decode_cursor(token)
+                    .and_then(|user_id| users.iter().position(|user| user.user_id == user_id));
+                resume_at.ok_or_else(|| {
+                    ListUsersErrorModeled::ValidationException(ValidationException {
+                        message: Some(
+                            "NextToken is not a cursor this service issued for this listing"
+                                .to_string(),
+                        ),
+                        request_id: None,
+                        reason: None,
+                    })
+                })?
+            }
+        };
+
+        let page: Vec<User> = users[start..]
+            .iter()
+            .take(page_size)
+            .map(|user| user.to_user(&store.identity_store_id, input.extensions.as_deref()))
+            .collect();
+        // A `NextToken` only when something is left: the item the next page starts at.
+        let next_token = users
+            .get(start + page.len())
+            .map(|user| crate::state::encode_cursor(&user.user_id));
+
+        Ok(ListUsersOutput {
+            users: page,
+            next_token,
+        })
     }
 }
+

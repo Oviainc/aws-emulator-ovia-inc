@@ -22,6 +22,14 @@
 //! caller supplies cannot be one it issued: such a request is refused with the modelled
 //! `InvalidNextTokenException`.
 //!
+//! That refusal comes AFTER the `WhatIfForecastArn` is resolved. A token is a position
+//! inside ONE resource's results, so there is nothing to judge it against until the
+//! resource is known: a request naming a what-if forecast this service holds nothing for
+//! is `ResourceNotFoundException` even when it also carries a token this service never
+//! minted. The ARN's own SYNTAX is judged first of all — a `LongArn` outside its modelled
+//! pattern or length never reaches a lookup and is refused with `InvalidInputException`
+//! (see `crate::service::override_refusal`).
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -157,23 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // No token this operation could have issued exists (see the module docs), so any
-        // `NextToken` the caller supplies is one this service did not mint.
-        if input.next_token.is_some() {
-            return Err(QueryWhatIfForecastErrorModeled::InvalidNextTokenException(
-                InvalidNextTokenException {
-                    message: Some(
-                        "The token is not valid. Tokens expire after 24 hours. \
-                         QueryWhatIfForecast returns the complete date range for the \
-                         filtered what-if forecast, so it returns no NextToken to resume \
-                         from."
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is keyed on the shared `InMemoryEngine`; mounted on any other
             // engine this service has no what-if forecasts to read and cannot serve the
@@ -199,6 +190,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+
+            // The what-if forecast the request names RESOLVED, so a continuation token can
+            // now be judged against it. The order matters and is not an accident: a token
+            // only means anything as a position inside one resource's results, so the
+            // resource is resolved first and an ARN that names nothing is answered
+            // `ResourceNotFoundException` even when the request also carries a token this
+            // service could not have issued. No token this operation could have issued
+            // exists (see the module docs), so any `NextToken` that gets this far is one
+            // this service did not mint.
+            if input.next_token.is_some() {
+                return Err(QueryWhatIfForecastErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(
+                            "The token is not valid. Tokens expire after 24 hours. \
+                             QueryWhatIfForecast returns the complete date range for the \
+                             filtered what-if forecast, so it returns no NextToken to \
+                             resume from."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+
             forecast.query(
                 &input.filters,
                 input.start_date.as_deref(),

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConstraint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConstraint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConstraint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConstraint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConstraintErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConstraint"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // `Parameters` is "the constraint parameters, in JSON format", so a value
+        // that is not a JSON object names no parameters this service can store —
+        // checked before the stored constraint is touched.
+        if let Some(parameters) = input.parameters.as_deref() {
+            if !serde_json::from_str::<serde_json::Value>(parameters)
+                .is_ok_and(|parsed| parsed.is_object())
+            {
+                return Err(UpdateConstraintErrorModeled::InvalidParametersException(
+                    InvalidParametersException {
+                        message: Some(
+                            "Package properties validation failed: Could not read package \
+                             properties from JSON."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(constraint) = state.constraints.get_mut(&input.id) else {
+            return Err(UpdateConstraintErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Constraint {} not found.", input.id)),
+                },
+            )
+            .into());
+        };
+
+        // Both updatable members are optional: one this request does not carry keeps
+        // its stored value. The constraint's type, product and portfolio are not
+        // updatable — the model does not carry them on this input.
+        if let Some(description) = input.description {
+            constraint.description = Some(description);
+        }
+        if let Some(parameters) = input.parameters {
+            constraint.parameters = parameters;
+        }
+
+        Ok(UpdateConstraintOutput {
+            constraint_detail: Some(constraint.detail()),
+            constraint_parameters: Some(constraint.parameters.clone()),
+            // The status is derived from the due instant the create stored, so an
+            // update reports where the clock has got to — it does not restart it.
+            status: Some(constraint.status(std::time::SystemTime::now()).to_string()),
+        })
     }
 }

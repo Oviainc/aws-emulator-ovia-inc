@@ -17,5 +17,13 @@ mod bucket_lifecycle;
 mod bucket_policy_and_tagging;
 #[path = "all/bucket_tagging.rs"]
 mod bucket_tagging;
+#[path = "all/head_object_read_back.rs"]
+mod head_object_read_back;
+#[path = "all/object_and_tagging_roundtrip.rs"]
+mod object_and_tagging_roundtrip;
+#[path = "all/object_write_and_read_back.rs"]
+mod object_write_and_read_back;
+#[path = "all/objects.rs"]
+mod objects;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

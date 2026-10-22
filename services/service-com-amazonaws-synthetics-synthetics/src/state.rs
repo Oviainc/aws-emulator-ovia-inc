@@ -158,6 +158,21 @@ pub const CREATE_IN_PROGRESS_REASON_CODE: &str = "CREATE_IN_PROGRESS";
 /// constant so the six handlers that can hit it word it identically.
 pub const STORE_UNAVAILABLE: &str = "the synthetics canary store is unavailable";
 
+/// `ResourceNotFoundException$Message` for a canary that does not exist.
+///
+/// The model says of the error only "One of the specified resources was not found." and
+/// documents no text, but the recorded service answers every canary lookup that misses —
+/// whichever operation asked — with one fixed sentence that never names the requested
+/// canary. The message is therefore request-independent: it is a constant here, not
+/// built from the lookup key, so the identifier the real service withholds is not handed
+/// back to the caller.
+pub const CANARY_NOT_FOUND: &str = "Canary not found.";
+
+/// `ResourceNotFoundException$Message` for a dry run that does not exist, by the same
+/// rule as [`CANARY_NOT_FOUND`]: a missing-resource message names the resource KIND that
+/// was not found and never the identifier the request asked for.
+pub const DRY_RUN_NOT_FOUND: &str = "Dry run not found.";
+
 /// The most canaries this store holds, so a request-driven create loop cannot grow it
 /// without limit.
 ///

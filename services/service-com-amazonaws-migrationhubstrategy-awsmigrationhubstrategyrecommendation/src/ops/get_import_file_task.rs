@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match store.settled_import_task_mut(&input.id, now) {
             Some(task) => Ok(task.to_output()),
             None => Err(GetImportFileTaskErrorModeled::ResourceNotFoundException(
-                crate::state::import_task_not_found(&input.id),
+                crate::state::import_task_not_found(),
             )
             .into()),
         }

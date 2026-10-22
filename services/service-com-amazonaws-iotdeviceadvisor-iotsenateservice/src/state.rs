@@ -592,22 +592,64 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     }
 }
 
+/// The message a refusal carries when the resource the request NAMED does not exist.
+///
+/// Device Advisor builds this text from the request: the template is
+/// `Unable to find resource with <member>: <value>`, where `<member>` is the input member
+/// that identified the missing resource and `<value>` is the value the caller sent. One
+/// definition for the whole service, so every lookup that cannot find what it was asked
+/// for words it the same way, whichever error shape the operation models for it.
+pub fn not_found_message(member: &str, value: &str) -> String {
+    format!("Unable to find resource with {member}: {value}")
+}
+
+/// The message a `SuiteDefinitionConfiguration` with an empty `rootGroup` is refused with
+/// when the suite is not intended for qualification.
+///
+/// Device Advisor builds it from the violated rule, with its `Invalid Request: ` prefix;
+/// see [`root_group_violation`] for the rule itself.
+pub const EMPTY_ROOT_GROUP_MESSAGE: &str =
+    "Invalid Request: rootGroup cannot be empty for non-qualification test suite";
+
+/// The upper bound the `MaxResults` shape's `range` trait puts on `maxResults`
+/// (`range 1..50`), which is also the page size a caller who names none gets: one page
+/// then holds everything unless the caller asks for fewer.
+pub const MAX_RESULTS_MAX: i32 = 50;
+
+/// True when `token` could be a pagination token one of this service's listings issued.
+///
+/// Every listing here resumes AT a resource id, so the token it hands out is one of the
+/// ids this service mints — a hyphenated lowercase v4 UUID (see [`new_uuid`]). A token of
+/// any other shape is one this service cannot have issued, which is what lets a listing
+/// refuse a garbled or hand-written token with the modelled client-input error instead of
+/// silently answering from the start of the map.
+///
+/// The shape is checked here rather than with `uuid::Uuid::parse_str`, which also accepts
+/// upper-case, braced and urn forms this service never mints and would therefore let
+/// through a token no listing of ours ever issued.
+pub fn is_page_token_shape(token: &str) -> bool {
+    /// A lowercase hex digit, the only byte a UUID group holds.
+    fn is_lower_hex(byte: u8) -> bool {
+        byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+    }
+
+    let groups: Vec<&str> = token.split('-').collect();
+    groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups.iter().all(|group| group.bytes().all(is_lower_hex))
+}
+
 /// The one rule the model states in prose for `SuiteDefinitionConfiguration$rootGroup`
 /// and cannot express as a constraint: "if intendedForQualification is set to true,
 /// rootGroup can be an empty string. If intendedForQualification is false, rootGroup
 /// cannot be an empty string."
 ///
-/// `Some(message)` names the violation for the modelled `ValidationException`; `None`
-/// means the configuration satisfies the rule. The rule belongs to the SHAPE, so every
-/// operation that accepts a `SuiteDefinitionConfiguration` asks here rather than
-/// restating it.
+/// `Some(message)` names the violation for the modelled `ValidationException` with the
+/// template AWS answers it with ([`EMPTY_ROOT_GROUP_MESSAGE`]); `None` means the
+/// configuration satisfies the rule. The rule belongs to the SHAPE, so every operation
+/// that accepts a `SuiteDefinitionConfiguration` asks here rather than restating it.
 pub fn root_group_violation(configuration: &SuiteDefinitionConfiguration) -> Option<String> {
     (configuration.root_group.is_empty() && configuration.intended_for_qualification != Some(true))
-        .then(|| {
-            "suiteDefinitionConfiguration.rootGroup cannot be empty unless \
-             intendedForQualification is true"
-                .to_string()
-        })
+        .then(|| EMPTY_ROOT_GROUP_MESSAGE.to_string())
 }
 
 /// The version string for the `n`-th configuration a definition holds (1-based).
@@ -635,6 +677,10 @@ pub fn version_ordinal(label: &str) -> Option<usize> {
 /// and how the call ended (the subscriber stamps the time). That is what makes a
 /// destructive call — `DeleteSuiteDefinition` cascading to a definition's runs, or
 /// `StopSuiteRun` moving a run — attributable after the fact.
+///
+/// An ATTEMPTED mutation is recorded too, with the outcome that refused it (an update of
+/// an id the store does not hold, say): `resource` is then the ARN the request NAMED, not
+/// a claim that such a resource is stored.
 ///
 /// Request-derived values are written with `Debug`, so a newline inside one cannot forge a
 /// second record. Nothing secret is written: the presented ACCESS KEY ID identifies the

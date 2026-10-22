@@ -25,6 +25,10 @@ mod connect_signing_name_routing;
 mod dynamodb_streams_routing;
 #[path = "all/events_signing_name_routing.rs"]
 mod events_signing_name_routing;
+#[path = "all/events_store_ownership.rs"]
+mod events_store_ownership;
+#[path = "all/forecast_signing_name_routing.rs"]
+mod forecast_signing_name_routing;
 #[path = "all/iam_and_signer_signing_name_routing.rs"]
 mod iam_and_signer_signing_name_routing;
 #[path = "all/iam_role_id_agrees_with_sts.rs"]
@@ -49,6 +53,10 @@ mod personalize_signing_name_routing;
 mod rds_docdb_neptune_signing_name_routing;
 #[path = "all/rds_shared_signing_name_routing.rs"]
 mod rds_shared_signing_name_routing;
+#[path = "all/rds_signing_name_routing.rs"]
+mod rds_signing_name_routing;
+#[path = "all/scheduler_execution_role.rs"]
+mod scheduler_execution_role;
 #[path = "all/servicecatalog_signing_name_routing.rs"]
 mod servicecatalog_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]
@@ -57,3 +65,10 @@ mod shared_signing_name_routing;
 mod transcribe_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]
 mod transfer_user_with_iam_role;
+
+// Declared last, out of the sorted order above, on purpose: every new router suite adds
+// a line to this file, and a line inserted in the middle of the list conflicts with
+// every other suite landing in the same window. Appending keeps this change out of that
+// contended region. The suite itself is an ordinary `tests/all/<name>.rs` file.
+#[path = "all/sagemaker_signing_name_routing.rs"]
+mod sagemaker_signing_name_routing;

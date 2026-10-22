@@ -310,3 +310,148 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
         .join()
         .expect("RDS, DocumentDB and Neptune must route apart");
 }
+
+/// The SigV4 `Authorization` header of a request signed for `signing_name`, as every AWS
+/// SDK sends it. The signature is never checked: the claim predicate reads only the
+/// credential scope.
+fn authorization(signing_name: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
+         SignedHeaders=host, Signature=not-verified"
+    )
+}
+
+/// How a row of the claim table below names the service it is for: the same two signals
+/// [`Addressed`] carries, plus the presigned form of a credential scope, which an SDK
+/// puts in the query string instead of a header.
+#[derive(Debug, Clone, Copy)]
+enum Claiming {
+    /// A SigV4 `Authorization` scope naming this routing key.
+    Signed(&'static str),
+    /// A presigned URL's `X-Amz-Credential` query parameter naming `rds`.
+    Presigned,
+    /// No credentials at all, so the `Host` label resolves the key.
+    Anonymous,
+}
+
+/// The claim table's own rule, one layer BELOW the dispatch table above: it asks each
+/// service's [`Service::can_handle`] directly, so a row pins both that the right service
+/// claims a request and that NO other does — the condition the router turns into
+/// `500 AmbiguousService` when it fails.
+///
+/// Every `awsQuery` request is `POST /`: none of the three models binds a
+/// `smithy.api#http` trait, so the path carries no discriminator and the route key
+/// decides alone. The rows span the three signals that resolve it, the three keys, and a
+/// `Host` that agrees with, disagrees with or says nothing about the target.
+#[test]
+fn exactly_one_service_claims_each_request_for_the_rds_key() {
+    use smithy_server_runtime::Service;
+
+    let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+    let rds = service_com_amazonaws_rds_amazonrdsv19::EmulatedService::new(Arc::clone(&engine));
+    let docdb = service_com_amazonaws_docdb_amazonrdsv19::EmulatedService::new(Arc::clone(&engine));
+    let neptune = service_com_amazonaws_neptune_amazonrdsv19::EmulatedService::new(engine);
+
+    /// A presigned credential scope naming `rds`, with its `/` separators encoded.
+    const PRESIGNED: &str = "X-Amz-Credential=AKIDEXAMPLE%2F20260101%2Fus-east-1%2Frds%2Faws4_request";
+
+    // (case, how the request is addressed, its Host, the services that must claim it, by
+    // routing key)
+    let rows: [(&str, Claiming, &str, &[&str]); 10] = [
+        (
+            "a signed request on the rds host",
+            Claiming::Signed("rds"),
+            "rds.us-east-1.amazonaws.com",
+            &["rds"],
+        ),
+        (
+            "a signed request on a bare emulator endpoint",
+            Claiming::Signed("rds"),
+            "localhost:9297",
+            &["rds"],
+        ),
+        (
+            "a signed request on the DocumentDB console's host: the scope decides",
+            Claiming::Signed("rds"),
+            "docdb.us-east-1.amazonaws.com",
+            &["rds"],
+        ),
+        (
+            "a presigned request in the query string",
+            Claiming::Presigned,
+            "rds.eu-west-2.amazonaws.com",
+            &["rds"],
+        ),
+        (
+            "an anonymous request addressed to the rds host",
+            Claiming::Anonymous,
+            "rds.us-east-1.amazonaws.com",
+            &["rds"],
+        ),
+        (
+            "a request signed for DocumentDB's own key",
+            Claiming::Signed("docdb"),
+            "rds.us-east-1.amazonaws.com",
+            &["docdb"],
+        ),
+        (
+            "an anonymous request addressed to the DocumentDB host",
+            Claiming::Anonymous,
+            "docdb.us-east-1.amazonaws.com",
+            &["docdb"],
+        ),
+        (
+            "a request signed for Neptune's own key",
+            Claiming::Signed("neptune"),
+            "rds.us-east-1.amazonaws.com",
+            &["neptune"],
+        ),
+        (
+            "an anonymous request addressed to the Neptune host",
+            Claiming::Anonymous,
+            "neptune.us-east-1.amazonaws.com",
+            &["neptune"],
+        ),
+        (
+            // Claimed by nobody, which is the router's `404 UnknownService` and NOT an
+            // ambiguity.
+            "an anonymous request addressed to an unrelated host",
+            Claiming::Anonymous,
+            "sqs.us-east-1.amazonaws.com",
+            &[],
+        ),
+    ];
+
+    for (case, claiming, host, expected) in rows {
+        let uri = match claiming {
+            Claiming::Presigned => format!("/?{PRESIGNED}"),
+            _ => "/".to_string(),
+        };
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", host);
+        if let Claiming::Signed(signing_name) = claiming {
+            builder = builder.header("authorization", authorization(signing_name));
+        }
+        let parts = builder
+            .body(bytes::Bytes::new())
+            .expect("a well-formed request")
+            .into_parts()
+            .0;
+        let claimants: Vec<&str> = [
+            ("rds", rds.can_handle(&parts)),
+            ("docdb", docdb.can_handle(&parts)),
+            ("neptune", neptune.can_handle(&parts)),
+        ]
+        .into_iter()
+        .filter_map(|(key, claimed)| claimed.then_some(key))
+        .collect();
+        assert_eq!(
+            claimants,
+            expected.to_vec(),
+            "case {case:?} (POST / to host {host}, {claiming:?}): expected it to be \
+             claimed by exactly {expected:?}, got {claimants:?}"
+        );
+    }
+}

@@ -4,7 +4,10 @@
 //! Places a game session on a stored fleet and persists it, so that the describes and
 //! `CreatePlayerSession` all read the same record.
 //!
-//! The target fleet must be `ACTIVE`. The new session is returned `ACTIVATING` and
+//! The target fleet must be `ACTIVE`, and the target fleet LOCATION must have an active,
+//! available server process free to host the session — this operation "prompts an
+//! available server process to start a game session" — or the request is refused with the
+//! modelled `FleetCapacityExceededException`. The new session is returned `ACTIVATING` and
 //! carries connection information only once it is `ACTIVE`, which the model's own doc
 //! pins: "When the game session status is ACTIVE, it is updated with connection
 //! information and you can create player sessions for the game session."
@@ -262,6 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into()
         };
+        // This operation's `NotFoundException` message is BUILT FROM THE REQUEST: the
+        // fleet identifier the caller supplied, verbatim, in the template AWS answers a
+        // CreateGameSession on an absent fleet with — `Cannot find fleet with ID
+        // <FleetId>`.
+        let fleet_not_found = |fleet_reference: &str| -> Self::Error {
+            not_found(format!("Cannot find fleet with ID {fleet_reference}"))
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateGameSessionErrorModeled::InternalServiceException(
@@ -308,14 +318,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(fleet_id) = state.resolve_fleet_id(&fleet_reference) else {
-            return Err(not_found(format!(
-                "The fleet {fleet_reference} was not found."
-            )));
+            return Err(fleet_not_found(&fleet_reference));
         };
         let Some(fleet) = state.fleets.get(&fleet_id) else {
-            return Err(not_found(format!(
-                "The fleet {fleet_reference} was not found."
-            )));
+            return Err(fleet_not_found(&fleet_reference));
         };
 
         // "The target fleet must be in ACTIVE status."
@@ -346,7 +352,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fleet_arn = fleet.fleet_arn.clone();
         let region = fleet.region.clone();
         let home_location = fleet.home_location.clone();
-        let capacity = fleet.game_session_capacity();
+        // "This operation prompts an available server process to start a game session":
+        // how many such processes run at the target location, and so how many sessions it
+        // can host at once.
+        let capacity = fleet.game_session_capacity(&location);
+        // Every live session listens on a port the fleet opens, and the fleet opens them
+        // for all of its locations at once.
+        let open_ports = fleet.open_port_count();
 
         // A caller-supplied `GameSessionId` and an `IdempotencyToken` are the same
         // custom string: either one makes a repeat of the request return the session the
@@ -393,17 +405,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Each running server process hosts one game session at a time, so a fleet whose
-        // processes are all hosting one has no instance left to fulfil the request. This
-        // is also what bounds the stored session set.
-        if state.live_game_sessions_on(&fleet_id) >= capacity {
+        // "This operation prompts an available server process to start a game session":
+        // each active, available server process hosts one game session at a time, so a
+        // fleet location with no such process free — because none is running there at all,
+        // or because every one of them is already hosting a session — has no instance to
+        // fulfil the request. This is also what bounds the stored session set.
+        if state.live_game_sessions_at(&fleet_id, &location) >= capacity {
+            let detail = if capacity == 0 {
+                format!(
+                    "no active and available server processes found at location {location} of \
+                     fleet {fleet_id}"
+                )
+            } else {
+                format!(
+                    "all {capacity} server processes at location {location} of fleet {fleet_id} \
+                     are hosting a game session"
+                )
+            };
+            return Err(
+                CreateGameSessionErrorModeled::FleetCapacityExceededException(
+                    FleetCapacityExceededException {
+                        message: Some(format!("Unable to reserve a process({detail})")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A server process listens on one of the ports the fleet opens and no two live
+        // sessions share one, so the opened ports bound the fleet's live sessions whatever
+        // location they run in — a fleet with none free has no process a session could be
+        // reserved on, wherever its processes are running.
+        if state.live_game_sessions_on(&fleet_id) >= open_ports {
             return Err(
                 CreateGameSessionErrorModeled::FleetCapacityExceededException(
                     FleetCapacityExceededException {
                         message: Some(format!(
-                            "Fleet {fleet_id} has no available instances to fulfil a \
-                             CreateGameSession request: all {capacity} of its server processes \
-                             are hosting a game session."
+                            "Unable to reserve a process(all {open_ports} port(s) that fleet \
+                             {fleet_id} opens are held by a game session)"
                         )),
                     },
                 )

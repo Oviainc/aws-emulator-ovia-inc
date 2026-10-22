@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This operation models no `ResourceNotFoundException`, so an id that names
             // no assessment is refused with its modelled client error.
             return Err(StopAssessmentErrorModeled::ValidationException(
-                crate::state::invalid_assessment_id(&input.assessment_id),
+                crate::state::invalid_assessment_id(),
             )
             .into());
         };

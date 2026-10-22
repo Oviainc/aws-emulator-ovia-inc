@@ -3,8 +3,9 @@
 //! @op CreateScheduleGroup
 //!
 //! Creates a `ScheduleGroup` in [`crate::state`] and answers its generated ARN.
-//! A name that already names a group — including the implicit `default` group
-//! every account has — is a `ConflictException`.
+//! The reserved built-in group name is refused as a `ValidationException` before
+//! anything is looked up; any other name that already names a group is a
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -156,8 +157,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The reserved name is a refusal about the REQUEST, so it is answered
+        // before the store is consulted at all: a client must be able to tell a
+        // permanently invalid name from a collision it could resolve.
+        if let Some(message) = crate::state::reserved_group_refusal(&input.name) {
+            return Err(
+                CreateScheduleGroupErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        store.settle(now);
 
         // The reserved-prefix rule holds wherever this service takes tags, not
         // only in TagResource: AWS owns the `aws:` key namespace.
@@ -199,7 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let now = ::std::time::SystemTime::now();
         let arn = crate::state::schedule_group_arn(&region, &input.name);
         let mut record = crate::state::ScheduleGroupRecord {
             name: input.name.clone(),
@@ -210,6 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_date: now,
             last_modification_date: now,
             tags: Vec::new(),
+            deletion_due: None,
         };
         // Merged rather than stored verbatim, so a tag set is a map keyed by tag
         // key here exactly as it is after TagResource.

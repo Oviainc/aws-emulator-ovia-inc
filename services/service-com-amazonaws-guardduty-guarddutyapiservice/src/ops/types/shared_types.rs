@@ -130,6 +130,7 @@ pub struct ScanEc2InstanceWithFindingsResult {
 pub struct EbsVolumesResult {
     pub status: Option<String>,
     pub reason: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#FindingCriteria")]
@@ -261,30 +262,54 @@ pub struct DataSourceConfigurationsResult {
     pub s3_logs: S3LogsConfigurationResult,
     pub kubernetes: Option<KubernetesConfigurationResult>,
     pub malware_protection: Option<MalwareProtectionConfigurationResult>,
+    pub database: Option<DatabaseConfigurationResult>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.guardduty#DatabaseConfigurationResult")]
+#[derive(Debug, Clone, Default)]
+pub struct DatabaseConfigurationResult {
+    pub rds: Option<RdsConfigurationResult>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.guardduty#RdsConfigurationResult")]
+#[derive(Debug, Clone, Default)]
+pub struct RdsConfigurationResult {
+    pub database_events: Option<DatabaseEventsConfigurationResult>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.guardduty#DatabaseEventsConfigurationResult")]
+#[derive(Debug, Clone, Default)]
+pub struct DatabaseEventsConfigurationResult {
+    pub status: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#CloudTrailConfigurationResult")]
 #[derive(Debug, Clone, Default)]
 pub struct CloudTrailConfigurationResult {
     pub status: String,
+    pub updated_at: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#DNSLogsConfigurationResult")]
 #[derive(Debug, Clone, Default)]
 pub struct DNSLogsConfigurationResult {
     pub status: String,
+    pub updated_at: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#FlowLogsConfigurationResult")]
 #[derive(Debug, Clone, Default)]
 pub struct FlowLogsConfigurationResult {
     pub status: String,
+    pub updated_at: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#S3LogsConfigurationResult")]
 #[derive(Debug, Clone, Default)]
 pub struct S3LogsConfigurationResult {
     pub status: String,
+    pub updated_at: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#KubernetesConfigurationResult")]
@@ -297,6 +322,7 @@ pub struct KubernetesConfigurationResult {
 #[derive(Debug, Clone, Default)]
 pub struct KubernetesAuditLogsConfigurationResult {
     pub status: String,
+    pub updated_at: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#ScanConfigurationContinuousScanDetails")]

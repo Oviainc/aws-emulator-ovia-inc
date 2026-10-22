@@ -3,9 +3,12 @@
 #![forbid(unsafe_code)]
 //! Code more than one emulated service needs, as a path dependency.
 //!
-//! Today that is one thing: [`claims_request`], the request-claim rule a service
-//! whose SigV4 signing name is SHARED with other services uses for its
-//! `Service::can_handle`.
+//! Today that is three things: [`claims_request`], the request-claim rule a
+//! service whose SigV4 signing name is SHARED with other services uses for its
+//! `Service::can_handle`; [`stable_hex_id`], the one deterministic mixing
+//! function a service derives a wire-visible id with; and [`network`], the
+//! contract the account's EC2 network — which subnets a Region has — is modelled
+//! against, so no two services answer "does this subnet exist" differently.
 //!
 //! # Why a shared rule
 //!
@@ -51,7 +54,46 @@
 //! each is covered by its own routing suite under `core/router/tests/all/`. Nothing new
 //! should inline the rule again — call this crate.
 
+pub mod network;
+
 use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};
+
+/// A stable 64-bit mixing of `parts`, rendered as 16 hexadecimal digits.
+///
+/// For an id a service DERIVES from what it identifies and then puts ON THE
+/// WIRE — X-Ray's inferred segment id, say. Two properties matter and neither is
+/// free:
+///
+/// * the same input mixes to the same id on every READ, so a caller that reads a
+///   derived resource twice sees one id; and
+/// * the same input mixes to the same id in every BUILD, which `std`'s
+///   `DefaultHasher` does not promise (`std` reserves the right to change its
+///   algorithm), so an id taken from it is reproducible only within one
+///   toolchain.
+///
+/// The mixing is SHA-256 from the maintained `sha2` crate — nothing is
+/// hand-rolled here — over the parts, each followed by a NUL so that two
+/// different part lists whose concatenation coincides still mix differently; the
+/// id is its first 8 bytes. Truncated like that it is an OPAQUE id, not an
+/// unguessable one: nothing may authenticate on it.
+///
+/// Several service crates still carry their own hand-written mixing function
+/// (`grep -rln 'FNV' services/*/src/state.rs`); they are to be migrated onto
+/// this one, and nothing new should write another.
+#[must_use]
+pub fn stable_hex_id(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(part.as_bytes());
+        digest.update(b"\0");
+    }
+    digest.finalize()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// The fixed first path segment of every `rpcv2Cbor` request
 /// (`POST /service/{Service}/operation/{Operation}`), as
@@ -421,6 +463,62 @@ mod tests {
                 claimed, expected,
                 "case {case:?}: expected claimed == {expected}, got {claimed}"
             );
+        }
+    }
+
+    /// The two properties a derived, wire-visible id needs: the same parts mix
+    /// to the same 16 hexadecimal digits every time, and parts that differ —
+    /// including parts that only differ in where one ends — mix to different
+    /// ids.
+    #[test]
+    fn a_stable_id_is_reproducible_and_separates_its_parts() {
+        // (case, parts)
+        let rows: [(&str, &[&str]); 6] = [
+            ("nothing", &[]),
+            ("one empty part", &[""]),
+            ("one part", &["inferred"]),
+            ("two parts", &["inferred", "1-58406520-a006649127e371903a2de979"]),
+            (
+                "three parts",
+                &[
+                    "inferred",
+                    "1-58406520-a006649127e371903a2de979",
+                    "0000000000000001",
+                ],
+            ),
+            // The same characters, split differently: a mixing function that
+            // concatenated its parts would answer the same id for this row as
+            // for the one above.
+            (
+                "the same characters split differently",
+                &[
+                    "inferred",
+                    "1-58406520-a006649127e371903a2de9790000000000000001",
+                ],
+            ),
+        ];
+
+        let mut seen: Vec<(&str, String)> = Vec::new();
+        for (case, parts) in rows {
+            let id = stable_hex_id(parts);
+            assert_eq!(
+                id.len(),
+                16,
+                "case {case:?}: an id is 16 hexadecimal digits, got {id:?}"
+            );
+            assert!(
+                id.chars().all(|c| c.is_ascii_hexdigit()),
+                "case {case:?}: an id is hexadecimal, got {id:?}"
+            );
+            assert_eq!(
+                stable_hex_id(parts),
+                id,
+                "case {case:?}: the same parts must mix to the same id"
+            );
+            if let Some((other, _)) = seen.iter().find(|(_, other)| *other == id) {
+                panic!("case {case:?}: mixes to the same id as case {other:?}: {id:?}");
+            }
+            seen.push((case, id));
         }
     }
 }

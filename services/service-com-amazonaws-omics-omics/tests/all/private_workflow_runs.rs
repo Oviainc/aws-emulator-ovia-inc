@@ -12,6 +12,12 @@
 //! the first call created rather than a second one; a status the clock owes is the only
 //! thing a read changes; and a record `DeleteRun`/`DeleteWorkflow` removed is a modelled
 //! 404 everywhere afterwards.
+//!
+//! The last suite asserts the second rule this slice carries: every call leaves ONE
+//! structured, attributable record on the `emulator::audit` target — above all the four
+//! that change the store, whose effect is otherwise invisible after the fact — carrying
+//! the operation, the identity the request presented, the request target, the resource and
+//! the outcome, and none of the caller's own data.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -62,9 +68,18 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// A request signed for `omics` in [`REGION`], the signal the router routes on and the
-/// handlers read the region from.
-fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
+/// The access key id a call presents when a case does not name one of its own.
+const DEFAULT_AKID: &str = "AKIDOMICSTEST";
+
+/// A request signed for `omics` in [`REGION`] — the signal the router routes on and the
+/// handlers read the region from — presenting `akid` as the SigV4 access key id, which is
+/// the identity the service's audit record attributes the call to.
+fn request_as(
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+    akid: &str,
+) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(uri)
@@ -72,7 +87,7 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDOMICSTEST/20260101/{REGION}/omics/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={akid}/20260101/{REGION}/omics/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         );
@@ -93,7 +108,18 @@ async fn call(
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let response = router.dispatch(request(method, uri, body)).await;
+    call_as(router, method, uri, body, DEFAULT_AKID).await
+}
+
+/// The same call, presenting `akid` as the SigV4 access key id.
+async fn call_as(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+    akid: &str,
+) -> (u16, Value) {
+    let response = router.dispatch(request_as(method, uri, body, akid)).await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()
@@ -2247,4 +2273,461 @@ async fn a_workflow_with_non_terminal_runs_cannot_be_deleted() {
     }
     let (status, body) = get_workflow(&router, &other).await;
     assert_eq!(status, 404, "the workflow must be gone, got {body:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Every call leaves a structured, attributable access record
+// ---------------------------------------------------------------------------
+
+/// A `tracing` subscriber that renders each event as one `target field=value …` line and
+/// keeps the lines so a test can read them back.
+///
+/// Written against `tracing`'s own `Subscriber` trait rather than pulling in a formatting
+/// subscriber crate: the test needs one line per event with its target and fields, which
+/// is a dozen lines of `Visit`, and a new dev-dependency would put an entry in the
+/// workspace lockfile this change deliberately leaves untouched.
+#[derive(Clone, Default)]
+struct CapturedRecords(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl CapturedRecords {
+    /// Every record captured since the last drain, clearing the buffer.
+    fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().expect("the audit capture lock"))
+    }
+}
+
+/// Renders an event's fields as ` name=value` onto one line.
+struct RecordLine(String);
+
+impl tracing::field::Visit for RecordLine {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value}", field.name());
+    }
+}
+
+impl tracing::Subscriber for CapturedRecords {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        // The service emits events, never spans; an id is still required by the trait.
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = RecordLine(format!("{} ", event.metadata().target()));
+        event.record(&mut line);
+        self.0.lock().expect("the audit capture lock").push(line.0);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// The access key id the audit case signs with, so it can pick its own records out of a
+/// process-wide log that sibling tests also write to.
+const AUDIT_AKID: &str = "AKIDAUDITCASE";
+
+/// The capture for audit records, installed ONCE as this test binary's global `tracing`
+/// subscriber.
+///
+/// Global rather than scoped on purpose: `tracing` caches per callsite whether any
+/// subscriber is interested, the cache is process-wide, and sibling tests run in parallel
+/// on other threads — so a thread-local subscriber is raced away as soon as another
+/// thread re-evaluates a handler's callsite with no subscriber of its own. A global
+/// default is always interested, which makes the capture deterministic; [`AUDIT_AKID`] is
+/// what keeps a sibling test's records out of this one's assertions.
+static AUDIT_CAPTURE: std::sync::OnceLock<CapturedRecords> = std::sync::OnceLock::new();
+
+fn audit_capture() -> &'static CapturedRecords {
+    AUDIT_CAPTURE.get_or_init(|| {
+        let captured = CapturedRecords::default();
+        tracing::subscriber::set_global_default(captured.clone())
+            .expect("this test binary installs no other global tracing subscriber");
+        captured
+    })
+}
+
+/// Values a row submitted that must NEVER reach the log: the record is metadata about
+/// the call, not a copy of what the caller sent.
+const WITHHELD_FROM_AUDIT: &[&str] = &[
+    "audit-create",
+    "audit-start",
+    "audit-missing",
+    "audit-tags",
+    ROLE_ARN,
+    OUTPUT_URI,
+    "audited-tag-value",
+];
+
+/// One row of the audit table: a call to make, and the record it must leave.
+struct AuditCase {
+    /// How the row is reported in a failure.
+    case: &'static str,
+    /// The operation the record must name.
+    operation: &'static str,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    /// The `outcome` token the record must carry.
+    outcome: &'static str,
+    resource: ExpectedResource,
+}
+
+/// What the `resource` field of a row's record must name.
+enum ExpectedResource {
+    /// The id the call's own response reported (a create or a start).
+    FromResponse,
+    /// A resource the row named in its request.
+    Named(String),
+    /// No single resource: a listing, or a refusal made before any lookup.
+    Nothing,
+}
+
+/// Assert the one record a row produced carries the metadata the audit rule requires and
+/// none of the caller's own data.
+fn assert_audit_record(
+    case: &str,
+    record: &str,
+    operation: &str,
+    request_target: &str,
+    outcome: &str,
+    resource: &str,
+) {
+    for (field, value) in [
+        // The sigv4 signing name of this service, from its Smithy model.
+        ("service", "omics"),
+        ("operation", operation),
+        // The identity the request PRESENTED, which is what the record attributes the
+        // call to.
+        ("access_key_id", AUDIT_AKID),
+        ("request_target", request_target),
+        ("resource", resource),
+        ("outcome", outcome),
+    ] {
+        // Asserted as the `field=value` pair, not as a bare substring, so a value cannot
+        // satisfy the check from the wrong field.
+        let pair = format!("{field}={value}");
+        assert!(
+            record.contains(&pair),
+            "case {case:?}: the audit record must carry {pair:?}, got {record:?}"
+        );
+    }
+    for withheld in WITHHELD_FROM_AUDIT {
+        assert!(
+            !record.contains(withheld),
+            "case {case:?}: the audit record must stay metadata-only, but it carries \
+             {withheld:?}: {record:?}"
+        );
+    }
+}
+
+/// The captured records that are THIS case's: on the `emulator::audit` target and
+/// presenting [`AUDIT_AKID`]. A sibling test running in parallel writes to the same
+/// global capture, so selecting by the presented identity is what keeps the assertions
+/// about this case's own calls.
+fn audit_records(captured: &[String]) -> Vec<String> {
+    captured
+        .iter()
+        .filter(|record| {
+            record.starts_with("emulator::audit ")
+                && record.contains(&format!("access_key_id={AUDIT_AKID}"))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The single record one call emitted, under [`AUDIT_AKID`].
+async fn audited_call(
+    captured: &CapturedRecords,
+    router: &MultiServiceRouter,
+    case: &str,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> (u16, Value, String) {
+    let _ = captured.drain();
+    let (status, response) = call_as(router, method, uri, body, AUDIT_AKID).await;
+    let records = audit_records(&captured.drain());
+    // One call, one record: a second would mean a branch audited twice.
+    assert_eq!(
+        records.len(),
+        1,
+        "case {case:?} (HTTP {status}, body {response:?}): expected exactly one audit \
+         record, got {records:?}"
+    );
+    (status, response, records[0].clone())
+}
+
+/// Every call in this slice — above all the four that CHANGE the store — emits one
+/// structured record on the `emulator::audit` target naming the operation, the identity
+/// the request presented, the request target, the resource it resolved and the outcome.
+///
+/// A TABLE over the whole lifecycle, so each distinct outcome the slice can report is a
+/// row: the two creates, the idempotent replay, the reads, the listings, the refusals,
+/// the "not found"s and the two deletes. Driven through the production router with the
+/// capturing subscriber installed, so what is asserted is the record a real run emits.
+#[tokio::test]
+async fn every_call_emits_a_structured_audit_record() {
+    let captured = audit_capture();
+
+    // Harness self-test, so a failure below can never be mistaken for a missing audit
+    // record: the capture must receive an event emitted right here.
+    tracing::info!(target: "emulator::audit", access_key_id = AUDIT_AKID, "probe");
+    let probe = audit_records(&captured.drain());
+    assert_eq!(
+        probe.len(),
+        1,
+        "case \"subscriber self-test\": the capture must receive events, got {probe:?}"
+    );
+
+    let router = emulator();
+    // The fixtures the read rows act on are created under the DEFAULT identity, so their
+    // own records are not this case's.
+    let workflow = workflow_for_runs(&router, "audit-fixture-workflow").await;
+    let fixture_run_body = start_run_body(&workflow, "audit-fixture-run", &json!({}));
+    let (status, response) = start_run(&router, &fixture_run_body).await;
+    let run = created_id("the audit fixture run", status, &response);
+
+    let mut over_the_tag_bound = Map::new();
+    for n in 0..=MAX_TAGS {
+        over_the_tag_bound.insert(format!("key{n}"), Value::String("audited-tag-value".into()));
+    }
+
+    // An id no store holds, spelled wider than anything this emulator mints.
+    let absent = "999999999999999999";
+
+    let cases: Vec<AuditCase> = vec![
+        AuditCase {
+            case: "a workflow created",
+            operation: "CreateWorkflow",
+            method: "POST",
+            uri: "/workflow".to_string(),
+            body: Some(json!({ "requestId": "audit-create", "name": "audited" })),
+            outcome: "workflow-created",
+            resource: ExpectedResource::FromResponse,
+        },
+        AuditCase {
+            case: "the same create replayed",
+            operation: "CreateWorkflow",
+            method: "POST",
+            uri: "/workflow".to_string(),
+            body: Some(json!({ "requestId": "audit-create", "name": "audited" })),
+            outcome: "no-change",
+            resource: ExpectedResource::FromResponse,
+        },
+        AuditCase {
+            case: "a create past the tag bound",
+            operation: "CreateWorkflow",
+            method: "POST",
+            uri: "/workflow".to_string(),
+            body: Some(json!({
+                "requestId": "audit-tags",
+                "tags": Value::Object(over_the_tag_bound),
+            })),
+            outcome: "validation-refused",
+            resource: ExpectedResource::Nothing,
+        },
+        AuditCase {
+            case: "a workflow read",
+            operation: "GetWorkflow",
+            method: "GET",
+            uri: format!("/workflow/{workflow}"),
+            body: None,
+            outcome: "reported",
+            resource: ExpectedResource::Named(workflow.clone()),
+        },
+        AuditCase {
+            case: "a workflow id nothing holds",
+            operation: "GetWorkflow",
+            method: "GET",
+            uri: format!("/workflow/{absent}"),
+            body: None,
+            outcome: "not-found",
+            resource: ExpectedResource::Named(absent.to_string()),
+        },
+        AuditCase {
+            case: "a workflow listing",
+            operation: "ListWorkflows",
+            method: "GET",
+            uri: "/workflow".to_string(),
+            body: None,
+            outcome: "reported",
+            resource: ExpectedResource::Nothing,
+        },
+        AuditCase {
+            case: "a listing resumed from a token nothing issued",
+            operation: "ListWorkflows",
+            method: "GET",
+            uri: "/workflow?startingToken=not-a-token".to_string(),
+            body: None,
+            outcome: "validation-refused",
+            resource: ExpectedResource::Nothing,
+        },
+        AuditCase {
+            case: "a run started",
+            operation: "StartRun",
+            method: "POST",
+            uri: "/run".to_string(),
+            body: Some(start_run_body(&workflow, "audit-start", &json!({}))),
+            outcome: "run-started",
+            resource: ExpectedResource::FromResponse,
+        },
+        AuditCase {
+            case: "a run started on a workflow nothing holds",
+            operation: "StartRun",
+            method: "POST",
+            uri: "/run".to_string(),
+            body: Some(start_run_body(absent, "audit-missing", &json!({}))),
+            outcome: "not-found",
+            resource: ExpectedResource::Named(absent.to_string()),
+        },
+        AuditCase {
+            case: "a run read",
+            operation: "GetRun",
+            method: "GET",
+            uri: format!("/run/{run}"),
+            body: None,
+            outcome: "reported",
+            resource: ExpectedResource::Named(run.clone()),
+        },
+        AuditCase {
+            case: "a run id nothing holds",
+            operation: "GetRun",
+            method: "GET",
+            uri: format!("/run/{absent}"),
+            body: None,
+            outcome: "not-found",
+            resource: ExpectedResource::Named(absent.to_string()),
+        },
+        AuditCase {
+            case: "a run listing",
+            operation: "ListRuns",
+            method: "GET",
+            uri: "/run".to_string(),
+            body: None,
+            outcome: "reported",
+            resource: ExpectedResource::Nothing,
+        },
+    ];
+
+    let mut started: Vec<String> = vec![run.clone()];
+    for row in cases {
+        let AuditCase {
+            case,
+            operation,
+            method,
+            uri,
+            body,
+            outcome,
+            resource: expected_resource,
+        } = row;
+        let (status, response, record) =
+            audited_call(captured, &router, case, method, &uri, body.as_ref()).await;
+        let resource = match &expected_resource {
+            ExpectedResource::FromResponse => {
+                let id = response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected an id in {response:?} (HTTP {status})")
+                    })
+                    .to_string();
+                if operation == "StartRun" {
+                    started.push(id.clone());
+                }
+                id
+            }
+            ExpectedResource::Named(id) => id.clone(),
+            // `crate::state::AUDIT_NO_RESOURCE`.
+            ExpectedResource::Nothing => "-".to_string(),
+        };
+        let target = format!("{method} {}", uri.split('?').next().unwrap_or(&uri));
+        assert_audit_record(case, &record, operation, &target, outcome, &resource);
+    }
+
+    // The two deletes. Which outcome each is owed depends on which side of the clock the
+    // call lands on — a run that has not finished cannot be deleted and its workflow is
+    // still in use — so the record is asserted against the answer the call actually gave,
+    // exactly as the delete rules themselves are asserted elsewhere in this file.
+    let (status, _, record) = audited_call(
+        captured,
+        &router,
+        "a workflow deleted while a run may still be in flight",
+        "DELETE",
+        &format!("/workflow/{workflow}"),
+        None,
+    )
+    .await;
+    let outcome = match status {
+        409 => "conflict",
+        202 => "workflow-deleted",
+        other => panic!("DeleteWorkflow answered {other}, neither 202 nor 409"),
+    };
+    assert_audit_record(
+        "a workflow deleted while a run may still be in flight",
+        &record,
+        "DeleteWorkflow",
+        &format!("DELETE /workflow/{workflow}"),
+        outcome,
+        &workflow,
+    );
+    let workflow_still_held = status == 409;
+
+    // Once the clock has finished every run, the delete rules admit both deletes, so each
+    // record's outcome is the one a successful delete is owed.
+    await_runs_finished(&router, &started).await;
+    for id in &started {
+        let case = "a finished run deleted";
+        let (status, body, record) =
+            audited_call(captured, &router, case, "DELETE", &format!("/run/{id}"), None).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: a finished run must be deletable, got {body:?}"
+        );
+        assert_audit_record(
+            case,
+            &record,
+            "DeleteRun",
+            &format!("DELETE /run/{id}"),
+            "run-deleted",
+            id,
+        );
+    }
+    if workflow_still_held {
+        let case = "the workflow deleted once its runs finished";
+        let (status, body, record) = audited_call(
+            captured,
+            &router,
+            case,
+            "DELETE",
+            &format!("/workflow/{workflow}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected 202 once every run finished, got {body:?}"
+        );
+        assert_audit_record(
+            case,
+            &record,
+            "DeleteWorkflow",
+            &format!("DELETE /workflow/{workflow}"),
+            "workflow-deleted",
+            &workflow,
+        );
+    }
 }

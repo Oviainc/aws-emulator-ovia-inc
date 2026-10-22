@@ -8,7 +8,8 @@
 //! than in one operation file because every implemented operation shares them:
 //! `CreateDBInstance`, `DescribeDBInstances`, `ModifyDBInstance`,
 //! `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
-//! `CreateOptionGroup` and `DescribeOptionGroups` all project the same records.
+//! `CreateOptionGroup`, `ModifyOptionGroup` and `DescribeOptionGroups` all project the
+//! same records.
 //!
 //! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
 //! region a request is signed for scopes what it can see and create, one identifier
@@ -31,9 +32,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    DBInstance, DBParameterGroupStatus, DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint,
-    OptionGroup, Tag, VpcSecurityGroupMembership,
+    Certificate, CertificateDetails, DBInstance, DBParameterGroupStatus, DBSecurityGroupMembership,
+    DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, EventCategoriesMap, Option2,
+    OptionGroup, OptionGroupMembership, OptionSetting, PendingModifiedValues, Tag,
+    VpcSecurityGroupMembership,
 };
+
+pub mod option_catalog;
 
 /// How long after the call that starts it a status transition this service owes
 /// becomes due.
@@ -44,6 +49,12 @@ use crate::ops::types::{
 /// go with it) exactly as it would against the real service. The due instant is
 /// stored on the record and materialised by the next call — nothing sleeps.
 pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(300);
+
+/// The status a DB instance reports once a delete has been accepted for it: "If you
+/// request a final DB snapshot, the status of the Amazon RDS DB instance is deleting
+/// until the DB snapshot is created" (`DeleteDBInstance`). It is a transient status —
+/// the instance is removed [`STATUS_TRANSITION_DELAY`] later, and then it is not found.
+pub const DB_INSTANCE_STATUS_DELETING: &str = "deleting";
 
 /// The ARN namespace and sigv4 signing name of this service, as its Smithy model's
 /// `aws.api#service` trait declares them (`arnNamespace: rds`).
@@ -166,6 +177,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// request does under the state lock does not grow with what other callers stored.
     pub fn settle_due_transitions(&mut self, region: &str) {
         let now = Instant::now();
+        // A record whose pending change is its REMOVAL leaves the store here: the
+        // keys are collected first because the range borrows the map mutably.
+        let mut gone: Vec<RegionalKey> = Vec::new();
         for (key, instance) in self
             .db_instances
             .range_mut((region.to_string(), String::new())..)
@@ -173,7 +187,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             if key.0 != region {
                 break;
             }
-            instance.settle(now);
+            if instance.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.db_instances.remove(&key);
         }
         for (key, snapshot) in self
             .db_snapshots
@@ -182,7 +201,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             if key.0 != region {
                 break;
             }
-            snapshot.settle(now);
+            if snapshot.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.db_snapshots.remove(&key);
         }
     }
 
@@ -230,10 +254,20 @@ fn range_in<'a, T>(map: &'a BTreeMap<RegionalKey, T>, region: &str) -> Vec<&'a T
         .collect()
 }
 
-/// A status this service owes: what the resource becomes, and when that is due.
+/// What the clock owes a record once its due instant passes.
+#[derive(Debug, Clone)]
+pub enum PendingChange {
+    /// The resource reaches this status (`creating` -> `available`, say).
+    Status(String),
+    /// The resource is gone from the service: the end of a delete that was already
+    /// accepted, which "can't be canceled or reverted after it begins".
+    Removal,
+}
+
+/// A change this service owes: what becomes of the resource, and when that is due.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
-    pub status: String,
+    pub change: PendingChange,
     pub due_at: Instant,
 }
 
@@ -241,7 +275,15 @@ impl PendingStatus {
     /// A transition to `status`, due [`STATUS_TRANSITION_DELAY`] from now.
     pub fn in_a_moment(status: &str) -> Self {
         Self {
-            status: status.to_string(),
+            change: PendingChange::Status(status.to_string()),
+            due_at: Instant::now() + STATUS_TRANSITION_DELAY,
+        }
+    }
+
+    /// The record's removal from the store, due [`STATUS_TRANSITION_DELAY`] from now.
+    pub fn removal_in_a_moment() -> Self {
+        Self {
+            change: PendingChange::Removal,
             due_at: Instant::now() + STATUS_TRANSITION_DELAY,
         }
     }
@@ -287,21 +329,65 @@ pub struct DbInstanceRecord {
     pub copy_tags_to_snapshot: bool,
     pub deletion_protection: bool,
     pub db_subnet_group_name: Option<String>,
+    /// The DB parameter group applied to the instance: the one the request named, or
+    /// the default group of the engine version it was created with.
     pub db_parameter_group_name: Option<String>,
+    /// The option group applied to the instance: the one the request named, or the
+    /// default group of its engine and major engine version.
+    pub option_group_name: Option<String>,
     pub vpc_security_group_ids: Vec<String>,
+    /// The legacy EC2-Classic DB security groups the request named, which is normally
+    /// none: "This setting applies to the legacy EC2-Classic platform, which is no
+    /// longer used to create new DB instances."
+    pub db_security_group_names: Vec<String>,
     pub db_cluster_identifier: Option<String>,
     pub domain: Option<String>,
+    /// The CA the instance's server certificate is issued under.
+    pub ca_certificate_identifier: String,
+    pub monitoring_interval: i32,
+    pub performance_insights_enabled: bool,
+    pub iam_database_authentication_enabled: bool,
+    pub database_insights_mode: String,
+    pub dedicated_log_volume: bool,
+    pub customer_owned_ip_enabled: bool,
+    pub network_type: String,
+    pub backup_target: String,
+    pub engine_lifecycle_support: String,
+    /// The storage throughput provisioned for the instance, in MiBps.
+    pub storage_throughput: i32,
     pub instance_create_time: ::aws_smithy_types::DateTime,
     pub tags: Vec<Tag>,
 }
 
 impl DbInstanceRecord {
-    /// Apply a transition whose due instant has passed.
-    fn settle(&mut self, now: Instant) {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone — an accepted delete that has run its course — so the caller drops it from
+    /// the store.
+    fn settle(&mut self, now: Instant) -> bool {
         if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
             let pending = self.pending_status.take().expect("checked just above");
-            self.status = pending.status;
+            match pending.change {
+                PendingChange::Status(status) => self.status = status,
+                PendingChange::Removal => return true,
+            }
         }
+        false
+    }
+
+    /// Whether a delete has already been accepted for this instance, so it is on its
+    /// way out and nothing further can be done to it.
+    pub fn is_deleting(&self) -> bool {
+        self.status == DB_INSTANCE_STATUS_DELETING
+    }
+
+    /// Accept a delete: the instance reports `deleting` from now on, and the clock
+    /// owes its removal from the store [`STATUS_TRANSITION_DELAY`] from now, after
+    /// which every read of the identifier is a `DBInstanceNotFoundFault`. Nothing
+    /// sleeps: the due instant is stored and materialised by
+    /// [`ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`].
+    pub fn begin_deletion(&mut self) {
+        self.status = DB_INSTANCE_STATUS_DELETING.to_string();
+        self.pending_status = Some(PendingStatus::removal_in_a_moment());
     }
 
     /// `arn:aws:rds:<region>:<account>:db:<identifier>`, from the stored region and
@@ -319,7 +405,39 @@ impl DbInstanceRecord {
         )
     }
 
+    /// When the server certificate issued at creation expires:
+    /// [`SERVER_CERTIFICATE_VALIDITY`] after the instance was created. A function of
+    /// the stored creation time rather than a stored instant, so it cannot drift from
+    /// it.
+    pub fn certificate_valid_till(&self) -> ::aws_smithy_types::DateTime {
+        ::aws_smithy_types::DateTime::from_secs_f64(
+            self.instance_create_time.as_secs_f64() + SERVER_CERTIFICATE_VALIDITY.as_secs_f64(),
+        )
+    }
+
+    /// `DbInstancePort`: "The port that the DB instance listens on. If the DB instance
+    /// is part of a DB cluster, this can be a different port than the DB cluster port."
+    ///
+    /// The member reports the port of a CLUSTER MEMBER, which is why it is separate
+    /// from `Endpoint.Port` (the port a client connects to, which this service reports
+    /// from the same stored port): an instance that belongs to no DB cluster has no
+    /// such port, and RDS reports zero for it.
+    pub fn db_instance_port(&self) -> i32 {
+        match self.db_cluster_identifier {
+            Some(_) => self.endpoint_port,
+            None => 0,
+        }
+    }
+
     /// Project the stored record onto the modelled `DBInstance` output shape.
+    ///
+    /// Every member RDS reports for a DB instance it holds is projected here, from the
+    /// stored record or from the documented default the record was created with; the
+    /// nested `Endpoint`, `DBSubnetGroup`, `CertificateDetails`, `PendingModifiedValues`
+    /// and membership lists are projected from the same record, so no two of them can
+    /// disagree. A member whose value this service has no state for at all is left out
+    /// rather than invented — a list it does have state for is reported EMPTY, which is
+    /// what RDS reports for an instance that has none of those associations.
     pub fn to_wire(&self) -> DBInstance {
         DBInstance {
             db_instance_identifier: Some(self.identifier.clone()),
@@ -337,51 +455,116 @@ impl DbInstanceRecord {
             instance_create_time: Some(self.instance_create_time),
             preferred_backup_window: self.preferred_backup_window.clone(),
             backup_retention_period: Some(self.backup_retention_period),
+            // The legacy EC2-Classic memberships: empty for every instance created
+            // through the VPC platform, which is every instance this service holds
+            // unless a request named one.
+            db_security_groups: Some(
+                self.db_security_group_names
+                    .iter()
+                    .map(|name| DBSecurityGroupMembership {
+                        db_security_group_name: Some(name.clone()),
+                        status: Some(MEMBERSHIP_ACTIVE.to_string()),
+                    })
+                    .collect(),
+            ),
             vpc_security_groups: Some(
                 self.vpc_security_group_ids
                     .iter()
                     .map(|id| VpcSecurityGroupMembership {
                         vpc_security_group_id: Some(id.clone()),
-                        status: Some("active".to_string()),
+                        status: Some(MEMBERSHIP_ACTIVE.to_string()),
                     })
                     .collect(),
             ),
-            db_parameter_groups: self.db_parameter_group_name.clone().map(|name| {
-                vec![DBParameterGroupStatus {
-                    db_parameter_group_name: Some(name),
-                    parameter_apply_status: Some("in-sync".to_string()),
-                }]
-            }),
+            db_parameter_groups: Some(
+                self.db_parameter_group_name
+                    .iter()
+                    .map(|name| DBParameterGroupStatus {
+                        db_parameter_group_name: Some(name.clone()),
+                        parameter_apply_status: Some(MEMBERSHIP_IN_SYNC.to_string()),
+                    })
+                    .collect(),
+            ),
+            option_group_memberships: Some(
+                self.option_group_name
+                    .iter()
+                    .map(|name| OptionGroupMembership {
+                        option_group_name: Some(name.clone()),
+                        status: Some(MEMBERSHIP_IN_SYNC.to_string()),
+                    })
+                    .collect(),
+            ),
             availability_zone: Some(self.availability_zone.clone()),
+            // Only the name and the status of the subnet group: its VPC, its subnets
+            // and its description are properties of a DB subnet group record, which
+            // only `CreateDBSubnetGroup` mints — still a stub, and its VPC and subnets
+            // are EC2 resources this emulator's EC2 service does not mint either. A
+            // made-up VPC or subnet id would name a network nothing can be reached on.
             db_subnet_group: self.db_subnet_group_name.clone().map(|name| DBSubnetGroup {
                 db_subnet_group_name: Some(name),
                 subnet_group_status: Some("Complete".to_string()),
                 ..DBSubnetGroup::default()
             }),
             preferred_maintenance_window: self.preferred_maintenance_window.clone(),
+            // Every change `ModifyDBInstance` accepts is applied to the stored record
+            // at once, so no change is ever pending: the element is reported EMPTY,
+            // which says exactly that, rather than omitted.
+            pending_modified_values: Some(PendingModifiedValues::default()),
+            upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
             multi_az: Some(self.multi_az),
             engine_version: self.engine_version.clone(),
             auto_minor_version_upgrade: Some(self.auto_minor_version_upgrade),
+            // No implemented operation creates a read replica of an instance
+            // (`CreateDBInstanceReadReplica` is still a stub), so no instance this
+            // service holds has one: the list is EMPTY, not absent.
+            read_replica_db_instance_identifiers: Some(Vec::new()),
             license_model: self.license_model.clone(),
             iops: self.iops,
+            storage_throughput: Some(self.storage_throughput),
             publicly_accessible: Some(self.publicly_accessible),
             storage_type: Some(self.storage_type.clone()),
+            db_instance_port: Some(self.db_instance_port()),
             db_cluster_identifier: self.db_cluster_identifier.clone(),
             storage_encrypted: Some(self.storage_encrypted),
             kms_key_id: self.kms_key_id.clone(),
             dbi_resource_id: Some(self.dbi_resource_id.clone()),
-            domain_memberships: self.domain.clone().map(|domain| {
-                vec![DomainMembership {
-                    domain: Some(domain),
-                    status: Some("joined".to_string()),
-                    ..DomainMembership::default()
-                }]
+            ca_certificate_identifier: Some(self.ca_certificate_identifier.clone()),
+            certificate_details: Some(CertificateDetails {
+                ca_identifier: Some(self.ca_certificate_identifier.clone()),
+                valid_till: Some(self.certificate_valid_till()),
             }),
+            domain_memberships: Some(
+                self.domain
+                    .iter()
+                    .map(|domain| DomainMembership {
+                        domain: Some(domain.clone()),
+                        status: Some("joined".to_string()),
+                        ..DomainMembership::default()
+                    })
+                    .collect(),
+            ),
             copy_tags_to_snapshot: Some(self.copy_tags_to_snapshot),
+            monitoring_interval: Some(self.monitoring_interval),
             db_instance_arn: Some(self.arn()),
+            iam_database_authentication_enabled: Some(self.iam_database_authentication_enabled),
+            database_insights_mode: Some(self.database_insights_mode.clone()),
+            performance_insights_enabled: Some(self.performance_insights_enabled),
             deletion_protection: Some(self.deletion_protection),
+            // No implemented operation associates an IAM role with an instance
+            // (`AddRoleToDBInstance` is still a stub): EMPTY for the same reason as the
+            // read-replica list above.
+            associated_roles: Some(Vec::new()),
             max_allocated_storage: self.max_allocated_storage,
             tag_list: Some(self.tags.clone()),
+            customer_owned_ip_enabled: Some(self.customer_owned_ip_enabled),
+            network_type: Some(self.network_type.clone()),
+            activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
+            backup_target: Some(self.backup_target.clone()),
+            dedicated_log_volume: Some(self.dedicated_log_volume),
+            // Nothing this service does changes an instance's storage file system
+            // configuration, so no upgrade of it is ever recommended.
+            is_storage_config_upgrade_available: Some(false),
+            engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
             ..DBInstance::default()
         }
     }
@@ -416,12 +599,17 @@ pub struct DbSnapshotRecord {
 }
 
 impl DbSnapshotRecord {
-    /// Apply a transition whose due instant has passed.
-    fn settle(&mut self, now: Instant) {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, exactly as [`DbInstanceRecord::settle`] does.
+    fn settle(&mut self, now: Instant) -> bool {
         if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
             let pending = self.pending_status.take().expect("checked just above");
-            self.status = pending.status;
+            match pending.change {
+                PendingChange::Status(status) => self.status = status,
+                PendingChange::Removal => return true,
+            }
         }
+        false
     }
 
     /// Snapshot the source instance's settings. `snapshot_type` is `manual` for a
@@ -497,7 +685,8 @@ impl DbSnapshotRecord {
     }
 }
 
-/// A stored option group: everything `CreateOptionGroup` persists about one.
+/// A stored option group: everything `CreateOptionGroup` persists about one, plus the
+/// options `ModifyOptionGroup` has added to it.
 ///
 /// The ARN is NOT stored as text: it is a function of the stored region and name,
 /// which [`OptionGroupRecord::to_wire`] computes, so it cannot drift from the record
@@ -511,6 +700,11 @@ pub struct OptionGroupRecord {
     pub engine_name: String,
     pub major_engine_version: String,
     pub tags: Vec<Tag>,
+    /// The options `ModifyOptionGroup` added, by the catalogue's own spelling of each
+    /// option's name. Ordered, so the group reports its options the same way on every
+    /// read, and keyed by name, so adding an option twice updates its configuration
+    /// instead of storing a second copy of it.
+    pub options: BTreeMap<String, OptionRecord>,
 }
 
 impl OptionGroupRecord {
@@ -522,21 +716,139 @@ impl OptionGroupRecord {
 
     /// Project the stored record onto the modelled `OptionGroup` output shape.
     pub fn to_wire(&self) -> OptionGroup {
+        let options: Vec<Option2> = self
+            .options
+            .values()
+            .map(|option| option.to_wire(&self.engine_name))
+            .collect();
         OptionGroup {
             option_group_name: Some(self.name.clone()),
             option_group_description: Some(self.description.clone()),
             engine_name: Some(self.engine_name.clone()),
             major_engine_version: Some(self.major_engine_version.clone()),
-            // A group `CreateOptionGroup` minted holds no options — options are added
-            // by `ModifyOptionGroup`, which is still a stub — so the list is reported
-            // EMPTY rather than absent: the group exists and has nothing in it.
-            options: Some(Vec::new()),
+            // A group nothing has added an option to reports an EMPTY list rather than
+            // no list at all: the group exists and has nothing in it.
+            // `AllowsVpcAndNonVpcInstanceMemberships` — "Indicates whether this option
+            // group can be applied to both VPC and non-VPC instances" — is ALWAYS
+            // reported, so a caller can tell a group it may apply anywhere from one it
+            // may not. A group holding no option constrains nothing and can be applied
+            // to both; once it holds an option, that option's own placement
+            // requirements bind the group to instances of one network type, so the
+            // answer is `false`.
+            allows_vpc_and_non_vpc_instance_memberships: Some(options.is_empty()),
+            options: Some(options),
             option_group_arn: Some(self.arn()),
-            // `VpcId` belongs to a group bound to one VPC, and
-            // `SourceOptionGroup`/`SourceAccountId`/`CopyTimestamp` to a group
-            // `CopyOptionGroup` produced. Neither describes a group created here, so
-            // neither is reported rather than carrying a made-up value.
+            // `VpcId` belongs to a group bound to ONE VPC, which nothing here creates:
+            // "If AllowsVpcAndNonVpcInstanceMemberships is false, this field is blank.
+            // If AllowsVpcAndNonVpcInstanceMemberships is true and this field is blank,
+            // then this option group can be applied to both VPC and non-VPC
+            // instances." `SourceOptionGroup`/`SourceAccountId`/`CopyTimestamp` belong
+            // to a group `CopyOptionGroup` produced. None describes a group created
+            // here, so none is reported rather than carrying a made-up value.
             ..OptionGroup::default()
+        }
+    }
+}
+
+/// One option a `ModifyOptionGroup` call added to a group: the caller's CONFIGURATION
+/// of it.
+///
+/// The option's own facts — its description, whether it is permanent or persistent,
+/// the settings it publishes and each setting's default, data type and allowed values
+/// — are NOT copied in here. They are catalogue data ([`option_catalog`]), which
+/// [`OptionRecord::to_wire`] reads at projection time, so a stored group cannot drift
+/// from the catalogue the way a stored copy could.
+#[derive(Debug, Clone, Default)]
+pub struct OptionRecord {
+    /// The catalogue's own spelling of the option's name.
+    pub name: String,
+    /// `OptionConfiguration$Port`, when the request named one; otherwise the option's
+    /// published port, if it has one.
+    pub port: Option<i32>,
+    /// `OptionConfiguration$OptionVersion`, when the request named one.
+    pub version: Option<String>,
+    /// `OptionConfiguration$DBSecurityGroupMemberships`.
+    pub db_security_group_memberships: Vec<String>,
+    /// `OptionConfiguration$VpcSecurityGroupMemberships`.
+    pub vpc_security_group_memberships: Vec<String>,
+    /// The values the caller set, by setting name — only for the settings it set. A
+    /// setting absent here reports the catalogue's default, which is what makes
+    /// `Value` fall back to `DefaultValue`.
+    pub settings: BTreeMap<String, String>,
+}
+
+impl OptionRecord {
+    /// Project the stored option onto the modelled `Option` wire shape, in the context
+    /// of the group's engine: the engine is half of the catalogue key, because an
+    /// option one engine publishes is a different catalogue entry than another's.
+    pub fn to_wire(&self, engine_name: &str) -> Option2 {
+        let facts = option_catalog::option_facts(engine_name, &self.name);
+        let settings = facts
+            .map(|facts| {
+                facts
+                    .settings
+                    .iter()
+                    .map(|setting| OptionSetting {
+                        name: Some(setting.name.to_string()),
+                        // The value the caller set, else the published default: that
+                        // is what "The current value of the option setting" is for a
+                        // setting nobody has set.
+                        value: Some(
+                            self.settings
+                                .get(setting.name)
+                                .cloned()
+                                .unwrap_or_else(|| setting.default_value.to_string()),
+                        ),
+                        default_value: Some(setting.default_value.to_string()),
+                        description: Some(setting.description.to_string()),
+                        apply_type: Some(setting.apply_type.to_string()),
+                        data_type: Some(setting.data_type.to_string()),
+                        // A free-form setting publishes no value list, and reports no
+                        // `AllowedValues` member rather than an empty one.
+                        allowed_values: (!setting.allowed_values.is_empty())
+                            .then(|| setting.allowed_values.to_string()),
+                        is_modifiable: Some(setting.is_modifiable),
+                        is_collection: Some(setting.is_collection),
+                    })
+                    .collect()
+            })
+            // Unreachable with a record this service stored: `ModifyOptionGroup`
+            // refuses an option the group's engine does not publish, so every stored
+            // option has catalogue facts. An option whose entry has since been
+            // dropped from the catalogue reports what the record itself holds rather
+            // than invented metadata.
+            .unwrap_or_default();
+        Option2 {
+            option_name: Some(self.name.clone()),
+            option_description: facts.map(|facts| facts.description.to_string()),
+            persistent: facts.map(|facts| facts.persistent),
+            permanent: facts.map(|facts| facts.permanent),
+            // "If required, the port configured for this option to use" — so no port
+            // at all for an option that requires none.
+            port: self.port.or_else(|| facts.and_then(|facts| facts.port)),
+            option_version: self.version.clone(),
+            option_settings: Some(settings),
+            // Both membership lists are reported even when the option was configured
+            // with none: an empty list says the option opened access to nothing, which
+            // is not the same claim as no list at all.
+            db_security_group_memberships: Some(
+                self.db_security_group_memberships
+                    .iter()
+                    .map(|name| DBSecurityGroupMembership {
+                        db_security_group_name: Some(name.clone()),
+                        status: Some("authorized".to_string()),
+                    })
+                    .collect(),
+            ),
+            vpc_security_group_memberships: Some(
+                self.vpc_security_group_memberships
+                    .iter()
+                    .map(|id| VpcSecurityGroupMembership {
+                        vpc_security_group_id: Some(id.clone()),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -690,6 +1002,96 @@ pub fn default_port(engine: &str) -> i32 {
     }
 }
 
+/// The CA certificate an instance's server certificate is issued under when the
+/// request names none.
+///
+/// `CACertificateIdentifier` documents no default, so the value comes from what AWS
+/// publishes: `rds-ca-rsa2048-g1` is the default certificate authority for a new DB
+/// instance ("Using SSL/TLS to encrypt a connection to a DB instance", Amazon RDS User
+/// Guide). It is a value AWS allocated — nothing computes it — so a table of one is
+/// the only honest source; extend it when the published default moves.
+pub const DEFAULT_CA_CERTIFICATE_IDENTIFIER: &str = "rds-ca-rsa2048-g1";
+
+/// How long the server certificate issued at creation stays valid, which is what
+/// `CertificateDetails$ValidTill` ("The expiration date of the DB instance's server
+/// certificate") reports.
+///
+/// Neither the model nor the RDS API documents a lifetime for the issued certificate,
+/// so this span is this emulator's choice: one year from the instant the instance was
+/// created. It is a function of the stored creation time, so it never moves between
+/// two reads of the same instance.
+pub const SERVER_CERTIFICATE_VALIDITY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// The daily backup window an instance gets when the request names none.
+///
+/// `PreferredBackupWindow`: "The default is a 30-minute window selected at random from
+/// an 8-hour block of time for each Amazon Web Services Region." This emulator picks
+/// ONE window rather than a random one, so two reads of an instance report the same
+/// window; it keeps the documented `hh24:mi-hh24:mi` UTC format and the documented
+/// 30-minute minimum.
+pub const DEFAULT_PREFERRED_BACKUP_WINDOW: &str = "07:00-07:30";
+
+/// The weekly maintenance window an instance gets when the request names none.
+///
+/// `PreferredMaintenanceWindow`: "The default is a 30-minute window selected at random
+/// from an 8-hour block of time for each Amazon Web Services Region, occurring on a
+/// random day of the week" — again one fixed window here, in the documented
+/// `ddd:hh24:mi-ddd:hh24:mi` form, on one of the documented day values, at the
+/// documented 30-minute minimum, and "not conflict[ing] with the preferred backup
+/// window" ([`DEFAULT_PREFERRED_BACKUP_WINDOW`] ends half an hour before it starts).
+pub const DEFAULT_PREFERRED_MAINTENANCE_WINDOW: &str = "mon:08:00-mon:08:30";
+
+/// The Database Insights mode an instance is created in when the request names none:
+/// the `standard` member of `DatabaseInsightsMode` (`standard | advanced`), advanced
+/// being the mode a request asks for.
+pub const DEFAULT_DATABASE_INSIGHTS_MODE: &str = "standard";
+
+/// The network type an instance is created with when the request names none.
+///
+/// `NetworkType`: "Valid Values: `IPV4 | DUAL`" — a subnet group "can support only the
+/// IPv4 protocol or the IPv4 and the IPv6 protocols (`DUAL`)", so IPv4 only unless the
+/// request asks for both.
+pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
+
+/// Where automated backups and manual snapshots are stored when the request names no
+/// `BackupTarget`: "Valid Values: local (Dedicated Local Zone) outposts (Amazon Web
+/// Services Outposts) region (Amazon Web Services Region) Default: region".
+pub const DEFAULT_BACKUP_TARGET: &str = "region";
+
+/// The lifecycle type an instance is created with when the request names none:
+/// `EngineLifecycleSupport` "Default: `open-source-rds-extended-support`".
+pub const DEFAULT_ENGINE_LIFECYCLE_SUPPORT: &str = "open-source-rds-extended-support";
+
+/// The Enhanced Monitoring interval an instance is created with when the request names
+/// none: `MonitoringInterval` "Valid Values: 0 | 1 | 5 | 10 | 15 | 30 | 60. Default:
+/// 0" — zero disables collection.
+pub const DEFAULT_MONITORING_INTERVAL: i32 = 0;
+
+/// The baseline storage throughput, in MiBps, of the `gp3` storage type — the only
+/// type `StorageThroughput` "applies only to" ("General Purpose SSD gp3 storage:
+/// baseline storage throughput of 125 MiBps", Amazon RDS storage types, Amazon RDS
+/// User Guide).
+pub const GP3_BASELINE_STORAGE_THROUGHPUT: i32 = 125;
+
+/// The activity-stream status of an instance no activity stream was started for: the
+/// `stopped` member of `ActivityStreamStatus` (`stopped | starting | started |
+/// stopping`). Nothing here starts one — `StartActivityStream` is still a stub — so
+/// this is the status every instance this service holds reports.
+pub const ACTIVITY_STREAM_STOPPED: &str = "stopped";
+
+/// The upgrade rollout order of an instance nothing configured one for:
+/// `UpgradeRolloutOrder` "[second] - Default order for resources not specifically
+/// configured". No operation this service implements configures it.
+pub const DEFAULT_UPGRADE_ROLLOUT_ORDER: &str = "second";
+
+/// The status RDS reports for a group membership that is in effect — the
+/// `ParameterApplyStatus` of an applied DB parameter group and the `Status` of an
+/// applied option group.
+const MEMBERSHIP_IN_SYNC: &str = "in-sync";
+
+/// The status RDS reports for a security-group membership that is in effect.
+const MEMBERSHIP_ACTIVE: &str = "active";
+
 /// The lowest and highest port `CreateDBInstanceMessage$Port` accepts
 /// ("Valid Values: 1150-65535").
 pub const PORT_RANGE: std::ops::RangeInclusive<i32> = 1150..=65535;
@@ -736,6 +1138,78 @@ pub fn default_storage_type(iops: Option<i32>) -> &'static str {
     } else {
         "gp3"
     }
+}
+
+/// The storage throughput a DB instance is provisioned with when the request names
+/// none.
+///
+/// `StorageThroughput` "applies only to the `gp3` storage type", whose baseline is
+/// [`GP3_BASELINE_STORAGE_THROUGHPUT`]; an instance on any other storage type is
+/// provisioned no separate throughput, which RDS reports as zero rather than as an
+/// absent member.
+pub fn default_storage_throughput(storage_type: &str) -> i32 {
+    if storage_type.eq_ignore_ascii_case("gp3") {
+        GP3_BASELINE_STORAGE_THROUGHPUT
+    } else {
+        0
+    }
+}
+
+/// The license model of an instance the request named none for, or `None` for an engine
+/// whose license model this emulator cannot cite one for.
+///
+/// From the value list `CreateDBInstanceMessage$LicenseModel` publishes: "RDS for Db2 -
+/// bring-your-own-license | marketplace-license" ("The default for RDS for Db2 is
+/// bring-your-own-license"), "RDS for MariaDB - general-public-license", "RDS for
+/// Microsoft SQL Server - license-included | bring-your-own-media", "RDS for MySQL -
+/// general-public-license", "RDS for Oracle - bring-your-own-license |
+/// license-included", "RDS for PostgreSQL - postgresql-license". Where the list offers
+/// one value it IS the default; where it offers two, the default is the one that engine
+/// can be created with unprepared — a Db2 or Oracle Enterprise Edition instance runs on
+/// a license you bring, while SQL Server and Oracle SE2 include one. The member
+/// "doesn't apply to Amazon Aurora", whose instances RDS reports with the license model
+/// of the engine family they run (`aurora-mysql` the MySQL one, `aurora-postgresql` the
+/// PostgreSQL one), so the match is on the engine family rather than on the exact
+/// engine name.
+pub fn default_license_model(engine: &str) -> Option<&'static str> {
+    let engine = engine.to_ascii_lowercase();
+    if engine.contains("db2") {
+        Some("bring-your-own-license")
+    } else if engine.contains("sqlserver") || engine.contains("oracle-se") {
+        Some("license-included")
+    } else if engine.contains("oracle") {
+        Some("bring-your-own-license")
+    } else if engine.contains("postgres") {
+        Some("postgresql-license")
+    } else if engine.contains("mysql") || engine.contains("mariadb") {
+        Some("general-public-license")
+    } else {
+        None
+    }
+}
+
+/// The name of the default DB parameter group of one engine-version family.
+///
+/// `DBParameterGroupName`: "If you don't specify a value, then Amazon RDS uses the
+/// default DB parameter group for the specified DB engine and version" — the group RDS
+/// names `default.` followed by that version's `DBParameterGroupFamily`
+/// (`default.mysql8.0`).
+pub fn default_db_parameter_group_name(parameter_group_family: &str) -> String {
+    format!("default.{parameter_group_family}")
+}
+
+/// The name of the default option group of one engine and major engine version.
+///
+/// RDS creates a default option group per engine and major version and names it
+/// `default:<engine>-<major engine version>`, writing the version's dots as hyphens
+/// (`default:mysql-8-0`, `default:sqlserver-ee-15-00`) — the naming the "Working with
+/// option groups" section of the Amazon RDS User Guide publishes.
+pub fn default_option_group_name(engine: &str, major_engine_version: &str) -> String {
+    format!(
+        "default:{}-{}",
+        engine.to_ascii_lowercase(),
+        major_engine_version.replace('.', "-")
+    )
 }
 
 /// Refuse an identifier that breaks the constraints its member documents.
@@ -820,6 +1294,74 @@ pub fn check_filter_terms(filters: &[crate::ops::types::Filter]) -> Result<(), S
     Ok(())
 }
 
+/// How many security group memberships one option of an option group may carry.
+///
+/// `OptionConfiguration$DBSecurityGroupMemberships` and
+/// `OptionConfiguration$VpcSecurityGroupMemberships` publish no bound, and their values
+/// are STORED, so they are capped for the same reason as [`MAX_FILTER_TERMS`]: request
+/// data that enters the store has to be bounded. Generous next to the five security
+/// groups AWS lets one DB instance carry.
+pub const MAX_OPTION_SECURITY_GROUPS: usize = 32;
+
+/// How long a text value a `ModifyOptionGroup` request may store: the value of an
+/// option setting, or an `OptionVersion`. Neither member publishes a bound and both are
+/// stored, so this emulator caps them.
+pub const MAX_OPTION_TEXT_LEN: usize = 1024;
+
+/// Refuse stored request text longer than [`MAX_OPTION_TEXT_LEN`], naming the member
+/// and the bound it broke.
+pub fn check_option_text(member: &str, value: &str) -> Result<(), String> {
+    let length = value.chars().count();
+    if length > MAX_OPTION_TEXT_LEN {
+        return Err(format!(
+            "{member} carries {length} characters: this emulator stores at most \
+             {MAX_OPTION_TEXT_LEN}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a security group membership list longer than [`MAX_OPTION_SECURITY_GROUPS`],
+/// and any entry that is not of the form a security group name or id takes.
+pub fn check_security_group_memberships(member: &str, values: &[String]) -> Result<(), String> {
+    if values.len() > MAX_OPTION_SECURITY_GROUPS {
+        return Err(format!(
+            "{member} carries {} entries: this emulator stores at most \
+             {MAX_OPTION_SECURITY_GROUPS}",
+            values.len()
+        ));
+    }
+    for value in values {
+        // A DB security group name and a VPC security group id are both drawn from the
+        // letters/numbers/hyphens alphabet the identifier members share.
+        check_identifier(member, value, 255)?;
+    }
+    Ok(())
+}
+
+/// How many entries one `ModifyOptionGroup` request may name in `OptionsToInclude`,
+/// `OptionsToRemove`, or in one option configuration's `OptionSettings`.
+///
+/// None of those members publishes a bound, and the work a request costs is the PRODUCT
+/// of its option count and its settings count, so each factor is capped BEFORE any
+/// per-entry work runs — the same reason [`MAX_FILTER_TERMS`] caps a describe's filter
+/// terms. The bound is generous: the whole catalogue publishes fewer options than this
+/// for every engine together, and no option publishes more settings than this, so a
+/// request past it is asking for options and settings that do not exist.
+pub const MAX_OPTIONS_PER_REQUEST: usize = 64;
+
+/// Refuse an option or option-settings list longer than [`MAX_OPTIONS_PER_REQUEST`],
+/// naming the member and the bound it broke.
+pub fn check_option_list_len(member: &str, len: usize) -> Result<(), String> {
+    if len > MAX_OPTIONS_PER_REQUEST {
+        return Err(format!(
+            "{member} carries {len} entries: this emulator serves at most \
+             {MAX_OPTIONS_PER_REQUEST} per request"
+        ));
+    }
+    Ok(())
+}
+
 /// One page of an ordered result set, plus the `Marker` to resume from.
 ///
 /// The marker is the key the next page starts AT, so resuming is a single ordered
@@ -855,3 +1397,206 @@ pub fn paginate<T>(
         .collect();
     Page { items, next_marker }
 }
+
+// ---------------------------------------------------------------------------
+// The reference catalogs this front door reports
+//
+// `DescribeCertificates` and `DescribeEventCategories` report what the service
+// PUBLISHES rather than what a caller created, so their source is a catalog rather than
+// the store above. Each catalog below names where its values come from, and every
+// handler projects them through one of the `to_wire` functions here, so no two handlers
+// can disagree about a CA certificate or an event category. (The DB engine version
+// catalogue is the same kind of reference data and lives in
+// `crate::ops::describe_db_engine_versions`, which owns it and lends it to
+// `DescribeOrderableDBInstanceOptions`.)
+//
+// This front door serves the RDS, Amazon DocumentDB and Amazon Neptune control planes —
+// the three models that share its endpoint prefix, signing name, protocol and API
+// version (see `src/service.rs`) — so the catalogs cover all three, as AWS's own `rds`
+// endpoint does.
+// ---------------------------------------------------------------------------
+
+/// One CA certificate the service publishes for a DB instance's TLS endpoint.
+///
+/// Source: the certificate authorities Amazon RDS publishes in "Using SSL/TLS to
+/// encrypt a connection to a DB instance" (Amazon RDS User Guide) and reports through
+/// `DescribeCertificates`. AWS publishes a validity DATE for each, not a time of day, so
+/// the instants below are that date at midnight UTC. `Thumbprint` is deliberately absent
+/// rather than invented: it is the fingerprint of a certificate this emulator does not
+/// hold.
+#[derive(Debug, Clone, Copy)]
+pub struct CaCertificate {
+    /// `Certificate$CertificateIdentifier` — "The unique key that identifies a
+    /// certificate."
+    pub identifier: &'static str,
+    /// `Certificate$CertificateType` — the type AWS reports for every published CA.
+    pub certificate_type: &'static str,
+    /// `Certificate$ValidFrom`, as an ISO-8601 instant.
+    pub valid_from: &'static str,
+    /// `Certificate$ValidTill`, as an ISO-8601 instant.
+    pub valid_till: &'static str,
+}
+
+impl CaCertificate {
+    /// This catalog entry as the modelled `Certificate`, with the ARN scoped to the
+    /// region the request was signed for.
+    pub fn to_wire(&self, region: &str) -> Certificate {
+        Certificate {
+            certificate_identifier: Some(self.identifier.to_string()),
+            certificate_type: Some(self.certificate_type.to_string()),
+            thumbprint: None,
+            valid_from: catalog_instant(self.valid_from),
+            valid_till: catalog_instant(self.valid_till),
+            certificate_arn: Some(emulator_server::emulator_arn(
+                ARN_NAMESPACE,
+                region,
+                &format!("cert:{}", self.identifier),
+            )),
+            // No account-level override is set: this emulator has no
+            // `ModifyCertificates` call behind it, so the default is the published one.
+            customer_override: Some(false),
+            customer_override_valid_till: None,
+        }
+    }
+}
+
+/// Every CA certificate `DescribeCertificates` reports. See [`CaCertificate`] for the
+/// source; the expired `rds-ca-2019` is included because AWS still reports it.
+pub const CA_CERTIFICATES: &[CaCertificate] = &[
+    CaCertificate {
+        identifier: "rds-ca-2019",
+        certificate_type: "CA",
+        valid_from: "2019-08-22T00:00:00Z",
+        valid_till: "2024-08-22T00:00:00Z",
+    },
+    CaCertificate {
+        identifier: "rds-ca-ecc384-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-25T00:00:00Z",
+        valid_till: "2121-05-25T00:00:00Z",
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa2048-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-25T00:00:00Z",
+        valid_till: "2061-05-25T00:00:00Z",
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa4096-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-25T00:00:00Z",
+        valid_till: "2121-05-25T00:00:00Z",
+    },
+];
+
+/// The certificate a DB instance created without one gets:
+/// `CertificateMessage$DefaultCertificateForNewLaunches` — "The default root CA for new
+/// DB instances", which Amazon RDS publishes as `rds-ca-rsa2048-g1`.
+pub const DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES: &str = "rds-ca-rsa2048-g1";
+
+/// One of the catalogs' fixed ISO-8601 instants as the modelled timestamp shapes carry
+/// it.
+///
+/// The input is a literal in this file, never caller data, so a value that is not an
+/// instant is a typo in the catalog above: it panics at the first read rather than
+/// silently dropping `ValidFrom`/`ValidTill` from the response.
+fn catalog_instant(iso: &str) -> Option<::aws_smithy_types::DateTime> {
+    Some(
+        ::aws_smithy_types::DateTime::from_str(iso, ::aws_smithy_types::date_time::Format::DateTime)
+            .expect("every catalog instant in this file is an ISO-8601 literal"),
+    )
+}
+
+/// The event source types and their categories, as `DescribeEventCategories` reports
+/// them.
+///
+/// The source types are the valid values documented on
+/// `DescribeEventCategoriesMessage$SourceType` ("`db-instance` | `db-cluster` |
+/// `db-parameter-group` | `db-security-group` | `db-snapshot` | `db-cluster-snapshot` |
+/// `db-proxy`"), in that order; the categories of each are the ones published in "Amazon
+/// RDS event categories and event messages" (Amazon RDS User Guide).
+///
+/// The model's `SourceType` enum (`smithy_query(query="shape",shape="SourceType")`)
+/// carries four further values — `custom-engine-version`, `blue-green-deployment`,
+/// `db-shard-group` and `zero-etl` — which this member's own documentation does not list
+/// and whose published categories this emulator does not have. It publishes no map for
+/// them rather than an invented one, and a request naming one is refused with the code a
+/// value this parameter does not accept gets, naming the set it is not in.
+pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
+    (
+        "db-instance",
+        &[
+            "availability",
+            "backup",
+            "configuration change",
+            "creation",
+            "deletion",
+            "failover",
+            "failure",
+            "low storage",
+            "maintenance",
+            "notification",
+            "read replica",
+            "recovery",
+            "restoration",
+            "security patching",
+        ],
+    ),
+    (
+        "db-cluster",
+        &[
+            "configuration change",
+            "creation",
+            "deletion",
+            "failover",
+            "failure",
+            "global-failover",
+            "maintenance",
+            "notification",
+        ],
+    ),
+    ("db-parameter-group", &["configuration change"]),
+    ("db-security-group", &["configuration change", "failure"]),
+    (
+        "db-snapshot",
+        &["creation", "deletion", "notification", "restoration"],
+    ),
+    ("db-cluster-snapshot", &["backup"]),
+    (
+        "db-proxy",
+        &["configuration change", "creation", "deletion", "failure"],
+    ),
+];
+
+/// The event categories of `source_type`, or `None` when it names no published source
+/// type. Matching is exact: the documented values are all lowercase.
+pub fn event_categories_of(source_type: &str) -> Option<&'static [&'static str]> {
+    EVENT_CATEGORIES
+        .iter()
+        .find(|(published, _)| *published == source_type)
+        .map(|(_, categories)| *categories)
+}
+
+/// The published event source types, comma-separated — what a refusal names as the set a
+/// rejected `SourceType` is not in.
+pub fn event_source_types() -> String {
+    EVENT_CATEGORIES
+        .iter()
+        .map(|(source_type, _)| *source_type)
+        .collect::<Vec<&str>>()
+        .join(", ")
+}
+
+/// One source type's categories as the modelled `EventCategoriesMap`.
+pub fn event_categories_to_wire(source_type: &str, categories: &[&str]) -> EventCategoriesMap {
+    EventCategoriesMap {
+        source_type: Some(source_type.to_string()),
+        event_categories: Some(
+            categories
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
+        ),
+    }
+}
+

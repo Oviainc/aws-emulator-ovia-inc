@@ -11,17 +11,23 @@
 //! the server-derived members of a stored record — two copies of that logic would let a
 //! Get disagree with the Create that wrote the record.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
+use ::aws_smithy_types::DateTime;
+
 use crate::ops::types::{
-    ConflictException, DependencyConfig, Goal, GroupingAttributeDefinition,
-    GroupingConfiguration, Interval, MetricDataQuery, MetricSource,
-    MonitoredRequestCountMetricDataQueries, RequestBasedServiceLevelIndicator,
-    RequestBasedServiceLevelIndicatorConfig, RequestBasedServiceLevelIndicatorMetric,
-    ResourceNotFoundException, RollingInterval, ServiceLevelIndicator,
-    ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric, ServiceLevelObjective,
-    ServiceLevelObjectiveSummary,
+    ConflictException, DependencyConfig, Goal, GroupingAttributeDefinition, GroupingConfiguration,
+    Interval, MetricDataQuery, MetricSource, MonitoredRequestCountMetricDataQueries,
+    RequestBasedServiceLevelIndicator, RequestBasedServiceLevelIndicatorConfig,
+    RequestBasedServiceLevelIndicatorMetric, ResourceNotFoundException, RollingInterval,
+    ServiceLevelIndicator, ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric,
+    ServiceLevelObjective, ServiceLevelObjectiveSummary,
+};
+// The shapes the time-ranged topology reads project, on their own `use` so this set and the
+// SLO lifecycle's above are edited on separate lines.
+use crate::ops::types::{
+    MetricReference, Service, ServiceDependency, ServiceDependent, ServiceOperation,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace
@@ -67,6 +73,11 @@ pub const MAX_SLO_PAGE: i32 = 50;
 /// caller, since nothing else in the create path evicts or expires a record.
 pub const MAX_SLOS: usize = 2_000;
 
+/// The largest page `ListAuditFindings` returns when the caller names no `MaxResults`.
+/// Model doc for the member: "The maximum number of audit findings to return in one
+/// operation. If you omit this parameter, the default of 10 is used."
+pub const DEFAULT_AUDIT_FINDING_PAGE: i32 = 10;
+
 /// `Goal.Interval` when omitted. Model doc: "If you omit this parameter, a rolling
 /// interval of 7 days is used."
 const DEFAULT_ROLLING_INTERVAL_DURATION: i32 = 7;
@@ -94,6 +105,17 @@ const DEFAULT_SLI_COMPARISON_OPERATOR: &str = "LessThan";
 /// in an SLO name (the modelled `ServiceLevelObjectiveName` pattern admits only
 /// `[-._0-9A-Za-z ]`), so the prefix can never be mistaken for part of the cursor.
 const NEXT_TOKEN_TAG: &str = "slos/1/";
+
+/// The [`NEXT_TOKEN_TAG`] of each time-ranged topology read. One tag per operation, so a
+/// token one of them issued is not read as a cursor by another: the offsets they count are
+/// into different projections, and honouring a foreign one would silently skip entries.
+pub const SERVICE_OPERATIONS_TOKEN_TAG: &str = "service-operations/1/";
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServiceDependencies`.
+pub const SERVICE_DEPENDENCIES_TOKEN_TAG: &str = "service-dependencies/1/";
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServiceDependents`.
+pub const SERVICE_DEPENDENTS_TOKEN_TAG: &str = "service-dependents/1/";
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListAuditFindings`.
+pub const AUDIT_FINDINGS_TOKEN_TAG: &str = "audit-findings/1/";
 
 /// Per-service state for com-amazonaws-applicationsignals-applicationsignals. A handler reaches it through [`service_state`].
 ///
@@ -673,7 +695,7 @@ pub const STATE_UNAVAILABLE: &str = "Application Signals state is unavailable";
 /// the last SLO name the previous page returned, which the next call resolves against the
 /// ordered store as an exclusive cursor.
 pub fn encode_next_token(last_name: &str) -> String {
-    ::hex::encode(format!("{NEXT_TOKEN_TAG}{last_name}"))
+    encode_cursor(NEXT_TOKEN_TAG, last_name)
 }
 
 /// The cursor a `NextToken` carries, or `None` when the token is not one this service
@@ -681,10 +703,54 @@ pub fn encode_next_token(last_name: &str) -> String {
 /// carries no [`NEXT_TOKEN_TAG`], so a forged token is refused rather than honoured as a
 /// page boundary.
 pub fn decode_next_token(token: &str) -> Option<String> {
+    decode_cursor(NEXT_TOKEN_TAG, token)
+}
+
+/// A `NextToken` carrying `cursor` under `tag`: hex, so the caller reads it as the opaque
+/// value the model documents rather than as a store key it could edit.
+pub fn encode_cursor(tag: &str, cursor: &str) -> String {
+    ::hex::encode(format!("{tag}{cursor}"))
+}
+
+/// The cursor `token` carries under `tag`, or `None` when it is not a token this service
+/// issued under that tag.
+pub fn decode_cursor(tag: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(NEXT_TOKEN_TAG)
-        .map(ToString::to_string)
+    decoded.strip_prefix(tag).map(ToString::to_string)
+}
+
+/// One page of a derived projection, plus the token for the page after it.
+///
+/// The projections the time-ranged topology reads page over are DERIVED (they are
+/// recomputed from the stored SLOs on every call) rather than stored, so a cursor into them
+/// is an offset into their deterministic order, not a key of a stored record. Each read
+/// passes its own [`SERVICE_OPERATIONS_TOKEN_TAG`]-style tag, so a token is only ever
+/// resolved against the projection that issued it; `Err` carries the refusal message for a
+/// token that is not one this service issued under that tag.
+pub fn page_of<T>(
+    items: Vec<T>,
+    tag: &str,
+    token: Option<&str>,
+    page_size: usize,
+) -> Result<(Vec<T>, Option<String>), String> {
+    // A page of nothing could not advance its own cursor, so a caller following `NextToken`
+    // would loop for ever. Every caller's `MaxResults` is modelled with a minimum of 1, so
+    // this only ever clamps a bound no request can state.
+    let page_size = page_size.max(1);
+    let offset = match token {
+        None => 0,
+        Some(token) => decode_cursor(tag, token)
+            .and_then(|cursor| cursor.parse::<usize>().ok())
+            .ok_or_else(|| format!("NextToken `{token}` is not a token this service issued"))?,
+    };
+    let mut page: Vec<T> = items.into_iter().skip(offset).collect();
+    let next_token = if page.len() > page_size {
+        page.truncate(page_size);
+        Some(encode_cursor(tag, &offset.saturating_add(page_size).to_string()))
+    } else {
+        None
+    };
+    Ok((page, next_token))
 }
 
 /// Whether `candidate` holds every entry of `filter` with the same value.
@@ -712,4 +778,300 @@ pub fn same_dependency(left: Option<&DependencyConfig>, right: &DependencyConfig
         left.dependency_operation_name == right.dependency_operation_name
             && left.dependency_key_attributes == right.dependency_key_attributes
     })
+}
+
+// =============================================================================
+// The time range every time-ranged read takes
+// =============================================================================
+
+/// The refusal a `StartTime`/`EndTime` pair earns, or `None` when the range is one this
+/// service serves.
+///
+/// Every operation that takes the pair documents it as a period to report over
+/// (`smithy_query(query="operation", operation="GetService")`: both members `@required`),
+/// and a period runs forwards: the real service refuses an inverted one with
+/// `ValidationException` and states the rule with both offending instants in it. The
+/// instants are rendered the way the service states them — the `Date.toString` form, in
+/// UTC — so the message names the times the request carried rather than a re-encoding the
+/// caller never sent.
+///
+/// The comparison is STRICT, because that is the rule the message states: a window whose
+/// start equals its end spans no time at all, so it is refused with the same wording as an
+/// inverted one rather than reporting over an empty period.
+pub fn time_range_refusal(start_time: &DateTime, end_time: &DateTime) -> Option<String> {
+    if start_time.as_secs_f64() < end_time.as_secs_f64() {
+        return None;
+    }
+    Some(format!(
+        "Invalid start time {} and end time {} provided: start time must be before end time",
+        stated_instant(start_time),
+        stated_instant(end_time),
+    ))
+}
+
+/// One instant as this service states it in a refusal: `EEE MMM dd HH:mm:ss UTC yyyy`
+/// (`Sun Sep 06 02:00:00 UTC 2026`), the `java.util.Date` rendering of a UTC instant.
+///
+/// The calendar conversion is the LIBRARY's: `DateTime::fmt(Format::DateTime)` renders the
+/// instant as RFC-3339 (`2026-09-06T02:00:00Z`) and this only reorders those already-correct
+/// fields and names the month, so no leap-year or era arithmetic is re-derived here. The
+/// weekday is not part of that rendering, and it needs no calendar either: day zero of the
+/// epoch — 1970-01-01 — was a Thursday, so it is the day count modulo 7.
+///
+/// An instant the library cannot render at all is stated as its epoch-second value, so the
+/// message still names the instant the request carried.
+fn stated_instant(at: &DateTime) -> String {
+    /// Indexed by the epoch day count modulo 7, which is 0 on Thursday 1970-01-01.
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    /// The month abbreviations `Date.toString` uses, in month order.
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let Ok(rendered) = at.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
+        return at.as_secs_f64().to_string();
+    };
+    // `<date>T<time>Z`, where the time may carry a fractional part the `Date` form omits.
+    let Some((date, time)) = rendered.split_once('T') else {
+        return rendered;
+    };
+    let mut fields = date.split('-');
+    let (Some(year), Some(month), Some(day)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return rendered;
+    };
+    let hour_minute_second = time.trim_end_matches('Z');
+    let hour_minute_second = hour_minute_second
+        .split_once('.')
+        .map_or(hour_minute_second, |(whole, _)| whole);
+    let Some(month) = month
+        .parse::<usize>()
+        .ok()
+        .and_then(|month| MONTHS.get(month.wrapping_sub(1)))
+    else {
+        return rendered;
+    };
+    let weekday = WEEKDAYS[at.secs().div_euclid(86_400).rem_euclid(7) as usize];
+    format!("{weekday} {month} {day} {hour_minute_second} UTC {year}")
+}
+
+// =============================================================================
+// The service topology the stored SLOs are evidence of
+// =============================================================================
+
+/// Whether a stored SLO is evidence of the entity it monitors over the requested window.
+///
+/// An SLO monitors its entity from the moment it is created until it is deleted, so the
+/// period it is evidence for is `[CreatedTime, now]`, and the two periods overlap exactly
+/// when the window does not END before the SLO existed and does not BEGIN after now. So a
+/// read over a past window reports an entity the account has only just started monitoring
+/// as absent, and a window entirely in the future observes nothing at all.
+fn monitored_in_window(
+    slo: &ServiceLevelObjective,
+    window_start: &DateTime,
+    window_end: &DateTime,
+) -> bool {
+    slo.created_time.as_secs_f64() <= window_end.as_secs_f64() && window_has_begun(window_start)
+}
+
+/// Whether a window has begun: nothing has been observed in one that starts after now,
+/// however far ahead it ends.
+fn window_has_begun(window_start: &DateTime) -> bool {
+    window_start.as_secs_f64() <= DateTime::from(::std::time::SystemTime::now()).as_secs_f64()
+}
+
+/// A dedup/order key for one `Attributes` map: its entries in key order. Used only to
+/// order and deduplicate derived topology entries, never put on the wire.
+fn attribute_key(attributes: &HashMap<String, String>) -> String {
+    attributes
+        .iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .map(|(key, value)| format!("{key}\u{1f}{value}"))
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+/// The `MetricReference`s this emulator can report for a discovered entity: NONE.
+///
+/// A `MetricReference` identifies a CloudWatch metric by three `@required` members —
+/// `Namespace`, `MetricName` and `MetricType` — and Application Signals fills them from its
+/// own standard-metric catalogue: which metric of which namespace it collects for an
+/// entity, under which metric type and dimension set. This emulator cannot compute that
+/// catalogue, and no stored record states it either: an SLO's
+/// `ServiceLevelIndicatorMetric.MetricType` reports a standard metric only for an SLO that
+/// names NO metric of its own ([`reported_metric_type`]), which is precisely the SLO that
+/// names no namespace or metric name to report beside it. So the list stays EMPTY rather
+/// than reporting a metric nothing selected — the same choice [`sli_from_config`] makes for
+/// `SliMetric.MetricDataQueries`.
+///
+/// Single-homed here so the four topology reads cannot differ on it, and so this reasoning
+/// is stated once.
+fn no_metric_references() -> Vec<MetricReference> {
+    Vec::new()
+}
+
+impl ComAmazonawsApplicationsignalsApplicationsignalsState {
+    /// Every stored SLO that monitors the entity `key_attributes` identifies, over a window
+    /// ending at `window_end`.
+    ///
+    /// The requested attributes identify the entity, and an entity is identified by as few
+    /// as one of its up to four `Attributes` entries, so an SLO matches when its own entity
+    /// attributes hold every entry the request named ([`attributes_contain`] — the same
+    /// match `ListServiceLevelObjectives` already applies to the same member).
+    fn monitoring<'a>(
+        &'a self,
+        key_attributes: &'a HashMap<String, String>,
+        window_start: &'a DateTime,
+        window_end: &'a DateTime,
+    ) -> impl Iterator<Item = &'a ServiceLevelObjective> + 'a {
+        self.slos.values().filter(move |slo| {
+            monitored_in_window(slo, window_start, window_end)
+                && attributes_contain(entity_of(slo).key_attributes.as_ref(), key_attributes)
+        })
+    }
+
+    /// The entity `key_attributes` identifies, as `GetService` reports it over the window.
+    ///
+    /// The reported key attributes are the fullest set this emulator holds for the entity —
+    /// the request's own when it holds none, since the attributes ARE the entity's identity
+    /// and the caller named it. So an entity no stored SLO monitors is reported by its
+    /// identity alone rather than refused: Application Signals identifies an entity by its
+    /// key attributes rather than by a stored resource id, and this read reports what it
+    /// observed for that identity.
+    ///
+    /// `MetricReferences` is empty for the reason stated on [`no_metric_references`].
+    /// `AttributeMaps`, `ServiceGroups` and `LogGroupReferences` stay absent: they are
+    /// platform, grouping and log-group facts the real service learns from the telemetry an
+    /// instrumented application sends it, which this emulator never receives.
+    pub fn observed_service(
+        &self,
+        key_attributes: &HashMap<String, String>,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Service {
+        let mut reported = key_attributes.clone();
+        for slo in self.monitoring(key_attributes, window_start, window_end) {
+            if let Some(observed) = entity_of(slo).key_attributes {
+                if observed.len() > reported.len() {
+                    reported = observed;
+                }
+            }
+        }
+        Service {
+            key_attributes: reported,
+            attribute_maps: None,
+            service_groups: None,
+            metric_references: no_metric_references(),
+            log_group_references: None,
+        }
+    }
+
+    /// The operations of the entity `key_attributes` identifies, in name order: one entry
+    /// per distinct operation the stored SLOs name on it.
+    pub fn observed_operations(
+        &self,
+        key_attributes: &HashMap<String, String>,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Vec<ServiceOperation> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for slo in self.monitoring(key_attributes, window_start, window_end) {
+            if let Some(name) = entity_of(slo).operation_name {
+                names.insert(name);
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| ServiceOperation {
+                name,
+                metric_references: no_metric_references(),
+            })
+            .collect()
+    }
+
+    /// The dependencies of the entity `key_attributes` identifies: one entry per distinct
+    /// edge the stored SLOs record from one of its operations to an operation of another
+    /// entity.
+    ///
+    /// An SLO that names a dependency but no operation of its own records no edge: the
+    /// modelled `ServiceDependency` states the edge as "the operation in this service that
+    /// calls the dependency" (`OperationName`, `@required`), so without it there is no edge
+    /// to report.
+    pub fn observed_dependencies(
+        &self,
+        key_attributes: &HashMap<String, String>,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Vec<ServiceDependency> {
+        let mut by_edge: BTreeMap<String, ServiceDependency> = BTreeMap::new();
+        for slo in self.monitoring(key_attributes, window_start, window_end) {
+            let entity = entity_of(slo);
+            let (Some(operation_name), Some(dependency)) =
+                (entity.operation_name, entity.dependency_config)
+            else {
+                continue;
+            };
+            by_edge
+                .entry(format!(
+                    "{operation_name}\u{1d}{}\u{1d}{}",
+                    attribute_key(&dependency.dependency_key_attributes),
+                    dependency.dependency_operation_name,
+                ))
+                .or_insert_with(|| ServiceDependency {
+                    operation_name,
+                    dependency_key_attributes: dependency.dependency_key_attributes,
+                    dependency_operation_name: dependency.dependency_operation_name,
+                    metric_references: no_metric_references(),
+                });
+        }
+        by_edge.into_values().collect()
+    }
+
+    /// The dependents of the entity `key_attributes` identifies: the inverse of
+    /// [`Self::observed_dependencies`], one entry per distinct edge the stored SLOs record
+    /// from another entity INTO one of this entity's operations.
+    ///
+    /// `OperationName` is the operation of the named entity that was invoked (the
+    /// dependency operation the edge points at), and `DependentOperationName` the operation
+    /// of the dependent that invoked it — which an SLO that names no operation of its own
+    /// leaves absent, as the model allows.
+    pub fn observed_dependents(
+        &self,
+        key_attributes: &HashMap<String, String>,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Vec<ServiceDependent> {
+        let mut by_edge: BTreeMap<String, ServiceDependent> = BTreeMap::new();
+        for slo in self
+            .slos
+            .values()
+            .filter(|slo| monitored_in_window(slo, window_start, window_end))
+        {
+            let entity = entity_of(slo);
+            let Some(dependency) = entity.dependency_config else {
+                continue;
+            };
+            if !attributes_contain(Some(&dependency.dependency_key_attributes), key_attributes) {
+                continue;
+            }
+            let Some(dependent_key_attributes) = entity.key_attributes else {
+                continue;
+            };
+            by_edge
+                .entry(format!(
+                    "{}\u{1d}{}\u{1d}{}",
+                    attribute_key(&dependent_key_attributes),
+                    entity.operation_name.clone().unwrap_or_default(),
+                    dependency.dependency_operation_name,
+                ))
+                .or_insert_with(|| ServiceDependent {
+                    operation_name: Some(dependency.dependency_operation_name),
+                    dependent_key_attributes,
+                    dependent_operation_name: entity.operation_name,
+                    metric_references: no_metric_references(),
+                });
+        }
+        by_edge.into_values().collect()
+    }
 }

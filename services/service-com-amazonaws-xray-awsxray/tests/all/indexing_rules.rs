@@ -2,10 +2,10 @@
 
 //! Indexing rules, end to end over the wire.
 //!
-//! Every case drives the same front door the production router does: a
-//! `MultiServiceRouter` with this service mounted, addressed by the `xray`
-//! endpoint host, speaking restJson1 — so the assertions are about HTTP
-//! responses, never about internal state.
+//! Every case drives the same front door the production router does (the `Xray`
+//! harness in [`super::xray_wire`]: a `MultiServiceRouter` with this service
+//! mounted, addressed by the `xray` endpoint host, speaking restJson1) — so the
+//! assertions are about HTTP responses, never about internal state.
 //!
 //! The rules under test, each checked over a table whose rows differ along what
 //! the rule generalises over (the configured percentage, the rule name, the
@@ -29,10 +29,9 @@
 //! * `IndexingRule$ModifiedAt` is whole epoch seconds, stable across reads, and
 //!   moves forward only when the rule is modified.
 
-use std::sync::Arc;
+use serde_json::Value;
 
-use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use crate::xray_wire::{Answer, Xray};
 
 /// The rule name every account holds, from `crate::state::DEFAULT_INDEXING_RULE_NAME`.
 const DEFAULT_RULE: &str = "Default";
@@ -40,78 +39,6 @@ const DEFAULT_RULE: &str = "Default";
 /// The `DesiredSamplingPercentage` the `Default` rule carries until it is
 /// updated, from `crate::state::DEFAULT_INDEXING_SAMPLING_PERCENTAGE`.
 const DEFAULT_PERCENTAGE: f64 = 1.0;
-
-/// One emulator with a fresh store.
-struct Xray {
-    router: MultiServiceRouter,
-}
-
-/// What one call answered.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    /// restJson1 resolves an error shape from `x-amzn-errortype`.
-    error_type: Option<String>,
-    body: Value,
-}
-
-impl Xray {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.register_service(service_com_amazonaws_xray_awsxray::EmulatedService::new(
-            engine,
-        ));
-        // These tests exercise handlers, not SigV4; the signing name still has
-        // to route, which the `Host` header below does.
-        router.set_request_authentication(false);
-        Self { router }
-    }
-
-    async fn call(&self, path: &str, body: &Value) -> Answer {
-        let request = ::http::Request::builder()
-            .method("POST")
-            .uri(format!("https://xray.us-east-1.amazonaws.com{path}"))
-            .header("host", "xray.us-east-1.amazonaws.com")
-            .header("content-type", "application/json")
-            .body(::bytes::Bytes::from(body.to_string()))
-            .expect("the request builds");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_type = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-        Answer {
-            status,
-            error_type,
-            body,
-        }
-    }
-
-    /// `GetIndexingRules`, with `NextToken` sent only when `token` is `Some`.
-    async fn get_rules(&self, token: Option<&str>) -> Answer {
-        let mut body = json!({});
-        if let Some(token) = token {
-            body["NextToken"] = json!(token);
-        }
-        self.call("/GetIndexingRules", &body).await
-    }
-
-    /// `UpdateIndexingRule` with a probabilistic configuration.
-    async fn update_rule(&self, name: &str, percentage: f64) -> Answer {
-        self.call(
-            "/UpdateIndexingRule",
-            &json!({
-                "Name": name,
-                "Rule": { "Probabilistic": { "DesiredSamplingPercentage": percentage } },
-            }),
-        )
-        .await
-    }
-}
 
 /// The single `IndexingRule` a successful listing carries.
 fn only_rule(answer: &Answer, case: &str) -> Value {

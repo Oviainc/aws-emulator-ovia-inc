@@ -13,17 +13,35 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AuthenticationSummary, NetworkAccessConfiguration, ResourceNotFoundException, VpcConfiguration,
-    WorkspaceDescription, WorkspaceSummary,
+    AuthenticationDescription, AuthenticationSummary, AwsSsoAuthentication,
+    NetworkAccessConfiguration, ResourceNotFoundException, SamlAuthentication, SamlConfiguration,
+    ValidationException, ValidationExceptionField, VpcConfiguration, WorkspaceDescription,
+    WorkspaceSummary,
 };
+
+/// The Grafana versions this emulator supports, OLDEST FIRST.
+///
+/// This is the emulator's single statement of the supported set: the catalogue
+/// `ListVersions` publishes ("Lists available versions of Grafana. These are
+/// available when calling CreateWorkspace") and the one
+/// [`DEFAULT_GRAFANA_VERSION`] reads "latest" off. The entries are the major
+/// versions Amazon Managed Grafana names in this service's own model docs —
+/// `CreateWorkspaceRequest$grafanaVersion` ("defaults to the latest version (for
+/// example, 10.4)") and `UpdateWorkspaceConfigurationRequest$grafanaVersion`
+/// ("Can only be used to upgrade (for example, from 8.4 to 9.4)").
+///
+/// Oldest first is what makes the slice its own total order, so a `ListVersions`
+/// page can be cut at any index and resumed from the version its `nextToken`
+/// names.
+pub const SUPPORTED_GRAFANA_VERSIONS: &[&str] = &["8.4", "9.4", "10.4"];
 
 /// The Grafana version a workspace runs when `CreateWorkspace` names none.
 ///
 /// `CreateWorkspaceRequest$grafanaVersion` documents the default as "the latest
-/// version (for example, 10.4)". `ListVersions`, which publishes the supported
-/// set, is still a stub, so this constant is the emulator's single statement of
-/// what "latest" is.
-pub const DEFAULT_GRAFANA_VERSION: &str = "10.4";
+/// version (for example, 10.4)", so it is the newest entry of
+/// [`SUPPORTED_GRAFANA_VERSIONS`] rather than a second, independent constant.
+pub const DEFAULT_GRAFANA_VERSION: &str =
+    SUPPORTED_GRAFANA_VERSIONS[SUPPORTED_GRAFANA_VERSIONS.len() - 1];
 
 /// The workspace configuration stored when `CreateWorkspace` names none.
 ///
@@ -35,6 +53,22 @@ pub const DEFAULT_WORKSPACE_CONFIGURATION: &str = "{}";
 /// SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The `AuthenticationProviderTypes` value naming SAML 2.0 authentication, one
+/// of the two that enum admits (`AWS_SSO`, `SAML`).
+pub const SAML_PROVIDER: &str = "SAML";
+
+/// The `AuthenticationProviderTypes` value naming IAM Identity Center
+/// authentication.
+pub const AWS_SSO_PROVIDER: &str = "AWS_SSO";
+
+/// `SamlConfigurationStatus$CONFIGURED`: "SAML on an AMG workspace is enabled
+/// and has been configured".
+pub const SAML_CONFIGURED: &str = "CONFIGURED";
+
+/// `SamlConfigurationStatus$NOT_CONFIGURED`: "SAML on an AMG workspace is
+/// enabled but has not been configured".
+pub const SAML_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
+
 /// The `resourceType` a `ResourceNotFoundException` reports for a workspace id
 /// that names no workspace.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "Workspace";
@@ -43,6 +77,32 @@ pub const WORKSPACE_RESOURCE_TYPE: &str = "Workspace";
 /// request names no `maxResults`: `ListWorkspacesRequest$maxResults` is modelled
 /// `@range(min: 1, max: 100)`.
 pub const WORKSPACE_PAGE_LIMIT: i32 = 100;
+
+/// The largest page `ListVersions` serves, and the page size it uses when the
+/// request names no `maxResults`: `ListVersionsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 100)`.
+pub const VERSION_PAGE_LIMIT: i32 = 100;
+
+/// The most tags one resource holds.
+///
+/// `TagMap` is modelled `@length(max: 50)`, so a single request can carry 50 tag
+/// pairs; the same bound is what a tagged resource can hold, and `TagResource`
+/// refuses a request that would take a workspace past it.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The shortest `TagKey` the model admits: `@length(min: 1, max: 128)`.
+pub const MIN_TAG_KEY_LENGTH: usize = 1;
+
+/// The longest `TagKey` the model admits: `@length(min: 1, max: 128)`.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The largest `TagValue` the model admits: `@length(min: 0, max: 256)`, so an
+/// empty value is a value and there is no lower bound to check.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// The resource-type segment of an Amazon Managed Grafana workspace ARN:
+/// `arn:aws:grafana:<region>:<account>:/workspaces/<workspace-id>`.
+pub const WORKSPACE_ARN_RESOURCE_TYPE: &str = "workspaces";
 
 /// How many workspaces the store holds before `CreateWorkspace` refuses with the
 /// modelled `ServiceQuotaExceededException`.
@@ -103,6 +163,12 @@ pub struct Workspace {
     /// The `OverridableConfigurationJson` document the workspace was created or
     /// updated with.
     pub configuration: String,
+    /// The SAML configuration stored for this workspace, if one has been
+    /// stored. `UpdateWorkspaceAuthentication` is the only operation that
+    /// carries a `samlConfiguration`, so this is unset until it is called —
+    /// which is what makes a SAML workspace's `samlConfigurationStatus`
+    /// `NOT_CONFIGURED` until then.
+    pub saml_configuration: Option<SamlConfiguration>,
     /// Set by `AssociateLicense`; unset until then.
     pub license_type: Option<String>,
     pub tags: BTreeMap<String, String>,
@@ -128,22 +194,70 @@ impl Workspace {
         self.pending = None;
     }
 
-    /// `AuthenticationSummary` for this workspace.
-    ///
-    /// `samlConfigurationStatus` reports "whether the workplace's user
-    /// authentication method is fully configured", so it is reported only for a
-    /// workspace that authenticates with SAML at all. A SAML configuration can
-    /// only arrive through `UpdateWorkspaceAuthentication`, which is still a
-    /// stub (its own gap issue), so a SAML workspace is never configured yet.
-    fn authentication(&self) -> AuthenticationSummary {
-        let uses_saml = self.authentication_providers.iter().any(|p| p == "SAML");
-        AuthenticationSummary {
-            providers: self.authentication_providers.clone(),
-            saml_configuration_status: uses_saml.then(|| "NOT_CONFIGURED".to_string()),
+    /// True when `provider` is one of this workspace's stored authentication
+    /// providers.
+    fn authenticates_with(&self, provider: &str) -> bool {
+        self.authentication_providers.iter().any(|p| p == provider)
+    }
+
+    /// `SamlConfigurationStatus` for this workspace: "whether the workspace's
+    /// SAML configuration is complete", which it is exactly once a SAML
+    /// configuration has been stored for it.
+    fn saml_configuration_status(&self) -> String {
+        if self.saml_configuration.is_some() {
+            SAML_CONFIGURED.to_string()
+        } else {
+            SAML_NOT_CONFIGURED.to_string()
         }
     }
 
-    fn tag_map(&self) -> HashMap<String, String> {
+    /// `AuthenticationSummary` for this workspace.
+    ///
+    /// `samlConfigurationStatus` reports whether the workspace's SAML
+    /// configuration is complete, so it is reported only for a workspace that
+    /// authenticates with SAML at all.
+    fn authentication(&self) -> AuthenticationSummary {
+        AuthenticationSummary {
+            providers: self.authentication_providers.clone(),
+            saml_configuration_status: self
+                .authenticates_with(SAML_PROVIDER)
+                .then(|| self.saml_configuration_status()),
+        }
+    }
+
+    /// The `AuthenticationDescription` `DescribeWorkspaceAuthentication` and
+    /// `UpdateWorkspaceAuthentication` return.
+    ///
+    /// `providers` is the stored provider list; `saml` describes "how this
+    /// workspace works with SAML" and `awsSso` "how this workspace works with
+    /// IAM Identity Center", so each is reported exactly when the workspace
+    /// authenticates with that provider.
+    pub fn to_authentication_description(&self) -> AuthenticationDescription {
+        AuthenticationDescription {
+            providers: self.authentication_providers.clone(),
+            saml: self
+                .authenticates_with(SAML_PROVIDER)
+                .then(|| SamlAuthentication {
+                    status: self.saml_configuration_status(),
+                    configuration: self.saml_configuration.clone(),
+                }),
+            aws_sso: self
+                .authenticates_with(AWS_SSO_PROVIDER)
+                .then_some(AwsSsoAuthentication {
+                    // `ssoClientId` is "the ID of the IAM Identity Center-managed
+                    // application that is created by Amazon Managed Grafana".
+                    // That application is minted in IAM Identity Center, which
+                    // this emulator does not model, so the optional member is
+                    // omitted rather than invented.
+                    sso_client_id: None,
+                }),
+        }
+    }
+
+    /// This workspace's tags, as the `TagMap` every operation that reports them
+    /// serialises: `WorkspaceDescription$tags`, `WorkspaceSummary$tags` and
+    /// `ListTagsForResourceResponse$tags` are all this one map.
+    pub fn tag_map(&self) -> HashMap<String, String> {
         self.tags
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -275,6 +389,38 @@ pub fn is_workspace_id(value: &str) -> bool {
     hex.len() == 10 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The sort key of a Grafana version: its dot-separated components as numbers.
+///
+/// A Grafana version is written `major.minor` (`GrafanaVersion` is otherwise an
+/// unconstrained 1..255 string), so the components must be compared as NUMBERS:
+/// byte order puts "10.4" before "9.4", which would report a newer version as
+/// older. A component that is not a number contributes 0, which keeps the key
+/// total over any string a workspace may carry.
+pub fn version_order(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|component| {
+            let digits: String = component.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// The versions a workspace running `current` can be upgraded to: the supported
+/// versions strictly newer than it, oldest first.
+///
+/// `UpdateWorkspaceConfigurationRequest$grafanaVersion` is what consumes this
+/// set — it "[c]an only be used to upgrade ..., not downgrade" — so the current
+/// version and every older one is not an upgrade target.
+pub fn upgrade_targets(current: &str) -> Vec<String> {
+    let current = version_order(current);
+    SUPPORTED_GRAFANA_VERSIONS
+        .iter()
+        .filter(|candidate| version_order(candidate) > current)
+        .map(|candidate| (*candidate).to_string())
+        .collect()
+}
+
 /// The region this request was signed for — what a workspace endpoint names.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
@@ -289,6 +435,87 @@ pub fn workspace_not_found(id: &str) -> ResourceNotFoundException {
         message: format!("Workspace {id} not found"),
         resource_id: id.to_string(),
         resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The workspace id the resource ARN `arn` names, or `None` when `arn` does not
+/// name a Grafana workspace at all.
+///
+/// The tagging operations take a `resourceArn` the model constrains no further
+/// than `String`, and the only resource Amazon Managed Grafana can tag is a
+/// workspace — so the ARN is accepted when it is an ARN of THIS service whose
+/// resource section is `workspaces/<workspace-id>` (the leading `/` the service's
+/// ARNs carry is optional here, since it separates nothing). The partition, the
+/// region and the account segments are not matched: this emulator serves one
+/// account, and the workspace id is what identifies the resource within it.
+pub fn workspace_id_in_arn(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    // The partition, region and account segments must be PRESENT (an ARN has
+    // six colon-separated fields) but are not matched against this request.
+    let _partition = fields.next()?;
+    if fields.next()? != "grafana" {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    let resource = resource.strip_prefix('/').unwrap_or(resource);
+    let (resource_type, id) = resource.split_once('/')?;
+    (resource_type == WORKSPACE_ARN_RESOURCE_TYPE && is_workspace_id(id)).then_some(id)
+}
+
+/// The modelled `ValidationException` for a tag whose key or value is outside the
+/// bounds `TagKey` / `TagValue` are modelled with, or `None` when the pair is
+/// within them.
+///
+/// The request-boundary validator refuses a modelled constraint on a member, but
+/// does not walk a map's KEY and VALUE constraints, so the handler that writes
+/// tags is what enforces these two. Lengths are counted in characters, as
+/// `@length` on a string is defined.
+pub fn out_of_bounds_tag(key: &str, value: &str) -> Option<ValidationException> {
+    let key_length = key.chars().count();
+    let value_length = value.chars().count();
+    let message = if !(MIN_TAG_KEY_LENGTH..=MAX_TAG_KEY_LENGTH).contains(&key_length) {
+        format!(
+            "tag key {key:?} is {key_length} characters long; a tag key is \
+             {MIN_TAG_KEY_LENGTH} to {MAX_TAG_KEY_LENGTH} characters"
+        )
+    } else if value_length > MAX_TAG_VALUE_LENGTH {
+        format!(
+            "the value of tag key {key:?} is {value_length} characters long; a tag \
+             value is at most {MAX_TAG_VALUE_LENGTH} characters"
+        )
+    } else {
+        return None;
+    };
+    Some(ValidationException {
+        message: message.clone(),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "tags".to_string(),
+            message,
+        }]),
+    })
+}
+
+/// The modelled `ValidationException` for a `resourceArn` that names no taggable
+/// Grafana resource.
+///
+/// `ValidationException$reason` is `FIELD_VALIDATION_FAILED`, and the field list
+/// names the member at fault, exactly as the other refusals in this service do.
+pub fn not_a_workspace_arn(arn: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{arn} is not the ARN of an Amazon Managed Grafana workspace"),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "resourceArn".to_string(),
+            message: format!(
+                "must be an ARN of the form arn:aws:grafana:<region>:<account>:/{WORKSPACE_ARN_RESOURCE_TYPE}/<workspaceId>"
+            ),
+        }]),
     }
 }
 

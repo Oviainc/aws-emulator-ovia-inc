@@ -211,6 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provider_name: input.provider_name,
             created_time: std::time::SystemTime::now(),
             tags,
+            // A new portfolio has no principal associated with it yet.
+            principals: std::collections::BTreeMap::new(),
         };
 
         let detail = portfolio.detail();

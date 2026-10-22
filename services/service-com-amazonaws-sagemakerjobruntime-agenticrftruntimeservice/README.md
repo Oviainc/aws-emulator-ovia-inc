@@ -105,3 +105,17 @@ State lives in the SINGLE shared engine, keyed by type. Reach it through
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
+
+## Known limitation: the job registry
+
+This service is a DATA plane: it serves rollouts of an AgenticRFT job that already
+exists, and models no operation that creates one, so `Sample` /
+`SampleWithResponseStream` refuse a `JobArn` the store does not hold with
+`400 ValidationException` ("Could not find job with jobArn …"), as the real service
+does. The store therefore seeds a fixture pair of job ARNs
+(`state::seed_job_arns`) standing in for the control-plane creation, and a test (or
+another in-process caller) adds its own with `state::register_job`.
+
+A job created through the emulated SageMaker control plane is NOT visible here yet:
+the control plane holds no AgentRFT job store to read. When it grows one, that store
+replaces the seed and `register_job` becomes the wiring point.

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFirewall
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFirewall`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFirewall::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED for VPC-attached firewalls: stores a `FirewallRecord`, associates it
+//! with an existing firewall policy, and reports the firewall and its status from
+//! that record. Transit gateway-attached and proxy-mode firewalls are not
+//! implemented and still answer 501.
 //!
 //! ## Shape of an operation
 //!
@@ -245,18 +240,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFirewall` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFirewallErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFirewall"))
+        // A transit gateway-attached firewall (`TransitGatewayId`,
+        // `AvailabilityZoneMappings`, `AvailabilityZoneChangeProtection`) and a
+        // proxy-mode one (`NoSourcePreservation`, `NatGatewayMappings`,
+        // `VpcEndpoint`, `ProxySettings`) are different resources with their own
+        // status and attachment models, and none of the operations that manage
+        // them is implemented. Answer "not written yet" rather than storing a
+        // half-built record — or, for a member this handler would otherwise drop,
+        // succeeding with the input ignored.
+        if input.transit_gateway_id.is_some()
+            || input.availability_zone_mappings.is_some()
+            || input.availability_zone_change_protection
+            || input.no_source_preservation
+            || input.nat_gateway_mappings.is_some()
+            || input.vpc_endpoint.is_some()
+            || input.proxy_settings.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateFirewall for a transit gateway-attached or proxy-mode firewall",
+            ));
+        }
+
+        let (Some(vpc_id), Some(subnet_mappings)) = (input.vpc_id, input.subnet_mappings) else {
+            return Err(CreateFirewallErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "VpcId and SubnetMappings are both required to create a firewall."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        if subnet_mappings.is_empty() {
+            return Err(CreateFirewallErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some("SubnetMappings must name at least one subnet.".to_string()),
+                },
+            )
+            .into());
+        }
+        // One firewall endpoint per Availability Zone, so one subnet may appear
+        // only once: `Firewall$SubnetMappings` documents that "each must belong to
+        // a different Availability Zone".
+        let mut seen_subnets = ::std::collections::HashSet::new();
+        for mapping in &subnet_mappings {
+            if !seen_subnets.insert(mapping.subnet_id.as_str()) {
+                return Err(CreateFirewallErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "SubnetMappings names subnet {} more than once.",
+                            mapping.subnet_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        if subnet_mappings.len() > crate::state::MAX_AVAILABILITY_ZONES {
+            return Err(CreateFirewallErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "A firewall can use at most {} subnets, one per Availability Zone.",
+                        crate::state::MAX_AVAILABILITY_ZONES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateFirewallErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the firewall store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        if state.firewalls.contains_key(&input.firewall_name) {
+            return Err(CreateFirewallErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(format!(
+                        "A firewall named {} already exists.",
+                        input.firewall_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The firewall policy must already exist: a firewall's
+        // `FirewallPolicyArn` is a reference to another resource, and the model
+        // classes "references an ARN that ... corresponds to a resource that
+        // isn't valid in the context of the request" as `InvalidRequestException`.
+        let Some(policy_name) = state
+            .firewall_policy_arn_index
+            .get(&input.firewall_policy_arn)
+            .cloned()
+        else {
+            return Err(CreateFirewallErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Firewall policy {} does not exist.",
+                        input.firewall_policy_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Bound what one caller can make this emulator retain: nothing else caps
+        // the number of stored firewalls, so a request past the ceiling is
+        // refused with the modelled `LimitExceededException` before the record is
+        // built or inserted.
+        if state.firewalls.len() >= crate::state::MAX_STORED_FIREWALLS {
+            return Err(CreateFirewallErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator holds the maximum of {} firewalls; delete one before \
+                         creating another.",
+                        crate::state::MAX_STORED_FIREWALLS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let sync_states = subnet_mappings
+            .iter()
+            .enumerate()
+            .map(|(index, mapping)| {
+                (
+                    crate::state::availability_zone_of(&region, index),
+                    crate::state::SyncStateRecord {
+                        subnet_id: mapping.subnet_id.clone(),
+                        endpoint_id: crate::state::new_endpoint_id(),
+                        attachment_status: crate::state::ATTACHMENT_CREATING.to_string(),
+                    },
+                )
+            })
+            .collect();
+        // The three protection members carry BOTH `@default false` and prose
+        // saying the create "initializes this setting to TRUE". The default is
+        // the normative one — it is what the wire contract makes an absent member
+        // mean, and what the SDKs send — so an omitted flag is stored as false and
+        // the response reports what was stored.
+        let record = crate::state::FirewallRecord {
+            firewall_arn: crate::state::firewall_arn(&region, &input.firewall_name),
+            firewall_name: input.firewall_name,
+            firewall_id: crate::state::new_uuid(),
+            firewall_policy_arn: input.firewall_policy_arn,
+            vpc_id,
+            subnet_mappings,
+            delete_protection: input.delete_protection,
+            subnet_change_protection: input.subnet_change_protection,
+            firewall_policy_change_protection: input.firewall_policy_change_protection,
+            description: input.description,
+            tags: input.tags,
+            encryption_configuration: input.encryption_configuration,
+            enabled_analysis_types: input.enabled_analysis_types,
+            status: crate::state::FIREWALL_PROVISIONING.to_string(),
+            config_sync_state: crate::state::SYNC_IN_SYNC.to_string(),
+            sync_states,
+            update_token: crate::state::new_uuid(),
+            created_at: now,
+        };
+
+        let output = CreateFirewallOutput {
+            firewall: Some(record.to_firewall()),
+            firewall_status: Some(record.to_firewall_status()),
+        };
+
+        // `policy_name` came out of `firewall_policy_arn_index`, which is written
+        // in the same critical section as `firewall_policies`, so the record is
+        // always there; the assertion makes that invariant visible rather than
+        // letting a divergence silently skip the increment.
+        let policy = state.firewall_policies.get_mut(&policy_name);
+        debug_assert!(
+            policy.is_some(),
+            "firewall_policy_arn_index named {policy_name}, which firewall_policies does not hold"
+        );
+        if let Some(policy) = policy {
+            policy.number_of_associations += 1;
+        }
+        state
+            .firewall_arn_index
+            .insert(record.firewall_arn.clone(), record.firewall_name.clone());
+        state
+            .firewalls
+            .insert(record.firewall_name.clone(), record);
+
+        Ok(output)
     }
 }

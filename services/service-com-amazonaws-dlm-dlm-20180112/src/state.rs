@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    CrossRegionCopyTarget, Exclusions, LifecyclePolicy, LifecyclePolicySummary, PolicyDetails,
-    ResourceNotFoundException, Tag,
+    CreateRule, CrossRegionCopyTarget, Exclusions, InvalidRequestException, LifecyclePolicy,
+    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, Tag,
 };
 
 /// The region a policy ARN is built for when the request carries no SigV4
@@ -29,7 +29,32 @@ pub const ARN_NAMESPACE: &str = "dlm";
 
 /// The `ResourceType` a `ResourceNotFoundException` / `LimitExceededException`
 /// reports for a lifecycle policy — "the type of resource that was not found".
-pub const POLICY_RESOURCE_TYPE: &str = "policy";
+///
+/// `ResourceNotFoundException$ResourceType` is a WIRE token naming a kind of
+/// Amazon Data Lifecycle Manager resource, which is what lets a client tell a
+/// missing policy from another missing DLM resource; it is not prose and not an
+/// internal name. The lifecycle policy's token is `LIFECYCLE_POLICY`.
+pub const POLICY_RESOURCE_TYPE: &str = "LIFECYCLE_POLICY";
+
+/// The `Code` every `InvalidRequestException` this service answers carries.
+///
+/// `InvalidRequestException$Code` is the service's own error code for the
+/// exception class — the member a client branches on beside the shape name —
+/// and Amazon Data Lifecycle Manager answers `InvalidParameter` for a request
+/// whose parameters it refuses.
+pub const INVALID_PARAMETER_CODE: &str = "InvalidParameter";
+
+/// The `Code` every `ResourceNotFoundException` this service answers carries,
+/// by the same rule as [`INVALID_PARAMETER_CODE`].
+pub const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFound";
+
+/// The tag-key prefix AWS reserves for itself: a caller may not SET a tag whose
+/// key begins with it, in any case.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// How Amazon Data Lifecycle Manager states the refusal of a reserved tag key.
+pub const RESERVED_TAG_KEY_MESSAGE: &str =
+    "Invalid tag key. Customers cannot set tag keys starting with aws: (case insensitive)";
 
 /// The policy type a policy carries when `PolicyDetails$PolicyType` names none:
 /// "The default is `EBS_SNAPSHOT_MANAGEMENT`."
@@ -429,16 +454,17 @@ pub fn policy_arn(policy_id: &str, region: &str) -> String {
 
 /// The `ResourceNotFoundException` payload for policy ids that name no policy.
 ///
-/// `Code` is left unset: the model declares it, but no rule for its value is
-/// documented, and this emulator does not invent one.
+/// Every member the shape declares is reported: the `Code` for the exception
+/// class, the `ResourceType` token of the resource that was not found, the ids
+/// that named none, and a message naming the resource asked for.
 pub fn policies_not_found(ids: &[String]) -> ResourceNotFoundException {
     let message = match ids {
-        [one] => format!("Policy {one} could not be found."),
-        many => format!("Policies {} could not be found.", many.join(", ")),
+        [one] => format!("The resource {{{one}}} was not found."),
+        many => format!("The resources {{{}}} were not found.", many.join(", ")),
     };
     ResourceNotFoundException {
         message: Some(message),
-        code: None,
+        code: Some(RESOURCE_NOT_FOUND_CODE.to_string()),
         resource_type: Some(POLICY_RESOURCE_TYPE.to_string()),
         resource_ids: Some(ids.to_vec()),
     }
@@ -447,13 +473,133 @@ pub fn policies_not_found(ids: &[String]) -> ResourceNotFoundException {
 /// The `ResourceNotFoundException` payload for an ARN that names no policy.
 pub fn policy_not_found_by_arn(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Policy {arn} could not be found.")),
-        code: None,
+        message: Some(format!("The resource {{{arn}}} was not found.")),
+        code: Some(RESOURCE_NOT_FOUND_CODE.to_string()),
         resource_type: Some(POLICY_RESOURCE_TYPE.to_string()),
         // `ResourceIds` is "a list of resource IDs that were not found", and the
         // request named an ARN rather than an id that could be echoed here.
         resource_ids: None,
     }
+}
+
+/// The `InvalidRequestException` payload for a request this service refuses as
+/// invalid, carrying the `Code` of the exception class and `message`.
+///
+/// `RequiredParameters` ("the request omitted one or more required parameters")
+/// and `MutuallyExclusiveParameters` ("the request included parameters that
+/// cannot be provided together") are left unset: each names a class of refusal,
+/// so only the refusal of that class fills it — see
+/// [`parameters_cannot_be_combined`] and [`required_parameters_omitted`].
+pub fn invalid_request(message: String) -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(message),
+        code: Some(INVALID_PARAMETER_CODE.to_string()),
+        required_parameters: None,
+        mutually_exclusive_parameters: None,
+    }
+}
+
+/// The `InvalidRequestException` for a request that stated `parameters` which
+/// cannot be provided together.
+pub fn parameters_cannot_be_combined(
+    message: String,
+    parameters: Vec<String>,
+) -> InvalidRequestException {
+    InvalidRequestException {
+        mutually_exclusive_parameters: Some(parameters),
+        ..invalid_request(message)
+    }
+}
+
+/// The `InvalidRequestException` for a request that omitted `parameters` it is
+/// required to state.
+pub fn required_parameters_omitted(
+    message: String,
+    parameters: Vec<String>,
+) -> InvalidRequestException {
+    InvalidRequestException {
+        required_parameters: Some(parameters),
+        ..invalid_request(message)
+    }
+}
+
+/// The first tag key in `keys` that begins with the reserved [`aws:`
+/// prefix](RESERVED_TAG_KEY_PREFIX), or `None` when none does.
+///
+/// The prefix is reserved case-insensitively, so `AWS:`, `Aws:` and `aws:` are
+/// one and the same reservation.
+///
+/// A tag key is arbitrary caller-supplied text, so the prefix is compared on
+/// BYTES: a `&str` range index would panic on a key whose fourth byte falls
+/// inside a multi-byte character (`aws\u{e9}`), and a request must never be able
+/// to panic the handler. The reservation itself is ASCII, so a byte comparison
+/// decides it exactly.
+pub fn reserved_tag_key<'keys, I>(keys: I) -> Option<&'keys str>
+where
+    I: IntoIterator<Item = &'keys str>,
+{
+    keys.into_iter().find(|key| {
+        key.as_bytes()
+            .get(..RESERVED_TAG_KEY_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+    })
+}
+
+/// The `InvalidRequestException` for a tag key a caller may not set.
+pub fn reserved_tag_key_refused() -> InvalidRequestException {
+    invalid_request(RESERVED_TAG_KEY_MESSAGE.to_string())
+}
+
+/// How the first schedule in `details` whose `CreateRule` states when to create
+/// BOTH ways is named, or `None` when no schedule does.
+///
+/// `CreateRule` documents "You must specify either CronExpression, or Interval,
+/// IntervalUnit, and Times", so the cron form and the interval form are
+/// alternatives: a rule carrying a `CronExpression` beside any interval member
+/// states its schedule twice, and the two cannot be reconciled into one.
+///
+/// `Schedule$Name` is optional, so a schedule that carries none is named by its
+/// position in `Schedules` instead — what matters is that the caller can tell
+/// WHICH of its schedules to correct.
+pub fn schedule_with_conflicting_create_rule(details: Option<&PolicyDetails>) -> Option<String> {
+    details?
+        .schedules
+        .as_ref()?
+        .iter()
+        .enumerate()
+        .find(|(_, schedule)| {
+            schedule
+                .create_rule
+                .as_ref()
+                .is_some_and(create_rule_states_both_forms)
+        })
+        .map(|(position, schedule)| match schedule.name.as_deref() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            // 1-based, as a validation path numbers a list element.
+            _ => format!("Schedules[{}]", position + 1),
+        })
+}
+
+/// True when `rule` states its schedule as a cron expression AND as an interval.
+///
+/// `Interval`, `IntervalUnit` and `Times` are the three members of the interval
+/// form, so ANY of them beside a `CronExpression` is the conflict — a request
+/// does not have to carry all three to have stated the schedule twice.
+fn create_rule_states_both_forms(rule: &CreateRule) -> bool {
+    let interval_based = rule.interval.is_some()
+        || rule.interval_unit.is_some()
+        || rule.times.as_ref().is_some_and(|times| !times.is_empty());
+    rule.cron_expression.is_some() && interval_based
+}
+
+/// The `InvalidRequestException` for a schedule whose `CreateRule` states when
+/// to create both ways. The message names the schedule that carries both, which
+/// is what tells a caller which of its schedules to correct.
+pub fn conflicting_create_rule(schedule: &str) -> InvalidRequestException {
+    invalid_request(format!(
+        "Interval based CreateRule and Cron based CreateRule cannot both be present in \
+         schedule {{{schedule}}}."
+    ))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

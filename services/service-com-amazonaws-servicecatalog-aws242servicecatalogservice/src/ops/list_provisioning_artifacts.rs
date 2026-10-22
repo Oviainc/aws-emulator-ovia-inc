@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProvisioningArtifacts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProvisioningArtifacts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProvisioningArtifacts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +135,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProvisioningArtifacts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProvisioningArtifactsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProvisioningArtifacts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: the versions of a product are reported, never changed, by
+        // listing them.
+        let state = state.lock();
+
+        // The versions live ON the product, so a product this account does not hold
+        // has no version list to report: that is the not-found case, not an empty one.
+        let Some(product) = state.products.get(&input.product_id) else {
+            return Err(
+                ListProvisioningArtifactsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Product {} not found.", input.product_id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListProvisioningArtifactsOutput {
+            provisioning_artifact_details: Some(
+                product
+                    .provisioning_artifacts
+                    .values()
+                    .map(crate::state::ProvisioningArtifact::detail)
+                    .collect(),
+            ),
+            // Every version of one product is reported in one response: this
+            // operation's input carries no page token to resume from, so there is no
+            // page after this one to hand a cursor for.
+            next_page_token: None,
+        })
     }
 }

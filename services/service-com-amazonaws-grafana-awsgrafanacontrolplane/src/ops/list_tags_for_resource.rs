@@ -1,26 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the workspace `resourceArn` names carries, exactly as
+//! [`crate::state`] holds them. It is `@readonly`: it writes nothing, so two reads with
+//! no tagging call between them answer the same map.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `ListTagsForResource::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
+//! The engine is held on `self` (constructor-injected), NOT passed per request, so
 //! engine access is guaranteed by the time any request runs. Reach the store through
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
@@ -30,7 +24,7 @@
 //!     state.lock().your_field = /* ... */;
 //! ```
 //!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
+//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only:
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
@@ -42,8 +36,8 @@
 //! # Modeled contract for `ListTagsForResource`
 //!
 //! What AWS documents for this operation, from this service's Smithy model. HTML is
-//! stripped and long entries are clipped at ` …`. For the FULL text of any one item,
-//! ask the model rather than reading the raw JSON:
+//! stripped and long entries are clipped. For the FULL text of any one item, ask the
+//! model rather than reading the raw JSON:
 //!
 //! ```text
 //! smithy_query(query="doc",shape="<Shape>",member="<Member>",model_path="services/service-com-amazonaws-grafana-awsgrafanacontrolplane/smithy-model/com-amazonaws-grafana-awsgrafanacontrolplane.json")
@@ -55,24 +49,24 @@
 //!
 //! ## Input
 //!
-//! * `resourceArn` (String) **required** — The ARN of the resource the list of tags are
+//! * `resourceArn` (String) **required** - The ARN of the resource the list of tags are
 //!   associated with.
 //!
 //! ## Output
 //!
-//! * `tags` (TagMap, len ..50) — The list of tags that are associated with the resource.
+//! * `tags` (TagMap, len ..50) - The list of tags that are associated with the resource.
 //!
 //! ## Errors
 //!
-//! * `AccessDeniedException` (HTTP 403) — You do not have sufficient permissions to perform
+//! * `AccessDeniedException` (HTTP 403) - You do not have sufficient permissions to perform
 //!   this action.
-//! * `InternalServerException` (HTTP 500) — Unexpected error while processing the request.
+//! * `InternalServerException` (HTTP 500) - Unexpected error while processing the request.
 //!   Retry the request.
-//! * `ResourceNotFoundException` (HTTP 404) — The request references a resource that does not
+//! * `ResourceNotFoundException` (HTTP 404) - The request references a resource that does not
 //!   exist.
-//! * `ThrottlingException` (HTTP 429) — The request was denied because of request throttling.
+//! * `ThrottlingException` (HTTP 429) - The request was denied because of request throttling.
 //!   Retry the request.
-//! * `ValidationException` (HTTP 400) — The value of a parameter in the request caused an
+//! * `ValidationException` (HTTP 400) - The value of a parameter in the request caused an
 //!   error.
 
 #[allow(unused_imports)]
@@ -150,18 +144,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the grafana workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // "Currently, the only resource that can be tagged is a workspace", so an ARN
+        // naming anything else names nothing this service holds tags for.
+        let Some(id) = crate::state::workspace_id_in_arn(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                crate::state::not_a_workspace_arn(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // A plain read: the workspace's status is not reported here, so there is
+        // nothing for this call to settle and nothing for it to write.
+        let store = state.lock();
+        match store.workspaces.get(id) {
+            Some(workspace) => Ok(ListTagsForResourceOutput {
+                tags: Some(workspace.tag_map()),
+            }),
+            None => Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::workspace_not_found(id),
+            )
+            .into()),
+        }
     }
 }

@@ -142,15 +142,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let datastore = store.datastores.get(&input.datastore_id).ok_or_else(|| {
             GetDICOMImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Datastore {} was not found", input.datastore_id),
+                // Constant, and stated by resource KIND: the requested id is not
+                // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
+                message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
             })
         })?;
         let job = datastore.import_jobs.get(&input.job_id).ok_or_else(|| {
             GetDICOMImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Import job {} was not found in datastore {}",
-                    input.job_id, input.datastore_id
-                ),
+                // Same rule, one resource kind down: the job id is not echoed either.
+                message: crate::state::IMPORT_JOB_NOT_FOUND_MESSAGE.to_string(),
             })
         })?;
 

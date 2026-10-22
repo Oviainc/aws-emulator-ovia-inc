@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventCategories
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventCategories`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the event categories this front door publishes,
+//! for all source types or for one. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventCategories::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalog it reports lives in [`crate::state`] beside the other published
+//! catalogs.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +132,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventCategories` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventCategoriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventCategories"))
+        // A published catalog read touches no store, and nothing about it is per-region,
+        // so neither the engine on `self` nor the request's scope decides what it
+        // reports.
+        let _ = (ctx, &self.engine);
+        let filters = input.filters.unwrap_or_default();
+        if !filters.is_empty() {
+            // `DescribeEventCategoriesMessage$Filters`: "This parameter isn't currently
+            // supported." Refused rather than dropped, so a caller is never served a
+            // list its filter asked to narrow.
+            return Err(DescribeEventCategoriesError::invalid_parameter_value(
+                format!(
+                    "Filters is not currently supported by DescribeEventCategories; \
+                     got {} filter(s)",
+                    filters.len()
+                ),
+            ));
+        }
+
+        // "Displays a list of categories for all event source types, or, if specified,
+        // for a specified source type."
+        let maps = match &input.source_type {
+            Some(source_type) => {
+                let categories = crate::state::event_categories_of(source_type).ok_or_else(
+                    || {
+                        DescribeEventCategoriesError::invalid_parameter_value(format!(
+                            "Invalid event source type: {source_type}. Valid values are: {}",
+                            crate::state::event_source_types()
+                        ))
+                    },
+                )?;
+                vec![crate::state::event_categories_to_wire(
+                    source_type,
+                    categories,
+                )]
+            }
+            None => crate::state::EVENT_CATEGORIES
+                .iter()
+                .map(|(source_type, categories)| {
+                    crate::state::event_categories_to_wire(source_type, categories)
+                })
+                .collect(),
+        };
+
+        Ok(DescribeEventCategoriesOutput {
+            event_categories_map_list: Some(maps),
+        })
     }
 }

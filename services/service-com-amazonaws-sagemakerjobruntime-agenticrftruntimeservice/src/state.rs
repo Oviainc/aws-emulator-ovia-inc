@@ -16,7 +16,7 @@
 //! * `UpdateReward` records the reward scores and "transitions it to
 //!   reward-received status".
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use sha2::Digest;
@@ -34,6 +34,25 @@ pub const MAX_TURNS_PER_TRAJECTORY: usize = 1_000;
 /// Same reason and same answer as [`MAX_TURNS_PER_TRAJECTORY`]: an emulator
 /// bound on a store that is never garbage-collected.
 pub const MAX_TRAJECTORIES: usize = 10_000;
+
+/// How many bytes of inference payload ONE captured turn may retain.
+///
+/// An EMULATOR bound, not a published AWS quota, and the reason it exists is
+/// different from the two counts above: a turn keeps the caller's payload
+/// verbatim for the life of the process, so a count bound alone leaves the
+/// RETAINED SIZE of the store chosen by the caller. A single oversized body is
+/// refused rather than captured.
+pub const MAX_TURN_BODY_BYTES: usize = 1 << 20;
+
+/// How many bytes of payload the whole store may retain, across every turn of
+/// every trajectory.
+///
+/// The store-wide half of the same bound: many in-bound bodies must not add up
+/// to an unbounded store either, so the retained total is tracked
+/// ([`ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState::retained_body_bytes`])
+/// and a turn that would pass this ceiling is refused as a quota, with nothing
+/// written.
+pub const MAX_RETAINED_BODY_BYTES: usize = 64 << 20;
 
 /// The wire value of the `Content-Type` the OpenAI-compatible, non-streaming
 /// inference response is rendered in.
@@ -186,15 +205,97 @@ impl Trajectory {
 /// The key a trajectory is stored under: the job it belongs to and its id.
 pub type TrajectoryKey = (String, String);
 
+/// The region this emulator presents in the ARNs and endpoints it hands clients
+/// (`vendor/server/src/lib.rs` writes `region = us-east-1` into the shared config).
+const SEED_REGION: &str = "us-east-1";
+
+/// The AgenticRFT jobs this runtime starts with.
+///
+/// This service models no operation that creates a job: a job is created in the
+/// SageMaker control plane and this runtime only serves rollouts of one that already
+/// exists, which is why `Sample` answers "Could not find job with jobArn …" for a job
+/// ARN it does not hold. Without a seed the registry would be empty, so the runtime
+/// could not decide that ANY job exists and no rollout would be reachable at all. The
+/// ARNs below are therefore a fixture standing in for that control-plane creation — two
+/// of them, so a caller can keep two rollouts apart — built through
+/// [`::engine::emulator_arn`] so they carry this emulator's canonical account. A test
+/// registers its own job with
+/// [`ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState::register_job`], and
+/// when the SageMaker emulator grows an AgentRFT job store this seed is what it
+/// replaces.
+#[must_use]
+pub fn seed_job_arns() -> Vec<String> {
+    vec![
+        ::engine::emulator_arn("sagemaker", SEED_REGION, "job/AgentRFT/agentic-rft-rollout-1"),
+        ::engine::emulator_arn("sagemaker", SEED_REGION, "job/AgentRFT/agentic-rft-rollout-2"),
+    ]
+}
+
+/// How this service reports a `Sample` or `SampleWithResponseStream` whose `JobArn`
+/// names no job this runtime holds.
+///
+/// Built from the request's own `JobArn`, so the caller can see which job was looked
+/// up.
+#[must_use]
+pub fn job_not_found_message(job_arn: &str) -> String {
+    format!("Could not find job with jobArn {job_arn}")
+}
+
+/// How this service reports a `(JobArn, TrajectoryId)` pair it holds no trajectory for.
+///
+/// Built from the request's own trajectory id and the account the call is served for —
+/// the one account every emulated service presents
+/// ([`::engine::emulator_account_id`]).
+#[must_use]
+pub fn trajectory_not_found_message(trajectory_id: &str) -> String {
+    format!(
+        "Trajectory {trajectory_id} not found for account {}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// Per-service state for com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
+    /// The ARNs of the jobs this runtime serves rollouts for. A sampling call for an
+    /// ARN that is not here is refused: the job does not exist.
+    pub jobs: BTreeSet<String>,
     /// Every trajectory this emulator has served a turn for, keyed by
     /// `(JobArn, TrajectoryId)`.
     pub trajectories: HashMap<TrajectoryKey, Trajectory>,
+    /// How many payload bytes every captured turn of this store retains, summed over
+    /// both the request and the response body of each turn.
+    ///
+    /// Maintained by [`Self::append_turn`], which is the only writer of a turn, and
+    /// read through [`Self::retained_body_bytes`]; it is what makes
+    /// [`MAX_RETAINED_BODY_BYTES`] a real ceiling rather than a comment.
+    retained_body_bytes: usize,
+}
+
+impl Default for ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
+    fn default() -> Self {
+        Self {
+            jobs: seed_job_arns().into_iter().collect(),
+            trajectories: HashMap::new(),
+            retained_body_bytes: 0,
+        }
+    }
 }
 
 impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
+    /// Whether this runtime holds the job `job_arn` names.
+    #[must_use]
+    pub fn knows_job(&self, job_arn: &str) -> bool {
+        self.jobs.contains(job_arn)
+    }
+
+    /// Record `job_arn` as a job this runtime serves rollouts for, answering whether it
+    /// was newly added. Stands in for the control-plane creation this service models no
+    /// operation for (see [`seed_job_arns`]).
+    pub fn register_job(&mut self, job_arn: &str) -> bool {
+        self.jobs.insert(job_arn.to_string())
+    }
+
     /// The trajectory `job_arn` / `trajectory_id` names, if this emulator has
     /// one.
     #[must_use]
@@ -213,25 +314,40 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
             .get_mut(&(job_arn.to_string(), trajectory_id.to_string()))
     }
 
+    /// How many bytes of payload every captured turn of this store retains.
+    #[must_use]
+    pub const fn retained_body_bytes(&self) -> usize {
+        self.retained_body_bytes
+    }
+
     /// Capture one turn on the trajectory `request` names, creating the
-    /// trajectory when this is its first turn, and answer the turn as it was
-    /// recorded.
+    /// trajectory when this is its first turn, and answer what was served for
+    /// it.
     ///
     /// `respond` is handed the turn's index and answers the response body and
     /// its `Content-Type`; it runs BEFORE the turn is recorded, so what the
-    /// caller is served and what the trajectory holds are the same bytes.
+    /// caller is served and what the trajectory holds are the same bytes. The
+    /// answer is the [`ServedTurn`] — the response alone, never a copy of the
+    /// caller's own payload, which is retained exactly once.
     ///
     /// Refused — with nothing written — when the trajectory is already sealed
     /// ("no further turns will be appended to the trajectory") or when an
-    /// emulator bound is reached.
+    /// emulator bound is reached, including the two BYTE bounds
+    /// ([`MAX_TURN_BODY_BYTES`], [`MAX_RETAINED_BODY_BYTES`]) that keep the
+    /// store's retained size from being the caller's choice.
     pub fn append_turn<F>(
         &mut self,
         request: &TurnRequest<'_>,
         respond: F,
-    ) -> Result<Turn, AppendRefusal>
+    ) -> Result<ServedTurn, AppendRefusal>
     where
         F: FnOnce(usize) -> (Vec<u8>, String),
     {
+        // A rollout belongs to a job: the trajectory of a job this runtime does not
+        // hold cannot be sampled, whether or not a turn was ever captured for it.
+        if !self.knows_job(request.job_arn) {
+            return Err(AppendRefusal::UnknownJob);
+        }
         let key = (
             request.job_arn.to_string(),
             request.trajectory_id.to_string(),
@@ -250,12 +366,32 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
                 return Err(AppendRefusal::TurnQuota);
             }
         }
+        // The caller's payload is retained for the life of the process, so its
+        // SIZE is bounded before anything is written: one body that is too big
+        // to capture, and a body that would pass the store-wide retained total,
+        // are both refused here.
+        let request_bytes = request.request_body.len();
+        if request_bytes > MAX_TURN_BODY_BYTES {
+            return Err(AppendRefusal::BodyTooLarge {
+                bytes: request_bytes,
+            });
+        }
+        if self.retained_body_bytes.saturating_add(request_bytes) > MAX_RETAINED_BODY_BYTES {
+            return Err(AppendRefusal::RetainedBytesQuota);
+        }
+        let retained_before = self.retained_body_bytes;
         let trajectory = self.trajectories.entry(key).or_insert_with(|| {
             Trajectory::new(request.job_arn, request.trajectory_id, request.at)
         });
         let index = trajectory.turns.len();
         let (response_body, response_content_type) = respond(index);
-        let turn = Turn {
+        let served = ServedTurn {
+            body: response_body.clone(),
+            content_type: response_content_type.clone(),
+            index,
+        };
+        let response_bytes = response_body.len();
+        trajectory.turns.push(Turn {
             request_body: request.request_body.to_vec(),
             request_content_type: request.request_content_type.clone(),
             response_body,
@@ -263,10 +399,12 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
             streamed: request.streamed,
             index,
             at: request.at,
-        };
-        trajectory.turns.push(turn.clone());
+        });
         trajectory.updated_at = request.at;
-        Ok(turn)
+        self.retained_body_bytes = retained_before
+            .saturating_add(request_bytes)
+            .saturating_add(response_bytes);
+        Ok(served)
     }
 }
 
@@ -289,11 +427,31 @@ pub struct TurnRequest<'a> {
     pub at: SystemTime,
 }
 
+/// What one captured turn served its caller: the response body and its
+/// `Content-Type`, plus the turn's position in the trajectory.
+///
+/// The answer of
+/// [`ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState::append_turn`].
+/// Deliberately NOT the whole [`Turn`]: the caller's own payload is retained
+/// once, in the store, and never copied back out into a response value.
+#[derive(Debug, Clone)]
+pub struct ServedTurn {
+    /// The response body the turn was served with, byte for byte what the store
+    /// holds for it.
+    pub body: Vec<u8>,
+    /// The `Content-Type` that body is served with.
+    pub content_type: String,
+    /// The turn's zero-based position in the trajectory.
+    pub index: usize,
+}
+
 /// Why [`ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState::append_turn`]
 /// refused to capture a turn. Each sampling operation renders this as one of its
 /// OWN modelled errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendRefusal {
+    /// The `JobArn` names no job this runtime holds.
+    UnknownJob,
     /// `CompleteRollout` has already sealed the trajectory.
     Sealed {
         /// The lifecycle status it is sealed in.
@@ -301,18 +459,28 @@ pub enum AppendRefusal {
         /// The terminal status it was sealed with.
         completion_status: Option<CompletionStatus>,
     },
+    /// The payload is larger than [`MAX_TURN_BODY_BYTES`], so no single turn can
+    /// retain it.
+    BodyTooLarge {
+        /// How many bytes the request carried.
+        bytes: usize,
+    },
     /// The trajectory already holds [`MAX_TURNS_PER_TRAJECTORY`] turns.
     TurnQuota,
     /// The store already holds [`MAX_TRAJECTORIES`] trajectories.
     TrajectoryQuota,
+    /// Capturing the turn would pass [`MAX_RETAINED_BODY_BYTES`], the store-wide
+    /// ceiling on retained payload.
+    RetainedBytesQuota,
 }
 
 impl AppendRefusal {
     /// The sentence this refusal is reported with, naming the trajectory and
     /// what about its state stops the turn being captured.
     #[must_use]
-    pub fn message(self, trajectory_id: &str) -> String {
+    pub fn message(self, job_arn: &str, trajectory_id: &str) -> String {
         match self {
+            Self::UnknownJob => job_not_found_message(job_arn),
             Self::Sealed {
                 status,
                 completion_status,
@@ -327,6 +495,10 @@ impl AppendRefusal {
                     status.as_str()
                 )
             }
+            Self::BodyTooLarge { bytes } => format!(
+                "Body carries {bytes} byte(s), more than the {MAX_TURN_BODY_BYTES} bytes one \
+                 captured turn of trajectory {trajectory_id} can hold."
+            ),
             Self::TurnQuota => format!(
                 "Trajectory {trajectory_id} already holds the maximum of \
                  {MAX_TURNS_PER_TRAJECTORY} turns."
@@ -335,15 +507,26 @@ impl AppendRefusal {
                 "This emulator already holds the maximum of {MAX_TRAJECTORIES} trajectories, so \
                  trajectory {trajectory_id} cannot be created."
             ),
+            Self::RetainedBytesQuota => format!(
+                "This emulator already retains the maximum of {MAX_RETAINED_BODY_BYTES} bytes of \
+                 captured payload, so no further turn can be appended to trajectory \
+                 {trajectory_id}."
+            ),
         }
     }
 
     /// Whether the refusal is a quota being reached — reported as the modelled
     /// `ServiceQuotaExceededException` — rather than a request that conflicts
-    /// with the trajectory's state.
+    /// with the trajectory's state or carries too much to capture.
+    ///
+    /// `BodyTooLarge` is deliberately NOT one: it is a property of the request the
+    /// caller sent, so it is refused as invalid rather than as a quota.
     #[must_use]
     pub const fn is_quota(self) -> bool {
-        matches!(self, Self::TurnQuota | Self::TrajectoryQuota)
+        matches!(
+            self,
+            Self::TurnQuota | Self::TrajectoryQuota | Self::RetainedBytesQuota
+        )
     }
 }
 

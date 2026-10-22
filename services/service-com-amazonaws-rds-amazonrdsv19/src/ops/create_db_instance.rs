@@ -449,6 +449,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let availability_zone = input
             .availability_zone
             .unwrap_or_else(|| format!("{region}a"));
+        // The version the instance RUNS, resolved through the engine-version catalogue
+        // `DescribeDBEngineVersions` publishes — never the request's string echoed
+        // back. The resolved entry also names the DB parameter group family and the
+        // major engine version the instance's default parameter group and option group
+        // are named after, so the three cannot disagree.
+        let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+            &input.engine,
+            input.engine_version.as_deref(),
+        )
+        .map_err(CreateDBInstanceError::validation)?;
+        let engine_version = match resolved_version {
+            Some(entry) => Some(entry.engine_version.to_string()),
+            // An engine the catalogue publishes no available version for: there is
+            // nothing to resolve against, so what the request named stands.
+            None => input.engine_version.clone(),
+        };
+        let db_parameter_group_name = input.db_parameter_group_name.or_else(|| {
+            resolved_version.map(|entry| {
+                crate::state::default_db_parameter_group_name(entry.parameter_group_family)
+            })
+        });
+        let option_group_name = input.option_group_name.or_else(|| {
+            resolved_version.map(|entry| {
+                crate::state::default_option_group_name(&input.engine, entry.major_engine_version)
+            })
+        });
 
         let record = crate::state::DbInstanceRecord {
             identifier: identifier.clone(),
@@ -456,8 +482,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dbi_resource_id: crate::state::mint_dbi_resource_id(mint),
             endpoint_host: crate::state::mint_endpoint_host(mint),
             db_instance_class: input.db_instance_class,
-            engine: input.engine,
-            engine_version: input.engine_version,
+            engine: input.engine.clone(),
+            engine_version,
             // A newly created DB instance is not yet usable: RDS answers `creating`,
             // and the instance reaches `available` on its own. The due instant is
             // stored on the record, so nothing sleeps on this thread.
@@ -471,17 +497,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             master_username: input.master_username,
             endpoint_port,
             multi_az: input.multi_az.unwrap_or(false),
+            // `StorageThroughput` "applies only to the gp3 storage type", whose
+            // baseline the instance is provisioned with when the request names none.
+            storage_throughput: input
+                .storage_throughput
+                .unwrap_or_else(|| crate::state::default_storage_throughput(&storage_type)),
             storage_type,
             // `StorageEncrypted`: "By default, it isn't encrypted."
             storage_encrypted: input.storage_encrypted.unwrap_or(false),
             kms_key_id: input.kms_key_id,
             iops: input.iops,
-            license_model: input.license_model,
+            license_model: input.license_model.or_else(|| {
+                crate::state::default_license_model(&input.engine).map(str::to_string)
+            }),
             availability_zone,
             // `BackupRetentionPeriod`: "Default: 1".
             backup_retention_period: input.backup_retention_period.unwrap_or(1),
-            preferred_backup_window: input.preferred_backup_window,
-            preferred_maintenance_window: input.preferred_maintenance_window,
+            preferred_backup_window: Some(
+                input
+                    .preferred_backup_window
+                    .unwrap_or_else(|| crate::state::DEFAULT_PREFERRED_BACKUP_WINDOW.to_string()),
+            ),
+            preferred_maintenance_window: Some(input.preferred_maintenance_window.unwrap_or_else(
+                || crate::state::DEFAULT_PREFERRED_MAINTENANCE_WINDOW.to_string(),
+            )),
             publicly_accessible,
             // `AutoMinorVersionUpgrade`: "By default, minor engine upgrades are
             // applied automatically."
@@ -491,10 +530,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `DeletionProtection`: "By default, deletion protection isn't enabled."
             deletion_protection: input.deletion_protection.unwrap_or(false),
             db_subnet_group_name: input.db_subnet_group_name,
-            db_parameter_group_name: input.db_parameter_group_name,
+            db_parameter_group_name,
+            option_group_name,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+            db_security_group_names: input.db_security_groups.unwrap_or_default(),
             db_cluster_identifier: input.db_cluster_identifier,
             domain: input.domain,
+            ca_certificate_identifier: input
+                .ca_certificate_identifier
+                .unwrap_or_else(|| crate::state::DEFAULT_CA_CERTIFICATE_IDENTIFIER.to_string()),
+            // `MonitoringInterval`: "Default: 0" — Enhanced Monitoring off.
+            monitoring_interval: input
+                .monitoring_interval
+                .unwrap_or(crate::state::DEFAULT_MONITORING_INTERVAL),
+            // `EnablePerformanceInsights`, `EnableIAMDatabaseAuthentication`,
+            // `EnableCustomerOwnedIp` and `DedicatedLogVolume` each enable something
+            // the request asks for, so an instance created without them has it off.
+            performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
+            iam_database_authentication_enabled: input
+                .enable_iam_database_authentication
+                .unwrap_or(false),
+            database_insights_mode: input
+                .database_insights_mode
+                .unwrap_or_else(|| crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string()),
+            dedicated_log_volume: input.dedicated_log_volume.unwrap_or(false),
+            customer_owned_ip_enabled: input.enable_customer_owned_ip.unwrap_or(false),
+            network_type: input
+                .network_type
+                .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string()),
+            // `BackupTarget`: "Default: region".
+            backup_target: input
+                .backup_target
+                .unwrap_or_else(|| crate::state::DEFAULT_BACKUP_TARGET.to_string()),
+            // `EngineLifecycleSupport`: "Default: open-source-rds-extended-support".
+            engine_lifecycle_support: input
+                .engine_lifecycle_support
+                .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
             instance_create_time: crate::state::now_as_wire_timestamp(),
             tags: input.tags.unwrap_or_default(),
         };

@@ -169,9 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(connector) = state.connectors.get_mut(&input.connector_arn) else {
             return Err(DeleteConnectorErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "No connector exists with the ARN {}.",
-                    input.connector_arn
+                message: Some(crate::state::invalid_parameter_because(
+                    "connectorArn",
+                    crate::state::RESOURCE_DOES_NOT_EXIST,
                 )),
             })
             .into());
@@ -180,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(named) = &input.current_version {
             if named != &connector.current_version {
                 return Err(DeleteConnectorErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(format!(
-                        "currentVersion {} is not the current version of connector {}, which is at {}.",
-                        named, connector.arn, connector.current_version
+                    message: Some(crate::state::invalid_parameter_because(
+                        "currentVersion",
+                        "The specified version is not the current version of the resource.",
                     )),
                 })
                 .into());

@@ -208,10 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.matching_workflows.contains_key(&input.workflow_name) {
             return Err(CreateMatchingWorkflowErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "Matching workflow {} already exists",
-                        input.workflow_name
-                    )),
+                    message: Some(
+                        crate::state::messages::CREATE_MATCHING_WORKFLOW_CONFLICT.to_string(),
+                    ),
                 },
             )
             .into());

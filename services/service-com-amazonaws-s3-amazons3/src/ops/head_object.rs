@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op HeadObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `HeadObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`HeadObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored object's metadata — its `ETag`, `ContentLength`, `LastModified`,
+//! the headers the write carried and its `x-amz-meta-*` user metadata — without its
+//! bytes. A key this emulator holds no object at is a 404, as is a bucket it does not
+//! hold.
 //!
 //! ## Shape of an operation
 //!
@@ -276,15 +271,24 @@ use super::types::*;
 // `HeadObjectError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `HeadObjectError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#HeadObject")]
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes
+// this SERVICE models for an address that does not exist. `HeadObject`'s own error,
+// `NotFound`, carries NO `@httpError` trait
+// (`smithy_query(query="shape", shape="NotFound")`: `httpErrorDefaulted: true`), so
+// rendering it would answer HTTP 400 for an object that merely does not exist, while
+// S3 answers 404 to a HEAD of an absent object. `NoSuchBucket` and `NoSuchKey` are
+// modelled `@httpError(404)` and name exactly which part of the address is missing,
+// so they are what this handler refuses with; the status is what a client branches on
+// here, since a HEAD response carries no error document.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#HeadObject",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum HeadObjectErrorModeled {
     NotFound(NotFound),
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -338,18 +342,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `HeadObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(HeadObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("HeadObject"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // What this slice cannot answer faithfully: a partial read—`Range` and
+        // `PartNumber` are answered with HTTP 206 and a `Content-Range`, and a
+        // conditional read with 304 or 412, none of which an operation whose success
+        // status is 200 can render—plus the customer-key encryption nothing here
+        // performs and the versioning this emulator does not keep. A 501 says so
+        // instead of answering 200 with the whole object as if the request had asked
+        // for it.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "HeadObject with {unserved}"
+            )));
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `HeadObjectRequest$ExpectedBucketOwner`, judged exactly as
+        // `PutObject` judges it: this emulator serves one account, so the owner of every
+        // bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The one modeled error here says "no such object", which would be a false
+            // statement about the object. The scaffold's 501 says what is true: this
+            // emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("HeadObject"));
+        };
+
+        // Read-only: the guard is taken, the object's metadata is copied out, and
+        // nothing is written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        // A missing bucket and a missing key are both a 404 on a HEAD, which carries no
+        // body to tell them apart by an error document. The modelled `NotFound` cannot
+        // say it: the shape carries no `@httpError`, so the framework would render the
+        // client-error default (400) and an SDK waiter keying on 404 would never see the
+        // object as absent. The code and status S3 sends go out directly instead.
+        let object = store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.object(&input.key));
+        let Some(object) = object else {
+            let (code, message) = match store.bucket(&input.bucket) {
+                Some(_) => (
+                    crate::state::NO_SUCH_KEY_CODE,
+                    crate::state::NO_SUCH_KEY_MESSAGE,
+                ),
+                None => (
+                    crate::state::NO_SUCH_BUCKET_CODE,
+                    crate::state::NO_SUCH_BUCKET_MESSAGE,
+                ),
+            };
+            return Err(crate::scaffolded::Scaffolded::unmodeled(code, 404, message));
+        };
+
+        Ok(HeadObjectOutput {
+            e_tag: Some(object.etag.clone()),
+            content_length: Some(i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
+            last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
+            content_type: object.content_type.clone(),
+            cache_control: object.cache_control.clone(),
+            content_disposition: object.content_disposition.clone(),
+            content_encoding: object.content_encoding.clone(),
+            content_language: object.content_language.clone(),
+            expires: object.expires.clone(),
+            website_redirect_location: object.website_redirect_location.clone(),
+            metadata: Some(
+                object
+                    .metadata
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            storage_class: Some(object.storage_class.clone()),
+            // "Indicates that a range of bytes was specified" — S3 reports that an
+            // object read supports range requests whether or not one was made.
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            // Every remaining member is documented as reported only when something this
+            // slice does not serve is true of the object: it is a delete marker
+            // (`DeleteMarker`), a lifecycle rule has it expiring (`Expiration`), it is
+            // archived (`Restore`, `ArchiveStatus`), a checksum was uploaded with it
+            // (`Checksum*`, `ChecksumType`), the bucket is versioned (`VersionId`),
+            // metadata could not be decoded (`MissingMeta`), the read was partial
+            // (`ContentRange`, `PartsCount`), something encrypted it
+            // (`ServerSideEncryption`, `SSE*`, `BucketKeyEnabled`), it carries object
+            // tags (`TagCount`), it is replicated (`ReplicationStatus`), it is locked
+            // (`ObjectLock*`) or the bucket is Requester Pays (`RequestCharged`).
+            ..HeadObjectOutput::default()
+        })
     }
+}
+
+/// The value `accept-ranges` carries for an object S3 can serve byte ranges of.
+const ACCEPT_RANGES_BYTES: &str = "bytes";
+
+/// The feature `input` asks for that this slice does not serve, if any — named for the
+/// 501 that refuses it.
+fn unserved_feature(input: &HeadObjectInput) -> Option<&'static str> {
+    [
+        (input.range.is_some(), "Range"),
+        (input.part_number.is_some(), "PartNumber"),
+        (input.if_match.is_some(), "IfMatch"),
+        (input.if_none_match.is_some(), "IfNoneMatch"),
+        (input.if_modified_since.is_some(), "IfModifiedSince"),
+        (input.if_unmodified_since.is_some(), "IfUnmodifiedSince"),
+        (input.version_id.is_some(), "VersionId"),
+        (
+            input.sse_customer_algorithm.is_some(),
+            "SSECustomerAlgorithm",
+        ),
+        (input.sse_customer_key.is_some(), "SSECustomerKey"),
+        // Nothing here charges a requester or stores a checksum, so a request asking to
+        // be charged or to be answered with one is refused rather than answered as if it
+        // had been honoured.
+        (input.request_payer.is_some(), "RequestPayer"),
+        (input.checksum_mode.is_some(), "ChecksumMode"),
+    ]
+    .into_iter()
+    .find_map(|(asked, name)| asked.then_some(name))
 }

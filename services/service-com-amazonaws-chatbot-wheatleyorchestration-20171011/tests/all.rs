@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/slack_channel_configuration.rs"]
 mod slack_channel_configuration;
+#[path = "all/slack_workspace_authorization.rs"]
+mod slack_workspace_authorization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

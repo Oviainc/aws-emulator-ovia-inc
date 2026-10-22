@@ -14,6 +14,49 @@ Issue-Commit: 38b62e174af309db3e46216fa3b3f7ac7f6f5b84
 
 # Transcribe is unusable behaviorally: every request is refused 500 AmbiguousService, and the remaining checks are blocked by an S3 PutObject stub (2 causes)
 
+## Resolution note (both causes fixed; two trace ids remain blocked elsewhere)
+
+Cause 1 is fixed in the two `transcribe`-signing services' `can_handle` seams, which now
+claim through `service_common::claims_request` (signing name AND the service's own
+modelled wire surface), plus the Transcribe custom-vocabulary slice they made reachable:
+Create/Get/Update/Delete/List for vocabularies and vocabulary filters and the three
+tagging operations, all served from this service's state. Cause 2 is fixed by the S3
+object data plane: `PutObject` stores the object and reports the entity tag of the stored
+bytes, and `GetObject` / `HeadObject` read it back.
+
+TWO of this issue's trace ids are NOT closed by that work and need a follow-up elsewhere:
+
+* `transcribe.vocabulary-filter-content-roundtrip-via-download-uri`
+* `transcribe.update-vocabulary-filter-words-reflected-in-download`
+
+Both fetch the vocabulary content back through the `DownloadUri` that `GetVocabulary` /
+`GetVocabularyFilter` report. That URI names the service-managed S3 location the real
+service presigns; this emulator computes it from the stored record but serves nothing at
+it, exactly as a completed transcription job's `Transcript.TranscriptFileUri` already
+does (documented in `services/service-com-amazonaws-transcribe-transcribe/src/state.rs`).
+Making it readable means a Transcribe handler writing to, and a caller reading from, the
+S3 object store — a cross-service call the framework routes through an SDK client this
+workspace does not carry today; naming the S3 crate from the Transcribe crate would form
+the cross-crate edge the callback seam exists to avoid. That belongs with the S3 object
+data plane's own issue, not with the routing fix.
+
+The SAME missing seam leaves one more gap, in the other direction: a custom vocabulary or
+vocabulary filter whose content has to be READ from a `VocabularyFileUri` /
+`VocabularyFilterFileUri` is refused with the operations' modelled `BadRequestException`
+("can't be accessed"). That is the right answer for the unreachable URI this issue
+records, and it is now also the answer for an `s3://` URI naming an object the S3 slice
+really holds since `PutObject` works — AWS would build the vocabulary from it. Making a
+file-backed vocabulary buildable needs the same cross-service read as the `DownloadUri`
+gap above, so it belongs with the same follow-up.
+
+Two further trace ids of this report are served by operations that are still SCAFFOLDED
+(each with its own stub issue), so they are not closed here either:
+`transcribe.medical-vocabulary-lifecycle-pending-to-ready` (`CreateMedicalVocabulary`,
+`GetMedicalVocabulary` — and a medical vocabulary's content is file-only, so it also needs
+the read above) and `transcribe.medical-transcription-job-lifecycle-completes`
+(`StartMedicalTranscriptionJob`, `GetMedicalTranscriptionJob`). The resolved record is
+therefore "both causes of this issue fixed", not "22/22 checks served".
+
 > _Note: this issue was identified against the code base at commit `38b62e174af309db3e46216fa3b3f7ac7f6f5b84`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

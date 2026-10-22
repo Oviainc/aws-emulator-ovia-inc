@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_instances::{call, emulator, expect_error, expect_ok, optional_text, subtrees, text};
+use crate::db_instances::{
+    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
+};
 
 /// The operation under test.
 const ACTION: &str = "DescribeDBEngineVersions";
@@ -699,13 +701,18 @@ async fn character_sets_and_timezones_are_reported_only_when_the_request_asks() 
     let router = emulator();
 
     // (engine, the engine takes a CharacterSetName, the engine takes a Timezone).
-    // Oracle is the character-set engine and SQL Server the time-zone one; MySQL is the
-    // row that must get NEITHER even when it asks for both.
-    let rows: [(&str, bool, bool); 4] = [
+    // `CreateDBInstance`'s `CharacterSetName` is the Oracle character set and the SQL
+    // Server server collation, and its `Timezone` is a SQL Server member; MySQL,
+    // MariaDB and PostgreSQL are the rows that must get NEITHER even when they ask for
+    // both.
+    let rows: [(&str, bool, bool); 7] = [
         ("oracle-se2", true, false),
         ("oracle-ee", true, false),
-        ("sqlserver-ee", false, true),
+        ("sqlserver-ee", true, true),
+        ("sqlserver-web", true, true),
         ("mysql", false, false),
+        ("mariadb", false, false),
+        ("postgres", false, false),
     ];
 
     for (engine, has_character_sets, has_timezones) in rows {
@@ -841,3 +848,394 @@ async fn an_entrys_upgrade_targets_are_that_engines_later_versions() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The capability members: what THIS version can do
+// ---------------------------------------------------------------------------
+
+/// The boolean capability members every reported entry carries. A client chooses an
+/// engine version by gating on these, so every entry has to answer each of them rather
+/// than leaving the caller to guess from the engine name.
+const CAPABILITY_FLAGS: [&str; 9] = [
+    "SupportsReadReplica",
+    "SupportsLogExportsToCloudwatchLogs",
+    "SupportsParallelQuery",
+    "SupportsGlobalDatabases",
+    "SupportsBabelfish",
+    "SupportsLimitlessDatabase",
+    "SupportsLocalWriteForwarding",
+    "SupportsIntegrations",
+    "SupportsCertificateRotationWithoutRestart",
+];
+
+/// The capability members that belong to Aurora's cluster engine: parallel query, global
+/// databases, Babelfish, Limitless Database and local write forwarding. A version of an
+/// RDS DB instance engine cannot claim one.
+const AURORA_ONLY_FLAGS: [&str; 5] = [
+    "SupportsParallelQuery",
+    "SupportsGlobalDatabases",
+    "SupportsBabelfish",
+    "SupportsLimitlessDatabase",
+    "SupportsLocalWriteForwarding",
+];
+
+/// The values of one list member of an entry: an awsQuery list of strings serializes its
+/// entries as `<member>` elements inside the member's own element
+/// (`smithy_query(query="shape",shape="CACertificateIdentifiersList")` — the list's
+/// member carries no `xmlName`).
+fn list_members(xml: &str, member: &str) -> Vec<String> {
+    subtrees(xml, member)
+        .first()
+        .map(|subtree| texts(subtree, "member"))
+        .unwrap_or_default()
+}
+
+/// One boolean member of an entry, asserted to be a boolean at all.
+fn flag(case: &str, xml: &str, member: &str) -> bool {
+    let value = optional_text(xml, member)
+        .unwrap_or_else(|| panic!("case {case:?}: {member} must be reported, got {xml}"));
+    match value.as_str() {
+        "true" => true,
+        "false" => false,
+        other => panic!("case {case:?}: {member} must be a boolean, got {other:?} in {xml}"),
+    }
+}
+
+/// One component of an engine version, so two versions compare by their NUMBERS rather
+/// than as text: `10.11.9` is later than `10.5.28`, and `8.0.mysql_aurora.3.07.1` later
+/// than `8.0.mysql_aurora.3.05.2`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Component {
+    /// A numeric component, compared as a number.
+    Number(u64),
+    /// Anything else (`mysql_aurora`, `ru`, `v1`, `limitless`), compared as text and
+    /// always after a number, so `16.4` precedes `16.4-limitless`.
+    Text(String),
+}
+
+/// The sort key of an engine version: its `.`, `-` and `_` separated components.
+fn version_key(version: &str) -> Vec<Component> {
+    version
+        .split(['.', '-', '_'])
+        .map(|part| match part.parse::<u64>() {
+            Ok(number) => Component::Number(number),
+            Err(_) => Component::Text(part.to_string()),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_entry_answers_every_capability_member_a_client_gates_on() {
+    let router = emulator();
+
+    for engine in MODELLED_ENGINES {
+        for version in all_versions_of(&router, engine).await {
+            let case = format!("{engine} {}", version.engine_version);
+            for member in CAPABILITY_FLAGS {
+                // Reading it is the assertion: `flag` refuses an absent member and a
+                // value that is not a boolean.
+                let _ = flag(&case, &version.scalars, member);
+            }
+
+            // "A list of the supported DB engine modes" — every version runs at least
+            // one, and each is one of the five the `engine-mode` filter documents.
+            let modes = list_members(&version.scalars, "SupportedEngineModes");
+            assert!(
+                !modes.is_empty(),
+                "case {case:?}: a version must report the engine modes it runs, got {}",
+                version.scalars
+            );
+            for mode in &modes {
+                assert!(
+                    ["global", "multimaster", "parallelquery", "provisioned", "serverless"]
+                        .contains(&mode.as_str()),
+                    "case {case:?}: {mode:?} is not one of the documented engine modes, \
+                     got {}",
+                    version.scalars
+                );
+            }
+
+            // "A list of the supported CA certificate identifiers": a client needs one
+            // to pass `CACertificateIdentifier` to CreateDBInstance, so every version
+            // reports the CAs it accepts.
+            let authorities = list_members(&version.scalars, "SupportedCACertificateIdentifiers");
+            assert!(
+                !authorities.is_empty(),
+                "case {case:?}: a version must report the CA certificates it accepts, \
+                 got {}",
+                version.scalars
+            );
+            for authority in &authorities {
+                assert!(
+                    authority.starts_with("rds-ca-"),
+                    "case {case:?}: an Amazon RDS CA identifier is named rds-ca-…, got \
+                     {authority:?} in {}",
+                    version.scalars
+                );
+            }
+
+            // `ExportableLogTypes` and `SupportsLogExportsToCloudwatchLogs` answer the
+            // same question, so they must agree.
+            let log_types = list_members(&version.scalars, "ExportableLogTypes");
+            assert_eq!(
+                flag(&case, &version.scalars, "SupportsLogExportsToCloudwatchLogs"),
+                !log_types.is_empty(),
+                "case {case:?}: SupportsLogExportsToCloudwatchLogs must agree with \
+                 ExportableLogTypes {log_types:?}, got {}",
+                version.scalars
+            );
+
+            // Every feature name is a name: an empty list is a version with no
+            // engine-integration feature, an empty NAME is a report defect.
+            for feature in list_members(&version.scalars, "SupportedFeatureNames") {
+                assert!(
+                    !feature.trim().is_empty(),
+                    "case {case:?}: a reported feature name must not be empty, got {}",
+                    version.scalars
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_capability_is_the_versions_own_and_not_its_engines() {
+    let router = emulator();
+
+    // The capability members of one entry, as the signature two versions of one engine
+    // are compared by.
+    let signature = |version: &Version| -> String {
+        let flags: Vec<String> = CAPABILITY_FLAGS
+            .iter()
+            .map(|member| {
+                format!(
+                    "{member}={}",
+                    optional_text(&version.scalars, member).unwrap_or_default()
+                )
+            })
+            .collect();
+        format!(
+            "{}|{}|{:?}",
+            flags.join(","),
+            list_members(&version.scalars, "SupportedEngineModes").join("+"),
+            optional_text(&version.scalars, "MaxCapacity")
+        )
+    };
+
+    let mut engines_whose_versions_differ = 0usize;
+    let mut serverless_v1_engines: BTreeSet<String> = BTreeSet::new();
+
+    for engine in MODELLED_ENGINES {
+        let all = all_versions_of(&router, engine).await;
+        if all.is_empty() {
+            continue;
+        }
+        let is_aurora = engine.starts_with("aurora");
+
+        for version in &all {
+            let case = format!("{engine} {}", version.engine_version);
+
+            // Aurora's cluster capabilities are Aurora's: an RDS DB instance engine
+            // version reports none of them.
+            if !is_aurora {
+                for member in AURORA_ONLY_FLAGS {
+                    assert!(
+                        !flag(&case, &version.scalars, member),
+                        "case {case:?}: {member} is an Aurora cluster capability, so a \
+                         version of an RDS engine must report false, got {}",
+                        version.scalars
+                    );
+                }
+                assert!(
+                    subtrees(&version.scalars, "ServerlessV2FeaturesSupport").is_empty(),
+                    "case {case:?}: Aurora Serverless v2 limits belong to an Aurora \
+                     version, got {}",
+                    version.scalars
+                );
+            } else {
+                // An Aurora reader is a member of its cluster, not an RDS read replica,
+                // so an Aurora version reports no read replica support.
+                assert!(
+                    !flag(&case, &version.scalars, "SupportsReadReplica"),
+                    "case {case:?}: an Aurora version serves cluster readers rather than \
+                     read replicas, so SupportsReadReplica must be false, got {}",
+                    version.scalars
+                );
+            }
+
+            // "Specifies any Aurora Serverless v2 properties or limits that differ
+            // between Aurora engine versions": when reported, the limits are a usable
+            // capacity range.
+            if let Some(limits) = subtrees(&version.scalars, "ServerlessV2FeaturesSupport").first()
+            {
+                let min: f64 = text(limits, "MinCapacity")
+                    .parse()
+                    .expect("MinCapacity is a number");
+                let max: f64 = text(limits, "MaxCapacity")
+                    .parse()
+                    .expect("MaxCapacity is a number");
+                assert!(
+                    min > 0.0 && min <= max,
+                    "case {case:?}: the Serverless v2 capacity range must be usable, got \
+                     {min}..{max} in {}",
+                    version.scalars
+                );
+            }
+
+            // Aurora Serverless v1 is a property of the VERSION: only an Aurora version
+            // offers it at all.
+            if list_members(&version.scalars, "SupportedEngineModes")
+                .iter()
+                .any(|mode| mode == "serverless")
+            {
+                assert!(
+                    is_aurora,
+                    "case {case:?}: only an Aurora version runs the serverless engine \
+                     mode, got {}",
+                    version.scalars
+                );
+                serverless_v1_engines.insert(engine.to_string());
+                assert!(
+                    all.iter().any(|other| !list_members(
+                        &other.scalars,
+                        "SupportedEngineModes"
+                    )
+                    .iter()
+                    .any(|mode| mode == "serverless")),
+                    "case {case:?}: the engine mode is the version's, so an engine with a \
+                     Serverless v1 version must also report versions without it"
+                );
+            }
+        }
+
+        // Two versions of one engine may disagree about a capability — that is what
+        // makes these members the VERSION's.
+        let signatures: BTreeSet<String> = all.iter().map(signature).collect();
+        if signatures.len() > 1 {
+            engines_whose_versions_differ += 1;
+        }
+    }
+
+    assert!(
+        engines_whose_versions_differ >= 2,
+        "the capability members are per version, so the report must carry engines whose \
+         versions disagree about one, got {engines_whose_versions_differ}"
+    );
+    assert!(
+        !serverless_v1_engines.is_empty(),
+        "the serverless engine mode must be reported by the Aurora versions that run \
+         Aurora Serverless v1, got none"
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_target_reports_the_capabilities_of_the_version_it_names() {
+    let router = emulator();
+
+    // A caller decides whether to take an upgrade by what it would be RUNNING
+    // afterwards, so each target's capability members are the target version's own.
+    let shared: [&str; 5] = [
+        "SupportsParallelQuery",
+        "SupportsGlobalDatabases",
+        "SupportsBabelfish",
+        "SupportsLimitlessDatabase",
+        "SupportsLocalWriteForwarding",
+    ];
+
+    for engine in MODELLED_ENGINES {
+        let all = all_versions_of(&router, engine).await;
+        let by_version: BTreeMap<String, Version> = all
+            .iter()
+            .map(|version| (version.engine_version.clone(), version.clone()))
+            .collect();
+
+        for version in &all {
+            for target in subtrees(&version.xml, "UpgradeTarget") {
+                let target_version = text(&target, "EngineVersion");
+                let case = format!("{engine} {} -> {target_version}", version.engine_version);
+                let entry = by_version
+                    .get(&target_version)
+                    .expect("a target is one of the engine's own versions");
+                for member in shared {
+                    assert_eq!(
+                        optional_text(&target, member),
+                        optional_text(&entry.scalars, member),
+                        "case {case:?}: {member} must be the TARGET version's, got \
+                         {target}"
+                    );
+                }
+                assert_eq!(
+                    list_members(&target, "SupportedEngineModes"),
+                    list_members(&entry.scalars, "SupportedEngineModes"),
+                    "case {case:?}: SupportedEngineModes must be the TARGET version's, \
+                     got {target}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_report_carries_several_versions_per_engine_in_ascending_order() {
+    let router = emulator();
+
+    let (all, _) = describe(
+        &router,
+        "every version",
+        &[("IncludeAll", "true".to_string())],
+    )
+    .await;
+
+    // The report is grouped by engine: an engine's entries are contiguous, so a client
+    // reading a page sees whole engine families rather than interleaved ones.
+    let mut seen_engines: Vec<String> = Vec::new();
+    for version in &all {
+        if seen_engines.last() != Some(&version.engine) {
+            assert!(
+                !seen_engines.contains(&version.engine),
+                "case \"every version\": the entries of {:?} must be contiguous, got the \
+                 engine again after {:?}",
+                version.engine,
+                seen_engines
+            );
+            seen_engines.push(version.engine.clone());
+        }
+    }
+
+    for engine in MODELLED_ENGINES {
+        let reported = all_versions_of(&router, engine).await;
+        if reported.is_empty() {
+            continue;
+        }
+
+        // A catalogue, not one synthesized entry: every engine carries several versions,
+        // and the earliest of them can be upgraded to a later one.
+        assert!(
+            reported.len() > 1,
+            "case {engine:?}: the report must carry the engine's versions, got only {:?}",
+            reported
+                .iter()
+                .map(|version| version.engine_version.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !subtrees(&reported[0].xml, "UpgradeTarget").is_empty(),
+            "case {engine:?}: the earliest version must have somewhere to upgrade to, \
+             got {}",
+            reported[0].xml
+        );
+
+        // …and they are reported in ascending version order, which is the order the
+        // Marker pages through.
+        for pair in reported.windows(2) {
+            let (earlier, later) = (&pair[0], &pair[1]);
+            assert!(
+                version_key(&earlier.engine_version) < version_key(&later.engine_version),
+                "case {engine:?}: the report must ascend by version, got {:?} before {:?}",
+                earlier.engine_version,
+                later.engine_version
+            );
+        }
+    }
+}
+

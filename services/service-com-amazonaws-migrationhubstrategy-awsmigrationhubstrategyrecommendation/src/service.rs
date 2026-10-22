@@ -98,15 +98,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Strategy Recommendations states EVERY such refusal as one service-wide
+        // sentence: the `ValidationException` the model documents as "The request
+        // body isn't valid.", carrying neither the member that failed nor the value
+        // it rejected. The framework's default instead renders the generic AWS-SDK
+        // constraint envelope ("N validation error detected: Value '…' at '…' failed
+        // to satisfy constraint: …"), which is a dialect this service does not speak
+        // and which quotes the caller's own value back at it. So the message is
+        // replaced by `crate::state::INVALID_REQUEST_BODY` for every operation and
+        // every constraint kind — length, range, pattern, enum, an absent required
+        // member — rather than case by case.
+        //
+        // The STATUS and the CODE are already right and stay exactly as they were:
+        // the framework answers a refusal with 400 `ValidationException`, which is
+        // what this service's model declares (`@httpError(400)`). `Refused` carries
+        // both, so the code is restated unchanged alongside the reworded message —
+        // a message without its matching code would be worse than leaving both.
+        //
+        // An authentication refusal is left to the framework: it is not an input
+        // failure and this service does not restate it.
+        let Refusal::Invalid(_) = refusal else {
+            return None;
+        };
+        Some(Refused {
+            code: "ValidationException".to_string(),
+            message: crate::state::INVALID_REQUEST_BODY.to_string(),
+        })
     }
 
     fn override_routing_error(

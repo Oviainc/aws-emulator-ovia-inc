@@ -175,10 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetMissionProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "No mission profile with id {} exists",
-                            input.mission_profile_id
-                        )),
+                        // The service's mission-profile literal: it does not disclose
+                        // the id that was asked for.
+                        message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
                     },
                 )
             })?;

@@ -41,9 +41,72 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The dotted member paths this service's RESOURCE IDENTIFIERS are refused under: the
+/// ARN each operation resolves a stored forecast by — `QueryForecast$ForecastArn`
+/// (target `Arn`, length 0..256) and `QueryWhatIfForecast$WhatIfForecastArn` (target
+/// `LongArn`, length 0..300), both carrying the pattern
+/// `^arn:([a-z\d-]+):forecast:.*:.*:.+$`. They are the only ARN-typed members the model
+/// declares; a refusal names a member in lowerCamel
+/// (`aws_smithy_schema_server::constraints::path::member`).
+///
+/// Source: `smithy_query(query="closure",operation="QueryForecast,QueryWhatIfForecast",
+/// model_path="services/service-com-amazonaws-forecastquery-amazonforecastruntime/\
+/// smithy-model/com-amazonaws-forecastquery-amazonforecastruntime.json")`.
+const RESOURCE_ARN_PATHS: [&str; 2] = ["forecastArn", "whatIfForecastArn"];
+
+/// The service key `::emulator_server::service_from_target` reads out of the
+/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
+/// the segment before the `.`, strips any trailing `_<version>` suffix and lower-cases
+/// the result, so `AmazonForecastRuntime.<OperationName>` (`OPERATIONS.md`, "Request
+/// routing") normalises to this key.
+///
+/// The Amazon Forecast CONTROL plane holds the mirror image of this constant, in
+/// `services/service-com-amazonaws-forecast-amazonforecast/src/service.rs`, where it is
+/// `amazonforecast`. The two decide ONE split of the shared `forecast` signing name, so
+/// change them together.
+const TARGET_SERVICE_KEY: &str = "amazonforecastruntime";
+
+/// The modelled error an ARN that is not a Forecast ARN is refused with:
+/// `InvalidInputException` (HTTP 400), whose documented meaning is "The value is invalid
+/// or is too long". It is a shape BOTH operations declare, so a client's
+/// `except InvalidInputException` matches it.
+const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
+
+/// The first violation, if any, that says a resource ARN is not an ARN of this service:
+/// its modelled `@pattern`, or the modelled maximum length an ARN too long to be one
+/// exceeds.
+///
+/// ONE selection, used both to DECIDE that this is an ARN-syntax refusal and to WORD it,
+/// so the code a caller branches on and the clause it reads can never come from different
+/// violations.
+///
+/// ANY such violation is enough, and it wins over the rest: both operations resolve the
+/// resource their ARN names before anything else about the request is judged, so an
+/// unreadable ARN is what the caller is told about even when another member is also
+/// wrong. Every refusal that does NOT concern the resource ARN's syntax (an absent
+/// required member, a bound on `Filters` or `NextToken`, a `Filters` key outside its
+/// pattern) keeps the framework's generic request-validation wording: those are
+/// request-SHAPE constraints, reported by the validation layer in front of the service
+/// rather than by the service's own resolution of the resource.
+fn resource_arn_syntax_violation(violations: &[Violation]) -> Option<&Violation> {
+    violations.iter().find(|violation| {
+        RESOURCE_ARN_PATHS.contains(&violation.path.as_str())
+            && matches!(
+                violation.kind,
+                ViolationKind::Pattern(_) | ViolationKind::MaxLength(_)
+            )
+    })
+}
+
+/// How an ARN-syntax refusal is worded: the modelled error's own sentence, followed by
+/// the clause THAT violation states (built from the request, so a caller can fix it).
+fn arn_syntax_message(violation: &Violation) -> String {
+    format!("The value is invalid or is too long. {}", violation.message())
+}
 
 /// The `com-amazonaws-forecastquery-amazonforecastruntime` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -74,12 +137,39 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // TWO services sit behind the ONE SigV4 signing name `forecast`: the Amazon
+        // Forecast control plane (sdkId `forecast`, endpoint `forecast`, target prefix
+        // `AmazonForecast`) and this query/runtime data plane (sdkId `forecastquery`,
+        // endpoint `forecastquery`, target prefix `AmazonForecastRuntime`). The model
+        // says so itself — `aws.auth#sigv4` names `forecast` here while
+        // `aws.api#service` gives `endpointPrefix: forecastquery` — and no Smithy trait
+        // expresses the sharing. The router's routing key comes from the SigV4
+        // credential scope first, so both services resolve to `forecast`: matching on
+        // the signing name ALONE makes each one claim the other's traffic, the router
+        // finds two claimants and refuses every Forecast-signed request with
+        // `500 AmbiguousService` — so NEITHER service is reachable.
+        //
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // rule every service under a shared signing name applies: the signing name must
+        // match AND the request must address THIS service. This model is `awsJson1_1`,
+        // an RPC protocol: every operation posts to `/` — the path its control-plane
+        // peer posts to as well, so a path test cannot separate them — and names its
+        // target service out of band, in `X-Amz-Target:
+        // AmazonForecastRuntime.<OperationName>`. That target is therefore the
+        // discriminator, read through the framework's OWN reader so the parsing rule
+        // (strip the operation, strip a trailing `_<version>`, lower-case) stays in one
+        // place — the same rule DynamoDB uses against DynamoDB Streams and Amazon
+        // Personalize against its two data planes, and exactly how real AWS tells
+        // `forecastquery` traffic from `forecast` traffic.
+        //
+        // A request carrying no such target names no operation of this awsJson1_1
+        // service, so it is not this service's traffic.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                ::emulator_server::service_from_target(&parts.headers).as_deref()
+                    == Some(TARGET_SERVICE_KEY)
+            }
+            _ => false,
         }
     }
 
@@ -97,16 +187,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // ONE class is reworded, and it replaces BOTH the code and the message: a
+        // resource ARN that is not a Forecast ARN. Each operation reads the ARN it is
+        // called with before it resolves (or fails to resolve) the forecast it names, so
+        // an ARN the service cannot read is answered with the service's OWN modelled
+        // input error — `InvalidInputException`, HTTP 400 — and not with a generic code
+        // this model does not declare. That is the code a client branches on
+        // (`except fq.exceptions.InvalidInputException`), and the one that keeps the
+        // documented precedence observable: ARN syntax is refused BEFORE resource
+        // resolution, which answers `ResourceNotFoundException` for an ARN that is
+        // well-formed but names nothing.
+        //
+        // Every other refusal keeps the framework's wording: an absent required member
+        // and a bound on another member are request-SHAPE constraints, reported by the
+        // validation layer in front of the service.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                resource_arn_syntax_violation(violations).map(|violation| Refused {
+                    code: INVALID_INPUT_EXCEPTION.to_string(),
+                    message: arn_syntax_message(violation),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

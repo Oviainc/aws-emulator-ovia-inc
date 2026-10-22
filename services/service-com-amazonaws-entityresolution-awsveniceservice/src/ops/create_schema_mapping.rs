@@ -188,10 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.schema_mappings.contains_key(&input.schema_name) {
             return Err(CreateSchemaMappingErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "Schema mapping {} already exists",
-                        input.schema_name
-                    )),
+                    message: Some(
+                        crate::state::messages::CREATE_SCHEMA_MAPPING_CONFLICT.to_string(),
+                    ),
                 },
             )
             .into());

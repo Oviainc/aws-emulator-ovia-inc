@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code this service answers an input-constraint violation with: the modeled
+/// `ValidationException`, which every operation that can be refused declares with
+/// `@httpError 400`. It is also the framework's own default code for a refusal, restated
+/// here because `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
 /// The error code this service answers a malformed resource ARN with: its own
 /// modelled `BadRequestException` — "The request is invalid or malformed.",
 /// `@error("client")`, `@httpError(400)`
@@ -136,11 +142,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `any`, not "every violation": the ARN parse runs first, so it decides
         // the answer even when the same request also breaks another rule.
         //
-        // Every other refusal — an absent required member, a `@length` or
-        // `@range` bound, a non-`Arn` pattern such as `kmsKeyArn`'s, an enum
-        // value, an authentication failure — keeps the framework's wording and
-        // its `ValidationException` code, which is the modelled error this
-        // service declares for a constraint failure.
+        // Every OTHER refusal of a value the model constrains keeps the modelled
+        // `ValidationException` code — restated unchanged, since it is also the
+        // framework's default — and only its message changes: this service quotes a
+        // `@pattern` without the model's anchors, and withholds the value of a
+        // member carrying a caller-chosen name, an encryption-key reference or a
+        // DICOM attribute. The one place that rule lives is
+        // `crate::state::validation_envelope`, which the handlers that refuse a
+        // request themselves call too.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
         match refusal {
             Refusal::Invalid(violations) if violations.iter().any(is_malformed_resource_arn) => {
                 Some(Refused {
@@ -148,6 +160,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     message: MALFORMED_ARN_MESSAGE.to_string(),
                 })
             }
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: crate::state::validation_envelope(violations)?,
+            }),
             _ => None,
         }
     }

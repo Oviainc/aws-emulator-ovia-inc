@@ -122,7 +122,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `TagResourceResponse` declares no members, and the wire answer to a
+    /// successful tag call is `204 No Content` — what the recorded traffic of
+    /// this operation carries. It is NOT a rule about every empty output shape
+    /// of this service: `UpdateLifecyclePolicy`'s output is empty too and its
+    /// success is a 200, so the status is per operation.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
@@ -139,6 +144,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A caller may not set a tag key under the reserved `aws:` prefix. The
+        // refusal precedes the lookup and the write, so nothing is tagged.
+        if crate::state::reserved_tag_key(input.tags.keys().map(String::as_str)).is_some() {
+            return Err(TagResourceErrorModeled::InvalidRequestException(
+                crate::state::reserved_tag_key_refused(),
+            )
+            .into());
+        }
 
         let mut store = state.lock();
         // `ResourceArn` is a `PolicyArn`, so the resource it names is the policy

@@ -639,8 +639,8 @@ async fn an_instant_no_timestamp_can_carry_is_refused_at_ingest_and_the_far_edge
             );
             assert_eq!(
                 unprocessed[0].get("ErrorCode").and_then(Value::as_str),
-                Some("InvalidField"),
-                "case {label:?}: the rejection must name the field at fault, got {put:?}"
+                Some("InvalidStartTime"),
+                "case {label:?}: the rejection's code must name the member at fault, got {put:?}"
             );
             continue;
         }

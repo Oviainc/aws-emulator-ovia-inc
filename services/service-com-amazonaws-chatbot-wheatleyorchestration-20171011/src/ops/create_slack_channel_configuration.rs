@@ -7,6 +7,12 @@
 //! for a `ConfigurationName` that already exists in the request's region is a 409
 //! `ConflictException`.
 //!
+//! A configuration can only be created for a Slack workspace AUTHORIZED with the
+//! account ([`crate::state::ComAmazonawsChatbotWheatleyorchestration20171011State::slack_workspace`]);
+//! a `SlackTeamId` no authorization names is refused with the modelled 400
+//! `InvalidRequestException` and persists nothing. The stored record takes the
+//! workspace's `SlackTeamName` from that authorization.
+//!
 //! A create past [`crate::state::MAX_SLACK_CHANNEL_CONFIGURATIONS`] is refused with
 //! `LimitExceededException`, so repeated creates cannot grow the store without bound.
 //!
@@ -188,6 +194,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::slack_channel_configuration_arn(&region, &input.configuration_name);
 
         let mut store = state.lock();
+
+        // A channel configuration can only be created for a Slack workspace the account
+        // has AUTHORIZED (the one-time Slack client handshake, which no operation in
+        // this model performs). The workspace registry is the only thing that decides
+        // that — never the spelling or shape of the id — so a workspace it does not
+        // hold is refused with the modelled 400 and nothing is persisted.
+        let Some(workspace) = store.slack_workspace(&input.slack_team_id).cloned() else {
+            return Err(
+                CreateSlackChannelConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::unauthorized_slack_workspace_message(
+                            &input.slack_team_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
         if store
             .slack_channel_configurations
             .contains_key(&chat_configuration_arn)
@@ -226,12 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             chat_configuration_arn: chat_configuration_arn.clone(),
             configuration_name: input.configuration_name,
             region,
-            // The Slack workspace's display name is not in this request, and the
-            // workspace-authorization operations that would carry it are still
-            // scaffolded, so the stored record names the workspace by its id.
-            // TODO: take the real display name from the workspace record once
-            // `DescribeSlackWorkspaces` is implemented.
-            slack_team_name: input.slack_team_id.clone(),
+            // The workspace's display name comes from the authorization the account
+            // holds for it, not from this request: the request carries only the id.
+            slack_team_name: workspace.slack_team_name,
             slack_team_id: input.slack_team_id,
             // `SlackChannelName` is optional on input but required on the
             // configuration, so an omitted name leaves the channel named by its id.

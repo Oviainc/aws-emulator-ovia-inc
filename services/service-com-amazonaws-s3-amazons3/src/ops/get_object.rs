@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieves an object `PutObject` stored in a general purpose bucket.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -275,13 +268,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetObjectError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetObject")]
+// here — hence the `GetObjectError` alias below.
+//
+// `NoSuchBucket` is widened in with `extra_errors`: `Bucket` is an `@httpLabel` naming a
+// bucket that may not exist, and the nearest error this operation lists (`NoSuchKey`)
+// would report an absent BUCKET as a missing key — a different statement. The shape is
+// this SERVICE's own ("The specified bucket does not exist", HTTP 404).
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetObject",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetObjectErrorModeled {
     InvalidObjectState(InvalidObjectState),
+    NoSuchBucket(NoSuchBucket),
     NoSuchKey(NoSuchKey),
 }
 
@@ -336,18 +336,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about an object the emulator cannot look up, and
+            // `NoSuchKey` would be a false statement about it, so the scaffold's 501 says
+            // what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetObject"));
+        };
+
+        // Members whose answer is a response this operation cannot render. Each of them
+        // changes the status or the body of a successful GET, and an operation here
+        // renders one success status (200) over the whole stored object, so serving them
+        // as a plain 200 full-body read would answer something the request did not ask:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetObject"))
+        // * `Range` and `partNumber` ask for part of the object, which S3 answers with
+        //   HTTP 206 and a `Content-Range`.
+        // * the conditional members are answered with HTTP 304 (`If-None-Match`,
+        //   `If-Modified-Since`) or 412 (`If-Match`, `If-Unmodified-Since`) when the
+        //   condition fails; `PreconditionFailed` is not a shape in this model either.
+        // * `versionId` names a version, and bucket versioning is not emulated
+        //   (`PutBucketVersioning` is still a stub), so this emulator holds no version to
+        //   match it against.
+        // * the SSE-C members are the key an encrypted object would be decrypted with;
+        //   `PutObject` refuses to store one, so no object here was encrypted with it.
+        for (member, present) in [
+            ("Range", input.range.is_some()),
+            ("partNumber", input.part_number.is_some()),
+            ("If-Match", input.if_match.is_some()),
+            ("If-None-Match", input.if_none_match.is_some()),
+            ("If-Modified-Since", input.if_modified_since.is_some()),
+            ("If-Unmodified-Since", input.if_unmodified_since.is_some()),
+            ("versionId", input.version_id.is_some()),
+            (
+                "x-amz-server-side-encryption-customer-algorithm",
+                input.sse_customer_algorithm.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                input.sse_customer_key.is_some(),
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "GetObject with {member}"
+                )));
+            }
+        }
+
+        // Read-only: the guard is taken, the object is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(object) = bucket.object(&input.key) else {
+            return Err(GetObjectErrorModeled::NoSuchKey(NoSuchKey {}).into());
+        };
+
+        // The `response-*` query parameters override the matching response headers
+        // ("Sets the Content-Type header of the response", and so on for each), so the
+        // request's value wins over the stored one when it carries any.
+        let expires = input
+            .response_expires
+            .and_then(|expires| {
+                expires
+                    .fmt(::aws_smithy_types::date_time::Format::HttpDate)
+                    .ok()
+            })
+            .or_else(|| object.expires.clone());
+
+        Ok(GetObjectOutput {
+            body: object.body.clone(),
+            // `Content-Length` is the length of the body actually being returned.
+            content_length: Some(object.body.len() as i64),
+            e_tag: Some(object.etag.clone()),
+            last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
+            // "Amazon S3 returns this header for all objects except for S3 Standard
+            // storage class objects" (`GetObjectOutput$StorageClass`).
+            storage_class: Some(object.storage_class.clone())
+                .filter(|class| class != crate::state::DEFAULT_STORAGE_CLASS),
+            metadata: Some(
+                object
+                    .metadata
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            content_type: input
+                .response_content_type
+                .or_else(|| object.content_type.clone()),
+            cache_control: input
+                .response_cache_control
+                .or_else(|| object.cache_control.clone()),
+            content_disposition: input
+                .response_content_disposition
+                .or_else(|| object.content_disposition.clone()),
+            content_encoding: input
+                .response_content_encoding
+                .or_else(|| object.content_encoding.clone()),
+            content_language: input
+                .response_content_language
+                .or_else(|| object.content_language.clone()),
+            expires,
+            website_redirect_location: object.website_redirect_location.clone(),
+            // Everything else describes a feature no stored object here has, so none of
+            // it is reported rather than being invented: `AcceptRanges` would advertise
+            // the ranged reads refused above, `DeleteMarker` and `VersionId` need bucket
+            // versioning, `Expiration` and `Restore`/`ArchiveStatus` need a lifecycle
+            // configuration and an archive tier, the checksum members need a checksum
+            // `PutObject` did not compute, the encryption members are refused at write
+            // time, `TagCount` needs object tags no operation here records, `PartsCount`
+            // needs a multipart upload, `ContentRange` belongs to a ranged read,
+            // `MissingMeta` counts unreadable metadata headers (there are none),
+            // `ReplicationStatus` needs a replication configuration and `RequestCharged`
+            // a Requester Pays charge this emulator does not model.
+            ..GetObjectOutput::default()
+        })
     }
 }

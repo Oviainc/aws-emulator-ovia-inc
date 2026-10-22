@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the submitted tag keys and values with the workspace `resourceArn` names:
+//! a key the workspace does not carry yet is added, a key it already carries takes the
+//! new value, and every other tag it holds is left as it was. The tags live on the one
+//! workspace record in [`crate::state`], so `ListTagsForResource`, `DescribeWorkspace`
+//! and `ListWorkspaces` all report what this operation wrote.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `TagResource::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
+//! The engine is held on `self` (constructor-injected), NOT passed per request, so
 //! engine access is guaranteed by the time any request runs. Reach the store through
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
@@ -30,7 +26,7 @@
 //!     state.lock().your_field = /* ... */;
 //! ```
 //!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
+//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only:
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
@@ -42,8 +38,8 @@
 //! # Modeled contract for `TagResource`
 //!
 //! What AWS documents for this operation, from this service's Smithy model. HTML is
-//! stripped and long entries are clipped at ` …`. For the FULL text of any one item,
-//! ask the model rather than reading the raw JSON:
+//! stripped and long entries are clipped. For the FULL text of any one item, ask the
+//! model rather than reading the raw JSON:
 //!
 //! ```text
 //! smithy_query(query="doc",shape="<Shape>",member="<Member>",model_path="services/service-com-amazonaws-grafana-awsgrafanacontrolplane/smithy-model/com-amazonaws-grafana-awsgrafanacontrolplane.json")
@@ -57,23 +53,23 @@
 //!
 //! ## Input
 //!
-//! * `resourceArn` (String) **required** — The ARN of the resource the tag is associated
+//! * `resourceArn` (String) **required** - The ARN of the resource the tag is associated
 //!   with.
-//! * `tags` (TagMap, len ..50) **required** — The list of tag keys and values to associate
+//! * `tags` (TagMap, len ..50) **required** - The list of tag keys and values to associate
 //!   with the resource. You can associate tag keys only, tags (key and values) only or a
 //!   combination of tag keys and tags.
 //!
 //! ## Errors
 //!
-//! * `AccessDeniedException` (HTTP 403) — You do not have sufficient permissions to perform
+//! * `AccessDeniedException` (HTTP 403) - You do not have sufficient permissions to perform
 //!   this action.
-//! * `InternalServerException` (HTTP 500) — Unexpected error while processing the request.
+//! * `InternalServerException` (HTTP 500) - Unexpected error while processing the request.
 //!   Retry the request.
-//! * `ResourceNotFoundException` (HTTP 404) — The request references a resource that does not
+//! * `ResourceNotFoundException` (HTTP 404) - The request references a resource that does not
 //!   exist.
-//! * `ThrottlingException` (HTTP 429) — The request was denied because of request throttling.
+//! * `ThrottlingException` (HTTP 429) - The request was denied because of request throttling.
 //!   Retry the request.
-//! * `ValidationException` (HTTP 400) — The value of a parameter in the request caused an
+//! * `ValidationException` (HTTP 400) - The value of a parameter in the request caused an
 //!   error.
 
 #[allow(unused_imports)]
@@ -151,18 +147,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the grafana workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // "Currently, the only resource that can be tagged is workspaces", so an ARN
+        // naming anything else names nothing this service can tag.
+        let Some(id) = crate::state::workspace_id_in_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::not_a_workspace_arn(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // The request-boundary validator refuses a modelled constraint on a member,
+        // but does not walk a MAP's key and value constraints, so `TagKey` and
+        // `TagValue` are enforced here. Walking a sorted copy makes the refusal
+        // deterministic when more than one pair is out of bounds.
+        let submitted: ::std::collections::BTreeMap<&str, &str> = input
+            .tags
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        for (key, value) in &submitted {
+            if let Some(refusal) = crate::state::out_of_bounds_tag(key, value) {
+                return Err(TagResourceErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(workspace) = store.settled_mut(id, now) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::workspace_not_found(id),
+            )
+            .into());
+        };
+
+        // Merge into a copy first, so a request that would take the workspace past the
+        // tag bound leaves the stored tags exactly as they were.
+        let mut merged = workspace.tags.clone();
+        for (key, value) in &submitted {
+            merged.insert(key.to_string(), value.to_string());
+        }
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "applying these tags would leave {} tags on {}, more than the maximum of {}",
+                    merged.len(),
+                    input.resource_arn,
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+                reason: "FIELD_VALIDATION_FAILED".to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "tags".to_string(),
+                    message: format!(
+                        "a resource holds at most {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                }]),
+            })
+            .into());
+        }
+
+        // Only the tags change: `modified` reports when the workspace's own
+        // configuration last changed, and nothing this service documents says
+        // associating a tag with a resource rewrites that date.
+        workspace.tags = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

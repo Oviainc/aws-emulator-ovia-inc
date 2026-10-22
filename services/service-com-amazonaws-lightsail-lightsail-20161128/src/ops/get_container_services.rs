@@ -163,12 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let wanted = input.service_name;
 
         crate::state::with_state(&*self.engine, |store| match &wanted {
-            // A well-formed name that names nothing in this region is a modelled
-            // 404, never an empty 200.
+            // A well-formed name that names nothing in this region is the
+            // service's `DoesNotExist` rejection, never an empty 200.
             Some(name) => store
                 .container_service(&region, name)
                 .map(|service| vec![service.view()])
-                .ok_or_else(|| not_found(name, &region)),
+                .ok_or_else(|| not_found(name)),
             None => Ok(store
                 .container_services_in(&region)
                 .into_iter()
@@ -182,16 +182,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// No container service of that name is stored in that region: the modelled
-/// `NotFoundException` (404).
-fn not_found(name: &str, region: &str) -> GetContainerServicesError {
-    GetContainerServicesErrorModeled::NotFoundException(NotFoundException {
-        message: Some(format!(
-            "no container service named '{name}' exists in {region}"
-        )),
-        ..Default::default()
-    })
-    .into()
+/// No container service of that name is stored in that region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the requested
+/// name. The region scopes the LOOKUP (the modelled `serviceName` documentation),
+/// but it is not part of the message: the identifier the message names is the one
+/// the request carried.
+fn not_found(name: &str) -> GetContainerServicesError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+        name,
+    )
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

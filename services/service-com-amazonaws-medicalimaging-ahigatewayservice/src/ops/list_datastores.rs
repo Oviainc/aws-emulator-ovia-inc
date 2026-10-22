@@ -140,9 +140,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListDatastoresErrorModeled::ValidationException(
                         ValidationException {
-                            message: format!(
-                                "datastoreStatus must be one of {}, got {value}",
-                                DATASTORE_STATUS_VALUES.join(", ")
+                            // Worded through the one refusal formatter this service
+                            // owns, so a refusal raised here reads exactly like one
+                            // the boundary validator stated.
+                            message: crate::state::one_validation_error(
+                                &smithy_server_runtime::Violation {
+                                    path: "datastoreStatus".to_string(),
+                                    kind: smithy_server_runtime::ViolationKind::EnumValue(
+                                        DATASTORE_STATUS_VALUES
+                                            .iter()
+                                            .map(|value| (*value).to_string())
+                                            .collect(),
+                                    ),
+                                    value: Some(value.to_string()),
+                                },
                             ),
                         },
                     )
@@ -152,13 +163,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token is this service's own opaque handle; only one this service minted
-        // can be honoured, and a forged one is a client error, not an empty page.
+        // can be honoured, and a forged one is a client error, not an empty page. The
+        // refusal is the service's FIXED sentence: it does not vary with the token, so
+        // it reveals nothing about how a real one is built.
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(decode_page_token(token).ok_or_else(|| {
                 ListDatastoresErrorModeled::ValidationException(ValidationException {
-                    message: "nextToken is not a pagination token issued by this service"
-                        .to_string(),
+                    message: crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                 })
             })?),
         };

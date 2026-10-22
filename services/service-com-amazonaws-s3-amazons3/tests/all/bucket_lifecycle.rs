@@ -90,7 +90,11 @@ impl Answer {
     }
 }
 
-/// Dispatch one request with the given headers and body.
+/// Dispatch one request with the given headers and an XML (or empty) body.
+///
+/// The XML content type every request in this suite and the tagging suite carries is
+/// added here; a suite whose payload is arbitrary bytes (an object's) calls
+/// [`send_bytes`] and names its own content type.
 pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
@@ -98,17 +102,30 @@ pub(crate) async fn send(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Answer {
+    let mut all: Vec<(&str, &str)> = vec![("content-type", "application/xml")];
+    all.extend_from_slice(headers);
+    send_bytes(router, method, uri, &all, body.as_bytes()).await
+}
+
+/// Dispatch one request whose body is arbitrary BYTES and whose headers are exactly the
+/// ones given — what an object payload needs.
+pub(crate) async fn send_bytes(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Answer {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://s3.us-east-1.amazonaws.com{uri}"))
         .header("host", "s3.us-east-1.amazonaws.com")
-        .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/xml");
+        .header("authorization", AUTHORIZATION);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
     let request = builder
-        .body(bytes::Bytes::from(body.to_string()))
+        .body(bytes::Bytes::copy_from_slice(body))
         .expect("the test request must build");
     let response = router.dispatch(request).await;
     let (parts, body) = response.into_parts();

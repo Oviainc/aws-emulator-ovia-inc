@@ -8,6 +8,7 @@
 #![allow(unused_imports)]
 
 use super::*;
+use crate::ops::types::shared_types::artifact_date_time_member_schema;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-artifact-artifact.json");
 
@@ -23,9 +24,47 @@ pub struct PutComplianceInquiryFeedbackInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.artifact#PutComplianceInquiryFeedbackResponse")]
+/// `PutComplianceInquiryFeedbackResponse`, with its schema written out instead of derived:
+/// `submittedAt` targets `TimestampAttribute`, so it is an RFC 3339 date-time string on the
+/// wire rather than the restJson1 default of epoch seconds. See the note on
+/// `crate::artifact_member_schema` in `types/shared_types.rs` for why this is hand-written
+/// and what deletes it. Member set, order and nullability from
+/// `smithy_query(query="shape",shape="PutComplianceInquiryFeedbackResponse")`.
 #[derive(Debug, Clone)]
 pub struct PutComplianceInquiryFeedbackOutput {
     pub submitted_at: ::aws_smithy_types::DateTime,
+}
+
+#[allow(non_upper_case_globals)]
+impl PutComplianceInquiryFeedbackOutput {
+    /// `TimestampAttribute`, `@timestampFormat("date-time")`.
+    pub const M_SUBMITTED_AT: ::aws_smithy_schema::Schema = artifact_date_time_member_schema!(
+        "PutComplianceInquiryFeedbackResponse",
+        "submittedAt",
+        0
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.artifact#PutComplianceInquiryFeedbackResponse",
+            "com.amazonaws.artifact",
+            "PutComplianceInquiryFeedbackResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_SUBMITTED_AT],
+    );
+}
+
+pub static PUT_COMPLIANCE_INQUIRY_FEEDBACK_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &PutComplianceInquiryFeedbackOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for PutComplianceInquiryFeedbackOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_timestamp(&Self::M_SUBMITTED_AT, &self.submitted_at)?;
+        Ok(())
+    }
 }
 

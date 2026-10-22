@@ -171,6 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // Materialise any group removal the clock has already made due, so no
+        // tag is removed from a group that is already gone.
+        store.settle(now);
 
         let Some(group_name) = store.group_name_for_arn(&input.resource_arn, &region) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(

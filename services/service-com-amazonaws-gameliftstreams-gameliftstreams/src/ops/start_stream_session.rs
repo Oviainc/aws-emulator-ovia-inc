@@ -383,13 +383,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(session_id) => session_id,
             None => {
                 let group = &state.stream_groups[&group_id];
-                // "Prerequisites: You must have a stream group in ACTIVE status."
-                if group.status != crate::state::STREAM_GROUP_ACTIVE {
+                // "Prerequisites: You must have a stream group in ACTIVE status." A
+                // group that is updating its locations keeps serving the capacity
+                // its provisioned locations hold, so it hosts sessions too (see
+                // `StreamGroup::can_host_sessions`).
+                if !group.can_host_sessions() {
                     return Err(StartStreamSessionErrorModeled::ConflictException(
                         ConflictException {
                             message: format!(
                                 "stream group {} is in {} status; a stream session can only \
-                                 start in a stream group in ACTIVE status",
+                                 start in a stream group that is ready to host streams",
                                 group.id, group.status
                             ),
                         },
@@ -428,14 +431,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "For stream groups that have multiple locations, provide a set of
                 // locations ordered by priority. Amazon GameLift Streams will start a
                 // single stream session in the next available location." With no
-                // `Locations`, the group's own first location hosts the stream.
+                // `Locations`, the group's own first available location hosts the
+                // stream. A location that is still being prepared is not available:
+                // "ACTIVATING: ... You cannot stream from ... this location yet."
                 let requested = input.locations.clone().unwrap_or_default();
                 let location = if requested.is_empty() {
-                    group.locations.first().map(|slot| slot.name.clone())
+                    group
+                        .locations
+                        .iter()
+                        .find(|slot| group.can_stream_from(&slot.name))
+                        .map(|slot| slot.name.clone())
                 } else {
                     requested
                         .iter()
-                        .find(|location| group.has_location(location))
+                        .find(|location| group.can_stream_from(location))
                         .cloned()
                 };
                 let Some(location) = location else {
@@ -449,7 +458,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 )
                             } else {
                                 format!(
-                                    "stream group {} holds none of the requested Locations: {}",
+                                    "stream group {} has no location that can host a stream \
+                                     session among the requested Locations: {}",
                                     group.id,
                                     requested.join(", ")
                                 )

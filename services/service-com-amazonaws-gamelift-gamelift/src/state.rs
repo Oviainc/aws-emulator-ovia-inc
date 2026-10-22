@@ -58,6 +58,25 @@ pub const FLEET_TYPE_ON_DEMAND: &str = "ON_DEMAND";
 /// decides which of the two documented `DnsName` forms a game session reports.
 pub const CERTIFICATE_TYPE_GENERATED: &str = "GENERATED";
 
+/// `CertificateConfiguration.CertificateType` default: that member's own doc —
+/// "DISABLED - (default) Do not generate a TLS/SSL certificate for this fleet." A fleet
+/// created without a `CertificateConfiguration` carries this one, so every fleet reports
+/// the member the service decided for it.
+pub const CERTIFICATE_TYPE_DISABLED: &str = "DISABLED";
+
+/// `PlayerGatewayMode` default: CreateFleet's `PlayerGatewayMode` doc — "`DISABLED`
+/// (default) -- Game clients connect to the game server endpoint."
+pub const PLAYER_GATEWAY_MODE_DISABLED: &str = "DISABLED";
+
+/// The CloudWatch metric group a fleet created without one is added to.
+///
+/// `FleetAttributes$MetricGroups`' doc: "Name of a metric group that metrics for this
+/// fleet are added to. [...] A fleet can be included in only one metric group at a
+/// time" — so a fleet is always in exactly one group, and a `CreateFleet` that names
+/// none leaves the fleet in the service's own group. The model does not name that group;
+/// the recorded wire responses of this service report it as `default`.
+pub const DEFAULT_METRIC_GROUP: &str = "default";
+
 /// The upper bound on `MaximumPlayerSessionCount`. CreatePlayerSession's doc: "The
 /// maximum number of players per game session is 200. It is not adjustable." The model
 /// leaves the member unbounded above, so the service rule is enforced here.
@@ -176,15 +195,19 @@ fn process_seed() -> u128 {
     })
 }
 
-/// An ARN in the format the GameLift model documents for its resources:
-/// `FleetAttributes$FleetArn` — "Format is
-/// `arn:aws:gamelift:<region>::fleet/fleet-a1234567-...`" — and
-/// `GameSession$GameSessionId` — "`arn:aws:gamelift:<home_region>::gamesession/<fleet
-/// ID>/<ID string>`". Both carry an EMPTY account segment, which is why this is not
-/// `engine::emulator_arn`: that helper always writes the emulator account id into the
-/// account segment.
+/// An ARN for a GameLift resource: `arn:aws:gamelift:<region>:<account>:<resource>`.
+///
+/// Every segment the model documents for `FleetAttributes$FleetArn` ("Format is
+/// `arn:aws:gamelift:<region>::fleet/fleet-a1234567-...`") and for
+/// `GameSession$GameSessionId` ("`arn:aws:gamelift:<home_region>::gamesession/<fleet
+/// ID>/<ID string>`"), with the account segment POPULATED: those prose examples render
+/// the account empty, but the service's own responses carry the account id of the
+/// calling account, and an ARN is only usable as an IAM resource — or splittable back
+/// into its owning account — when that segment is there. So this delegates to
+/// [`::engine::emulator_arn`], the single source of the one account every emulated
+/// response presents.
 pub fn gamelift_arn(region: &str, resource: &str) -> String {
-    format!("arn:aws:gamelift:{region}::{resource}")
+    ::engine::emulator_arn("gamelift", region, resource)
 }
 
 /// The region the caller addressed, read from the request's SigV4 credential scope.
@@ -333,6 +356,58 @@ pub struct Fleet {
 pub struct FleetLocation {
     pub location: String,
     pub status: String,
+    /// How many server processes are running at this location and available to host a
+    /// game session, i.e. this location's game-session capacity. See
+    /// [`server_processes_per_location`] for where the number comes from.
+    pub server_processes: usize,
+}
+
+/// How many server processes a fleet location runs, and so how many game sessions that
+/// location can host at once.
+///
+/// A managed (`EC2`) fleet is hosted on instances Amazon GameLift Servers provisions and
+/// launches the fleet's server processes on itself, so its locations run the processes
+/// the fleet's `RuntimeConfiguration` asks for — `RuntimeConfiguration`'s doc: "To
+/// calculate the total number of processes defined in a runtime configuration, add the
+/// values of the `ConcurrentExecutions` parameter for each server process" — capped at
+/// the [`MAX_SERVER_PROCESSES_PER_INSTANCE`] one instance may run, and given that same
+/// per-instance maximum when the fleet carries no runtime configuration, which
+/// `CreateFleet`'s member doc allows. `ComputeType` declares exactly `EC2` and `ANYWHERE`
+/// (`smithy_query shape=ComputeType`), and `CreateFleet` applies the managed-fleet rules
+/// to everything that is not `ANYWHERE`, so this does too: the two stay in step.
+///
+/// An `ANYWHERE` fleet runs NO server process of its own. Its game servers run on compute
+/// resources the customer registers (`RegisterCompute`'s doc: "Registers a compute
+/// resource in an Amazon GameLift Servers Anywhere fleet"), and each server process on
+/// such a compute becomes active and available only by announcing itself through the
+/// server SDK ("Each server process includes the SDK endpoint in its call to the Amazon
+/// GameLift Servers server SDK action `InitSDK()`") — a game-server-side protocol, not an
+/// API this emulator serves. So no process on an Anywhere fleet location is ever active
+/// and available here, its capacity is zero, and `CreateGameSession` against it answers
+/// the modelled `FleetCapacityExceededException`, as the real service does for an
+/// Anywhere fleet with no active, available server process.
+pub fn server_processes_per_location(compute_type: &str, configured_processes: i32) -> usize {
+    if compute_type == COMPUTE_TYPE_ANYWHERE {
+        return 0;
+    }
+    let processes = if configured_processes > 0 {
+        configured_processes.min(MAX_SERVER_PROCESSES_PER_INSTANCE)
+    } else {
+        MAX_SERVER_PROCESSES_PER_INSTANCE
+    };
+    usize::try_from(processes).unwrap_or(0)
+}
+
+/// The total `ConcurrentExecutions` a runtime configuration asks for, saturating rather
+/// than overflowing on a sum no instance could run (the caller refuses it).
+pub fn configured_server_processes(configuration: Option<&RuntimeConfiguration>) -> i32 {
+    configuration
+        .and_then(|configuration| configuration.server_processes.as_ref())
+        .map_or(0, |processes| {
+            processes.iter().fold(0_i32, |total, process| {
+                total.saturating_add(process.concurrent_executions)
+            })
+        })
 }
 
 impl Fleet {
@@ -388,6 +463,17 @@ impl Fleet {
             .collect()
     }
 
+    /// Whether Amazon GameLift Servers owns and runs this fleet's compute.
+    ///
+    /// `ComputeType`'s doc distinguishes the two: an `EC2` fleet's instances are managed
+    /// by the service, while an `ANYWHERE` fleet "represents compute resources that are
+    /// not owned or managed by Amazon GameLift Servers". Deleting a fleet "shuts down
+    /// any currently running fleet instances", so only a fleet WITH managed instances
+    /// has anything to shut down — which is what makes its deletion take time.
+    pub fn hosts_managed_instances(&self) -> bool {
+        self.compute_type != COMPUTE_TYPE_ANYWHERE
+    }
+
     /// Whether this fleet deploys to `location`.
     pub fn has_location(&self, location: &str) -> bool {
         self.locations
@@ -395,37 +481,25 @@ impl Fleet {
             .any(|candidate| candidate.location == location)
     }
 
-    /// How many game sessions this fleet can host at once.
+    /// How many game sessions this fleet can host at once in `location`.
     ///
-    /// Each running server process hosts one game session at a time, and this emulator
-    /// provisions a single compute per fleet (one [`Fleet::ip_address`]), so the fleet's
-    /// capacity is the total `ConcurrentExecutions` its `RuntimeConfiguration` asks for,
-    /// capped at the [`MAX_SERVER_PROCESSES_PER_INSTANCE`] one compute may run. A fleet
-    /// created without a runtime configuration — which `RuntimeConfiguration`'s member
-    /// doc allows — is given that same per-compute maximum.
-    pub fn game_session_capacity(&self) -> usize {
-        let configured = self
-            .runtime_configuration
-            .as_ref()
-            .and_then(|configuration| configuration.server_processes.as_ref())
-            .map_or(0, |processes| {
-                processes.iter().fold(0_i32, |total, process| {
-                    total.saturating_add(process.concurrent_executions)
-                })
-            });
-        let capacity = if configured > 0 {
-            configured.min(MAX_SERVER_PROCESSES_PER_INSTANCE)
-        } else {
-            MAX_SERVER_PROCESSES_PER_INSTANCE
-        };
-        // Each running server process listens on a port the fleet opens, and two live
-        // sessions on one compute cannot share a port, so the opened ports bound the
-        // capacity as well as the processes do. NOT clamped up to one: a fleet with no
-        // port to listen on has no capacity, and answers `FleetCapacityExceededException`
-        // rather than admitting a session that could never be given a port.
-        usize::try_from(capacity)
-            .unwrap_or(1)
-            .min(self.open_port_count())
+    /// Each active, available server process hosts one game session at a time, so the
+    /// capacity of a fleet location is the number of such processes running there (see
+    /// [`server_processes_per_location`]). A location this fleet does not deploy to, and
+    /// one whose own life cycle has not reached `ACTIVE` — so its processes are not
+    /// running yet — has none.
+    ///
+    /// The ports the fleet opens bound its live sessions too, but they are opened for the
+    /// WHOLE fleet rather than per location, so that bound is [`open_port_count`] against
+    /// the fleet's live sessions and is applied beside this one.
+    ///
+    /// [`open_port_count`]: Fleet::open_port_count
+    pub fn game_session_capacity(&self, location: &str) -> usize {
+        self.locations
+            .iter()
+            .find(|known| known.location == location)
+            .filter(|known| known.status == FLEET_STATUS_ACTIVE)
+            .map_or(0, |known| known.server_processes)
     }
 
     /// The inbound port ranges this fleet opens, lowest first and with overlaps merged,
@@ -466,10 +540,11 @@ impl Fleet {
     /// opens that no live session already holds, starting the walk where the last
     /// handout left off so consecutive sessions get consecutive ports.
     ///
-    /// `None` only when every opened port is taken, which [`game_session_capacity`]
-    /// keeps unreachable for a session the fleet admitted.
+    /// `None` only when every opened port is taken, which `CreateGameSession`'s port
+    /// bound — the fleet's live sessions against its [`open_port_count`] — keeps
+    /// unreachable for a session the fleet admitted.
     ///
-    /// [`game_session_capacity`]: Fleet::game_session_capacity
+    /// [`open_port_count`]: Fleet::open_port_count
     pub fn next_game_session_port(
         &mut self,
         taken: &HashSet<i32>,
@@ -735,13 +810,25 @@ impl ComAmazonawsGameliftGameliftState {
             .retain(|_, game_session_id| !sessions.contains(game_session_id));
     }
 
-    /// How many game sessions are placed on `fleet_id` and have not reached a terminal
-    /// status, i.e. how much of the fleet's capacity is in use.
+    /// How many game sessions are placed on `fleet_id` in `location` and have not reached
+    /// a terminal status, i.e. how much of that fleet location's capacity is in use.
+    pub fn live_game_sessions_at(&self, fleet_id: &str, location: &str) -> usize {
+        self.live_game_sessions(fleet_id, Some(location))
+    }
+
+    /// How many game sessions are placed on `fleet_id`, in any of its locations, and have
+    /// not reached a terminal status — so how many of the ports the fleet opens are held.
     pub fn live_game_sessions_on(&self, fleet_id: &str) -> usize {
+        self.live_game_sessions(fleet_id, None)
+    }
+
+    /// The live game sessions of a fleet, optionally narrowed to one of its locations.
+    fn live_game_sessions(&self, fleet_id: &str, location: Option<&str>) -> usize {
         self.game_sessions
             .values()
             .filter(|session| {
                 session.fleet_id == fleet_id
+                    && location.is_none_or(|location| session.location == location)
                     && (session.status == GAME_SESSION_STATUS_ACTIVATING
                         || session.status == GAME_SESSION_STATUS_ACTIVE)
             })

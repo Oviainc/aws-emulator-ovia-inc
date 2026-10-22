@@ -166,17 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteMatchingWorkflowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Matching workflow {} not found",
-                        input.workflow_name
+                    message: Some(crate::state::messages::delete_matching_workflow_not_found(
+                        &input.workflow_name,
                     )),
                 },
             )
             .into());
         }
 
+        // `message` is a modelled @required output member carrying this operation's
+        // own constant success text, not a sentence about the removed record.
         Ok(DeleteMatchingWorkflowOutput {
-            message: format!("Successfully deleted {}", input.workflow_name),
+            message: crate::state::messages::DELETE_MATCHING_WORKFLOW_SUCCESS.to_string(),
         })
     }
 }

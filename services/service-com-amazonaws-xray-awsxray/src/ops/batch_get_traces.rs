@@ -4,8 +4,10 @@
 //!
 //! Rebuilds each requested trace from the segment documents
 //! `PutTraceSegments` stored: `Segment$Document` is the exact string that was
-//! submitted. A requested id with no stored segments goes to
-//! `UnprocessedTraceIds`.
+//! submitted, beside the documents of the segments this service inferred from
+//! them. A well-formed id with no stored segments is a MISS and is simply not
+//! answered for; `UnprocessedTraceIds` reports ids the service failed to
+//! process, which a miss is not.
 //!
 //! ## Shape of an operation
 //!
@@ -152,8 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `TraceIds` carries no modelled length bound and each unstored id costs
-        // one `UnprocessedTraceIds` entry, so the request is bounded here.
+        // `TraceIds` carries no modelled length bound, so the bound is the
+        // service's own: at most `MAX_TRACE_IDS_PER_CALL` ids per call, and a
+        // longer list is an invalid request rather than a partly served one.
         let requested = input.trace_ids.len();
         if requested > crate::state::MAX_TRACE_IDS_PER_CALL {
             return Err(BatchGetTracesErrorModeled::InvalidRequestException(
@@ -161,6 +164,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!(
                         "TraceIds carries {requested} ids; at most {} are accepted per call",
                         crate::state::MAX_TRACE_IDS_PER_CALL
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An id that is not of the documented `1-<8 hex>-<24 hex>` form names no
+        // trace this service could ever hold, so the request is refused rather
+        // than answered as though the trace merely did not exist.
+        if let Some(malformed) = input
+            .trace_ids
+            .iter()
+            .find(|trace_id| !crate::state::is_trace_id(trace_id))
+        {
+            return Err(BatchGetTracesErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "TraceIds carries `{malformed}`, which is not a trace id of the form 1-<8 hex>-<24 hex>"
                     )),
                 },
             )
@@ -189,7 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let mut traces = Vec::new();
-        let mut unprocessed_trace_ids = Vec::new();
         // The page caps the number of traces; this budget caps the number of
         // segment documents they carry, so a short request cannot pull the whole
         // accumulated store into one response. A trace that does not fit in what
@@ -200,16 +220,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if traces.len() == TRACES_PAGE_SIZE {
                 break;
             }
-            match store.traces.get(trace_id) {
-                Some(trace) => {
-                    if trace.segments.len() > segment_budget && !traces.is_empty() {
-                        break;
-                    }
-                    let (wire, carried) = trace_of(trace, segment_budget);
-                    segment_budget -= carried;
-                    traces.push(wire);
+            // A requested id with nothing stored under it is a MISS: it is
+            // neither answered for in `Traces` nor reported in
+            // `UnprocessedTraceIds`, which is for ids the service failed to
+            // process — a client reading it as a retry signal would otherwise
+            // retry an id that simply does not exist for ever.
+            if let Some(trace) = store.traces.get(trace_id) {
+                if trace.segments.len() > segment_budget && !traces.is_empty() {
+                    break;
                 }
-                None => unprocessed_trace_ids.push(trace_id.clone()),
+                let (wire, carried) = trace_of(trace, segment_budget);
+                segment_budget -= carried;
+                traces.push(wire);
             }
             consumed += 1;
         }
@@ -219,7 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(BatchGetTracesOutput {
             traces: Some(traces),
-            unprocessed_trace_ids: Some(unprocessed_trace_ids),
+            // Nothing this service holds can fail to be processed once its id is
+            // well formed and its trace is stored, so this list is empty rather
+            // than carrying the misses.
+            unprocessed_trace_ids: Some(Vec::new()),
             next_token,
         })
     }
@@ -228,9 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// How many `Trace` values one page carries.
 ///
 /// The model declares no page size for `BatchGetTraces`, so this is the
-/// emulator's: a `NextToken` is emitted only when requested ids are still
-/// unread, and resuming from that token returns the remainder.
-pub const TRACES_PAGE_SIZE: usize = 5;
+/// emulator's: one page serves every id a call may carry
+/// ([`crate::state::MAX_TRACE_IDS_PER_CALL`]), and a `NextToken` is emitted only
+/// when a trace was deferred because the response's segment budget could not
+/// carry it.
+pub const TRACES_PAGE_SIZE: usize = crate::state::MAX_TRACE_IDS_PER_CALL;
 
 /// Rebuild one `Trace` from its stored segments, carrying at most `budget`
 /// segment documents. Returns the trace and how many it carried.

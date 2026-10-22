@@ -6,14 +6,15 @@
 //! endpoint operations share, so no two handlers grow their own copy: id
 //! minting, the RFC 3339 clock read, the clock-owed status transition, the
 //! opaque pagination cursor the two `@paginated` list operations mint and
-//! verify, and the record -> modelled-shape projections.
+//! verify, the record -> modelled-shape projections, and the RSLVR-coded
+//! exception message every endpoint operation reports a missing endpoint with.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{IpAddressResponse, ResolverEndpoint, Tag};
+use crate::ops::types::{IpAddressResponse, ResolverEndpoint, ResourceNotFoundException, Tag};
 
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -105,6 +106,50 @@ const MAX_RESULTS_RANGE: (i32, i32) = (1, 100);
 /// never minted is detected and refused, instead of being silently read as
 /// "start from the beginning".
 const PAGE_TOKEN_DOMAIN: &str = "route53resolver/page-token/v1";
+
+/// The Route 53 Resolver service error code reported when a request names a
+/// Resolver endpoint id the service holds no endpoint under.
+///
+/// Route 53 Resolver carries its own `RSLVR-nnnnn` code inside every exception
+/// message, because the HTTP status (400 for every modelled Resolver error) and
+/// the exception shape name together still do not say which Resolver fault
+/// occurred — the code is what operators and tooling key on. The model states
+/// no message text, so this code comes from the recorded responses of the
+/// endpoint operations that raise `ResourceNotFoundException`.
+pub const RSLVR_CODE_ENDPOINT_NOT_FOUND: &str = "RSLVR-00501";
+
+/// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
+/// exist": the modelled shape name of a Resolver endpoint.
+pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
+
+/// Render one Route 53 Resolver exception message: the service error code in
+/// square brackets, a space, the sentence that states the fault, and the
+/// terminating period.
+///
+/// `sentence` is passed WITHOUT its final period, so the shape of the message
+/// is decided in exactly one place.
+pub fn rslvr_message(code: &str, sentence: &str) -> String {
+    format!("[{code}] {sentence}.")
+}
+
+/// The `ResourceNotFoundException` every Resolver endpoint operation answers
+/// for an id it holds no endpoint under.
+///
+/// Built here rather than in each handler so the four operations that resolve a
+/// `ResolverEndpointId` (`GetResolverEndpoint`,
+/// `ListResolverEndpointIpAddresses`, `UpdateResolverEndpoint`,
+/// `DeleteResolverEndpoint`) cannot drift apart: all of them report the
+/// RSLVR-coded message, with the requested id double-quoted inside it, and the
+/// resource type the model asks for.
+pub fn resolver_endpoint_not_found(resolver_endpoint_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_ENDPOINT_NOT_FOUND,
+            &format!(r#"Resolver endpoint with ID "{resolver_endpoint_id}" does not exist"#),
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_ENDPOINT.to_string()),
+    }
+}
 
 /// One IP address of a Resolver endpoint, as stored.
 #[derive(Debug, Clone)]

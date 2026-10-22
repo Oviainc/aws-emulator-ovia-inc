@@ -155,6 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let group_name = crate::state::effective_group_name(input.group_name.as_deref());
         let mut store = state.lock();
+        // Materialise any group deletion the clock has already made due, so a
+        // schedule that went with its group is reported gone rather than
+        // deleted a second time.
+        store.settle(::std::time::SystemTime::now());
 
         if store
             .schedules

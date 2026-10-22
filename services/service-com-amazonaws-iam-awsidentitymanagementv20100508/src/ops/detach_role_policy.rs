@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachRolePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachRolePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachRolePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the managed policy the request's `PolicyArn` names from the role it names,
+//! so the attachment `AttachRolePolicy` recorded is gone: `ListAttachedRolePolicies`
+//! stops reporting it and it no longer holds the role back from `DeleteRole`. A role the
+//! account does not hold, or a policy the role does not carry, is a
+//! `NoSuchEntityException`; a service-linked role is an `UnmodifiableEntityException`;
+//! and a `PolicyArn` that is not a managed policy's is an `InvalidInputException`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +172,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only; nothing about a detachment depends on
+        // it — IAM is global, and both entities are named by the request.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachRolePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachRolePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachRolePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DetachRolePolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` asks only for a 20..2048 character string, so the ARN still has
+        // to BE a managed policy's: `arn:<partition>:iam::<account>:policy/<path><name>`,
+        // exactly as this crate's `AttachRolePolicy` reads one. Anything else is an
+        // "invalid … value … supplied for an input parameter".
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(DetachRolePolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "ARN {} is not valid: PolicyArn must be an IAM managed policy ARN",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The role is named (friendly name, not ARN) and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity. A name the
+        // account holds no role under "referenced a resource entity that does not
+        // exist".
+        let role_key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get(&role_key) else {
+            return Err(DetachRolePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let role_name = role.role_name.clone();
+        // Which service a role is linked to is carried by its path, read through the
+        // one definition of that rule in `crate::state`.
+        let linked_service =
+            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
+
+        // "Service-linked roles are protected Amazon Web Services resources. Only the
+        // service that depends on the service-linked role can modify … the role on
+        // your behalf" (`UnmodifiableEntityException`), and detaching a managed policy
+        // modifies the role's permission policy — so this caller, which is not that
+        // service, cannot. The documented message "includes the name of the service
+        // that depends on this service-linked role".
+        if let Some(linked_service) = linked_service {
+            return Err(DetachRolePolicyErrorModeled::UnmodifiableEntityException(
+                UnmodifiableEntityException {
+                    message: Some(format!(
+                        "Service role {role_name} may not be modified: it is a service-linked \
+                         role for {linked_service}, so the change must be requested through \
+                         that service"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Removes the specified managed policy from the specified role": what goes
+        // is the ATTACHMENT the role carries, so after this call the role no longer
+        // depends on that policy — `ListAttachedRolePolicies` stops reporting it, and
+        // `DeleteRole`'s conflict guard, which reads this very set, no longer counts
+        // it against the role. A policy the role does not carry "referenced a
+        // resource entity that does not exist".
+        let detached = store
+            .role_attached_policies
+            .get_mut(&role_key)
+            .is_some_and(|attached| attached.remove(&input.policy_arn));
+        if !detached {
+            return Err(DetachRolePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Policy {} was not found attached to role {role_name}.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A role carrying no attachment carries no attachment set either: an empty
+        // one left behind is bookkeeping for a dependency that no longer exists.
+        if store
+            .role_attached_policies
+            .get(&role_key)
+            .is_some_and(::std::collections::BTreeSet::is_empty)
+        {
+            store.role_attached_policies.remove(&role_key);
+        }
+
+        Ok(DetachRolePolicyOutput)
     }
 }

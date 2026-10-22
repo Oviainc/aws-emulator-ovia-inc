@@ -175,23 +175,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `NamePrefix` is a filter, so a prefix nothing starts with is an empty
         // page — never a missing resource, which is why this operation models no
         // ResourceNotFoundException.
-        let matched: Vec<crate::state::ScheduleGroupRecord> = state
-            .lock()
-            .groups_in_name_order(&region)
-            .into_iter()
-            .filter(|record| {
-                let filtered_out = input
-                    .name_prefix
-                    .as_deref()
-                    .is_some_and(|prefix| !record.name.starts_with(prefix));
-                // A page token is a POSITION in the name order, so resuming
-                // means "every name strictly after it".
-                let already_returned = resume_after
-                    .as_deref()
-                    .is_some_and(|after| record.name.as_str() <= after);
-                !filtered_out && !already_returned
-            })
-            .collect();
+        let matched: Vec<crate::state::ScheduleGroupRecord> = {
+            let mut store = state.lock();
+            // Materialise any group removal the clock has already made due, so a
+            // page never carries a group a reader of that group answers 404 for.
+            store.settle(::std::time::SystemTime::now());
+            store.groups_in_name_order(&region)
+        }
+        .into_iter()
+        .filter(|record| {
+            let filtered_out = input
+                .name_prefix
+                .as_deref()
+                .is_some_and(|prefix| !record.name.starts_with(prefix));
+            // A page token is a POSITION in the name order, so resuming
+            // means "every name strictly after it".
+            let already_returned = resume_after
+                .as_deref()
+                .is_some_and(|after| record.name.as_str() <= after);
+            !filtered_out && !already_returned
+        })
+        .collect();
 
         let limit = input
             .max_results

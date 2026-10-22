@@ -30,6 +30,25 @@ const BATCH_LATEST: &str = "/properties/batch/latest";
 /// batch get must report.
 const BATCH_PUT: &str = "/properties";
 
+/// The fixed epoch the timestamps in this suite's tables are written against.
+///
+/// `BatchPutAssetPropertyValue` ingests only TQVs inside
+/// `[now - 7 days, now + 10 minutes]`, so a seed at a fixed calendar second is
+/// refused. The tables keep their readable timestamps and the shared
+/// `super::support` anchoring maps this epoch onto a point inside the window, with
+/// [`relative`] mapping a reported timestamp back for the assertions.
+const ROW_EPOCH: i64 = 1_700_000_000;
+
+/// A table second as the absolute `timeInSeconds` the wire carries.
+fn anchored(seconds: i64) -> i64 {
+    crate::support::anchored(ROW_EPOCH, seconds)
+}
+
+/// The inverse of [`anchored`].
+fn relative(seconds: i64) -> i64 {
+    crate::support::relative(ROW_EPOCH, seconds)
+}
+
 /// The entry of `list` whose `entryId` is `entry_id`, if any.
 fn find_entry<'a>(list: &'a Value, entry_id: &str) -> Option<&'a Value> {
     list.as_array()?
@@ -74,7 +93,7 @@ async fn put_value(
             "propertyId": property,
             "propertyValues": [{
                 "value": value,
-                "timestamp": {"timeInSeconds": seconds, "offsetInNanos": 125},
+                "timestamp": {"timeInSeconds": anchored(seconds), "offsetInNanos": 125},
                 "quality": quality,
             }],
         }]})),
@@ -218,7 +237,7 @@ async fn batch_get_reports_the_latest_stored_value_of_every_entry_it_carries() {
             "case {case:?}: expected the newest {member} {newer}, got {entry}"
         );
         assert_eq!(
-            reported["timestamp"]["timeInSeconds"].as_i64(),
+            reported["timestamp"]["timeInSeconds"].as_i64().map(relative),
             Some(*seconds),
             "case {case:?}: expected the newest sample's timestamp {seconds}, got {entry}"
         );

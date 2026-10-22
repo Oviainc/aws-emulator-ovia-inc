@@ -158,9 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&(input.config_type.clone(), input.config_id.clone()))
             .ok_or_else(|| {
                 GetConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "No config of type {} with id {} exists",
-                        input.config_type, input.config_id
+                    // This service's `GetConfig` text names the two `@httpLabel` path
+                    // members of `GET /config/{configType}/{configId}`, id before type.
+                    message: Some(crate::state::config_not_found_message(
+                        &input.config_type,
+                        &input.config_id,
                     )),
                 })
             })?;

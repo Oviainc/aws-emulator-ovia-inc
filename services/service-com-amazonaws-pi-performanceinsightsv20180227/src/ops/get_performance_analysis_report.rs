@@ -3,12 +3,15 @@
 //! @op GetPerformanceAnalysisReport
 //! IMPLEMENTED: returns the stored report, with the window and the metadata
 //! `CreatePerformanceAnalysisReport` persisted, and materialises the status the clock
-//! already owes it. An unknown id is `InvalidArgumentException` (HTTP 400).
+//! already owes it.
 //!
-//! Authorization is NOT emulated: the emulator holds no IAM principals or
-//! policies, so the modelled `NotAuthorizedException` is never the answer and a
-//! well-formed request for a stored report is served. That is a deliberate,
-//! documented divergence, not a permission decision.
+//! A request that addresses no data source this account may see, or an
+//! `AnalysisReportId` the addressed data source does not hold, is refused with
+//! the modelled `NotAuthorizedException` (HTTP 400) carrying this service's
+//! uniform message: the real service answers one error for "absent", "not
+//! yours" and "no such report here" precisely so the answer discloses which (see
+//! [`crate::state::is_data_source_identifier`] and
+//! [`crate::state::NOT_AUTHORIZED_MESSAGE`]).
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // The gate comes before the store is even reached, so an unauthorized
+        // read performs no write at all — not even the clock-owed status
+        // transition below.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
         let mut store = state.lock();
         // The only write a reporting operation may make: the RUNNING ->
         // SUCCEEDED move the clock already owed at this instant, whether or not
@@ -179,17 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.identifier,
             &input.analysis_report_id,
         ) else {
-            return Err(
-                GetPerformanceAnalysisReportErrorModeled::InvalidArgumentException(
-                    InvalidArgumentException {
-                        message: Some(format!(
-                            "AnalysisReportId {} was not found for the resource {}.",
-                            input.analysis_report_id, input.identifier
-                        )),
-                    },
-                )
-                .into(),
-            );
+            // A report id is resolved WITHIN the data source it was created
+            // for, and an id that data source does not hold is answered with
+            // the same uniform refusal as a data source the caller may not see:
+            // the id is a well-formed `AnalysisReportId`, so this is an
+            // authorization outcome and not an argument-validity one, and the
+            // message says nothing about whether the report exists elsewhere.
+            return Err(not_authorized());
         };
 
         // `TextFormat` and `AcceptLanguage` choose the rendering of an insight's
@@ -209,4 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
         })
     }
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal this service answers
+/// for a data source the caller may not see and for a report the addressed data
+/// source does not hold — one error for both, so neither discloses the other.
+fn not_authorized() -> GetPerformanceAnalysisReportError {
+    GetPerformanceAnalysisReportErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

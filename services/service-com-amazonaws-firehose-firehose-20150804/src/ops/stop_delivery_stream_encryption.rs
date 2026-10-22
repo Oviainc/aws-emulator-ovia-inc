@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopDeliveryStreamEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopDeliveryStreamEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopDeliveryStreamEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Disables server-side encryption for a Firehose stream: it leaves the stream's
+//! encryption configuration in the transient `DISABLING` status and leaves the settled
+//! `DISABLED` to the clock, so `DescribeDeliveryStream` reports the change this call
+//! started.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopDeliveryStreamEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopDeliveryStreamEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopDeliveryStreamEncryption"))
+        // Mounted on an engine that holds no state this service can reach. Unreachable
+        // through the router (which mounts every service on one `InMemoryEngine`), and
+        // this operation models no server-side error to report it with, so the scaffold
+        // channel carries it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StopDeliveryStreamEncryption",
+            ));
+        };
+        // The stream is addressed by name, and this call carries no configuration: nothing
+        // else about the request bears on what it does.
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        let Some(stream) = store.streams.get_mut(&input.delivery_stream_name) else {
+            return Err(
+                StopDeliveryStreamEncryptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Firehose stream {} not found",
+                            input.delivery_stream_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The stream has to be settled before its encryption can be changed: a stream
+        // still being created or already being deleted, and one whose own encryption
+        // change has not settled yet, are both "already in use and not available for this
+        // operation" — the same two refusals `StartDeliveryStreamEncryption` makes.
+        if stream.status != crate::state::StreamStatus::Active {
+            return Err(in_use(format!(
+                "Firehose stream {} is {} and server-side encryption cannot be changed \
+                 until it is {}",
+                stream.name,
+                stream.status.as_wire(),
+                crate::state::StreamStatus::Active.as_wire()
+            )));
+        }
+        if stream.encryption_change_in_flight() {
+            return Err(in_use(format!(
+                "server-side encryption for Firehose stream {} is {} and cannot be \
+                 changed until that change settles",
+                stream.name,
+                stream.encryption_status().unwrap_or_default()
+            )));
+        }
+
+        // There has to be encryption in force for this call to disable. A stream that was
+        // never encrypted, or whose SSE is already `DISABLED`, or whose enable failed
+        // (`ENABLING_FAILED`, so nothing is encrypting it), has none; a settled `ENABLED`
+        // and a failed disable (`DISABLING_FAILED`, which leaves encryption on) do.
+        let in_force = matches!(
+            stream.encryption_status(),
+            Some(
+                crate::state::ENCRYPTION_ENABLED | crate::state::ENCRYPTION_DISABLING_FAILED
+            )
+        );
+        if !in_force {
+            return Err(
+                StopDeliveryStreamEncryptionErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "Cannot disable encryption on firehose: {} when encryption is \
+                             already disabled",
+                            stream.name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The StartDeliveryStreamEncryption and StopDeliveryStreamEncryption operations
+        // have a combined limit of 25 calls per Firehose stream per 24 hours." Charged
+        // here, after the refusals above: a call that changes nothing has not spent one of
+        // the stream's encryption changes, so a client cannot be locked out of SSE for 24
+        // hours by requests the service never acted on.
+        if !stream.charge_encryption_call(now) {
+            return Err(
+                StopDeliveryStreamEncryptionErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "the limit of {} combined StartDeliveryStreamEncryption and \
+                             StopDeliveryStreamEncryption calls per Firehose stream per \
+                             24 hours has been reached for {}",
+                            crate::state::MAX_ENCRYPTION_CALLS_PER_WINDOW,
+                            stream.name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Firehose first sets the encryption status of the stream to DISABLING, and then
+        // to DISABLED." The call returns immediately; the clock owes `DISABLED`. The CMK
+        // the stream records stays named while the disable is in flight, because Firehose
+        // "schedules the related KMS grant for retirement and then retires it after it
+        // ensures that it is finished delivering records to the destination".
+        let disabling = DeliveryStreamEncryptionConfiguration {
+            key_arn: stream
+                .encryption
+                .as_ref()
+                .and_then(|encryption| encryption.key_arn.clone()),
+            key_type: stream
+                .encryption
+                .as_ref()
+                .and_then(|encryption| encryption.key_type.clone()),
+            status: Some(crate::state::ENCRYPTION_DISABLING.to_string()),
+            // Nothing in this emulator fails an encryption change, so no attempt leaves a
+            // KMS failure description behind.
+            failure_description: None,
+        };
+        stream.begin_encryption_change(disabling, crate::state::ENCRYPTION_DISABLED, now);
+
+        Ok(StopDeliveryStreamEncryptionOutput {})
     }
+}
+
+/// `ResourceInUseException`: "The resource is already in use and not available for this
+/// operation."
+fn in_use(message: String) -> StopDeliveryStreamEncryptionError {
+    StopDeliveryStreamEncryptionErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(message),
+    })
+    .into()
 }

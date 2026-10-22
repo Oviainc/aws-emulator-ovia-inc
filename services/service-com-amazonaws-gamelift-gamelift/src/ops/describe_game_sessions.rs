@@ -3,7 +3,7 @@
 //! @op DescribeGameSessions
 //! Reports the stored game sessions a request's selector picks out — a fleet, or one
 //! game session by id — optionally narrowed to a location and a status, a page at a
-//! time.
+//! time; a selector that picks out none reports an empty page.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -234,25 +234,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut selected: Vec<GameSession> = if let Some(fleet_reference) = &input.fleet_id {
-            let Some(fleet_id) = state.resolve_fleet_id(fleet_reference) else {
-                return Err(not_found(format!(
-                    "The fleet {fleet_reference} was not found."
-                )));
-            };
-            state
-                .game_sessions_in_order()
-                .into_iter()
-                .filter(|session| session.fleet_id == fleet_id)
-                .map(crate::state::GameSessionRecord::to_modelled)
-                .collect()
+            // A reporting operation whose output is a paginated collection answers a
+            // selector that picks out no stored session with that collection empty: the
+            // sessions of a fleet this service does not hold are none, not an error. So
+            // an enumeration loop sees an empty page where AWS gives it one.
+            match state.resolve_fleet_id(fleet_reference) {
+                Some(fleet_id) => state
+                    .game_sessions_in_order()
+                    .into_iter()
+                    .filter(|session| session.fleet_id == fleet_id)
+                    .map(crate::state::GameSessionRecord::to_modelled)
+                    .collect(),
+                None => Vec::new(),
+            }
         } else {
+            // "To retrieve a specific game session, provide the game session ID." That id
+            // selects which stored sessions this collection reports, so one that matches
+            // nothing reports none of them.
             let game_session_id = input.game_session_id.clone().unwrap_or_default();
-            let Some(session) = state.game_sessions.get(&game_session_id) else {
-                return Err(not_found(format!(
-                    "The game session {game_session_id} was not found."
-                )));
-            };
-            vec![session.to_modelled()]
+            state
+                .game_sessions
+                .get(&game_session_id)
+                .map(crate::state::GameSessionRecord::to_modelled)
+                .into_iter()
+                .collect()
         };
 
         // "provide a fleet or alias ID and a location name" narrows the set to one of the

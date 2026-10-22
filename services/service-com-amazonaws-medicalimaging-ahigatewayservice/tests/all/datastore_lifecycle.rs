@@ -133,7 +133,7 @@ impl Emulator {
             .await
     }
 
-    async fn list_datastores(&self, query: &str) -> Answer {
+    pub(crate) async fn list_datastores(&self, query: &str) -> Answer {
         let uri = if query.is_empty() {
             "/datastore".to_string()
         } else {
@@ -142,7 +142,7 @@ impl Emulator {
         self.call("GET", &uri, None).await
     }
 
-    async fn start_import_job(&self, datastore_id: &str, body: Value) -> Answer {
+    pub(crate) async fn start_import_job(&self, datastore_id: &str, body: Value) -> Answer {
         self.call(
             "POST",
             &format!("/startDICOMImportJob/datastore/{datastore_id}"),
@@ -151,7 +151,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_import_job(&self, datastore_id: &str, job_id: &str) -> Answer {
+    pub(crate) async fn get_import_job(&self, datastore_id: &str, job_id: &str) -> Answer {
         self.call(
             "GET",
             &format!("/getDICOMImportJob/datastore/{datastore_id}/job/{job_id}"),

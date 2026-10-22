@@ -21,13 +21,20 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256, used to mint the server-generated `ResourceId` / `UpdateToken` and
+# firewall-endpoint ids this service hands out (see `state::fresh_bytes`).
+sha2 = { workspace = true }
+# Hex codec for those ids' digits, so nothing here hand-writes one.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` beyond what `#[tokio::test]` needs: an integration test waits out the
+# firewall provisioning span with `tokio::time::sleep`. Test-only, so it does not
+# widen the shipped crate's feature set.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

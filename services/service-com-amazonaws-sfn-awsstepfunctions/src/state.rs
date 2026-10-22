@@ -50,6 +50,15 @@ pub const STATE_MACHINE_RESOURCE: &str = "stateMachine";
 /// The resource type an execution ARN carries.
 pub const EXECUTION_RESOURCE: &str = "execution";
 
+/// The resource type an activity ARN carries.
+///
+/// A Step Functions tagging call takes "the ARN for the Step Functions state
+/// machine or activity", so this is the second resource type those calls accept —
+/// even though no activity can exist in this emulator yet (`CreateActivity` still
+/// answers 501), which is why an activity ARN is a resource that cannot be found
+/// rather than an ARN that cannot be read.
+pub const ACTIVITY_RESOURCE: &str = "activity";
+
 /// Returned when the shared engine does not carry this service's store, which can
 /// only happen on an engine this crate was not mounted on. The model declares no
 /// server-fault error for any operation in this slice, so the refusal goes out
@@ -219,9 +228,10 @@ pub struct StateMachine {
     /// The bytes the store counts for this record against [`MAX_STORE_BYTES`].
     ///
     /// Set by [`ComAmazonawsSfnAwsstepfunctionsState::insert_state_machine`] from
-    /// [`StateMachine::measure`]; no operation in this slice changes what a stored
-    /// state machine holds, so it is not re-measured. A constructor may leave it
-    /// `0`.
+    /// [`StateMachine::measure`], and moved by the one operation that changes what a
+    /// stored state machine holds:
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::merge_state_machine_tags`] re-counts
+    /// the tag set it wrote. A constructor may leave it `0`.
     pub retained_bytes: usize,
 }
 
@@ -245,16 +255,20 @@ impl StateMachine {
             + self.fingerprint.len()
             + self.revision_id.as_ref().map_or(0, String::len)
             + self.description.as_ref().map_or(0, String::len)
-            + self
-                .tags
-                .iter()
-                .map(|tag| {
-                    std::mem::size_of::<Tag>()
-                        + tag.key.as_ref().map_or(0, String::len)
-                        + tag.value.as_ref().map_or(0, String::len)
-                })
-                .sum::<usize>()
+            + tags_bytes(&self.tags)
     }
+}
+
+/// The bytes a tag set holds, so a tag write can move the store's total by what it
+/// changed instead of re-measuring a record whose definition is up to 1 MiB.
+fn tags_bytes(tags: &[Tag]) -> usize {
+    tags.iter()
+        .map(|tag| {
+            std::mem::size_of::<Tag>()
+                + tag.key.as_ref().map_or(0, String::len)
+                + tag.value.as_ref().map_or(0, String::len)
+        })
+        .sum()
 }
 
 /// One event of an execution's history, appended as the interpreter runs so a later
@@ -531,6 +545,66 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.state_machines.insert(machine.arn.clone(), machine);
     }
 
+    /// Merge `incoming` into the tags of the state machine `arn` names.
+    ///
+    /// A resource's tags are a MAP keyed by tag key: a key the resource already
+    /// carries takes the incoming value in place, and a key it does not carry is
+    /// appended, so re-tagging one key never adds a second entry for it and the
+    /// order the keys were first written in is the same for every later reader.
+    /// Nothing is written when the merge is rejected, so a refused call leaves the
+    /// resource exactly as it was.
+    ///
+    /// The WORK is bounded before any of it is done: `incoming` is caller-sized and
+    /// the merge scans the set per entry, so a list longer than [`MAX_TAGS`] — which
+    /// could only ever be refused — is refused up front, leaving at most
+    /// `MAX_TAGS` iterations over at most `2 * MAX_TAGS` entries however long the
+    /// request's list is.
+    pub fn merge_state_machine_tags(
+        &mut self,
+        arn: &str,
+        incoming: &[Tag],
+    ) -> Result<(), TagWriteRejection> {
+        let Some(machine) = self.state_machines.get(arn) else {
+            return Err(TagWriteRejection::NotFound);
+        };
+        if incoming.len() > MAX_TAGS {
+            return Err(TagWriteRejection::TooManyTags(incoming.len()));
+        }
+
+        let mut merged = machine.tags.clone();
+        for tag in incoming {
+            match merged.iter_mut().find(|existing| existing.key == tag.key) {
+                Some(existing) => existing.value = tag.value.clone(),
+                None => merged.push(tag.clone()),
+            }
+        }
+        if merged.len() > MAX_TAGS {
+            return Err(TagWriteRejection::TooManyTags(merged.len()));
+        }
+
+        // The tags are caller-sized, so the record's measurement moves by what the
+        // write changed and a write that would take the store past
+        // [`MAX_STORE_BYTES`] is refused instead of growing it.
+        let before = machine.retained_bytes;
+        let after = before
+            .saturating_sub(tags_bytes(&machine.tags))
+            .saturating_add(tags_bytes(&merged));
+        if after > before && !self.has_room_for(after - before) {
+            return Err(TagWriteRejection::NoRoom);
+        }
+
+        let Some(machine) = self.state_machines.get_mut(arn) else {
+            return Err(TagWriteRejection::NotFound);
+        };
+        machine.tags = merged;
+        machine.retained_bytes = after;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        Ok(())
+    }
+
     /// Begin deleting the state machine `arn` names: it reports `DELETING` from now
     /// and is removed once [`DELETE_SETTLE_DELAY`] has passed. `false` when nothing
     /// matched, which `DeleteStateMachine` answers as a success all the same.
@@ -716,6 +790,67 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 // ---------------------------------------------------------------------------
 // ARNs
 // ---------------------------------------------------------------------------
+
+/// What a Step Functions tagging call named in its `resourceArn`.
+///
+/// From `TagResource`'s and `ListTagsForResource`'s own `resourceArn`
+/// documentation: "The Amazon Resource Name (ARN) for the Step Functions state
+/// machine or activity." Those two resource types are the taggable ones, and an ARN
+/// naming anything else — another service, another Step Functions resource type —
+/// is what the modelled `InvalidArn` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggableResource {
+    /// `arn:<partition>:states:<region>:<account>:stateMachine:<name>`, qualified or
+    /// not.
+    StateMachine(StateMachineArn),
+    /// `arn:<partition>:states:<region>:<account>:activity:<name>`.
+    Activity(String),
+}
+
+/// The taggable resource `arn` names, or `None` when `arn` is not the ARN of one.
+pub fn parse_taggable_arn(arn: &str) -> Option<TaggableResource> {
+    if let Some(state_machine) = parse_state_machine_arn(arn) {
+        return Some(TaggableResource::StateMachine(state_machine));
+    }
+    let resource = states_arn_resource(arn)?;
+    let mut parts = resource.splitn(3, ':');
+    if parts.next()? != ACTIVITY_RESOURCE {
+        return None;
+    }
+    let name = parts.next().filter(|name| !name.is_empty())?;
+    // An activity ARN carries no qualifier: only versions and aliases of a state
+    // machine do.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(TaggableResource::Activity(name.to_string()))
+}
+
+/// What the modelled `InvalidArn` says about an ARN that is not a taggable Step
+/// Functions ARN, so every operation reading [`parse_taggable_arn`] words its
+/// refusal the same way.
+pub fn untaggable_arn_message(resource_arn: &str) -> String {
+    format!("'{resource_arn}' is not the ARN of a Step Functions state machine or activity")
+}
+
+/// What the modelled `ResourceNotFound` says about a taggable ARN the store holds no
+/// resource under, for the same reason.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("could not find the resource {resource_arn}")
+}
+
+/// Why a tag write was not applied; see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::merge_state_machine_tags`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagWriteRejection {
+    /// The store holds no resource under that ARN — the modelled `ResourceNotFound`.
+    NotFound,
+    /// The merged tag set would hold this many tags, past [`MAX_TAGS`] — the
+    /// modelled `TooManyTags`.
+    TooManyTags(usize),
+    /// The merged record would take the store past [`MAX_STORE_BYTES`].
+    NoRoom,
+}
 
 /// The parts of a state machine ARN this service reads.
 #[derive(Debug, Clone, PartialEq, Eq)]

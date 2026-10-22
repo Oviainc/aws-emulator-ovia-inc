@@ -213,19 +213,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let mut parameters = vec!["PolicyDetails".to_string()];
                 parameters.extend(duplicated.iter().map(|name| (*name).to_string()));
                 return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
+                    crate::state::parameters_cannot_be_combined(
+                        format!(
                             "a default policy specifies {} either in the request body or in \
                              PolicyDetails, but not both",
                             duplicated.join(", ")
-                        )),
-                        code: None,
-                        required_parameters: None,
-                        mutually_exclusive_parameters: Some(parameters),
-                    },
+                        ),
+                        parameters,
+                    ),
                 )
                 .into());
             }
+        }
+
+        // The other cross-member rule the model cannot express: a schedule's
+        // `CreateRule` states when to create EITHER as a cron expression OR as an
+        // interval, never both. Refused before anything is stored, so a request
+        // AWS would never have accepted leaves no policy behind.
+        if let Some(schedule) =
+            crate::state::schedule_with_conflicting_create_rule(input.policy_details.as_ref())
+        {
+            return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                crate::state::conflicting_create_rule(&schedule),
+            )
+            .into());
+        }
+
+        // A caller may not SET a tag key under the reserved `aws:` prefix, here
+        // or through `TagResource`.
+        if crate::state::reserved_tag_key(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        )
+        .is_some()
+        {
+            return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                crate::state::reserved_tag_key_refused(),
+            )
+            .into());
         }
 
         let now = ::std::time::SystemTime::now();

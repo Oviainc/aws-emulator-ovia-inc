@@ -15,8 +15,8 @@
 //! server-assigned member (ARN, creation time, power id, default domain,
 //! principal ARN, lifecycle) computed from the request plus the store's own
 //! allocators — and `GetContainerServices` reports exactly that record, in the
-//! region the request is made in, with a name that names nothing answered as a
-//! modelled 404.
+//! region the request is made in, with a name that names nothing answered as the
+//! service's `DoesNotExist` rejection.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -990,10 +990,11 @@ async fn an_unsigned_request_is_served_in_the_default_region() {
 }
 
 /// RULE: a well-formed name that names no stored container service in the
-/// region of the request is the modelled 404 — never a 501 and never a hollow
-/// 200.
+/// region of the request is refused with the service's `DoesNotExist` envelope —
+/// HTTP 400, `NotFoundException`, body code `DoesNotExist` and a message naming
+/// the resource type and the requested name — never a 501 and never a hollow 200.
 #[tokio::test]
-async fn an_unknown_container_service_is_a_modelled_404() {
+async fn an_unknown_container_service_does_not_exist() {
     let emulator = Emulator::new();
     emulator
         .create(
@@ -1014,13 +1015,23 @@ async fn an_unknown_container_service_is_a_modelled_404() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case}: expected a 404, got {status} {body:?}"
+            status, 400,
+            "case {case}: expected a 400, got {status} {body:?}"
         );
         assert_eq!(
             error_code(&body),
             "NotFoundException",
             "case {case}: expected NotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {case}: expected code DoesNotExist, got {body:?}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(format!("The ContainerService does not exist: {name}").as_str()),
+            "case {case}: expected the resource-type/name message, got {body:?}"
         );
     }
 }

@@ -20,6 +20,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::asset_lifecycle::{
     call, create_asset, create_model, error_code, property_catalog, property_id, router,
 };
+use super::support::now_seconds;
 
 /// A `CustomID`-shaped id no create ever minted, for the refusal cases.
 const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -304,7 +305,9 @@ async fn an_alias_bound_by_update_asset_property_carries_ingest_and_retrieval() 
             "propertyAlias": alias,
             "propertyValues": [{
                 "value": {"doubleValue": 42.5},
-                "timestamp": {"timeInSeconds": 1_700_000_000},
+                // Anchored a minute in the past: BatchPutAssetPropertyValue ingests
+                // only TQVs inside `[now - 7 days, now + 10 minutes]`.
+                "timestamp": {"timeInSeconds": now_seconds() - 60},
             }],
         }]})),
     )

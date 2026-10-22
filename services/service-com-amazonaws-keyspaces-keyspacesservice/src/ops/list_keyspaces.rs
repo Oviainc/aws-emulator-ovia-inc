@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKeyspaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKeyspaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages the account's keyspaces out of [`crate::state`]. This is the ONLY
+//! file to touch for `ListKeyspaces`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKeyspaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +80,40 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `ListKeyspaces` returns, and the page size a caller that names no
+/// `maxResults` gets: the maximum of the modelled `maxResults` range (`1..1000`).
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
+///
+/// The token names the LAST keyspace on the page just returned, hex-encoded so a caller
+/// is not invited to read a resource name out of it or to assemble one by hand.
+fn encode_page_token(keyspace_name: &str) -> String {
+    ::hex::encode(keyspace_name)
+}
+
+/// The keyspace name a `nextToken` resumes after, or `None` when the token is not one
+/// this operation could have issued — one minted elsewhere resumes nothing here and is
+/// refused rather than silently ignored.
+///
+/// A token this operation issued decodes to a `keyspaceName`, so anything that is not one
+/// is foreign: that rules out the keyspace-qualified tokens `ListTables` mints (a
+/// `keyspaceName` cannot contain `#`) along with every other hand-built string.
+fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    is_keyspace_name(&decoded).then_some(decoded)
+}
+
+/// Whether `value` is a name a keyspace could carry: the modelled `KeyspaceName` length
+/// (`1..48`) and pattern (`^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`).
+fn is_keyspace_name(value: &str) -> bool {
+    (1..=48).contains(&value.len())
+        && value.starts_with(|first: char| first.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,20 +184,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKeyspaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKeyspacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKeyspaces"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListKeyspacesErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+
+        // `maxResults` is modelled `1..1000`, so the boundary validator has already
+        // refused a page size outside that range; an absent one means "no limit the
+        // caller asked for", which is the whole account up to the modelled maximum.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize);
+
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListKeyspacesErrorModeled::ValidationException(ValidationException {
+                    message: Some(
+                        "nextToken is not a pagination token this operation issued."
+                            .to_string(),
+                    ),
+                })
+            })?),
+        };
+
+        let mut store = state.lock();
+        // Reporting, not mutating: settling only materialises the status transitions the
+        // clock already owed at this instant, which a later caller would have seen anyway.
+        store.settle(::std::time::SystemTime::now());
+
+        // One page, plus one lookahead item: the token is present exactly when a keyspace
+        // follows the last one on this page, so the final page carries none.
+        let mut scanned: Vec<&crate::state::Keyspace> = match resume_after.as_deref() {
+            Some(after) => store
+                .keyspaces
+                .range::<str, _>((
+                    ::std::ops::Bound::Excluded(after),
+                    ::std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, keyspace)| keyspace)
+                .take(page_size + 1)
+                .collect(),
+            None => store.keyspaces.values().take(page_size + 1).collect(),
+        };
+        let truncated = scanned.len() > page_size;
+        scanned.truncate(page_size);
+        let next_token = match truncated {
+            true => scanned
+                .last()
+                .map(|keyspace| encode_page_token(&keyspace.name)),
+            false => None,
+        };
+
+        Ok(ListKeyspacesOutput {
+            next_token,
+            keyspaces: scanned
+                .into_iter()
+                .map(|keyspace| KeyspaceSummary {
+                    keyspace_name: keyspace.name.clone(),
+                    resource_arn: keyspace.resource_arn.clone(),
+                    replication_strategy: keyspace.replication_strategy.clone(),
+                    replication_regions: keyspace.reported_replication_regions(),
+                })
+                .collect(),
+        })
     }
 }

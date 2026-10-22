@@ -3,6 +3,9 @@
 //! Engine state for the com-amazonaws-s3-amazons3 service.
 
 use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use md5::{Digest, Md5};
 
 /// The Region a general purpose bucket is created in when the request names no
 /// `CreateBucketConfiguration.LocationConstraint`.
@@ -45,6 +48,93 @@ pub enum BucketCreation {
     NameTaken,
     /// The account already holds [`MAX_BUCKETS_PER_ACCOUNT`] buckets; nothing was written.
     QuotaReached,
+}
+
+/// The `StorageClass` an object gets when the `PutObject` request names none.
+///
+/// From `PutObjectRequest$StorageClass`'s own documentation: "By default, Amazon S3 uses
+/// the STANDARD Storage Class to store newly created objects."
+pub const DEFAULT_STORAGE_CLASS: &str = "STANDARD";
+
+/// The longest object key this emulator records, in UTF-8 bytes.
+///
+/// The published S3 limit: "The name for a key is a sequence of Unicode characters whose
+/// UTF-8 encoding is at most 1,024 bytes long" (Amazon S3 User Guide, "Creating object key
+/// names"). The model constrains only the other end — `ObjectKey` is `length {min 1}`
+/// (`smithy_query(query="shape",shape="ObjectKey")`) — so nothing refuses a longer key
+/// before this check, and a key is allocated per stored object.
+pub const MAX_OBJECT_KEY_BYTES: usize = 1_024;
+
+/// How many objects one bucket in this emulator may hold.
+///
+/// NOT a fidelity claim: S3 publishes no such limit ("you can store any number of objects
+/// in a bucket"). It is the emulator's own ceiling, because every object it records lives
+/// in this process's memory — set generously so no realistic workflow meets it, and
+/// enforced so a caller looping on `PutObject` with fresh keys cannot grow the store
+/// without bound. A write past it is refused rather than recorded, the way a create past
+/// [`MAX_BUCKETS_PER_ACCOUNT`] is.
+pub const MAX_OBJECTS_PER_BUCKET: usize = 1_000;
+
+/// How many bytes of object payload one bucket in this emulator may hold in total.
+///
+/// Same reason as [`MAX_OBJECTS_PER_BUCKET`], for the other dimension: an object's bytes
+/// are kept verbatim, so a few large writes exhaust memory as surely as many small ones.
+/// Also not a fidelity claim — AWS caps one `PutObject` payload at 5 GiB and a bucket not
+/// at all; this is the emulator's own budget, and a write that would take a bucket past it
+/// is refused rather than recorded.
+pub const MAX_OBJECT_BYTES_PER_BUCKET: usize = 16 * 1024 * 1024;
+
+/// How many objects this emulator will hold ACROSS every bucket.
+///
+/// The per-bucket ceilings alone would leave total memory bounded only by their product
+/// with [`MAX_BUCKETS_PER_ACCOUNT`], so the service-wide ones below are what actually
+/// bound this process: whatever a caller does — one bucket or ten thousand — the object
+/// store holds at most this many objects and [`MAX_OBJECT_BYTES_TOTAL`] bytes of payload.
+pub const MAX_OBJECTS_TOTAL: usize = 10_000;
+
+/// How many bytes of object payload this emulator will hold across every bucket.
+///
+/// Same reason as [`MAX_OBJECTS_TOTAL`], and the same order as the service-wide retained
+/// budgets of this workspace's peer services (appconfig's
+/// `MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`, codeguruprofiler's `MAX_RETAINED_PROFILE_BYTES`).
+/// A write that would take the whole store past it is refused rather than recorded.
+pub const MAX_OBJECT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+
+/// The most user-defined metadata one stored object may carry, in UTF-8 bytes summed
+/// over every `x-amz-meta-` key and value.
+///
+/// The published S3 limit: "Within the PUT request header, the user-defined metadata is
+/// limited to 2 KB in size" (Amazon S3 User Guide, "Working with object metadata"). The
+/// model constrains `Metadata` not at all, so nothing refuses more before this check, and
+/// every byte of it is retained with the object.
+pub const MAX_OBJECT_METADATA_BYTES: usize = 2 * 1024;
+
+/// What [`ComAmazonawsS3Amazons3State::put_object`] did, so the caller answers each
+/// outcome without re-deriving it — and cannot record an object without having gone
+/// through the key, count and byte-budget checks, per bucket AND service-wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectWrite {
+    /// The object was recorded at a key the bucket did not hold.
+    Created,
+    /// The object replaced the one the bucket held at that key.
+    Replaced,
+    /// The key is longer than [`MAX_OBJECT_KEY_BYTES`]; nothing was written.
+    KeyTooLong { bytes: usize },
+    /// The request's user-defined metadata is larger than
+    /// [`MAX_OBJECT_METADATA_BYTES`]; nothing was written.
+    MetadataTooLarge { bytes: usize },
+    /// The bucket already holds [`MAX_OBJECTS_PER_BUCKET`] objects at other keys; nothing
+    /// was written.
+    ObjectCountReached,
+    /// Recording the object would take the bucket past [`MAX_OBJECT_BYTES_PER_BUCKET`]
+    /// retained bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// This emulator already holds [`MAX_OBJECTS_TOTAL`] objects across every bucket;
+    /// nothing was written.
+    TotalObjectCountReached,
+    /// Recording the object would take the whole store past
+    /// [`MAX_OBJECT_BYTES_TOTAL`] retained bytes; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
 }
 
 /// How many tags one bucket's tag set may carry.
@@ -176,6 +266,12 @@ pub struct Bucket {
     /// "an empty tag set" are the same state on AWS, which is why `PutBucketTagging` with
     /// an empty `TagSet` and `DeleteBucketTagging` leave a bucket in the same place.
     tags: Vec<BucketTag>,
+    /// The objects the bucket holds, by key, as `PutObject` last recorded each.
+    ///
+    /// Private for the same reason as `tags`, and sorted by key because that is the order
+    /// S3 lists objects in ("returns some or all of the objects in a bucket … in
+    /// lexicographical order").
+    objects: BTreeMap<String, Object>,
 }
 
 impl Bucket {
@@ -198,6 +294,160 @@ impl Bucket {
     pub fn clear_tags(&mut self) {
         self.tags.clear();
     }
+
+    /// The object stored at `key`, or `None` when the bucket holds no such key.
+    pub fn object(&self, key: &str) -> Option<&Object> {
+        self.objects.get(key)
+    }
+
+    /// Store `object` at `key`, replacing any object already there, and report what that
+    /// did.
+    ///
+    /// A replacement, not a merge: "If it receives multiple write requests for the same
+    /// object simultaneously, it overwrites all but the last object written", and "You
+    /// cannot use PutObject to only update a single piece of metadata for an existing
+    /// object. You must put the entire object with updated metadata" (`PutObject`'s own
+    /// documentation).
+    ///
+    /// PRIVATE, and reached only through
+    /// [`ComAmazonawsS3Amazons3State::put_object`]: the per-bucket ceilings checked here
+    /// cannot see the service-wide ones, so a handler calling this directly would bypass
+    /// them. NOTHING is written unless the answer is [`ObjectWrite::Created`] or
+    /// [`ObjectWrite::Replaced`]: an over-long key, metadata past
+    /// [`MAX_OBJECT_METADATA_BYTES`], a bucket at [`MAX_OBJECTS_PER_BUCKET`] objects and a
+    /// write past [`MAX_OBJECT_BYTES_PER_BUCKET`] retained bytes are each refused here.
+    /// Replacing an object releases everything it retained, so the budget is over what the
+    /// bucket WOULD hold, not over everything ever written.
+    fn put_object(&mut self, key: &str, object: Object) -> ObjectWrite {
+        if key.len() > MAX_OBJECT_KEY_BYTES {
+            return ObjectWrite::KeyTooLong { bytes: key.len() };
+        }
+        let metadata_bytes = object.metadata_bytes();
+        if metadata_bytes > MAX_OBJECT_METADATA_BYTES {
+            return ObjectWrite::MetadataTooLarge {
+                bytes: metadata_bytes,
+            };
+        }
+        let replacing = self.objects.contains_key(key);
+        if !replacing && self.objects.len() >= MAX_OBJECTS_PER_BUCKET {
+            return ObjectWrite::ObjectCountReached;
+        }
+        let would_hold = self.retained_bytes_excluding(key) + object.retained_bytes();
+        if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
+            return ObjectWrite::ByteBudgetReached { would_hold };
+        }
+        self.objects.insert(key.to_string(), object);
+        if replacing {
+            ObjectWrite::Replaced
+        } else {
+            ObjectWrite::Created
+        }
+    }
+
+    /// How many bytes this bucket's objects retain — payloads AND every string kept
+    /// beside them, so no part of a stored object escapes the budgets.
+    fn retained_bytes(&self) -> usize {
+        self.objects
+            .values()
+            .map(Object::retained_bytes)
+            .sum()
+    }
+
+    /// How many bytes this bucket's objects retain at keys OTHER than `key` — what it
+    /// would still hold if the object at `key` were replaced.
+    fn retained_bytes_excluding(&self, key: &str) -> usize {
+        self.objects
+            .iter()
+            .filter(|(held_key, _)| held_key.as_str() != key)
+            .map(|(_, held)| held.retained_bytes())
+            .sum()
+    }
+}
+
+/// One object this emulator holds, as a single `PutObject` recorded it.
+///
+/// Only the members this emulator can report back faithfully are kept: everything a
+/// stored object's reader (`GetObject`) answers comes from here, so a member that is not
+/// stored is not reported either.
+#[derive(Debug, Clone)]
+pub struct Object {
+    /// The object's bytes, exactly as the request carried them.
+    pub body: Vec<u8>,
+    /// The object's entity tag, including the quotes S3 reports it with — see
+    /// [`object_etag`].
+    pub etag: String,
+    /// When the object was last written, which is what `Last-Modified` reports.
+    pub last_modified: SystemTime,
+    /// A `StorageClass` value; [`DEFAULT_STORAGE_CLASS`] when the request named none.
+    pub storage_class: String,
+    pub content_type: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_language: Option<String>,
+    pub expires: Option<String>,
+    pub website_redirect_location: Option<String>,
+    /// The user-defined metadata the request carried in its `x-amz-meta-` headers.
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl Object {
+    /// How many bytes this stored object retains: its payload AND every string kept
+    /// beside it (its entity tag, storage class, the response headers it carries and its
+    /// user-defined metadata).
+    ///
+    /// This, not the payload alone, is what the per-bucket and service-wide budgets are
+    /// computed from: a one-byte object with large metadata or a large
+    /// `Content-Disposition` retains just as much of this process's memory as a large
+    /// payload does, so none of it may escape the ceilings.
+    pub fn retained_bytes(&self) -> usize {
+        self.body.len()
+            + self.etag.len()
+            + self.storage_class.len()
+            + self.metadata_bytes()
+            + [
+                &self.content_type,
+                &self.cache_control,
+                &self.content_disposition,
+                &self.content_encoding,
+                &self.content_language,
+                &self.expires,
+                &self.website_redirect_location,
+            ]
+            .iter()
+            .filter_map(|header| header.as_ref())
+            .map(String::len)
+            .sum::<usize>()
+    }
+
+    /// How large this object's user-defined metadata is, in UTF-8 bytes summed over every
+    /// key and value — what [`MAX_OBJECT_METADATA_BYTES`] bounds.
+    pub fn metadata_bytes(&self) -> usize {
+        self.metadata
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum()
+    }
+}
+
+/// The entity tag S3 reports for an object written by a single `PutObject`.
+///
+/// The rule is `PutObjectOutput$ETag`'s own documentation: "General purpose buckets - To
+/// ensure that data is not corrupted traversing the network, for objects where the ETag
+/// is the MD5 digest of the object, you can calculate the MD5 while putting an object to
+/// Amazon S3 and compare the returned ETag to the calculated MD5 value." A one-part,
+/// unencrypted PUT into a general purpose bucket — the only kind this emulator records —
+/// is exactly that case, so the tag is the MD5 of the stored bytes, lowercase hex, inside
+/// the double quotes S3 wraps it in.
+pub fn object_etag(body: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Md5::digest(body)))
+}
+
+/// The same digest as [`object_etag`], Base64 encoded the way the `Content-MD5` header
+/// carries it: "The Base64 encoded 128-bit MD5 digest of the data"
+/// (`PutObjectRequest$ContentMD5`), which is what makes that header checkable.
+pub fn content_md5(body: &[u8]) -> String {
+    ::aws_smithy_types::base64::encode(Md5::digest(body))
 }
 
 /// Per-service state for com-amazonaws-s3-amazons3. A handler reaches it through [`service_state`].
@@ -219,11 +469,65 @@ impl ComAmazonawsS3Amazons3State {
         self.buckets.get(name)
     }
 
-    /// The bucket named `name` for writing, or `None` when this emulator holds no such
-    /// bucket — so a subresource write (a policy or a tag set) refuses a name that is not
-    /// a bucket instead of creating one.
+    /// The bucket named `name` for writing — a subresource (a policy or a tag set) or its
+    /// objects — or `None` when this emulator holds no such bucket, so such a write
+    /// refuses a name that is not a bucket instead of creating one.
     pub fn bucket_mut(&mut self, name: &str) -> Option<&mut Bucket> {
         self.buckets.get_mut(name)
+    }
+
+    /// Store `object` at `key` in the bucket named `bucket`, reporting what that did, or
+    /// `None` when this emulator holds no such bucket (so an object write refuses a name
+    /// that is not a bucket instead of creating one).
+    ///
+    /// This is the ONLY way an object is recorded, because it is the only place that can
+    /// see BOTH the per-bucket ceilings and the service-wide ones: the per-bucket pair
+    /// alone would leave the store bounded only by their product with
+    /// [`MAX_BUCKETS_PER_ACCOUNT`], so the whole-store checks here ([`MAX_OBJECTS_TOTAL`]
+    /// and [`MAX_OBJECT_BYTES_TOTAL`]) are what bound this process's object memory
+    /// whatever a caller does. Nothing is written unless the answer is
+    /// [`ObjectWrite::Created`] or [`ObjectWrite::Replaced`]; a refusal leaves every
+    /// stored object exactly as it was.
+    pub fn put_object(&mut self, bucket: &str, key: &str, object: Object) -> Option<ObjectWrite> {
+        if !self.buckets.contains_key(bucket) {
+            return None;
+        }
+
+        // What the whole store would hold after this write: every other bucket's bytes,
+        // plus what this bucket would hold with the object at `key` replaced. The counts
+        // work the same way — a key the bucket already holds adds no entry.
+        let replacing = self
+            .buckets
+            .get(bucket)
+            .is_some_and(|held| held.object(key).is_some());
+        let held_objects: usize = self
+            .buckets
+            .values()
+            .map(|held| held.objects.len())
+            .sum::<usize>();
+        if !replacing && held_objects >= MAX_OBJECTS_TOTAL {
+            return Some(ObjectWrite::TotalObjectCountReached);
+        }
+        let would_hold: usize = self
+            .buckets
+            .iter()
+            .map(|(name, held)| {
+                if name == bucket {
+                    held.retained_bytes_excluding(key)
+                } else {
+                    held.retained_bytes()
+                }
+            })
+            .sum::<usize>()
+            + object.retained_bytes();
+        if would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(ObjectWrite::TotalByteBudgetReached { would_hold });
+        }
+
+        // Then the per-bucket ceilings, which also perform the write.
+        self.buckets
+            .get_mut(bucket)
+            .map(|held| held.put_object(key, object))
     }
 
     /// Record a bucket named `name` in `region`, reporting what happened.
@@ -242,10 +546,10 @@ impl ComAmazonawsS3Amazons3State {
             name.to_string(),
             Bucket {
                 region: region.to_string(),
-                // A fresh bucket carries no policy and no tags; `PutBucketPolicy` and
-                // `PutBucketTagging` are what associate those subresources with it.
-                policy: None,
-                tags: Vec::new(),
+                // A fresh bucket carries no policy and no tags and holds no objects;
+                // `PutBucketPolicy` and `PutBucketTagging` are what associate those
+                // subresources with it and `PutObject` what puts an object in it.
+                ..Bucket::default()
             },
         );
         BucketCreation::Created
@@ -264,6 +568,22 @@ impl ComAmazonawsS3Amazons3State {
 pub const NO_SUCH_BUCKET_CODE: &str = "NoSuchBucket";
 /// See [`NO_SUCH_BUCKET_CODE`].
 pub const NO_SUCH_BUCKET_MESSAGE: &str = "The specified bucket does not exist";
+/// "The specified key does not exist." — what a read of an object no bucket holds
+/// answers with.
+pub const NO_SUCH_KEY_CODE: &str = "NoSuchKey";
+/// See [`NO_SUCH_KEY_CODE`].
+pub const NO_SUCH_KEY_MESSAGE: &str = "The specified key does not exist.";
+/// The code S3 answers a write whose `Content-MD5` is not the digest of the bytes it
+/// carried: "The Content-MD5 or checksum value that you specified did not match what the
+/// server received."
+pub const BAD_DIGEST_CODE: &str = "BadDigest";
+/// The code S3 answers a write whose body is larger than one request may carry
+/// ([`MAX_OBJECT_BYTES`]).
+pub const ENTITY_TOO_LARGE_CODE: &str = "EntityTooLarge";
+/// The code S3 answers a conditional write whose precondition does not hold, with HTTP
+/// 412 (`PutObjectRequest$IfMatch`: "If the ETag values do not match, the operation
+/// returns a 412 Precondition Failed error").
+pub const PRECONDITION_FAILED_CODE: &str = "PreconditionFailed";
 /// "The bucket policy does not exist."
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
 /// See [`NO_SUCH_BUCKET_POLICY_CODE`].

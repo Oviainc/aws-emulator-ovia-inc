@@ -22,7 +22,7 @@ use crate::delivery_stream_lifecycle::{
 /// A customer managed CMK in the Region the requests are signed for, satisfying
 /// `DeliveryStreamEncryptionConfigurationInput$KeyARN`'s modelled pattern
 /// (`^arn:.*:kms:[a-zA-Z0-9\-]+:\d{12}:key/[a-zA-Z_0-9+=,.@\-_/]+$`).
-fn key_arn(key: &str) -> String {
+pub(crate) fn key_arn(key: &str) -> String {
     format!("arn:aws:kms:{REGION}:000000000000:key/{key}")
 }
 
@@ -35,7 +35,7 @@ async fn active_stream(emulator: &Emulator, name: &str) {
 
 /// `DeliveryStreamEncryptionConfiguration` as `DescribeDeliveryStream` reports it for
 /// `name`.
-async fn described_encryption(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn described_encryption(emulator: &Emulator, name: &str) -> Value {
     let (status, described) = emulator
         .call("DescribeDeliveryStream", json!({ "DeliveryStreamName": name }))
         .await;

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/datastore_lifecycle.rs"]
 mod datastore_lifecycle;
+#[path = "all/error_message_texts.rs"]
+mod error_message_texts;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

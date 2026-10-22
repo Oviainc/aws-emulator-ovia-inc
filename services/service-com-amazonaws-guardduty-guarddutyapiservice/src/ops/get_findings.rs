@@ -220,10 +220,15 @@ fn finding(record: &crate::state::FindingRecord) -> Finding {
             resource_role: Some(record.resource_role.clone()),
             service_name: Some(GUARDDUTY_SERVICE_NAME.to_string()),
             // GuardDuty marks a generated sample this way, which is how a client
-            // tells a sample finding from a real detection.
+            // tells a sample finding from a real detection: `AdditionalInfo.Value`
+            // is a JSON DOCUMENT string ("the value of the additional
+            // information", `smithy_query(shape="ServiceAdditionalInfo")`) carrying
+            // the `sample` marker, and `AdditionalInfo.Type` describes the kind of
+            // document it is — `default` for the service's own additional-info
+            // document.
             additional_info: record.sample.then(|| ServiceAdditionalInfo {
-                r#type: Some(SAMPLE_ADDITIONAL_INFO_TYPE.to_string()),
-                value: Some("true".to_string()),
+                r#type: Some(ADDITIONAL_INFO_TYPE_DEFAULT.to_string()),
+                value: Some(sample_marker_document()),
             }),
             ..Service::default()
         }),
@@ -240,5 +245,15 @@ fn finding(record: &crate::state::FindingRecord) -> Finding {
 /// service (GuardDuty) that generated a finding" (`smithy_query(shape="Service")`).
 const GUARDDUTY_SERVICE_NAME: &str = "guardduty";
 
-/// The `Service.AdditionalInfo.Type` a sample finding carries.
-const SAMPLE_ADDITIONAL_INFO_TYPE: &str = "SAMPLE";
+/// The `Service.AdditionalInfo.Type` a finding carries when `AdditionalInfo` is the
+/// service's own additional-information document rather than a typed projection of
+/// some other record.
+const ADDITIONAL_INFO_TYPE_DEFAULT: &str = "default";
+
+/// The `Service.AdditionalInfo.Value` document of a generated sample finding: the
+/// `sample` marker, serialized as the JSON document the member carries (a client
+/// reads `AdditionalInfo.Value` by parsing it, so the marker is a document and not a
+/// bare literal).
+fn sample_marker_document() -> String {
+    ::serde_json::json!({ "sample": true }).to_string()
+}

@@ -69,6 +69,80 @@ pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     pub matching_workflows: BTreeMap<String, MatchingWorkflow>,
 }
 
+/// The text this service puts in a response `message` member.
+///
+/// Every message AWS Entity Resolution returns on these paths is the SERVICE'S OWN
+/// per-operation text: a fixed string that names the resource TYPE the way the API
+/// spells it (`SchemaMapping`, `MatchingWorkflow`), with the requested name
+/// substituted only where that operation's own template includes it. None of it is a
+/// sentence composed from the request or from the stored record, and none of it is
+/// shared between operations: a missing workflow reads `MatchingWorkflow Not Found`
+/// from `GetMatchingWorkflow` but `MatchingWorkflow <workflowName> does not exist`
+/// from `DeleteMatchingWorkflow`, so collapsing the two into one string would be
+/// wrong. Each path therefore gets its OWN item below, derived from no other.
+pub mod messages {
+    /// `DeleteSchemaMappingOutput$message` — modelled @required, target `String`, doc
+    /// "A successful operation message"
+    /// (`smithy_query(query="operation",operation="DeleteSchemaMapping")`). The value
+    /// is this fixed service string, observed on the wire from AWS.
+    pub const DELETE_SCHEMA_MAPPING_SUCCESS: &str = "SchemaMapping Deleted.";
+
+    /// `DeleteMatchingWorkflowOutput$message` — modelled @required, target `String`,
+    /// doc "A successful operation message". Not itself recorded; it is this
+    /// operation's own constant, spelled with the resource type the API uses, in the
+    /// same form as the recorded [`DELETE_SCHEMA_MAPPING_SUCCESS`].
+    pub const DELETE_MATCHING_WORKFLOW_SUCCESS: &str = "MatchingWorkflow Deleted.";
+
+    /// `GetSchemaMapping`'s `ResourceNotFoundException$message` (HTTP 404). AWS
+    /// answers this constant and does NOT name the schema that was asked for.
+    pub const GET_SCHEMA_MAPPING_NOT_FOUND: &str = "SchemaMapping does not exist";
+
+    /// `GetMatchingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404). AWS
+    /// answers this constant — deliberately worded differently from
+    /// [`delete_matching_workflow_not_found`] — and does not name the workflow.
+    pub const GET_MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+
+    /// `CreateSchemaMapping`'s `ConflictException$message` (HTTP 400) when the
+    /// `schemaName` is already taken. AWS answers this constant with no resource name
+    /// in it; `ConflictException`'s own doc gives "Schema already exists" as the
+    /// example of the condition.
+    pub const CREATE_SCHEMA_MAPPING_CONFLICT: &str = "SchemaMapping already exists.";
+
+    /// `CreateMatchingWorkflow`'s `ConflictException$message` (HTTP 400) when the
+    /// `workflowName` is already taken. Not itself recorded; it is this operation's
+    /// own constant, in the same form as the recorded
+    /// [`CREATE_SCHEMA_MAPPING_CONFLICT`] and spelled with the resource type
+    /// `ConflictException`'s doc names ("Workflow already exists").
+    pub const CREATE_MATCHING_WORKFLOW_CONFLICT: &str = "MatchingWorkflow already exists.";
+
+    /// `DeleteSchemaMapping`'s `ConflictException$message` (HTTP 400) when a matching
+    /// workflow still names the schema in its `inputSourceConfig` — the refusal this
+    /// operation's own doc describes ("This operation will fail if there is a
+    /// MatchingWorkflow object that references the SchemaMapping in the workflow's
+    /// InputSourceConfig"). Not recorded; a constant, not a composed sentence.
+    pub const DELETE_SCHEMA_MAPPING_IN_USE: &str =
+        "SchemaMapping is referenced by the InputSourceConfig of a MatchingWorkflow";
+
+    /// `DeleteMatchingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404).
+    ///
+    /// This is the one path where the service's text is a TEMPLATE over the request:
+    /// the `workflowName` @httpLabel the caller asked for is substituted into it. The
+    /// template is the rule — any name goes through it unchanged.
+    pub fn delete_matching_workflow_not_found(workflow_name: &str) -> String {
+        format!("MatchingWorkflow {workflow_name} does not exist")
+    }
+
+    /// `DeleteSchemaMapping`'s `ResourceNotFoundException$message` (HTTP 404) — the
+    /// refusal its doc describes ("This operation returns a ResourceNotFoundException
+    /// if a schema with the given name does not exist"). Not itself recorded; this
+    /// delete path follows the same request-templated form as the recorded
+    /// [`delete_matching_workflow_not_found`], with the `schemaName` @httpLabel
+    /// substituted.
+    pub fn delete_schema_mapping_not_found(schema_name: &str) -> String {
+        format!("SchemaMapping {schema_name} does not exist")
+    }
+}
+
 /// How many schema mappings this emulator lets exist at once, past which
 /// `CreateSchemaMapping` answers the modelled `ExceedsLimitException` (HTTP 402, "The
 /// request was rejected because it attempted to create resources beyond the current

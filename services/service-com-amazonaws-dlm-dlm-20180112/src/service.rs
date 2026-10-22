@@ -21,11 +21,13 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — which operation serves a request. EDITED HERE: the key
-//!   and the handler stay the generated table's, but an operation that takes an
-//!   `ExecutionRoleArn` is served through [`PassRoleAuthorized`], which authorizes
-//!   `iam:PassRole` for that ARN ahead of the operation — the order the real
-//!   front door works in, and the only place a refusal can precede the member's
-//!   own `@pattern`.
+//!   and the handler stay the generated table's, but every operation that models
+//!   `InvalidRequestException` is served through [`InModelledEnvelope`], which
+//!   (a) authorizes `iam:PassRole` for an `ExecutionRoleArn` the request names,
+//!   ahead of the operation — the order the real front door works in, and the only
+//!   place a refusal can precede the member's own `@pattern` — and (b) refuses a
+//!   request outside a modelled constraint with that operation's own
+//!   `InvalidRequestException` instead of the framework's pre-dispatch envelope.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -42,15 +44,53 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How this service refuses a request
+//!
+//! A request meets three layers before a handler runs, in this order:
+//!
+//! 1. **`iam:PassRole` for the `ExecutionRoleArn` it names.** Amazon Data
+//!    Lifecycle Manager assumes that role, so the authorization precedes even the
+//!    member-constraint walk: an ARN that denotes a principal the caller may not
+//!    pass is `AccessDeniedException` (403), not a shape refusal.
+//! 2. **The modelled input constraints.** A value outside a declared `@pattern`,
+//!    `@length` or `@range`, or a `@required` member absent, is this service's own
+//!    `InvalidRequestException` (400) — the error every operation that can refuse
+//!    a parameter at all declares — carrying the `Code` of that exception class
+//!    and a `Message` naming the parameters it refused. The framework's
+//!    pre-dispatch envelope would answer the right status under the error type
+//!    `ValidationException`, a shape this service's model does not declare, with
+//!    the prose in a lowercase `message` key the modelled shape does not have.
+//!    The two operations whose model declares no client error
+//!    (`GetLifecyclePolicy`, `DeleteLifecyclePolicy`) are left to that envelope:
+//!    an operation answers only the errors it models.
+//! 3. **The cross-member rules the model cannot express** — which `PolicyDetails`
+//!    members may be combined, and which tag keys may be set. Those live in the
+//!    handlers, which already hold the state the rule is about.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use aws_smithy_schema_server::constraints;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
-    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service,
+    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code of the client error this service refuses a bad request with:
+/// the shape `com.amazonaws.dlm#InvalidRequestException`, which every operation
+/// that can refuse a parameter declares
+/// (`smithy_query(query="shape", shape="InvalidRequestException")`).
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// The HTTP status that shape's `@httpError` declares.
+const INVALID_REQUEST_EXCEPTION_STATUS: u16 = 400;
+
+/// The path segment a validation path puts between a collection and its element
+/// (`schedules.1.member.createRule`). It names no parameter of the request, so a
+/// parameter name drops it.
+const COLLECTION_PATH_STEP: &str = "member";
 
 /// The `message` member of the `AccessDeniedException` this service answers a
 /// denied `iam:PassRole` with.
@@ -98,25 +138,36 @@ impl SerializableStruct for AccessDeniedException {
     }
 }
 
-/// An operation input that names an `ExecutionRoleArn` for Amazon Data Lifecycle
-/// Manager to assume: the create states it `@required`, the update states it
-/// optionally, and both must have `iam:PassRole` for it before they run.
-trait NamesExecutionRole {
+/// An operation input of this service, as the request layer above the handlers
+/// reads it.
+///
+/// Only one fact is asked of it: the `ExecutionRoleArn` it names, when it names
+/// one. Amazon Data Lifecycle Manager assumes that role, so the two operations
+/// that take one must have `iam:PassRole` for it before they run; every other
+/// operation names none, which is this trait's default.
+trait DlmRequest {
     /// The `ExecutionRoleArn` this request names, when it names one.
-    fn execution_role_arn(&self) -> Option<&str>;
+    fn execution_role_arn(&self) -> Option<&str> {
+        None
+    }
 }
 
-impl NamesExecutionRole for crate::ops::types::CreateLifecyclePolicyInput {
+impl DlmRequest for crate::ops::types::CreateLifecyclePolicyInput {
     fn execution_role_arn(&self) -> Option<&str> {
         Some(self.execution_role_arn.as_str())
     }
 }
 
-impl NamesExecutionRole for crate::ops::types::UpdateLifecyclePolicyInput {
+impl DlmRequest for crate::ops::types::UpdateLifecyclePolicyInput {
     fn execution_role_arn(&self) -> Option<&str> {
         self.execution_role_arn.as_deref()
     }
 }
+
+impl DlmRequest for crate::ops::types::GetLifecyclePoliciesInput {}
+impl DlmRequest for crate::ops::types::ListTagsForResourceInput {}
+impl DlmRequest for crate::ops::types::TagResourceInput {}
+impl DlmRequest for crate::ops::types::UntagResourceInput {}
 
 /// The `com-amazonaws-dlm-dlm-20180112` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -125,12 +176,28 @@ impl NamesExecutionRole for crate::ops::types::UpdateLifecyclePolicyInput {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The operations that take an `ExecutionRoleArn`, each the generated table's
-    /// own operation wrapped in [`PassRoleAuthorized`] and built from the SAME
-    /// shared engine, so a wrapped operation reads and writes the one store.
+    /// The operations that model `InvalidRequestException`, each the generated
+    /// table's own operation wrapped in [`InModelledEnvelope`] and built from the
+    /// SAME shared engine, so a wrapped operation reads and writes the one store.
     /// Keyed by the routing key the protocol resolves, which is the key the
     /// generated table uses.
-    pass_role_authorized: OperationRoutingTable,
+    in_modelled_envelope: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`InModelledEnvelope`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(InModelledEnvelope::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -138,59 +205,66 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut pass_role_authorized = OperationRoutingTable::new();
-        pass_role_authorized.add_operation(
-            "CreateLifecyclePolicy",
-            Box::new(PassRoleAuthorized::new(
-                crate::ops::create_lifecycle_policy::CreateLifecyclePolicy::new(Arc::clone(
-                    &engine,
-                )),
-            )) as Box<dyn ErasedOperation>,
-        );
-        pass_role_authorized.add_operation(
-            "UpdateLifecyclePolicy",
-            Box::new(PassRoleAuthorized::new(
-                crate::ops::update_lifecycle_policy::UpdateLifecyclePolicy::new(Arc::clone(
-                    &engine,
-                )),
-            )) as Box<dyn ErasedOperation>,
+        let mut in_modelled_envelope = OperationRoutingTable::new();
+        // Every operation whose model declares `InvalidRequestException`
+        // (`smithy_query(query="digest")`). `GetLifecyclePolicy` and
+        // `DeleteLifecyclePolicy` declare no client error, so they are not here:
+        // an operation answers only the errors it models.
+        wrap_operations!(
+            in_modelled_envelope,
+            engine,
+            create_lifecycle_policy::CreateLifecyclePolicy,
+            get_lifecycle_policies::GetLifecyclePolicies,
+            list_tags_for_resource::ListTagsForResource,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_lifecycle_policy::UpdateLifecyclePolicy,
         );
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            pass_role_authorized,
+            in_modelled_envelope,
         }
     }
 }
 
-/// One modelled operation, served with the `iam:PassRole` authorization of its
-/// `ExecutionRoleArn` done first.
+/// One modelled operation, served with the refusals that precede its handler
+/// stated the way Amazon Data Lifecycle Manager states them.
 ///
-/// Amazon Data Lifecycle Manager assumes the role the request names, so the front
-/// door authorizes `iam:PassRole` for that ARN before the operation runs at all,
-/// and answers `AccessDeniedException` when it is denied. That is ahead of the
-/// member-constraint walk, so the denial reaches the caller even for an ARN the
-/// `ExecutionRoleArn` `@pattern` would otherwise refuse as malformed — and,
-/// because nothing has run yet, a denied create leaves no policy behind and a
-/// denied update leaves the stored policy as it was.
+/// Two layers, in the order the real front door runs them:
 ///
-/// Nothing else is re-implemented: a request this wrapper does not deny is handed
-/// to the generated [`ErasedOperation::run`], which owns deserialize -> validate
-/// -> handle -> serialize, telemetry and every modelled error.
-struct PassRoleAuthorized<O> {
+/// 1. `iam:PassRole` for the `ExecutionRoleArn` the request names. That is ahead
+///    of the member-constraint walk, so the denial reaches the caller even for an
+///    ARN the `ExecutionRoleArn` `@pattern` would otherwise refuse as malformed —
+///    and, because nothing has run yet, a denied create leaves no policy behind
+///    and a denied update leaves the stored policy as it was.
+/// 2. The modelled input constraints, refused with this service's own
+///    `InvalidRequestException`. The framework's pre-dispatch renderer gets the
+///    status (400) right, but names the error type `ValidationException` — a shape
+///    this model does not declare, so an SDK never deserializes it into the
+///    modelled error — and writes the prose into a lowercase `message` key, while
+///    this service's error shapes carry `Message` and `Code`.
+///
+/// The violations are the very two classes the framework's own walk collects,
+/// from the framework's own deserializer and constraint walk, so this cannot find
+/// a different set from the walk that follows it. Nothing else is
+/// re-implemented: a request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate ->
+/// handle -> serialize, telemetry and every modelled error.
+struct InModelledEnvelope<O> {
     operation: O,
 }
 
-impl<O> PassRoleAuthorized<O> {
+impl<O> InModelledEnvelope<O> {
     /// Wrap one operation, already constructed from the shared engine.
     fn new(operation: O) -> Self {
         Self { operation }
     }
 }
 
-impl<O> ErasedOperation for PassRoleAuthorized<O>
+impl<O> ErasedOperation for InModelledEnvelope<O>
 where
     O: Operation + ErasedOperation,
-    O::Input: NamesExecutionRole,
+    O::Input: DlmRequest,
 {
     fn run<'r>(
         &'r self,
@@ -202,8 +276,8 @@ where
             // Read the protocol out before the await: `&dyn ErasedServiceDefinition`
             // is not `Sync`, and this future is. The protocol itself is.
             let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
-            if let Some(denied) = pass_role_denied::<O>(protocol, req) {
-                return denied;
+            if let Some(refused) = refused_before_handling::<O>(protocol, req) {
+                return refused;
             }
             self.operation.run(svc, req, ctx).await
         })
@@ -216,26 +290,146 @@ where
     }
 }
 
-/// The `AccessDeniedException` response for `req`, when the `ExecutionRoleArn` it
-/// names is one the caller may not pass. `None` when it may be passed, when the
-/// request names none, and when the request cannot be read at all — a body the
-/// codec rejects is not an authorization answer, and the framework's own walk
-/// words it.
+/// This service's answer to `req`, when it is one of the two refusals that
+/// precede `O`'s handler; `None` when the request reaches the handler.
+///
+/// `None` also when the request cannot be read at all — a body the codec rejects
+/// is neither an authorization answer nor a constraint refusal, and the
+/// framework's own walk words it — and when the chosen error cannot be
+/// serialized, which leaves that walk to refuse the request rather than answering
+/// with no reason at all.
 ///
 /// The request is read with the framework's own deserializer (the same one the
 /// walk uses) and WITHOUT the constraint walk, because `iam:PassRole` is
 /// authorized ahead of the member constraints: an ARN that does not denote a
 /// role the caller may pass is denied rather than refused as malformed.
-fn pass_role_denied<O: Operation>(
+///
+/// A request this does not refuse is deserialized and walked a SECOND time by
+/// the generated `ErasedOperation::run`. That is the cost of stating the refusal
+/// in the modelled shape today: the framework's refusal seam carries only a
+/// [`Refused`] code and message, which cannot hold the `Code`,
+/// `RequiredParameters` and `MutuallyExclusiveParameters` members this service's
+/// error declares. Should `Refused` ever grow a structured form, this layer can
+/// be dropped for `override_refusal` and the second walk goes away with it.
+fn refused_before_handling<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Option<RtResponse>
 where
-    O::Input: NamesExecutionRole,
+    O::Input: DlmRequest,
 {
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
-    let input = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
-    let message = crate::state::pass_role_denial(input.execution_role_arn()?)?;
+    let violations = match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
+        Ok(input) => {
+            if let Some(denied) = pass_role_denied(protocol, input.execution_role_arn()) {
+                return Some(denied);
+            }
+            constraints::validate(&input, O::INPUT_SCHEMA)
+        }
+        // Absence is found while READING the request and a bad value while
+        // walking what was read; to a caller they are one refusal, so they are
+        // one here.
+        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
+            path: member_name,
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+        }],
+        Err(_) => Vec::new(),
+    };
+    invalid_request(protocol, &violations)
+}
+
+/// This service's `InvalidRequestException` for `violations`: HTTP 400 with the
+/// `Code` of the exception class, a `Message` naming the parameters it refused,
+/// and `RequiredParameters` when any of them was omitted rather than invalid.
+/// `None` when there is nothing to refuse.
+fn invalid_request(
+    protocol: &dyn ServerHttpProtocol,
+    violations: &[Violation],
+) -> Option<RtResponse> {
+    if violations.is_empty() {
+        return None;
+    }
+    let (omitted, invalid): (Vec<&Violation>, Vec<&Violation>) = violations
+        .iter()
+        .partition(|violation| violation.kind == ViolationKind::MissingRequiredMember);
+    let omitted: Vec<String> = omitted
+        .iter()
+        .map(|violation| parameter_name(&violation.path))
+        .collect();
+    let invalid: Vec<String> = invalid.iter().copied().map(stated).collect();
+
+    let mut clauses: Vec<String> = Vec::new();
+    if !invalid.is_empty() {
+        clauses.push(format!(
+            "The following parameter(s) are invalid: {}",
+            invalid.join(", ")
+        ));
+    }
+    if !omitted.is_empty() {
+        clauses.push(format!(
+            "The following parameter(s) are required: {}",
+            omitted.join(", ")
+        ));
+    }
+    let message = clauses.join(" ");
+    let refused = if omitted.is_empty() {
+        crate::state::invalid_request(message)
+    } else {
+        crate::state::required_parameters_omitted(message, omitted)
+    };
+    protocol
+        .serialize_error(
+            &refused,
+            &crate::ops::types::shared_types::SCHEMA_INVALID_REQUEST_EXCEPTION,
+            INVALID_REQUEST_EXCEPTION,
+            INVALID_REQUEST_EXCEPTION_STATUS,
+        )
+        .ok()
+}
+
+/// One refused parameter as the message states it: the parameter, then the value
+/// it held in braces.
+fn stated(violation: &Violation) -> String {
+    format!(
+        "{} {{{}}}",
+        parameter_name(&violation.path),
+        violation.value.as_deref().unwrap_or_default()
+    )
+}
+
+/// The parameter a validation path names, as the model spells it.
+///
+/// A validation path is lowerCamel (`description`, `policyDetails.schedules.1.member.name`)
+/// because that is the casing AWS validation paths use; a REQUEST parameter is
+/// named as the model declares the member, so each segment's first character is
+/// restored and the collection step is dropped.
+fn parameter_name(path: &str) -> String {
+    path.split('.')
+        .filter(|segment| *segment != COLLECTION_PATH_STEP)
+        .map(upper_camel)
+        .collect::<Vec<String>>()
+        .join(".")
+}
+
+/// `segment` with its first character upper-cased, which is exactly the inverse
+/// of the lowerCamel a path segment is built with.
+fn upper_camel(segment: &str) -> String {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The `AccessDeniedException` response for the `ExecutionRoleArn` a request
+/// names, when it is one the caller may not pass. `None` when it may be passed,
+/// and when the request names none.
+fn pass_role_denied(
+    protocol: &dyn ServerHttpProtocol,
+    execution_role_arn: Option<&str>,
+) -> Option<RtResponse> {
+    let message = crate::state::pass_role_denial(execution_role_arn?)?;
     protocol
         .serialize_error(
             &AccessDeniedException { message },
@@ -270,13 +464,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol
         // resolves, and the operation it names is the one served — wrapped in
-        // `PassRoleAuthorized` for the two operations that take an
-        // `ExecutionRoleArn`, so that ARN's `iam:PassRole` is authorized ahead of
-        // the operation (and so ahead of the member-constraint walk), as the real
-        // front door does it. Every other key resolves to `None` here exactly as
-        // it does for an unedited service, leaving the generated table to serve it.
+        // `InModelledEnvelope` for every operation that models
+        // `InvalidRequestException`, so that operation's refusals are stated the
+        // way this service states them and an `ExecutionRoleArn`'s `iam:PassRole`
+        // is authorized ahead of the operation (and so ahead of the
+        // member-constraint walk), as the real front door does it. Every other
+        // key resolves to `None` here exactly as it does for an unedited service,
+        // leaving the generated table to serve it.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.pass_role_authorized.get(key)
+        self.in_modelled_envelope.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

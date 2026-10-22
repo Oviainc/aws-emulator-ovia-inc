@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let mut state = state.lock();
 
-        if state.portfolios.remove(&input.id).is_none() {
+        if !state.portfolios.contains_key(&input.id) {
             return Err(DeletePortfolioErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Portfolio {} not found.", input.id)),
@@ -150,16 +150,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // AWS documents the refusal: "You cannot delete a portfolio if it was shared
+        // with you or if it has associated products, users, constraints, or shared
+        // accounts." `ResourceInUseException` is the modelled error for exactly that,
+        // so a portfolio that still carries an association is refused — before
+        // anything is removed, so a refused delete leaves the portfolio whole. The
+        // message names the KIND still associated, the first of them in the order a
+        // caller has to clear them: a product's constraints go before the product
+        // itself, and a portfolio's own principals last.
+        let in_use = if state
+            .products
+            .values()
+            .any(|product| product.portfolio_ids.contains(&input.id))
+        {
+            Some("Products")
+        } else if state
+            .constraints
+            .values()
+            .any(|constraint| constraint.portfolio_id == input.id)
+        {
+            Some("Constraints")
+        } else if state
+            .portfolios
+            .get(&input.id)
+            .is_some_and(|portfolio| !portfolio.principals.is_empty())
+        {
+            Some("Principals")
+        } else {
+            None
+        };
+        if let Some(kind) = in_use {
+            return Err(DeletePortfolioErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Portfolio {} still has associated {kind}",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        state.portfolios.remove(&input.id);
         // The deleted portfolio can no longer be replayed, so its idempotency tokens
         // are dropped with it: a create repeating one of them creates a new portfolio.
         let deleted = input.id;
         state.forget_portfolio_tokens(&deleted);
 
-        // `ResourceInUseException` is the refusal for a portfolio that still has
-        // products, shares or constraints attached. Nothing can attach any of those
-        // yet (every association operation is still scaffolded at 501), so no stored
-        // portfolio can be in use and that refusal is unreachable rather than guessed
-        // at here.
         Ok(DeletePortfolioOutput {})
     }
 }

@@ -21,6 +21,11 @@ use crate::ops::types::{
 /// A DynamoDB item: the attribute-name -> attribute-value map a client put.
 pub type Item = HashMap<String, AttributeValue>;
 
+/// A resource's tag set: at most ONE value per key — "Each DynamoDB table can only
+/// have up to one tag with the same key" (the `Tag$Key` doc) — kept in key order so
+/// every reader reports the same list for the same stored set.
+pub type TagSet = BTreeMap<String, String>;
+
 /// How long a table stays in a transient status before the clock makes the next
 /// status due.
 ///
@@ -63,6 +68,17 @@ pub const MAX_TABLES: usize = 2500;
 /// real surface; reaching it answers the same modelled `LimitExceededException` AWS
 /// answers when a create would exceed an allowance.
 pub const MAX_REGIONS: usize = 64;
+
+/// The most tags one resource may carry: "You can add up to 50 tags to a single
+/// DynamoDB table" (the `Tag` shape's doc). A request carrying more, or a merge that
+/// would push a resource past it, is answered with the modelled
+/// `LimitExceededException` rather than stored.
+pub const MAX_TAGS_PER_TABLE: usize = 50;
+
+/// The tag-key prefix a caller may not assign: "Amazon Web Services-assigned tag
+/// names and values are automatically assigned the `aws:` prefix, which the user
+/// cannot assign" (the `Tag` doc).
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
 
 /// The most global secondary indexes one table may carry: "One or more global
 /// secondary indexes (the maximum is 20) to be created on the table" (the
@@ -537,7 +553,10 @@ pub struct Table {
     pub global_secondary_indexes: Vec<GlobalSecondaryIndex>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
-    pub tags: Vec<Tag>,
+    /// The tags this table carries: the set `CreateTable` seeded and every later
+    /// `TagResource`/`UntagResource` edited, and the one thing
+    /// `ListTagsOfResource` reports.
+    pub tags: TagSet,
     pub creation_date_time: SystemTime,
     /// When the clock owes this table its `CREATING` -> `ACTIVE` transition.
     pub active_at: SystemTime,
@@ -573,6 +592,31 @@ impl Table {
     /// Whether the clock has already made this table's removal due.
     pub fn removal_due(&self, now: SystemTime) -> bool {
         self.removed_at.is_some_and(|due| now >= due)
+    }
+
+    /// How many tags this table would carry once `incoming` were merged in: a key it
+    /// already holds is overwritten rather than added, so only new keys grow the set.
+    pub fn tag_count_after_merging(&self, incoming: &TagSet) -> usize {
+        self.tags.len()
+            + incoming
+                .keys()
+                .filter(|key| !self.tags.contains_key(*key))
+                .count()
+    }
+
+    /// Merge `incoming` into this table's tag set: "If you try to add an existing tag
+    /// (same key), the existing tag value will be updated to the new value" (the
+    /// `Tag$Key` doc), and every key the request does not name keeps its value.
+    pub fn merge_tags(&mut self, incoming: TagSet) {
+        self.tags.extend(incoming);
+    }
+
+    /// Drop exactly the tag keys named, leaving every other one alone. A key this
+    /// table does not carry is nothing to remove, so the call is idempotent.
+    pub fn remove_tags<'k>(&mut self, keys: impl IntoIterator<Item = &'k str>) {
+        for key in keys {
+            self.tags.remove(key);
+        }
     }
 
     /// The name of the `HASH` key attribute.
@@ -1080,6 +1124,91 @@ pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
         )));
     }
     Ok(name.to_string())
+}
+
+/// The DynamoDB resource a tagging operation's `ResourceArn` names: the region it
+/// lives in and the table it is.
+///
+/// A tagging call carries no `TableName`, so the ARN is the caller's whole selector
+/// and it names the region too — which is the scope a table name resolves in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedResource {
+    pub region: String,
+    pub table: String,
+}
+
+/// Resolve a tagging operation's `ResourceArn` to the table it names.
+///
+/// The one place an ARN is classified for the tagging surface, so `TagResource`,
+/// `UntagResource` and `ListTagsOfResource` share a single rule: the value must be an
+/// ARN of THIS service (`arn:<partition>:dynamodb:<region>:<account>:table/<name>`)
+/// naming a table and nothing deeper — a sub-resource ARN (`.../index/<i>`,
+/// `.../stream/<label>`) is not a resource this emulator keeps a tag set for, so it
+/// is refused rather than silently tagged as its table. A value that is not such an
+/// ARN is a bad request, not a missing resource.
+pub fn resolve_resource_arn(resource_arn: &str) -> Result<TaggedResource, RequestError> {
+    let invalid = || {
+        RequestError::Validation(format!(
+            "Invalid ResourceArn: {resource_arn} is not a DynamoDB table ARN of the form \
+             arn:<partition>:dynamodb:<region>:<account>:table/<name>"
+        ))
+    };
+    // `arn`, partition, service, region, account, resource — the resource field is
+    // the last one and may itself carry `/`, so the split stops at six.
+    let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
+    let (partition, service, region, resource) = match fields.as_slice() {
+        ["arn", partition, service, region, _account, resource] => {
+            (*partition, *service, *region, *resource)
+        }
+        _ => return Err(invalid()),
+    };
+    if partition.is_empty() || service != "dynamodb" || region.is_empty() {
+        return Err(invalid());
+    }
+    let path = resource.strip_prefix("table/").ok_or_else(invalid)?;
+    if path.contains('/') {
+        return Err(invalid());
+    }
+    Ok(TaggedResource {
+        region: region.to_string(),
+        table: resolve_table_name(path).map_err(|_| invalid())?,
+    })
+}
+
+/// Fold a request's `TagList` into the stored [`TagSet`].
+///
+/// A key repeated inside one request keeps its LAST value, by the same rule that
+/// makes a second `TagResource` overwrite the first: "If you try to add an existing
+/// tag (same key), the existing tag value will be updated to the new value"
+/// (`Tag$Key`). A key in the reserved `aws:` namespace is refused — the user "cannot
+/// assign" it — so no stored key is ever one AWS alone mints.
+pub fn tag_set_from_request(tags: &[Tag]) -> Result<TagSet, RequestError> {
+    let mut set = TagSet::new();
+    for tag in tags {
+        if tag
+            .key
+            .to_ascii_lowercase()
+            .starts_with(RESERVED_TAG_PREFIX)
+        {
+            return Err(RequestError::Validation(format!(
+                "Invalid tag key {}: the {RESERVED_TAG_PREFIX} prefix is reserved for Amazon \
+                 Web Services-assigned tags and cannot be assigned by a caller",
+                tag.key
+            )));
+        }
+        set.insert(tag.key.clone(), tag.value.clone());
+    }
+    Ok(set)
+}
+
+/// A stored tag set as the modelled `TagList` carries it, in key order.
+pub fn tag_list(tags: &TagSet) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
 }
 
 /// The `AttributeValue` union member name of a value, for a type-mismatch message.

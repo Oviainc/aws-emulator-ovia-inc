@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the named resource carries, read out of this service's state:
+//! the application or stream group the `ResourceArn` resolves to. Reporting only —
+//! it writes nothing but the transitions the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Reporting only: materialise the transitions the clock had already made
+        // due at `now`, which were owed whether or not anybody read. A resource
+        // whose deletion completed is therefore gone here too.
+        state.materialize(now);
+
+        // This operation models no `ResourceNotFoundException`, so an ARN that
+        // names no taggable resource this store holds is refused with the modelled
+        // client-input error instead.
+        let Some(tags) = state.tags_of(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "no Amazon GameLift Streams resource matches ResourceArn {}",
+                        input.resource_arn
+                    ),
+                },
+            )
+            .into());
+        };
+        // `Tags` is modelled `length 1..50`, so a resource carrying none reports
+        // the member absent rather than an empty map that breaks that bound.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags.clone()).filter(|tags| !tags.is_empty()),
+        })
     }
 }

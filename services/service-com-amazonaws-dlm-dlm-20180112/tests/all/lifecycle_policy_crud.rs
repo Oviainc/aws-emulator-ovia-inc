@@ -1275,8 +1275,8 @@ async fn tag_operations_read_and_write_the_stored_tags() {
     )
     .await;
     assert_eq!(
-        tagged.status, 200,
-        "expected HTTP 200 from TagResource, got {} with {:?}",
+        tagged.status, 204,
+        "expected HTTP 204 from TagResource, got {} with {:?}",
         tagged.status, tagged.body
     );
     let after_tag = call(&router, "GET", &tags_uri(&tagged_arn), None).await;

@@ -309,6 +309,13 @@ fn validate_name(name: &str) -> Result<(), PutMetricStreamError> {
 /// Either of the two namespace filter lists a stream can carry.
 type Filters = Option<Vec<MetricStreamFilter>>;
 
+/// A metric stream's filters can name at most this many names in total: "A metric stream's
+/// filters can include up to 1000 total names. This limit applies to the sum of namespace
+/// names and metric names in the filters. For example, this could include 10 metric
+/// namespace filters with 99 metrics each, or 20 namespace filters with 49 metrics specified
+/// in each filter." (`MetricStreamFilter`)
+const MAX_FILTER_NAMES: usize = 1_000;
+
 /// The namespace filters to store, refusing the one combination the operation forbids:
 /// "You cannot include ExcludeFilters and IncludeFilters in the same operation."
 ///
@@ -334,7 +341,32 @@ fn validate_filters(
             .into(),
         );
     }
+    validate_filter_names(include.as_deref(), "IncludeFilters")?;
+    validate_filter_names(exclude.as_deref(), "ExcludeFilters")?;
     Ok((include, exclude))
+}
+
+/// Refuse a filter list naming more than [`MAX_FILTER_NAMES`] names in total — the sum, over
+/// the list's filters, of the namespace names and the metric names they carry.
+fn validate_filter_names(
+    filters: Option<&[MetricStreamFilter]>,
+    member: &str,
+) -> Result<(), PutMetricStreamError> {
+    let names: usize = filters
+        .unwrap_or_default()
+        .iter()
+        .map(|filter| {
+            usize::from(filter.namespace.is_some())
+                + filter.metric_names.as_ref().map_or(0, Vec::len)
+        })
+        .sum();
+    if names <= MAX_FILTER_NAMES {
+        return Ok(());
+    }
+    Err(invalid_parameter_value(format!(
+        "{member} can name at most {MAX_FILTER_NAMES} namespaces and metrics in total; \
+         got {names}"
+    )))
 }
 
 /// A filter list the request actually constrains the stream with, or `None`.
@@ -350,6 +382,10 @@ const MAX_STATISTICS_CONFIGURATIONS: usize = 100;
 /// "This list can include as many as 20 statistics."
 /// (`MetricStreamStatisticsConfiguration$AdditionalStatistics`)
 const MAX_ADDITIONAL_STATISTICS: usize = 20;
+
+/// "There can be as many as 100 pairs in the array."
+/// (`MetricStreamStatisticsConfiguration$IncludeMetrics`)
+const MAX_INCLUDE_METRICS: usize = 100;
 
 /// "You can associate as many as 50 tags with a metric stream." (`PutMetricStreamInput$Tags`)
 const MAX_TAGS: usize = 50;
@@ -374,6 +410,12 @@ fn validate_statistics_configurations(
     }
     let percentiles_only = is_opentelemetry_format(&input.output_format);
     for configuration in configurations {
+        if configuration.include_metrics.len() > MAX_INCLUDE_METRICS {
+            return Err(invalid_parameter_value(format!(
+                "IncludeMetrics can have at most {MAX_INCLUDE_METRICS} pairs; got {}",
+                configuration.include_metrics.len()
+            )));
+        }
         if configuration.additional_statistics.len() > MAX_ADDITIONAL_STATISTICS {
             return Err(invalid_parameter_value(format!(
                 "AdditionalStatistics can include at most {MAX_ADDITIONAL_STATISTICS} \

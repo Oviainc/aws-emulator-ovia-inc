@@ -9,7 +9,9 @@
 //! A repeated `actionId` REPLACES the record stored for it — the latest call for an id
 //! is that record, not a second one. The `datasetArn` must name a dataset this emulator
 //! knows (`ResourceNotFoundException`, 404, when it does not; `ResourceInUseException`,
-//! 409, when it is marked in use), and `properties` must be a JSON object
+//! 409, when it is marked in use), that dataset must be an ACTIONS dataset — the type
+//! the ARN's last segment names — (`InvalidInputException`, 400, for a dataset of any
+//! other type), and `properties` must be a JSON object
 //! (`InvalidInputException`, 400). Action metadata documents no reserved property keys —
 //! that rule belongs to the two event streams. The behaviour itself lives in
 //! `crate::state::put_metadata_records`, which `PutItems` and `PutUsers` share.

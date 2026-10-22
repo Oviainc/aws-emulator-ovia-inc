@@ -67,10 +67,36 @@
 //! cannot make here is whether a well-formed identifier names a resource the account
 //! holds — that is this service's state — so each report handler makes it, through
 //! `crate::scaffolded::Scaffolded::unauthorized`, and answers the same 401.
+//!
+//! ## The document plane
+//!
+//! `ExportComplianceInquiry` hands out a PRESIGNED URL, and a presigned URL is a promise
+//! that a caller can follow it: it is addressed to the document host this service
+//! publishes (`crate::state::is_document_host`), under the path
+//! `/compliance-inquiry/<inquiryId>/export/<exportId>/<object>`, which names no modelled
+//! operation. Two seams carry it, the same pair any emulated data plane uses:
+//!
+//! - [`Service::can_handle`] also claims a request addressed to that published host,
+//!   whose first label names no service, so the router does not answer `UnknownService`
+//!   for a URL this service handed out;
+//! - [`Service::override_routing_error`] serves it. A document request names no modelled
+//!   operation by construction, so the router reaches exactly this seam for it, and
+//!   reaches it BEFORE authentication — which is what lets a presigned URL be followed
+//!   without a signature, as a presigned URL is.
+//!
+//! What it serves is the document the export STORED
+//! (`crate::state::InquiryExport::document`), rendered from the inquiry when the export
+//! ran: a download is a pure read, and a URL whose export has since been released, or
+//! that names another inquiry or another object, is `404`. The report and term URLs
+//! `GetReport` and `GetTermForReport` hand out are NOT served here: their documents are
+//! AWS-published PDFs whose bytes this emulator does not hold, and synthesising them
+//! would be inventing content, so those URLs stay locators.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::serde::SerializableStruct;
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{path, validate};
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused,
     ServerHttpProtocol, Service,
@@ -231,6 +257,13 @@ where
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the document plane is served from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own; it must read the one store the operations write, not a
+    /// second copy.
+    engine: Arc<Eng>,
     /// Answers a request whose targeted resource the front door cannot authorize.
     unauthorized: FrontDoorAnswer,
     /// Answers a request whose body the front door cannot bind to the modelled shape.
@@ -243,7 +276,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
             unauthorized: FrontDoorAnswer(FrontDoorRefusal::unauthorized()),
             invalid_request_body: FrontDoorAnswer(FrontDoorRefusal::invalid_request_body()),
         }
@@ -392,10 +426,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // And a request addressed to the DOCUMENT host this service publishes its
+        // presigned URLs under, whose first label names no service at all: without this
+        // the router answers `UnknownService` for a URL this service handed out. See the
+        // module docs.
+        request_host(parts).is_some_and(crate::state::is_document_host)
     }
 
     fn override_operation(
@@ -460,10 +500,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A request to a DOCUMENT URL this service handed out is exactly that case by
+        // construction — the path is not in the model — so this is where an export's
+        // presigned URL is served. Anything else keeps the framework's default.
+        let target = crate::state::parse_export_document_path(request_path(req.uri()))?;
+        Some(self.serve_export_document(req, &target))
     }
 
     fn override_framework_error(
@@ -478,5 +521,103 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
+    /// Serve one request to a published export-document URL.
+    ///
+    /// A download is a pure READ: it answers the bytes the export stored and writes
+    /// nothing, so following a presigned URL twice answers the same document and changes
+    /// nothing a later caller sees. The export, the inquiry it was taken from and the
+    /// object name must all agree with the URL — an export this store no longer holds, or
+    /// a path that crosses one export's id with another inquiry's id, names no document.
+    fn serve_export_document(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::ExportDocumentTarget,
+    ) -> RtResponse {
+        if !matches!(req.method(), "GET" | "HEAD") {
+            return document_error(405, "MethodNotAllowed", "This document is served by GET");
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return document_error(
+                500,
+                "InternalServerException",
+                "the artifact compliance inquiry store is unavailable",
+            );
+        };
+        let store = state.lock();
+        let found = store.inquiry_exports.get(&target.export_id).filter(|export| {
+            export.inquiry_id == target.inquiry_id
+                && target.object == crate::state::INQUIRY_EXPORT_OBJECT
+        });
+        let Some(export) = found else {
+            return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
+        };
+
+        let length = export.document.len();
+        // A `HEAD` reports the document's metadata without its bytes, which is what the
+        // method means; a `GET` carries them.
+        let body = if req.method() == "HEAD" {
+            SdkBody::empty()
+        } else {
+            SdkBody::from(export.document.clone())
+        };
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            body,
+        );
+        resp.headers_mut()
+            .insert("content-type", crate::state::INQUIRY_EXPORT_CONTENT_TYPE);
+        resp.headers_mut()
+            .insert("content-length", length.to_string());
+        resp
+    }
+}
+
+/// The body of a document-plane refusal that found no document: one sentence carrying
+/// nothing from the request, so a caller cannot probe for exports it was not handed.
+const DOCUMENT_NOT_FOUND_MESSAGE: &str = "The requested document does not exist";
+
+/// One document-plane error response: the status, the code in `x-amzn-errortype`, and a
+/// JSON body carrying the reason.
+///
+/// The document plane is plain HTTPS rather than a modelled operation, so it answers in
+/// its own small envelope instead of the service's restJson1 one. The message is built
+/// from constants, never from the request.
+fn document_error(status: u16, code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "message": message, "code": code }).to_string();
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(status).expect("the status is a constant of this module"),
+        SdkBody::from(body),
+    );
+    resp.headers_mut()
+        .insert("content-type", crate::state::INQUIRY_EXPORT_CONTENT_TYPE);
+    resp.headers_mut()
+        .insert("x-amzn-errortype", code.to_string());
+    resp
+}
+
+/// The `Host` header of a buffered request, or the URI authority when the request is
+/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+fn request_host(parts: &http::request::Parts) -> Option<&str> {
+    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
+        Some(host) => Some(host),
+        None => parts.uri.authority().map(http::uri::Authority::as_str),
+    }
+}
+
+/// The path component of a request URI, with any scheme, authority and query removed.
+fn request_path(uri: &str) -> &str {
+    // The query is dropped FIRST: a query VALUE may carry `://`, which a scheme scan over
+    // the whole URI would mistake for the authority.
+    let without_query = uri.split('?').next().unwrap_or(uri);
+    match without_query.split_once("://") {
+        Some((_scheme, authority_and_path)) => match authority_and_path.find('/') {
+            Some(path_start) => &authority_and_path[path_start..],
+            None => "/",
+        },
+        None => without_query,
     }
 }

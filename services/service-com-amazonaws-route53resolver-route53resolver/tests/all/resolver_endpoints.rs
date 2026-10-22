@@ -1618,3 +1618,137 @@ async fn the_endpoint_store_is_bounded() {
         "a delete frees exactly one slot, so the store is full again"
     );
 }
+
+/// Every Resolver endpoint operation that resolves a `ResolverEndpointId`
+/// reports an id it holds no endpoint under with Route 53 Resolver's own
+/// service error code inside the message: the code in square brackets, the
+/// sentence naming the requested id in double quotes, and a terminating period.
+///
+/// The template is a rule over whatever id the request carried, so the table
+/// varies the id along its form and its length: the model puts `ResourceId` at
+/// length 1..64
+/// (`smithy_query(query="shape",shape="ResourceId")`, no pattern), so both
+/// published bounds are covered, as are an id of no Resolver form and one that
+/// itself contains the quote character the template uses.
+#[tokio::test]
+async fn a_missing_endpoint_is_reported_with_its_rslvr_error_code() {
+    /// The Route 53 Resolver service error code for "this Resolver endpoint id
+    /// is not stored", as recorded on AWS for these operations.
+    const CODE: &str = "RSLVR-00501";
+
+    let router = emulator();
+    // One real endpoint exists, so each case is about the id in the request and
+    // not about an empty store.
+    seed_endpoints(&router, 1).await;
+
+    // Each row: what the case varies, and an id no endpoint is stored under.
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "an outbound id of the minted form",
+            "rslvr-out-0123456789abcdef0".to_string(),
+        ),
+        (
+            "an inbound id of the minted form",
+            "rslvr-in-0000000000000000".to_string(),
+        ),
+        ("an id of no Resolver form", "not-an-endpoint-id".to_string()),
+        ("the shortest ResourceId (length 1)", "r".to_string()),
+        ("the longest ResourceId (length 64)", "e".repeat(64)),
+        (
+            "an id containing the quote character the template uses",
+            "rslvr-out-\"quoted\"".to_string(),
+        ),
+        (
+            "an id that differs from a stored one only by case",
+            "RSLVR-OUT-0123456789ABCDEF0".to_string(),
+        ),
+    ];
+
+    for (case, id) in &cases {
+        // The operations that take a `ResolverEndpointId` and nothing else
+        // required, plus the update, which needs a member to write.
+        let requests = [
+            ("GetResolverEndpoint", json!({ "ResolverEndpointId": id })),
+            ("DeleteResolverEndpoint", json!({ "ResolverEndpointId": id })),
+            (
+                "ListResolverEndpointIpAddresses",
+                json!({ "ResolverEndpointId": id }),
+            ),
+            (
+                "UpdateResolverEndpoint",
+                json!({ "ResolverEndpointId": id, "Name": "renamed" }),
+            ),
+        ];
+
+        for (operation, body) in requests {
+            let (status, parsed) = call(&router, operation, body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}/{operation}: expected HTTP 400, got {status}: {parsed}"
+            );
+            assert!(
+                error_type(&parsed).contains("ResourceNotFoundException"),
+                "case {case:?}/{operation}: expected ResourceNotFoundException, got {parsed}"
+            );
+
+            let message = string_member(&parsed, "Message");
+            let expected = format!(r#"[{CODE}] Resolver endpoint with ID "{id}" does not exist."#);
+            assert_eq!(
+                message, expected,
+                "case {case:?}/{operation}: expected Message {expected:?}, got {message:?}"
+            );
+            // The parts the rule is made of, asserted on their own so a future
+            // reword cannot drop one of them unnoticed.
+            assert!(
+                message.starts_with(&format!("[{CODE}] ")),
+                "case {case:?}/{operation}: expected the bracketed {CODE} prefix, got {message:?}"
+            );
+            assert!(
+                message.contains(&format!("\"{id}\"")),
+                "case {case:?}/{operation}: expected the requested id double-quoted, got {message:?}"
+            );
+            assert!(
+                message.ends_with('.'),
+                "case {case:?}/{operation}: expected a terminating period, got {message:?}"
+            );
+            assert_eq!(
+                string_member(&parsed, "ResourceType"),
+                "ResolverEndpoint",
+                "case {case:?}/{operation}: expected the Resolver endpoint resource type, got {parsed}"
+            );
+        }
+    }
+
+    // The message is built from the request, not fixed text: two different ids
+    // yield two different messages.
+    let mut seen: Vec<String> = Vec::with_capacity(cases.len());
+    for (case, id) in &cases {
+        let (_, parsed) = call(
+            &router,
+            "GetResolverEndpoint",
+            json!({ "ResolverEndpointId": id }),
+        )
+        .await;
+        let message = string_member(&parsed, "Message");
+        assert!(
+            !seen.contains(&message),
+            "case {case:?}: every distinct id must give a distinct Message, got {message:?} twice"
+        );
+        seen.push(message);
+    }
+
+    // An endpoint that IS stored is still served, so the not-found path is
+    // keyed on the store and not on the shape of the id.
+    let stored = seed_endpoints(&router, 1).await;
+    let read = ok(
+        &router,
+        "GetResolverEndpoint",
+        json!({ "ResolverEndpointId": stored[0] }),
+    )
+    .await;
+    assert_eq!(
+        string_member(endpoint(&read), "Id"),
+        stored[0],
+        "a stored endpoint must still be returned, got {read}"
+    );
+}

@@ -30,12 +30,12 @@ pub mod catalog;
 // The catalog's types, data and refusals are reached as `crate::state::…` by the two
 // operations that read it, exactly as they were before the catalog grew its own module.
 pub use catalog::{
-    table_spec, unknown_table, ColumnSpec, TablePropertySpec, TableSpec,
-    PROPERTY_BILLING_VIEW_ARN, PROPERTY_FALSE, PROPERTY_FILTER,
+    table_spec, unknown_table, ColumnGroup, ColumnSpec, TablePropertySpec, TableSpec,
+    PROPERTY_BILLING_VIEW_ARN, PROPERTY_DEPRECATED, PROPERTY_FALSE, PROPERTY_FILTER,
     PROPERTY_INCLUDE_ALL_RECOMMENDATIONS, PROPERTY_INCLUDE_CAPACITY_RESERVATION_DATA,
-    PROPERTY_INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY, PROPERTY_INCLUDE_RESOURCES,
-    PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA, PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE,
-    TABLE_CATALOG,
+    PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA, PROPERTY_INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY,
+    PROPERTY_INCLUDE_RESOURCES, PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
+    PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE, TABLE_CATALOG,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace (see

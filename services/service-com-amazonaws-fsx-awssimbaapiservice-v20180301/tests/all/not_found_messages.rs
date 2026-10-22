@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_fsx_awssimbaapiservice_v20180301::state::MAX_ERROR_MESSAGE_LEN;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::file_system_lifecycle::{call, emulator, ok, ACCOUNT, REGION, SUBNET_A};
+use crate::file_system_lifecycle::{
+    call, emulator, ok, subnet_a, with_client_request_token, ACCOUNT, REGION,
+};
 
 /// Absent `FileSystemId`s spanning the modelled `FileSystemId` shape: pattern
 /// `^(fs-[0-9a-f]{8,})$` with `length 11..21`, so the shortest legal id, a mid-length one
@@ -83,11 +85,11 @@ async fn create_one(router: &MultiServiceRouter) -> (String, String) {
     let created = ok(
         router,
         "CreateFileSystem",
-        &json!({
+        &with_client_request_token(&json!({
             "FileSystemType": "WINDOWS",
             "StorageCapacity": 32,
-            "SubnetIds": [SUBNET_A],
-        }),
+            "SubnetIds": [subnet_a()],
+        })),
     )
     .await;
     let file_system = &created["FileSystem"];

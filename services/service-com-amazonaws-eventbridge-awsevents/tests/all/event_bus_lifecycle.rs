@@ -567,8 +567,7 @@ async fn a_created_bus_is_the_bus_the_rule_operations_see() {
     let cases = ["orders", "orders.eu", "orders_eu-1"];
 
     for bus in cases {
-        let (status, created) =
-            call(&emulator, "CreateEventBus", &json!({ "Name": bus })).await;
+        let (status, created) = call(&emulator, "CreateEventBus", &json!({ "Name": bus })).await;
         assert_eq!(
             status, 200,
             "case {bus}: CreateEventBus answered {status} {created}"
@@ -592,9 +591,12 @@ async fn a_created_bus_is_the_bus_the_rule_operations_see() {
         );
 
         // The bus the rule was bound to is the one the request named.
-        let (status, described) =
-            call(&emulator, "DescribeRule", &json!({ "Name": "on-order", "EventBusName": bus }))
-                .await;
+        let (status, described) = call(
+            &emulator,
+            "DescribeRule",
+            &json!({ "Name": "on-order", "EventBusName": bus }),
+        )
+        .await;
         assert_eq!(
             status, 200,
             "case {bus}: DescribeRule answered {status} {described}"

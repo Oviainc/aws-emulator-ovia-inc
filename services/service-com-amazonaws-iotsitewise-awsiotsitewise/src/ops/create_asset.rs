@@ -315,6 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_update_date: now,
             // The CREATING -> ACTIVE transition the clock owes. Stored, never slept on.
             active_at: now + crate::state::ACTIVATION_DELAY,
+            settling_state: crate::state::STATE_CREATING.to_string(),
             tags: input.tags.clone().unwrap_or_default(),
         };
 

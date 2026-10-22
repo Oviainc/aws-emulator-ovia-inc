@@ -165,9 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = state.packaging_groups.get(&input.id) else {
             return Err(DescribePackagingGroupErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "PackagingGroup with Id {} does not exist.",
-                        input.id
+                    message: Some(crate::scaffolded::not_found_message(
+                        "PackagingGroup",
+                        &input.id,
                     )),
                 },
             )

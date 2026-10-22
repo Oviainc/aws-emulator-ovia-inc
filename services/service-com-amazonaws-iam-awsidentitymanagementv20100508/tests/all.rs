@@ -23,6 +23,8 @@ mod role_deletion;
 mod role_inline_policies;
 #[path = "all/role_lifecycle.rs"]
 mod role_lifecycle;
+#[path = "all/role_policy_removal.rs"]
+mod role_policy_removal;
 #[path = "all/role_tags.rs"]
 mod role_tags;
 #[path = "all/service_linked_roles.rs"]

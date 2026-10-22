@@ -186,8 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Every branch below records the call through `crate::state::audit`, so one log
+        // reader sees the whole slice's traffic and not only its state changes. A
+        // listing resolves no single resource, so its records carry
+        // `crate::state::AUDIT_NO_RESOURCE`.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
             ListRunsErrorModeled::InternalServerException(InternalServerException {
                 message: "the omics run store is unavailable".to_string(),
             })
@@ -198,12 +207,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
                 requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
             });
-        let start = input
-            .starting_token
-            .as_deref()
-            .map(decode_page_token)
-            .transpose()?
-            .unwrap_or(0);
+        let start = match input.starting_token.as_deref().map(decode_page_token) {
+            Some(Err(refusal)) => {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    None,
+                );
+                return Err(refusal);
+            }
+            Some(Ok(start)) => start,
+            None => 0,
+        };
 
         let now_ms = crate::state::now_epoch_millis();
         let mut store = state.lock();
@@ -220,6 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("runGroupId", "run group", input.run_group_id.as_deref()),
         ] {
             if let Some(value) = value {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(value),
+                );
                 return Err(ListRunsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: format!(
@@ -273,6 +295,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 workflow_name: run.workflow_name.clone(),
             });
         }
+
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::Reported, None);
 
         Ok(ListRunsOutput {
             items: Some(items),

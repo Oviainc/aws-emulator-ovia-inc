@@ -146,9 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .run_mut(&input.suite_definition_id, &input.suite_run_id, now)
             .ok_or_else(|| {
                 StopSuiteRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "No suite run with suiteRunId {} for suite definition {}",
-                        input.suite_run_id, input.suite_definition_id
+                    message: Some(crate::state::not_found_message(
+                        "suiteRunId",
+                        &input.suite_run_id,
                     )),
                 })
             })?;

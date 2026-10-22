@@ -3,12 +3,13 @@
 //! @op GetTraceSummaries
 //!
 //! Selects the stored traces whose earliest segment `start_time` falls in
-//! [`StartTime`, `EndTime`) and builds each `TraceSummary` from the persisted
-//! segment documents, so a trace just written by `PutTraceSegments` appears
-//! here. A request asking for behaviour this slice does not implement — a
-//! `FilterExpression`, another `TimeRangeType`, sampling — is REFUSED with
-//! `InvalidRequestException` naming what is unsupported, rather than answered
-//! with an unfiltered 200.
+//! [`StartTime`, `EndTime`) and, when the request carries a `FilterExpression`,
+//! the ones that expression selects ([`crate::state::filter`]); each
+//! `TraceSummary` is then built from the persisted segment documents, so a trace
+//! just written by `PutTraceSegments` appears here. A request asking for
+//! behaviour this slice does not implement — another `TimeRangeType`, sampling —
+//! is REFUSED with `InvalidRequestException` naming what is unsupported, rather
+//! than answered with an unfiltered 200, and so is an inverted time range.
 //!
 //! ## Shape of an operation
 //!
@@ -184,96 +185,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = epoch_seconds(&input.start_time);
         let end = epoch_seconds(&input.end_time);
 
-        // A request asking for behaviour this slice does not implement is
-        // REFUSED, never answered with a success that quietly ignored it: a
-        // caller that asks for a filtered, differently-ranged or sampled
-        // selection would otherwise get the full unfiltered window under HTTP
-        // 200. The selection below is on the trace's own start time, which is
-        // the `TraceId` time range; `Event` and `Service` range over a different
-        // clock this slice does not keep. A reversed or zero-width window is NOT
-        // refused — it is a well-formed request whose half-open interval simply
-        // contains nothing, so it selects nothing.
-        if input
-            .filter_expression
-            .as_deref()
-            .is_some_and(|filter| !filter.trim().is_empty())
-        {
-            return Err(unsupported(
-                "FilterExpression is not evaluated by this emulator yet; omit it to select every trace in [StartTime, EndTime)",
+        // [StartTime, EndTime) is a half-open interval, so an EndTime that
+        // PRECEDES StartTime describes no interval at all: that is a mistake in
+        // the request, refused as invalid, not a window that happens to be
+        // empty. A zero-width window is well formed and selects nothing.
+        if end < start {
+            return Err(invalid_request(
+                "EndTime precedes StartTime, so the requested [StartTime, EndTime) time range is inverted",
             ));
         }
+
+        // A request asking for behaviour this slice does not implement is
+        // REFUSED, never answered with a success that quietly ignored it: a
+        // caller that asks for a differently-ranged or sampled selection would
+        // otherwise get the full window under HTTP 200. The selection below is
+        // on the trace's own start time, which is the `TraceId` time range;
+        // `Event` and `Service` range over a different clock this slice does not
+        // keep.
         if let Some(range) = input.time_range_type.as_deref() {
             if range != SUPPORTED_TIME_RANGE_TYPE {
-                return Err(unsupported(format!(
+                return Err(invalid_request(format!(
                     "TimeRangeType `{range}` is not supported by this emulator yet; only `{SUPPORTED_TIME_RANGE_TYPE}` is"
                 )));
             }
         }
         if input.sampling == Some(true) || input.sampling_strategy.is_some() {
-            return Err(unsupported(
+            return Err(invalid_request(
                 "sampling is not supported by this emulator yet; omit Sampling and SamplingStrategy to select every matching trace",
             ));
         }
 
-        let resume = input.next_token.as_deref();
-        let store = state.lock();
-
-        // A token this service issued names the trace the next page starts at.
-        // One still inside the keyspace being walked is honoured even if that
-        // exact trace has since been evicted, so an eviction between pages does
-        // not fail an in-flight paginator; one beyond it never came from here.
-        if let Some(token) = resume {
-            let within_keyspace = store
-                .traces
-                .keys()
-                .next_back()
-                .is_some_and(|last| token <= last.as_str());
-            if !within_keyspace {
-                return Err(unsupported(format!(
-                    "NextToken `{token}` was not issued by this service"
-                )));
-            }
-        }
-
-        // `traces` is a `BTreeMap`, so the walk is in trace-id order and the
-        // token resumes at the first id at or after it, in O(log n).
-        let scan: Box<dyn Iterator<Item = &crate::state::TraceRecord>> = match resume {
-            Some(token) => Box::new(
-                store
-                    .traces
-                    .range(token.to_string()..)
-                    .map(|(_, trace)| trace),
+        // The filter expression selects a subset of the traces in the window, so
+        // it is parsed here — by the one parser every surface reads this
+        // language with (`crate::state::filter_expression`), compiled into what
+        // this reader can answer — and evaluated per trace below. Only an
+        // expression that parser refuses, or one this reader cannot evaluate, is
+        // refused, and the refusal names the part at fault; an absent or blank
+        // one selects every trace in the window.
+        let filter = match input
+            .filter_expression
+            .as_deref()
+            .map(str::trim)
+            .filter(|filter| !filter.is_empty())
+        {
+            None => None,
+            Some(source) => Some(
+                crate::state::filter::parse(source)
+                    .map_err(|error| invalid_request(error.message))?,
             ),
-            None => Box::new(store.traces.values()),
         };
-        let mut traces_scanned: i64 = 0;
-        let mut selected: Vec<&crate::state::TraceRecord> = Vec::new();
-        for trace in scan {
-            traces_scanned += 1;
-            if trace.first_start >= start && trace.first_start < end {
-                selected.push(trace);
+
+        let resume = input.next_token.as_deref();
+
+        // PASS ONE, under the lock: which traces the window selects, and how
+        // many were walked. Only ids are taken, so the critical section is one
+        // walk of the keyspace with no caller-supplied work in it.
+        let (candidates, traces_scanned) = {
+            let store = state.lock();
+
+            // A token this service issued names the trace the next page starts
+            // at. One still inside the keyspace being walked is honoured even
+            // if that exact trace has since been evicted, so an eviction
+            // between pages does not fail an in-flight paginator; one beyond it
+            // never came from here.
+            if let Some(token) = resume {
+                let within_keyspace = store
+                    .traces
+                    .keys()
+                    .next_back()
+                    .is_some_and(|last| token <= last.as_str());
+                if !within_keyspace {
+                    return Err(invalid_request(format!(
+                        "NextToken `{token}` was not issued by this service"
+                    )));
+                }
+            }
+
+            // `traces` is a `BTreeMap`, so the walk is in trace-id order and the
+            // token resumes at the first id at or after it, in O(log n).
+            let scan: Box<dyn Iterator<Item = &crate::state::TraceRecord>> = match resume {
+                Some(token) => Box::new(
+                    store
+                        .traces
+                        .range(token.to_string()..)
+                        .map(|(_, trace)| trace),
+                ),
+                None => Box::new(store.traces.values()),
+            };
+            let mut scanned: i64 = 0;
+            let mut candidates: Vec<String> = Vec::new();
+            for trace in scan {
+                scanned += 1;
+                if trace.first_start >= start && trace.first_start < end {
+                    candidates.push(trace.id.clone());
+                }
+            }
+            (candidates, scanned)
+        };
+
+        // PASS TWO: evaluate the filter expression, one trace per critical
+        // section, yielding to the runtime between chunks — so a caller's
+        // expression never holds the shared store for the whole walk, and a
+        // timeout or a shutdown has somewhere to land. The whole pass shares one
+        // work budget, which is what bounds the product of traces, nodes and
+        // segments one request can drive; a pass that spends it is answered with
+        // the modelled `ThrottledException`, because the selection it would
+        // otherwise report stopped halfway.
+        // A trace evicted between the two passes is simply gone, exactly as it
+        // is for a paginator resuming after an eviction.
+        let mut budget = crate::state::filter::QueryBudget::new();
+        let mut selected: Vec<TraceSummary> = Vec::new();
+        let mut next_token = None;
+        for (position, trace_id) in candidates.iter().enumerate() {
+            // Checked FIRST, and before the non-match path can `continue` past
+            // it: once the budget is spent, evaluation answers "no match" for
+            // every remaining trace, so a selection built from here on would be
+            // silently short. The page is never full at this point — the loop
+            // breaks as soon as one trace past it is selected — so there is no
+            // complete answer being thrown away.
+            if budget.exhausted() {
+                return Err(budget_spent());
+            }
+            if position > 0 && position % FILTER_YIELD_EVERY == 0 {
+                ::tokio::task::yield_now().await;
+            }
+            {
+                let store = state.lock();
+                let Some(trace) = store.traces.get(trace_id) else {
+                    continue;
+                };
+                if let Some(filter) = &filter {
+                    if !filter.matches(trace, &mut budget) {
+                        continue;
+                    }
+                }
+                if selected.len() == TRACE_SUMMARIES_PAGE_SIZE {
+                    // One past the page: the token names where the next page
+                    // starts, and nothing after it needs evaluating.
+                    next_token = Some(trace.id.clone());
+                } else {
+                    selected.push(summary_of(trace));
+                }
+            }
+            if next_token.is_some() {
+                break;
             }
         }
-
-        // A token only when the selection was truncated.
-        let next_token = selected
-            .get(TRACE_SUMMARIES_PAGE_SIZE)
-            .map(|trace| trace.id.clone());
-        let trace_summaries = selected
-            .iter()
-            .take(TRACE_SUMMARIES_PAGE_SIZE)
-            .copied()
-            .map(summary_of)
-            .collect();
+        // And once more for the last candidate, whose evaluation the loop's own
+        // check cannot see. A page that filled is complete and carries its
+        // token, so only an unfinished walk is refused.
+        if next_token.is_none() && budget.exhausted() {
+            return Err(budget_spent());
+        }
 
         Ok(GetTraceSummariesOutput {
-            trace_summaries: Some(trace_summaries),
+            trace_summaries: Some(selected),
             approximate_time: Some(now()),
             traces_processed_count: Some(traces_scanned),
             next_token,
         })
     }
 }
+
+/// How many traces one filtered scan evaluates between yields to the runtime.
+const FILTER_YIELD_EVERY: usize = 32;
 
 /// How many `TraceSummary` values one page carries.
 ///
@@ -287,11 +362,30 @@ pub const TRACE_SUMMARIES_PAGE_SIZE: usize = 5;
 /// `Service` range over times this slice does not keep.
 pub const SUPPORTED_TIME_RANGE_TYPE: &str = "TraceId";
 
-/// Refuse a request asking for behaviour this slice does not implement, with the
-/// error this operation models for an invalid request.
-fn unsupported(message: impl Into<String>) -> GetTraceSummariesError {
+/// Refuse a request this operation cannot serve as asked — an inverted time
+/// range, an unreadable filter expression, a token this service never issued, or
+/// behaviour this slice does not implement — with the error it models for an
+/// invalid request.
+fn invalid_request(message: impl Into<String>) -> GetTraceSummariesError {
     GetTraceSummariesErrorModeled::InvalidRequestException(InvalidRequestException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Answer a filtered query that spent its whole work budget
+/// ([`crate::state::filter::MAX_QUERY_STEPS`]).
+///
+/// The request is well formed; what it would COST is the problem, so it takes
+/// the throttling error this operation models rather than one that blames the
+/// input — and it is an error rather than a short page, because a selection that
+/// stopped halfway is indistinguishable from one that found nothing more.
+fn budget_spent() -> GetTraceSummariesError {
+    GetTraceSummariesErrorModeled::ThrottledException(ThrottledException {
+        message: Some(
+            "the FilterExpression could not be evaluated over every trace in [StartTime, EndTime) within the work one request may do; narrow the time range or simplify the expression"
+                .to_string(),
+        ),
     })
     .into()
 }
@@ -315,10 +409,145 @@ fn summary_of(trace: &crate::state::TraceRecord) -> TraceSummary {
         is_partial: Some(trace.is_partial()),
         http: root.and_then(http_of),
         annotations: annotations_of(trace),
+        users: users_of(trace),
         service_ids: Some(service_ids_of(trace)),
+        resource_ar_ns: resource_arns_of(trace),
         entry_point: root.map(service_id_of),
+        fault_root_causes: Some(
+            trace
+                .root_causes(crate::state::RootCauseKind::Fault)
+                .iter()
+                .map(fault_root_cause_of)
+                .collect(),
+        ),
+        error_root_causes: Some(
+            trace
+                .root_causes(crate::state::RootCauseKind::Error)
+                .iter()
+                .map(error_root_cause_of)
+                .collect(),
+        ),
         ..TraceSummary::default()
     }
+}
+
+/// A derived fault root cause, as the modelled `FaultRootCause`.
+fn fault_root_cause_of(cause: &crate::state::RootCauseView) -> FaultRootCause {
+    FaultRootCause {
+        services: Some(
+            cause
+                .services
+                .iter()
+                .map(|service| FaultRootCauseService {
+                    name: Some(service.name.clone()),
+                    names: Some(vec![service.name.clone()]),
+                    r#type: service.r#type.clone(),
+                    account_id: service.account_id.clone(),
+                    entity_path: Some(
+                        service
+                            .entity_path
+                            .iter()
+                            .map(|entity| FaultRootCauseEntity {
+                                name: Some(entity.name.clone()),
+                                exceptions: Some(exceptions_of(&entity.exceptions)),
+                                remote: Some(entity.remote),
+                            })
+                            .collect(),
+                    ),
+                    inferred: Some(service.inferred),
+                })
+                .collect(),
+        ),
+        client_impacting: Some(cause.client_impacting),
+    }
+}
+
+/// A derived error root cause, as the modelled `ErrorRootCause`. The shapes
+/// differ only in name: `ErrorRootCauseService` and `FaultRootCauseService`
+/// carry the same members.
+fn error_root_cause_of(cause: &crate::state::RootCauseView) -> ErrorRootCause {
+    ErrorRootCause {
+        services: Some(
+            cause
+                .services
+                .iter()
+                .map(|service| ErrorRootCauseService {
+                    name: Some(service.name.clone()),
+                    names: Some(vec![service.name.clone()]),
+                    r#type: service.r#type.clone(),
+                    account_id: service.account_id.clone(),
+                    entity_path: Some(
+                        service
+                            .entity_path
+                            .iter()
+                            .map(|entity| ErrorRootCauseEntity {
+                                name: Some(entity.name.clone()),
+                                exceptions: Some(exceptions_of(&entity.exceptions)),
+                                remote: Some(entity.remote),
+                            })
+                            .collect(),
+                    ),
+                    inferred: Some(service.inferred),
+                })
+                .collect(),
+        ),
+        client_impacting: Some(cause.client_impacting),
+    }
+}
+
+/// An entity's exceptions, as the modelled `RootCauseException` list.
+fn exceptions_of(exceptions: &[crate::state::CauseException]) -> Vec<RootCauseException> {
+    exceptions
+        .iter()
+        .map(|exception| RootCauseException {
+            name: exception.name.clone(),
+            message: exception.message.clone(),
+        })
+        .collect()
+}
+
+/// "Users from the trace's segment documents" — one per distinct `user`, with
+/// the services that recorded it. `None` when no segment names one.
+fn users_of(trace: &crate::state::TraceRecord) -> Option<Vec<TraceUser>> {
+    let mut users: Vec<TraceUser> = Vec::new();
+    for segment in &trace.segments {
+        let Some(name) = segment.user.clone() else {
+            continue;
+        };
+        match users
+            .iter_mut()
+            .find(|user| user.user_name.as_deref() == Some(name.as_str()))
+        {
+            Some(user) => user
+                .service_ids
+                .get_or_insert_with(Vec::new)
+                .push(service_id_of(segment)),
+            None => users.push(TraceUser {
+                user_name: Some(name),
+                service_ids: Some(vec![service_id_of(segment)]),
+            }),
+        }
+    }
+    (!users.is_empty()).then_some(users)
+}
+
+/// "A list of resource ARNs for any resource corresponding to the trace
+/// segments" — one per distinct `resource_arn`. `None` when no segment names
+/// one.
+fn resource_arns_of(trace: &crate::state::TraceRecord) -> Option<Vec<ResourceARNDetail>> {
+    let mut arns: Vec<String> = Vec::new();
+    for segment in &trace.segments {
+        if let Some(arn) = segment.resource_arn.clone() {
+            if !arns.contains(&arn) {
+                arns.push(arn);
+            }
+        }
+    }
+    (!arns.is_empty()).then(|| {
+        arns.into_iter()
+            .map(|arn| ResourceARNDetail { arn: Some(arn) })
+            .collect()
+    })
 }
 
 /// The root segment's `http` block, as the modelled `Http`.

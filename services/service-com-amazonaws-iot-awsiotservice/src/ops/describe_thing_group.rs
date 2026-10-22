@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeThingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeThingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeThingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeThingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeThingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeThingGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeThingGroupErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // A pure read of the thing-group registry: the record is cloned out and
+        // reported, and a name the registry does not hold is a 404, never a hollow
+        // 200.
+        let store = state.lock();
+        let group = store
+            .thing_groups
+            .get(&input.thing_group_name)
+            .ok_or_else(|| {
+                DescribeThingGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Thing group {} does not exist",
+                            input.thing_group_name
+                        )),
+                    },
+                )
+            })?;
+
+        // `rootToParentThingGroups` is "The root parent thing group" chain, so it is
+        // reported only for a group that HAS a parent; a root group carries neither
+        // member.
+        let root_to_parent_thing_groups =
+            group
+                .configuration
+                .parent_group_name
+                .as_deref()
+                .map(|parent_group_name| {
+                    store
+                        .root_to_parent_thing_groups(parent_group_name)
+                        .into_iter()
+                        .map(|(group_name, group_arn)| GroupNameAndArn {
+                            group_name: Some(group_name),
+                            group_arn: Some(group_arn),
+                        })
+                        .collect::<Vec<GroupNameAndArn>>()
+                });
+
+        Ok(DescribeThingGroupOutput {
+            thing_group_name: Some(group.thing_group_name.clone()),
+            thing_group_id: Some(group.thing_group_id.clone()),
+            thing_group_arn: Some(group.thing_group_arn.clone()),
+            version: group.version,
+            thing_group_properties: Some(ThingGroupProperties {
+                thing_group_description: group.configuration.description.clone(),
+                // The payload is reported only when the group has attributes: an
+                // `attributePayload` is how attributes are carried, and a group
+                // created without any carries none.
+                attribute_payload: (!group.configuration.attributes.is_empty()).then(|| {
+                    AttributePayload {
+                        attributes: Some(group.attributes()),
+                        // `merge` "is only valid when calling UpdateThing or
+                        // UpdateThingGroup", so a read never asks for a merge.
+                        merge: false,
+                    }
+                }),
+            }),
+            thing_group_metadata: Some(ThingGroupMetadata {
+                parent_group_name: group.configuration.parent_group_name.clone(),
+                root_to_parent_thing_groups,
+                creation_date: Some(::aws_smithy_types::DateTime::from(group.creation_date)),
+            }),
+            // `indexName`, `queryString`, `queryVersion` and `status` are the DYNAMIC
+            // thing group members (`status` is a `DynamicGroupStatus`). A group
+            // created by `CreateThingGroup` is static, so it has none of them;
+            // `CreateDynamicThingGroup` is a scaffold with its own issue and is what
+            // will populate them.
+            index_name: None,
+            query_string: None,
+            query_version: None,
+            status: None,
+        })
     }
 }

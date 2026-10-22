@@ -17,6 +17,8 @@ mod bucket_bundles;
 mod container_service_lifecycle;
 #[path = "all/domain_zone.rs"]
 mod domain_zone;
+#[path = "all/instance_error_envelope.rs"]
+mod instance_error_envelope;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/region_catalog.rs"]

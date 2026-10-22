@@ -194,6 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .stream_keys
             .retain(|_, key| key.channel_arn.as_deref() != Some(input.arn.as_str()));
+        // The stream a channel carries is part of the channel: with the channel
+        // gone there is nothing left to ingest on or report about, so the entry
+        // goes too rather than lingering as unreachable state.
+        store.streams.remove(&input.arn);
 
         Ok(DeleteChannelOutput)
     }

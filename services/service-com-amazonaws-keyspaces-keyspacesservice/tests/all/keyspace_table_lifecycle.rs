@@ -44,6 +44,9 @@ pub(crate) fn settle_wait() -> Duration {
 }
 
 /// One emulator holding one shared engine, driven over HTTP exactly as the router does.
+///
+/// Shared with the other suites of this test binary (`tests/all/type_lifecycle.rs`), so
+/// there is ONE harness for this service rather than a copy per file.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }

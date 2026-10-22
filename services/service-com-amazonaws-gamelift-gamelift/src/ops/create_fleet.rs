@@ -337,8 +337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            COMPUTE_TYPE_ANYWHERE, COMPUTE_TYPE_EC2, FLEET_STATUS_ACTIVE, FLEET_STATUS_NEW,
-            FLEET_TYPE_ON_DEMAND, PROTECTION_POLICY_NO_PROTECTION, WORKFLOW_DELAY,
+            CERTIFICATE_TYPE_DISABLED, COMPUTE_TYPE_ANYWHERE, COMPUTE_TYPE_EC2,
+            FLEET_STATUS_ACTIVE, FLEET_STATUS_NEW, FLEET_TYPE_ON_DEMAND,
+            PLAYER_GATEWAY_MODE_DISABLED, PROTECTION_POLICY_NO_PROTECTION, WORKFLOW_DELAY,
         };
 
         let invalid = |message: &str| -> Self::Error {
@@ -377,10 +378,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be unreachable. Once that slice lands, an unknown build or script becomes the
         // modelled `NotFoundException` here.
         if compute_type == COMPUTE_TYPE_ANYWHERE {
+            // An Anywhere fleet is defined by the locations it deploys to, and what this
+            // branch checks is that the request carried some: so the refusal names THAT
+            // constraint — the location configurations cannot be empty — rather than a
+            // stronger one the handler does not enforce. (AWS answers a CreateFleet
+            // whose `Locations` is absent or empty with exactly this wording.)
             if input.locations.as_ref().is_none_or(Vec::is_empty) {
-                return Err(invalid(
-                    "Locations with a custom location is required to create a fleet with ComputeType ANYWHERE.",
-                ));
+                return Err(invalid("Location configuration(s) cannot be empty."));
             }
         } else {
             match (&input.build_id, &input.script_id) {
@@ -441,15 +445,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 50 processes running concurrently. To calculate the total number of processes
         // defined in a runtime configuration, add the values of the ConcurrentExecutions
         // parameter for each server process."
-        let configured_processes = input
-            .runtime_configuration
-            .as_ref()
-            .and_then(|configuration| configuration.server_processes.as_ref())
-            .map_or(0, |processes| {
-                processes.iter().fold(0_i32, |total, process| {
-                    total.saturating_add(process.concurrent_executions)
-                })
-            });
+        let configured_processes =
+            crate::state::configured_server_processes(input.runtime_configuration.as_ref());
         if configured_processes > crate::state::MAX_SERVER_PROCESSES_PER_INSTANCE {
             return Err(invalid(&format!(
                 "RuntimeConfiguration asks for {configured_processes} concurrent server \
@@ -490,12 +487,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (FLEET_STATUS_NEW, Some(now + WORKFLOW_DELAY))
         };
 
+        // How many server processes each of this fleet's locations runs, and so how many
+        // game sessions each can host: a managed fleet runs the processes its runtime
+        // configuration asks for, an Anywhere fleet runs none of its own.
+        let server_processes =
+            crate::state::server_processes_per_location(&compute_type, configured_processes);
+
         // `CreateFleetOutput$LocationStates` doc: "This list includes an entry for the
         // fleet's home Region. For fleets with no remote locations, only one entry,
         // representing the home Region, is returned."
         let mut locations = vec![crate::state::FleetLocation {
             location: region.clone(),
             status: status.to_string(),
+            server_processes,
         }];
         for configured in input.locations.iter().flatten() {
             if !locations
@@ -505,6 +509,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 locations.push(crate::state::FleetLocation {
                     location: configured.location.clone(),
                     status: status.to_string(),
+                    server_processes,
                 });
             }
         }
@@ -534,9 +539,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             log_paths: input.log_paths.clone(),
             runtime_configuration: input.runtime_configuration.clone(),
             resource_creation_limit_policy: input.resource_creation_limit_policy.clone(),
-            certificate_configuration: input.certificate_configuration.clone(),
+            // `CertificateType` doc: "DISABLED - (default) Do not generate a TLS/SSL
+            // certificate for this fleet." A fleet the request left without a
+            // certificate configuration still HAS one, so a client that reads
+            // `CertificateConfiguration.CertificateType` to decide whether to use TLS
+            // reads the decision the service made for it.
+            certificate_configuration: Some(input.certificate_configuration.clone().unwrap_or_else(
+                || CertificateConfiguration {
+                    certificate_type: CERTIFICATE_TYPE_DISABLED.to_string(),
+                },
+            )),
             anywhere_configuration: input.anywhere_configuration.clone(),
-            player_gateway_mode: input.player_gateway_mode.clone(),
+            // `PlayerGatewayMode` doc: "DISABLED (default) -- Game clients connect to
+            // the game server endpoint."
+            player_gateway_mode: Some(
+                input
+                    .player_gateway_mode
+                    .clone()
+                    .unwrap_or_else(|| PLAYER_GATEWAY_MODE_DISABLED.to_string()),
+            ),
             player_gateway_configuration: input.player_gateway_configuration.clone(),
             instance_role_arn: input.instance_role_arn.clone(),
             instance_role_credentials_provider: input.instance_role_credentials_provider.clone(),
@@ -547,7 +568,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .new_game_session_protection_policy
                 .clone()
                 .unwrap_or_else(|| PROTECTION_POLICY_NO_PROTECTION.to_string()),
-            metric_groups: input.metric_groups.clone().unwrap_or_default(),
+            // "A fleet can be included in only one metric group at a time": a fleet
+            // that named none is in the service's own group, not in no group at all, so
+            // the CloudWatch group a client reads off the fleet always resolves. A
+            // request that DOES name a group is honoured as it stands.
+            metric_groups: input
+                .metric_groups
+                .clone()
+                .unwrap_or_else(|| vec![crate::state::DEFAULT_METRIC_GROUP.to_string()]),
             locations,
             home_location: region.clone(),
             region,

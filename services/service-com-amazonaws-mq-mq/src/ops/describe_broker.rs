@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBroker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBroker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBroker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a REPORTING operation. It looks the broker up by `BrokerId` and
+//! returns the values `CreateBroker` persisted, with `BrokerState` DERIVED from the
+//! stored instants — nothing is written here, so a describe never changes what a
+//! later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +135,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -211,18 +208,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBroker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBrokerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBroker"))
+        let _ = ctx;
+        let Some(state) = state::service_state(&*self.engine) else {
+            return Err(DescribeBrokerErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(broker) = store.brokers.get(&input.broker_id) else {
+            return Err(DescribeBrokerErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some("broker-id".to_string()),
+                message: Some(format!("no broker with id {:?} exists", input.broker_id)),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+
+        Ok(DescribeBrokerOutput {
+            broker_id: Some(broker.broker_id.clone()),
+            broker_arn: Some(broker.broker_arn.clone()),
+            broker_name: Some(broker.broker_name.clone()),
+            broker_state: Some(
+                broker
+                    .broker_state(::std::time::SystemTime::now())
+                    .to_string(),
+            ),
+            engine_type: Some(broker.engine_type.clone()),
+            engine_version: broker.engine_version.clone(),
+            deployment_mode: Some(broker.deployment_mode.clone()),
+            host_instance_type: Some(broker.host_instance_type.clone()),
+            publicly_accessible: Some(broker.publicly_accessible),
+            auto_minor_version_upgrade: Some(broker.auto_minor_version_upgrade),
+            authentication_strategy: Some(broker.authentication_strategy.clone()),
+            storage_type: broker.storage_type.clone(),
+            storage_size: broker.storage_size,
+            security_groups: state::optional_list(&broker.security_groups),
+            subnet_ids: state::optional_list(&broker.subnet_ids),
+            data_replication_mode: broker.data_replication_mode.clone(),
+            created: Some(broker.created_timestamp()),
+            tags: broker.optional_tags(),
+            // The logging the broker was created with, plus the CloudWatch Logs
+            // log groups Amazon MQ derives from the broker's own id.
+            logs: Some(LogsSummary {
+                audit: broker.logs.audit,
+                audit_log_group: (broker.logs.audit == Some(true))
+                    .then(|| broker.log_group("audit")),
+                general: broker.logs.general,
+                general_log_group: broker.log_group("general"),
+                pending: None,
+            }),
+            encryption_options: broker.encryption_options.as_ref().map(|options| {
+                EncryptionOptions {
+                    kms_key_id: options.kms_key_id.clone(),
+                    use_aws_owned_key: options.use_aws_owned_key,
+                }
+            }),
+            maintenance_window_start_time: broker
+                .maintenance_window_start_time
+                .as_ref()
+                .map(|window| WeeklyStartTime {
+                    day_of_week: window.day_of_week.clone(),
+                    time_of_day: window.time_of_day.clone(),
+                    time_zone: Some(window.time_zone.clone()),
+                }),
+            // `LdapServerMetadataOutput` carries no password member, so the
+            // stored service-account password is not reported.
+            ldap_server_metadata: broker.ldap_server_metadata.as_ref().map(|ldap| {
+                LdapServerMetadataOutput {
+                    hosts: ldap.hosts.clone(),
+                    role_base: ldap.role_base.clone(),
+                    role_name: ldap.role_name.clone(),
+                    role_search_matching: ldap.role_search_matching.clone(),
+                    role_search_subtree: ldap.role_search_subtree,
+                    service_account_username: ldap.service_account_username.clone(),
+                    user_base: ldap.user_base.clone(),
+                    user_role_name: ldap.user_role_name.clone(),
+                    user_search_matching: ldap.user_search_matching.clone(),
+                    user_search_subtree: ldap.user_search_subtree,
+                }
+            }),
+            // Omitted when the broker holds no users, the same omit-when-empty
+            // rule `state::optional_list` applies to the list members above.
+            users: (!broker.users.is_empty()).then(|| {
+                broker
+                    .users
+                    .values()
+                    .map(|user| UserSummary {
+                        username: user.username.clone(),
+                        pending_change: None,
+                    })
+                    .collect()
+            }),
+            ..Default::default()
+        })
     }
 }

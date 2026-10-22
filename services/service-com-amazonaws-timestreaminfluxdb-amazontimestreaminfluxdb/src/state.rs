@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DbBackupConfiguration, DbBackupConfigurationOutput, DbInstanceSummary,
-    LogDeliveryConfiguration, MaintenanceSchedule,
+    LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
 };
 
 /// `Status` values this service's records use, each one a member of
@@ -34,6 +34,15 @@ pub const STATUS_UPDATING_DEPLOYMENT_TYPE: &str = "UPDATING_DEPLOYMENT_TYPE";
 /// `ResourceNotFoundException` for a DB instance — a member of
 /// `crate::ops::types::RESOURCE_TYPE_VALUES` (the modelled `ResourceType` enum).
 pub const RESOURCE_TYPE_DB_INSTANCE: &str = "DB_INSTANCE";
+
+/// The `resourceType` this service reports on `ConflictException` /
+/// `ResourceNotFoundException` for a DB parameter group.
+///
+/// Those exceptions model `resourceType` as a plain `String`, NOT as the `ResourceType`
+/// enum (`smithy_query(query="shape", shape="ConflictException,ResourceType")`), so the
+/// parameter-group resource type is reportable even though the enum lists only the two
+/// compute resources.
+pub const RESOURCE_TYPE_DB_PARAMETER_GROUP: &str = "DB_PARAMETER_GROUP";
 
 /// The `deploymentType` that places a standby in a second Availability Zone, from the
 /// modelled `DeploymentType` enum (`crate::ops::types::DEPLOYMENT_TYPE_VALUES`).
@@ -70,6 +79,15 @@ pub const MAX_RESULTS_DEFAULT: i32 = 100;
 /// never outgrow this bound either. It also caps the per-request work `ListDbInstances`
 /// does when it settles the clock-owed statuses.
 pub const DB_INSTANCE_QUOTA: usize = 1_000;
+
+/// How many DB parameter groups the store holds before `CreateDbParameterGroup` refuses
+/// with the modelled `ServiceQuotaExceededException`.
+///
+/// Like [`DB_INSTANCE_QUOTA`], this is the emulator's OWN bound on the state rather than
+/// a claim about any account's adjustable Service Quotas limit: it is what stops the
+/// store (and the parameter-group name index beside it) growing without end, and it sits
+/// far above any workflow an emulator serves.
+pub const DB_PARAMETER_GROUP_QUOTA: usize = 1_000;
 
 /// One persisted Timestream for InfluxDB DB instance: the single source of truth every
 /// DB-instance operation reads and writes.
@@ -232,6 +250,56 @@ db_instance_record_projections! {
     to_delete_output -> crate::ops::types::DeleteDbInstanceOutput,
 }
 
+/// One persisted Timestream for InfluxDB DB parameter group: the single source of truth
+/// every DB-parameter-group operation reads and writes.
+///
+/// A parameter group has no lifecycle status in its model (no `status` member on any of
+/// its shapes), so it is ready the moment it is created and owes the clock no transition.
+#[derive(Debug, Clone)]
+pub struct DbParameterGroup {
+    pub id: String,
+    pub name: String,
+    pub arn: String,
+    /// The region the group was created in; its ARN is scoped to it, and the name
+    /// uniqueness rule is per region, so later operations read the region from here.
+    pub region: String,
+    pub description: Option<String>,
+    pub parameters: Option<Parameters>,
+    /// The tags the create request attached. No parameter-group output shape carries
+    /// them, so nothing echoes them back; they are kept for the tagging operations.
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+}
+
+/// The DB-parameter-group operations whose output shape is the same full record.
+///
+/// They are distinct generated types with identical members, so one macro writes one
+/// projection per shape instead of copies that could drift apart.
+macro_rules! db_parameter_group_record_projections {
+    ($($method:ident -> $out:path),* $(,)?) => {
+        impl DbParameterGroup {
+            $(
+                /// Project this stored record into the operation's output shape. Every
+                /// member comes from the record; nothing is recomputed from the request.
+                pub fn $method(&self) -> $out {
+                    $out {
+                        id: self.id.clone(),
+                        name: self.name.clone(),
+                        arn: self.arn.clone(),
+                        description: self.description.clone(),
+                        parameters: self.parameters.clone(),
+                    }
+                }
+            )*
+        }
+    };
+}
+
+db_parameter_group_record_projections! {
+    to_create_output -> crate::ops::types::CreateDbParameterGroupOutput,
+    to_get_output -> crate::ops::types::GetDbParameterGroupOutput,
+}
+
 /// Per-service state for com-amazonaws-timestreaminfluxdb-amazontimestreaminfluxdb. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
@@ -246,6 +314,15 @@ pub struct ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
     /// Monotonic sequence mixed into every minted `id`, so two instances created with
     /// the same name in one process never collide.
     pub db_instance_seq: u64,
+    /// Live DB parameter groups by their service-generated `id`. Ordered, so
+    /// `ListDbParameterGroups` pages deterministically.
+    pub db_parameter_groups: BTreeMap<String, DbParameterGroup>,
+    /// `(region, name)` -> `id`: the uniqueness index behind `ConflictException` on a
+    /// duplicate parameter-group name. The key carries the region because the rule the
+    /// model documents is "The name must be unique per customer and per region".
+    pub db_parameter_group_names: BTreeMap<(String, String), String>,
+    /// Monotonic sequence mixed into every minted parameter-group `id`.
+    pub db_parameter_group_seq: u64,
 }
 
 impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
@@ -285,6 +362,38 @@ impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
         self.db_instance_names
             .remove(&(region.to_string(), name.to_string()));
     }
+
+    /// Mint the next service-generated DB parameter group id: 10 lowercase hex
+    /// characters, which satisfies the modelled `DbParameterGroupId` pattern
+    /// `^[a-zA-Z0-9]+$` and length 3..64.
+    ///
+    /// Opaque to the caller but deterministic for a given (name, region, sequence), and
+    /// unique because the monotonic sequence advances until the id is unused.
+    pub fn mint_db_parameter_group_id(&mut self, name: &str, region: &str) -> String {
+        loop {
+            self.db_parameter_group_seq += 1;
+            let seq = self.db_parameter_group_seq;
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(
+                format!("db-parameter-group|{region}|{name}|{seq}").as_bytes(),
+            );
+            let id = hex::encode(digest)[..10].to_string();
+            if !self.db_parameter_groups.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The id of the DB parameter group holding `name` in `region`, if any.
+    pub fn db_parameter_group_id_for_name(&self, region: &str, name: &str) -> Option<&String> {
+        self.db_parameter_group_names
+            .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Claim `name` in `region` for `id`.
+    pub fn claim_db_parameter_group_name(&mut self, region: &str, name: &str, id: String) {
+        self.db_parameter_group_names
+            .insert((region.to_string(), name.to_string()), id);
+    }
 }
 
 /// The region a request is scoped to: the region of its SigV4 credential scope, else
@@ -307,6 +416,13 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The ARN of a DB instance: `arn:aws:timestream-influxdb:<region>:<account>:db-instance/<id>`.
 pub fn db_instance_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("db-instance/{id}"))
+}
+
+/// The ARN of a DB parameter group:
+/// `arn:aws:timestream-influxdb:<region>:<account>:db-parameter-group/<id>`, one of the
+/// four resource segments the modelled `Arn` pattern allows.
+pub fn db_parameter_group_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("db-parameter-group/{id}"))
 }
 
 /// The endpoint a client connects to InfluxDB on.

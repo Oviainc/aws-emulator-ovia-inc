@@ -824,16 +824,19 @@ async fn a_request_outside_the_modelled_constraints_is_refused() {
     let forecast_arn = arn("forecast/constraints");
     seed_forecast(&engine, electricity_forecast(&forecast_arn));
 
-    // Every row is a 400. The code differs by WHERE the refusal happens: the framework's
-    // boundary validator answers `ValidationException` for a constraint it checks before
-    // `handle`, while a `Filters` KEY pattern (a map-key constraint the boundary does not
-    // walk) reaches the handler and is answered with the operation's own modelled
-    // `InvalidInputException`. Either way the caller gets a 400, never a 404 or a 501.
+    // Every row is a 400. The code differs by WHAT was refused: a RESOURCE ARN outside
+    // its modelled pattern or length is refused by the service itself, before the forecast
+    // it names is resolved, with the operation's own modelled `InvalidInputException`
+    // (`crate::service::override_refusal`); a `Filters` KEY pattern (a map-key constraint
+    // the boundary does not walk) reaches the handler and is answered with the same
+    // modelled error; every other modelled constraint is checked by the framework's
+    // boundary validator before `handle` and keeps its generic `ValidationException`
+    // report. Either way the caller gets a 400, never a 404 or a 501.
     let cases: Vec<(&str, Value, &str)> = vec![
         (
             "ForecastArn that is not an ARN",
             json!({"ForecastArn": "electricity_demand", "Filters": {"item_id": "client_21"}}),
-            "ValidationException",
+            "InvalidInputException",
         ),
         (
             "ForecastArn of another service",
@@ -841,7 +844,7 @@ async fn a_request_outside_the_modelled_constraints_is_refused() {
                 "ForecastArn": "arn:aws:s3:us-east-1:000000000000:bucket/x",
                 "Filters": {"item_id": "client_21"},
             }),
-            "ValidationException",
+            "InvalidInputException",
         ),
         (
             "ForecastArn past its 256-character bound",
@@ -849,7 +852,7 @@ async fn a_request_outside_the_modelled_constraints_is_refused() {
                 "ForecastArn": arn(&format!("forecast/{}", "x".repeat(256))),
                 "Filters": {"item_id": "client_21"},
             }),
-            "ValidationException",
+            "InvalidInputException",
         ),
         (
             "Filters below its 1-entry bound",
@@ -1104,6 +1107,321 @@ async fn a_what_if_forecast_answers_its_own_transformed_series() {
         "InvalidInputException",
         "case \"what-if unknown dimension\": expected InvalidInputException, got {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Error precedence
+// ---------------------------------------------------------------------------
+
+/// A resource ARN is READ before it is RESOLVED: an ARN outside its modelled pattern or
+/// length is the modelled `InvalidInputException` (400), while an ARN that is well-formed
+/// but names nothing is `ResourceNotFoundException` (404). Both operations, over a set of
+/// malformed forms.
+///
+/// The malformed rows are forms the pattern `^arn:([a-z\d-]+):forecast:.*:.*:.+$` and the
+/// length bound (`Arn` 0..256, `LongArn` 0..300) reject — the constraint source is
+/// `smithy_query(query="closure",operation="QueryForecast,QueryWhatIfForecast")` — and
+/// each is a DIFFERENT way of being outside them: not an ARN at all, another service's
+/// ARN, an empty resource part, a partition outside the character class, and one past the
+/// member's own maximum length. The well-formed rows differ only in naming nothing.
+#[tokio::test]
+async fn an_arn_outside_its_modelled_syntax_is_invalid_input_before_any_lookup() {
+    let (engine, router) = harness();
+    let forecast_arn = arn("forecast/precedence");
+    let what_if_arn = arn("what-if-forecast/precedence/variant");
+    seed_forecast(&engine, electricity_forecast(&forecast_arn));
+    seed_what_if(
+        &engine,
+        electricity_forecast(&what_if_arn).derived_from(&forecast_arn),
+    );
+
+    /// One operation and the length its ARN member is bounded at.
+    struct Operation {
+        name: &'static str,
+        arn_member: &'static str,
+        max_length: usize,
+    }
+
+    let operations: [Operation; 2] = [
+        Operation {
+            name: "QueryForecast",
+            arn_member: "ForecastArn",
+            max_length: 256,
+        },
+        Operation {
+            name: "QueryWhatIfForecast",
+            arn_member: "WhatIfForecastArn",
+            max_length: 300,
+        },
+    ];
+
+    for operation in operations {
+        let Operation {
+            name,
+            arn_member,
+            max_length,
+        } = operation;
+        // (case, the ARN sent, expected status, expected code)
+        let mut rows: Vec<(String, String, u16, &str)> = vec![
+            (
+                "not an ARN at all".to_string(),
+                "definitely-not-an-arn".to_string(),
+                400,
+                "InvalidInputException",
+            ),
+            (
+                "another service's ARN".to_string(),
+                "arn:aws:s3:us-east-1:000000000000:bucket/x".to_string(),
+                400,
+                "InvalidInputException",
+            ),
+            (
+                "an empty resource part".to_string(),
+                "arn:aws:forecast:us-east-1:000000000000:".to_string(),
+                400,
+                "InvalidInputException",
+            ),
+            (
+                "a partition outside the character class".to_string(),
+                "arn:AWS:forecast:us-east-1:000000000000:forecast/x".to_string(),
+                400,
+                "InvalidInputException",
+            ),
+            (
+                // Well-formed, and nothing is stored under it: resolution, not syntax.
+                "well-formed but absent".to_string(),
+                arn("forecast/absent-everywhere"),
+                404,
+                "ResourceNotFoundException",
+            ),
+        ];
+        // One character past this member's own maximum length — a bound, so it is tested
+        // at the bound (which must be accepted as syntax and resolve to a 404) and one
+        // past it (refused as invalid input).
+        let resource = "x".repeat(max_length);
+        let at_bound = format!("arn:aws:forecast:us-east-1:000000000000:{resource}");
+        let at_bound = at_bound[..max_length].to_string();
+        rows.push((
+            "exactly at the maximum length".to_string(),
+            at_bound.clone(),
+            404,
+            "ResourceNotFoundException",
+        ));
+        rows.push((
+            "one character past the maximum length".to_string(),
+            format!("{at_bound}x"),
+            400,
+            "InvalidInputException",
+        ));
+
+        for (case, sent, expected_status, expected_code) in rows {
+            let case = format!("{name} / {case}");
+            let (status, body) = call(
+                &router,
+                name,
+                &json!({
+                    arn_member: sent,
+                    "Filters": {"item_id": "client_21"},
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, expected_status,
+                "case {case:?}: expected HTTP {expected_status}, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {body}"
+            );
+            assert!(
+                body.get("Message")
+                    .or_else(|| body.get("message"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| !message.is_empty()),
+                "case {case:?}: the error must carry a Message, got {body}"
+            );
+        }
+    }
+}
+
+/// Resolving the resource comes BEFORE judging a continuation token: a `NextToken` is a
+/// position inside one resource's results, so an ARN that names nothing is
+/// `ResourceNotFoundException` (404) even when the request also carries a token, while the
+/// same token against a stored resource is `InvalidNextTokenException` (400).
+#[tokio::test]
+async fn resolving_the_resource_precedes_judging_a_next_token() {
+    let (engine, router) = harness();
+    let forecast_arn = arn("forecast/token-precedence");
+    let what_if_arn = arn("what-if-forecast/token-precedence/variant");
+    seed_forecast(&engine, electricity_forecast(&forecast_arn));
+    seed_what_if(
+        &engine,
+        electricity_forecast(&what_if_arn).derived_from(&forecast_arn),
+    );
+
+    // Tokens differing in form and size, all inside the modelled 1..3000 bound.
+    let tokens: [&str; 3] = [
+        "x",
+        "bogus-next-token",
+        "eyJhcm4iOiJmb3JlY2FzdCIsIm9mZnNldCI6M30=",
+    ];
+
+    for (operation, arn_member, stored, absent) in [
+        (
+            "QueryForecast",
+            "ForecastArn",
+            forecast_arn.clone(),
+            arn("forecast/never-created"),
+        ),
+        (
+            "QueryWhatIfForecast",
+            "WhatIfForecastArn",
+            what_if_arn.clone(),
+            arn("what-if-forecast/never-created/variant"),
+        ),
+    ] {
+        for token in tokens {
+            // (case, the ARN sent, expected status, expected code)
+            let rows: [(&str, &String, u16, &str); 2] = [
+                (
+                    "an ARN that names nothing, plus a token",
+                    &absent,
+                    404,
+                    "ResourceNotFoundException",
+                ),
+                (
+                    "a stored resource, plus a token",
+                    &stored,
+                    400,
+                    "InvalidNextTokenException",
+                ),
+            ];
+            for (case, sent, expected_status, expected_code) in rows {
+                let case = format!("{operation} / {case} / token {}", token.len());
+                let (status, body) = call(
+                    &router,
+                    operation,
+                    &json!({
+                        arn_member: sent,
+                        "Filters": {"item_id": "client_21"},
+                        "NextToken": token,
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected HTTP {expected_status}, got {status} with {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    expected_code,
+                    "case {case:?}: expected {expected_code}, got {body}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Which requests this service claims
+// ---------------------------------------------------------------------------
+
+/// This service's SigV4 signing name, `forecast`, is SHARED with the Amazon Forecast
+/// CONTROL plane, so the signing name alone cannot tell the two apart: claiming on it
+/// makes both services claim every Forecast-signed request and the router answers
+/// neither. Both are awsJson1_1 posting to `/`, so the discriminator is the service the
+/// request NAMES in `X-Amz-Target`.
+///
+/// With only this service mounted, a request it declines reaches no service at all and
+/// the router answers `404 UnknownService` — which is the evidence wanted here: this
+/// service does not claim the control plane's traffic. The control plane holds the
+/// mirror table in
+/// `services/service-com-amazonaws-forecast-amazonforecast/tests/all/request_claiming.rs`,
+/// and the two together are the whole split: each claims only the targets naming it.
+///
+/// The rows differ along the service the target names and the spelling it uses. The
+/// versioned spelling is a row because the framework's target reader strips a trailing
+/// `_<digits>` API-version suffix, so both spellings name one service.
+#[tokio::test]
+async fn only_requests_naming_this_service_are_claimed() {
+    let (engine, router) = harness();
+    let forecast_arn = arn("forecast/claiming");
+    seed_forecast(&engine, electricity_forecast(&forecast_arn));
+
+    /// One awsJson1_1 `POST /` carrying `target` verbatim: `(status, wire error code)`.
+    async fn dispatch(
+        router: &MultiServiceRouter,
+        target: &str,
+        body: &Value,
+    ) -> (u16, String) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", target)
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIAEXAMPLEEXAMPLE/20150101/us-east-1/forecast/aws4_request, \
+                 SignedHeaders=content-type;host;x-amz-target, Signature=0",
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(body).expect("serialize request body"),
+            ))
+            .expect("build request");
+        let response = router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed: Value = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, error_code(&parsed))
+    }
+
+    let query = json!({"ForecastArn": forecast_arn, "Filters": {"item_id": "client_21"}});
+    // (case, x-amz-target, expected status, expected error code)
+    let rows: [(&str, &str, u16, &str); 5] = [
+        ("its own QueryForecast", "AmazonForecastRuntime.QueryForecast", 200, ""),
+        (
+            "its own QueryForecast, versioned target spelling",
+            "AmazonForecastRuntime_20180626.QueryForecast",
+            200,
+            "",
+        ),
+        (
+            // The control plane's traffic: declined here, so with only this service
+            // mounted the router finds no claimant.
+            "the control plane's ListForecasts",
+            "AmazonForecast.ListForecasts",
+            404,
+            "UnknownService",
+        ),
+        (
+            "the control plane's CreateForecast",
+            "AmazonForecast.CreateForecast",
+            404,
+            "UnknownService",
+        ),
+        (
+            // A third service's target, signed for `forecast`: not this service's either.
+            "another service entirely",
+            "AWSKMS.Encrypt",
+            404,
+            "UnknownService",
+        ),
+    ];
+
+    for (case, target, expected_status, expected_code) in rows {
+        let (status, code) = dispatch(&router, target, &query).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (expected_status, expected_code),
+            "case {case:?} ({target}): expected HTTP {expected_status} {expected_code:?}, \
+             got {status} {code:?}"
+        );
+    }
 }
 
 /// Neither operation is a stub any more: no request answers HTTP 501.

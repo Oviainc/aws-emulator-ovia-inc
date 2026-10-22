@@ -15,7 +15,11 @@
 //! exactly what is stored there. Both maps are ordered, so a page boundary is stable.
 //!
 //! Beside them, [`ComAmazonawsBillingAwsbillingState::credits`] holds the account
-//! credits `GetCredits` reports, keyed and ordered by `creditId`.
+//! credits `GetCredits` reports, keyed and ordered by `creditId`, and
+//! [`ComAmazonawsBillingAwsbillingState::credit_allocations`] the credits
+//! applied to an account's bills, keyed by [`CreditAllocation::key`] so a
+//! reverse walk is the `billingMonth`-descending order
+//! `GetCreditAllocationHistory` documents.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -288,6 +292,72 @@ pub struct CreditAmount {
     pub currency_amount: String,
 }
 
+/// One persisted credit-allocation entry: how much of one credit was applied to
+/// one Amazon Web Services service on one account's bill for one billing month.
+///
+/// The members mirror the modeled `CreditAllocationHistoryEntry`, so
+/// `GetCreditAllocationHistory` reports what was persisted rather than
+/// recomputing anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditAllocation {
+    /// The `CreditId` of the credit that was applied (1..32 digits), as
+    /// [`Credit::credit_id`] holds it.
+    pub credit_id: String,
+    /// The amount of the credit this entry applied.
+    pub credit_amount: CreditAmount,
+    pub description: Option<String>,
+    /// The 12-digit account whose bill the credit was applied to.
+    pub account_id: String,
+    /// The Amazon Web Services service the credit was applied to.
+    pub applied_service_name: String,
+    /// The billing month of the application, in the modeled `BillingMonth`
+    /// `YYYY-MM` form — the first segment of [`CreditAllocation::key`].
+    pub billing_month: String,
+    /// `true` when the entry was applied to a bill that is not yet finalized.
+    pub is_estimated_bill: bool,
+}
+
+impl CreditAllocation {
+    /// The most credit-allocation entries this emulator keeps resident.
+    ///
+    /// `credit_allocations` grows with every credit applied to a bill, so it
+    /// needs a ceiling for the same reason `billing_views` does. An emulator
+    /// resource bound, not a published AWS quota:
+    /// [`ComAmazonawsBillingAwsbillingState::record_credit_allocation`] refuses
+    /// a write past it rather than growing without limit.
+    pub const MAX_RESIDENT: usize = 4096;
+
+    /// The key this allocation is stored under: billing month, then credit id,
+    /// then account, then applied service — the members that together identify
+    /// one application of one credit.
+    ///
+    /// The credit id is left-padded to the modeled `CreditId` maximum of 32
+    /// digits so ids order numerically, and the parts are joined with the ASCII
+    /// unit separator (`0x1F`), which sorts below every character the modeled
+    /// members can carry. Ascending key order is therefore chronological, and a
+    /// reverse walk is the `billingMonth`-descending order
+    /// `GetCreditAllocationHistory` documents.
+    pub fn key(&self) -> String {
+        format!(
+            "{}\u{1f}{:0>32}\u{1f}{}\u{1f}{}",
+            self.billing_month, self.credit_id, self.account_id, self.applied_service_name,
+        )
+    }
+
+    /// The lowest [`CreditAllocation::key`] of the billing month `month`, and
+    /// the lowest key ABOVE every key of that month — the inclusive lower and
+    /// exclusive upper bounds of one month's entries in `credit_allocations`.
+    ///
+    /// A month is a fixed-width `YYYY-MM` prefix followed by the key separator
+    /// (`0x1F`), so the month string itself sorts below every key of that month
+    /// and the same string followed by the next character (a space) sorts above
+    /// them all and below every key of a later month. A reader can therefore
+    /// seek straight to a month range instead of scanning the whole store.
+    pub fn month_key_bounds(month: &str) -> (String, String) {
+        (month.to_string(), format!("{month}\u{20}"))
+    }
+}
+
 /// One persisted account credit — the record `GetCredits` reports.
 ///
 /// Mirrors the modeled `CreditData` shape, with instants kept as
@@ -351,6 +421,14 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// Every persisted billing view, keyed and ordered by ARN. Bounded by
     /// [`MAX_BILLING_VIEWS`].
     pub billing_views: BTreeMap<String, BillingView>,
+    /// Every persisted credit allocation, keyed and ordered by
+    /// [`CreditAllocation::key`] so `GetCreditAllocationHistory`'s page
+    /// boundaries are stable. Bounded by [`CreditAllocation::MAX_RESIDENT`].
+    ///
+    /// Empty on a fresh emulator: an allocation is written when a credit is
+    /// applied to a bill, and this emulator runs no billing pipeline, so only a
+    /// future operation that applies credits adds entries here.
+    pub credit_allocations: BTreeMap<String, CreditAllocation>,
     /// `clientToken` -> the ARN its first `CreateBillingView` minted, so a
     /// replayed create returns that ARN instead of making a second view.
     /// Bounded by [`MAX_IDEMPOTENCY_TOKENS`]: an entry is reclaimed by
@@ -436,6 +514,10 @@ impl Default for ComAmazonawsBillingAwsbillingState {
         );
         Self {
             billing_views,
+            // No credit has been applied to a bill yet, so the account has no
+            // allocation history: AWS documents no credit every account owns
+            // by default, the way it documents the PRIMARY billing view.
+            credit_allocations: BTreeMap::new(),
             idempotency_tokens: HashMap::new(),
             next_view_id: 1,
             billing_preferences: BTreeMap::new(),
@@ -483,6 +565,27 @@ impl ComAmazonawsBillingAwsbillingState {
         let removed = self.billing_views.remove(arn);
         self.idempotency_tokens.retain(|_, stored| stored != arn);
         removed
+    }
+
+    /// Persist one credit allocation under its [`CreditAllocation::key`],
+    /// replacing an entry with the same key (same credit, account, service and
+    /// billing month) rather than duplicating it.
+    ///
+    /// Answers `false` without writing when the store is already at
+    /// [`CreditAllocation::MAX_RESIDENT`], so the caller refuses rather than
+    /// growing the store without a bound. The only writer today is this
+    /// service's test suite: a credit is APPLIED to a bill by a billing run,
+    /// which this emulator does not perform, so a future operation that applies
+    /// credits is what will call this in production.
+    pub fn record_credit_allocation(&mut self, allocation: CreditAllocation) -> bool {
+        let key = allocation.key();
+        if !self.credit_allocations.contains_key(&key)
+            && self.credit_allocations.len() >= CreditAllocation::MAX_RESIDENT
+        {
+            return false;
+        }
+        self.credit_allocations.insert(key, allocation);
+        true
     }
 
     /// Whether `needle` is `start` itself or is reachable from `start` by

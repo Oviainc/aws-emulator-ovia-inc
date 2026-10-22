@@ -41,9 +41,27 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The validation paths bound ONLY by the three tagging operations, whose modelled
+/// client-input error is `ValidationException` rather than the two parameter errors
+/// every other operation in this service declares.
+///
+/// `ResourceArn` is an `@httpLabel` on all three and `TagKeys` an `@httpQuery` on
+/// `UntagResource`; no other operation binds either
+/// (`smithy_query(query="digest")`). The paths are lowerCamel because that is the
+/// casing the validation envelope uses.
+///
+/// `Tags` is deliberately NOT here: `TagResource` binds it, but so do `CreateSink`
+/// and `CreateLink`, where the parameter errors ARE the modelled ones — and a
+/// [`Refusal`] carries no operation id, so a violation on `tags` alone cannot be
+/// attributed to one of them. Such a refusal therefore keeps the parameter wording,
+/// which is right for the two creates and is the one case where a tagging operation
+/// is worded with a code it does not declare. Narrowing it further needs an
+/// operation-aware refusal seam in the framework, which this service cannot add.
+const TAGGING_ONLY_MEMBERS: &[&str] = &["resourceArn", "tagKeys"];
 
 /// The `com-amazonaws-oam-oamservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -96,17 +114,54 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // OAM models its own two client-input errors and uses them where the
+        // framework's default wording would say `ValidationException`: a member the
+        // request left out is `MissingRequiredParameterException` ("A required
+        // parameter is missing from the request") and a value outside a declared
+        // bound, pattern or enum is `InvalidParameterException` ("A parameter is
+        // specified incorrectly"). Both are HTTP 400, which is the status this
+        // refusal already carries, so only the code and the message change.
+        //
+        // The three tagging operations are the exception: `ListTagsForResource`,
+        // `TagResource` and `UntagResource` model `ValidationException` and neither
+        // of the two codes above, and they are the only operations that bind
+        // `ResourceArn` and `TagKeys` — so a violation on one of those members keeps
+        // the `ValidationException` the default already names.
+        let violations = match refusal {
+            Refusal::Invalid(violations) => violations,
+            // An authentication refusal is the framework's 403 to word, not ours.
+            _ => return None,
+        };
+        if violations.is_empty() {
+            return None;
+        }
+        if violations.iter().any(|violation| {
+            // `Violation::path` is DOTTED (`tagKeys.1.member` for a list element),
+            // so the member is the path's first segment, not the whole path.
+            let member = violation.path.split('.').next().unwrap_or_default();
+            TAGGING_ONLY_MEMBERS.contains(&member)
+        }) {
+            return None;
+        }
+        // One absent member makes the whole request a missing-parameter refusal; the
+        // caller has to supply it before any other complaint matters.
+        let code = if violations
+            .iter()
+            .any(|violation| violation.kind == ViolationKind::MissingRequiredMember)
+        {
+            "MissingRequiredParameterException"
+        } else {
+            "InvalidParameterException"
+        };
+        let message = violations
+            .iter()
+            .map(Violation::message)
+            .collect::<Vec<String>>()
+            .join("; ");
+        Some(Refused {
+            code: code.to_string(),
+            message,
+        })
     }
 
     fn override_routing_error(

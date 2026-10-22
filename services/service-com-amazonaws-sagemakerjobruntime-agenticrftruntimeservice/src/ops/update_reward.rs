@@ -123,6 +123,20 @@ fn conflict(message: String) -> UpdateRewardError {
     UpdateRewardErrorModeled::ConflictException(ConflictException { message }).into()
 }
 
+/// This operation's own modelled 400 `ValidationException`.
+fn validation(message: String) -> UpdateRewardError {
+    UpdateRewardErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
+/// How this service refuses an empty `Rewards` list.
+///
+/// `Rewards` is `@required` targeting `DoubleList`, which declares no `@length`
+/// minimum, so an empty list satisfies every modelled constraint and reaches the
+/// handler; the service refuses it anyway, because a reward submission with no score in
+/// it carries nothing to record. The sentence is the one the service answers, observed
+/// in the recorded `UpdateReward` call that sent `Rewards: []`.
+const EMPTY_REWARDS_MESSAGE: &str = "Rewards list cannot be empty";
+
 /// Whether two reward lists are the same submission.
 ///
 /// Compared on the bit pattern of each score so the comparison is total: two
@@ -177,15 +191,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // Request validation comes before the trajectory is looked up, so a call that
+        // carries no reward at all is refused as invalid whether or not the trajectory
+        // it names exists.
+        if input.rewards.is_empty() {
+            return Err(validation(EMPTY_REWARDS_MESSAGE.to_string()));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let Some(trajectory) = guard.trajectory_mut(&input.job_arn, &input.trajectory_id) else {
             return Err(UpdateRewardErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Trajectory {} was not found for job {}.",
-                        input.trajectory_id, input.job_arn
-                    ),
+                    message: crate::state::trajectory_not_found_message(&input.trajectory_id),
                 },
             )
             .into());

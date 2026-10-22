@@ -13,11 +13,19 @@
 // points it into `tests/all/`.
 #[path = "all/db_engine_versions.rs"]
 mod db_engine_versions;
+#[path = "all/db_instance_deletion.rs"]
+mod db_instance_deletion;
+#[path = "all/db_instance_envelope.rs"]
+mod db_instance_envelope;
 #[path = "all/db_instances.rs"]
 mod db_instances;
+#[path = "all/option_group_options.rs"]
+mod option_group_options;
 #[path = "all/option_groups.rs"]
 mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]
 mod orderable_db_instance_options;
+#[path = "all/query_catalog_reads.rs"]
+mod query_catalog_reads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

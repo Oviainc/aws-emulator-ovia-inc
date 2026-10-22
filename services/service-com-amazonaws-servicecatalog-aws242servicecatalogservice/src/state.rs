@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    PortfolioDetail, ProductViewDetail, ProductViewSummary, ProvisioningArtifactDetail,
+    ConstraintDetail, PortfolioDetail, ProductViewDetail, ProductViewSummary,
+    ProvisioningArtifact as ModelledProvisioningArtifact, ProvisioningArtifactDetail,
     ProvisioningArtifactSummary, ServiceActionDetail, ServiceActionSummary, SourceConnectionDetail,
     Tag, TagOptionDetail,
 };
@@ -31,6 +32,24 @@ pub struct Portfolio {
     pub created_time: SystemTime,
     /// Tag key -> tag value.
     pub tags: BTreeMap<String, String>,
+    /// The principals associated with this portfolio, keyed by principal ARN: the
+    /// API addresses an association BY that ARN, so re-associating one ARN changes
+    /// its type rather than listing it twice. The stored value carries the order the
+    /// associations were made in, which is the order
+    /// `ListPrincipalsForPortfolio` reports and pages over.
+    pub principals: BTreeMap<String, PrincipalAssociation>,
+}
+
+/// One portfolio-principal association: what was associated, and when in the
+/// portfolio's life.
+#[derive(Debug, Clone)]
+pub struct PrincipalAssociation {
+    /// `PrincipalType` (`IAM` | `IAM_PATTERN`), as the request declared it.
+    pub principal_type: String,
+    /// The position of this association in the order they were made, so a list
+    /// reports them in that order however the ARNs sort. Re-associating an ARN keeps
+    /// its original position: it is the same association with a new type.
+    pub sequence: u64,
 }
 
 impl Portfolio {
@@ -50,6 +69,98 @@ impl Portfolio {
     /// The stored tags as the modelled `Tags` list, in key order.
     pub fn tag_list(&self) -> Vec<Tag> {
         tag_list(&self.tags)
+    }
+
+    /// The stored associations in the order they were made — the one order every
+    /// response that reports them walks.
+    ///
+    /// Neither the model nor AWS's documentation fixes an order for
+    /// `ListPrincipalsForPortfolio`, so this service picks one and reports it
+    /// consistently: the order the associations were made in, which is also the
+    /// order its page cursor walks.
+    pub fn principals_in_association_order(&self) -> Vec<(&String, &PrincipalAssociation)> {
+        let mut associations: Vec<(&String, &PrincipalAssociation)> =
+            self.principals.iter().collect();
+        associations.sort_by_key(|(_, association)| association.sequence);
+        associations
+    }
+}
+
+/// A tag map as the modelled `Tags` list, in key order: every operation that
+/// reports a resource's tags renders them through this one function, so they read
+/// the same everywhere.
+pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// A persisted constraint — the record `CreateConstraint` mints and
+/// `DescribeConstraint` reports.
+#[derive(Debug, Clone)]
+pub struct Constraint {
+    /// The minted constraint id (`cons-…`).
+    pub id: String,
+    /// `ConstraintType` (`LAUNCH`, `NOTIFICATION`, `STACKSET`, `TEMPLATE`, …), as
+    /// the request declared it: the model constrains it only by length, so the
+    /// stored value is the requested one.
+    pub constraint_type: String,
+    pub description: Option<String>,
+    /// The constraint's `Parameters` document, stored verbatim so a describe
+    /// reports the parameters the create was given.
+    pub parameters: String,
+    pub portfolio_id: String,
+    pub product_id: String,
+    /// The instant this constraint stops being `CREATING` and becomes `AVAILABLE`.
+    /// `CreateConstraint` answers in the non-terminal `CREATING` status, so the
+    /// transition to the terminal one is owed by the CLOCK: it is stored as the
+    /// instant it falls due and never slept for, and every report derives the
+    /// status from it rather than from who asked.
+    pub available_at: SystemTime,
+}
+
+/// How long after its create a constraint stays `CREATING`.
+///
+/// A span this emulator CHOOSES (AWS documents none): long enough that a caller
+/// acting straight after the create still sees the transient status and the state
+/// it implies, short enough that nothing waits on it.
+pub const CONSTRAINT_AVAILABLE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `Status`'s terminal value for a constraint that is ready for use
+/// (`smithy_query query="shape" shape="Status"`: `AVAILABLE` | `CREATING` |
+/// `FAILED`).
+pub const STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// `Status`'s non-terminal value, which the model documents as "creation has
+/// started; the [resource] is not ready for use".
+pub const STATUS_CREATING: &str = "CREATING";
+
+impl Constraint {
+    /// This constraint's `Status` at `now`: the non-terminal one until the clock
+    /// owes the transition, the terminal one afterwards.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.available_at {
+            STATUS_CREATING
+        } else {
+            STATUS_AVAILABLE
+        }
+    }
+
+    /// This record as the modelled `ConstraintDetail`.
+    pub fn detail(&self) -> ConstraintDetail {
+        ConstraintDetail {
+            constraint_id: Some(self.id.clone()),
+            r#type: Some(self.constraint_type.clone()),
+            description: self.description.clone(),
+            // `ConstraintDetail$Owner` targets `AccountId`, so it is the account that
+            // created the constraint — this emulator's canonical account.
+            owner: Some(::emulator_server::emulator_account_id().to_string()),
+            product_id: Some(self.product_id.clone()),
+            portfolio_id: Some(self.portfolio_id.clone()),
+        }
     }
 }
 
@@ -90,6 +201,10 @@ pub struct Product {
     /// This product's provisioning artifacts, keyed by artifact id. A `BTreeMap` so
     /// every list of them has a stable, deterministic order.
     pub provisioning_artifacts: BTreeMap<String, ProvisioningArtifact>,
+    /// The portfolios this product is associated with, by portfolio id. A product may
+    /// live in several, and `AssociateProductWithPortfolio` addresses one association
+    /// by the PAIR, so the set holds each portfolio once.
+    pub portfolio_ids: std::collections::BTreeSet<String>,
 }
 
 /// The `Status` a product carries from the moment it is created.
@@ -114,11 +229,13 @@ impl Product {
             short_description: self.short_description.clone(),
             r#type: Some(self.product_type.clone()),
             distributor: self.distributor.clone(),
-            // `HasDefaultPath` is true only for a product reachable through more than
-            // one portfolio launch path; nothing associates a product with a portfolio
-            // yet (`AssociateProductWithPortfolio` is still scaffolded), so no stored
-            // product has one.
-            has_default_path: false,
+            // "If the product does not have a default path, call ListLaunchPaths to
+            // disambiguate between paths" — a product reachable through exactly one
+            // portfolio needs no disambiguation, so that one path is its default;
+            // zero or several portfolios leave it without one. Derived from the same
+            // stored set `DescribeProduct` reports as `LaunchPaths`, so one response
+            // cannot contradict itself.
+            has_default_path: self.portfolio_ids.len() == 1,
             support_email: self.support_email.clone(),
             support_description: self.support_description.clone(),
             support_url: self.support_url.clone(),
@@ -204,6 +321,18 @@ impl ProvisioningArtifact {
             ),
         }
     }
+
+    /// This record as the modelled `ProvisioningArtifact`, the shorter shape
+    /// `DescribeProduct` lists a product's versions as.
+    pub fn listed(&self) -> ModelledProvisioningArtifact {
+        ModelledProvisioningArtifact {
+            id: Some(self.id.clone()),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            guidance: Some(self.guidance.clone()),
+        }
+    }
 }
 
 /// A persisted self-service action.
@@ -221,15 +350,21 @@ pub struct ServiceAction {
 }
 
 impl ServiceAction {
+    /// This record as the modelled `ServiceActionSummary`, which `ListServiceActions`
+    /// reports instead of the fuller detail.
+    pub fn summary(&self) -> ServiceActionSummary {
+        ServiceActionSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            definition_type: Some(self.definition_type.clone()),
+        }
+    }
+
     /// This record as the modelled `ServiceActionDetail`.
     pub fn detail(&self) -> ServiceActionDetail {
         ServiceActionDetail {
-            service_action_summary: Some(ServiceActionSummary {
-                id: Some(self.id.clone()),
-                name: Some(self.name.clone()),
-                description: self.description.clone(),
-                definition_type: Some(self.definition_type.clone()),
-            }),
+            service_action_summary: Some(self.summary()),
             definition: Some(
                 self.definition
                     .iter()
@@ -267,16 +402,6 @@ impl TagOption {
     }
 }
 
-/// A stored tag map as the modelled `Tags` list, in key order.
-fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
-    tags.iter()
-        .map(|(key, value)| Tag {
-            key: key.clone(),
-            value: value.clone(),
-        })
-        .collect()
-}
-
 /// The most tags one portfolio can carry.
 ///
 /// From the model: every operation that returns a portfolio's `Tags` targets the
@@ -284,6 +409,14 @@ fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
 /// (`smithy_query query="operation" operation="UpdatePortfolio"`), so a stored
 /// portfolio can never hold more than 50 tags.
 pub const MAX_PORTFOLIO_TAGS: usize = 50;
+
+/// The most tags one product can carry.
+///
+/// From the model, the same way: every operation that returns a product's `Tags`
+/// targets the `Tags` list constrained `0..50`
+/// (`smithy_query query="operation" operation="UpdateProduct"`), so a stored product
+/// can never hold more than 50 tags either.
+pub const MAX_PRODUCT_TAGS: usize = 50;
 
 /// The most portfolios one account can hold, which also bounds this store.
 ///
@@ -293,6 +426,19 @@ pub const MAX_PORTFOLIO_TAGS: usize = 50;
 /// that refusal. Because the live set is capped, so is every response built from
 /// it: `ListPortfolios` cannot return more than this many records on a page.
 pub const MAX_PORTFOLIOS: usize = 100;
+
+/// The most principals one portfolio can carry, bounding that map the same way and
+/// answered with the `LimitExceededException` that
+/// `AssociatePrincipalWithPortfolio` models. The emulator's own bound, finite and
+/// small, checked before every association is stored.
+pub const MAX_PRINCIPALS_PER_PORTFOLIO: usize = 100;
+
+/// The most constraints this account can hold, which also bounds this store.
+///
+/// `CreateConstraint` models `LimitExceededException` for a create past the account's
+/// quota. As with [`MAX_PRODUCTS`] this is the emulator's own bound, not a quoted AWS
+/// figure, and it is checked before every insert.
+pub const MAX_CONSTRAINTS: usize = 500;
 
 /// The most products this account can hold, which also bounds this store.
 ///
@@ -325,6 +471,10 @@ pub struct ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     /// Every created, not-yet-deleted portfolio, keyed by portfolio id. A
     /// `BTreeMap` so `ListPortfolios` and its page tokens walk one stable order.
     pub portfolios: BTreeMap<String, Portfolio>,
+    /// Every created, not-yet-deleted constraint, keyed by constraint id. A
+    /// `BTreeMap` so `ListConstraintsForPortfolio` and its page tokens walk one
+    /// stable order.
+    pub constraints: BTreeMap<String, Constraint>,
     /// Every created, not-yet-deleted product, keyed by product id. A `BTreeMap` so
     /// every walk over the set has one stable order.
     pub products: BTreeMap<String, Product>,
@@ -335,7 +485,7 @@ pub struct ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     /// `CreatePortfolio` idempotency: `IdempotencyToken` -> portfolio id, so a
     /// repeated create replays the first one instead of minting a second portfolio.
     ///
-    /// PRIVATE, like the other two token maps: every write goes through
+    /// PRIVATE, like the other token maps: every write goes through
     /// [`Self::remember_portfolio_token`], which prunes entries whose portfolio is gone,
     /// so the map holds at most one entry per live portfolio and a caller cycling fresh
     /// tokens cannot grow it past [`MAX_PORTFOLIOS`]. A handler reads it through
@@ -349,6 +499,9 @@ pub struct ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     /// `CreateServiceAction` idempotency: `IdempotencyToken` -> service-action id.
     /// Private and pruned on every write, so it is bounded by [`MAX_SERVICE_ACTIONS`].
     service_action_idempotency: HashMap<String, String>,
+    /// `CreateConstraint` idempotency: `IdempotencyToken` -> constraint id. Private and
+    /// pruned on every write, so it is bounded by [`MAX_CONSTRAINTS`].
+    constraint_idempotency: HashMap<String, String>,
     /// Counter behind every `next_*_id`. Deterministic, so a fresh
     /// emulator mints the same id sequence every run.
     pub next_id_seed: u64,
@@ -419,6 +572,26 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             .retain(|_, id| id != action_id);
     }
 
+    /// The constraint a create carrying `token` already made, if it is still stored.
+    pub fn replayed_constraint(&self, token: &str) -> Option<&Constraint> {
+        self.constraints.get(self.constraint_idempotency.get(token)?)
+    }
+
+    /// Remember a `CreateConstraint` idempotency token, bounded the same way.
+    pub fn remember_constraint_token(&mut self, token: String, constraint_id: String) {
+        let constraints = &self.constraints;
+        self.constraint_idempotency
+            .retain(|_, id| constraints.contains_key(id));
+        self.constraint_idempotency.insert(token, constraint_id);
+    }
+
+    /// Drop every idempotency token pointing at `constraint_id`, which a delete has just
+    /// removed.
+    pub fn forget_constraint_tokens(&mut self, constraint_id: &str) {
+        self.constraint_idempotency
+            .retain(|_, id| id != constraint_id);
+    }
+
     /// Mint an unused portfolio id of AWS's form: `port-` followed by 12
     /// lowercase base-36 characters, which satisfies the modelled `Id` pattern
     /// `^[a-zA-Z0-9_\-]*$` and its 1..100 length.
@@ -426,6 +599,16 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
         loop {
             let id = self.mint_id("port");
             if !self.portfolios.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an unused constraint id (`cons-…`), the same shape as a portfolio id.
+    pub fn next_constraint_id(&mut self) -> String {
+        loop {
+            let id = self.mint_id("cons");
+            if !self.constraints.contains_key(&id) {
                 return id;
             }
         }
@@ -517,6 +700,28 @@ fn base36_12(value: u64) -> String {
         n /= 36;
     }
     out.iter().map(|digit| char::from(*digit)).collect()
+}
+
+/// Encode the stored key a page resumes AT as an opaque page token: hex, so a
+/// client cannot read a token as a resource id and the value stays inside the
+/// modelled `PageToken` pattern and its 0..2024 length.
+///
+/// The one cursor codec every paged list over an id-keyed map in this service
+/// shares, so a token one of them mints is the same shape as the next one's.
+pub fn encode_page_cursor(key: &str) -> String {
+    hex::encode(key)
+}
+
+/// The inverse of [`encode_page_cursor`]. `None` for anything this service did not
+/// mint: not hex, not UTF-8, or not a value the modelled `Id` pattern
+/// `^[a-zA-Z0-9_\-]*$` allows.
+pub fn decode_page_cursor(token: &str) -> Option<String> {
+    let key = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let well_formed = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    well_formed.then_some(key)
 }
 
 /// The failure a handler answers when this service's state cannot be reached —

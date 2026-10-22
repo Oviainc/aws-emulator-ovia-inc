@@ -5,6 +5,19 @@
 //! account never created, or one `DeleteDetector` removed, is refused with
 //! `BadRequestException` rather than answered with a hollow 200.
 //!
+//! The whole response is a projection of [`crate::state::Detector`]: `DataSources`
+//! is the deprecated view of the detector's feature switches — each node carrying
+//! the governing feature's status AND the instant it last changed — `Features`
+//! reports every `DetectorFeatureResult` member in the service's canonical order,
+//! and `Tags` is always a map, empty for a detector nothing tagged.
+//!
+//! Two members the live service answers with are absent from the public model, so
+//! this service's `smithy-model/` copy declares them (the response is serialized
+//! from the schema, so a member the model does not carry cannot be emitted at all):
+//! an `updatedAt` on every data-source node, and
+//! `dataSources.database.rds.databaseEvents`, the data-source view of RDS
+//! Protection. Everything else below is the model as shipped.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -179,19 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service_role: detector.service_role.clone(),
             status: detector.status.clone(),
             data_sources: Some(data_sources_result(detector)),
-            // `TagMap` is `len 1..200`, so an untagged detector must omit the
-            // member rather than carry an empty map.
-            tags: if detector.tags.is_empty() {
-                None
-            } else {
-                Some(
-                    detector
-                        .tags
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )
-            },
+            // A detector always reports a tag map, EMPTY when nothing tagged it:
+            // `Tags` is a `TagMap`, so a client iterates it without a null guard.
+            tags: Some(
+                detector
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
             features: Some(
                 detector
                     .features
@@ -233,40 +242,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The deprecated `DataSources` view of the detector's configuration.
 ///
 /// `DataSources` is "deprecated, use Features instead"
-/// (`smithy_query(operation="GetDetector")`), so every status here is read back off
-/// the feature that governs it. CloudTrail management events, VPC flow logs and DNS
-/// logs are the foundational sources GuardDuty always consumes for an enabled
-/// detector, so they follow the detector's own status.
+/// (`smithy_query(operation="GetDetector")`), so every node here is read back off
+/// the feature that governs it: the same stored switch, projected under its other
+/// name. Each node carries that switch's status AND the instant it last changed,
+/// which is the feature record's own `UpdatedAt`.
 fn data_sources_result(detector: &crate::state::Detector) -> DataSourceConfigurationsResult {
-    let foundational = detector.foundational_status();
+    let cloud_trail = reported(detector, crate::state::FEATURE_CLOUD_TRAIL);
+    let dns_logs = reported(detector, crate::state::FEATURE_DNS_LOGS);
+    let flow_logs = reported(detector, crate::state::FEATURE_FLOW_LOGS);
+    let s3_logs = reported(detector, crate::state::FEATURE_S3_DATA_EVENTS);
+    let audit_logs = reported(detector, crate::state::FEATURE_EKS_AUDIT_LOGS);
+    let ebs_volumes = reported(detector, crate::state::FEATURE_EBS_MALWARE_PROTECTION);
+    let database_events = reported(detector, crate::state::FEATURE_RDS_LOGIN_EVENTS);
     DataSourceConfigurationsResult {
         cloud_trail: CloudTrailConfigurationResult {
-            status: foundational.clone(),
+            status: cloud_trail.status,
+            updated_at: Some(cloud_trail.updated_at),
         },
         dns_logs: DNSLogsConfigurationResult {
-            status: foundational.clone(),
+            status: dns_logs.status,
+            updated_at: Some(dns_logs.updated_at),
         },
         flow_logs: FlowLogsConfigurationResult {
-            status: foundational,
+            status: flow_logs.status,
+            updated_at: Some(flow_logs.updated_at),
         },
         s3_logs: S3LogsConfigurationResult {
-            status: detector.data_source_status(crate::state::FEATURE_S3_DATA_EVENTS),
+            status: s3_logs.status,
+            updated_at: Some(s3_logs.updated_at),
         },
         kubernetes: Some(KubernetesConfigurationResult {
             audit_logs: KubernetesAuditLogsConfigurationResult {
-                status: detector.data_source_status(crate::state::FEATURE_EKS_AUDIT_LOGS),
+                status: audit_logs.status,
+                updated_at: Some(audit_logs.updated_at),
             },
         }),
         malware_protection: Some(MalwareProtectionConfigurationResult {
             scan_ec2_instance_with_findings: Some(ScanEc2InstanceWithFindingsResult {
                 ebs_volumes: Some(EbsVolumesResult {
-                    status: Some(
-                        detector.data_source_status(crate::state::FEATURE_EBS_MALWARE_PROTECTION),
-                    ),
+                    status: Some(ebs_volumes.status),
+                    // Nothing stopped the source from being enabled, so there is no
+                    // reason to report.
                     reason: None,
+                    updated_at: Some(ebs_volumes.updated_at),
                 }),
             }),
-            service_role: Some(detector.service_role.clone()),
+            service_role: Some(detector.malware_protection_service_role.clone()),
         }),
+        // RDS login activity, the `Database` view of the RDS_LOGIN_EVENTS feature.
+        database: Some(DatabaseConfigurationResult {
+            rds: Some(RdsConfigurationResult {
+                database_events: Some(DatabaseEventsConfigurationResult {
+                    status: Some(database_events.status),
+                    updated_at: Some(database_events.updated_at),
+                }),
+            }),
+        }),
+    }
+}
+
+/// What one data-source node reports.
+struct Reported {
+    /// `DataSourceStatus`: the governing feature's own status.
+    status: String,
+    /// When that status last changed, rendered the way this service renders every
+    /// other timestamp it models as a string — `CreatedAt` and `UpdatedAt` on the
+    /// detector itself — so one response orders its instants consistently as text.
+    updated_at: String,
+}
+
+/// Read one data-source node off the feature that governs it.
+fn reported(detector: &crate::state::Detector, feature: &str) -> Reported {
+    let (status, updated_at_millis) = detector.data_source(feature);
+    Reported {
+        status,
+        updated_at: crate::state::iso8601(updated_at_millis),
     }
 }

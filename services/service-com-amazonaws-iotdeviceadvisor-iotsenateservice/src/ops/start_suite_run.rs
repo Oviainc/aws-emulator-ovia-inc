@@ -172,9 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(definition) = store.definitions.get(&input.suite_definition_id) else {
             return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "No suite definition with suiteDefinitionId {}",
-                    input.suite_definition_id
+                message: Some(crate::state::not_found_message(
+                    "suiteDefinitionId",
+                    &input.suite_definition_id,
                 )),
             })
             .into());
@@ -185,9 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| definition.latest_version.clone());
         if !definition.versions.contains_key(&version) {
             return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "Suite definition {} has no version {version}",
-                    input.suite_definition_id
+                message: Some(crate::state::not_found_message(
+                    "suiteDefinitionVersion",
+                    &version,
                 )),
             })
             .into());

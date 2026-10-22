@@ -195,10 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.tick(now);
 
         let Some(session) = state.game_sessions.get(&input.game_session_id) else {
+            // This operation's `NotFoundException` message is BUILT FROM THE REQUEST: the
+            // game session identifier the caller supplied, verbatim, in the template AWS
+            // answers a CreatePlayerSession on an absent session with —
+            // `GameSession <GameSessionId> does not exist`.
             return Err(CreatePlayerSessionErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(format!(
-                        "The game session {} was not found.",
+                        "GameSession {} does not exist",
                         input.game_session_id
                     )),
                 },

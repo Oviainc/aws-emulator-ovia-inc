@@ -21,10 +21,10 @@ use service_com_amazonaws_timestreaminfluxdb_amazontimestreaminfluxdb as influxd
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the tests sign with by default; the ARNs must be scoped to it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account segment every emulated ARN carries.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Members that `CreateDbInstanceInput` and `CreateDbInstanceOutput` BOTH model, from
 /// `smithy_query(query="operation", operation="CreateDbInstance")`. A value the request
@@ -77,7 +77,7 @@ const ALWAYS_REPORTED_SUMMARY_MEMBERS: &[&str] = &[
 ];
 
 /// A router mounting only this service over a fresh shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These tests exercise handler behaviour, not SigV4: the `Authorization` header
@@ -88,7 +88,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// One `awsJson1_0` call, signed into `region`'s credential scope.
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -126,12 +126,12 @@ async fn call_in(
 }
 
 /// One `awsJson1_0` call in [`REGION`].
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     call_in(router, REGION, operation, body).await
 }
 
 /// Unwrap a 200 answer, reporting the case and the actual answer on failure.
-fn ok(case: &str, answer: (u16, Value)) -> Value {
+pub(crate) fn ok(case: &str, answer: (u16, Value)) -> Value {
     let (status, body) = answer;
     assert_eq!(
         status, 200,

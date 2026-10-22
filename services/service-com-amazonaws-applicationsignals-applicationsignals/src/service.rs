@@ -20,9 +20,11 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — which operation serves a request. EDITED HERE: the key
+//!   and the handler stay the generated table's, but an operation that binds a
+//!   timestamp to the query string is served through [`EpochSecondsQueryTimestamps`],
+//!   which reads such a value in the epoch-seconds form the member documents as well
+//!   as in the RFC-3339 date-time form the protocol defaults to.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -39,10 +41,33 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # Timestamps in the query string
+//!
+//! Every time-ranged read of this service binds its `StartTime`/`EndTime` to the query
+//! string (`@httpQuery`, `@required`) and documents the value's wire form on the member
+//! itself: "When used in a raw HTTP Query API, it is formatted as epoch time in seconds.
+//! For example, 1698778057" (`smithy_query(query="doc", shape="GetServiceInput",
+//! member="StartTime")`). The model carries no `@timestampFormat`, so the protocol's
+//! default for an `@httpQuery` timestamp — RFC-3339 `date-time` — is the only form the
+//! framework's query-value deserializer reads, and a client sending the documented
+//! epoch-seconds number is refused before the operation's handler runs.
+//!
+//! [`EpochSecondsQueryTimestamps`] closes that gap for every operation of this service
+//! that binds a timestamp to the query string: a query value that is a number is read as
+//! epoch seconds, anything else is left exactly as the client sent it, so BOTH documented
+//! forms bind and nothing else about the request changes.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::{Schema, ShapeType};
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
+// What the query-timestamp wrapper below needs, on its own `use` so this set and the
+// service's own above are edited on separate lines.
+use smithy_server_runtime::{BoxFuture, Operation, OperationContext, OperationRoutingTable};
 use std::sync::Arc;
 
 /// The error code this service answers an input-constraint violation with: the modelled
@@ -113,6 +138,27 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The operations that bind a timestamp to the query string, each the generated
+    /// table's own operation wrapped in [`EpochSecondsQueryTimestamps`] and built from the
+    /// SAME shared engine, so a wrapped operation reads and writes the one store. Keyed by
+    /// the routing key the protocol resolves, which is the key the generated table uses.
+    epoch_seconds_query_timestamps: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`EpochSecondsQueryTimestamps`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(EpochSecondsQueryTimestamps::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -120,10 +166,182 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // Exactly the operations whose input binds a timestamp to the query string —
+        // `StartTime` and `EndTime` on each (`smithy_query(query="operation", …)`:
+        // `{"target": "Timestamp", "httpQuery": "StartTime", "required": true}`). Every
+        // other operation of this service takes its timestamps in the body, where the
+        // protocol already reads the epoch-seconds form, so wrapping them would change
+        // nothing.
+        let mut epoch_seconds_query_timestamps = OperationRoutingTable::new();
+        wrap_operations!(
+            epoch_seconds_query_timestamps,
+            engine,
+            get_service::GetService,
+            list_audit_findings::ListAuditFindings,
+            list_service_dependencies::ListServiceDependencies,
+            list_service_dependents::ListServiceDependents,
+            list_service_operations::ListServiceOperations,
+            list_services::ListServices,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            epoch_seconds_query_timestamps,
         }
     }
+}
+
+/// One modelled operation, served with each of its `@httpQuery`-bound timestamps read in
+/// either form this service accepts for it.
+///
+/// A query value the member's own documentation calls "epoch time in seconds" is rewritten
+/// into the RFC-3339 `date-time` rendering of the SAME instant before the framework's walk
+/// reads the request, so the walk binds it with the protocol's default format and
+/// everything downstream — constraint validation, the handler, the response — sees the
+/// instant the client sent. A value that is not a number is left untouched, so a client
+/// sending the `date-time` form still binds, and a value that is neither is refused by the
+/// framework's own deserializer exactly as before.
+///
+/// Nothing else is re-implemented: the request is handed to the generated
+/// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize,
+/// telemetry and every modelled error.
+struct EpochSecondsQueryTimestamps<O> {
+    operation: O,
+    /// The `@httpQuery` names of this operation's `date-time` timestamp members, read off
+    /// its input schema ONCE at construction: the schema is a `&'static Schema` baked at
+    /// codegen, so the answer is fixed per operation and nothing about it is per-request.
+    query_names: Vec<&'static str>,
+}
+
+impl<O: Operation> EpochSecondsQueryTimestamps<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self {
+            operation,
+            query_names: date_time_query_members(O::INPUT_SCHEMA),
+        }
+    }
+}
+
+impl<O> ErasedOperation for EpochSecondsQueryTimestamps<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            match as_date_time_query(req, &self.query_names) {
+                // The rewritten request lives for the call it is read by, which is all the
+                // framework's walk borrows it for; `ctx` still carries the request parts
+                // the client sent, so a handler reading the URI sees the original.
+                Some(rewritten) => self.operation.run(svc, &rewritten, ctx).await,
+                None => self.operation.run(svc, req, ctx).await,
+            }
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// `req` with every epoch-seconds query value bound to one of the `names` rewritten into
+/// its RFC-3339 rendering, or `None` when the request carries no such value and so needs no
+/// rewriting at all.
+fn as_date_time_query(req: &RtRequest, names: &[&str]) -> Option<RtRequest> {
+    if names.is_empty() {
+        return None;
+    }
+    let (path, query) = req.uri().split_once('?')?;
+
+    let mut rewritten = String::with_capacity(query.len());
+    let mut changed = false;
+    for (index, pair) in query.split('&').enumerate() {
+        if index > 0 {
+            rewritten.push('&');
+        }
+        // A modelled `@httpQuery` name is a shape-name-like literal (`StartTime`), so it
+        // needs no percent-decoding to be recognised; a value that does carry
+        // percent-escapes is not a bare number and so is left alone below.
+        let rendered = pair
+            .split_once('=')
+            .filter(|(name, _)| names.iter().any(|bound| bound == name))
+            .and_then(|(name, value)| Some((name, as_date_time(value)?)));
+        match rendered {
+            Some((name, value)) => {
+                changed = true;
+                rewritten.push_str(name);
+                rewritten.push('=');
+                rewritten.push_str(&value);
+            }
+            None => rewritten.push_str(pair),
+        }
+    }
+    if !changed {
+        return None;
+    }
+
+    let mut normalized = req.try_clone()?;
+    normalized.set_uri(format!("{path}?{rewritten}")).ok()?;
+    Some(normalized)
+}
+
+/// The `@httpQuery` names of `schema`'s timestamp members that are read in the protocol's
+/// default `date-time` format — the members an epoch-seconds value has to be rewritten for.
+/// A member that declares its own `@timestampFormat` is read in THAT format and is left to
+/// the framework.
+fn date_time_query_members(schema: &'static Schema) -> Vec<&'static str> {
+    schema
+        .members()
+        .iter()
+        .filter(|member| matches!(member.shape_type(), ShapeType::Timestamp))
+        .filter(|member| member.timestamp_format().is_none())
+        .filter_map(|member| member.http_query().map(|query| query.value()))
+        .collect()
+}
+
+/// The RFC-3339 `date-time` rendering, percent-encoded for a query string, of a query value
+/// that is an epoch-seconds number. `None` for anything else — a value already in
+/// `date-time` form, an empty value, a number in a form the member does not document, or
+/// one that names no instant this service can render — each of which is left for the
+/// framework's own deserializer to read or refuse.
+///
+/// The recognised form is exactly the one the member documents: an optionally negative
+/// decimal number, with at most one fractional part (`1698778057`, `1698778057.5`,
+/// `-86400`). Nothing wider is read as an instant, so a value in an encoding neither the
+/// member doc nor the protocol describes (`1e9`, `+1`, `inf`) is refused rather than
+/// quietly accepted as a new wire form.
+fn as_date_time(value: &str) -> Option<String> {
+    if !is_decimal_number(value) {
+        return None;
+    }
+    let seconds: f64 = value.parse().ok()?;
+    if !seconds.is_finite() {
+        return None;
+    }
+    let rendered = DateTime::from_secs_f64(seconds).fmt(Format::DateTime).ok()?;
+    // `:` is the only character the rendering carries that a query string reserves.
+    Some(rendered.replace(':', "%3A"))
+}
+
+/// Whether `value` is a plain decimal number: an optional `-`, at least one digit, and at
+/// most one `.` followed by at least one digit.
+fn is_decimal_number(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (digits, None),
+    };
+    !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -148,12 +366,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in
+        // `EpochSecondsQueryTimestamps` for the operations that bind a timestamp to the
+        // query string, so the epoch-seconds form their members document binds as well as
+        // the protocol's default `date-time`. Every other key resolves to `None` here
+        // exactly as it does for an unedited service, leaving the generated table to serve
+        // it.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.epoch_seconds_query_timestamps.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

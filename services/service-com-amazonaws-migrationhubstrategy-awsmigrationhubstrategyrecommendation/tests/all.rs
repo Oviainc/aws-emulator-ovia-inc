@@ -14,5 +14,8 @@
 #[path = "all/import_and_assess.rs"]
 mod import_and_assess;
 
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -41,7 +41,8 @@ const KNOWN_TABLE: &str = "COST_AND_USAGE_REPORT";
 /// token without making progress fails the test instead of looping forever.
 const MAX_PAGES: usize = 64;
 
-/// A reported table property's `DefaultValue`, which every property carries.
+/// A reported table property's `DefaultValue`, which a property that publishes one
+/// carries.
 fn default_value_of(property: &Value) -> Option<&str> {
     property.get("DefaultValue").and_then(Value::as_str)
 }
@@ -207,12 +208,14 @@ async fn every_listed_table_satisfies_the_modelled_table_contract() {
         );
 
         // TableProperties is a list of descriptions; a table need not have any, but a
-        // description that IS reported names a property, the values it accepts, and a
-        // default among them ("Each table property has a default value that it assumes if
-        // not specified" — smithy_query shape `GetTableRequest`, member
-        // `TableProperties`). A FREE-FORM property — one whose value the caller writes
-        // rather than picks, such as a billing view ARN — publishes no valid values, so
-        // only its default is constrained.
+        // description that IS reported names a property, the values it accepts, and —
+        // where the catalog publishes one — a default among them ("Each table property
+        // has a default value that it assumes if not specified" — smithy_query shape
+        // `GetTableRequest`, member `TableProperties`). A property the catalog publishes
+        // NO default for assumes nothing and reports none: it is in force only for a
+        // request that names it, which `catalog_schema.rs` covers. A FREE-FORM property —
+        // one whose value the caller writes rather than picks, such as a billing view
+        // ARN — publishes no valid values, so only its default is constrained.
         let properties = table
             .get("TableProperties")
             .and_then(Value::as_array)
@@ -239,12 +242,12 @@ async fn every_listed_table_satisfies_the_modelled_table_contract() {
                 !valid_values.is_empty() || FREE_FORM_PROPERTIES.contains(&property_name),
                 "case {name:?}/{property_name}: only a free-form property {FREE_FORM_PROPERTIES:?} may report an empty ValidValues, got {property}"
             );
-            let default_value = default_value_of(property)
-                .unwrap_or_else(|| panic!("case {name:?}/{property_name}: DefaultValue is absent from {property}"));
-            assert!(
-                valid_values.is_empty() || valid_values.contains(&default_value),
-                "case {name:?}/{property_name}: DefaultValue {default_value:?} must be one of {valid_values:?}"
-            );
+            if let Some(default_value) = default_value_of(property) {
+                assert!(
+                    valid_values.is_empty() || valid_values.contains(&default_value),
+                    "case {name:?}/{property_name}: DefaultValue {default_value:?} must be one of {valid_values:?}"
+                );
+            }
             let property_description = property
                 .get("Description")
                 .and_then(Value::as_str)
@@ -290,12 +293,15 @@ async fn every_listed_table_is_one_get_table_describes() {
             "case {name:?}: the two readers must report one description, got {described}"
         );
         // The listing reports each property's description; GetTable reports the
-        // properties in force as a map, so the names are what the two share.
+        // properties in FORCE as a map, so the names the two share are the properties
+        // that assume a published default — a property the catalog publishes no default
+        // for is in force only for a request that names it.
         let listed_names: Vec<&str> = table
             .get("TableProperties")
             .and_then(Value::as_array)
             .expect("the listing reports TableProperties")
             .iter()
+            .filter(|property| default_value_of(property).is_some())
             .map(|property| {
                 property
                     .get("Name")

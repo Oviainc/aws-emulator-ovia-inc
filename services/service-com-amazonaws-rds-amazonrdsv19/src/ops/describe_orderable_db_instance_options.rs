@@ -4,10 +4,15 @@
 //! IMPLEMENTED: this operation reports the DB instance options a caller can order for an
 //! engine — the cross product of that engine's AVAILABLE versions (read from the engine
 //! catalogue `DescribeDBEngineVersions` owns, so the two reports cannot disagree), the DB
-//! instance classes this service offers for it and its license models — narrowed by the
-//! request's `EngineVersion`, `DBInstanceClass`, `LicenseModel`, `Vpc` and
-//! `AvailabilityZoneGroup` filters and paged by `MaxRecords` / `Marker`. This is the ONLY
-//! file to touch for it.
+//! instance classes this service offers for it, its license models and the STORAGE TYPES
+//! each class can be ordered with — narrowed by the request's `EngineVersion`,
+//! `DBInstanceClass`, `LicenseModel`, `Vpc` and `AvailabilityZoneGroup` filters and paged
+//! by `MaxRecords` / `Marker`. This is the ONLY file to touch for it.
+//!
+//! An option is one (engine version, DB instance class, license model, storage type)
+//! combination: the storage members an option carries (`MinStorageSize`/`MaxStorageSize`,
+//! the provisioned IOPS bounds, the provisioned throughput bounds) are properties of its
+//! storage type, so a class orderable with several types has one option per type.
 //!
 //! An option is reference data, not caller state, with one request-derived member: an
 //! option's `AvailabilityZones` are the zones of the region the request is signed for,
@@ -199,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An option is offered for an engine VERSION this service reports, so the two
         // reports cannot disagree: `DescribeDBEngineVersions` owns the engine catalogue
         // and this operation reads it.
-        for (_, version, facts) in crate::ops::describe_db_engine_versions::catalogue() {
+        for (_, version, _) in crate::ops::describe_db_engine_versions::catalogue() {
             // Only a version that is still available can be ordered; a deprecated one is
             // reported by `DescribeDBEngineVersions` under `IncludeAll` and ordered by
             // nobody.
@@ -238,13 +243,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     {
                         continue;
                     }
-                    matching.push((
-                        format!(
-                            "{}#{}#{}#{license_model}",
-                            version.engine, version.engine_version, class.name
-                        ),
-                        to_wire(version, facts, class, license_model, &region),
-                    ));
+                    // An option is ordered WITH a storage type, and the storage members
+                    // (`MinStorageSize`/`MaxStorageSize`, the provisioned IOPS bounds,
+                    // the provisioned throughput bounds) are properties of that type — so
+                    // each storage type the class can be ordered with is its OWN option,
+                    // never one option carrying the type `CreateDBInstance` defaults to.
+                    for storage in storage_profiles(version.engine, &class) {
+                        matching.push((
+                            format!(
+                                "{}#{}#{}#{license_model}#{}",
+                                version.engine,
+                                version.engine_version,
+                                class.name,
+                                storage.name
+                            ),
+                            to_wire(version, &class, license_model, storage, &region),
+                        ));
+                    }
                 }
             }
         }
@@ -264,114 +279,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`crate::state::check_max_records_in`) is given this range rather than its default.
 const MAX_RECORDS_RANGE: std::ops::RangeInclusive<i32> = 20..=1000;
 
-/// One DB instance class this service offers.
-struct InstanceClass {
-    /// `DBInstanceClass`.
-    name: &'static str,
-    /// Whether `SupportsPerformanceInsights`: Performance Insights is not offered on the
-    /// smallest burstable classes.
-    supports_performance_insights: bool,
-    /// Whether this class can back a Multi-AZ DB CLUSTER (`SupportsClusters`), which the
-    /// burstable classes cannot.
-    supports_clusters: bool,
+/// One DB instance FAMILY this service offers, and the sizes it is offered in.
+///
+/// A `DBInstanceClass` is `db.<family>.<size>`, so the published RDS instance-class table
+/// is a family-by-size matrix and this table is read as one: the classes this service
+/// offers are each family crossed with its own sizes, not a hand-listed set of names.
+struct InstanceFamily {
+    /// The family part of a `DBInstanceClass` (`m5`, `t4g`, `c6gd`, `x2iedn`).
+    family: &'static str,
+    /// The sizes RDS publishes this family in, smallest first.
+    sizes: &'static [&'static str],
+    /// Whether this is a BURSTABLE-performance family (`t3`, `t4g`): its vCPUs are
+    /// shared, so it exposes no configurable processor features, it cannot back a
+    /// Multi-AZ DB cluster, and the two smallest sizes take no Performance Insights.
+    burstable: bool,
+    /// Whether the family runs on AWS Graviton processors. A Graviton core is not
+    /// multithreaded and its count is not configurable, so such a class reports no
+    /// `AvailableProcessorFeatures`.
+    graviton: bool,
 }
 
-/// The classes a non-Aurora DB instance can be ordered in.
+/// One family row, so the tables below read as tables.
 ///
-/// This emulator's published set: a burstable, a general-purpose and a
-/// memory-optimised family, in both the Intel and the Graviton generation, so a caller
-/// choosing a class by family finds one. It is not AWS's full per-region matrix, which
-/// moves with every instance-type launch.
-const INSTANCE_CLASSES: &[InstanceClass] = &[
-    InstanceClass {
-        name: "db.m5.large",
-        supports_performance_insights: true,
-        supports_clusters: true,
-    },
-    InstanceClass {
-        name: "db.m5.xlarge",
-        supports_performance_insights: true,
-        supports_clusters: true,
-    },
-    InstanceClass {
-        name: "db.m6g.large",
-        supports_performance_insights: true,
-        supports_clusters: true,
-    },
-    InstanceClass {
-        name: "db.r5.large",
-        supports_performance_insights: true,
-        supports_clusters: true,
-    },
-    InstanceClass {
-        name: "db.r6g.large",
-        supports_performance_insights: true,
-        supports_clusters: true,
-    },
-    InstanceClass {
-        name: "db.t3.medium",
-        supports_performance_insights: true,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.t3.micro",
-        supports_performance_insights: false,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.t3.small",
-        supports_performance_insights: false,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.t4g.medium",
-        supports_performance_insights: true,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.t4g.micro",
-        supports_performance_insights: false,
-        supports_clusters: false,
-    },
-];
-
-/// The classes an Aurora DB instance can be ordered in: the Aurora subset of the classes
-/// above plus `db.serverless`, the Aurora Serverless v2 capacity class.
-const AURORA_INSTANCE_CLASSES: &[InstanceClass] = &[
-    InstanceClass {
-        name: "db.r5.large",
-        supports_performance_insights: true,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.r6g.large",
-        supports_performance_insights: true,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.serverless",
-        supports_performance_insights: true,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.t3.medium",
-        supports_performance_insights: true,
-        supports_clusters: false,
-    },
-    InstanceClass {
-        name: "db.t4g.medium",
-        supports_performance_insights: true,
-        supports_clusters: false,
-    },
-];
-
-/// The classes `engine` can be ordered in.
-fn instance_classes(engine: &str) -> &'static [InstanceClass] {
-    if crate::state::is_aurora(engine) {
-        AURORA_INSTANCE_CLASSES
-    } else {
-        INSTANCE_CLASSES
+/// Columns, in order: family, sizes, burstable, Graviton.
+const fn family(
+    family: &'static str,
+    sizes: &'static [&'static str],
+    burstable: bool,
+    graviton: bool,
+) -> InstanceFamily {
+    InstanceFamily {
+        family,
+        sizes,
+        burstable,
+        graviton,
     }
+}
+
+/// Whether `engine` is a CLUSTER engine, whose storage the cluster manages instead of an
+/// instance ordering it: the Aurora engines, and the Amazon DocumentDB and Amazon Neptune
+/// engines this same front door serves (`src/service.rs`).
+fn is_cluster_engine(engine: &str) -> bool {
+    crate::state::is_aurora(engine) || matches!(engine, "docdb" | "neptune")
+}
+
+/// The sizes a burstable family is published in.
+const BURSTABLE_SIZES: &[&str] = &["micro", "small", "medium", "large", "xlarge", "2xlarge"];
+
+/// The sizes a standard (non-burstable) family is published in.
+const STANDARD_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+
+/// The sizes the memory-optimised `x2iedn` family is published in: it starts at `xlarge`
+/// and runs past the sizes the standard families reach.
+const X2IEDN_SIZES: &[&str] = &[
+    "xlarge", "2xlarge", "4xlarge", "8xlarge", "16xlarge", "24xlarge", "32xlarge",
+];
+
+/// The only cluster-engine size of a burstable family: a cluster member is offered on
+/// `db.t3.medium` and `db.t4g.medium`, not on the smaller burstable sizes.
+const CLUSTER_BURSTABLE_SIZES: &[&str] = &["medium"];
+
+/// The DB instance families a non-Aurora (provisioned-storage) DB instance can be ordered
+/// in.
+///
+/// Source: the "DB instance classes" family list in the Amazon RDS User Guide — the
+/// burstable families, the general-purpose and compute families (including the `d`
+/// families with local NVMe storage) and the memory-optimised families, in both the Intel
+/// and the Graviton generations. It is this emulator's PUBLISHED set, not AWS's full
+/// per-region, per-engine matrix, which moves with every instance-type launch; what a
+/// caller can rely on is that a class this report names can be ordered and that every
+/// storage type it can be ordered with is reported with that class.
+const PROVISIONED_FAMILIES: &[InstanceFamily] = &[
+    // Burstable performance.
+    family("t3", BURSTABLE_SIZES, true, false),
+    family("t4g", BURSTABLE_SIZES, true, true),
+    // General purpose and compute, Intel.
+    family("m5", STANDARD_SIZES, false, false),
+    family("m5d", STANDARD_SIZES, false, false),
+    family("m6i", STANDARD_SIZES, false, false),
+    // General purpose and compute, Graviton.
+    family("c6gd", STANDARD_SIZES, false, true),
+    family("m6g", STANDARD_SIZES, false, true),
+    family("m6gd", STANDARD_SIZES, false, true),
+    family("m7g", STANDARD_SIZES, false, true),
+    // Memory optimised, Intel.
+    family("r5", STANDARD_SIZES, false, false),
+    family("r5b", STANDARD_SIZES, false, false),
+    family("r5d", STANDARD_SIZES, false, false),
+    family("r6i", STANDARD_SIZES, false, false),
+    family("x2iedn", X2IEDN_SIZES, false, false),
+    // Memory optimised, Graviton.
+    family("r6g", STANDARD_SIZES, false, true),
+    family("r6gd", STANDARD_SIZES, false, true),
+    family("r7g", STANDARD_SIZES, false, true),
+];
+
+/// The DB instance families a CLUSTER-engine DB instance can be ordered in: the
+/// burstable `medium` classes and the memory-optimised families, as the Aurora section of
+/// the same instance-class list publishes them. A DocumentDB or Neptune instance is a
+/// cluster member ordered in those same families. `db.serverless`, the serverless
+/// capacity class, is not a family-by-size class and is added by [`instance_classes`].
+const CLUSTER_FAMILIES: &[InstanceFamily] = &[
+    family("t3", CLUSTER_BURSTABLE_SIZES, true, false),
+    family("t4g", CLUSTER_BURSTABLE_SIZES, true, true),
+    family("r5", STANDARD_SIZES, false, false),
+    family("r6i", STANDARD_SIZES, false, false),
+    family("r6g", STANDARD_SIZES, false, true),
+    family("r7g", STANDARD_SIZES, false, true),
+];
+
+/// The serverless capacity class (Aurora Serverless v2, and the serverless capacity a
+/// DocumentDB or Neptune cluster member is ordered with), which has no family-and-size
+/// form.
+const SERVERLESS_CLASS: &str = "db.serverless";
+
+/// The threads each configurable (Intel) core runs, which is also why a class's
+/// `coreCount` is half its vCPU count: the published `threadsPerCore` processor feature
+/// allows `1,2`.
+const THREADS_PER_CORE: i32 = 2;
+
+/// One DB instance class this service offers, as an option reports it.
+struct InstanceClass {
+    /// `DBInstanceClass`.
+    name: String,
+    /// Whether the class is burstable (see [`InstanceFamily::burstable`]).
+    burstable: bool,
+    /// The CPU CORES whose count a caller can configure on this class, or `None` for a
+    /// class whose processor features are not configurable (a burstable or Graviton
+    /// class, or a size whose vCPU count the published naming does not state).
+    cores: Option<i32>,
+    /// Whether `SupportsPerformanceInsights`.
+    supports_performance_insights: bool,
+}
+
+/// The vCPU count the published instance-size naming gives `size`: a `large` is 2 vCPUs
+/// and each `<n>xlarge` is `4 * n`, with `xlarge` as `n = 1`. `None` for the burstable
+/// sizes (`micro`, `small`, `medium`), whose vCPUs are shared and whose count is
+/// therefore not a configurable processor feature.
+fn vcpus(size: &str) -> Option<i32> {
+    /// `(size, vCPUs)` for the sizes whose name states the count.
+    const SIZE_VCPUS: &[(&str, i32)] = &[
+        ("large", 2),
+        ("xlarge", 4),
+        ("2xlarge", 8),
+        ("4xlarge", 16),
+        ("8xlarge", 32),
+        ("12xlarge", 48),
+        ("16xlarge", 64),
+        ("24xlarge", 96),
+        ("32xlarge", 128),
+    ];
+
+    SIZE_VCPUS
+        .iter()
+        .find(|(name, _)| *name == size)
+        .map(|(_, vcpus)| *vcpus)
+}
+
+/// The classes `engine` can be ordered in, built from the family tables above.
+fn instance_classes(engine: &str) -> Vec<InstanceClass> {
+    let cluster = is_cluster_engine(engine);
+    let families = if cluster {
+        CLUSTER_FAMILIES
+    } else {
+        PROVISIONED_FAMILIES
+    };
+    let mut classes: Vec<InstanceClass> = families
+        .iter()
+        .flat_map(|family| {
+            family.sizes.iter().map(move |size| InstanceClass {
+                name: format!("db.{}.{size}", family.family),
+                burstable: family.burstable,
+                cores: if family.burstable || family.graviton {
+                    None
+                } else {
+                    vcpus(size).map(|vcpus| vcpus / THREADS_PER_CORE)
+                },
+                // Performance Insights is not offered on the two smallest burstable
+                // sizes; every other class this service offers takes it.
+                supports_performance_insights: !(family.burstable
+                    && matches!(*size, "micro" | "small")),
+            })
+        })
+        .collect();
+    if cluster {
+        classes.push(InstanceClass {
+            name: SERVERLESS_CLASS.to_string(),
+            burstable: false,
+            cores: None,
+            supports_performance_insights: true,
+        });
+    }
+    classes
 }
 
 /// The license models `engine` can be ordered under, as `CreateDBInstance`'s
@@ -382,6 +483,9 @@ fn license_models(engine: &str) -> &'static [&'static str] {
     match engine {
         "postgres" | "aurora-postgresql" => &["postgresql-license"],
         "mysql" | "mariadb" | "aurora-mysql" => &["general-public-license"],
+        // The licence setting "doesn't apply to" the Amazon DocumentDB and Amazon
+        // Neptune engines, whose orderable options carry `na`.
+        "docdb" | "neptune" => &["na"],
         // Oracle Enterprise Edition is BYOL only; Standard Edition Two is offered both
         // ways.
         "oracle-ee" | "oracle-ee-cdb" => &["bring-your-own-license"],
@@ -393,38 +497,172 @@ fn license_models(engine: &str) -> &'static [&'static str] {
     }
 }
 
-/// The storage type an option is offered with, and whether that type takes provisioned
-/// IOPS and provisioned throughput.
-///
-/// `gp3` is the type `CreateDBInstance`'s `StorageType` defaults to
-/// (`crate::state::default_storage_type`), and Aurora storage is managed by the cluster
-/// rather than ordered per instance, which is why an Aurora option reports `aurora` and
-/// neither provisioned IOPS nor provisioned throughput.
-fn storage(engine: &str) -> (&'static str, bool) {
-    if crate::state::is_aurora(engine) {
-        ("aurora", false)
-    } else {
-        ("gp3", true)
-    }
+/// The provisioned IOPS a storage type takes, as the published storage table states them.
+struct ProvisionedIops {
+    /// `MinIopsPerDbInstance`.
+    min_per_instance: i32,
+    /// `MaxIopsPerDbInstance`.
+    max_per_instance: i32,
+    /// `MinIopsPerGib` — the lowest IOPS-to-GiB ratio.
+    min_per_gib: f64,
+    /// `MaxIopsPerGib` — the highest IOPS-to-GiB ratio.
+    max_per_gib: f64,
 }
 
-/// The lowest and highest `AllocatedStorage` an option accepts, in GiB, or `None` for an
-/// engine whose storage is cluster-managed rather than ordered (Aurora).
+/// The provisioned storage throughput a storage type takes, in MiB/s.
+struct ProvisionedThroughput {
+    /// `MinStorageThroughputPerDbInstance`.
+    min_per_instance: i32,
+    /// `MaxStorageThroughputPerDbInstance`.
+    max_per_instance: i32,
+    /// `MinStorageThroughputPerIops`.
+    min_per_iops: f64,
+    /// `MaxStorageThroughputPerIops`.
+    max_per_iops: f64,
+}
+
+/// One storage type a DB instance can be ordered with, and everything an option reports
+/// ABOUT that type.
 ///
-/// The bounds are the published General Purpose SSD ranges: 20–65,536 GiB for the MySQL,
-/// MariaDB, PostgreSQL and Oracle engines, 20–16,384 GiB for Microsoft SQL Server and
-/// 20–64,000 GiB for Db2.
-fn storage_size_range(engine: &str) -> Option<(i32, i32)> {
+/// Source: the "Amazon RDS DB instance storage" section of the Amazon RDS User Guide —
+/// General Purpose SSD (`gp2`, `gp3`) and Provisioned IOPS SSD (`io1`, `io2`), with the
+/// sizes, IOPS and throughput each publishes.
+struct StorageProfile {
+    /// `StorageType`.
+    name: &'static str,
+    /// `MinStorageSize` and the largest `MaxStorageSize` this type reaches, in GiB,
+    /// before the engine's own cap ([`max_allocated_storage`]) is applied. `None` for
+    /// storage that is managed by a cluster rather than ordered per instance (Aurora),
+    /// which reports no storage bounds and no autoscaling.
+    size_range: Option<(i32, i32)>,
+    /// The provisioned IOPS this type takes, which is also `SupportsIops`.
+    iops: Option<ProvisionedIops>,
+    /// The provisioned throughput this type takes, which is also
+    /// `SupportsStorageThroughput`.
+    throughput: Option<ProvisionedThroughput>,
+}
+
+/// General Purpose SSD `gp2`: 20 GiB upwards, with IOPS and throughput derived from the
+/// volume size rather than provisioned, so it takes neither.
+const GP2: StorageProfile = StorageProfile {
+    name: "gp2",
+    size_range: Some((20, 65_536)),
+    iops: None,
+    throughput: None,
+};
+
+/// General Purpose SSD `gp3`: 20 GiB upwards, with a 3,000 IOPS / 125 MiB/s baseline that
+/// can be provisioned up to 64,000 IOPS and 4,000 MiB/s, at up to 0.25 MiB/s per
+/// provisioned IOPS.
+const GP3: StorageProfile = StorageProfile {
+    name: "gp3",
+    size_range: Some((20, 65_536)),
+    iops: Some(ProvisionedIops {
+        min_per_instance: 3_000,
+        max_per_instance: 64_000,
+        min_per_gib: 0.5,
+        max_per_gib: 500.0,
+    }),
+    throughput: Some(ProvisionedThroughput {
+        min_per_instance: 125,
+        max_per_instance: 4_000,
+        min_per_iops: 0.0,
+        max_per_iops: 0.25,
+    }),
+};
+
+/// Provisioned IOPS SSD `io1`: from 100 GiB, 1,000 to 256,000 provisioned IOPS, at a
+/// ratio of up to 50 IOPS per GiB. Throughput follows the provisioned IOPS and is not
+/// ordered separately.
+const IO1: StorageProfile = StorageProfile {
+    name: "io1",
+    size_range: Some((100, 65_536)),
+    iops: Some(ProvisionedIops {
+        min_per_instance: 1_000,
+        max_per_instance: 256_000,
+        min_per_gib: 0.5,
+        max_per_gib: 50.0,
+    }),
+    throughput: None,
+};
+
+/// Provisioned IOPS SSD `io2` Block Express: the same sizes and IOPS as `io1` at a ratio
+/// of up to 1,000 IOPS per GiB.
+const IO2: StorageProfile = StorageProfile {
+    name: "io2",
+    size_range: Some((100, 65_536)),
+    iops: Some(ProvisionedIops {
+        min_per_instance: 1_000,
+        max_per_instance: 256_000,
+        min_per_gib: 0.5,
+        max_per_gib: 1_000.0,
+    }),
+    throughput: None,
+};
+
+/// Aurora storage, which the CLUSTER manages: it is not ordered per instance, so the
+/// option reports the type and no bounds.
+const AURORA: StorageProfile = StorageProfile {
+    name: "aurora",
+    size_range: None,
+    iops: None,
+    throughput: None,
+};
+
+/// The storage an Amazon DocumentDB or Amazon Neptune cluster member reports.
+///
+/// `CreateDBClusterMessage$StorageType` in the DocumentDB and Neptune models: "Valid
+/// values for storage type - standard | iopt1 … Default value is standard" — and the
+/// CLUSTER carries it, so the instance orders neither size nor IOPS of its own.
+const CLUSTER_STANDARD: StorageProfile = StorageProfile {
+    name: "standard",
+    size_range: None,
+    iops: None,
+    throughput: None,
+};
+
+/// The storage types an Aurora DB instance is offered with.
+const AURORA_STORAGE: &[StorageProfile] = &[AURORA];
+
+/// The storage types a DocumentDB or Neptune cluster member is offered with.
+const CLUSTER_STANDARD_STORAGE: &[StorageProfile] = &[CLUSTER_STANDARD];
+
+/// The storage types a burstable class is offered with: General Purpose SSD only —
+/// Provisioned IOPS SSD starts at 100 GiB and is ordered on the standard classes.
+const GENERAL_PURPOSE_STORAGE: &[StorageProfile] = &[GP2, GP3];
+
+/// The storage types a standard (non-burstable) provisioned-storage class is offered
+/// with, in the order the published storage table lists them.
+const ALL_PROVISIONED_STORAGE: &[StorageProfile] = &[GP2, GP3, IO1, IO2];
+
+/// The storage types `class` can be ordered with for `engine`.
+fn storage_profiles(engine: &str, class: &InstanceClass) -> &'static [StorageProfile] {
     if crate::state::is_aurora(engine) {
-        return None;
+        return AURORA_STORAGE;
     }
+    if matches!(engine, "docdb" | "neptune") {
+        return CLUSTER_STANDARD_STORAGE;
+    }
+    if class.burstable {
+        return GENERAL_PURPOSE_STORAGE;
+    }
+    ALL_PROVISIONED_STORAGE
+}
+
+/// The largest `AllocatedStorage` `engine` accepts, in GiB.
+///
+/// The published per-engine caps: 65,536 GiB for the MySQL, MariaDB, PostgreSQL and
+/// Oracle engines, 16,384 GiB for Microsoft SQL Server and 64,000 GiB for Db2. A storage
+/// type's own maximum ([`StorageProfile::size_range`]) is capped at this; a cluster
+/// engine's storage carries no bounds at all, so this is not consulted for one.
+fn max_allocated_storage(engine: &str) -> i32 {
     if engine.starts_with("sqlserver") {
-        return Some((20, 16_384));
+        return 16_384;
     }
     if engine.starts_with("db2") {
-        return Some((20, 64_000));
+        return 64_000;
     }
-    Some((20, 65_536))
+    65_536
 }
 
 /// Whether `engine` supports IAM database authentication
@@ -435,6 +673,65 @@ fn supports_iam_database_authentication(engine: &str) -> bool {
         engine,
         "mysql" | "mariadb" | "postgres" | "aurora-mysql" | "aurora-postgresql"
     )
+}
+
+/// The Database Activity Streams modes an option reports, exactly as
+/// `OrderableDBInstanceOption$SupportedActivityStreamModes` documents them: "Aurora
+/// PostgreSQL returns the value `[sync, async]`. Aurora MySQL and RDS for Oracle return
+/// `[async]` only. If Database Activity Streams isn't supported, the return value is an
+/// empty list."
+fn activity_stream_modes(engine: &str) -> Vec<String> {
+    let modes: &[&str] = match engine {
+        "aurora-postgresql" => &["sync", "async"],
+        "aurora-mysql" => &["async"],
+        engine if engine.starts_with("oracle") => &["async"],
+        _ => &[],
+    };
+    modes.iter().map(|mode| (*mode).to_string()).collect()
+}
+
+/// The processor features a caller can configure on `class` for `engine`.
+///
+/// Configuring the CPU cores and threads per core of a DB instance is published for the
+/// core-licensed engines — RDS for Oracle and RDS for Microsoft SQL Server — on the Intel
+/// classes that expose multithreaded cores. Every other combination reports no
+/// configurable feature, so the list is empty and the member is left absent.
+///
+/// The two features are the published ones: `coreCount`, whose default is the class's
+/// full core count and whose allowed values are the EVEN counts up to it (cores are
+/// disabled in pairs), and `threadsPerCore`, which allows one thread or
+/// [`THREADS_PER_CORE`].
+fn available_processor_features(
+    engine: &str,
+    class: &InstanceClass,
+) -> Vec<AvailableProcessorFeature> {
+    if !(engine.starts_with("oracle") || engine.starts_with("sqlserver")) {
+        return Vec::new();
+    }
+    let Some(cores) = class.cores.filter(|cores| *cores > 1) else {
+        return Vec::new();
+    };
+    let allowed_core_counts: Vec<String> = (1..=cores)
+        .filter(|count| count % 2 == 0)
+        .map(|count| count.to_string())
+        .collect();
+    vec![
+        AvailableProcessorFeature {
+            name: Some("coreCount".to_string()),
+            default_value: Some(cores.to_string()),
+            allowed_values: Some(allowed_core_counts.join(",")),
+        },
+        AvailableProcessorFeature {
+            name: Some("threadsPerCore".to_string()),
+            default_value: Some(THREADS_PER_CORE.to_string()),
+            allowed_values: Some(
+                (1..=THREADS_PER_CORE)
+                    .map(|threads| threads.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        },
+    ]
 }
 
 /// The Availability Zones of `region` an option is offered in.
@@ -451,63 +748,95 @@ fn availability_zones(region: &str) -> Vec<AvailabilityZone> {
         .collect()
 }
 
-/// Project one (engine version, DB instance class, license model) onto the modelled
-/// `OrderableDBInstanceOption` wire shape.
+/// Project one (engine version, DB instance class, license model, storage type) onto the
+/// modelled `OrderableDBInstanceOption` wire shape.
 fn to_wire(
     version: &crate::ops::describe_db_engine_versions::CatalogVersion,
-    facts: &crate::ops::describe_db_engine_versions::EngineFacts,
     class: &InstanceClass,
     license_model: &str,
+    storage: &StorageProfile,
     region: &str,
 ) -> OrderableDBInstanceOption {
-    let (storage_type, provisioned_storage) = storage(version.engine);
-    let storage_size = storage_size_range(version.engine);
+    let engine = version.engine;
+    // A storage type's published maximum, capped by what the ENGINE accepts.
+    let storage_size = storage
+        .size_range
+        .map(|(min, max)| (min, max.min(max_allocated_storage(engine))));
+    let processor_features = available_processor_features(engine, class);
     OrderableDBInstanceOption {
-        engine: Some(version.engine.to_string()),
+        engine: Some(engine.to_string()),
         engine_version: Some(version.engine_version.to_string()),
-        db_instance_class: Some(class.name.to_string()),
+        db_instance_class: Some(class.name.clone()),
         license_model: Some(license_model.to_string()),
         availability_zones: Some(availability_zones(region)),
         // A Multi-AZ deployment puts the standby in another zone of the same region, so
         // every option offered in several zones is Multi-AZ capable.
         multi_az_capable: Some(true),
-        read_replica_capable: Some(facts.supports_read_replica),
+        read_replica_capable: Some(version.profile.supports_read_replica),
         vpc: Some(true),
         supports_storage_encryption: Some(true),
-        storage_type: Some(storage_type.to_string()),
-        supports_iops: Some(provisioned_storage),
-        supports_storage_throughput: Some(provisioned_storage),
-        supports_storage_autoscaling: Some(provisioned_storage),
+        // Everything below comes from the option's OWN storage type.
+        storage_type: Some(storage.name.to_string()),
+        supports_iops: Some(storage.iops.is_some()),
+        min_iops_per_db_instance: storage.iops.as_ref().map(|iops| iops.min_per_instance),
+        max_iops_per_db_instance: storage.iops.as_ref().map(|iops| iops.max_per_instance),
+        min_iops_per_gib: storage.iops.as_ref().map(|iops| iops.min_per_gib),
+        max_iops_per_gib: storage.iops.as_ref().map(|iops| iops.max_per_gib),
+        supports_storage_throughput: Some(storage.throughput.is_some()),
+        min_storage_throughput_per_db_instance: storage
+            .throughput
+            .as_ref()
+            .map(|throughput| throughput.min_per_instance),
+        max_storage_throughput_per_db_instance: storage
+            .throughput
+            .as_ref()
+            .map(|throughput| throughput.max_per_instance),
+        min_storage_throughput_per_iops: storage
+            .throughput
+            .as_ref()
+            .map(|throughput| throughput.min_per_iops),
+        max_storage_throughput_per_iops: storage
+            .throughput
+            .as_ref()
+            .map(|throughput| throughput.max_per_iops),
+        // Storage autoscaling raises `AllocatedStorage`, so it applies exactly where
+        // storage is ordered per instance rather than managed by a cluster.
+        supports_storage_autoscaling: Some(storage.size_range.is_some()),
         min_storage_size: storage_size.map(|(min, _)| min),
         max_storage_size: storage_size.map(|(_, max)| max),
         supports_enhanced_monitoring: Some(true),
         supports_performance_insights: Some(class.supports_performance_insights),
-        supports_iam_database_authentication: Some(supports_iam_database_authentication(
-            version.engine,
-        )),
+        supports_iam_database_authentication: Some(supports_iam_database_authentication(engine)),
+        // The engine modes and the global-database capability are the VERSION's, read
+        // from the engine catalogue, so this report and `DescribeDBEngineVersions` cannot
+        // disagree about the version an option is offered for.
         supported_engine_modes: Some(
-            facts
+            version
+                .profile
                 .engine_modes
                 .iter()
                 .map(|mode| (*mode).to_string())
                 .collect(),
         ),
-        supports_global_databases: Some(facts.supports_global_databases),
+        supports_global_databases: Some(version.profile.supports_global_databases),
         // "Whether DB instances can be configured as a Multi-AZ DB cluster": offered on
         // the MySQL and PostgreSQL engines, and never on a burstable class.
-        supports_clusters: Some(
-            class.supports_clusters && matches!(version.engine, "mysql" | "postgres"),
-        ),
+        supports_clusters: Some(!class.burstable && matches!(engine, "mysql" | "postgres")),
+        // A dedicated log volume is offered on the RDS engines, whose log volume is
+        // ordered with the instance; a cluster engine's storage is cluster-managed.
+        supports_dedicated_log_volume: Some(!is_cluster_engine(engine)),
+        supported_activity_stream_modes: Some(activity_stream_modes(engine)),
+        // Absent rather than empty when the class has no configurable feature.
+        available_processor_features: (!processor_features.is_empty()).then_some(processor_features),
         // This emulator's subnets are IPv4, so an option is offered for IPv4 only rather
         // than reporting a dual-stack network it does not provide.
         supported_network_types: Some(vec!["IPV4".to_string()]),
         // `AvailabilityZoneGroup` names a Local Zone group and `OutpostCapable` an AWS
         // Outpost; this service offers neither, so no option claims one.
         outpost_capable: Some(false),
-        // The members that describe capacity this emulator does not model — processor
-        // features, activity stream modes, Kerberos authentication, a dedicated log
-        // volume, additional storage volumes, the Data API HTTP endpoint — are left
-        // absent rather than invented.
+        // The members that describe capacity this emulator does not model — Kerberos
+        // authentication, additional storage volumes, the Data API HTTP endpoint — are
+        // left absent rather than invented.
         ..Default::default()
     }
 }

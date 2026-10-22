@@ -52,7 +52,10 @@ fn tagging_payload(tags: &[(String, String)]) -> String {
 }
 
 /// `PUT /<bucket>?tagging` — `PutBucketTagging`.
-async fn put_bucket_tagging(
+///
+/// `pub(crate)`, like the reader below it: the object suite in this same test crate tags a
+/// bucket through the same helper instead of writing a second tagging payload builder.
+pub(crate) async fn put_bucket_tagging(
     router: &MultiServiceRouter,
     bucket: &str,
     tags: &[(String, String)],
@@ -68,7 +71,7 @@ async fn put_bucket_tagging(
 }
 
 /// `GET /<bucket>?tagging` — `GetBucketTagging`.
-async fn get_bucket_tagging(router: &MultiServiceRouter, bucket: &str) -> Answer {
+pub(crate) async fn get_bucket_tagging(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "GET", &format!("/{bucket}?tagging"), &[], "").await
 }
 
@@ -82,7 +85,7 @@ async fn delete_bucket_tagging(router: &MultiServiceRouter, bucket: &str) -> Ans
 /// Parsed with `quick-xml` (already a dependency of this workspace) rather than by
 /// slicing the body, so escaped text and an empty `<Value/>` are read the way a client's
 /// XML reader reads them.
-fn tag_set_of(answer: &Answer) -> Vec<(String, String)> {
+pub(crate) fn tag_set_of(answer: &Answer) -> Vec<(String, String)> {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 
@@ -153,7 +156,7 @@ fn push_fragment(element: &str, fragment: &str, key: &mut String, value: &mut St
 }
 
 /// One tag, owned, so a table row can hold generated keys and values.
-fn tag(key: &str, value: &str) -> (String, String) {
+pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 

@@ -30,17 +30,20 @@ const MAX_CANARIES: usize = 100;
 const MAX_RETAINED_RUNS_PER_CANARY: usize = 100;
 
 /// One answer from the emulator: enough to assert on a success or a modelled failure.
+///
+/// `pub(crate)` because the sibling suites in this test target share this harness rather
+/// than each growing their own.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The `restJson1` error shape, from `x-amzn-errortype`.
-    error_code: Option<String>,
-    body: Value,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The JSON at a dotted path, or `Value::Null`.
-    fn at(&self, path: &str) -> &Value {
+    pub(crate) fn at(&self, path: &str) -> &Value {
         let mut cursor = &self.body;
         for segment in path.split('.') {
             cursor = &cursor[segment];
@@ -48,7 +51,7 @@ impl Answer {
         cursor
     }
 
-    fn string_at(&self, path: &str) -> String {
+    pub(crate) fn string_at(&self, path: &str) -> String {
         self.at(path)
             .as_str()
             .unwrap_or_else(|| panic!("expected a string at {path}, got {:?}", self.at(path)))
@@ -57,13 +60,13 @@ impl Answer {
 }
 
 /// A single emulated synthetics endpoint in one Region.
-struct Synthetics {
+pub(crate) struct Synthetics {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Synthetics {
-    fn new(region: &str) -> Self {
+    pub(crate) fn new(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -119,41 +122,41 @@ impl Synthetics {
         }
     }
 
-    async fn create(&self, body: Value) -> Answer {
+    pub(crate) async fn create(&self, body: Value) -> Answer {
         self.call("POST", "/canary", Some(body)).await
     }
 
-    async fn get(&self, name: &str) -> Answer {
+    pub(crate) async fn get(&self, name: &str) -> Answer {
         self.call("GET", &format!("/canary/{name}"), None).await
     }
 
-    async fn start(&self, name: &str) -> Answer {
+    pub(crate) async fn start(&self, name: &str) -> Answer {
         self.call("POST", &format!("/canary/{name}/start"), Some(json!({})))
             .await
     }
 
-    async fn stop(&self, name: &str) -> Answer {
+    pub(crate) async fn stop(&self, name: &str) -> Answer {
         self.call("POST", &format!("/canary/{name}/stop"), Some(json!({})))
             .await
     }
 
-    async fn delete(&self, name: &str) -> Answer {
+    pub(crate) async fn delete(&self, name: &str) -> Answer {
         self.call("DELETE", &format!("/canary/{name}?deleteLambda=true"), None)
             .await
     }
 
-    async fn describe(&self, body: Value) -> Answer {
+    pub(crate) async fn describe(&self, body: Value) -> Answer {
         self.call("POST", "/canaries", Some(body)).await
     }
 
-    async fn runs(&self, name: &str, body: Value) -> Answer {
+    pub(crate) async fn runs(&self, name: &str, body: Value) -> Answer {
         self.call("POST", &format!("/canary/{name}/runs"), Some(body))
             .await
     }
 }
 
 /// A minimal, valid `CreateCanary` body for `name`.
-fn create_body(name: &str) -> Value {
+pub(crate) fn create_body(name: &str) -> Value {
     json!({
         "Name": name,
         "Code": { "Handler": "index.handler", "S3Bucket": "scripts", "S3Key": "canary.zip" },

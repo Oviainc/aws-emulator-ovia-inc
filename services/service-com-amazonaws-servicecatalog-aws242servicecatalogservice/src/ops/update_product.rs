@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProduct"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        let Some(product) = state.products.get_mut(&input.id) else {
+            return Err(UpdateProductErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "{} does not exist or access was denied",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The tag set this update would leave behind: `RemoveTags` deletes by key and
+        // `AddTags` then merges, overwriting an existing key's value — so a key named
+        // by both ends up with the supplied value.
+        let mut tags = product.tags.clone();
+        for key in input.remove_tags.unwrap_or_default() {
+            tags.remove(&key);
+        }
+        for tag in input.add_tags.unwrap_or_default() {
+            tags.insert(tag.key, tag.value);
+        }
+        if tags.len() > crate::state::MAX_PRODUCT_TAGS {
+            // Refused BEFORE anything is stored, so a rejected update leaves the
+            // record exactly as it was. This operation models no
+            // `LimitExceededException`, so the refusal is the bad-parameter one it
+            // does model.
+            return Err(UpdateProductErrorModeled::InvalidParametersException(
+                InvalidParametersException {
+                    message: Some(format!(
+                        "A product cannot carry more than {} tags.",
+                        crate::state::MAX_PRODUCT_TAGS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Only supplied members change; an absent member keeps its stored value. The
+        // product's type, id, ARN and versions are not updatable — the model does not
+        // carry them on this input.
+        if let Some(name) = input.name {
+            product.name = name;
+        }
+        if let Some(owner) = input.owner {
+            product.owner = owner;
+        }
+        if let Some(description) = input.description {
+            product.short_description = Some(description);
+        }
+        if let Some(distributor) = input.distributor {
+            product.distributor = Some(distributor);
+        }
+        if let Some(support_description) = input.support_description {
+            product.support_description = Some(support_description);
+        }
+        if let Some(support_email) = input.support_email {
+            product.support_email = Some(support_email);
+        }
+        if let Some(support_url) = input.support_url {
+            product.support_url = Some(support_url);
+        }
+        if let Some(source_connection) = input.source_connection {
+            // Stored as the detail shape every response reports: the `Type` and
+            // `ConnectionParameters` the request carried, with no `LastSync` because no
+            // sync has run.
+            product.source_connection = Some(SourceConnectionDetail {
+                r#type: source_connection.r#type,
+                connection_parameters: Some(source_connection.connection_parameters),
+                last_sync: None,
+            });
+        }
+        product.tags = tags;
+
+        // The response is the post-update STORED record, so a following
+        // DescribeProduct reports the same values.
+        Ok(UpdateProductOutput {
+            product_view_detail: Some(product.detail()),
+            tags: Some(product.tag_list()),
+        })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IsMemberInGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IsMemberInGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`IsMemberInGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -95,11 +86,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `IsMemberInGroupsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#IsMemberInGroups")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#IsMemberInGroups",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum IsMemberInGroupsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,23 +146,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::IS_MEMBER_IN_GROUPS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report, for each requested group, whether this identity store holds a
+    /// membership joining that group and this member.
+    ///
+    /// `@readonly`: the store is looked up rather than vivified and nothing is
+    /// written, so a check can never change what a later caller sees.
+    ///
+    /// One result per element of `GroupIds`, in the order they were requested
+    /// (repeats included): the modelled `Results` is a list of per-group
+    /// `GroupMembershipExistenceResult`, so every requested id gets its own answer,
+    /// and a group this store does not hold simply holds no membership — `false` —
+    /// rather than discarding the answers for the up to 99 other ids one request
+    /// asks about.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IsMemberInGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IsMemberInGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IsMemberInGroups"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            IsMemberInGroupsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let state = state.lock();
+        let store = state.store(&input.identity_store_id).ok_or_else(|| {
+            IsMemberInGroupsErrorModeled::ResourceNotFoundException(
+                crate::state::identity_store_not_found(&input.identity_store_id),
+            )
+        })?;
+
+        // The modelled `MemberId` union declares exactly one variant, `UserId`, so the
+        // member is always a user of this store — and a user the store does not hold is
+        // the one resource the whole call is about, hence refused rather than reported
+        // as a row of `false`s.
+        let MemberId::UserId(member) = &input.member_id;
+        let member_key = crate::state::resource_key(member);
+        if !store.users.contains_key(&member_key) {
+            return Err(IsMemberInGroupsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::ResourceKind::User, member),
+            )
+            .into());
+        }
+
+        let results = input
+            .group_ids
+            .iter()
+            .map(|group_id| {
+                // Every id member also accepts the resource's ARN, so both forms are
+                // reduced to the id they name before the store is consulted — and the
+                // result reports that resolved id, not the form the request wrote it in.
+                let group_key = crate::state::resource_key(group_id);
+                GroupMembershipExistenceResult {
+                    membership_exists: store.membership_of(&group_key, &member_key).is_some(),
+                    group_id: Some(group_key),
+                    member_id: Some(MemberId::UserId(member_key.clone())),
+                }
+            })
+            .collect();
+
+        Ok(IsMemberInGroupsOutput { results })
     }
 }

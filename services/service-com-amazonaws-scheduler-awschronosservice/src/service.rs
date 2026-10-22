@@ -41,9 +41,72 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: the modelled
+/// `ValidationException`, which every operation that can be refused declares with
+/// `@httpError 400`. It is also the framework's own default code for a refusal, restated
+/// here because `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// One constraint violation, worded the way EventBridge Scheduler words it.
+///
+/// The framework already states every violation class in the AWS sentence
+/// (`Value '<v>' at '<path>' failed to satisfy constraint: <requirement>`), so that
+/// rendering is reused rather than re-spelled — and exactly one thing is changed: a
+/// `@pattern` requirement quotes the expression WITHOUT the `^` / `$` the model spells it
+/// with. AWS advertises the expression a value must satisfy, not the anchoring the model
+/// uses to make the match total, and a client, test or log scraper that reconstructs the
+/// advertised pattern from the message must get the one the service really publishes.
+///
+/// The pattern is replaced at its LAST occurrence, which is the requirement clause: the
+/// echoed value precedes it, so a caller who sends the pattern text as the value cannot
+/// have its own value rewritten.
+fn constraint_clause(violation: &Violation) -> String {
+    let rendered = violation.message();
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => match rendered.rsplit_once(pattern.as_str()) {
+            Some((head, tail)) => format!("{head}{}{tail}", unanchored(pattern)),
+            None => rendered,
+        },
+        _ => rendered,
+    }
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
+/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
+/// it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation, in the order the
+/// framework accumulated them.
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations.iter().map(constraint_clause).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-scheduler-awschronosservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +161,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Only ONE thing is reworded here, and the code is restated unchanged: a
+        // `@pattern` requirement quotes the expression without the model's `^` / `$`
+        // anchors, which is how AWS advertises it. See [`constraint_clause`]. An
+        // authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -148,7 +148,8 @@ pub const ENABLED: &str = "ENABLED";
 pub const DISABLED: &str = "DISABLED";
 
 /// Every member of the `DetectorFeature` enum, in model order
-/// (`smithy_query(shape="DetectorFeature")`).
+/// (`smithy_query(shape="DetectorFeature")`). These are the features a request may
+/// configure: `DetectorFeatureConfiguration.Name` targets this enum.
 pub const DETECTOR_FEATURES: [&str; 9] = [
     "S3_DATA_EVENTS",
     "EKS_AUDIT_LOGS",
@@ -161,11 +162,11 @@ pub const DETECTOR_FEATURES: [&str; 9] = [
     "AI_ANALYST",
 ];
 
-/// The one feature `CreateDetector` does NOT enable by default: "When you don't
-/// specify any features, with an exception to RUNTIME_MONITORING, all the optional
-/// features are enabled by default"
+/// Runtime Monitoring: the feature `CreateDetector` documents as the exception to
+/// its "all the optional features are enabled by default" default
 /// (`smithy_query(query="doc",shape="CreateDetector")`).
 pub const FEATURE_RUNTIME_MONITORING: &str = "RUNTIME_MONITORING";
+
 /// Runtime Monitoring already covers Amazon EKS, so the two cannot both be
 /// requested: "Specifying both EKS Runtime Monitoring (EKS_RUNTIME_MONITORING) and
 /// Runtime Monitoring (RUNTIME_MONITORING) will cause an error"
@@ -179,6 +180,54 @@ pub const FEATURE_S3_DATA_EVENTS: &str = "S3_DATA_EVENTS";
 pub const FEATURE_EKS_AUDIT_LOGS: &str = "EKS_AUDIT_LOGS";
 /// The feature behind `DataSources.MalwareProtection.ScanEc2InstanceWithFindings`.
 pub const FEATURE_EBS_MALWARE_PROTECTION: &str = "EBS_MALWARE_PROTECTION";
+/// The feature behind `DataSources.Database.Rds.DatabaseEvents`: RDS Protection
+/// watches Amazon RDS login activity.
+pub const FEATURE_RDS_LOGIN_EVENTS: &str = "RDS_LOGIN_EVENTS";
+
+/// The feature behind `DataSources.CloudTrail`: GuardDuty's analysis of CloudTrail
+/// management events.
+pub const FEATURE_CLOUD_TRAIL: &str = "CLOUD_TRAIL";
+/// The feature behind `DataSources.DNSLogs`.
+pub const FEATURE_DNS_LOGS: &str = "DNS_LOGS";
+/// The feature behind `DataSources.FlowLogs`.
+pub const FEATURE_FLOW_LOGS: &str = "FLOW_LOGS";
+
+/// The optional features a bare `CreateDetector` leaves DISABLED — the ones a
+/// detector reports only once a request asks for them.
+///
+/// Runtime Monitoring is the exception `CreateDetector` documents: "When you don't
+/// specify any features, with an exception to RUNTIME_MONITORING, all the optional
+/// features are enabled by default"
+/// (`smithy_query(query="doc",shape="CreateDetector")`). RDS Protection is opt-in
+/// the same way: the recorded wire for a freshly created detector reports
+/// `dataSources.database.rds.databaseEvents` DISABLED while every other data source
+/// reports ENABLED.
+pub const OPT_IN_FEATURES: [&str; 2] = [FEATURE_RUNTIME_MONITORING, FEATURE_RDS_LOGIN_EVENTS];
+
+/// The three data sources GuardDuty always consumes for a detector — CloudTrail
+/// management events, VPC flow logs and DNS logs.
+///
+/// They are reported as features (`DetectorFeatureResult` carries `CLOUD_TRAIL`,
+/// `DNS_LOGS` and `FLOW_LOGS`, `smithy_query(shape="DetectorFeatureResult")`) but
+/// are NOT members of `DetectorFeature` and have no `DataSourceConfigurations`
+/// member, so no request can switch them off: they report `ENABLED` for the life of
+/// the detector.
+pub const FOUNDATIONAL_FEATURES: [&str; 3] =
+    [FEATURE_CLOUD_TRAIL, FEATURE_DNS_LOGS, FEATURE_FLOW_LOGS];
+
+/// Every feature a detector reports, in the order the service reports them: the
+/// three foundational sources first, in the order `DataSourceConfigurationsResult`
+/// lists them (`CloudTrail`, `DNSLogs`, `FlowLogs`), then every configurable
+/// [`DETECTOR_FEATURES`] member in `DetectorFeature` model order.
+///
+/// The list is a total order over a SET, so a client may index it positionally.
+pub fn reported_features() -> Vec<&'static str> {
+    FOUNDATIONAL_FEATURES
+        .iter()
+        .chain(DETECTOR_FEATURES.iter())
+        .copied()
+        .collect()
+}
 
 /// The current GuardDuty finding schema version, the value every finding carries
 /// in its required `SchemaVersion` member.
@@ -217,6 +266,12 @@ pub struct Detector {
     /// `DetectorStatus`: [`ENABLED`] or [`DISABLED`].
     pub status: String,
     pub service_role: String,
+    /// The Malware Protection service-linked role, which is a DIFFERENT role from
+    /// the detector-level [`Self::service_role`]:
+    /// `MalwareProtectionConfigurationResult.ServiceRole` is "The GuardDuty Malware
+    /// Protection service role"
+    /// (`smithy_query(shape="MalwareProtectionConfigurationResult")`).
+    pub malware_protection_service_role: String,
     pub finding_publishing_frequency: Option<String>,
     pub features: Vec<FeatureRecord>,
     pub tags: BTreeMap<String, String>,
@@ -239,25 +294,18 @@ impl Detector {
             .map_or(DISABLED, |f| f.status.as_str())
     }
 
-    /// A data source reports [`ENABLED`] only when the detector itself is enabled:
-    /// a disabled detector ingests nothing.
-    pub fn data_source_status(&self, feature: &str) -> String {
-        if self.status == ENABLED && self.feature_status(feature) == ENABLED {
-            ENABLED.to_string()
-        } else {
-            DISABLED.to_string()
-        }
-    }
-
-    /// The status the foundational data sources (CloudTrail management events, VPC
-    /// flow logs, DNS logs) report: they are always on for an enabled detector and
-    /// always off for a disabled one.
-    pub fn foundational_status(&self) -> String {
-        if self.status == ENABLED {
-            ENABLED.to_string()
-        } else {
-            DISABLED.to_string()
-        }
+    /// What one data source reports: the status of the feature that governs it and
+    /// the instant that feature's status last changed, in epoch milliseconds.
+    ///
+    /// The status is the feature's OWN status, never a function of the detector's
+    /// `Status` member: that member carries whether the detector is enabled, while
+    /// the feature and data-source views carry the configuration, which a detector
+    /// keeps across being disabled and enabled again.
+    pub fn data_source(&self, feature: &str) -> (String, i64) {
+        self.features.iter().find(|f| f.name == feature).map_or_else(
+            || (DISABLED.to_string(), self.updated_at_millis),
+            |f| (f.status.clone(), f.updated_at_millis),
+        )
     }
 
     /// Set one feature's status, recording `now` as its `UpdatedAt`. Adds the
@@ -676,16 +724,22 @@ pub fn paginate(
 }
 
 /// The feature set `CreateDetector` gives a detector when the request names no
-/// features: every `DetectorFeature` enabled except Runtime Monitoring. "When you
+/// features.
+///
+/// Every configurable feature is enabled except the [`OPT_IN_FEATURES`]: "When you
 /// don't specify any features, with an exception to RUNTIME_MONITORING, all the
 /// optional features are enabled by default"
-/// (`smithy_query(query="doc",shape="CreateDetector")`).
+/// (`smithy_query(query="doc",shape="CreateDetector")`). The three
+/// [`FOUNDATIONAL_FEATURES`] are not optional and are always enabled.
+///
+/// The records are created in [`reported_features`] order, which is the order a
+/// read reports them in.
 pub fn default_features(now: i64) -> Vec<FeatureRecord> {
-    DETECTOR_FEATURES
-        .iter()
+    reported_features()
+        .into_iter()
         .map(|name| FeatureRecord {
-            name: (*name).to_string(),
-            status: if *name == FEATURE_RUNTIME_MONITORING {
+            name: name.to_string(),
+            status: if OPT_IN_FEATURES.contains(&name) {
                 DISABLED.to_string()
             } else {
                 ENABLED.to_string()

@@ -22,6 +22,10 @@
 //! [`ComplianceInquiry::materialise`] applies from the stored due instant, so a reader
 //! only ever materialises a change the clock had already made due.
 //!
+//! An inquiry EXPORT is the second thing a caller creates: `ExportComplianceInquiry`
+//! produces a document from one inquiry, so each call mints an [`InquiryExport`] whose id
+//! the presigned URL it answers with carries.
+//!
 //! The CUSTOMER-AGREEMENT set is held the same way as the catalog, and for the same
 //! reason: the API has no operation that creates, accepts or terminates one — an
 //! account's agreements are
@@ -38,6 +42,7 @@ use smithy_server_runtime::Violation;
 use crate::ops::types::{
     ConflictException, CustomerAgreementSummary, InquiryDetail, InquirySummary, QuerySummary,
     ReportDetail, ReportSummary, ResourceNotFoundException, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The region a report ARN names when the request carries no SigV4 credential scope to
@@ -109,6 +114,30 @@ pub const INQUIRY_CAPACITY: usize = 1_000;
 /// bounded by count rather than expired on a span this emulator would be inventing.
 pub const INQUIRY_IDEMPOTENCY_CAPACITY: usize = 1_000;
 
+/// How many compliance-inquiry EXPORTS the store holds before the oldest is released.
+///
+/// `ExportComplianceInquiry` produces a new document on every call, so the records would
+/// otherwise grow without end. The same kind of emulator-owned bound as
+/// [`TERM_GRANT_CAPACITY`]: AWS publishes no quota on exports, and the oldest export is
+/// the one whose URL a caller is least likely to still be following, so it is released
+/// first rather than refusing the call.
+pub const INQUIRY_EXPORT_CAPACITY: usize = 1_000;
+
+/// The file name an exported compliance-inquiry report carries in its document URL.
+///
+/// A JSON document, and named one: AWS publishes the export as an opaque S3 object whose
+/// format the API does not state, and this emulator renders the one it CAN render from
+/// what it holds — the inquiry, its queries and their statuses. Nothing here claims a
+/// typeset report it did not produce.
+pub const INQUIRY_EXPORT_OBJECT: &str = "compliance-inquiry-report.json";
+
+/// The media type [`INQUIRY_EXPORT_OBJECT`] is served with.
+pub const INQUIRY_EXPORT_CONTENT_TYPE: &str = "application/json";
+
+/// `ValidationExceptionReason`'s value for a member whose value the service itself
+/// refused — what `fieldList` names the member in.
+pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
 /// How long after the create call an inquiry's processing is due to be over.
 ///
 /// AWS answers `CreateComplianceInquiry` with HTTP 202 and a `PROCESSING` inquiry, so
@@ -129,8 +158,12 @@ pub const INQUIRY_STATUS_FAILED: &str = "FAILED";
 /// `InquiryStatusMessage`'s value for an inquiry that is still being processed.
 pub const INQUIRY_MESSAGE_IN_PROGRESS: &str = "Compliance inquiry processing is in-progress.";
 
+/// `InquiryStatusMessage`'s value for an inquiry that is over and every query of which
+/// reached its terminal state without erroring.
+pub const INQUIRY_MESSAGE_COMPLETE: &str = "Compliance inquiry processing is complete.";
+
 /// `InquiryStatusMessage`'s value for an inquiry that is over with at least one query
-/// that did not yield a response.
+/// that failed.
 pub const INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS: &str =
     "Compliance inquiry processing is complete. One or more queries encountered errors \
      during processing.";
@@ -142,13 +175,19 @@ pub const INQUIRY_MESSAGE_INTERNAL_ERROR: &str =
 /// `QueryStatus`'s non-terminal value.
 pub const QUERY_STATUS_PROCESSING: &str = "PROCESSING";
 
-/// `QueryStatus`'s value for a query that did not yield a response.
+/// `QueryStatus`'s value for a query whose processing is over.
+pub const QUERY_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `QueryStatus`'s value for a query whose processing could not be performed.
 pub const QUERY_STATUS_FAILED: &str = "FAILED";
 
 /// `QueryStatusMessage`'s value for a query that is still being processed.
 pub const QUERY_MESSAGE_IN_PROGRESS: &str = "Query processing is in-progress.";
 
-/// `QueryStatusMessage`'s value for a query that did not yield a response.
+/// `QueryStatusMessage`'s value for a query whose processing is over.
+pub const QUERY_MESSAGE_COMPLETE: &str = "Query processing is complete.";
+
+/// `QueryStatusMessage`'s value for a query whose processing could not be performed.
 pub const QUERY_MESSAGE_INTERNAL_ERROR: &str =
     "An internal error occurred while processing the query. Try again at a later time.";
 
@@ -407,10 +446,11 @@ pub struct InquiryQuery {
     pub query: String,
     /// "Generated response to the query."
     ///
-    /// `None` until something generates one. NOTHING in this emulator does: a compliance
-    /// answer is model-generated text, and no such engine runs in-process, so a query
-    /// ends in its modelled failure status instead of carrying a response nothing
-    /// produced.
+    /// `None` until something generates one, and NOTHING in this emulator does: a
+    /// compliance answer is model-generated text and no such engine runs in-process, so
+    /// this member stays absent rather than carrying prose nothing produced. Its absence
+    /// is the honest signal; the query's own status still reports that its processing is
+    /// over, because the query itself was received and recorded.
     pub response: Option<String>,
     /// One of `ReviewType`'s values — the review the inquiry was submitted for.
     pub review_type: Option<String>,
@@ -477,16 +517,23 @@ impl ComplianceInquiry {
     /// instant. A no-op otherwise, and a no-op for an inquiry already terminal, so
     /// calling it on every read is idempotent.
     ///
-    /// The terminal status is the one the emulator can honestly report. No
-    /// response-generating engine runs in-process, so:
+    /// The terminal status is DERIVED from the queries': an inquiry is over when its
+    /// queries are, and the inquiry-level message says whether any of them errored.
     ///
-    /// * a TEXT inquiry's one query is enumerated (its text IS the submitted query) and
-    ///   then fails for want of a response, which is exactly the inquiry-level
-    ///   "processing is complete. One or more queries encountered errors" state the
-    ///   `InquiryStatusMessage` enum models;
+    /// * a TEXT inquiry's one query is enumerated — its text IS the submitted query, so
+    ///   nothing had to be read or generated to know it — and its processing is over at
+    ///   the due instant, so it reaches `COMPLETED` and the inquiry reaches the modelled
+    ///   clean-completion message. NO RESPONSE is reported for it: a compliance answer is
+    ///   model-generated text and no such engine runs in-process, so the `response` member
+    ///   stays absent (see [`InquiryQuery::response`]) rather than carrying prose nothing
+    ///   produced. The absent member is the honest signal, not a query-level error that
+    ///   never happened;
     /// * a FILE inquiry's queries would have to be read out of the uploaded document,
     ///   which this emulator does not parse, so its processing never got as far as a
-    ///   query and the inquiry ends in the modelled FAILED state instead.
+    ///   query and the inquiry ends in the modelled FAILED state instead;
+    /// * a query that did reach `FAILED` is what selects the inquiry-level
+    ///   "One or more queries encountered errors" message, so the two enum values are
+    ///   told apart by the queries rather than one of them being unreachable.
     pub fn materialise(&mut self, now: SystemTime) {
         let Some(due) = self.processing_due_at else {
             return;
@@ -499,15 +546,24 @@ impl ComplianceInquiry {
         // not the instant some caller happened to look.
         self.updated_at = due;
         for query in &mut self.queries {
-            query.status = QUERY_STATUS_FAILED.to_string();
-            query.status_message = QUERY_MESSAGE_INTERNAL_ERROR.to_string();
+            if query.status == QUERY_STATUS_PROCESSING {
+                query.status = QUERY_STATUS_COMPLETED.to_string();
+                query.status_message = QUERY_MESSAGE_COMPLETE.to_string();
+            }
         }
+        let any_query_failed = self
+            .queries
+            .iter()
+            .any(|query| query.status == QUERY_STATUS_FAILED);
         if self.queries.is_empty() {
             self.status = INQUIRY_STATUS_FAILED.to_string();
             self.status_message = INQUIRY_MESSAGE_INTERNAL_ERROR.to_string();
-        } else {
+        } else if any_query_failed {
             self.status = INQUIRY_STATUS_COMPLETED.to_string();
             self.status_message = INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS.to_string();
+        } else {
+            self.status = INQUIRY_STATUS_COMPLETED.to_string();
+            self.status_message = INQUIRY_MESSAGE_COMPLETE.to_string();
         }
     }
 
@@ -549,6 +605,68 @@ impl ComplianceInquiry {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
     }
+
+    /// The DOCUMENT `ExportComplianceInquiry` exports: this inquiry, and the queries
+    /// `covered` names, as the bytes a caller downloads from the URL that export
+    /// published.
+    ///
+    /// Every value in it is read off this stored record — the inquiry's metadata and its
+    /// queries with their statuses — so the document reports what the emulator holds and
+    /// nothing else. In particular a query carries the `response` it has, which is null
+    /// while nothing has generated one, rather than text no model wrote.
+    pub fn export_document(&self, covered: &[i32], include_citations: bool) -> Vec<u8> {
+        let queries: Vec<::serde_json::Value> = self
+            .queries
+            .iter()
+            .filter(|query| covered.contains(&query.identifier))
+            .map(|query| {
+                let mut entry = ::serde_json::json!({
+                    "queryIdentifier": query.identifier,
+                    "query": query.query,
+                    "response": query.response,
+                    "reviewType": query.review_type,
+                    "status": query.status,
+                    "statusMessage": query.status_message,
+                    "createdAt": rendered_timestamp(query.created_at),
+                });
+                if include_citations {
+                    // "When true, include citations in the exported document." A citation
+                    // cites the source a generated response drew on, so a query with no
+                    // response has none: the member is present and EMPTY rather than
+                    // filled with references nothing read.
+                    entry["citations"] = ::serde_json::json!([]);
+                }
+                entry
+            })
+            .collect();
+        let document = ::serde_json::json!({
+            "complianceInquiryId": self.id,
+            "arn": self.arn,
+            "name": self.name,
+            "status": self.status,
+            "statusMessage": self.status_message,
+            "supportMode": self.support_mode,
+            "inputSource": self.content.input_source(),
+            "createdAt": rendered_timestamp(self.created_at),
+            "updatedAt": rendered_timestamp(self.updated_at),
+            "includeCitations": include_citations,
+            "queryIdentifiers": covered,
+            "queries": queries,
+            "tags": self.tags,
+        });
+        // Pretty-printed: the document is what a caller downloads and reads, not a wire
+        // payload. A value that will not render leaves the document empty rather than
+        // half-written, which the download then reports as the server error it is.
+        ::serde_json::to_vec_pretty(&document).unwrap_or_default()
+    }
+}
+
+/// One timestamp as the service renders every `TimestampAttribute` on the wire — RFC 3339
+/// date-time, which is the `@timestampFormat` the model declares for them.
+fn rendered_timestamp(value: SystemTime) -> String {
+    ::aws_smithy_types::DateTime::from(value)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 /// What one remembered `CreateComplianceInquiry` `clientToken` replays: the inquiry the
@@ -558,6 +676,89 @@ impl ComplianceInquiry {
 pub struct InquiryCreateRecord {
     pub inquiry_id: String,
     pub fingerprint: String,
+}
+
+/// One export `ExportComplianceInquiry` produced: the document it minted for an inquiry,
+/// and the options it was exported under.
+///
+/// The record is what makes the presigned URL a locator for something this emulator
+/// persists rather than a string assembled per request: the URL carries the export's id,
+/// and this is the export that id names.
+#[derive(Debug, Clone)]
+pub struct InquiryExport {
+    /// The minted export id, which the document URL carries.
+    pub id: String,
+    /// The inquiry this document was exported from.
+    pub inquiry_id: String,
+    /// The `queryIdentifiers` the export covers, ascending and without repeats: the ones
+    /// the request named, or every query the inquiry owns when it named none.
+    pub query_identifiers: Vec<i32>,
+    /// `ExportComplianceInquiryRequest$includeCitations`, defaulted to false when the
+    /// request named no value.
+    pub include_citations: bool,
+    pub exported_at: SystemTime,
+    /// The exported document itself, as [`ComplianceInquiry::export_document`] rendered
+    /// it when this export was taken.
+    ///
+    /// Held rather than re-rendered on download, because an export is a SNAPSHOT: the
+    /// document a caller follows the URL to is the one the export produced, whatever has
+    /// become of the inquiry since.
+    pub document: Vec<u8>,
+}
+
+/// What a request to a published export-document URL names: the inquiry the document was
+/// exported from, the export that produced it, and the object being fetched.
+///
+/// The path is the one [`inquiry_export_url`] builds:
+/// `/compliance-inquiry/<inquiryId>/export/<exportId>/<object>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportDocumentTarget {
+    pub inquiry_id: String,
+    pub export_id: String,
+    pub object: String,
+}
+
+/// The export document a request path names, or `None` when the path is not one this
+/// service publishes.
+pub fn parse_export_document_path(path: &str) -> Option<ExportDocumentTarget> {
+    let rest = path.strip_prefix("/compliance-inquiry/")?;
+    let mut segments = rest.split('/');
+    let (Some(inquiry_id), Some("export"), Some(export_id), Some(object), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if inquiry_id.is_empty() || export_id.is_empty() || object.is_empty() {
+        return None;
+    }
+    Some(ExportDocumentTarget {
+        inquiry_id: inquiry_id.to_string(),
+        export_id: export_id.to_string(),
+        object: object.to_string(),
+    })
+}
+
+/// True when `host` is the hostname this service publishes its document URLs under —
+/// `<DOCUMENT_HOST>.<region>.amazonaws.com`, as [`inquiry_export_url`] builds it.
+///
+/// Recognising it is what routes a request to a URL this service HANDED OUT back to this
+/// service: the host's first label names no service, so the framework's route key cannot
+/// name one from it.
+pub fn is_document_host(host: &str) -> bool {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let Some(rest) = host
+        .strip_prefix(DOCUMENT_HOST)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return false;
+    };
+    rest.strip_suffix(".amazonaws.com")
+        .is_some_and(is_region_shaped)
 }
 
 /// Per-service state for com-amazonaws-artifact-artifact. A handler reaches it through [`service_state`].
@@ -595,6 +796,16 @@ pub struct ComAmazonawsArtifactArtifactState {
     /// gives `ListCustomerAgreements` the stable total order its pagination token
     /// indexes into.
     pub customer_agreements: BTreeMap<String, CustomerAgreement>,
+    /// Every document `ExportComplianceInquiry` has exported, keyed by its export id.
+    ///
+    /// A `BTreeMap` for the same reason as [`term_tokens`](Self::term_tokens): the ids
+    /// are minted from a monotonic counter in fixed-width hex, so the first entry is
+    /// always the oldest export, which is what lets
+    /// [`ComAmazonawsArtifactArtifactState::record_inquiry_export`] hold the map to
+    /// [`INQUIRY_EXPORT_CAPACITY`] without scanning it.
+    pub inquiry_exports: BTreeMap<String, InquiryExport>,
+    /// The counter export ids are minted from, so two exports never share an id.
+    pub inquiry_export_seq: u64,
 }
 
 impl Default for ComAmazonawsArtifactArtifactState {
@@ -608,6 +819,8 @@ impl Default for ComAmazonawsArtifactArtifactState {
             inquiry_create_tokens: BTreeMap::new(),
             inquiry_create_token_order: ::std::collections::VecDeque::new(),
             customer_agreements: seed_customer_agreements(),
+            inquiry_exports: BTreeMap::new(),
+            inquiry_export_seq: 0,
         }
     }
 }
@@ -717,6 +930,46 @@ impl ComAmazonawsArtifactArtifactState {
         );
         token
     }
+
+    /// Mint and persist one compliance-inquiry export, returning its id.
+    ///
+    /// Every call produces a NEW document — that is what exporting is — so the id is
+    /// fresh on every call and two exports of one inquiry are two records with two URLs.
+    /// The map is held to [`INQUIRY_EXPORT_CAPACITY`] by releasing the oldest export
+    /// first, so a caller exporting in a loop cannot grow it without end.
+    pub fn record_inquiry_export(
+        &mut self,
+        inquiry_id: &str,
+        query_identifiers: Vec<i32>,
+        include_citations: bool,
+        document: Vec<u8>,
+        now: SystemTime,
+    ) -> String {
+        while self.inquiry_exports.len() >= INQUIRY_EXPORT_CAPACITY {
+            if self.inquiry_exports.pop_first().is_none() {
+                break;
+            }
+        }
+        let id = loop {
+            self.inquiry_export_seq = self.inquiry_export_seq.wrapping_add(1);
+            let candidate = format!("export-{:016x}", self.inquiry_export_seq);
+            if !self.inquiry_exports.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        self.inquiry_exports.insert(
+            id.clone(),
+            InquiryExport {
+                id: id.clone(),
+                inquiry_id: inquiry_id.to_string(),
+                query_identifiers,
+                include_citations,
+                exported_at: now,
+                document,
+            },
+        );
+        id
+    }
 }
 
 /// The ARN of a report resource.
@@ -792,6 +1045,20 @@ pub fn report_document_url(
         version,
         &report.document_object,
         term_token,
+    )
+}
+
+/// The URL of the document one compliance-inquiry export produced.
+///
+/// Built from the stored export — the inquiry it was exported from and the export's own
+/// id — so each export of an inquiry has its own URL and the URL names the record it can
+/// be traced back to. As with [`report_document_url`], NO SigV4 signature is attached:
+/// this emulator does not sign documents, and a fabricated signature would claim a
+/// computation nothing performed.
+pub fn inquiry_export_url(region: &str, inquiry_id: &str, export_id: &str) -> String {
+    format!(
+        "https://{DOCUMENT_HOST}.{region}.amazonaws.com/compliance-inquiry/{inquiry_id}\
+         /export/{export_id}/{INQUIRY_EXPORT_OBJECT}"
     )
 }
 
@@ -1005,6 +1272,30 @@ pub fn invalid_token() -> ValidationException {
         field_list: None,
     }
 }
+
+/// The modelled `ValidationException` for a request whose `queryIdentifiers` name queries
+/// the targeted inquiry does not own.
+///
+/// The clause is built from the REQUEST — the member that carried the value and the
+/// requirement it failed — in the same validation envelope
+/// [`constraint_violation_message`] renders for a modelled constraint, and without
+/// echoing the refused identifiers back: the request already carried them.
+pub fn unknown_query_identifiers() -> ValidationException {
+    ValidationException {
+        message: format!("1 validation error detected: {UNKNOWN_QUERY_IDENTIFIER_MESSAGE}"),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "queryIdentifiers".to_string(),
+            message: UNKNOWN_QUERY_IDENTIFIER_MESSAGE.to_string(),
+        }]),
+    }
+}
+
+/// The clause [`unknown_query_identifiers`] states, in both the message and the
+/// `fieldList` entry: the member path and the requirement its value failed.
+pub const UNKNOWN_QUERY_IDENTIFIER_MESSAGE: &str =
+    "Value at 'queryIdentifiers' failed to satisfy constraint: every query identifier must \
+     name a query of the compliance inquiry";
 
 /// The `ValidationException` message every token refusal in this service states: a token
 /// (a `nextToken` or a `termToken`) this service did not issue is refused with this one

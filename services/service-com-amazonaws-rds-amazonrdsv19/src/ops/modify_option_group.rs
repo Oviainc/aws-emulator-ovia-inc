@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyOptionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyOptionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation adds options to, and removes them from, an option group
+//! this service's store holds. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyOptionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The group's record, the option-group option catalogue the added options are resolved
+//! against, and the projection onto the modelled `OptionGroup` wire shape live in
+//! [`crate::state`], shared with `CreateOptionGroup` and `DescribeOptionGroups`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,244 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyOptionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyOptionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyOptionGroupError::validation)?;
+        let name = input.option_group_name;
+        // The rule `OptionGroupName` shares with the other identifier members, at the
+        // bound `CreateOptionGroupMessage$OptionGroupName` publishes for a group name.
+        crate::state::check_identifier("OptionGroupName", &name, 255)
+            .map_err(ModifyOptionGroupError::validation)?;
+
+        let to_include = input.options_to_include.unwrap_or_default();
+        let to_remove = input.options_to_remove.unwrap_or_default();
+        // The length caps come FIRST, before any per-entry work: what this request
+        // costs is the product of the options it names and the settings each of them
+        // carries, and neither member publishes a bound of its own.
+        crate::state::check_option_list_len("OptionsToInclude", to_include.len())
+            .map_err(ModifyOptionGroupError::validation)?;
+        crate::state::check_option_list_len("OptionsToRemove", to_remove.len())
+            .map_err(ModifyOptionGroupError::validation)?;
+        for config in &to_include {
+            crate::state::check_option_list_len(
+                "OptionsToInclude.OptionSettings",
+                config.option_settings.as_ref().map_or(0, Vec::len),
+            )
+            .map_err(ModifyOptionGroupError::validation)?;
+        }
+        check_no_contradiction(&to_include, &to_remove)
+            .map_err(ModifyOptionGroupError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so
+        // it cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated option group.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope, and
+        // a name no stored group has is the modelled 404.
+        let Some(record) = store.option_groups.get_mut(&(region.clone(), name.clone())) else {
+            return Err(ModifyOptionGroupErrorModeled::OptionGroupNotFoundFault(
+                OptionGroupNotFoundFault {
+                    message: Some(format!("Specified OptionGroupName: {name} not found.")),
+                },
+            )
+            .into());
+        };
+
+        // Resolve EVERY change against the option catalogue before writing any of it,
+        // so a request this service refuses leaves the group exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyOptionGroup"))
+        // `InvalidOptionGroupStateFault` ("The option group isn't in the available
+        // state") is not raised here: this service's option groups carry no status and
+        // are never in a transient one, so the state it names does not arise.
+        let removals =
+            resolve_removals(record, &to_remove).map_err(ModifyOptionGroupError::validation)?;
+        let additions =
+            resolve_additions(record, &to_include).map_err(ModifyOptionGroupError::validation)?;
+
+        for option_name in removals {
+            record.options.remove(&option_name);
+        }
+        for option in additions {
+            record.options.insert(option.name.clone(), option);
+        }
+
+        // `ApplyImmediately` chooses whether the change reaches the DB instances the
+        // group is associated with now or in their next maintenance window. The GROUP
+        // itself changes either way, and this slice keeps no per-instance association,
+        // so the member is accepted and changes nothing about what is reported.
+        Ok(ModifyOptionGroupOutput {
+            option_group: Some(record.to_wire()),
+        })
     }
+}
+
+/// Refuse a request that names one option in both `OptionsToInclude` and
+/// `OptionsToRemove`: the two lists ask for opposite outcomes for that option, so there
+/// is no state that satisfies the request.
+///
+/// The removal names are folded into a set ONCE, so the check costs the sum of the two
+/// list lengths rather than their product.
+fn check_no_contradiction(
+    to_include: &[OptionConfiguration],
+    to_remove: &[String],
+) -> Result<(), String> {
+    let removing: std::collections::BTreeSet<String> = to_remove
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    for config in to_include {
+        if removing.contains(&config.option_name.to_ascii_lowercase()) {
+            return Err(format!(
+                "'{}' is named in both OptionsToInclude and OptionsToRemove: one request \
+                 can't both add and remove an option",
+                config.option_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The stored option names `OptionsToRemove` asks to drop, resolved against the group.
+///
+/// "Options in this list are removed from the option group." A name the group does not
+/// hold is a no-op: the group already is as the request asks for it, and no documented
+/// rule makes that a failure. A PERMANENT option is refused —
+/// `ModifyOptionGroupMessage$OptionGroupName`: "Permanent options, such as the TDE
+/// option for Oracle Advanced Security TDE, can't be removed from an option group".
+fn resolve_removals(
+    record: &crate::state::OptionGroupRecord,
+    to_remove: &[String],
+) -> Result<Vec<String>, String> {
+    let mut removals = Vec::new();
+    for requested in to_remove {
+        let Some(stored) = record
+            .options
+            .keys()
+            .find(|stored| stored.eq_ignore_ascii_case(requested))
+        else {
+            continue;
+        };
+        if crate::state::option_catalog::option_facts(&record.engine_name, stored)
+            .is_some_and(|facts| facts.permanent)
+        {
+            return Err(format!(
+                "invalid value '{stored}' for OptionsToRemove: a permanent option can't be \
+                 removed from an option group"
+            ));
+        }
+        removals.push(stored.clone());
+    }
+    Ok(removals)
+}
+
+/// The option records `OptionsToInclude` asks for, resolved against the catalogue.
+///
+/// "Options in this list are added to the option group or, if already present, the
+/// specified configuration is used to update the existing configuration" — so each
+/// entry starts from the option the group already holds, and a request that sets one
+/// setting keeps the values an earlier request set.
+///
+/// An option the group's engine does not publish, a setting the option does not
+/// publish, a setting the option publishes as not modifiable, and a setting carrying no
+/// value are each refused: the catalogue, not the request, says which options and
+/// settings exist.
+fn resolve_additions(
+    record: &crate::state::OptionGroupRecord,
+    to_include: &[OptionConfiguration],
+) -> Result<Vec<crate::state::OptionRecord>, String> {
+    let mut additions = Vec::new();
+    for config in to_include {
+        let Some(facts) =
+            crate::state::option_catalog::option_facts(&record.engine_name, &config.option_name)
+        else {
+            let published = crate::state::option_catalog::published_option_names(
+                &record.engine_name,
+            );
+            let published = if published.is_empty() {
+                "none".to_string()
+            } else {
+                published.join(", ")
+            };
+            return Err(format!(
+                "invalid value '{}' for OptionsToInclude.OptionName: engine '{}' publishes \
+                 no such option; its options are {published}",
+                config.option_name, record.engine_name
+            ));
+        };
+        let mut option = record.options.get(facts.name).cloned().unwrap_or_else(|| {
+            crate::state::OptionRecord {
+                // The catalogue's own spelling, whatever spelling the request used.
+                name: facts.name.to_string(),
+                ..crate::state::OptionRecord::default()
+            }
+        });
+        if let Some(port) = config.port {
+            option.port = Some(port);
+        }
+        if let Some(version) = &config.option_version {
+            crate::state::check_option_text("OptionsToInclude.OptionVersion", version)?;
+            option.version = Some(version.clone());
+        }
+        if let Some(memberships) = &config.db_security_group_memberships {
+            crate::state::check_security_group_memberships(
+                "OptionsToInclude.DBSecurityGroupMemberships",
+                memberships,
+            )?;
+            option.db_security_group_memberships = memberships.clone();
+        }
+        if let Some(memberships) = &config.vpc_security_group_memberships {
+            crate::state::check_security_group_memberships(
+                "OptionsToInclude.VpcSecurityGroupMemberships",
+                memberships,
+            )?;
+            option.vpc_security_group_memberships = memberships.clone();
+        }
+        // Only `Name` and `Value` of a settings entry are the caller's to give: every
+        // other member of `OptionSetting` — the default, the data type, the allowed
+        // values, whether it is modifiable — is catalogue data this service reports,
+        // so an entry carrying them is accepted and they are ignored.
+        for setting in config.option_settings.iter().flatten() {
+            let Some(setting_name) = &setting.name else {
+                return Err(format!(
+                    "an OptionsToInclude.OptionSettings entry for option '{}' carries no Name",
+                    facts.name
+                ));
+            };
+            let Some(published) = facts.setting(setting_name) else {
+                let names: Vec<&str> = facts.settings.iter().map(|s| s.name).collect();
+                let names = if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                };
+                return Err(format!(
+                    "invalid value '{setting_name}' for OptionsToInclude.OptionSettings.Name: \
+                     option '{}' publishes the settings {names}",
+                    facts.name
+                ));
+            };
+            if !published.is_modifiable {
+                return Err(format!(
+                    "the setting '{}' of option '{}' can't be modified from its default",
+                    published.name, facts.name
+                ));
+            }
+            let Some(value) = &setting.value else {
+                return Err(format!(
+                    "the OptionsToInclude.OptionSettings entry for '{}' carries no Value",
+                    published.name
+                ));
+            };
+            crate::state::check_option_text("OptionsToInclude.OptionSettings.Value", value)?;
+            option
+                .settings
+                .insert(published.name.to_string(), value.clone());
+        }
+        additions.push(option);
+    }
+    Ok(additions)
 }

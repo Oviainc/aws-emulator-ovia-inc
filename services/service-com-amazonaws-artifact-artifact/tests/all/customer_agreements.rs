@@ -67,10 +67,10 @@ struct Expected {
     agreement: &'static str,
     /// One of `AgreementType`'s values (`CUSTOM` | `DEFAULT` | `MODIFIED`).
     agreement_type: &'static str,
-    /// `effectiveStart`, in seconds since the Unix epoch — the form this emulator's
-    /// restJson1 serializer renders a `TimestampAttribute` in (as `ListReports` renders
-    /// a report's period).
-    effective_start: i64,
+    /// `effectiveStart`, as the wire carries it: `TimestampAttribute` is
+    /// `@timestampFormat("date-time")`, so an RFC 3339 date-time STRING — never the
+    /// restJson1 default of epoch seconds.
+    effective_start: &'static str,
     acceptance_terms: usize,
     terminate_terms: usize,
 }
@@ -84,7 +84,7 @@ const ACTIVE: &[Expected] = &[
         agreement: "AWS-BAA",
         agreement_type: "DEFAULT",
         // 2024-01-01T00:00:00Z
-        effective_start: 1_704_067_200,
+        effective_start: "2024-01-01T00:00:00Z",
         acceptance_terms: 2,
         terminate_terms: 1,
     },
@@ -94,7 +94,7 @@ const ACTIVE: &[Expected] = &[
         agreement: "AWS-GDPR-DPA",
         agreement_type: "MODIFIED",
         // 2024-07-01T00:00:00Z
-        effective_start: 1_719_792_000,
+        effective_start: "2024-07-01T00:00:00Z",
         acceptance_terms: 3,
         terminate_terms: 2,
     },
@@ -104,7 +104,7 @@ const ACTIVE: &[Expected] = &[
         agreement: "AWS-NDA",
         agreement_type: "CUSTOM",
         // 2025-01-01T00:00:00Z
-        effective_start: 1_735_689_600,
+        effective_start: "2025-01-01T00:00:00Z",
         acceptance_terms: 1,
         terminate_terms: 1,
     },
@@ -351,7 +351,7 @@ async fn every_active_agreement_is_projected_from_the_persisted_record() {
             actual["effectiveEnd"]
         );
         assert_eq!(
-            actual["effectiveStart"].as_i64(),
+            actual["effectiveStart"].as_str(),
             Some(expected.effective_start),
             "case {case:?}: expected effectiveStart {:?}, got {actual:?}",
             expected.effective_start
