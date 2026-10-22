@@ -15,7 +15,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_launchwizard_launchwizard::ops::types::WORKLOAD_STATUS_VALUES;
 
-use crate::deployment_lifecycle::{catalogue, create, create_body, first_pattern, Harness};
+use crate::deployment_lifecycle::{create, create_body, first_pattern};
+use crate::harness::{catalogue, Harness};
 
 /// The fixed message a DEPLOYMENT lookup failure carries. Launch Wizard's recorded
 /// wording; mirrored by `state::DEPLOYMENT_NOT_FOUND_MESSAGE`.
