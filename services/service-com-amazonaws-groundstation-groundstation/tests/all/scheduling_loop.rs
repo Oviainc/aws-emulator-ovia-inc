@@ -156,7 +156,7 @@ pub(crate) async fn send(
 /// A spectral config with every optional member set, so a response that echoes it back
 /// is comparable to the request verbatim (`polarization` carries a modelled default,
 /// which an omitted member would materialise).
-fn spectrum_config(center_mhz: f64, bandwidth_mhz: f64) -> Value {
+pub(crate) fn spectrum_config(center_mhz: f64, bandwidth_mhz: f64) -> Value {
     json!({
         "centerFrequency": {"value": center_mhz, "units": "MHz"},
         "bandwidth": {"value": bandwidth_mhz, "units": "MHz"},
@@ -181,7 +181,7 @@ pub(crate) fn antenna_uplink_config_data() -> Value {
 /// Source: `smithy_query(query="shape", shape="ConfigTypeData")` for the union's eight
 /// members and `shape="ConfigCapabilityType"` for the eight enum values — the mapping
 /// under test, so the table lists all of them, not only the two the issue cited.
-fn config_data_table(antenna_uplink_arn: &str) -> Vec<(&'static str, Value)> {
+pub(crate) fn config_data_table(antenna_uplink_arn: &str) -> Vec<(&'static str, Value)> {
     vec![
         (
             "antenna-downlink",

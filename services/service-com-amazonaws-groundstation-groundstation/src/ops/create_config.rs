@@ -182,8 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what say so.
             const ECHOED_TYPE: &str = "antenna-uplink";
 
-            let echoed = guard.config_by_arn(&echo.antenna_uplink_config_arn);
-            if echoed.is_none_or(|config| config.config_type != ECHOED_TYPE) {
+            if !guard.resolves_config(&echo.antenna_uplink_config_arn, Some(ECHOED_TYPE)) {
                 return Err(CreateConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         // This service's `CreateConfig` text names the capability the

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMissionProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMissionProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMissionProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,20 +155,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMissionProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMissionProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMissionProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMissionProfileErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        if !guard
+            .mission_profiles
+            .contains_key(&input.mission_profile_id)
+        {
+            return Err(
+                UpdateMissionProfileErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every config a profile wires up must exist, and a reference whose member names
+        // ONE config type must name a config of that type — the same rule the create is
+        // held to, applied to whichever of those members this update carries, so an
+        // update cannot leave a profile pointing at a config that is not there.
+        let mut referenced: Vec<(&String, Option<&str>)> = Vec::new();
+        if let Some(arn) = input.tracking_config_arn.as_ref() {
+            referenced.push((arn, Some("tracking")));
+        }
+        if let Some(arn) = input.telemetry_sink_config_arn.as_ref() {
+            referenced.push((arn, Some("telemetry-sink")));
+        }
+        for edge in input.dataflow_edges.iter().flatten() {
+            referenced.extend(edge.iter().map(|arn| (arn, None)));
+        }
+        for (arn, required_type) in referenced {
+            if !guard.resolves_config(arn, required_type) {
+                return Err(
+                    UpdateMissionProfileErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::config_reference_not_found_message(
+                                arn,
+                                required_type,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let stored = guard
+            .mission_profiles
+            .get_mut(&input.mission_profile_id)
+            .expect("the mission profile whose presence was just checked under this lock");
+
+        // Every member the request carries replaces the stored one; a member the request
+        // omits leaves the profile's value alone. The profile's id, ARN and region are
+        // its identity and no member of this request addresses them.
+        if let Some(name) = input.name {
+            stored.name = name;
+        }
+        if let Some(seconds) = input.contact_pre_pass_duration_seconds {
+            stored.contact_pre_pass_duration_seconds = Some(seconds);
+        }
+        if let Some(seconds) = input.contact_post_pass_duration_seconds {
+            stored.contact_post_pass_duration_seconds = Some(seconds);
+        }
+        if let Some(seconds) = input.minimum_viable_contact_duration_seconds {
+            stored.minimum_viable_contact_duration_seconds = seconds;
+        }
+        if let Some(edges) = input.dataflow_edges {
+            stored.dataflow_edges = edges;
+        }
+        if let Some(arn) = input.tracking_config_arn {
+            stored.tracking_config_arn = arn;
+        }
+        if let Some(arn) = input.telemetry_sink_config_arn {
+            stored.telemetry_sink_config_arn = Some(arn);
+        }
+        if let Some(key) = input.streams_kms_key {
+            stored.streams_kms_key = Some(key);
+        }
+        if let Some(role) = input.streams_kms_role {
+            stored.streams_kms_role = Some(role);
+        }
+
+        Ok(UpdateMissionProfileOutput {
+            mission_profile_id: Some(stored.mission_profile_id.clone()),
+        })
     }
 }

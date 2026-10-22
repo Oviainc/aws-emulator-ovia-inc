@@ -160,9 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     // This service's `GetConfig` text names the two `@httpLabel` path
                     // members of `GET /config/{configType}/{configId}`, id before type.
-                    message: Some(format!(
-                        "No config found with id {} and type {}",
-                        input.config_id, input.config_type
+                    message: Some(crate::state::config_not_found_message(
+                        &input.config_type,
+                        &input.config_id,
                     )),
                 })
             })?;
