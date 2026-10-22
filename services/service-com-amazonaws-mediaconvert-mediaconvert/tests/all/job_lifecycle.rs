@@ -820,8 +820,8 @@ async fn create_job_persists_its_input_and_get_job_reads_it_back() {
         );
         assert_eq!(
             created.string("/job/queue"),
-            case.queue,
-            "case {label:?}: expected Queue {:?}, got {}",
+            arn(&format!("queues/{}", case.queue)),
+            "case {label:?}: expected the ARN of queue {:?}, got {}",
             case.queue,
             created.body
         );

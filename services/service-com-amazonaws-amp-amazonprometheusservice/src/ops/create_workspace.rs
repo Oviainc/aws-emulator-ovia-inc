@@ -257,6 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_arn: input.kms_key_arn,
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
             delete_token: None,
+            // A workspace is created with the service's default configuration, which
+            // `DescribeWorkspaceConfiguration` reports until an
+            // `UpdateWorkspaceConfiguration` changes it.
+            configuration: crate::state::WorkspaceConfiguration::default(),
             // A new workspace has no logging configuration until
             // `CreateLoggingConfiguration` gives it one.
             logging_configuration: None,

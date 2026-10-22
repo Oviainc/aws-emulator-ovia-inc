@@ -24,6 +24,72 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETING: &str = "DELETING";
 
+/// `WorkspaceConfigurationStatusCode` values a workspace CONFIGURATION moves through
+/// here. Each is an entry of the modelled
+/// `com.amazonaws.amp#WorkspaceConfigurationStatusCode` enum, whose own documentation
+/// states the rule this crate enforces: `UPDATING` — "Workspace configuration is being
+/// updated. Update is disallowed until workspace configuration is ACTIVE and workspace
+/// status is ACTIVE."; `ACTIVE` — "Workspace configuration has been updated. Update is
+/// disallowed until workspace configuration is ACTIVE and workspace status is ACTIVE."
+/// The enum's third entry, `UPDATE_FAILED`, is never reported: nothing in this emulator
+/// fails a configuration update, so claiming that status would be a status for work that
+/// never ran. (`crate::ops::types::WORKSPACE_CONFIGURATION_STATUS_CODE_VALUES` carries
+/// the full list.)
+pub const CONFIG_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`CONFIG_STATUS_ACTIVE`].
+pub const CONFIG_STATUS_UPDATING: &str = "UPDATING";
+
+/// The retention period a workspace's configuration carries before any
+/// `UpdateWorkspaceConfiguration` sets one.
+///
+/// DOCUMENTED: Amazon Managed Service for Prometheus publishes "Data retention period"
+/// as a workspace quota with a default value of 150 days, so a workspace that nobody has
+/// configured still retains metrics for that long and `DescribeWorkspaceConfiguration`
+/// reports it. `WorkspaceConfigurationDescription$retentionPeriodInDays` is modelled
+/// `@range(min: 1)`, which this value satisfies.
+pub const DEFAULT_RETENTION_PERIOD_IN_DAYS: i32 = 150;
+
+/// The out-of-order sample window a workspace's configuration carries before any
+/// `UpdateWorkspaceConfiguration` sets one.
+///
+/// Amazon Managed Service for Prometheus rejects out-of-order samples unless a window
+/// is configured for them, so an unconfigured workspace's window is zero seconds —
+/// which is also the published lower bound of the modelled `@range(min: 0)` on
+/// `WorkspaceConfigurationDescription$outOfOrderTimeWindowInSeconds`. The member is
+/// reported rather than omitted because the workspace HAS a window from the moment it
+/// exists; a caller comparing it before and after an update reads a number either way.
+pub const DEFAULT_OUT_OF_ORDER_TIME_WINDOW_IN_SECONDS: i32 = 0;
+
+/// The rule-evaluation query offset a workspace's configuration carries before any
+/// `UpdateWorkspaceConfiguration` sets one.
+///
+/// `UpdateWorkspaceConfigurationRequest$ruleQueryOffsetInSeconds` documents what the
+/// member buys — "Specifies the duration in seconds to offset rule evaluation queries
+/// into the past. This allows ingested samples to be available before rule evaluation."
+/// — so a workspace nobody has configured offsets them by nothing, the published lower
+/// bound of the modelled `@range(min: 0)`. Reported for the same reason as
+/// [`DEFAULT_OUT_OF_ORDER_TIME_WINDOW_IN_SECONDS`].
+pub const DEFAULT_RULE_QUERY_OFFSET_IN_SECONDS: i32 = 0;
+
+/// How many label sets one workspace's configuration holds before
+/// `UpdateWorkspaceConfiguration` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// This emulator models neither Service Quotas nor an account's adjustments, so — like
+/// [`WORKSPACE_QUOTA`] — this is the emulator's OWN bound on the store rather than a
+/// claim about any account's limit. It is what stops one request's `limitsPerLabelSet`
+/// list growing a workspace's stored configuration without end; an update REPLACES the
+/// stored list, so nothing accumulates beyond this bound.
+pub const LABEL_SET_LIMITS_PER_WORKSPACE: usize = 1_000;
+
+/// The Prometheus metric-name label. `LimitsPerLabelSet$labelSet` documents the rule
+/// that goes with it: "If the label name is metric name label `__name__`, then the
+/// metric part of the name must conform to the following pattern:
+/// `[a-zA-Z_:][a-zA-Z0-9_:]*`" — so for this label name the VALUE is a metric name and
+/// is held to that pattern. Validated by `UpdateWorkspaceConfiguration`, because
+/// `LabelValue` is modelled with a length bound only.
+pub const METRIC_NAME_LABEL: &str = "__name__";
+
 /// `LoggingConfigurationStatusCode` values a rules-and-alerting logging configuration
 /// moves through here. Each is an entry of the modelled
 /// `com.amazonaws.amp#LoggingConfigurationStatusCode` enum, whose own documentation
@@ -44,12 +110,14 @@ pub const LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
 pub const LOGGING_CONFIGURATION_RESOURCE_TYPE: &str = "AWS::APS::LoggingConfiguration";
 
 /// How long a workspace stays in a transient status before the clock owes the next
-/// transition (`CREATING` -> `ACTIVE`, `DELETING` -> removed).
+/// transition (`CREATING` -> `ACTIVE`, `DELETING` -> removed, a workspace
+/// configuration's `UPDATING` -> `ACTIVE`).
 ///
 /// CHOSEN, not documented: Amazon Managed Service for Prometheus publishes no
-/// duration for either transition, so this is the emulator's own span — long enough
-/// that a caller acting straight after `CreateWorkspace`/`DeleteWorkspace` still
-/// observes the transient status and the state errors that go with it, short enough
+/// duration for any of these transitions, so this is the emulator's own span — long
+/// enough that a caller acting straight after
+/// `CreateWorkspace`/`DeleteWorkspace`/`UpdateWorkspaceConfiguration` still observes
+/// the transient status and the state errors that go with it, short enough
 /// that a workflow does not wait on it. Nothing sleeps for it: the due instant is
 /// stored and applied by [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`].
 pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
@@ -142,6 +210,9 @@ pub struct Workspace {
     /// deletion, so replaying that exact call stays idempotent rather than
     /// conflicting with the deletion it already started.
     pub delete_token: Option<String>,
+    /// What `DescribeWorkspaceConfiguration` reports and `UpdateWorkspaceConfiguration`
+    /// writes: the workspace's label set limits, retention period and sample windows.
+    pub configuration: WorkspaceConfiguration,
     /// This workspace's rules-and-alerting logging configuration, when it has one.
     ///
     /// `/workspaces/{workspaceId}/logging` names at most ONE such configuration per
@@ -149,6 +220,66 @@ pub struct Workspace {
     /// but the workspace — so it lives ON the workspace record: a workspace that goes
     /// away takes its logging configuration with it.
     pub logging_configuration: Option<LoggingConfiguration>,
+}
+
+/// One entry of a configuration's `limitsPerLabelSet`: a label set and the active time
+/// series limit enforced for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelSetLimit {
+    /// The label set, `labelName -> labelValue`. Sorted, so a describe reports one
+    /// stable order whatever order the request's `LabelSet` map was iterated in.
+    pub label_set: BTreeMap<String, String>,
+    /// `LimitsPerLabelSetEntry$maxSeries`, absent when the request set none.
+    pub max_series: Option<i64>,
+}
+
+/// One workspace's stored configuration — the record
+/// `WorkspaceConfigurationDescription` reports.
+#[derive(Debug, Clone)]
+pub struct WorkspaceConfiguration {
+    /// One of [`CONFIG_STATUS_ACTIVE`], [`CONFIG_STATUS_UPDATING`].
+    pub status_code: String,
+    /// `WorkspaceConfigurationStatus$statusReason` — "The reason for the current
+    /// status, if a reason is available". No status this emulator reports has one.
+    pub status_reason: Option<String>,
+    /// The label sets with an enforced active time series limit, in the order the
+    /// update that set them listed them.
+    pub limits_per_label_set: Vec<LabelSetLimit>,
+    /// Always present: a workspace retains metrics for some period from the moment it
+    /// exists ([`DEFAULT_RETENTION_PERIOD_IN_DAYS`] until an update changes it).
+    pub retention_period_in_days: i32,
+    /// Always present, for the same reason:
+    /// [`DEFAULT_OUT_OF_ORDER_TIME_WINDOW_IN_SECONDS`] until an update changes it.
+    pub out_of_order_time_window_in_seconds: i32,
+    /// Always present, for the same reason:
+    /// [`DEFAULT_RULE_QUERY_OFFSET_IN_SECONDS`] until an update changes it.
+    pub rule_query_offset_in_seconds: i32,
+    /// When the clock owes this configuration's move out of `UPDATING` back to
+    /// `ACTIVE`, if an update is pending.
+    pub status_due: Option<SystemTime>,
+    /// The `clientToken` of the `UpdateWorkspaceConfiguration` call that started the
+    /// update now pending, so replaying that exact call answers with the update it
+    /// already started instead of starting a second one. Forgotten when that update
+    /// settles, so it never speaks for a configuration that is no longer updating.
+    pub update_token: Option<String>,
+}
+
+impl Default for WorkspaceConfiguration {
+    /// The configuration a freshly created workspace carries: nothing is updating, no
+    /// label set limit is enforced, metrics are retained for the service's default
+    /// period, and neither sample window is offset.
+    fn default() -> Self {
+        Self {
+            status_code: CONFIG_STATUS_ACTIVE.to_string(),
+            status_reason: None,
+            limits_per_label_set: Vec::new(),
+            retention_period_in_days: DEFAULT_RETENTION_PERIOD_IN_DAYS,
+            out_of_order_time_window_in_seconds: DEFAULT_OUT_OF_ORDER_TIME_WINDOW_IN_SECONDS,
+            rule_query_offset_in_seconds: DEFAULT_RULE_QUERY_OFFSET_IN_SECONDS,
+            status_due: None,
+            update_token: None,
+        }
+    }
 }
 
 /// One stored rules-and-alerting logging configuration: every member
@@ -262,6 +393,14 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     pub fn materialize_due(&mut self, now: SystemTime) {
         let mut deleted: Vec<String> = Vec::new();
         for workspace in self.workspaces.values_mut() {
+            if workspace.configuration.status_due.is_some_and(|due| now >= due) {
+                workspace.configuration.status_due = None;
+                workspace.configuration.status_code = CONFIG_STATUS_ACTIVE.to_string();
+                workspace.configuration.status_reason = None;
+                // The token identified the update that just settled, so it stops
+                // standing for one: a later call carrying it is a new request.
+                workspace.configuration.update_token = None;
+            }
             if let Some(logging) = workspace.logging_configuration.as_mut() {
                 logging.materialize_due(now);
             }
@@ -419,6 +558,45 @@ pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a String>>(keys: I) -> Opti
         .map(String::as_str)
         .filter(|key| key.starts_with(RESERVED_TAG_KEY_PREFIX))
         .min()
+}
+
+/// The label set limits to STORE for a request's `limitsPerLabelSet`.
+///
+/// `LabelSet` is a map on the wire, so each entry's labels are kept sorted; the list
+/// itself keeps the request's order, which is the order a later describe reports.
+pub fn store_label_set_limits(limits: &[crate::ops::types::LimitsPerLabelSet]) -> Vec<LabelSetLimit> {
+    limits
+        .iter()
+        .map(|entry| LabelSetLimit {
+            label_set: entry
+                .label_set
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            max_series: entry.limits.max_series,
+        })
+        .collect()
+}
+
+/// The stored label set limits as the `LimitsPerLabelSetList` the wire shapes carry.
+/// Always a list, empty when no label set limit is enforced, so a reader sees `[]`
+/// rather than an absent member — the same choice [`tag_map`] makes for `TagMap`.
+pub fn label_set_limit_list(
+    limits: &[LabelSetLimit],
+) -> Vec<crate::ops::types::LimitsPerLabelSet> {
+    limits
+        .iter()
+        .map(|entry| crate::ops::types::LimitsPerLabelSet {
+            label_set: entry
+                .label_set
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            limits: crate::ops::types::LimitsPerLabelSetEntry {
+                max_series: entry.max_series,
+            },
+        })
+        .collect()
 }
 
 /// The stored configuration's status, as the modelled `LoggingConfigurationStatus` the
