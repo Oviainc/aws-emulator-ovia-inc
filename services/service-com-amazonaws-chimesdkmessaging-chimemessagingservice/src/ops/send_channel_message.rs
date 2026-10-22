@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendChannelMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendChannelMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendChannelMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! APPENDS a message to the stored channel named by `ChannelArn` and answers with the
+//! `MessageId` it minted, so `GetChannelMessage` and `ListChannelMessages` can read the
+//! same record back. A PERSISTENT message also advances the channel's
+//! `LastMessageTimestamp`, which `DescribeChannel` and `ListChannels` report.
+//!
+//! `Content` is modelled with no maximum length, and neither `MessageAttributes` nor its
+//! `StringValues` carries a modelled length, so a message larger than
+//! `crate::state::MAX_MESSAGE_BYTES`, or carrying more than
+//! `crate::state::MAX_MESSAGE_ATTRIBUTES` attributes or
+//! `crate::state::MAX_MESSAGE_ATTRIBUTE_VALUES` values in one of them, is REFUSED with
+//! the modelled `BadRequestException`: every stored message has to fit inside the
+//! channel's byte budget, or the store's memory bound would rest on the size of a
+//! request.
 //!
 //! ## Shape of an operation
 //!
@@ -129,10 +134,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `SendChannelMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#SendChannelMessage")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`GetChannelMessage` lists it) that this operation's own error list omits: a send to a
+// channel ARN that names no channel has to say the channel is not there, and answering
+// 400 would tell the caller its REQUEST was malformed when it was not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#SendChannelMessage",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum SendChannelMessageErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -190,20 +203,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendChannelMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendChannelMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendChannelMessage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendChannelMessageErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        if !CHANNEL_MESSAGE_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            return Err(bad_request(format!(
+                "Type must be one of {CHANNEL_MESSAGE_TYPE_VALUES:?}; got {:?}",
+                input.r#type
+            )));
+        }
+        if !CHANNEL_MESSAGE_PERSISTENCE_TYPE_VALUES.contains(&input.persistence.as_str()) {
+            return Err(bad_request(format!(
+                "Persistence must be one of {CHANNEL_MESSAGE_PERSISTENCE_TYPE_VALUES:?}; got {:?}",
+                input.persistence
+            )));
+        }
+        // Sub-channels exist only on elastic channels, which this slice does not serve;
+        // accepting the member would silently drop the routing it asks for.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(bad_request(format!(
+                "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+            )));
+        }
+        // `Content` carries no modelled maximum, and neither `MessageAttributes` nor its
+        // `StringValues` carries a modelled length, so this emulator caps what it will
+        // ACCEPT on all three: a stored message has to fit inside the channel's byte
+        // budget, or the store's memory bound would rest on the size of a request.
+        if let Some(attributes) = &input.message_attributes {
+            if attributes.len() > crate::state::MAX_MESSAGE_ATTRIBUTES {
+                return Err(bad_request(format!(
+                    "MessageAttributes carries {} entries; this emulator accepts at most {}",
+                    attributes.len(),
+                    crate::state::MAX_MESSAGE_ATTRIBUTES
+                )));
+            }
+            for (name, value) in attributes {
+                let values = value.string_values.as_ref().map_or(0, Vec::len);
+                if values > crate::state::MAX_MESSAGE_ATTRIBUTE_VALUES {
+                    return Err(bad_request(format!(
+                        "MessageAttributes entry {name:?} carries {values} StringValues; this emulator accepts at most {}",
+                        crate::state::MAX_MESSAGE_ATTRIBUTE_VALUES
+                    )));
+                }
+            }
+        }
+        let request_bytes = crate::state::message_bytes(
+            &input.content,
+            input.metadata.as_deref(),
+            input.content_type.as_deref(),
+            input.message_attributes.as_ref(),
+            input.target.as_deref(),
+        );
+        if request_bytes > crate::state::MAX_MESSAGE_BYTES {
+            return Err(bad_request(format!(
+                "the message would retain {request_bytes} bytes for its Content, Metadata, ContentType, MessageAttributes and Target; this emulator's per-message retention budget is {}",
+                crate::state::MAX_MESSAGE_BYTES
+            )));
+        }
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        // Minted before the channel is borrowed, because the counter it draws lives on
+        // the store itself.
+        let minted_id = store.mint_id(&input.channel_arn);
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            SendChannelMessageErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+
+        // A replayed @idempotencyToken answers with the message the first send appended,
+        // rather than appending a second copy of it.
+        if let Some(message_id) = channel.message_idempotency.get(&input.client_request_token) {
+            let existing = channel.message(message_id).ok_or_else(|| {
+                SendChannelMessageErrorModeled::ServiceFailureException(ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some(format!(
+                        "the idempotency record for message {message_id} has no message"
+                    )),
+                })
+            })?;
+            return Ok(SendChannelMessageOutput {
+                channel_arn: Some(input.channel_arn.clone()),
+                message_id: Some(existing.message_id.clone()),
+                status: Some(existing.status_structure()),
+                sub_channel_id: None,
+            });
+        }
+
+        let message = crate::state::ChannelMessageRecord {
+            message_id: minted_id,
+            content: input.content,
+            content_type: input.content_type,
+            metadata: input.metadata,
+            r#type: input.r#type,
+            persistence: input.persistence,
+            created_millis: now,
+            last_updated_millis: now,
+            // Nothing has edited the message, so it carries no edit time yet.
+            last_edited_millis: None,
+            sender: crate::state::identity_of(&input.chime_bearer),
+            redacted: false,
+            status: "SENT".to_string(),
+            message_attributes: input.message_attributes,
+            target: input.target,
+        };
+        let message_id = message.message_id.clone();
+        let status = message.status_structure();
+        // Only a PERSISTENT message is kept for a channel's members to read later, so
+        // only a PERSISTENT message moves the channel's last-message time.
+        if message.persistence == "PERSISTENT" {
+            channel.last_message_millis = Some(now);
+        }
+        // `append_message` is what keeps the channel's messages and its per-channel
+        // idempotency records inside their caps, evicting oldest-first.
+        channel.append_message(message, input.client_request_token);
+
+        Ok(SendChannelMessageOutput {
+            channel_arn: Some(input.channel_arn),
+            message_id: Some(message_id),
+            status: Some(status),
+            sub_channel_id: None,
+        })
     }
+}
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> SendChannelMessageError {
+    SendChannelMessageErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

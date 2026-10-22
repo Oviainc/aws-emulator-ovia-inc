@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannelMessages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannelMessages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannelMessages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over a channel's stored messages, newest first by default, honouring
+//! `max-results`, `sort-order`, `not-before` / `not-after` and an opaque `next-token`
+//! that resumes the same ordered view. Reporting only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -115,10 +110,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `ListChannelMessagesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#ListChannelMessages")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`GetChannelMessage` lists it) that this operation's own error list omits: listing a
+// channel ARN that names no channel has to say the channel is not there, rather than
+// answering an empty page that reads as "this channel has no messages".
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#ListChannelMessages",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListChannelMessagesErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -175,20 +178,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannelMessages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelMessagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannelMessages"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListChannelMessagesErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // "Default is Descending, based on time created" — the model's own `SortOrder`
+        // documentation for this operation.
+        let sort_order = input
+            .sort_order
+            .unwrap_or_else(|| "DESCENDING".to_string());
+        if !SORT_ORDER_VALUES.contains(&sort_order.as_str()) {
+            return Err(bad_request(format!(
+                "SortOrder must be one of {SORT_ORDER_VALUES:?}; got {sort_order:?}"
+            )));
+        }
+        // Sub-channels exist only on elastic channels, which this slice does not serve.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(bad_request(format!(
+                "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+            )));
+        }
+        // `MaxResults` is modelled `range 1..50`; an omitted page size takes that
+        // maximum, so a caller that asks for no size still gets a bounded page.
+        let requested = input.max_results.unwrap_or(MAX_RESULTS_MAX);
+        if !(1..=MAX_RESULTS_MAX).contains(&requested) {
+            return Err(bad_request(format!(
+                "MaxResults must be between 1 and {MAX_RESULTS_MAX}; got {requested}"
+            )));
+        }
+        let page_size = usize::try_from(requested).unwrap_or(0);
+
+        let not_before = input.not_before.as_ref().map(crate::state::millis_of);
+        let not_after = input.not_after.as_ref().map(crate::state::millis_of);
+
+        let store = state.lock();
+        let channel = store.channels.get(&input.channel_arn).ok_or_else(|| {
+            ListChannelMessagesErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+
+        // The stored order IS ascending `CreatedTimestamp`, because messages are
+        // appended as they are accepted; DESCENDING is that view reversed. The
+        // `not-before` / `not-after` bounds are inclusive, as a starting and ending
+        // timestamp.
+        let mut view: Vec<&crate::state::ChannelMessageRecord> = channel
+            .messages
+            .iter()
+            .filter(|m| not_before.is_none_or(|bound| m.created_millis >= bound))
+            .filter(|m| not_after.is_none_or(|bound| m.created_millis <= bound))
+            .collect();
+        if sort_order == "DESCENDING" {
+            view.reverse();
+        }
+
+        // A `NextToken` names the last message of the previous page, so this page
+        // resumes at the one after it in THIS ordered view and can never repeat or skip
+        // an entry.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_next_token(token)
+                    .ok_or_else(|| bad_request("NextToken is not a token this service issued".to_string()))?;
+                view.iter()
+                    .position(|m| m.message_id == cursor)
+                    .ok_or_else(|| {
+                        bad_request(
+                            "NextToken does not resume this view: the message it names is no longer in it"
+                                .to_string(),
+                        )
+                    })?
+                    + 1
+            }
+        };
+
+        let page: Vec<&crate::state::ChannelMessageRecord> =
+            view.iter().skip(start).take(page_size).copied().collect();
+        let next_token = (start + page.len() < view.len())
+            .then(|| page.last().map(|m| crate::state::encode_next_token(&m.message_id)))
+            .flatten();
+
+        Ok(ListChannelMessagesOutput {
+            channel_arn: Some(channel.arn.clone()),
+            next_token,
+            channel_messages: Some(page.iter().map(|m| m.to_summary()).collect()),
+            // Sub-channels are not served, so no sub-channel is echoed back.
+            sub_channel_id: None,
+        })
     }
+}
+
+/// `MaxResults`'s modelled upper bound for this operation (`range 1..50`).
+const MAX_RESULTS_MAX: i32 = 50;
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> ListChannelMessagesError {
+    ListChannelMessagesErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

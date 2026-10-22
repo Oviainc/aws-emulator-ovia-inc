@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Pagination cursors are hex-encoded, and so are the ids minted below.
+hex = { workspace = true }
+# SHA-256 is what mints a channel id / message id from a counter and the clock.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` so a test can await `tokio::time::sleep` instead of blocking the runtime.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

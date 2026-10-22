@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a channel under the request's `AppInstanceArn` and PERSISTS it in
+//! [`crate::state::ComAmazonawsChimesdkmessagingChimemessagingserviceState::channels`],
+//! so `DescribeChannel`, `ListChannels`, `SendChannelMessage` and `DeleteChannel` all
+//! see the same record. Replaying the same `ClientRequestToken` answers with the ARN the
+//! first call minted.
+//!
+//! `MemberArns` and `ModeratorArns` are REFUSED rather than accepted: channel
+//! memberships and moderators are resources of their own and every operation that
+//! creates or reads them is still a 501, so accepting them would answer 201 for work
+//! nothing performed.
+//!
+//! `ExpirationSettings` is persisted and reported by `DescribeChannel`, which is the
+//! provisioning half of the feature; the automatic deletion that interval owes is NOT
+//! implemented here, and belongs with `PutChannelExpirationSettings` (still a 501) and
+//! its own gap issue. `ElasticChannelConfiguration` is persisted and reported the same
+//! way, and is likewise provisioning ONLY: nothing in this slice serves elastic
+//! behaviour, so `SubChannelId` is refused on send/get/list and `ListSubChannels` is
+//! still a 501. A 201 for a channel carrying it is not a claim of elastic support.
 //!
 //! ## Shape of an operation
 //!
@@ -188,20 +198,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChannelErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // `Mode` and `Privacy` default to what the Chime SDK Messaging model documents
+        // for an omitted member: an unrestricted, publicly discoverable channel.
+        let mode = input.mode.unwrap_or_else(|| "UNRESTRICTED".to_string());
+        if !CHANNEL_MODE_VALUES.contains(&mode.as_str()) {
+            return Err(bad_request(format!(
+                "Mode must be one of {CHANNEL_MODE_VALUES:?}; got {mode:?}"
+            )));
+        }
+        let privacy = input.privacy.unwrap_or_else(|| "PUBLIC".to_string());
+        if !CHANNEL_PRIVACY_VALUES.contains(&privacy.as_str()) {
+            return Err(bad_request(format!(
+                "Privacy must be one of {CHANNEL_PRIVACY_VALUES:?}; got {privacy:?}"
+            )));
+        }
+
+        // Channel memberships and moderators are resources of their own, created by
+        // `CreateChannelMembership` / `CreateChannelModerator` and read back by
+        // `ListChannelMemberships` / `ListChannelModerators` — every one of which is
+        // still a 501 in this emulator. Accepting these members would answer 201 for
+        // memberships nothing created and no caller could observe, so the request is
+        // refused instead, the same way `SubChannelId` is.
+        if let Some(member_arns) = &input.member_arns {
+            return Err(bad_request(format!(
+                "MemberArns is not supported: this emulator does not serve channel memberships yet, so the {} member ARN(s) in the request would not be added to the channel",
+                member_arns.len()
+            )));
+        }
+        if let Some(moderator_arns) = &input.moderator_arns {
+            return Err(bad_request(format!(
+                "ModeratorArns is not supported: this emulator does not serve channel moderators yet, so the {} moderator ARN(s) in the request would not be added to the channel",
+                moderator_arns.len()
+            )));
+        }
+
+        let idempotency_key = (
+            input.app_instance_arn.clone(),
+            input.client_request_token.clone(),
+        );
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // A replayed @idempotencyToken answers with the result the first request
+        // produced, rather than minting a second channel.
+        if let Some(first) = store.remembered_channel(&idempotency_key) {
+            return Ok(CreateChannelOutput {
+                channel_arn: Some(first.clone()),
+            });
+        }
+
+        // The channel's own id: the caller's `ChannelId` when given, else one this
+        // service mints, exactly as the model documents.
+        let channel_id = match input.channel_id {
+            Some(channel_id) => channel_id,
+            None => store.mint_id(&input.app_instance_arn),
+        };
+        let arn = format!("{}/channel/{channel_id}", input.app_instance_arn);
+        let arn_length = arn.chars().count();
+        if arn_length > CHIME_ARN_MAX_LENGTH {
+            return Err(bad_request(format!(
+                "the channel ARN derived from AppInstanceArn and ChannelId is {arn_length} characters, over the {CHIME_ARN_MAX_LENGTH}-character ChimeArn limit"
+            )));
+        }
+        if store.channels.contains_key(&arn) {
+            return Err(CreateChannelErrorModeled::ConflictException(ConflictException {
+                code: Some("Conflict".to_string()),
+                message: Some(format!("a channel already exists at {arn}")),
+            })
+            .into());
+        }
+        // `DeleteChannel` is the only way a channel leaves the store and calling it is
+        // the caller's option, so the store carries a cap of its own; past it this is a
+        // quota refusal, which is the modelled error for exceeding a resource limit.
+        if store.channels.len() >= crate::state::MAX_STORED_CHANNELS {
+            return Err(CreateChannelErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    code: Some("ResourceLimitExceeded".to_string()),
+                    message: Some(format!(
+                        "this emulator stores at most {} channels at once; delete a channel before creating another",
+                        crate::state::MAX_STORED_CHANNELS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.channels.insert(
+            arn.clone(),
+            crate::state::ChannelRecord {
+                arn: arn.clone(),
+                app_instance_arn: input.app_instance_arn,
+                channel_id,
+                name: input.name,
+                mode,
+                privacy,
+                metadata: input.metadata,
+                created_by: crate::state::identity_of(&input.chime_bearer),
+                created_millis: now,
+                last_updated_millis: now,
+                // No message has been sent yet, so the channel has no last-message time.
+                last_message_millis: None,
+                elastic_channel_configuration: input.elastic_channel_configuration,
+                expiration_settings: input.expiration_settings,
+                tags: input.tags.unwrap_or_default(),
+                messages: Vec::new(),
+                message_idempotency: std::collections::HashMap::new(),
+            },
+        );
+        store.remember_channel(idempotency_key, arn.clone());
+
+        Ok(CreateChannelOutput {
+            channel_arn: Some(arn),
+        })
     }
+}
+
+/// `ChimeArn`'s modelled maximum length, which the derived channel ARN must respect.
+const CHIME_ARN_MAX_LENGTH: usize = 1600;
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> CreateChannelError {
+    CreateChannelErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }
