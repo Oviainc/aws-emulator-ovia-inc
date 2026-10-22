@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomainEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomainEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomainEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomainEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomainEntry"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the entry it removes lives in the zone the request
+        // names, whose own location the store already holds.
+        let _ = ctx;
+
+        // `domainName` and `domainEntry` are modelled `@required` members, so the
+        // centralized walk refused an absent one before this body ran. Every
+        // member INSIDE `DomainEntry` is optional in the model, so WHICH entry of
+        // the zone the request addresses is worked out here, BEFORE the first
+        // write, from the handles the request carries: the server-assigned id —
+        // "The ID of the domain recordset entry" — and the name, type and target
+        // triple that identifies a recordset inside a zone. A `domainEntry`
+        // carrying neither names no recordset at all, which is a refusal and not
+        // a delete of nothing.
+        let domain_name = input.domain_name;
+        let requested = input.domain_entry;
+        let address = Address::of(&requested)?;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The lookup runs against the immutably borrowed zone first, so a
+            // request resolving to no entry removes nothing and logs nothing.
+            let (location, position) = {
+                let domain = store
+                    .domain(&domain_name)
+                    .ok_or_else(|| not_found(&domain_name))?;
+                let position = address
+                    .position_in(domain)
+                    .ok_or_else(|| address.operation_failure(&domain_name))?;
+                (domain.location.clone(), position)
+            };
+
+            // The addressed entry leaves the zone; every other entry keeps its own
+            // place in it, which is why this is a removal at `position` rather
+            // than a rebuilt list.
+            store
+                .domain_mut(&domain_name)
+                .ok_or_else(|| not_found(&domain_name))?
+                .entries
+                .remove(position);
+
+            // The entry is out of the zone as this call returns — a `DomainEntry`
+            // carries no status member, so there is nothing for the clock to
+            // settle later — which is why the operation it logs is answered
+            // terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_DOMAIN_ENTRY,
+                crate::state::RESOURCE_TYPE_DOMAIN,
+                &domain_name,
+                &location,
+                None,
+            );
+            Ok(DeleteDomainEntryOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The handles a `domainEntry` carries on an entry of a zone.
+///
+/// A stored entry has TWO of them, and a request may carry either or both:
+///
+/// * the server-assigned `DomainEntry$id`, the handle this service minted for the
+///   entry and reports on every read of the zone; and
+/// * the recordset itself — the name, type and target — which identifies one
+///   entry of a zone, because no two entries of a zone hold the same triple (the
+///   rule `CreateDomainEntry` refuses a duplicate by, through the crate's shared
+///   [`crate::state::is_same_domain_entry`]).
+///
+/// So a request resolves to the entry EITHER handle it carries names, the id's
+/// when the zone holds that id: whatever a caller has of the entry it read back
+/// addresses it. A `domainEntry` carrying neither handle names no recordset, and
+/// one whose handles name no entry of the zone — an entry already deleted, say —
+/// has nothing to remove, so the delete cannot execute.
+struct Address {
+    id: Option<String>,
+    recordset: Option<Recordset>,
+}
+
+/// The name, type and target a `domainEntry` carried, when it carried all three.
+struct Recordset {
+    name: String,
+    entry_type: String,
+    target: String,
+}
+
+impl Address {
+    /// The handles `requested` carries, or a 400 refusal: a `domainEntry` carrying
+    /// neither an id nor a whole recordset triple addresses no entry at all.
+    fn of(requested: &DomainEntry) -> Result<Self, DeleteDomainEntryError> {
+        let id = value(requested.id.as_deref());
+        let recordset = match (
+            value(requested.name.as_deref()),
+            value(requested.r#type.as_deref()),
+            value(requested.target.as_deref()),
+        ) {
+            (Some(name), Some(entry_type), Some(target)) => Some(Recordset {
+                name,
+                entry_type,
+                target,
+            }),
+            _ => None,
+        };
+        if id.is_none() && recordset.is_none() {
+            return Err(invalid(
+                "domainEntry addresses no entry to delete: carry domainEntry.id, or \
+                 domainEntry.name, domainEntry.type and domainEntry.target together"
+                    .to_string(),
+            ));
+        }
+        Ok(Self { id, recordset })
+    }
+
+    /// Where in `domain`'s entry list the addressed entry sits, if the zone holds
+    /// an entry either handle names.
+    fn position_in(&self, domain: &crate::state::StoredDomain) -> Option<usize> {
+        let by_id = self.id.as_deref().and_then(|id| {
+            domain
+                .entries
+                .iter()
+                .position(|entry| entry.id.as_deref() == Some(id))
+        });
+        by_id.or_else(|| {
+            let recordset = self.recordset.as_ref()?;
+            domain.entries.iter().position(|entry| {
+                crate::state::is_same_domain_entry(
+                    entry,
+                    &recordset.name,
+                    &recordset.entry_type,
+                    &recordset.target,
+                )
+            })
+        })
+    }
+
+    /// The zone holds no entry either handle names, so there is no recordset for
+    /// this delete to remove and the operation cannot execute: the modelled
+    /// `OperationFailureException` — HTTP 400, "Lightsail throws this exception
+    /// when an operation fails to execute" — with a message naming every handle
+    /// the request carried and the zone they were looked for in.
+    ///
+    /// NOT the crate's `DoesNotExist` envelope: that one answers a request naming
+    /// a RESOURCE the account does not hold (a zone, an instance, a bucket), and a
+    /// recordset entry is not a resource of the modelled `ResourceType` enum but a
+    /// row inside one — so a delete that finds none fails as an operation, which
+    /// is what the recorded endpoint answers a repeated delete with.
+    fn operation_failure(&self, domain_name: &str) -> DeleteDomainEntryError {
+        let mut addressed = Vec::new();
+        if let Some(id) = &self.id {
+            addressed.push(id.clone());
+        }
+        if let Some(recordset) = &self.recordset {
+            addressed.push(format!(
+                "{} of type {} with target {}",
+                recordset.name, recordset.entry_type, recordset.target
+            ));
+        }
+        DeleteDomainEntryErrorModeled::OperationFailureException(OperationFailureException {
+            // The body's `code` is what a Lightsail client branches on to tell
+            // "already gone" apart from a transport failure (see
+            // `crate::scaffolded`, where the same constant carries the recorded
+            // Lightsail `DoesNotExist` envelope): the recordset this delete was
+            // to remove is not in the zone, so that is the code it answers.
+            code: Some(crate::scaffolded::DOES_NOT_EXIST_CODE.to_string()),
+            message: Some(format!(
+                "No such domain record: the domain entry {} does not exist in the \
+                 Domain {domain_name}",
+                addressed.join(", nor ")
+            )),
+            // `docs` and `tip` are members this service fills from its own
+            // catalogue of failures, and no recorded response shows what it puts
+            // there for this one — so they are left absent rather than invented.
+            ..Default::default()
+        })
+        .into()
+    }
+}
+
+/// The value of an optional `DomainEntry` member, or `None` when it carries
+/// nothing a DNS zone could be addressed by — absent, or blank.
+fn value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> DeleteDomainEntryError {
+    DeleteDomainEntryErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No domain recordset of that name is stored, so there is no zone whose entries
+/// could be deleted: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(name: &str) -> DeleteDomainEntryError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_DOMAIN, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteDomainEntryError {
+    DeleteDomainEntryErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail domain store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

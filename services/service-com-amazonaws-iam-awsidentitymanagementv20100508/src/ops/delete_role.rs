@@ -229,10 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policies, attached managed policies, instance profile" — a role that still
         // holds one is NOT deleted, and the caller is told what blocks it with the
         // modelled `DeleteConflictException` ("attempted to delete a resource that has
-        // attached subordinate entities"). Managed policies (`AttachRolePolicy`) and
-        // inline policies (`PutRolePolicy`) are what a role can hold today; an
-        // instance profile is not attachable to a role in this emulator yet, so it
-        // cannot block a delete until the operation that attaches one lands.
+        // attached subordinate entities"). Managed policies (`AttachRolePolicy`),
+        // inline policies (`PutRolePolicy`) and instance profiles
+        // (`AddRoleToInstanceProfile`) are what can hold a role today, and each of them
+        // blocks the delete until the caller removes it.
         let attached = store
             .role_attached_policies
             .get(&key)
@@ -241,7 +241,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .role_inline_policies
             .get(&key)
             .map_or(0, ::std::collections::BTreeMap::len);
-        if attached > 0 || embedded > 0 {
+        let profiles = store.instance_profiles_holding_role(&key);
+        if attached > 0 || embedded > 0 || !profiles.is_empty() {
             // Only the kinds that actually hold the role back are named, so the
             // message says what the caller has to remove and nothing else, and each
             // clause agrees in number with its own count.
@@ -256,6 +257,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 blockers.push(format!(
                     "{embedded} inline {} must be deleted",
                     if embedded == 1 { "policy" } else { "policies" }
+                ));
+            }
+            if !profiles.is_empty() {
+                blockers.push(format!(
+                    "the role must be removed from instance {} {}",
+                    if profiles.len() == 1 {
+                        "profile"
+                    } else {
+                        "profiles"
+                    },
+                    profiles.join(", ")
                 ));
             }
             return Err(DeleteRoleErrorModeled::DeleteConflictException(

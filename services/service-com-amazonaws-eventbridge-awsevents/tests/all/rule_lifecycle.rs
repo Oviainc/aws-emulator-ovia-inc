@@ -857,7 +857,7 @@ async fn put_events_reports_one_outcome_per_entry() {
         ),
         (
             json!({ "Source": "com.demo.widgets", "DetailType": "Order Created", "Detail": "   " }),
-            None,
+            Some("MalformedDetail"),
         ),
         (
             json!({ "Source": "com.demo.widgets", "DetailType": "Order Created", "Detail": "not json" }),
@@ -1241,8 +1241,8 @@ async fn targets_upsert_by_id_and_page_in_insertion_order() {
         "expected ValidationException for a forged NextToken, got {body}"
     );
 
-    // A target whose Arn is not an ARN is a per-entry failure, and is NOT
-    // stored; the entries beside it still land.
+    // A target whose Arn is not an ARN refuses the WHOLE request: nothing it
+    // asked for is stored, including the well-formed entry beside it.
     let (status, body) = call(
         &emulator,
         "PutTargets",
@@ -1255,21 +1255,19 @@ async fn targets_upsert_by_id_and_page_in_insertion_order() {
         }),
     )
     .await;
-    assert_eq!(status, 200, "PutTargets answered {status} {body}");
     assert_eq!(
-        body["FailedEntryCount"],
-        json!(1),
-        "expected FailedEntryCount 1 for one malformed target ARN, got {body}"
+        status, 400,
+        "expected HTTP 400 for a target Arn that is not an ARN, got {status} {body}"
     );
     assert_eq!(
-        body["FailedEntries"][0]["TargetId"],
-        json!("t5"),
-        "expected the failed entry to name the target that failed, got {body}"
+        error_code(&body),
+        "ValidationException",
+        "expected ValidationException for a target Arn that is not an ARN, got {body}"
     );
     let ids = target_ids(&emulator, rule, None).await;
     assert_eq!(
         ids, expected,
-        "a failed target entry must not be stored, got {ids:?}"
+        "a refused PutTargets must store nothing, got {ids:?}"
     );
 
     // The rule's own quota is checked against the rule, not the request.
