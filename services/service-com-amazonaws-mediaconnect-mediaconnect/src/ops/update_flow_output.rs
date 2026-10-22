@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFlowOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFlowOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the settings the request carries to ONE stored output of an existing flow and
+//! answers with that stored record read back, so DescribeFlow reports exactly what this
+//! operation wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFlowOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is a PARTIAL update (`@idempotent`, every input member but `FlowArn` and
+//! `OutputArn` optional): a member the request carries replaces that setting on the stored
+//! output and a member it omits leaves the stored setting untouched — the same rule
+//! UpdateFlow applies to a flow's own settings. The members that belong to the output's
+//! `Transport` (its protocol and the latency / id / NDI members) are merged into the
+//! transport the output holds, and `Encryption` arrives as the request-only
+//! `UpdateEncryption` wrapper and is merged member by member into the output's
+//! `Encryption`.
+//!
+//! The output is addressed by its own minted `OutputArn` WITHIN the flow the request
+//! names, exactly as RemoveFlowOutput addresses one: an ARN no output of that flow carries
+//! resolves nothing and is refused with the modelled `NotFoundException`.
+//!
+//! `RouterIntegrationState` is stored as the request configured it and reported through
+//! [`crate::state::reported_router_integration_state`], the one place a stored record
+//! becomes the state an output reports, so an output whose requests never mentioned router
+//! integration still reports the disabled state.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +151,145 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> UpdateFlowOutputError {
+    UpdateFlowOutputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow or the output `identifier`
+/// addressed, in this service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateFlowOutputError {
+    UpdateFlowOutputErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// Whether the request carries any member that belongs to the output's `Transport`.
+///
+/// A request that touches none of them leaves the stored transport exactly as it is —
+/// including an output that has none — so the merge below runs only for a request that
+/// does.
+fn touches_transport(input: &UpdateFlowOutputInput) -> bool {
+    input.protocol.is_some()
+        || input.cidr_allow_list.is_some()
+        || input.max_latency.is_some()
+        || input.min_latency.is_some()
+        || input.smoothing_latency.is_some()
+        || input.remote_id.is_some()
+        || input.sender_control_port.is_some()
+        || input.sender_ip_address.is_some()
+        || input.stream_id.is_some()
+        || input.ndi_program_name.is_some()
+        || input.ndi_speed_hq_quality.is_some()
+        || input.ndi_output_timecode_source.is_some()
+        || input.ndi_audio_reference_level.is_some()
+}
+
+/// The transport the output holds after this request is applied to `stored`, or `None`
+/// when the request would leave a transport with no protocol.
+///
+/// The transport members are individually optional on the request, so this is a
+/// member-wise merge like UpdateFlow's: a member the request carries replaces its
+/// counterpart, one it omits keeps the stored value. `Transport$Protocol` is REQUIRED
+/// (`smithy_query(query="shape",shape="Transport")`), so an output that holds no transport
+/// yet can only be given one by a request that names the protocol — hence the `None`,
+/// which the caller refuses with the operation's own client error.
+fn merged_transport(stored: Option<&Transport>, input: &UpdateFlowOutputInput) -> Option<Transport> {
+    let protocol = input
+        .protocol
+        .clone()
+        .or_else(|| stored.map(|transport| transport.protocol.clone()))?;
+    let mut merged = stored.cloned().unwrap_or_default();
+    merged.protocol = protocol;
+    if let Some(cidr_allow_list) = input.cidr_allow_list.clone() {
+        merged.cidr_allow_list = Some(cidr_allow_list);
+    }
+    if let Some(max_latency) = input.max_latency {
+        merged.max_latency = Some(max_latency);
+    }
+    if let Some(min_latency) = input.min_latency {
+        merged.min_latency = Some(min_latency);
+    }
+    if let Some(smoothing_latency) = input.smoothing_latency {
+        merged.smoothing_latency = Some(smoothing_latency);
+    }
+    if let Some(remote_id) = input.remote_id.clone() {
+        merged.remote_id = Some(remote_id);
+    }
+    if let Some(sender_control_port) = input.sender_control_port {
+        merged.sender_control_port = Some(sender_control_port);
+    }
+    if let Some(sender_ip_address) = input.sender_ip_address.clone() {
+        merged.sender_ip_address = Some(sender_ip_address);
+    }
+    if let Some(stream_id) = input.stream_id.clone() {
+        merged.stream_id = Some(stream_id);
+    }
+    if let Some(ndi_program_name) = input.ndi_program_name.clone() {
+        merged.ndi_program_name = Some(ndi_program_name);
+    }
+    if let Some(ndi_speed_hq_quality) = input.ndi_speed_hq_quality {
+        merged.ndi_speed_hq_quality = Some(ndi_speed_hq_quality);
+    }
+    if let Some(timecode_source) = input.ndi_output_timecode_source.clone() {
+        merged.ndi_output_timecode_source = Some(timecode_source);
+    }
+    if let Some(reference_level) = input.ndi_audio_reference_level {
+        merged.ndi_audio_reference_level = Some(reference_level);
+    }
+    Some(merged)
+}
+
+/// The encryption the output holds after `update` is applied to `stored`, or `None` when
+/// the request would leave an encryption with no role ARN.
+///
+/// `UpdateEncryption` mirrors `Encryption` member for member with every member optional,
+/// so this is the same member-wise merge as [`merged_transport`]. `Encryption$RoleArn` is
+/// REQUIRED (`smithy_query(query="shape",shape="Encryption")`) while
+/// `UpdateEncryption$RoleArn` is not, so an output that is not encrypted yet can only be
+/// given encryption by a request that carries the role — hence the `None`.
+fn merged_encryption(stored: Option<&Encryption>, update: &UpdateEncryption) -> Option<Encryption> {
+    let role_arn = update
+        .role_arn
+        .clone()
+        .or_else(|| stored.map(|encryption| encryption.role_arn.clone()))?;
+    let mut merged = stored.cloned().unwrap_or_default();
+    merged.role_arn = role_arn;
+    if let Some(algorithm) = update.algorithm.clone() {
+        merged.algorithm = Some(algorithm);
+    }
+    if let Some(vector) = update.constant_initialization_vector.clone() {
+        merged.constant_initialization_vector = Some(vector);
+    }
+    if let Some(device_id) = update.device_id.clone() {
+        merged.device_id = Some(device_id);
+    }
+    if let Some(key_type) = update.key_type.clone() {
+        merged.key_type = Some(key_type);
+    }
+    if let Some(region) = update.region.clone() {
+        merged.region = Some(region);
+    }
+    if let Some(resource_id) = update.resource_id.clone() {
+        merged.resource_id = Some(resource_id);
+    }
+    if let Some(secret_arn) = update.secret_arn.clone() {
+        merged.secret_arn = Some(secret_arn);
+    }
+    if let Some(url) = update.url.clone() {
+        merged.url = Some(url);
+    }
+    Some(merged)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -212,18 +363,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFlowOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFlowOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFlowOutput"))
+        // Nothing in this operation's answer depends on request metadata: every setting
+        // comes off `input`, and the response is the stored record read back.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFlowOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect flow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a status change the
+        // clock already made due is materialised before the flow is read or written.
+        store.settle_due_transitions(now);
+
+        // The output updated is the one of THIS flow's outputs that carries the requested
+        // ARN — the flow first, so a flow the store does not hold is answered for the
+        // flow it named rather than for the output.
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+        let Some(position) = flow
+            .outputs
+            .iter()
+            .position(|output| output.output_arn == input.output_arn)
+        else {
+            return Err(not_found(&input.output_arn));
+        };
+        // The stored record as it stands, so the merges below can be validated before
+        // anything is written: a refused request must leave the output exactly as it was.
+        let mut updated = flow.outputs[position].clone();
+
+        // What each setting becomes once this request is applied: the request's value
+        // where it carries one, the stored value where it does not.
+        if let Some(description) = input.description.clone() {
+            updated.description = Some(description);
+        }
+        if let Some(destination) = input.destination.clone() {
+            updated.destination = Some(destination);
+        }
+        if let Some(port) = input.port {
+            updated.port = Some(port);
+        }
+        if let Some(output_status) = input.output_status.clone() {
+            updated.output_status = Some(output_status);
+        }
+        if let Some(attachment) = input.vpc_interface_attachment.clone() {
+            updated.vpc_interface_attachment = Some(attachment);
+        }
+        // "Indicates whether to enable or disable router integration for this flow
+        // output", and the transit encryption that goes with it: both are stored as the
+        // request configured them, exactly as the add path stores them, and reported
+        // through `crate::state::reported_router_integration_state`.
+        if let Some(router_integration_state) = input.router_integration_state.clone() {
+            updated.router_integration_state = Some(router_integration_state);
+        }
+        if let Some(transit_encryption) = input.router_integration_transit_encryption.clone() {
+            updated.router_integration_transit_encryption = Some(transit_encryption);
+        }
+        if let Some(update) = input.encryption.as_ref() {
+            let Some(encryption) = merged_encryption(updated.encryption.as_ref(), update) else {
+                return Err(bad_request(
+                    "Encryption.RoleArn is required to encrypt an output that is not encrypted \
+                     yet: it is the ARN of the role the service assumes to reach the key.",
+                ));
+            };
+            updated.encryption = Some(encryption);
+        }
+        if touches_transport(&input) {
+            let Some(transport) = merged_transport(updated.transport.as_ref(), &input) else {
+                return Err(bad_request(
+                    "Protocol is required to give an output a transport: an output that has no \
+                     transport yet cannot be given transport settings without one.",
+                ));
+            };
+            updated.transport = Some(transport);
+        }
+        // "The media streams that are associated with the output, and the parameters for
+        // those associations": the member carries the WHOLE association list, so the list
+        // in the request becomes the output's, materialised the one way this crate
+        // materialises that request shape. A request that carries an empty list
+        // disassociates every media stream from the output.
+        let media_stream_output_configurations = input
+            .media_stream_output_configurations
+            .as_ref()
+            .map(|requests| (requests.clone(), store.next_suffix()));
+        if let Some((requests, suffix)) = media_stream_output_configurations {
+            updated.media_stream_output_configurations = (!requests.is_empty()).then(|| {
+                crate::state::materialise_media_stream_output_configurations(&requests, suffix)
+            });
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the flow as it was.
+        // From here the merged record replaces the stored one, under the same store lock
+        // this call has held throughout.
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(UpdateFlowOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the flow could not be read back while its output was updated"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let Some(stored) = flow.outputs.get_mut(position) else {
+            return Err(UpdateFlowOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the output could not be read back while it was updated".to_string(),
+                },
+            )
+            .into());
+        };
+        *stored = updated;
+
+        // "The new settings of the output that you updated" — read back out of the STORE,
+        // never echoed from the request, so the response is what DescribeFlow will report.
+        // The output's name and ARN are its identity and no input member names either, so
+        // an update never moves them; the flow's status is left to the clock, exactly as
+        // UpdateFlow leaves it.
+        Ok(UpdateFlowOutputOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            output: Some(flow.outputs[position].to_output()),
+        })
     }
 }
