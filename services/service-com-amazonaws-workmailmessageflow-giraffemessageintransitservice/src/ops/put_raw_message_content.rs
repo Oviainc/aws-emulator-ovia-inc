@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRawMessageContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRawMessageContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRawMessageContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the request's `S3Reference` to the bytes S3 holds for it and installs
+//! those bytes as the in-transit message's MIME content, so the next
+//! `GetRawMessageContent` reports them. The reference is resolved, never echoed:
+//! nothing in the store is built out of the request beyond the reference itself.
+//!
+//! The three content failures the model declares are the three things that can go
+//! wrong on the way, in the order the message flow meets them: the message must be
+//! eligible for update (`MessageFrozen`), the object must be readable
+//! (`InvalidContentLocation`), and its bytes must be usable MIME
+//! (`MessageRejected`). The rules for the last two come from the model's own
+//! documentation — see [`resolve_content`] and [`validate_mime`], which also name
+//! the documented criteria this emulator does NOT decide.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +84,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::S3Ref;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +157,409 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRawMessageContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRawMessageContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRawMessageContent"))
+        let request_region = crate::state::request_region(ctx.parts());
+        // The access key id the request presented, for the access records below. An
+        // AKID is an identifier, not a secret; it is what attributes a mutation to a
+        // caller.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let store = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let reference = S3Ref::from_modeled(&input.content.s3_reference);
+
+        // FIRST critical section: the message's own identity and eligibility, then
+        // the reference resolved to bytes. An update names a message, and a message
+        // that is no longer in transit cannot take one. The guard is dropped at the
+        // end of this block so the content validation below — whose cost is
+        // proportional to the message, not to the state access — does not hold the
+        // store against every other request.
+        let resolved = {
+            let state = store.lock();
+            match eligibility(&state, &input.message_id) {
+                Eligibility::Missing => {
+                    return Err(refuse_missing(&akid, &input.message_id, &request_region))
+                }
+                Eligibility::Frozen => {
+                    return Err(refuse_frozen(&akid, &input.message_id, &request_region))
+                }
+                Eligibility::Updatable => {}
+            }
+            resolve_content(&state, &reference, &request_region)
+        };
+
+        let content = match resolved {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                // Which of the documented conditions fired stays in the access
+                // record: the wire error carries the model's own generic wording,
+                // the way the real service answers, rather than the stored object's
+                // region or owner.
+                ::tracing::info!(
+                    operation = "PutRawMessageContent",
+                    akid = %akid,
+                    message_id = %input.message_id,
+                    reference = ?reference,
+                    region = %request_region,
+                    outcome = "InvalidContentLocation",
+                    reason = %reason,
+                    "refused an update whose S3 reference could not be read"
+                );
+                return Err(PutRawMessageContentErrorModeled::InvalidContentLocation(
+                    InvalidContentLocation {
+                        message: Some(format!(
+                            "WorkMail could not access the updated email content at {}.",
+                            reference.display()
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Validation runs with NO lock held.
+        validate_mime(&content).map_err(|reason| {
+            ::tracing::info!(
+                operation = "PutRawMessageContent",
+                akid = %akid,
+                message_id = %input.message_id,
+                reference = ?reference,
+                region = %request_region,
+                outcome = "MessageRejected",
+                reason = %reason,
+                "refused an update whose content is not usable MIME"
+            );
+            PutRawMessageContentErrorModeled::MessageRejected(MessageRejected {
+                message: Some(reason),
+            })
+        })?;
+
+        // SECOND critical section: install the bytes. The lock was released while
+        // the content was validated, so the eligibility the first section checked is
+        // re-checked here — another request may have frozen the message, or it may no
+        // longer be in transit at all.
+        let content_octets = content.len();
+        {
+            let mut state = store.lock();
+            match eligibility(&state, &input.message_id) {
+                Eligibility::Missing => {
+                    return Err(refuse_missing(&akid, &input.message_id, &request_region))
+                }
+                Eligibility::Frozen => {
+                    return Err(refuse_frozen(&akid, &input.message_id, &request_region))
+                }
+                Eligibility::Updatable => {}
+            }
+            // The whole point of the operation: the store now holds the resolved
+            // bytes, so the next `GetRawMessageContent` reports them and not the old
+            // content.
+            state.replace_message_content(&input.message_id, content, reference.clone());
+        }
+
+        // The one mutating operation this service models, recorded: who asked, which
+        // message changed, which reference it was given and in which region. Never
+        // the content itself. `messageId` is interpolated as a display value because
+        // the model constrains it to `^[a-z0-9\-]*$`, which admits no CR or LF and is
+        // enforced before this handler runs; the reference is recorded through its
+        // `Debug`, which escapes every control character, so no part of it can
+        // terminate or forge a record whatever the model's patterns allow.
+        ::tracing::info!(
+            operation = "PutRawMessageContent",
+            akid = %akid,
+            message_id = %input.message_id,
+            reference = ?reference,
+            region = %request_region,
+            content_octets = content_octets,
+            outcome = "success",
+            "replaced the raw content of an in-transit message"
+        );
+
+        Ok(PutRawMessageContentOutput {})
     }
+}
+
+/// Whether a message can take an update, as the two critical sections above ask it.
+enum Eligibility {
+    /// No message is stored under that id.
+    Missing,
+    /// The message is stored but is no longer eligible for an update.
+    Frozen,
+    /// The message is in transit and can take an update.
+    Updatable,
+}
+
+/// The eligibility of `message_id` in `state`.
+fn eligibility(
+    state: &crate::state::ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState,
+    message_id: &str,
+) -> Eligibility {
+    match state.messages.get(message_id) {
+        None => Eligibility::Missing,
+        Some(message) if message.frozen => Eligibility::Frozen,
+        Some(_) => Eligibility::Updatable,
+    }
+}
+
+/// Record and build the refusal for a message that is not in transit.
+fn refuse_missing(akid: &str, message_id: &str, region: &str) -> PutRawMessageContentError {
+    ::tracing::info!(
+        operation = "PutRawMessageContent",
+        akid = %akid,
+        message_id = %message_id,
+        region = %region,
+        outcome = "ResourceNotFoundException",
+        "refused an update to a message that is not in transit"
+    );
+    PutRawMessageContentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("The in-transit message {message_id} was not found.")),
+    })
+    .into()
+}
+
+/// Record and build the refusal for a message that is no longer eligible for an
+/// update.
+fn refuse_frozen(akid: &str, message_id: &str, region: &str) -> PutRawMessageContentError {
+    ::tracing::info!(
+        operation = "PutRawMessageContent",
+        akid = %akid,
+        message_id = %message_id,
+        region = %region,
+        outcome = "MessageFrozen",
+        "refused an update to a message that is not eligible for one"
+    );
+    PutRawMessageContentErrorModeled::MessageFrozen(MessageFrozen {
+        message: Some(format!("The message {message_id} is not eligible for update.")),
+    })
+    .into()
+}
+
+/// The bytes the reference resolves to, or the reason it is not readable — an
+/// `InvalidContentLocation` for the caller, and this string for the access record.
+///
+/// Three conditions make an object unreadable, and the model's own
+/// `InvalidContentLocation` documentation
+/// (`smithy_query(query="doc", shape="InvalidContentLocation")`) names the first
+/// two of them: "You made the request in a region other than your S3 bucket
+/// region" and "The S3 bucket owner is not the same as the calling AWS account".
+/// The third is the reference naming no object at all — including a versioned
+/// reference naming a version that is not stored, since the model documents
+/// `objectVersion` as selecting one version of the object.
+///
+/// The remaining documented reason, an incomplete or missing S3 bucket policy, is
+/// not decided here: this emulator's S3 holds no bucket policies, so there is
+/// nothing to evaluate.
+fn resolve_content(
+    state: &crate::state::ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState,
+    reference: &S3Ref,
+    request_region: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(object) = state.resolve_s3_object(reference) else {
+        return Err("no object is stored at that bucket, key and object version".to_string());
+    };
+
+    if object.region != request_region {
+        return Err(format!(
+            "the bucket is in region {} but the request was made in region {request_region}",
+            object.region
+        ));
+    }
+
+    let caller = ::engine::emulator_account_id();
+    if object.owner_account_id != caller {
+        return Err(format!(
+            "the bucket owner {} is not the calling AWS account {caller}",
+            object.owner_account_id
+        ));
+    }
+
+    Ok(object.content.clone())
+}
+
+/// Headers RFC 5322 §3.6 permits at most once in a message.
+///
+/// The model's `RawMessageContent` documentation
+/// (`smithy_query(query="doc", shape="RawMessageContent")`) requires that "certain
+/// unique headers can only appear once"; RFC 5322 §3.6 is the list of which ones.
+const SINGLETON_HEADERS: &[&str] = &[
+    "date",
+    "from",
+    "sender",
+    "reply-to",
+    "to",
+    "cc",
+    "bcc",
+    "message-id",
+    "in-reply-to",
+    "references",
+    "subject",
+];
+
+/// The longest a line of a message may be, including its CRLF.
+///
+/// From the model's `RawMessageContent` documentation: "Per RFC 5321, the maximum
+/// length of each line of text, including the <CRLF>, must not exceed 1,000
+/// characters."
+const MAX_LINE_OCTETS: usize = 1000;
+
+/// The most content this emulator will read, as a guard on the process rather
+/// than a service rule.
+///
+/// Not a fidelity limit: WorkMail's own raw-message quota is in neither the model
+/// nor its documentation, so this is deliberately set far above any size a mail
+/// system accepts (every AWS mail service's documented maximum is a few tens of
+/// MiB), and therefore refuses nothing the real service takes. It exists because
+/// the scans below are linear in the content and run inside one request.
+const MAX_CONTENT_OCTETS: usize = 128 * 1024 * 1024;
+
+/// Whether `content` is usable MIME content, answering why it is not when it is
+/// not — the `message` of `MessageRejected`, which the model documents as carrying
+/// "more information about what caused the error".
+///
+/// Every rule is one the model's `RawMessageContent` documentation states:
+///
+/// 1. the object must carry content at all, and that content must begin with a
+///    header field, so the message HAS a header block — "The message must contain
+///    all the required header fields";
+/// 2. no line may exceed [`MAX_LINE_OCTETS`] including its CRLF;
+/// 3. a header from [`SINGLETON_HEADERS`] may not appear twice.
+///
+/// Four documented criteria are deliberately NOT enforced, because neither the
+/// model nor the service's documentation says what to enforce them against: WHICH
+/// header fields are required (rule 1 checks that a header block is present, not
+/// that a particular field is — the model names no field, and refusing a message
+/// AWS would accept is the worse error of the two), that "each part of a multipart
+/// MIME message" is "formatted properly" (the documentation states no rule for
+/// what makes a part malformed, and a message is not refused for failing a rule
+/// this emulator invented), the set of attachment content types Amazon SES
+/// supports (an external appendix), and which headers are immutable.
+///
+/// One refusal is not a fidelity rule but a guard on this process, and says so in
+/// the message it produces: content beyond [`MAX_CONTENT_OCTETS`]. That ceiling
+/// sits far above anything a mail system accepts, so it refuses nothing the real
+/// service takes; everything else here is a single linear scan of the content.
+fn validate_mime(content: &[u8]) -> Result<(), String> {
+    if content.is_empty() {
+        return Err(
+            "The message content is empty; a message must contain the required header fields."
+                .to_string(),
+        );
+    }
+
+    if content.len() > MAX_CONTENT_OCTETS {
+        return Err(format!(
+            "The message is {} octets long, beyond the {MAX_CONTENT_OCTETS} octets this emulator \
+             will read.",
+            content.len()
+        ));
+    }
+
+    if !starts_with_header_field(content) {
+        return Err(
+            "The message does not begin with a header field; a message must contain the required \
+             header fields."
+                .to_string(),
+        );
+    }
+
+    if let Some((number, octets)) = overlong_line(content) {
+        return Err(format!(
+            "Line {number} of the message is {octets} octets long, which exceeds the \
+             {MAX_LINE_OCTETS}-octet limit including the CRLF."
+        ));
+    }
+
+    let counts = header_field_counts(content);
+    for name in SINGLETON_HEADERS {
+        if counts.get(*name).copied().unwrap_or_default() > 1 {
+            return Err(format!(
+                "The message carries more than one {name} header, which may only appear once."
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// How many times each header field name appears in the message's header block,
+/// lowercased (RFC 5322 field names are case-insensitive).
+///
+/// The block is the content up to the first empty line, and a line that opens with
+/// a space or a tab continues the field before it (RFC 5322 §2.2.3 folding) rather
+/// than starting a new one.
+fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<String, usize> {
+    let mut counts: ::std::collections::BTreeMap<String, usize> =
+        ::std::collections::BTreeMap::new();
+    for line in content.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            // The end of the header block.
+            break;
+        }
+        if line[0] == b' ' || line[0] == b'\t' {
+            // A folded continuation of the field above.
+            continue;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(&line[..colon])
+            .trim()
+            .to_ascii_lowercase();
+        *counts.entry(name).or_default() += 1;
+    }
+    counts
+}
+
+/// The 1-based number and octet length of the first line of `content` longer than
+/// [`MAX_LINE_OCTETS`], counting the line terminator the way RFC 5321 does: a line
+/// terminator is a CRLF and counts two octets, so a line a sender terminated with a
+/// bare LF is measured as though it carried the CRLF the RFC requires.
+fn overlong_line(content: &[u8]) -> Option<(usize, usize)> {
+    let mut number = 0usize;
+    let mut rest = content;
+    while !rest.is_empty() {
+        number += 1;
+        let (octets, next) = match rest.iter().position(|byte| *byte == b'\n') {
+            // The CR, when the sender sent one, is already inside the segment; a
+            // bare LF stands for a CRLF, so it counts for two.
+            Some(index) => {
+                let terminator = if rest[..index].last() == Some(&b'\r') { 1 } else { 2 };
+                (index + terminator, &rest[index + 1..])
+            }
+            // A final line the content does not terminate has no terminator.
+            None => (rest.len(), &rest[rest.len()..]),
+        };
+        if octets > MAX_LINE_OCTETS {
+            return Some((number, octets));
+        }
+        rest = next;
+    }
+    None
+}
+
+/// Whether `content` opens with an RFC 5322 header field: a field name of
+/// printable US-ASCII without a colon, then a colon.
+fn starts_with_header_field(content: &[u8]) -> bool {
+    let first_line = content
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let Some(colon) = first_line.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    colon > 0
+        && first_line[..colon]
+            .iter()
+            .all(|byte| (33..=126).contains(byte))
+}
+
+/// The answer when this service's store is not reachable at all.
+///
+/// Not a modeled failure: none of this operation's four modeled errors says "the
+/// emulator cannot reach its own state". It can only happen when the service is
+/// mounted on an engine that is not the shared in-memory one, so it is reported as
+/// 501 with wording that says exactly that.
+fn store_unavailable() -> PutRawMessageContentError {
+    crate::scaffolded::Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+        message: "the WorkMail Message Flow in-transit message store is unavailable: this \
+                  service is mounted on an engine that holds no state for it"
+            .to_string(),
+    })
 }

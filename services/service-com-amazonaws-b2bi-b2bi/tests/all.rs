@@ -15,3 +15,5 @@
 mod onboarding_loop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging.rs"]
+mod tagging;
