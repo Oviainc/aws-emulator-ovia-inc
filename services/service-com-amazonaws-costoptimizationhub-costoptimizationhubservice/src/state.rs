@@ -14,7 +14,9 @@
 //!   `UpdatePreferences` and read by `GetPreferences` (and by the recommendation
 //!   readers, because `savingsEstimationMode` decides whether the figures they
 //!   report are before or after discounts). A member the account never set reads
-//!   back as the default the service applies for it.
+//!   back as the default the service applies for it, where it has one — the
+//!   member that governs the organization has none, and is reported only once
+//!   the management account has set it.
 //! * `recommendations` + `recommendation_order` — the recommendation catalog
 //!   `ListRecommendations` pages over and `GetRecommendation` looks ids up in,
 //!   narrowed to what the calling account may read by
@@ -45,6 +47,18 @@ pub const AFTER_DISCOUNTS: &str = "AfterDiscounts";
 /// `EnrollmentStatus` values, from the model's enum of the same name.
 pub const STATUS_ACTIVE: &str = "Active";
 
+/// The `EnrollmentStatus` values `UpdateEnrollmentStatus` accepts on the wire.
+///
+/// The PUBLISHED model's enum lists two
+/// (`shared_types::ENROLLMENT_STATUS_VALUES`: `Active`, `Inactive`), but the
+/// service's own validator admits a third: its recorded rejection of an
+/// out-of-enum status reports the accepted set as `[Active, Inactive, Failed]`,
+/// `Failed` being a terminal enrollment state the wire enum carries ahead of the
+/// published model. The wire set is what a request is judged against
+/// (`crate::service::not_in_enum`) and what the refusal of a value outside it
+/// advertises.
+pub const ENROLLMENT_STATUS_WIRE_VALUES: &[&str] = &["Active", "Inactive", "Failed"];
+
 /// The other `EnrollmentStatus` value: an account Cost Optimization Hub knows
 /// about but that has not opted in, which is what an account's enrollment reads
 /// as before it ever calls `UpdateEnrollmentStatus`.
@@ -74,7 +88,9 @@ pub const CURRENCY_CODE: &str = "USD";
 #[derive(Debug, Clone)]
 pub struct Enrollment {
     pub account_id: String,
-    /// `EnrollmentStatus`: `Active` | `Inactive`.
+    /// The account's enrollment status, one of the values the service accepts on
+    /// the wire ([`ENROLLMENT_STATUS_WIRE_VALUES`]): `Active` | `Inactive` |
+    /// `Failed`.
     pub status: String,
     /// Whether the last `UpdateEnrollmentStatus` asked for the organization's
     /// member accounts to be enrolled as well, or `None` while no

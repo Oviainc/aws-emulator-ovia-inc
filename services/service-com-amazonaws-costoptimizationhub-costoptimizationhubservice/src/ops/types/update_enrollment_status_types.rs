@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-costoptimizationhub-costoptimizationhubservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.costoptimizationhub#UpdateEnrollmentStatusRequest")]
+// `status` carries `skip_validation`: the value set the service accepts on the
+// wire is wider than the published model's `EnrollmentStatus` enum, so the
+// HANDLER judges the value against the wire set
+// (`crate::service::not_in_enum` over `crate::state::ENROLLMENT_STATUS_WIRE_VALUES`).
+// `@required` is unaffected — absence is found while reading the request, not by
+// the constraint walk.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.costoptimizationhub#UpdateEnrollmentStatusRequest",
+    skip_validation = ["status"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateEnrollmentStatusInput {
     pub status: String,
