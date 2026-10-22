@@ -119,6 +119,10 @@ pub const MAX_ACCESS_POINTS_PER_FILE_SYSTEM: usize = 10_000;
 /// `DescribeAccessPoints$MaxResults`: "The default value is 100."
 pub const DEFAULT_ACCESS_POINT_PAGE_SIZE: usize = 100;
 
+/// `ListTagsForResource$MaxResults`: "(Optional) Specifies the maximum number of tag
+/// objects to return in the response. The default value is 100."
+pub const DEFAULT_TAG_PAGE_SIZE: usize = 100;
+
 /// The root directory an access point exposes when the request names none: the file
 /// system root. `RootDirectory$Path` "specifies the path on the EFS file system to expose
 /// as the root directory to NFS clients using the access point", and its modelled pattern
@@ -726,6 +730,40 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
         access_points
     }
 
+    /// The tag set the resource a `ResourceId` names holds, or `None` when this store
+    /// holds no such resource. The one way a tag set is read, so every reporting
+    /// operation reads the set the writes left.
+    pub fn tags_of(&self, resource: TaggedResource<'_>) -> Option<&[Tag]> {
+        match resource {
+            TaggedResource::FileSystem(id) => {
+                self.file_systems.get(id).map(|held| held.tags.as_slice())
+            }
+            TaggedResource::AccessPoint(id) => {
+                self.access_points.get(id).map(|held| held.tags.as_slice())
+            }
+        }
+    }
+
+    /// The same resource's tag set for a WRITE, together with the `Name` its description
+    /// derives from the `Name` tag; see [`TaggedRecordMut`]. `None` when this store holds
+    /// no such resource.
+    pub fn tagged_record_mut(&mut self, resource: TaggedResource<'_>) -> Option<TaggedRecordMut<'_>> {
+        match resource {
+            TaggedResource::FileSystem(id) => {
+                self.file_systems.get_mut(id).map(|held| TaggedRecordMut {
+                    tags: &mut held.tags,
+                    name: &mut held.name,
+                })
+            }
+            TaggedResource::AccessPoint(id) => {
+                self.access_points.get_mut(id).map(|held| TaggedRecordMut {
+                    tags: &mut held.tags,
+                    name: &mut held.name,
+                })
+            }
+        }
+    }
+
     /// The mount targets of one file system, in creation order.
     pub fn mount_targets_of(&self, file_system_id: &str) -> Vec<MountTarget> {
         let mut targets: Vec<MountTarget> = self
@@ -739,8 +777,8 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
     }
 }
 
-/// The page size one describe request gets: its `MaxItems` when it names one, else
-/// `default`, clamped to [`MAX_PAGE_SIZE`] — the page both operations document they
+/// The page size one paginated read gets: its `MaxItems`/`MaxResults` when it names one,
+/// else `default`, clamped to [`MAX_PAGE_SIZE`] — the page these operations document they
 /// paginate at — so one request cannot amplify into the whole store.
 pub fn page_size(max_items: Option<i32>, default: usize) -> usize {
     match max_items {
@@ -751,10 +789,20 @@ pub fn page_size(max_items: Option<i32>, default: usize) -> usize {
     }
 }
 
+/// The resource segment an EFS file-system ARN carries
+/// (`arn:aws:elasticfilesystem:<region>:<account>:file-system/fs-…`), which is also how
+/// an ARN form is told apart from a bare id.
+pub const FILE_SYSTEM_ARN_PREFIX: &str = "file-system/";
+/// The resource segment an EFS access-point ARN carries; see [`FILE_SYSTEM_ARN_PREFIX`].
+pub const ACCESS_POINT_ARN_PREFIX: &str = "access-point/";
+/// The prefix of a bare access point id (`fsap-…`). A file system id is `fs-…`, which
+/// this is NOT a prefix of, so the two id forms are distinguishable.
+pub const ACCESS_POINT_ID_PREFIX: &str = "fsap-";
+
 /// A `FileSystemId` member accepts "either a file system ID or ARN", so reduce either
 /// form to the bare `fs-…` id the state is keyed by.
 pub fn file_system_id_of(value: &str) -> &str {
-    match value.rsplit_once("file-system/") {
+    match value.rsplit_once(FILE_SYSTEM_ARN_PREFIX) {
         Some((_, id)) => id,
         None => value,
     }
@@ -768,9 +816,74 @@ pub fn arn_region(arn: &str) -> Option<&str> {
 
 /// An `AccessPointId` member accepts an id or an ARN; reduce either to the bare id.
 pub fn access_point_id_of(value: &str) -> &str {
-    match value.rsplit_once("access-point/") {
+    match value.rsplit_once(ACCESS_POINT_ARN_PREFIX) {
         Some((_, id)) => id,
         None => value,
+    }
+}
+
+/// The EFS resource a tag-addressed `ResourceId` names, reduced to the bare id the store
+/// is keyed by. "You can retrieve tags for EFS file systems and access points using this
+/// API endpoint" (`ListTagsForResource$ResourceId`), and the member's modelled pattern
+/// admits exactly those two resources, each as a bare id or as its ARN:
+/// `^(arn:aws[-a-z]*:elasticfilesystem:[0-9a-z-:]+:(access-point/fsap|file-system/fs)-[0-9a-f]{8,40}|fs(ap)?-[0-9a-f]{8,40})$`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResource<'a> {
+    /// A `fs-…` file system, keyed in [`ComAmazonawsEfsMagnolioapiserviceV20150201State::file_systems`].
+    FileSystem(&'a str),
+    /// A `fsap-…` access point, keyed in
+    /// [`ComAmazonawsEfsMagnolioapiserviceV20150201State::access_points`].
+    AccessPoint(&'a str),
+}
+
+/// Which resource a tag-addressed `ResourceId` names: the access-point forms are the
+/// `access-point/fsap-…` ARN and the `fsap-…` id, and every other form the modelled
+/// pattern admits names a file system.
+///
+/// One construction for every tag operation of this service, so a tag write and a later
+/// tag read can never resolve the same `ResourceId` to two different records.
+pub fn tagged_resource(resource_id: &str) -> TaggedResource<'_> {
+    if resource_id.contains(ACCESS_POINT_ARN_PREFIX)
+        || resource_id.starts_with(ACCESS_POINT_ID_PREFIX)
+    {
+        TaggedResource::AccessPoint(access_point_id_of(resource_id))
+    } else {
+        TaggedResource::FileSystem(file_system_id_of(resource_id))
+    }
+}
+
+/// The tag-carrying parts of one stored resource, for a tag WRITE: its tag set and the
+/// `Name` its description reports, which is derived from the `Name` tag
+/// (`FileSystemDescription$Name`: "If the file system has a Name tag, Amazon EFS returns
+/// the value in this field"; `AccessPointDescription$Name`: "The name of the access
+/// point. This is the value of the Name tag.").
+///
+/// Handed out by [`ComAmazonawsEfsMagnolioapiserviceV20150201State::tagged_record_mut`]
+/// so a tag write touches both through one construction and the reported `Name` cannot
+/// drift from the stored `Name` tag.
+#[derive(Debug)]
+pub struct TaggedRecordMut<'a> {
+    pub tags: &'a mut Vec<Tag>,
+    pub name: &'a mut Option<String>,
+}
+
+impl TaggedRecordMut<'_> {
+    /// Add `requested` to this resource's tag set by [`merge_tags`], then re-derive the
+    /// reported `Name` from the resulting set.
+    pub fn apply(&mut self, requested: &[Tag]) {
+        merge_tags(self.tags, requested);
+        *self.name = name_tag(self.tags);
+    }
+
+    /// Remove every tag whose key is in `keys`, then re-derive the reported `Name` from
+    /// the resulting set — so removing the `Name` tag also clears the `Name` the
+    /// description reports.
+    ///
+    /// A key the resource does not carry leaves the set as it is: the request asks for
+    /// the key to be gone, which it already is, so a repeated removal is idempotent.
+    pub fn remove(&mut self, keys: &[String]) {
+        self.tags.retain(|tag| !keys.contains(&tag.key));
+        *self.name = name_tag(self.tags);
     }
 }
 
@@ -987,6 +1100,38 @@ pub fn tag_list_problem(tags: &[Tag]) -> Option<String> {
         }
     }
     None
+}
+
+/// The tag key whose value a resource's reported `Name` is: "Name your file system on
+/// creation by including a "Key":"Name","Value":"{value}" key-value pair"
+/// (`CreateFileSystem$Tags`), and an access point's `Name` "is the value of the Name
+/// tag".
+pub const NAME_TAG_KEY: &str = "Name";
+
+/// The `Name` a description reports for a resource holding `tags`: the value of its
+/// [`NAME_TAG_KEY`] tag, and `None` while it carries none.
+///
+/// One construction, reached by every operation that stores a tag set, so a create and a
+/// later tag write report the member the same way.
+pub fn name_tag(tags: &[Tag]) -> Option<String> {
+    tags.iter()
+        .find(|tag| tag.key == NAME_TAG_KEY)
+        .map(|tag| tag.value.clone())
+}
+
+/// Add a caller-supplied tag list to a stored one, in place.
+///
+/// A tag key identifies a tag on a resource — "each key must be unique" (`Tags`) — so a
+/// requested key the resource already carries REPLACES that key's value and a key it does
+/// not carry is appended, leaving the order the keys were first set in untouched. A
+/// request may therefore be replayed without growing the set.
+pub fn merge_tags(stored: &mut Vec<Tag>, requested: &[Tag]) {
+    for tag in requested {
+        match stored.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => stored.push(tag.clone()),
+        }
+    }
 }
 
 /// A `SystemTime` as the modelled `Timestamp`. EFS reports a file system's

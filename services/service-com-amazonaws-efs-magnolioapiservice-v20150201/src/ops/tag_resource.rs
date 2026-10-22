@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the request's `Tags` to the tag set the resource named by `ResourceId` holds in
+//! this service's state — a file system or an access point, as a bare id or as its ARN.
+//! A requested key the resource already carries replaces that key's value, so the write
+//! is idempotent, and the reported `Name` is re-derived from the resulting `Name` tag.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+
+        // "An array of Tag objects to add. Each Tag object is a key-value pair." The
+        // modelled list carries no length bound and no key-uniqueness constraint, so the
+        // quota and the unique-key rule are checked here, before anything is stored.
+        if let Some(problem) = efs::tag_list_problem(&input.tags) {
+            return Err(bad_request(problem));
+        }
+
+        let mut state = state.lock();
+
+        // "The ID specifying the EFS resource that you want to create a tag for": the
+        // member's pattern accepts a file system or an access point, as a bare id or as
+        // its ARN, and the store is keyed by the id.
+        let resource = efs::tagged_resource(&input.resource_id);
+        let Some(held) = state.tags_of(resource) else {
+            return Err(does_not_exist(resource));
+        };
+
+        // The published quota bounds the set this write LEAVES, not the request alone: a
+        // requested key the resource already carries replaces a value instead of adding a
+        // tag, so only the keys that are new count towards it.
+        let added = input
+            .tags
+            .iter()
+            .filter(|tag| !held.iter().any(|tag_held| tag_held.key == tag.key))
+            .count();
+        let resulting = held.len() + added;
+        if resulting > efs::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "resource {} would hold {resulting} tags, more than the maximum of {}",
+                efs::quoted(&input.resource_id),
+                efs::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+
+        // Past every refusal, so this is the first write the request makes. `apply` both
+        // merges the list and re-derives the `Name` the description reports from the
+        // `Name` tag, so the two cannot disagree.
+        let Some(mut record) = state.tagged_record_mut(resource) else {
+            return Err(does_not_exist(resource));
+        };
+        record.apply(&input.tags);
+        Ok(TagResourceOutput)
     }
+}
+
+/// The modelled 404 for a `ResourceId` that names no stored resource: `FileSystemNotFound`
+/// ("the specified FileSystemId value doesn't exist in the requester's Amazon Web
+/// Services account") for a file system, `AccessPointNotFound` for an access point — the
+/// two resources this endpoint addresses, each with its own modelled error.
+fn does_not_exist(resource: crate::state::TaggedResource<'_>) -> TagResourceError {
+    match resource {
+        crate::state::TaggedResource::FileSystem(id) => {
+            TagResourceErrorModeled::FileSystemNotFound(FileSystemNotFound {
+                error_code: "FileSystemNotFound".to_string(),
+                message: Some(crate::state::file_system_not_found_message(id)),
+            })
+        }
+        crate::state::TaggedResource::AccessPoint(id) => {
+            TagResourceErrorModeled::AccessPointNotFound(AccessPointNotFound {
+                error_code: "AccessPointNotFound".to_string(),
+                message: Some(crate::state::access_point_not_found_message(id)),
+            })
+        }
+    }
+    .into()
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> TagResourceError {
+    TagResourceErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> TagResourceError {
+    TagResourceErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

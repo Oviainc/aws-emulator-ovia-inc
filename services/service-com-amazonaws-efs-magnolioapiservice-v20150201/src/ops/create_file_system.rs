@@ -436,10 +436,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("file-system/{file_system_id}"),
         );
         // "If the file system has a Name tag, Amazon EFS returns the value in this field."
-        let name = tags
-            .iter()
-            .find(|tag| tag.key == "Name")
-            .map(|tag| tag.value.clone());
+        // The one construction every operation that stores a tag set derives it through.
+        let name = efs::name_tag(&tags);
         let kms_key_id = (input.encrypted == Some(true)).then(|| {
             efs::kms_key_arn(
                 input
