@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination cursors, and the hex rendering of a minted resource id.
+hex = { workspace = true }
+# Digests the counter + clock seed a minted cluster / snapshot id is built from.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `tokio::time::sleep` in the lifecycle suite waits out a clock-owed transition.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

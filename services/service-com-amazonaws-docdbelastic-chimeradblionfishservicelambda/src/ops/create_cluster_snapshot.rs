@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a snapshot of the referenced cluster, copying the cluster's own
+//! `subnetIds`, `vpcSecurityGroupIds`, `adminUserName`, `kmsKeyId` and creation time
+//! onto it. An unknown `clusterArn` is `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClusterSnapshot"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(CreateClusterSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx.parts());
+        // Caller-sized values are bounded BEFORE they are stored. `snapshotName` is
+        // stored twice — on the record and as the key of the name index — so it is
+        // bounded here as well as by its modelled member length.
+        state::validate_snapshot_name("snapshotName", &input.snapshot_name)
+            .map_err(CreateClusterSnapshotErrorModeled::ValidationException)?;
+        if let Some(tags) = input.tags.as_ref() {
+            state::validate_tags("tags", tags)
+                .map_err(CreateClusterSnapshotErrorModeled::ValidationException)?;
+        }
+
+        let mut guard = store.lock();
+        // The cluster being snapshotted is resolved FIRST, so a request naming a
+        // cluster that does not exist is a 404 rather than a quota or name conflict.
+        // Everything the snapshot copies is taken here, in one lookup.
+        let Some(cluster) = guard.clusters.get(&input.cluster_arn) else {
+            return Err(CreateClusterSnapshotErrorModeled::ResourceNotFoundException(
+                state::not_found("cluster", &input.cluster_arn),
+            )
+            .into());
+        };
+        let cluster_arn = cluster.cluster_arn.clone();
+        let cluster_creation_time = cluster.create_time.clone();
+        let admin_user_name = cluster.admin_user_name.clone();
+        let kms_key_id = cluster.kms_key_id.clone();
+        let subnet_ids = cluster.subnet_ids.clone();
+        let vpc_security_group_ids = cluster.vpc_security_group_ids.clone();
+
+        // The snapshot map is reclaimed only by DeleteClusterSnapshot, so the record
+        // count is capped.
+        state::ensure_snapshot_capacity(guard.snapshots.len())
+            .map_err(CreateClusterSnapshotErrorModeled::ServiceQuotaExceededException)?;
+        if let Some(existing_arn) = guard.snapshot_names.get(&input.snapshot_name) {
+            return Err(CreateClusterSnapshotErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "A cluster snapshot named {} already exists",
+                        input.snapshot_name
+                    ),
+                    resource_id: existing_arn.clone(),
+                    resource_type: "cluster-snapshot".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let snapshot_id = state::new_resource_id();
+        let snapshot_arn =
+            state::docdb_elastic_arn(&region, &format!("cluster-snapshot/{snapshot_id}"));
+        let record = state::SnapshotRecord {
+            snapshot_name: input.snapshot_name,
+            snapshot_arn: snapshot_arn.clone(),
+            cluster_arn,
+            snapshot_creation_time: state::now_utc(),
+            cluster_creation_time,
+            status: state::STATUS_CREATING.to_string(),
+            // A snapshot the caller asked for is MANUAL; AWS reserves AUTOMATED for the
+            // ones it takes itself on the backup window.
+            snapshot_type: state::SNAPSHOT_TYPE_MANUAL.to_string(),
+            admin_user_name,
+            kms_key_id,
+            subnet_ids,
+            vpc_security_group_ids,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Reported CREATING, with ACTIVE owed by the clock.
+            settles_at: Some(state::settle_instant()),
+        };
+
+        let snapshot = record.as_snapshot();
+        guard
+            .snapshot_names
+            .insert(record.snapshot_name.clone(), snapshot_arn.clone());
+        guard.snapshots.insert(snapshot_arn, record);
+        drop(guard);
+
+        Ok(CreateClusterSnapshotOutput { snapshot })
     }
 }

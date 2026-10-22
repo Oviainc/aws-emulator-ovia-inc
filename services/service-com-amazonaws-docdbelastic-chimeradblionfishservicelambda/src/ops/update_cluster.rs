@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members the request carries to the stored cluster — an omitted member
+//! keeps its previous value — and returns the updated cluster. The change is visible
+//! to the next `GetCluster`.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        use crate::state;
+
+        let _ = ctx;
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(UpdateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Constraints the docs state but the model does not express, checked on the
+        // members this request actually carries and before anything is written.
+        if let Some(capacity) = input.shard_capacity {
+            state::validate_shard_capacity("shardCapacity", capacity)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(count) = input.shard_count {
+            state::validate_shard_count("shardCount", count)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(count) = input.shard_instance_count {
+            state::validate_shard_instance_count("shardInstanceCount", count)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(password) = input.admin_user_password.as_deref() {
+            state::validate_admin_user_password("adminUserPassword", password)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+        // Caller-sized values are bounded BEFORE they replace what is stored.
+        if let Some(ids) = input.vpc_security_group_ids.as_deref() {
+            state::validate_id_list("vpcSecurityGroupIds", ids)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(ids) = input.subnet_ids.as_deref() {
+            state::validate_id_list("subnetIds", ids)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(window) = input.preferred_maintenance_window.as_deref() {
+            state::validate_maintenance_window("preferredMaintenanceWindow", window)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(window) = input.preferred_backup_window.as_deref() {
+            state::validate_backup_window("preferredBackupWindow", window)
+                .map_err(UpdateClusterErrorModeled::ValidationException)?;
+        }
+
+        let mut guard = store.lock();
+        let Some(record) = guard.clusters.get_mut(&input.cluster_arn) else {
+            return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
+                state::not_found("cluster", &input.cluster_arn),
+            )
+            .into());
+        };
+        record.settle_due();
+
+        // Only the members present are applied; every other one keeps its value.
+        let mut applied = false;
+        if let Some(auth_type) = input.auth_type {
+            record.auth_type = auth_type;
+            applied = true;
+        }
+        if let Some(capacity) = input.shard_capacity {
+            record.shard_capacity = capacity;
+            applied = true;
+        }
+        if let Some(password) = input.admin_user_password {
+            record.admin_user_password = password;
+            applied = true;
+        }
+        if let Some(ids) = input.vpc_security_group_ids {
+            record.vpc_security_group_ids = ids;
+            applied = true;
+        }
+        if let Some(ids) = input.subnet_ids {
+            record.subnet_ids = ids;
+            applied = true;
+        }
+        if let Some(window) = input.preferred_maintenance_window {
+            record.preferred_maintenance_window = window;
+            applied = true;
+        }
+        if let Some(window) = input.preferred_backup_window {
+            record.preferred_backup_window = Some(window);
+            applied = true;
+        }
+        if let Some(days) = input.backup_retention_period {
+            record.backup_retention_period = Some(days);
+            applied = true;
+        }
+        if let Some(count) = input.shard_instance_count {
+            record.shard_instance_count = Some(count);
+            applied = true;
+        }
+        if let Some(count) = input.shard_count {
+            // Resizing keeps the shards the cluster still has, mints the new ones and
+            // drops the ones past the new count.
+            record.shard_count = count;
+            let created_at = state::now_utc();
+            record.shards = state::shards_for(
+                count,
+                &created_at,
+                &std::mem::take(&mut record.shards),
+            );
+            applied = true;
+        }
+        // An applied update is reported UPDATING and the clock owes it ACTIVE. A
+        // request that carried no updatable member changed nothing, so it moves no
+        // status and re-arms no transition.
+        if applied {
+            record.begin_transition(state::STATUS_UPDATING);
+        }
+
+        let cluster = record.as_cluster();
+        drop(guard);
+
+        Ok(UpdateClusterOutput { cluster })
     }
 }

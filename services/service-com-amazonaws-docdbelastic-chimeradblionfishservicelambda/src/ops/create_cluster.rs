@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates, persists and returns a new elastic cluster. The record it mints in
+//! [`crate::state`] is what every later `GetCluster`, `ListClusters`,
+//! `UpdateCluster`, `DeleteCluster` and `CreateClusterSnapshot` reads.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +185,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        use crate::state;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(CreateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Constraints the docs state but the model does not express. Refused BEFORE
+        // anything is minted, so a rejected create leaves no record behind.
+        state::validate_cluster_name("clusterName", &input.cluster_name)
+            .map_err(CreateClusterErrorModeled::ValidationException)?;
+        state::validate_admin_user_name("adminUserName", &input.admin_user_name)
+            .map_err(CreateClusterErrorModeled::ValidationException)?;
+        state::validate_admin_user_password("adminUserPassword", &input.admin_user_password)
+            .map_err(CreateClusterErrorModeled::ValidationException)?;
+        state::validate_shard_capacity("shardCapacity", input.shard_capacity)
+            .map_err(CreateClusterErrorModeled::ValidationException)?;
+        state::validate_shard_count("shardCount", input.shard_count)
+            .map_err(CreateClusterErrorModeled::ValidationException)?;
+        if let Some(count) = input.shard_instance_count {
+            state::validate_shard_instance_count("shardInstanceCount", count)
+                .map_err(CreateClusterErrorModeled::ValidationException)?;
+        }
+        // Caller-sized values are bounded BEFORE they are stored, so one request's
+        // stored footprint is not caller-chosen.
+        if let Some(ids) = input.vpc_security_group_ids.as_deref() {
+            state::validate_id_list("vpcSecurityGroupIds", ids)
+                .map_err(CreateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(ids) = input.subnet_ids.as_deref() {
+            state::validate_id_list("subnetIds", ids)
+                .map_err(CreateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(tags) = input.tags.as_ref() {
+            state::validate_tags("tags", tags)
+                .map_err(CreateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(key) = input.kms_key_id.as_deref() {
+            state::validate_kms_key_id("kmsKeyId", key)
+                .map_err(CreateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(window) = input.preferred_maintenance_window.as_deref() {
+            state::validate_maintenance_window("preferredMaintenanceWindow", window)
+                .map_err(CreateClusterErrorModeled::ValidationException)?;
+        }
+        if let Some(window) = input.preferred_backup_window.as_deref() {
+            state::validate_backup_window("preferredBackupWindow", window)
+                .map_err(CreateClusterErrorModeled::ValidationException)?;
+        }
+
+        // "This parameter is stored as a lowercase string" — CreateClusterInput$clusterName.
+        let cluster_name = input.cluster_name.to_ascii_lowercase();
+        let region = state::request_region(ctx.parts());
+
+        let mut guard = store.lock();
+        // The store lives for the life of the process and is reclaimed only by an
+        // explicit delete, so the record count is capped.
+        state::ensure_cluster_capacity(guard.clusters.len())
+            .map_err(CreateClusterErrorModeled::ServiceQuotaExceededException)?;
+        if let Some(existing_arn) = guard.cluster_names.get(&cluster_name) {
+            return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
+                message: format!("An elastic cluster named {cluster_name} already exists"),
+                resource_id: existing_arn.clone(),
+                resource_type: "cluster".to_string(),
+            })
+            .into());
+        }
+
+        let cluster_id = state::new_resource_id();
+        let cluster_arn = state::docdb_elastic_arn(&region, &format!("cluster/{cluster_id}"));
+        let create_time = state::now_utc();
+        let mut record = state::ClusterRecord {
+            cluster_name: cluster_name.clone(),
+            cluster_arn: cluster_arn.clone(),
+            // `begin_transition` below sets the status and the instant it settles at.
+            status: String::new(),
+            settles_at: None,
+            cluster_endpoint: state::cluster_endpoint(&cluster_name, &cluster_id, &region),
+            create_time: create_time.clone(),
+            admin_user_name: input.admin_user_name,
+            admin_user_password: input.admin_user_password,
+            auth_type: input.auth_type,
+            shard_capacity: input.shard_capacity,
+            shard_count: input.shard_count,
+            shard_instance_count: input.shard_instance_count,
+            vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+            subnet_ids: input.subnet_ids.unwrap_or_default(),
+            preferred_maintenance_window: input
+                .preferred_maintenance_window
+                .unwrap_or_else(|| state::default_maintenance_window(&cluster_name)),
+            preferred_backup_window: input.preferred_backup_window,
+            backup_retention_period: input.backup_retention_period,
+            kms_key_id: input
+                .kms_key_id
+                .unwrap_or_else(|| state::AWS_OWNED_KMS_KEY.to_string()),
+            shards: state::shards_for(input.shard_count, &create_time, &[]),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+        // A new cluster is reported CREATING and the clock owes it ACTIVE.
+        record.begin_transition(state::STATUS_CREATING);
+
+        let cluster = record.as_cluster();
+        guard.cluster_names.insert(cluster_name, cluster_arn.clone());
+        guard.clusters.insert(cluster_arn, record);
+        drop(guard);
+
+        Ok(CreateClusterOutput { cluster })
     }
 }
