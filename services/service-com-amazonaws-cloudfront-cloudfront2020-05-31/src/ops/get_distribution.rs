@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(stored) = store.distribution(&input.id) else {
             return Err(GetDistributionErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(&input.id),
+                crate::state::no_such_distribution(),
             )
             .into());
         };

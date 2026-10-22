@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/billing_group_core_loop.rs"]
 mod billing_group_core_loop;
+#[path = "all/custom_line_item_and_create_name_refusals.rs"]
+mod custom_line_item_and_create_name_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_exception_message.rs"]

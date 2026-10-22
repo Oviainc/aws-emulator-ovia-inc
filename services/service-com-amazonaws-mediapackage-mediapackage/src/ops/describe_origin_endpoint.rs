@@ -178,15 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         let Some(record) = state.origin_endpoints.get(&input.id) else {
-            return Err(DescribeOriginEndpointErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "Origin endpoint with ID \"{}\" not found.",
-                        input.id
-                    )),
-                },
-            )
-            .into());
+            return Err(crate::state::origin_endpoint_not_found(&input.id).into());
         };
 
         let endpoint = record.to_origin_endpoint();

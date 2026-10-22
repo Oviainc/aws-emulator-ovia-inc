@@ -468,7 +468,12 @@ async fn describe_of_an_unknown_id_is_not_found() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(format!("PackagingConfiguration with id={id} not found").as_str()),
+            // The recorded AWS message for a missing PackagingConfiguration names the
+            // resource type by its ABBREVIATED label: behavioral unit
+            // `mediapackage-vod.delete-packaging-configuration-state-transition`
+            // asserts `PackagingConfig with id=<id> not found`, so that is the label
+            // this service words the message with.
+            Some(format!("PackagingConfig with id={id} not found").as_str()),
             "case {case:?} ({id}): expected the id bound into the message, got {}",
             body["message"]
         );

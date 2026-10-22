@@ -161,6 +161,11 @@ impl Emulator {
                     .iter()
                     .map(|(key, holding)| (key.clone(), holding.clone()))
                     .collect(),
+                contracts: ledger
+                    .contracts
+                    .values()
+                    .map(|contract| contract.contract_address.clone())
+                    .collect(),
             })
             .collect()
     }
@@ -173,11 +178,13 @@ pub(crate) struct NetworkFixture {
     pub(crate) transactions: Vec<StoredTransaction>,
     /// In the ledger's own key order.
     pub(crate) holdings: Vec<(HoldingKey, StoredHolding)>,
+    /// The address of every asset contract this ledger holds.
+    pub(crate) contracts: Vec<String>,
 }
 
 impl NetworkFixture {
     /// Every address that appears anywhere in this ledger.
-    fn addresses(&self) -> BTreeSet<String> {
+    pub(crate) fn addresses(&self) -> BTreeSet<String> {
         self.transactions
             .iter()
             .flat_map(|transaction| {
@@ -191,7 +198,7 @@ impl NetworkFixture {
     }
 
     /// The hashes of the stored transactions `address` took part in, in chain order.
-    fn hashes_for(&self, address: &str) -> Vec<String> {
+    pub(crate) fn hashes_for(&self, address: &str) -> Vec<String> {
         self.transactions
             .iter()
             .filter(|transaction| transaction.addresses().contains(&address))
@@ -201,7 +208,7 @@ impl NetworkFixture {
 
     /// The address with the most transactions — the busiest row, so a filter test has
     /// something to narrow.
-    fn busiest_address(&self) -> String {
+    pub(crate) fn busiest_address(&self) -> String {
         let mut addresses: Vec<String> = self.addresses().into_iter().collect();
         addresses.sort_by_key(|address| (usize::MAX - self.hashes_for(address).len(), address.clone()));
         addresses
@@ -232,7 +239,7 @@ pub(crate) fn error_code(body: &Value) -> String {
 }
 
 /// The `transactionHash` of every item in a list response.
-fn hashes(items: &Value) -> Vec<String> {
+pub(crate) fn hashes(items: &Value) -> Vec<String> {
     items
         .as_array()
         .unwrap_or_else(|| panic!("expected a list of items, got {items:?}"))
@@ -483,7 +490,9 @@ async fn list_transactions_returns_nothing_for_an_address_the_ledger_does_not_kn
     let emulator = Emulator::new();
     // Each row satisfies `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` and differs in form:
     // an Ethereum-shaped address, a base58-shaped one, a hyphenated label, and the
-    // longest and shortest the pattern admits.
+    // longest and shortest the pattern admits. The emulator holds no index of the
+    // public chains, so an identifier its fixture ledger does not hold answers with an
+    // empty page rather than with a history made up for it.
     let strangers = [
         "0x0000000000000000000000000000000000000000".to_string(),
         "1NotASeededBitcoinAddressAtAll".to_string(),
@@ -545,11 +554,17 @@ async fn list_transactions_honours_sort_order_the_confirmation_filter_and_the_wi
         for include in [vec!["FINAL"], vec!["NONFINAL"], vec!["FINAL", "NONFINAL"]] {
             let mut body = base.clone();
             body["confirmationStatusFilter"] = json!({"include": include});
+            // `ConfirmationStatusFilter$include`: "Transactions that have reached
+            // finality are always part of the response", so the filter only decides
+            // whether the ones that have not are included too.
             let expected: Vec<String> = network
                 .transactions
                 .iter()
                 .filter(|transaction| transaction.addresses().contains(&address.as_str()))
-                .filter(|transaction| include.contains(&transaction.confirmation_status.as_str()))
+                .filter(|transaction| {
+                    transaction.confirmation_status == "FINAL"
+                        || include.contains(&transaction.confirmation_status.as_str())
+                })
                 .map(|transaction| transaction.transaction_hash.clone())
                 .collect();
             let got = hashes(&emulator.ok("/list-transactions", &body).await["transactions"]);
@@ -1634,12 +1649,17 @@ async fn the_confirmation_filter_narrows_the_listing_to_the_statuses_it_names() 
 
         // Rows: each value of the model's `ConfirmationStatus` enum on its own, and both
         // together.
+        // `ConfirmationStatusFilter$include`: "Transactions that have reached finality
+        // are always part of the response", so the filter only decides whether the
+        // events of the transactions that have NOT reached it come too.
+        let filter_status = |event: &Value, include: &[&str]| {
+            let status = event["confirmationStatus"].as_str().unwrap_or_default();
+            status == "FINAL" || include.contains(&status)
+        };
         for include in [vec!["FINAL"], vec!["NONFINAL"], vec!["FINAL", "NONFINAL"]] {
             let want: Vec<Value> = whole
                 .iter()
-                .filter(|event| {
-                    include.contains(&event["confirmationStatus"].as_str().unwrap_or_default())
-                })
+                .filter(|event| filter_status(event, &include))
                 .cloned()
                 .collect();
             let mut body = filtered_events_body(&network.network, &address);

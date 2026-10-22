@@ -157,46 +157,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // Bound what the caller may make this record cost, before anything is stored.
-        let refuse = |message: String| {
-            CreateChannelError::from(CreateChannelErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(message),
-                },
-            ))
-        };
-        crate::state::bound_chars("Id", &input.id, crate::state::MAX_STRING_CHARS)
-            .map_err(refuse)?;
+        // Each refusal is this service's own envelope, keyed by the member it is about.
+        crate::state::bound_chars("id", &input.id, crate::state::MAX_STRING_CHARS)?;
         if let Some(description) = &input.description {
             crate::state::bound_chars(
-                "Description",
+                "description",
                 description,
                 crate::state::MAX_STRING_CHARS,
-            )
-            .map_err(refuse)?;
+            )?;
         }
-        crate::state::bound_tags(&input.tags).map_err(refuse)?;
+        crate::state::bound_tags(&input.tags)?;
 
         // The ID must be unique within the region: a second CreateChannel with an id
-        // already in use is refused, never an overwrite of the stored channel.
+        // already in use is refused, never an overwrite of the stored channel. The
+        // refusal names the resource type that is in the way and why.
         if state.channels.contains_key(&input.id) {
-            return Err(CreateChannelErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(format!("A channel with ID \"{}\" already exists.", input.id)),
-                },
-            )
-            .into());
+            return Err(
+                crate::state::resource_already_exists(crate::state::CHANNEL_KIND, &input.id).into(),
+            );
         }
 
         // The store lives for the life of the process and only a create adds to it, so
         // it is capped by entry count; past the cap the resource limit is reported.
         if state.channels.len() >= crate::state::MAX_CHANNELS {
-            return Err(CreateChannelErrorModeled::TooManyRequestsException(
-                TooManyRequestsException {
-                    message: Some(format!(
-                        "The channel limit of {} for this account has been reached.",
-                        crate::state::MAX_CHANNELS
-                    )),
-                },
+            return Err(crate::state::resource_limit_reached(
+                crate::state::CHANNEL_KIND,
+                crate::state::MAX_CHANNELS,
             )
             .into());
         }

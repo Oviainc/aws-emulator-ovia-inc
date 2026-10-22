@@ -20,12 +20,14 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_operation` — EDITED HERE. The key and the handler stay the generated
+//!   table's; the operation is served through [`ModelledValidation`], which states a
+//!   request refused for violating a modelled constraint in THIS service's own
+//!   `ValidationException`. See "Why this file validates input" below.
+//! - `override_refusal` — EDITED HERE. A refusal the framework still renders (one with
+//!   no modelled operation to read the request against) is worded from the same
+//!   violations through the same [`refusal_message`], so the two refusal paths cannot
+//!   disagree.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -432,3 +434,4 @@ fn validation_exception(message: String) -> crate::ops::types::ValidationExcepti
         fields: None,
     }
 }
+

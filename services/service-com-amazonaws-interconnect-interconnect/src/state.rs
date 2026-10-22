@@ -385,6 +385,8 @@ pub fn summary_of(connection: &Connection) -> ConnectionSummary {
 pub const ENVIRONMENT_CURSOR_TAG: &str = "env:";
 /// The tag `ListConnections` stamps on the cursors it issues.
 pub const CONNECTION_CURSOR_TAG: &str = "conn:";
+/// The tag `ListAttachPoints` stamps on the cursors it issues.
+pub const ATTACH_POINT_CURSOR_TAG: &str = "ap:";
 
 /// Read the key out of a page cursor this operation issued.
 ///
@@ -542,30 +544,53 @@ fn seed_environments() -> BTreeMap<String, Environment> {
         .collect()
 }
 
+/// The `AttachPointType` every seeded descriptor carries.
+///
+/// `AttachPointType` is an enum whose ONLY modelled value is
+/// `DirectConnectGateway`, so it is the only type a descriptor can report even
+/// though `AttachPointDescriptor$type`'s prose also mentions an ARN form.
+pub const ATTACH_POINT_TYPE_DIRECT_CONNECT_GATEWAY: &str = "DirectConnectGateway";
+
+/// How many attach points the n-th seeded Environment offers.
+///
+/// AWS publishes no count — an Environment offers whatever gateways the caller has
+/// access to — so the shape of the seed is emulator-chosen. It varies with the
+/// environment's position in the catalog (1, 2 or 3) so the catalog spans
+/// environments whose attach points fit in one page and environments whose do not,
+/// rather than making every `ListAttachPoints` page trivially the last one.
+fn seeded_attach_point_count(index: usize) -> usize {
+    1 + index % 3
+}
+
 /// The attach points each seeded Environment offers.
 ///
 /// `AttachPointType`'s only modelled value is `DirectConnectGateway`, so each entry
 /// names a Direct Connect gateway by the UUID that
 /// `AttachPoint$directConnectGateway` requires. The UUID is DERIVED from the
-/// environment id (a name-based v5 UUID), so the seed cannot fall out of step with
-/// the catalog however many environments it holds, and it is stable across runs the
-/// way an AWS-owned resource id is.
+/// environment id and the entry's ordinal (a name-based v5 UUID), so the seed cannot
+/// fall out of step with the catalog however many environments it holds, and it is
+/// stable across runs the way an AWS-owned resource id is.
 fn seed_attach_points(
     environments: &BTreeMap<String, Environment>,
 ) -> BTreeMap<String, Vec<AttachPointDescriptor>> {
     environments
         .keys()
-        .map(|environment_id| {
-            let gateway =
-                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, environment_id.as_bytes());
-            (
-                environment_id.clone(),
-                vec![AttachPointDescriptor {
-                    r#type: "DirectConnectGateway".to_string(),
-                    identifier: gateway.to_string(),
-                    name: format!("dxgw-for-{environment_id}"),
-                }],
-            )
+        .enumerate()
+        .map(|(index, environment_id)| {
+            let descriptors = (0..seeded_attach_point_count(index))
+                .map(|ordinal| {
+                    let gateway = uuid::Uuid::new_v5(
+                        &uuid::Uuid::NAMESPACE_OID,
+                        format!("{environment_id}#{ordinal}").as_bytes(),
+                    );
+                    AttachPointDescriptor {
+                        r#type: ATTACH_POINT_TYPE_DIRECT_CONNECT_GATEWAY.to_string(),
+                        identifier: gateway.to_string(),
+                        name: format!("dxgw-{ordinal}-for-{environment_id}"),
+                    }
+                })
+                .collect();
+            (environment_id.clone(), descriptors)
         })
         .collect()
 }
