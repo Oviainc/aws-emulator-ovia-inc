@@ -18,19 +18,22 @@
 //! (both published bounds of `MaxResults`' modelled `range 1..1000`, sizes above,
 //! below and equal to the stored count, and no bound at all).
 //!
-//! `CreateConnector` is still a scaffold stub
-//! (`issues/things-that-do-not-work/20261022T110916Z-transfer-createconnector-stub.md`),
-//! so these suites SEED the store the way a connector write will — through the one
-//! shared engine the handlers read, see `state_roundtrip.rs` — and then read it back
-//! over the wire. Nothing here bypasses the handler being tested.
+//! These suites SEED the store directly — through the one shared engine the handlers
+//! read, see `state_roundtrip.rs` — rather than through `CreateConnector`, so a row can
+//! carry a `Url` form a create does not store (absent on a service-managed connector,
+//! or the empty string at `Url`'s modelled lower bound) and the listing is still
+//! exercised over it. Nothing here bypasses the handler being tested: the records are
+//! written exactly as `CreateConnector` writes them and read back over the wire.
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_transfer_transferservice::ops::types::SftpConnectorConfig;
 use service_com_amazonaws_transfer_transferservice::state::{
-    connector_arn, Connector, MAX_STORED_CONNECTORS,
+    connector_arn, Connector, CONNECTOR_STATUS_ACTIVE, DEFAULT_CONNECTOR_EGRESS_TYPE,
+    DEFAULT_MAX_CONCURRENT_CONNECTIONS, MAX_STORED_CONNECTORS,
 };
 
-use crate::harness::{drain_pages, Answer, Emulator, ACCOUNT, REGION};
+use crate::harness::{drain_pages, Answer, Emulator, ACCOUNT, REGION, ROLE};
 
 /// A url of exactly 255 characters: `Url`'s modelled `len 0..255` upper bound.
 fn url_at_max_length() -> String {
@@ -66,6 +69,24 @@ fn seed_connectors(emulator: &Emulator, urls: &[Option<String>]) -> Vec<(String,
             connector_id: connector_id.clone(),
             arn: connector_arn(REGION, &connector_id),
             url: url.clone(),
+            // The rest of the record is what a service-managed SFTP connector write
+            // stores (`CreateConnector` resolves exactly these); a LISTING projects
+            // none of them, which is part of what these suites assert.
+            as2_config: None,
+            sftp_config: Some(SftpConnectorConfig {
+                user_secret_id: Some("sftp-partner-credentials".to_string()),
+                trusted_host_keys: None,
+                max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+                ordered_user_secret_version_stages: None,
+            }),
+            access_role: ROLE.to_string(),
+            logging_role: None,
+            security_policy_name: None,
+            egress_config: None,
+            egress_type: DEFAULT_CONNECTOR_EGRESS_TYPE.to_string(),
+            ip_address_type: None,
+            status: CONNECTOR_STATUS_ACTIVE.to_string(),
+            tags: Vec::new(),
         };
         guard.connectors.insert(connector_id.clone(), connector);
         seeded.push((connector_id, url.clone()));

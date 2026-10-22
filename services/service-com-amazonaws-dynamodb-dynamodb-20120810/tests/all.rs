@@ -36,3 +36,6 @@ mod table_items;
 
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
+
+#[path = "all/value_rules_and_resource_policy.rs"]
+mod value_rules_and_resource_policy;
