@@ -8,6 +8,19 @@
 //! target, ordering, format and tags the caller asked for. The target's
 //! `roleArn` has to be a role this account can pass.
 //!
+//! ## Where the pass-role decision is taken
+//!
+//! Being allowed to pass the role named in `targetDefinition` is an
+//! AUTHORIZATION decision about the caller and that one member — the operation's
+//! documented `iam:PassRole` requirement — so it is reached BEFORE this request's
+//! contents are checked: before the cluster is looked up (below) and before the
+//! model's member-constraint validation, which the framework runs ahead of every
+//! handler. [`PassRoleGate`] is the second half of that: `handle` is only ever
+//! entered by a request the framework already found valid, so a request whose
+//! target names an unpassable role AND breaks some other member's constraint
+//! would otherwise be refused as malformed and never reach the decision. The
+//! gate takes it on the way in, from the same two helpers the handler uses.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -102,6 +115,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use ::aws_smithy_schema_server::constraints;
+use smithy_server_runtime::{
+    BoxFuture, DeserializableStruct, ErasedOperation, OperationContext, OperationError,
+    ServerHttpProtocol, Service,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -194,6 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
+
+        // Passing a role is an AUTHORIZATION decision, so it is settled before any
+        // state is read or touched — before the cluster lookup below, as
+        // [`PassRoleGate`] settles it before the model-constraint validation of the
+        // rest of the request: a role in another account cannot have its trust
+        // relationship with this service established, and the caller is told that
+        // it may not pass that role rather than that its request was malformed or
+        // that the cluster it named is missing.
+        if let Some(denial) = cross_account_denial(&input.target_definition) {
+            return Err(CreateStreamErrorModeled::AccessDeniedException(denial).into());
+        }
+
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
         state.settle(now);
@@ -201,22 +233,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.clusters.contains_key(&input.cluster_identifier) {
             return Err(CreateStreamErrorModeled::ResourceNotFoundException(
                 crate::state::cluster_not_found(&region, &input.cluster_identifier),
-            )
-            .into());
-        }
-
-        // Passing a role is an authorization decision, so it is settled before any
-        // state is touched: a role in another account cannot have its trust
-        // relationship with this service established, and the caller is told that
-        // it may not pass that role rather than that its request was malformed.
-        let role_arn = match &input.target_definition {
-            TargetDefinition::Kinesis(kinesis) => kinesis.role_arn.clone(),
-        };
-        if !is_passable_role(&role_arn) {
-            return Err(CreateStreamErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: "Cross-account pass role is not allowed.".to_string(),
-                },
             )
             .into());
         }
@@ -356,6 +372,164 @@ fn created_stream_output(
 /// `smithy_query(query="shape", shape="KinesisTargetDefinition")`).
 fn is_passable_role(role_arn: &str) -> bool {
     role_arn.split(':').nth(4) == Some(::engine::emulator_account_id())
+}
+
+/// The sentence this service states a cross-account pass-role denial with.
+const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not allowed.";
+
+/// The member of `KinesisTargetDefinition` that names the role this service is
+/// asked to pass (`smithy_query(query="shape",
+/// shape="KinesisTargetDefinition")`: `roleArn`, `@length(20, 2048)` and
+/// `@pattern("^arn:aws(-[^:]+)?:iam::[0-9]{12}:role(/[a-zA-Z0-9+=,.@_-]+)+$")`).
+/// A violation path ends in it wherever the target travels.
+const ROLE_ARN_MEMBER: &str = "roleArn";
+
+/// The `roleArn` a `targetDefinition` asks this service to pass, whichever
+/// destination the union names.
+fn target_role_arn(target: &TargetDefinition) -> &str {
+    match target {
+        TargetDefinition::Kinesis(kinesis) => kinesis.role_arn.as_str(),
+    }
+}
+
+/// The modelled `AccessDeniedException` for a target naming a role this account
+/// cannot pass, or `None` when it names one it can.
+///
+/// The ONE place the pass-role decision becomes a refusal, so the gate ahead of
+/// validation and the handler behind it cannot answer a role differently.
+fn cross_account_denial(target: &TargetDefinition) -> Option<AccessDeniedException> {
+    (!is_passable_role(target_role_arn(target))).then(|| AccessDeniedException {
+        message: CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
+    })
+}
+
+/// `CreateStream` served so the pass-role decision on `targetDefinition` is
+/// reached BEFORE the framework refuses the request for a constraint broken by
+/// some OTHER member.
+///
+/// The framework's per-request sequence is deserialize -> validate -> handle, so
+/// a handler never sees a request that breaks a modelled constraint: a target
+/// naming an unpassable role together with, say, a `streamArn` outside its
+/// pattern would be answered 400 `ValidationException` — "fix your ARN" — where
+/// the authorization boundary says 403 `AccessDeniedException`, and a client
+/// branching on the code cannot tell a denied role pass from a typo. This
+/// wrapper takes that decision on the way in and answers it; it is wired in
+/// `crate::service`'s `override_operation`.
+///
+/// Nothing else is re-implemented. A request it does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate ->
+/// handle -> serialize, telemetry and every modelled error — the cluster lookup,
+/// the idempotency ledger and the quota included. The cost is that such a
+/// request is read twice, once here and once in the operation's own sequence,
+/// because the framework hands no already-built input to an operation.
+pub struct PassRoleGate<Eng> {
+    operation: CreateStream<Eng>,
+}
+
+impl<Eng> PassRoleGate<Eng> {
+    /// Wrap this operation, constructed from the shared engine the way the
+    /// generated routing table constructs it.
+    pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
+        Self {
+            operation: CreateStream::new(engine),
+        }
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ErasedOperation
+    for PassRoleGate<Eng>
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The service definition is read, used and dropped inside this one
+            // statement: `&dyn ErasedServiceDefinition` is not `Sync`, so holding
+            // it across the await below would make this future non-`Send`.
+            if let Some(denied) = pass_role_denial_response(svc, req) {
+                return denied;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must
+    /// not change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// The 403 this service answers a `CreateStream` whose target names a role the
+/// caller may not pass, or `None` when there is no such decision to take.
+///
+/// Rendered from the SAME four facts the framework's own error tail renders a
+/// modelled failure from — the error shape, its schema, its wire code and its
+/// modelled HTTP status — so this is the answer the handler would have given had
+/// validation not refused the request first.
+///
+/// Once the decision is taken it is ANSWERED: a refusal this function cannot
+/// serialize is rendered through the service's own framework-error envelope
+/// rather than dropped, because falling through would hand the request back to
+/// the walk whose 400 this exists to reclassify.
+fn pass_role_denial_response(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
+    let protocol = svc.definition().protocol();
+    let denial = CreateStreamErrorModeled::AccessDeniedException(unpassable_role(protocol, req)?);
+    // The record the per-operation sequence would have made: the gate answers
+    // ahead of `ErasedOperation::run`, which is where the framework classifies an
+    // operation's outcome, so the denial is noted here instead. Nothing the
+    // caller sent is logged — the outcome is what a reader needs.
+    ::tracing::info!(
+        operation = <CreateStream<()> as smithy_server_runtime::Operation>::NAME,
+        outcome = denial.shape_name(),
+        status = denial.http_status(),
+        "refused a CreateStream whose target names a role this account cannot pass"
+    );
+    match protocol.serialize_error(
+        denial.as_serializable(),
+        denial.variant_schema(),
+        denial.shape_name(),
+        denial.http_status(),
+    ) {
+        Ok(response) => Some(response),
+        Err(error) => Some(svc.definition().framework_error_response(error)),
+    }
+}
+
+/// The denial for a request that asks this service to pass a role it may not,
+/// when that decision is reachable at all.
+///
+/// Reachable means two things. The request has to READ as this operation's input:
+/// a body no codec can read, or one missing a required member, names no role, and
+/// is left to the framework's own refusal. And the role member itself has to
+/// satisfy its modelled constraints: a `roleArn` outside [`ROLE_ARN_MEMBER`]'s
+/// pattern or length names no role to authorize, so that request stays a
+/// validation refusal. A constraint broken by any OTHER member does not stand in
+/// the way — the decision is about the caller and the role alone, so it is taken
+/// first.
+fn unpassable_role(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<AccessDeniedException> {
+    let mut deserializer = protocol
+        .deserialize_input(req, CREATE_STREAM_INPUT_SCHEMA)
+        .ok()?;
+    let read = CreateStreamInput::deserialize(&mut *deserializer);
+    drop(deserializer);
+    let input = read.ok()?;
+    // The violations come from the framework's own machinery over the same input
+    // schema, so this cannot read a member as valid that the walk behind it
+    // refuses.
+    let role_refused = constraints::validate(&input, CREATE_STREAM_INPUT_SCHEMA)
+        .iter()
+        .any(|violation| violation.path.rsplit('.').next() == Some(ROLE_ARN_MEMBER));
+    if role_refused {
+        return None;
+    }
+    cross_account_denial(&input.target_definition)
 }
 
 /// Render a `targetDefinition` into one idempotency-fingerprint part.
