@@ -21,47 +21,22 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice as cost_optimization_hub;
 
-use crate::cost_optimization_hub::{call, router};
+use crate::cost_optimization_hub::{call, error_code, router, FIELD_VALIDATION_FAILED};
 
 /// The model's enum value sets, as the generated catalogue holds them — the same
 /// model data the constraint walk checks against, so the clause a refusal states
 /// is compared with the model rather than with a list copied into this file.
 use cost_optimization_hub::ops::types::shared_types::{
     ENROLLMENT_STATUS_VALUES, GRANULARITY_TYPE_VALUES, IMPLEMENTATION_EFFORT_VALUES,
-    SAVINGS_ESTIMATION_MODE_VALUES,
+    MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES, SAVINGS_ESTIMATION_MODE_VALUES,
 };
 
-/// The reason a member outside its declared constraint is reported under: one of
-/// the two values `ValidationExceptionReason` holds (the other is `Other`).
-const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
-
-/// The wire error code (`__type`) of an error body, without its namespace.
-fn error_code(payload: &Value) -> String {
-    payload["__type"]
-        .as_str()
-        .unwrap_or_default()
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
 /// The `fields` list of a `ValidationException` body as `(fieldName, message)`
-/// pairs, sorted so a case does not depend on the order the walk found the
-/// violations in.
+/// pairs, SORTED so a case does not depend on the order the walk found the
+/// violations in — which is the only thing this suite needs beyond the shared
+/// extractor.
 fn fields(payload: &Value) -> Vec<(String, String)> {
-    let mut entries: Vec<(String, String)> = payload["fields"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .map(|entry| {
-            (
-                entry["fieldName"].as_str().unwrap_or_default().to_string(),
-                entry["message"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
+    let mut entries = crate::cost_optimization_hub::fields(payload);
     entries.sort();
     entries
 }
@@ -322,6 +297,31 @@ async fn a_constraint_refusal_names_every_member_and_its_constraint() {
                 SAVINGS_ESTIMATION_MODE_VALUES,
             )],
         ),
+        (
+            // A value outside the member's enum is refused for THAT, before the
+            // handler gets to the rule about who may write the member at all:
+            // the request is answered with the field list, not with the
+            // permission refusal `management_account_gating` covers.
+            "enum membership on a management-account-only member",
+            "UpdatePreferences",
+            json!({"memberAccountDiscountVisibility": "Everyone"}),
+            vec![enum_entry(
+                "memberAccountDiscountVisibility",
+                MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES,
+            )],
+        ),
+        (
+            "two members at once on a write",
+            "UpdatePreferences",
+            json!({"memberAccountDiscountVisibility": "Everyone", "savingsEstimationMode": "Nope"}),
+            vec![
+                enum_entry(
+                    "memberAccountDiscountVisibility",
+                    MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES,
+                ),
+                enum_entry("savingsEstimationMode", SAVINGS_ESTIMATION_MODE_VALUES),
+            ],
+        ),
     ];
 
     for (case, operation, request, expected) in &cases {
@@ -467,13 +467,13 @@ async fn every_request_inside_its_constraints_is_served() {
         (
             "a twelve-digit accountId".to_string(),
             "ListEnrollmentStatuses",
-            json!({"includeOrganizationInfo": true, "accountId": "123456789012"}),
+            json!({"includeOrganizationInfo": false, "accountId": engine::emulator_account_id()}),
             200,
         ),
         (
             "a nested list at its minimum length".to_string(),
             "ListRecommendations",
-            json!({"filter": {"accountIds": ["123456789012"]}}),
+            json!({"filter": {"regions": ["us-east-1"]}}),
             200,
         ),
         (

@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/cost_optimization_hub.rs"]
 mod cost_optimization_hub;
+#[path = "all/management_account_gating.rs"]
+mod management_account_gating;
+#[path = "all/max_results_bounds.rs"]
+mod max_results_bounds;
 #[path = "all/recommendation_summaries.rs"]
 mod recommendation_summaries;
 #[path = "all/state_roundtrip.rs"]

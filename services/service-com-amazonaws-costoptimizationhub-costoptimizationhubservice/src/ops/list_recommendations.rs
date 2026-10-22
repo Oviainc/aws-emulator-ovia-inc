@@ -12,6 +12,10 @@
 //! from each row's stored prices under the caller's effective
 //! `savingsEstimationMode` preference.
 //!
+//! `filter.accountIds` asks for other accounts' recommendations, which only the
+//! organization's management account may do, so a populated `accountIds` from
+//! any other caller is refused with the modelled `AccessDeniedException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -161,6 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // This operation's own `@range` on `maxResults`, which the shared
+        // `MaxResults` shape does not bound (see `MAX_RESULTS_MAX`).
+        if let Some(refused) =
+            crate::service::out_of_range("maxResults", input.max_results, 0, MAX_RESULTS_MAX)
+        {
+            return Err(ListRecommendationsErrorModeled::ValidationException(refused).into());
+        }
+
         let offset = match &input.next_token {
             None => 0,
             Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
@@ -184,6 +196,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (mode, mut rows) = {
             let store = state.lock();
+
+            // Asking for the recommendations of accounts other than the
+            // caller's is an organization view, which only the organization's
+            // management account has. Refused for ANY populated `accountIds`,
+            // because what the caller lacks is the view, not one account in it.
+            if input
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.account_ids.as_ref())
+                .is_some_and(|account_ids| !account_ids.is_empty())
+                && !store.is_management_account(crate::state::caller_account_id())
+            {
+                return Err(not_an_organization_view());
+            }
+
             let mode = store
                 .effective_preferences(crate::state::caller_account_id())
                 .savings_estimation_mode;
@@ -221,6 +248,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The list a `nextToken` from this operation belongs to.
 const PAGE_KIND: &str = "recommendations";
+
+/// The largest page this operation accepts, from the `@range` its OWN
+/// `maxResults` member declares — which overrides the narrower range of the
+/// `MaxResults` shape it targets
+/// (`smithy_query(query="operation", operation="ListRecommendations")`:
+/// `maxResults` `range` min 0 max 1000). The member is excluded from the
+/// schema's constraint walk (`skip_validation` on `ListRecommendationsInput`)
+/// because that walk reads the target shape's bound, so the bound is enforced
+/// here against the operation's own.
+const MAX_RESULTS_MAX: i64 = 1000;
 
 /// The `Order` value that reverses the sort; the other value (`Asc`) is the
 /// order a dimension's values take on their own, and is what an absent `order`
@@ -293,27 +330,34 @@ fn render(row: &crate::state::StoredRecommendation, mode: Option<&str>) -> Recom
 
 /// Refuse a `nextToken` this service did not issue for this list.
 fn invalid_next_token() -> ListRecommendationsError {
-    ListRecommendationsErrorModeled::ValidationException(ValidationException {
-        message: "nextToken is not a pagination token issued by ListRecommendations".to_string(),
-        reason: Some("FieldValidationFailed".to_string()),
-        fields: Some(vec![ValidationExceptionDetail {
+    ListRecommendationsErrorModeled::ValidationException(crate::service::field_validation_exception(
+        vec![ValidationExceptionDetail {
             field_name: "nextToken".to_string(),
             message: "the value is not a pagination token issued by ListRecommendations"
                 .to_string(),
-        }]),
-    })
+        }],
+    ))
     .into()
 }
 
 /// Refuse an `orderBy.dimension` that names no `Recommendation` member.
 fn unknown_dimension(dimension: &str) -> ListRecommendationsError {
-    ListRecommendationsErrorModeled::ValidationException(ValidationException {
-        message: format!("orderBy.dimension {dimension} is not a recommendation dimension"),
-        reason: Some("FieldValidationFailed".to_string()),
-        fields: Some(vec![ValidationExceptionDetail {
+    ListRecommendationsErrorModeled::ValidationException(crate::service::field_validation_exception(
+        vec![ValidationExceptionDetail {
             field_name: "orderBy.dimension".to_string(),
             message: format!("{dimension} is not a dimension recommendations can be sorted by"),
-        }]),
+        }],
+    ))
+    .into()
+}
+
+/// Refuse a caller that is not the organization's management account the
+/// recommendations of the organization's member accounts: the modelled
+/// `AccessDeniedException` (403), because what is missing is the caller's
+/// permission and not anything about the values it sent.
+fn not_an_organization_view() -> ListRecommendationsError {
+    ListRecommendationsErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: crate::service::organization_view_denied("recommendations"),
     })
     .into()
 }
