@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/abort_environment_update.rs"]
 mod abort_environment_update;
+#[path = "all/application_version_updates.rs"]
+mod application_version_updates;
 #[path = "all/application_versions.rs"]
 mod application_versions;
 #[path = "all/dns_availability.rs"]

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplicationVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplicationVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: updates the stored application version's mutable properties and answers
+//! with the `ApplicationVersionDescription` built from what is now stored. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplicationVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A property the request OMITS keeps its stored value; a property supplied as the empty
+//! string is CLEARED, which is what this operation's own documentation note states.
+//!
+//! `DateUpdated` is CHANGE-triggered, not call-triggered: a call that asks for the value
+//! the record already holds (or names no property at all) leaves the record, and so its
+//! `DateUpdated`, exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -136,20 +137,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplicationVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplicationVersion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApplicationVersionError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `ApplicationName`: "If no application is found with this name,
+        // UpdateApplication returns an InvalidParameterValue error."
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(UpdateApplicationVersionError::invalid_parameter_value(
+                format!("No Application named '{}' found.", input.application_name),
+            ));
+        }
+
+        // `VersionLabel`: "If no application version is found with this label,
+        // UpdateApplication returns an InvalidParameterValue error." A version is
+        // keyed by (application, label), so the same label under a different
+        // application is a different record and does not satisfy this lookup.
+        let key = (input.application_name.clone(), input.version_label.clone());
+        let Some(version) = store.application_versions.get_mut(&key) else {
+            return Err(UpdateApplicationVersionError::invalid_parameter_value(
+                format!(
+                    "No Application Version named '{}' found.",
+                    input.version_label
+                ),
+            ));
+        };
+
+        // "Updates the specified application version to have the specified
+        // properties. If a property (for example, description) is not provided,
+        // the value remains unchanged. To clear properties, specify an empty
+        // string." `Description` is the only property this operation's input
+        // carries, so it is the only one that rule applies to here: an absent
+        // member leaves the stored value alone, and an empty one clears it
+        // (the property is then reported as absent, not as an empty value).
+        let supplied = input
+            .description
+            .map(|description| Some(description).filter(|text| !text.is_empty()));
+        if let Some(description) = supplied {
+            if description != version.description {
+                version.description = description;
+                // `DateUpdated` records when the record last CHANGED, so a call
+                // that asks for the value it already holds leaves it alone.
+                version.date_updated = crate::state::now();
+            }
+        }
+
+        Ok(UpdateApplicationVersionOutput {
+            application_version: Some(version.to_description()),
+        })
     }
 }
