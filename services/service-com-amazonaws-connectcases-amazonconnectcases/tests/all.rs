@@ -23,6 +23,8 @@ mod field_listing;
 mod field_options;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/layout_deletion.rs"]
+mod layout_deletion;
 #[path = "all/layout_lifecycle.rs"]
 mod layout_lifecycle;
 #[path = "all/state_roundtrip.rs"]

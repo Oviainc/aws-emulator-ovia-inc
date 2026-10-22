@@ -284,9 +284,10 @@ pub struct Layout {
     /// group's name and the order of its fields are exactly what the write
     /// gave, so a read hands back the record rather than a re-encoding of it.
     pub content: LayoutContent,
-    /// Reserved for `DeleteLayout`, which is still a 501: a deleted layout is
-    /// still readable through `GetLayout` and refuses `UpdateLayout`, so the
-    /// record carries a flag rather than being dropped.
+    /// Whether `DeleteLayout` has deleted this layout. The service's delete is
+    /// a SOFT delete, so the record carries a flag rather than being dropped: a
+    /// deleted layout is still readable through `GetLayout`, refuses
+    /// `UpdateLayout`, and is left out of `ListLayouts`.
     pub deleted: bool,
     /// Reserved for the tagging slice, as [`Field::tags`].
     pub tags: HashMap<String, String>,
