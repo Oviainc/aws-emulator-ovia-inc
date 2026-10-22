@@ -4,6 +4,14 @@
 //! Persists a new pricing rule and answers with the ARN it minted, so a later
 //! `ListPricingRules` reports it and `DeletePricingRule` can remove it.
 //!
+//! NOT DECIDED HERE: AWS gates every Billing Conductor operation on the caller being
+//! the organization's payer (management) account, answering 403
+//! `AccessDeniedException` to anyone else. That gate is a property of the CALLER, not
+//! of this request, so it belongs to the service's dispatch path rather than to one
+//! handler, and it is tracked by its own issue
+//! (`billingconductor-payer-account-authorization-gate-absent-across-the`). This
+//! handler decides what the request says and what state holds.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
