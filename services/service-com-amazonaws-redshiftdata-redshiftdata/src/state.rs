@@ -11,11 +11,17 @@
 //! * [`Statement`] — one submitted statement and everything the API reports
 //!   about it. `ExecuteStatement` writes it; `DescribeStatement`,
 //!   `GetStatementResult`, `ListStatements` and `CancelStatement` all read it.
+//!   A `BatchExecuteStatement` submission is one of these too, holding one per
+//!   statement it submitted in [`Statement::sub_statements`] — a batch's
+//!   statement has its own text, status, outcome and `Id` (`<batch id>:<n>`),
+//!   so it is the same thing as any other statement rather than a second kind.
 //! * [`Database`] — the SQL engine itself. One in-process SQLite database
 //!   (`rusqlite`, a real engine, not a hand-written SQL subset) per
 //!   connection target and database name, so a `CREATE TABLE` submitted by one
 //!   statement is visible to the `SELECT` submitted by the next, exactly as a
-//!   Redshift database is.
+//!   Redshift database is. A batch's statements run serially on that one
+//!   connection, which is what lets [`ExecutionMode::Transaction`] commit or
+//!   roll back all of them together.
 //!
 //! The asynchronous status timeline is modelled with a stored due instant and
 //! never with a sleep: a statement is `SUBMITTED` when `ExecuteStatement`
@@ -78,17 +84,18 @@ const SQL_QUEUE_GRACE: Duration = Duration::from_secs(3);
 /// the timeout and the step budget.
 const PROGRESS_HANDLER_OPS: i32 = 1_000;
 
-/// Cap on the number of rows one statement's result set retains.
+/// Cap on the number of rows one submission's results retain.
 pub const MAX_RESULT_ROWS: usize = 100_000;
 
-/// Cap on the number of VALUES (rows times columns) one statement's result set
-/// retains. A cell costs memory whatever it holds, so a wide projection of
+/// Cap on the number of VALUES (rows times columns) one submission's results
+/// retain. A cell costs memory whatever it holds, so a wide projection of
 /// constants is bounded by this even though it charges almost nothing in bytes.
 const MAX_RESULT_CELLS: usize = 2_000_000;
 
-/// Cap on the MATERIALISED size of one statement's result set, in bytes. Held
+/// Cap on the MATERIALISED size of one SUBMISSION's results, in bytes. Held
 /// low enough that [`MAX_RETAINED_STATEMENTS`] of them still fit in the
-/// emulator's own memory.
+/// emulator's own memory. A batch's statements share this one budget, so a
+/// request cannot retain more by submitting more statements.
 const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
 
 /// What one retained cell costs beyond its payload: the `Field` union itself.
@@ -152,8 +159,14 @@ const DATABASE_IDLE_TIMEOUT: Duration = STATEMENT_RETENTION;
 /// How many statements are retained. An emulator-chosen memory bound on top of
 /// [`STATEMENT_RETENTION`]: each retained statement holds its result set, so the
 /// per-statement caps above only bind if the number retained is bounded too.
-/// Together with [`MAX_RESULT_BYTES`] this caps the retained result data.
-/// The oldest submissions are evicted first.
+///
+/// It counts STATEMENTS, not submissions: a batch counts as itself plus each of
+/// its statements, because each of those holds a result set of its own. Since
+/// one submission's results share a single [`MAX_RESULT_BYTES`] budget (see
+/// `Retention`), this caps the retained result data at
+/// `MAX_RETAINED_STATEMENTS` times [`MAX_RESULT_BYTES`] whatever mix of single
+/// statements and batches a caller sends. The oldest submissions are evicted
+/// first.
 pub const MAX_RETAINED_STATEMENTS: usize = 100;
 
 /// How long a statement stays readable. The Amazon Redshift Data API
@@ -203,6 +216,42 @@ pub enum StatementStatus {
     Aborted,
 }
 
+/// How a submission's statements are committed.
+///
+/// The wire spellings are the ones `ExecutionMode` declares
+/// (`shared_types::EXECUTION_MODE_VALUES`): TRANSACTION and AUTO_COMMIT. The
+/// model documents what each one does: "If set to TRANSACTION (the default),
+/// all SQL statements are run as a single transaction and they are committed or
+/// rolled back together. If set to AUTO_COMMIT, each SQL statement is committed
+/// individually, and a failure of one statement does not affect the others."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// The statements are committed or rolled back together.
+    Transaction,
+    /// Each statement is committed on its own.
+    AutoCommit,
+}
+
+impl ExecutionMode {
+    /// The wire value, as `ExecutionMode` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transaction => "TRANSACTION",
+            Self::AutoCommit => "AUTO_COMMIT",
+        }
+    }
+
+    /// The mode a request's `ExecutionMode` names, or `None` for a value the
+    /// model does not declare.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "TRANSACTION" => Some(Self::Transaction),
+            "AUTO_COMMIT" => Some(Self::AutoCommit),
+            _ => None,
+        }
+    }
+}
+
 impl StatementStatus {
     /// The wire value, as `StatementStatusString` spells it.
     pub fn as_str(self) -> &'static str {
@@ -223,13 +272,17 @@ impl StatementStatus {
 /// What a `CancelStatement` request found when it asked for a statement to be
 /// stopped. Carries the status the store OBSERVED, so the caller never has to
 /// look the statement up a second time to describe the outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cancellation {
     /// This call stopped a statement that was still running.
     Cancelled,
     /// The statement had already stopped, in this status, so this call
     /// cancelled nothing.
     AlreadyStopped(StatementStatus),
+    /// The `Id` names ONE statement of a batch, which is not a query that runs
+    /// on its own: its batch is what a caller cancels. Carries the batch's
+    /// `Id`.
+    BatchMember(String),
     /// No retained statement carries that `Id`.
     Unknown,
 }
@@ -290,18 +343,29 @@ impl ConnectionTarget {
 }
 
 /// One submitted SQL statement, and everything the Data API reports about it.
+///
+/// A batch submission is held as one statement too, with one of these per
+/// statement it submitted in [`Statement::sub_statements`]: a batch's statement
+/// is a statement in its own right — it has its own text, status, outcome and
+/// `Id` (`<batch id>:<n>`) and is read back through the same operations — so it
+/// is the same type rather than a parallel one.
 #[derive(Debug)]
 pub struct Statement {
-    /// The `Id` minted at submit, a UUID as the `UUID` shape's pattern requires.
+    /// The `Id` minted at submit, a UUID as the `UUID` shape's pattern requires;
+    /// for one statement of a batch, that batch's `Id` with the `:<n>` suffix
+    /// the same pattern allows.
     pub id: String,
-    /// A `RedshiftQueryUuid` for the underlying query.
-    pub query_uuid: String,
+    /// `RedshiftQueryUuid`: the query the cluster ran. A batch is not itself a
+    /// query — its statements are, and each one carries its own — so a batch has
+    /// none.
+    pub query_uuid: Option<String>,
     /// Monotonic submission sequence number. `ListStatements` orders by it and
     /// its pagination cursor names it, so a page boundary survives later
     /// submissions.
     pub seq: u64,
-    /// The SQL text as submitted, reported as `QueryString`.
-    pub sql: String,
+    /// The SQL text as submitted, reported as `QueryString`. Empty for a batch,
+    /// whose statements each carry their own text.
+    sql: String,
     /// The caller's `StatementName`, if any.
     pub statement_name: Option<String>,
     /// The database the statement ran against.
@@ -312,6 +376,14 @@ pub struct Statement {
     pub secret_arn: Option<String>,
     /// The cluster or workgroup the statement ran against.
     pub target: ConnectionTarget,
+    /// Whether this is a batch submission (`IsBatchStatement`), whose statements
+    /// are [`Statement::sub_statements`].
+    pub is_batch: bool,
+    /// How this submission's statements were committed (`ExecutionMode`).
+    execution_mode: ExecutionMode,
+    /// The statements of a batch, in submission order. Empty for a single
+    /// statement.
+    pub sub_statements: Vec<Statement>,
     /// The status as of the last materialised transition.
     pub status: StatementStatus,
     /// The status the clock owes this statement at [`Statement::due_at`].
@@ -359,6 +431,11 @@ impl Statement {
     /// already terminal: a read calls this so that a status the clock made due
     /// is reported even when nothing else has touched the statement since.
     fn advance(&mut self, now: Instant) {
+        // A batch's statements share its due instant, so one call materialises
+        // the whole batch's timeline.
+        for sub_statement in &mut self.sub_statements {
+            sub_statement.advance(now);
+        }
         if self.status.is_terminal() || now < self.due_at {
             return;
         }
@@ -419,13 +496,29 @@ impl Statement {
         }
     }
 
-    /// `ExecutionMode`. A single `ExecuteStatement` is committed on its own, which
-    /// is what the modelled `AUTO_COMMIT` means ("`AUTO_COMMIT` indicates each SQL
-    /// statement is committed individually"); `TRANSACTION` describes a batch
-    /// request's statements running as one transaction, which this operation
-    /// never submits.
+    /// `ExecutionMode`. A single `ExecuteStatement` is committed on its own,
+    /// which is what the modelled `AUTO_COMMIT` means; a batch reports the mode
+    /// it was submitted with.
     pub fn execution_mode(&self) -> &'static str {
-        "AUTO_COMMIT"
+        self.execution_mode.as_str()
+    }
+
+    /// `QueryString`: the text of one statement. A batch has no single query
+    /// string — its statements are reported as `QueryStrings` and as
+    /// `SubStatements` — so it reports none.
+    pub fn query_string(&self) -> Option<String> {
+        (!self.is_batch).then(|| self.sql.clone())
+    }
+
+    /// `QueryStrings`: the texts of a batch's statements, in submission order.
+    /// A single statement reports its text as `QueryString` instead.
+    pub fn query_strings(&self) -> Option<Vec<String>> {
+        self.is_batch.then(|| {
+            self.sub_statements
+                .iter()
+                .map(|sub_statement| sub_statement.sql.clone())
+                .collect()
+        })
     }
 
     /// Stop a still-running statement, as `CancelStatement` does. Returns false
@@ -442,6 +535,11 @@ impl Statement {
     fn cancel(&mut self, now_wall: SystemTime) -> bool {
         if self.status.is_terminal() {
             return false;
+        }
+        // Cancelling a batch stops every statement of it: they are one
+        // submission, and none of them is still running after this call.
+        for sub_statement in &mut self.sub_statements {
+            sub_statement.cancel(now_wall);
         }
         self.status = StatementStatus::Aborted;
         self.terminal_status = StatementStatus::Aborted;
@@ -712,7 +810,8 @@ fn authorize(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Auth
 }
 
 /// What one execution produced. Opaque to a handler, which only carries it from
-/// [`run_on`] to [`ComAmazonawsRedshiftdataRedshiftdataState::record`].
+/// [`run_on`] or [`run_batch_on`] to
+/// [`ComAmazonawsRedshiftdataRedshiftdataState::record`].
 #[derive(Debug)]
 pub struct Execution {
     status: StatementStatus,
@@ -722,6 +821,108 @@ pub struct Execution {
     result_rows: i64,
     result_size: i64,
     result: Option<ResultSet>,
+}
+
+impl Execution {
+    /// A statement that produced nothing because the engine refused it, with
+    /// the engine's own message for why.
+    fn failed(message: String) -> Self {
+        Self {
+            status: StatementStatus::Failed,
+            error: Some(message),
+            duration_nanos: 0,
+            has_result_set: false,
+            result_rows: -1,
+            result_size: -1,
+            result: None,
+        }
+    }
+
+    /// A statement of a batch the run never reached: an earlier statement of
+    /// the same transaction failed, so the batch stopped there and everything
+    /// it had done was rolled back.
+    ///
+    /// It reports ABORTED — the only modelled status for a run that stopped
+    /// without finishing or failing — and no `Error`, because this statement
+    /// never reached the engine and so has no message from it.
+    fn never_ran() -> Self {
+        Self {
+            status: StatementStatus::Aborted,
+            error: None,
+            duration_nanos: 0,
+            has_result_set: false,
+            result_rows: -1,
+            result_size: -1,
+            result: None,
+        }
+    }
+
+    /// Report a statement whose work did not land after all, because the
+    /// transaction holding it could not be closed. Its rows are dropped with
+    /// it: a result computed inside a transaction that was never committed is
+    /// not a result a caller may fetch.
+    fn mark_uncommitted(&mut self, message: &str) {
+        if self.status != StatementStatus::Finished {
+            return;
+        }
+        self.status = StatementStatus::Failed;
+        self.error = Some(message.to_string());
+        self.has_result_set = false;
+        self.result_rows = -1;
+        self.result_size = -1;
+        self.result = None;
+    }
+}
+
+/// What ONE submission may still retain of its results: the rows, the values
+/// and the bytes left of its budget.
+///
+/// The budget belongs to the SUBMISSION, not to one execution: a batch's
+/// statements all draw on one of these, so a batch cannot retain more result
+/// data than a single `ExecuteStatement` can, whatever it submits and however
+/// many statements it submits. [`MAX_RESULT_BYTES`] therefore bounds what one
+/// REQUEST can add to the retained history, which is what makes
+/// [`MAX_RETAINED_STATEMENTS`] a bound on the whole of it.
+///
+/// Only a result that is retained is charged: a statement that fails retains
+/// nothing, so it spends nothing, and a statement with no result set spends
+/// nothing either.
+#[derive(Debug)]
+struct Retention {
+    rows_left: usize,
+    cells_left: usize,
+    bytes_left: usize,
+}
+
+impl Retention {
+    /// A full budget, for one submission.
+    fn new() -> Self {
+        Self {
+            rows_left: MAX_RESULT_ROWS,
+            cells_left: MAX_RESULT_CELLS,
+            bytes_left: MAX_RESULT_BYTES,
+        }
+    }
+
+    /// Charge a result set this submission is keeping against the budget.
+    fn spend(&mut self, rows: usize, cells: usize, bytes: usize) {
+        self.rows_left = self.rows_left.saturating_sub(rows);
+        self.cells_left = self.cells_left.saturating_sub(cells);
+        self.bytes_left = self.bytes_left.saturating_sub(bytes);
+    }
+}
+
+/// Which of a submission's named `Parameters` are bound to one statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// Every parameter is bound, so one the statement does not reference is the
+    /// engine's own error: `ExecuteStatement`'s `Parameters` are "the parameters
+    /// for the SQL statement", that one statement's.
+    Every,
+    /// Only the parameters the statement references are bound: a batch's
+    /// `Parameters` "are available to all SQL statements in the batch. Each
+    /// statement can reference any subset of the provided parameters."
+    Referenced,
 }
 
 /// Either the rows a query returned, or the row count a DML/DDL statement
@@ -775,7 +976,113 @@ pub fn run_on(
     let database = handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    run_sql(&database, sql, parameters, timeout, bound)
+    let mut budget = Retention::new();
+    run_sql(
+        &database,
+        sql,
+        parameters,
+        Binding::Every,
+        &mut budget,
+        timeout,
+        bound,
+    )
+}
+
+/// Run `sqls` serially, in submission order, on the engine `handle` guards, and
+/// report one [`Execution`] per submitted statement in that same order.
+///
+/// BLOCKING for the same reason [`run_on`] is, and it takes the same single
+/// database lock — held for the whole batch, which is what lets
+/// [`ExecutionMode::Transaction`] run the statements as ONE transaction: they
+/// are committed together, or, as soon as one of them fails, the batch stops
+/// there and everything it had done is rolled back ("If any SQL statement
+/// fails, all work is rolled back"). Under [`ExecutionMode::AutoCommit`] each
+/// statement is committed on its own and a failure stops nothing.
+///
+/// `timeout` bounds the WHOLE batch rather than each statement: each statement
+/// is given what is left of it, so a batch of forty statements cannot outlast
+/// the request that is waiting for it.
+pub fn run_batch_on(
+    handle: &DatabaseHandle,
+    sqls: &[String],
+    parameters: &[SqlParameter],
+    mode: ExecutionMode,
+    timeout: Duration,
+    bound: &ExecutionBound,
+) -> Vec<Execution> {
+    let database = handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let deadline = Instant::now() + timeout;
+    let transactional = mode == ExecutionMode::Transaction;
+
+    // The transaction is opened through the engine itself, under the same
+    // authorizer every submitted statement runs under. If it cannot be opened,
+    // no statement of the batch ran, and each one reports the engine's own
+    // message for why.
+    if transactional {
+        if let Err(error) = database.connection.execute_batch("BEGIN") {
+            let message = scrub_paths(&error.to_string());
+            return sqls
+                .iter()
+                .map(|_| Execution::failed(message.clone()))
+                .collect();
+        }
+    }
+
+    let mut executions: Vec<Execution> = Vec::with_capacity(sqls.len());
+    // ONE retained-result budget for the whole batch, so a batch of forty
+    // statements cannot keep forty result sets where a single statement may
+    // keep one.
+    let mut budget = Retention::new();
+    for sql in sqls {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let execution = run_sql(
+            &database,
+            sql,
+            parameters,
+            Binding::Referenced,
+            &mut budget,
+            remaining,
+            bound,
+        );
+        let failed = execution.status == StatementStatus::Failed;
+        executions.push(execution);
+        // Everything this transaction did is about to be rolled back, so there
+        // is nothing left for its remaining statements to do.
+        if failed && transactional {
+            break;
+        }
+    }
+
+    if transactional {
+        let rolled_back = executions
+            .iter()
+            .any(|execution| execution.status == StatementStatus::Failed);
+        let close = if rolled_back { "ROLLBACK" } else { "COMMIT" };
+        if let Err(error) = database.connection.execute_batch(close) {
+            // The transaction could not be closed, so nothing it held landed:
+            // every statement that had succeeded is reported as failed with the
+            // engine's message rather than as work that was committed.
+            let message = scrub_paths(&error.to_string());
+            for execution in &mut executions {
+                execution.mark_uncommitted(&message);
+            }
+        }
+        // A transaction left open would leak into the next statement submitted
+        // against this database, so it is closed even when the close above
+        // reported an error.
+        if !database.connection.is_autocommit() {
+            let _ = database.connection.execute_batch("ROLLBACK");
+        }
+    }
+
+    // The statements the batch never reached, because it stopped at the failure
+    // above and rolled everything back.
+    while executions.len() < sqls.len() {
+        executions.push(Execution::never_ran());
+    }
+    executions
 }
 
 /// Run `sql` on `database` under the wall-clock and step bounds, and report what
@@ -785,6 +1092,8 @@ fn run_sql(
     database: &Database,
     sql: &str,
     parameters: &[SqlParameter],
+    binding: Binding,
+    budget: &mut Retention,
     timeout: Duration,
     bound: &ExecutionBound,
 ) -> Execution {
@@ -800,7 +1109,7 @@ fn run_sql(
 
     let started = Instant::now();
     guard.arm(timeout, SQL_STEP_BUDGET);
-    let produced = execute_once(&database.connection, sql, parameters);
+    let produced = execute_once(&database.connection, sql, parameters, binding, budget);
     guard.disarm();
     let duration_nanos = i64::try_from(started.elapsed().as_nanos()).unwrap_or(i64::MAX);
 
@@ -875,28 +1184,33 @@ fn scrub_paths(message: &str) -> String {
     scrubbed
 }
 
-/// Prepare, bind and run one statement on the engine.
+/// Prepare, bind and run one statement on the engine, keeping no more of its
+/// result than `budget` — its SUBMISSION's remaining retained-result budget —
+/// still allows.
 fn execute_once(
     connection: &rusqlite::Connection,
     sql: &str,
     parameters: &[SqlParameter],
+    binding: Binding,
+    budget: &mut Retention,
 ) -> Result<Produced, ExecutionFailure> {
     let mut statement = connection.prepare(sql)?;
 
     // Redshift's `Parameters` are named (`:name`), and so are SQLite's, so the
-    // names bind straight through. A name the statement does not use is the
-    // engine's error, not a result.
+    // names bind straight through. Which of them this statement gets is
+    // [`Binding`]'s decision, and whether a name is in the statement at all is
+    // the ENGINE's answer (`parameter_index`), never a scan of the SQL text.
     let names: Vec<String> = parameters
         .iter()
         .map(|parameter| format!(":{}", parameter.name))
         .collect();
-    let bound: Vec<(&str, &dyn rusqlite::ToSql)> = names
-        .iter()
-        .zip(parameters.iter())
-        .map(|(name, parameter)| {
-            (name.as_str(), &parameter.value as &dyn rusqlite::ToSql)
-        })
-        .collect();
+    let mut bound: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::with_capacity(names.len());
+    for (name, parameter) in names.iter().zip(parameters.iter()) {
+        if binding == Binding::Referenced && statement.parameter_index(name)?.is_none() {
+            continue;
+        }
+        bound.push((name.as_str(), &parameter.value as &dyn rusqlite::ToSql));
+    }
 
     if statement.column_count() == 0 {
         let affected = statement.execute(bound.as_slice())?;
@@ -931,16 +1245,18 @@ fn execute_once(
     let mut cells: usize = 0;
     let mut observed: Vec<Option<ColumnType>> = declared.clone();
     while let Some(row) = rows.next()? {
-        if records.len() >= MAX_RESULT_ROWS {
+        if records.len() >= budget.rows_left {
             return Err(bound_reached(format!(
-                "the result set exceeded this emulator's retained-result bound of \
-                 {MAX_RESULT_ROWS} rows"
+                "the result set exceeded the {} rows this submission may still retain, of this \
+                 emulator's bound of {MAX_RESULT_ROWS}",
+                budget.rows_left
             )));
         }
-        if cells.saturating_add(columns.len()) > MAX_RESULT_CELLS {
+        if cells.saturating_add(columns.len()) > budget.cells_left {
             return Err(bound_reached(format!(
-                "the result set exceeded this emulator's retained-result bound of \
-                 {MAX_RESULT_CELLS} values"
+                "the result set exceeded the {} values this submission may still retain, of this \
+                 emulator's bound of {MAX_RESULT_CELLS}",
+                budget.cells_left
             )));
         }
 
@@ -956,10 +1272,11 @@ fn execute_once(
             row_reported = row_reported.saturating_add(value_bytes(value));
             row_retained = row_retained.saturating_add(retained_bytes(value));
         }
-        if retained.saturating_add(row_retained) > MAX_RESULT_BYTES {
+        if retained.saturating_add(row_retained) > budget.bytes_left {
             return Err(bound_reached(format!(
-                "the result set exceeded this emulator's retained-result bound of \
-                 {MAX_RESULT_BYTES} bytes"
+                "the result set exceeded the {} bytes this submission may still retain, of this \
+                 emulator's bound of {MAX_RESULT_BYTES}",
+                budget.bytes_left
             )));
         }
         reported = reported.saturating_add(row_reported);
@@ -982,6 +1299,11 @@ fn execute_once(
         .zip(observed.iter())
         .map(|((name, _), column_type)| column_metadata(name, column_type.as_ref()))
         .collect();
+
+    // The result is kept, so its cost is charged to the submission — only here,
+    // on the path that returns it: a statement that failed above dropped every
+    // row it had materialised and so spends nothing.
+    budget.spend(records.len(), cells, retained);
 
     Ok(Produced::Rows(
         ResultSet {
@@ -1250,11 +1572,41 @@ pub fn to_timestamp(instant: SystemTime) -> ::aws_smithy_types::DateTime {
 // The service's state
 // ---------------------------------------------------------------------------
 
-/// Everything `ExecuteStatement` needs to record one statement.
+/// What was submitted: one statement, or a batch of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionKind {
+    /// One statement, submitted by `ExecuteStatement`. It is committed on its
+    /// own, which is what the modelled `AUTO_COMMIT` means.
+    Single,
+    /// A batch, submitted by `BatchExecuteStatement` in the `ExecutionMode` it
+    /// asked for.
+    Batch(ExecutionMode),
+}
+
+impl SubmissionKind {
+    /// Whether this submission is a batch, which is reported as one statement
+    /// with one `SubStatements` entry per statement it submitted.
+    pub fn is_batch(self) -> bool {
+        matches!(self, Self::Batch(_))
+    }
+
+    /// The `ExecutionMode` this submission's statements were committed under.
+    pub fn execution_mode(self) -> ExecutionMode {
+        match self {
+            Self::Single => ExecutionMode::AutoCommit,
+            Self::Batch(mode) => mode,
+        }
+    }
+}
+
+/// Everything a submit operation needs to record what it ran.
 #[derive(Debug)]
 pub struct Submission {
-    /// The SQL text to run.
-    pub sql: String,
+    /// The statements that were run, in submission order: one for
+    /// `ExecuteStatement`, a batch's `Sqls` for `BatchExecuteStatement`.
+    pub statements: Vec<String>,
+    /// Whether this was one statement or a batch, and how a batch committed.
+    pub kind: SubmissionKind,
     /// The cluster or workgroup to run it against.
     pub target: ConnectionTarget,
     /// The database to run it in.
@@ -1277,6 +1629,133 @@ pub struct Submission {
     pub client_token: Option<String>,
     /// Whether the caller asked to wait for completion (`WaitTimeSeconds`).
     pub wait_for_completion: bool,
+}
+
+/// The connection members of a submit request, as the wire carried them.
+///
+/// `ExecuteStatement` and `BatchExecuteStatement` document the SAME
+/// authorization combinations, so both resolve them here rather than each
+/// deciding for itself.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConnectionRequest<'a> {
+    /// `ClusterIdentifier`: a provisioned cluster.
+    pub cluster_identifier: Option<&'a String>,
+    /// `WorkgroupName`: a serverless workgroup.
+    pub workgroup_name: Option<&'a String>,
+    /// `SessionId`: a session a previous statement opened.
+    pub session_id: Option<&'a String>,
+    /// `Database`.
+    pub database: Option<&'a String>,
+    /// `DbUser`: temporary-credentials authorization.
+    pub db_user: Option<&'a String>,
+    /// `SecretArn`: Secrets Manager authorization.
+    pub secret_arn: Option<&'a String>,
+}
+
+/// The data warehouse, database and authorization method a submission runs
+/// under.
+#[derive(Debug)]
+pub struct Connection {
+    /// The cluster or workgroup.
+    pub target: ConnectionTarget,
+    /// The database name.
+    pub database: String,
+    /// `DbUser`, when authenticating with temporary credentials.
+    pub db_user: Option<String>,
+    /// `SecretArn`, when authenticating with Secrets Manager.
+    pub secret_arn: Option<String>,
+}
+
+/// Why a request's connection members do not name exactly one data warehouse,
+/// one database and one authorization method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadConnection {
+    /// A provisioned cluster AND a serverless workgroup.
+    BothWarehouses,
+    /// Neither of them, and no session either.
+    NoWarehouse,
+    /// Neither of them, but a `SessionId`: a valid request whose warehouse and
+    /// database belong to a session this emulator does not model yet.
+    SessionOnly,
+    /// No database.
+    NoDatabase,
+    /// Two authorization methods at once.
+    BothAuthMethods,
+}
+
+impl BadConnection {
+    /// What is wrong with the request, as a `ValidationException` message.
+    /// [`BadConnection::SessionOnly`] is NOT a malformed request, so its text
+    /// says what is missing from the emulator instead.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::BothWarehouses => {
+                "ClusterIdentifier and WorkgroupName cannot both be supplied: a statement runs \
+                 against either a provisioned cluster or a serverless workgroup"
+            }
+            Self::NoWarehouse => {
+                "one of ClusterIdentifier (a provisioned cluster) or WorkgroupName (a serverless \
+                 workgroup) is required"
+            }
+            Self::SessionOnly => "only a SessionId as its connection target",
+            Self::NoDatabase => "Database is required",
+            Self::BothAuthMethods => {
+                "DbUser and SecretArn cannot both be supplied: DbUser authenticates with \
+                 temporary credentials and SecretArn with Secrets Manager"
+            }
+        }
+    }
+}
+
+impl ConnectionRequest<'_> {
+    /// Resolve the one data warehouse, database and authorization method the
+    /// documented combinations name.
+    ///
+    /// A statement runs against exactly one data warehouse: every documented
+    /// authorization combination names either a provisioned cluster
+    /// (`ClusterIdentifier`) or a serverless workgroup (`WorkgroupName`), never
+    /// both and never neither, and supplies the database. `SecretArn` selects
+    /// Secrets Manager authorization and `DbUser` temporary credentials; they
+    /// are alternatives, so supplying both names two methods for one
+    /// submission.
+    ///
+    /// The session-reuse form, where a caller that already holds a `SessionId`
+    /// names neither warehouse, is a VALID request this slice cannot serve
+    /// faithfully: the warehouse and database such a call runs against are the
+    /// ones its session was opened with, and no session store exists yet
+    /// (`ListSessions` is still scaffolded), so answering it would mean
+    /// inventing a connection target. It is reported as
+    /// [`BadConnection::SessionOnly`], which a handler answers with the
+    /// scaffold's `NotImplemented` — the gap is the emulator's, not the
+    /// caller's.
+    pub fn resolve(self) -> Result<Connection, BadConnection> {
+        let target = match (
+            non_empty(self.cluster_identifier),
+            non_empty(self.workgroup_name),
+        ) {
+            (Some(cluster), None) => ConnectionTarget::Cluster(cluster),
+            (None, Some(workgroup)) => ConnectionTarget::Workgroup(workgroup),
+            (Some(_), Some(_)) => return Err(BadConnection::BothWarehouses),
+            (None, None) if non_empty(self.session_id).is_some() => {
+                return Err(BadConnection::SessionOnly)
+            }
+            (None, None) => return Err(BadConnection::NoWarehouse),
+        };
+        let Some(database) = non_empty(self.database) else {
+            return Err(BadConnection::NoDatabase);
+        };
+        let db_user = non_empty(self.db_user);
+        let secret_arn = non_empty(self.secret_arn);
+        if db_user.is_some() && secret_arn.is_some() {
+            return Err(BadConnection::BothAuthMethods);
+        }
+        Ok(Connection {
+            target,
+            database,
+            db_user,
+            secret_arn,
+        })
+    }
 }
 
 /// A lockable handle to one database's engine.
@@ -1349,8 +1828,23 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
     }
 
     /// The statement with this `Id`.
+    ///
+    /// The `Id` may name ONE statement of a batch: `SubStatementData.Id`
+    /// documents that "a suffix indicates the number of the SQL statement" —
+    /// `<batch id>:2` "indicates the second SQL statement of a batch query" —
+    /// and the `UUID` pattern allows exactly that suffix. So the suffix is
+    /// resolved against the batch's statements, in submission order, and a
+    /// batch's statement is readable through every operation that takes an
+    /// `Id`.
     pub fn statement(&self, id: &str) -> Option<&Statement> {
-        self.statements.get(id)
+        if let Some(statement) = self.statements.get(id) {
+            return Some(statement);
+        }
+        let (batch_id, position) = split_batch_member(id)?;
+        self.statements
+            .get(batch_id)
+            .filter(|batch| batch.is_batch)
+            .and_then(|batch| batch.sub_statements.get(position.checked_sub(1)?))
     }
 
     /// The `Id` a previous `ExecuteStatement` with this `ClientToken` minted.
@@ -1370,15 +1864,26 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
     /// lookup decides the outcome AND carries the status that was observed, so
     /// no caller re-reads the statement to describe what happened.
     pub fn cancel(&mut self, id: &str) -> Cancellation {
-        let Some(statement) = self.statements.get_mut(id) else {
-            return Cancellation::Unknown;
-        };
-        let observed = statement.status;
-        if statement.cancel(SystemTime::now()) {
-            Cancellation::Cancelled
-        } else {
-            Cancellation::AlreadyStopped(observed)
+        if let Some(statement) = self.statements.get_mut(id) {
+            let observed = statement.status;
+            return if statement.cancel(SystemTime::now()) {
+                Cancellation::Cancelled
+            } else {
+                Cancellation::AlreadyStopped(observed)
+            };
         }
+        // One statement of a batch does not run on its own: the batch was
+        // submitted as one request and its statements run serially inside it,
+        // so what a caller stops is the batch.
+        if let Some((batch_id, position)) = split_batch_member(id) {
+            let names_a_member = self.statements.get(batch_id).is_some_and(|batch| {
+                batch.is_batch && position >= 1 && position <= batch.sub_statements.len()
+            });
+            if names_a_member {
+                return Cancellation::BatchMember(batch_id.to_string());
+            }
+        }
+        Cancellation::Unknown
     }
 
     /// Resolve the database a submission will run on, opening and confining it on
@@ -1438,13 +1943,23 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
         });
     }
 
-    /// Record a finished execution as a new statement, as SUBMITTED with the
+    /// Record a finished submission as a new statement, as SUBMITTED with the
     /// clock owing its outcome, and return its `Id`.
-    pub fn record(&mut self, submission: Submission, pid: i64, execution: Execution) -> String {
+    ///
+    /// `executions` carries one entry per statement of the submission, in
+    /// submission order, exactly as [`run_on`] and [`run_batch_on`] report
+    /// them. A batch is recorded as ONE statement with one substatement per
+    /// statement it submitted, and the batch's own status, error, duration and
+    /// `HasResultSet` are its statements' — never values of its own.
+    pub fn record(
+        &mut self,
+        submission: Submission,
+        pid: i64,
+        executions: Vec<Execution>,
+    ) -> String {
         let id = new_uuid();
         let created_at = SystemTime::now();
         self.next_seq += 1;
-        self.next_query_id += 1;
 
         // The statement answers SUBMITTED now and owes its terminal status
         // later; a caller that asked to wait for completion has already waited
@@ -1458,35 +1973,80 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             )
         };
 
-        let mut statement = Statement {
-            id: id.clone(),
-            query_uuid: new_uuid(),
-            seq: self.next_seq,
-            sql: submission.sql,
-            statement_name: submission.statement_name,
-            database: Some(submission.database),
-            db_user: submission.db_user,
-            secret_arn: submission.secret_arn,
-            target: submission.target,
-            status: StatementStatus::Submitted,
-            terminal_status: execution.status,
+        // One entry per submitted statement, whatever the engine reported.
+        let mut executions = executions;
+        executions.truncate(submission.statements.len());
+        while executions.len() < submission.statements.len() {
+            executions.push(Execution::never_ran());
+        }
+
+        let shared = Shared {
+            submission: &submission,
+            created_at,
             due_at,
             completed_at,
-            error: execution.error,
-            created_at,
-            updated_at: created_at,
-            duration_nanos: execution.duration_nanos,
-            redshift_pid: pid,
-            redshift_query_id: self.next_query_id,
-            has_result_set: execution.has_result_set,
-            result_rows: execution.result_rows,
-            result_size: execution.result_size,
-            with_event: submission.with_event,
-            result_format: submission.result_format,
-            parameters: submission.parameters,
-            session_id: submission.session_id,
-            client_token: submission.client_token.clone(),
-            result: execution.result,
+            seq: self.next_seq,
+            pid,
+        };
+
+        let mut statement = if submission.kind.is_batch() {
+            let mut sub_statements = Vec::with_capacity(executions.len());
+            for (index, (sql, execution)) in submission
+                .statements
+                .iter()
+                .zip(executions)
+                .enumerate()
+            {
+                self.next_query_id += 1;
+                sub_statements.push(build_statement(
+                    &shared,
+                    Recorded {
+                        // "A suffix indicates the number of the SQL statement",
+                        // counted from one in submission order.
+                        id: format!("{id}:{}", index + 1),
+                        sql: sql.clone(),
+                        query_uuid: Some(new_uuid()),
+                        redshift_query_id: self.next_query_id,
+                        execution,
+                        client_token: None,
+                        is_batch: false,
+                        sub_statements: Vec::new(),
+                    },
+                ));
+            }
+            let outcome = batch_outcome(&sub_statements);
+            build_statement(
+                &shared,
+                Recorded {
+                    id: id.clone(),
+                    // A batch has no single query string; each of its
+                    // statements carries its own.
+                    sql: String::new(),
+                    // Nor is a batch itself a query the cluster ran, so it
+                    // carries none of the identifiers a query gets.
+                    query_uuid: None,
+                    redshift_query_id: 0,
+                    execution: outcome,
+                    client_token: submission.client_token.clone(),
+                    is_batch: true,
+                    sub_statements,
+                },
+            )
+        } else {
+            self.next_query_id += 1;
+            build_statement(
+                &shared,
+                Recorded {
+                    id: id.clone(),
+                    sql: submission.statements.first().cloned().unwrap_or_default(),
+                    query_uuid: Some(new_uuid()),
+                    redshift_query_id: self.next_query_id,
+                    execution: executions.into_iter().next().unwrap_or_else(Execution::never_ran),
+                    client_token: submission.client_token.clone(),
+                    is_batch: false,
+                    sub_statements: Vec::new(),
+                },
+            )
         };
         statement.advance(Instant::now());
 
@@ -1500,9 +2060,10 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
 
     /// Drop the statements this service no longer retains: those past
     /// [`STATEMENT_RETENTION`], then the oldest submissions while more than
-    /// [`MAX_RETAINED_STATEMENTS`] remain. Each eviction drops that statement's
-    /// result set and its client token with it, so neither map outgrows the
-    /// history.
+    /// [`MAX_RETAINED_STATEMENTS`] statements remain — a batch counting as
+    /// itself plus each of its statements, since each of those holds a result
+    /// set of its own. Each eviction drops that submission's result sets and
+    /// its client token with it, so neither map outgrows the history.
     fn evict_expired_statements(&mut self, now: SystemTime) {
         let expired: Vec<String> = self
             .statements
@@ -1517,7 +2078,7 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             self.forget(&id);
         }
 
-        while self.statements.len() > MAX_RETAINED_STATEMENTS {
+        while self.retained_statement_count() > MAX_RETAINED_STATEMENTS {
             let Some(oldest) = self
                 .statements
                 .values()
@@ -1530,7 +2091,18 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
         }
     }
 
-    /// Remove one statement and everything that points at it.
+    /// How many statements the history holds: every retained submission, plus
+    /// each statement of a batch, because each of those retains a result set of
+    /// its own.
+    fn retained_statement_count(&self) -> usize {
+        self.statements
+            .values()
+            .map(|statement| 1 + statement.sub_statements.len())
+            .sum()
+    }
+
+    /// Remove one statement and everything that points at it. A batch's
+    /// statements go with the batch they belong to, since they are held on it.
     fn forget(&mut self, id: &str) {
         if let Some(statement) = self.statements.remove(id) {
             if let Some(token) = statement.client_token {
@@ -1538,6 +2110,112 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             }
         }
     }
+}
+
+/// What every statement of ONE submission shares: its connection, its database,
+/// its parameters and its clock.
+struct Shared<'a> {
+    submission: &'a Submission,
+    created_at: SystemTime,
+    due_at: Instant,
+    completed_at: SystemTime,
+    seq: u64,
+    pid: i64,
+}
+
+/// What is a statement's OWN: its `Id`, its text, the identifiers Redshift
+/// generated for it, what its execution produced, and — for a batch — the
+/// statements it submitted.
+struct Recorded {
+    id: String,
+    sql: String,
+    query_uuid: Option<String>,
+    redshift_query_id: i64,
+    execution: Execution,
+    client_token: Option<String>,
+    is_batch: bool,
+    sub_statements: Vec<Statement>,
+}
+
+/// Assemble one stored statement from what its submission shares and what is
+/// its own. A batch and each statement of it are built through here, so neither
+/// can drift from the other on the connection they ran under.
+fn build_statement(shared: &Shared<'_>, recorded: Recorded) -> Statement {
+    let submission = shared.submission;
+    Statement {
+        id: recorded.id,
+        query_uuid: recorded.query_uuid,
+        seq: shared.seq,
+        sql: recorded.sql,
+        statement_name: submission.statement_name.clone(),
+        database: Some(submission.database.clone()),
+        db_user: submission.db_user.clone(),
+        secret_arn: submission.secret_arn.clone(),
+        target: submission.target.clone(),
+        status: StatementStatus::Submitted,
+        terminal_status: recorded.execution.status,
+        due_at: shared.due_at,
+        completed_at: shared.completed_at,
+        error: recorded.execution.error,
+        created_at: shared.created_at,
+        updated_at: shared.created_at,
+        duration_nanos: recorded.execution.duration_nanos,
+        redshift_pid: shared.pid,
+        redshift_query_id: recorded.redshift_query_id,
+        has_result_set: recorded.execution.has_result_set,
+        result_rows: recorded.execution.result_rows,
+        result_size: recorded.execution.result_size,
+        with_event: submission.with_event,
+        result_format: submission.result_format.clone(),
+        parameters: submission.parameters.clone(),
+        session_id: submission.session_id.clone(),
+        client_token: recorded.client_token,
+        result: recorded.execution.result,
+        is_batch: recorded.is_batch,
+        execution_mode: submission.kind.execution_mode(),
+        sub_statements: recorded.sub_statements,
+    }
+}
+
+/// What a batch as a whole did, from the statements it ran.
+///
+/// A batch computes nothing of its own: it FAILED if any of its statements
+/// failed, it stopped short if any of them never ran, and "the value [of
+/// `HasResultSet`] is true if any substatement returns a result set". Its
+/// `ResultRows` and `ResultSize` belong to its statements, so the batch reports
+/// the modelled `-1` null marker for both.
+fn batch_outcome(sub_statements: &[Statement]) -> Execution {
+    let failed = sub_statements
+        .iter()
+        .any(|sub| sub.terminal_status == StatementStatus::Failed);
+    let stopped = sub_statements
+        .iter()
+        .any(|sub| sub.terminal_status == StatementStatus::Aborted);
+    let status = match (failed, stopped) {
+        (true, _) => StatementStatus::Failed,
+        (false, true) => StatementStatus::Aborted,
+        (false, false) => StatementStatus::Finished,
+    };
+    Execution {
+        status,
+        // The engine's own message from the statement that failed — never a
+        // message this service wrote about the batch.
+        error: sub_statements.iter().find_map(|sub| sub.error.clone()),
+        duration_nanos: sub_statements
+            .iter()
+            .fold(0_i64, |total, sub| total.saturating_add(sub.duration_nanos)),
+        has_result_set: sub_statements.iter().any(|sub| sub.has_result_set),
+        result_rows: -1,
+        result_size: -1,
+        result: None,
+    }
+}
+
+/// The batch `Id` and the 1-based statement number an `Id` of the form
+/// `<batch id>:<n>` names, or `None` for an `Id` that carries no such suffix.
+fn split_batch_member(id: &str) -> Option<(&str, usize)> {
+    let (batch_id, suffix) = id.rsplit_once(':')?;
+    Some((batch_id, suffix.parse().ok()?))
 }
 
 /// How long a request waits for the engine before giving up.

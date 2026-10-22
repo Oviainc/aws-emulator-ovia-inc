@@ -343,6 +343,121 @@ pub fn request_region(parts: &http::request::Parts) -> String {
     }
 }
 
+// =============================================================================
+// This service's own check of a caller-supplied ARN
+// =============================================================================
+//
+// For SOME of its resources, Amazon Bedrock reads an ARN a caller submits ITSELF, ahead
+// of the constraints the model declares for the member carrying it, and answers its own
+// short sentence for one it will not accept — never the `N validation error(s) detected:
+// Value '…' at '…' failed to satisfy constraint: …` envelope a constraint violation
+// words. The two sentences below, and which resources they cover, are recorded in
+// `simparity-wire-aws-v1`; which of them a request gets is decided here, and only here,
+// so every member carrying an ARN of those resources answers alike.
+
+/// This service's own ARN namespace: the third field of every ARN it owns.
+///
+/// `aws.api#service$arnNamespace` on this model is `bedrock`
+/// (`smithy_query(query="service_info")`), so an ARN whose vendor field is another
+/// service's — an IAM role, a KMS key, an S3 bucket — names no resource of this service
+/// and is left to the constraints the model declares for it.
+pub const ARN_NAMESPACE: &str = "bedrock";
+
+/// What this service answers for an ARN of a resource it validates itself that names a
+/// region other than the one the request addresses.
+///
+/// RECORDED behaviour, not a modelled rule: the model declares no per-region ARN check,
+/// and the corpus records Amazon Bedrock answering 400 `ValidationException` with exactly
+/// this sentence for an ARN of one of the resources in
+/// [`SELF_VALIDATED_RESOURCE_TYPES`] from another region. A CONSTANT, interpolating no
+/// part of the request: it reports that the ARN is not usable here, and nothing about
+/// which member carried it or which expression that member declares.
+pub const ARN_INVALID_FOR_SERVICE_REGION: &str =
+    "The provided ARN is invalid for the service region";
+
+/// The ARN resource types this service validates ITSELF — the ones the two sentences
+/// above cover.
+///
+/// A CATALOG, read off the corpus, because nothing in the model marks the difference and
+/// the corpus records BOTH answers for ARNs of the same shape and the same foreign
+/// region:
+///
+/// * these four resources answer this service's own sentences —
+///   `custom-model` (`CreateCustomModelDeployment.modelArn`,
+///   `CreateModelCopyJob.sourceModelArn`), `model-copy-job` (`GetModelCopyJob.jobArn`),
+///   `model-invocation-job` (`Get`/`StopModelInvocationJob.jobIdentifier`) and
+///   `provisioned-model` (`Get`/`Update`/`DeleteProvisionedModelThroughput
+///   .provisionedModelId`);
+/// * an `advanced-prompt-optimization-job` and an `evaluation-job` ARN from the SAME
+///   foreign region, submitted by the same probe generator, are refused with the
+///   framework's constraint envelope instead — recorded in
+///   `issues/…-bedrock-validation-error-messages-render-model-regex-with.md`, which is
+///   why this is a catalog of the resources bedrock checks itself rather than a rule over
+///   every ARN. A resource type NOT listed here keeps the refusal the model's own
+///   constraints word, which is what that recording shows.
+///
+/// Matched on the ARN's resource TYPE rather than on an operation or a member, so every
+/// member of this service that carries one of these ARNs — the ones the recorded causes
+/// name and the ones they do not (`GetCustomModel.modelIdentifier`,
+/// `CreateProvisionedModelThroughput.modelId`, …) — is read the same way.
+pub const SELF_VALIDATED_RESOURCE_TYPES: &[&str] = &[
+    "custom-model",
+    "model-copy-job",
+    "model-invocation-job",
+    "provisioned-model",
+];
+
+/// A caller-supplied ARN this service validates itself: one of its own namespace naming a
+/// resource type in [`SELF_VALIDATED_RESOURCE_TYPES`], as the parsed ARN and the type it
+/// names.
+///
+/// The parse is `service_common::arn`'s one parse — six fields, the first literally
+/// `arn`, a non-empty partition, vendor and resource, the vendor compared exactly — so no
+/// two services disagree about what an ARN is or which one is theirs.
+fn self_validated_arn(value: &str) -> Option<(::service_common::arn::Arn<'_>, &'static str)> {
+    let arn = ::service_common::arn::parse_of(value, ARN_NAMESPACE)?;
+    let resource_type = arn.resource_type();
+    SELF_VALIDATED_RESOURCE_TYPES
+        .iter()
+        .find(|listed| **listed == resource_type)
+        .map(|listed| (arn, *listed))
+}
+
+/// Whether `value` is an ARN of this service's own namespace naming a region other than
+/// `region` — the region the request addresses, as
+/// [`request_region`] reads it off the request's SigV4 credential scope.
+///
+/// Only an ARN of a resource this service validates itself
+/// ([`SELF_VALIDATED_RESOURCE_TYPES`]), and only one whose region field is NOT empty: an
+/// empty region names none to disagree with, which is how a partition-global resource is
+/// written.
+#[must_use]
+pub fn arn_names_another_region(value: &str, region: &str) -> bool {
+    self_validated_arn(value)
+        .is_some_and(|(arn, _)| !arn.region.is_empty() && arn.region != region)
+}
+
+/// What this service answers for an ARN of its own namespace that is not a well-formed
+/// ARN of the resource type IT names: `Invalid <resource type> ARN format`, the type
+/// spelled in words.
+///
+/// The corpus records `Invalid custom model ARN format` for a `custom-model` ARN whose
+/// resource id is not one `CustomModelArn` admits, so the sentence is built from the
+/// resource type the ARN itself carries rather than from the member or the member's
+/// expression — a `model-copy-job` ARN reports the model copy job.
+///
+/// `None` for an ARN of a resource this service does not validate itself, and for a value
+/// that is no ARN of its namespace at all: those are values this check has nothing to say
+/// about, so the refusal the model's own constraints word stands.
+#[must_use]
+pub fn invalid_arn_format_message(value: &str) -> Option<String> {
+    let (_, resource_type) = self_validated_arn(value)?;
+    // An ARN resource type is a hyphenated token (`custom-model`,
+    // `model-invocation-job`); the recorded sentence spells it as words.
+    let words = resource_type.replace('-', " ");
+    Some(format!("Invalid {words} ARN format"))
+}
+
 /// A `SystemTime` as the wire timestamp type the response shapes carry.
 pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
