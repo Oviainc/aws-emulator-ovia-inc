@@ -7,7 +7,8 @@
 //! resource's ARN), ARN and id minting, the records the resources persist as, the
 //! record-to-modelled-shape conversions, the list cursor codec and the modelled
 //! failures — so the operation files agree on one implementation of each instead of
-//! carrying a copy apiece that can drift.
+//! carrying a copy apiece that can drift. How a request the boundary validator refused
+//! is WORDED lives in `crate::service::validation`, beside the seam that answers it.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -114,6 +115,28 @@ impl ResourceKind {
             Self::User => "USER",
             Self::Group => "GROUP",
             Self::Membership => "GROUP_MEMBERSHIP",
+        }
+    }
+
+    /// The message a `ResourceNotFoundException` for this resource class carries.
+    ///
+    /// A constant per class, with nothing of the request in it: the service states
+    /// WHICH CLASS of resource it could not find, so the message is the same for every
+    /// id of that class and discloses no id that was probed. All three are recorded:
+    /// `Group not found`, `User not found`, and for a membership the sentence that names
+    /// the identity store ("pool") and the request member,
+    /// [`MEMBERSHIP_NOT_FOUND_MESSAGE`].
+    ///
+    /// An operation that RESOLVES an identifier rather than reading a resource by one
+    /// (`GetGroupId`, `GetUserId`, `GetGroupMembershipId`) states its own constant for
+    /// the same class — the `ResourceType` token followed by ` not found.` — through
+    /// [`not_found_by_alternate_identifier`], and the member end of a membership states
+    /// its own through [`member_not_found`]; neither widens this one.
+    pub fn not_found_message(self) -> &'static str {
+        match self {
+            Self::User => "User not found",
+            Self::Group => "Group not found",
+            Self::Membership => MEMBERSHIP_NOT_FOUND_MESSAGE,
         }
     }
 }
@@ -748,27 +771,53 @@ pub fn modeled_list<T: Clone>(items: &[T]) -> Option<Vec<T>> {
 /// so an identifier no create has ever named holds nothing at all — and a reporting
 /// operation says so with the modelled 404 rather than vivifying one. `IDENTITY_STORE`
 /// is the `ResourceType` value for this kind (`RESOURCE_TYPE_VALUES`).
+///
+/// The MESSAGE is this class's constant, like every other not-found message this service
+/// states: it carries nothing of the request, so it neither varies per call nor
+/// discloses which store identifier was probed. No recording pins the text for this
+/// class, so it follows the form the recorded classes use; `ResourceId` still reports
+/// the store the request named, which is the modelled member for exactly that.
 pub fn identity_store_not_found(identifier: &str) -> ResourceNotFoundException {
-    let identity_store_id = identity_store_key(identifier);
     ResourceNotFoundException {
         resource_type: Some("IDENTITY_STORE".to_string()),
-        resource_id: Some(identity_store_id.clone()),
+        resource_id: Some(identity_store_key(identifier)),
         reason: None,
-        message: Some(format!("identity store {identity_store_id} not found")),
+        message: Some("Identity store not found".to_string()),
         request_id: None,
     }
 }
 
 /// The `ResourceNotFoundException` for a resource this store does not hold.
+///
+/// The MESSAGE is the fixed one its resource class carries
+/// ([`ResourceKind::not_found_message`]) rather than a sentence built from the
+/// lookup: the service's message is a constant per class, so it neither varies per
+/// request nor tells the caller which id was probed. `resource_type` and
+/// `resource_id` are the modelled members for naming the resource, and keep doing so.
 pub fn not_found(kind: ResourceKind, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         resource_type: Some(kind.resource_type().to_string()),
         resource_id: Some(resource_id.to_string()),
         reason: None,
-        message: Some(format!(
-            "{} {resource_id} not found in this identity store",
-            kind.as_str()
-        )),
+        message: Some(kind.not_found_message().to_string()),
+        request_id: None,
+    }
+}
+
+/// The `ResourceNotFoundException` for a `MemberId.UserId` that names a user this
+/// store does not hold.
+///
+/// A resource the request names through a member OTHER than the operation's own
+/// resource id gets its own constant, naming that member: a `CreateGroupMembership`
+/// whose `MemberId` matches nobody answers `User with provided member ID not found`,
+/// not the bare `User not found` a `DescribeUser` answers, so a caller can tell which
+/// end of the membership was missing without parsing an id out of the text.
+pub fn member_not_found(member_user_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        resource_type: Some(ResourceKind::User.resource_type().to_string()),
+        resource_id: Some(member_user_id.to_string()),
+        reason: None,
+        message: Some("User with provided member ID not found".to_string()),
         request_id: None,
     }
 }
@@ -776,47 +825,76 @@ pub fn not_found(kind: ResourceKind, resource_id: &str) -> ResourceNotFoundExcep
 /// The `ResourceNotFoundException` for a group membership the named identity store does
 /// not hold.
 ///
-/// AWS's not-found message for this class is a FIXED sentence that names the identity
-/// store ("pool") and the request member rather than the id that was probed:
-/// `DescribeGroupMembership` on a membership id nothing holds answers `Group membership
-/// not found for given pool and membershipId.` (recorded behaviour, repeated across
-/// every recorded rejection of that class), so the message is a rule rather than prose
-/// rebuilt from state. The modelled `ResourceType` / `ResourceId` members still report
-/// which resource was asked for, so [`not_found`] supplies them.
+/// The membership class's own fixed message, which [`not_found`] already supplies
+/// through [`ResourceKind::not_found_message`]; this stays as the named entry point its
+/// handlers call.
 pub fn membership_not_found(membership_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(MEMBERSHIP_NOT_FOUND_MESSAGE.to_string()),
-        ..not_found(ResourceKind::Membership, membership_id)
-    }
+    not_found(ResourceKind::Membership, membership_id)
 }
 
 /// AWS's fixed `ResourceNotFoundException` message for a membership id the identity
 /// store does not hold.
+///
+/// Recorded behaviour, repeated across every recorded rejection of that class: the
+/// sentence names the identity store ("pool") and the request member rather than the id
+/// that was probed.
 pub const MEMBERSHIP_NOT_FOUND_MESSAGE: &str =
     "Group membership not found for given pool and membershipId.";
 
 /// The `ResourceNotFoundException` for a resource an ALTERNATE identifier names and
 /// this store does not hold.
 ///
+/// An operation that RESOLVES an identifier (`GetGroupId`, `GetUserId`,
+/// `GetGroupMembershipId`) states its own constant for the resource class: the modelled
+/// `ResourceType` token followed by ` not found.` — `GROUP not found.` and `USER not
+/// found.` are the recorded ones — rather than the sentence a read BY resource id
+/// answers ([`ResourceKind::not_found_message`]). Nothing of the request reaches it: not
+/// the identifier that failed to resolve and not its value (a `DisplayName` is
+/// `@sensitive`), so the message is the same for every identifier of that class.
+///
 /// `ResourceId` is left unset rather than carrying what the caller sent: the modelled
 /// member is a `ResourceId` (pattern
 /// `^(arn:…)?([0-9a-f]{10}-|)[A-Fa-f0-9]{8}-…$`, from
-/// `smithy_query(query="shape",shape="ResourceId")`), which an external id or a unique
-/// attribute value is not. `subject` names the identifier that failed to resolve, not
-/// its value — a `DisplayName` is `@sensitive`.
-pub fn not_found_by_alternate_identifier(
-    kind: ResourceKind,
-    subject: &str,
-) -> ResourceNotFoundException {
+/// `smithy_query(query="shape",shape="ResourceId")`), which an external id, a unique
+/// attribute value or a (group, member) pair is not.
+pub fn not_found_by_alternate_identifier(kind: ResourceKind) -> ResourceNotFoundException {
     ResourceNotFoundException {
         resource_type: Some(kind.resource_type().to_string()),
         resource_id: None,
         reason: None,
-        message: Some(format!(
-            "no {} in this identity store matches the given {subject}",
-            kind.as_str()
-        )),
+        message: Some(format!("{} not found.", kind.resource_type())),
         request_id: None,
+    }
+}
+
+/// Which uniqueness claim a create would violate.
+///
+/// One variant per claim this service makes: a `UserName` and a group `DisplayName`
+/// are unique within an identity store, and a (group, member) pair has at most one
+/// membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniquenessClaim {
+    /// One group per `DisplayName` in an identity store.
+    GroupDisplayName,
+    /// One user per `UserName` in an identity store.
+    UserName,
+    /// One membership per (group, member) pair.
+    GroupMembership,
+}
+
+impl UniquenessClaim {
+    /// The message a `ConflictException` for this claim carries.
+    ///
+    /// A constant naming the claim that was violated — not a sentence built from the
+    /// request or from the record that already holds the value: the caller branches on
+    /// WHICH claim collided, and the ids of a resource it did not ask about are not
+    /// part of that answer.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::GroupDisplayName => "Duplicate GroupDisplayName",
+            Self::UserName => "Duplicate UserName",
+            Self::GroupMembership => "Member and Group relationship already exists",
+        }
     }
 }
 
@@ -826,9 +904,9 @@ pub fn not_found_by_alternate_identifier(
 ///
 /// `reason` is the modelled `ConflictExceptionReason` value for exactly that case
 /// (`CONFLICT_EXCEPTION_REASON_VALUES`).
-pub fn uniqueness_conflict(message: String) -> ConflictException {
+pub fn uniqueness_conflict(claim: UniquenessClaim) -> ConflictException {
     ConflictException {
-        message: Some(message),
+        message: Some(claim.message().to_string()),
         request_id: None,
         reason: Some("UNIQUENESS_CONSTRAINT_VIOLATION".to_string()),
     }
@@ -911,6 +989,11 @@ fn uuid_from_seed(counter: u64, nanos: u128) -> String {
         &hex[20..32]
     )
 }
+
+// The wording of a refused request lives in `crate::service::validation`, beside the
+// `override_refusal` seam that answers one, rather than here: it renders the
+// `ValidationException` message from the violations the boundary validator found, which
+// is not state at all.
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
