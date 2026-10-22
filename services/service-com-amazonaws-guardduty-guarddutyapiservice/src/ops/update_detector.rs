@@ -148,14 +148,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateDetectorErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    message: Some("the GuardDuty state store is unavailable".to_string()),
-                    r#type: None,
-                },
+                crate::state::state_unavailable(),
             )
             .into());
         };
         let region = crate::state::request_region(ctx);
+
+        // The id's FORM is checked before anything is looked up: a value that
+        // cannot be a detector id is a parameter failure, whatever the store holds.
+        // It is checked HERE, ahead of the feature-list validation below, so an id
+        // that cannot be a detector id is reported as such rather than being
+        // overtaken by a second fault in the same request.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::DETECTOR_ID_MEMBER,
+            )));
+        }
 
         // Refuse an unacceptable feature list before anything is written, so a
         // rejected update leaves the detector exactly as it was.
@@ -166,16 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = state.lock();
         if state.detector_in(&region, &input.detector_id).is_none() {
-            return Err(bad_request(format!(
-                "The request is rejected because the specified detector ID does not exist: {}.",
-                input.detector_id
+            return Err(bad_request(crate::state::not_owned_message(
+                crate::state::DETECTOR_ID_MEMBER,
             )));
         }
         let now = state.tick_millis();
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
-            return Err(bad_request(format!(
-                "The request is rejected because the specified detector ID does not exist: {}.",
-                input.detector_id
+            return Err(bad_request(crate::state::not_owned_message(
+                crate::state::DETECTOR_ID_MEMBER,
             )));
         };
 
@@ -199,11 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse the request with this operation's modeled 400.
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
 fn bad_request(message: impl Into<String>) -> UpdateDetectorError {
-    UpdateDetectorErrorModeled::BadRequestException(BadRequestException {
-        message: Some(message.into()),
-        r#type: None,
-    })
-    .into()
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

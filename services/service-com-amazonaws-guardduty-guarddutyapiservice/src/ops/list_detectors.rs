@@ -142,10 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListDetectorsErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    message: Some("the GuardDuty state store is unavailable".to_string()),
-                    r#type: None,
-                },
+                crate::state::state_unavailable(),
             )
             .into());
         };
@@ -164,13 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
             DETECTOR_IDS_MAX,
         )
-        .map_err(|token| {
-            ListDetectorsErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "The request is rejected because nextToken is not a token this service issued: {token}."
-                )),
-                r#type: None,
-            })
+        .map_err(|_| {
+            // Under the error CLASS, naming the parameter at fault and not quoting
+            // the token back.
+            crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::NEXT_TOKEN_MEMBER),
+            )
         })?;
 
         Ok(ListDetectorsOutput {

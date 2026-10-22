@@ -3,7 +3,8 @@
 //! @op DeleteDetector
 //! IMPLEMENTED: removes the detector and everything it owns — its findings and its
 //! filters — so a later `GetDetector` is refused and `ListDetectors` no longer carries
-//! the id. Deleting an id that does not exist is refused with `BadRequestException`.
+//! the id. Deleting an id that does not exist is refused with HTTP 400 under the
+//! `InvalidInputException` class.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -132,26 +133,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteDetectorErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    message: Some("the GuardDuty state store is unavailable".to_string()),
-                    r#type: None,
-                },
+                crate::state::state_unavailable(),
             )
             .into());
         };
         let region = crate::state::request_region(ctx);
 
+        // The id's FORM is checked before anything is looked up: a value that
+        // cannot be a detector id is a parameter failure, whatever the store holds.
+        // Written out rather than deferred to `state::detector_id_rejection` so the
+        // order is explicit — a malformed id is reported as such even if a future
+        // check lands between here and the lookup.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::DETECTOR_ID_MEMBER),
+            ));
+        }
+
         let mut state = state.lock();
         // Only this Region's endpoint can delete the detector it serves.
         if state.detector_in(&region, &input.detector_id).is_none() {
-            return Err(DeleteDetectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "The request is rejected because the specified detector ID does not exist: {}.",
-                    input.detector_id
-                )),
-                r#type: None,
-            })
-            .into());
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::not_owned_message(crate::state::DETECTOR_ID_MEMBER),
+            ));
         }
         // Dropping the detector drops the findings and filters it owns, which is the
         // cascade GuardDuty performs.

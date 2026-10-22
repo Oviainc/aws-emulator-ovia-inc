@@ -177,6 +177,152 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The error CLASS GuardDuty rejects an unacceptable request input with.
+///
+/// GuardDuty's model folds every client rejection into the single
+/// `BadRequestException` envelope (`httpError` 400, members `message` and `type`,
+/// "The error type"), but the service answers with the specific class: the body
+/// carries it in BOTH the `__type` discriminator and the exception's own `type`
+/// member, so a client switching on the error type can tell an unacceptable input
+/// from any other 400. See [`ClassifiedError`].
+pub const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
+
+/// The modeled error SHAPE every one of this service's client rejections is
+/// enveloped in: the only client error bound to its operations
+/// (`smithy_query(query="service_info")` lists it among the common errors).
+///
+/// restJson1 resolves the error shape from the `x-amzn-errortype` header rather
+/// than from the body, so that header names the SHAPE while the body's `__type`
+/// names the class. The two differ on purpose: an SDK needs the shape to
+/// unmarshal the response into, and the client needs the class to switch on.
+pub const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// `message` of a classified rejection, rendered with the `jsonName` the modeled
+/// envelope gives it (`smithy_query(shape="BadRequestException")`).
+///
+/// The shape this and its siblings hang off lives in `smithy.framework`, like
+/// [`NOT_IMPLEMENTED_SCHEMA`] above and for the same reason: it carries a member the
+/// model does not declare (the header binding below), so it must not claim a modeled
+/// shape's id. Nothing depends on that id — the wire names come from the explicit
+/// `jsonName`s here and from [`OperationError::shape_name`].
+static CLASSIFIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ClassifiedError$Message",
+        "smithy.framework#ClassifiedError",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_json_name("message")
+.with_xml_name("Message");
+
+/// `type` — "The error type" — of a classified rejection.
+static CLASSIFIED_TYPE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ClassifiedError$Type",
+        "smithy.framework#ClassifiedError",
+        "Type",
+    ),
+    ShapeType::String,
+    "Type",
+    1,
+)
+.with_json_name("type")
+.with_xml_name("Type");
+
+/// The `x-amzn-errortype` header, bound as a member so it carries the modeled
+/// envelope SHAPE rather than the error class.
+///
+/// The framework writes the error code to this header and then lets an
+/// `@httpHeader`-bound member win, which is the seam this uses: without it the
+/// header and the body's `__type` would both carry the class, and a restJson1 SDK —
+/// which resolves the error shape from the header — would fail to find a shape by
+/// that name at all.
+static CLASSIFIED_ERROR_TYPE_HEADER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ClassifiedError$ErrorType",
+        "smithy.framework#ClassifiedError",
+        "ErrorType",
+    ),
+    ShapeType::String,
+    "ErrorType",
+    2,
+)
+.with_http_header("x-amzn-errortype");
+
+/// Schema for a classified rejection: the modeled envelope's body members, plus the
+/// header binding above.
+static CLASSIFIED_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ClassifiedError",
+        "smithy.framework",
+        "ClassifiedError",
+    ),
+    ShapeType::Structure,
+    &[
+        &CLASSIFIED_MESSAGE,
+        &CLASSIFIED_TYPE,
+        &CLASSIFIED_ERROR_TYPE_HEADER,
+    ],
+);
+
+/// A GuardDuty client rejection, carrying the error CLASS the wire names it by.
+///
+/// The body is the model's own `BadRequestException` — the same members with the
+/// same `jsonName`s — with `type` set to the class and the `__type` discriminator
+/// carrying it too. The `x-amzn-errortype` header still names the envelope shape,
+/// because that is what resolves the error shape on restJson1. Construct it through
+/// [`Scaffolded::invalid_input`].
+#[derive(Debug, Clone)]
+pub struct ClassifiedError {
+    /// The error class, written to the body's `__type` and `type`.
+    class: &'static str,
+    /// The modeled error shape the class is enveloped in, written to
+    /// `x-amzn-errortype`.
+    envelope: &'static str,
+    /// Why the request was refused: built from the request, never from the store.
+    message: String,
+}
+
+impl ClassifiedError {
+    /// A rejection of class `class`, enveloped in `envelope`, carrying `message`.
+    ///
+    /// The body's `type` is set from `class` rather than taken separately: the two
+    /// are the same fact, and a body whose `__type` and `type` disagreed would
+    /// describe two different errors at once.
+    pub fn new(class: &'static str, envelope: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            envelope,
+            message: message.into(),
+        }
+    }
+
+    /// The error class this rejection is named by on the wire.
+    pub fn class(&self) -> &'static str {
+        self.class
+    }
+}
+
+impl std::fmt::Display for ClassifiedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.class, self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedError {}
+
+impl SerializableStruct for ClassifiedError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&CLASSIFIED_MESSAGE, self.message.as_str())?;
+        s.write_string(&CLASSIFIED_TYPE, self.class)?;
+        s.write_string(&CLASSIFIED_ERROR_TYPE_HEADER, self.envelope)?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +331,9 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A client rejection rendered under GuardDuty's own error class rather than
+    /// under the `BadRequestException` envelope the model names. HTTP 400.
+    Classified(ClassifiedError),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +370,25 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request as GuardDuty does: HTTP 400 under the
+    /// [`INVALID_INPUT_EXCEPTION`] class, in both the body's `__type` and its
+    /// `type` member.
+    ///
+    /// This is the ONLY way this service answers a client rejection. Returning the
+    /// modeled `BadRequestException` variant instead names the envelope shape in
+    /// `__type` and leaves `type` absent, which is not what the service sends.
+    ///
+    /// `message` must be built from the REQUEST — the parameter at fault and the
+    /// rule it broke — never from the store: GuardDuty does not echo a caller's
+    /// resource id or the endpoint's Region back in a rejection.
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self::Classified(ClassifiedError::new(
+            INVALID_INPUT_EXCEPTION,
+            BAD_REQUEST_EXCEPTION,
+            message,
+        ))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +396,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Classified(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +409,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Classified(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +424,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            // The members come from the modeled envelope, so `message` and `type`
+            // render with the `jsonName`s the model gives them.
+            Self::Classified(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +435,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::Classified(_) => &CLASSIFIED_ERROR_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +448,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The error CLASS, not the envelope shape: that is what GuardDuty puts
+            // in `__type`, and what the body's `type` member repeats.
+            Self::Classified(e) => e.class(),
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +463,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // `BadRequestException` carries `httpError` 400
+            // (`smithy_query(shape="BadRequestException")`), and the class is one of
+            // the rejections it envelopes.
+            Self::Classified(_) => 400,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +478,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // GuardDuty is restJson1 only (`smithy_query(query="service_info")`), so
+            // no awsQuery code applies.
+            Self::Classified(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }
