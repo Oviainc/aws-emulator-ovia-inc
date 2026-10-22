@@ -93,7 +93,8 @@
 use super::types::*;
 
 use crate::state::{
-    decode_page_token, page_size, paginate, tags_page_scope, ResourceLookup, MAX_TAGS_PER_PAGE,
+    decode_page_token, page_size, paginate, resource_not_found_message, tags_page_scope,
+    ResourceLookup, MAX_TAGS_PER_PAGE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -187,11 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let file_system_id = match store.resolve_resource(&input.resource_arn) {
             ResourceLookup::FileSystem(id) => id,
-            ResourceLookup::NotFound => {
+            ResourceLookup::NotFound(resource_id) => {
                 return Err(ListTagsForResourceErrorModeled::ResourceNotFound(
                     ResourceNotFound {
                         resource_arn: input.resource_arn.clone(),
-                        message: Some("the resource does not exist".to_string()),
+                        // Built from the identifier the request's ARN named, so the response
+                        // says WHICH resource could not be found.
+                        message: Some(resource_not_found_message(&resource_id)),
                     },
                 )
                 .into());
@@ -213,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListTagsForResourceErrorModeled::ResourceNotFound(
                 ResourceNotFound {
                     resource_arn: input.resource_arn.clone(),
-                    message: Some("the resource does not exist".to_string()),
+                    message: Some(resource_not_found_message(&file_system_id)),
                 },
             )
             .into());

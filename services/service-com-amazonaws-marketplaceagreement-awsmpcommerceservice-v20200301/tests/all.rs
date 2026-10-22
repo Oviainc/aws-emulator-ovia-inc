@@ -19,3 +19,5 @@ mod billing_adjustments;
 mod state_roundtrip;
 #[path = "all/validation_envelope.rs"]
 mod validation_envelope;
+#[path = "all/validation_messages.rs"]
+mod validation_messages;

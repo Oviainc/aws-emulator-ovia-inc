@@ -151,7 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeletePolicyStoreOutput {});
         };
 
-        // Deletion protection is the one failure this operation models.
+        // Deletion protection is the one failure this operation models, and it
+        // is read from the store's CURRENT record, so an `UpdatePolicyStore`
+        // that turned protection off is what makes this delete succeed.
         if state
             .policy_stores
             .get(&store_id)

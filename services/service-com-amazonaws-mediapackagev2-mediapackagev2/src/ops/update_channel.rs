@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Updates one channel's editable members and reports the channel as it is
+//! now stored, so a later `GetChannel` returns the same bytes.
+//!
+//! ## The conditional-update contract
+//!
+//! `ETag` arrives in the `x-amzn-update-if-match` header. When it is present it is a
+//! PRECONDITION: the update commits only if the entity tag it carries is still the
+//! committed one, and is refused `ConflictException` (409,
+//! `ConflictExceptionType` `CONFLICTING_OPERATION`) otherwise. The comparison and the
+//! write happen under ONE hold of the store lock, which is the serialization point that
+//! makes N concurrent racers reading one entity tag resolve to exactly ONE winner —
+//! never zero, because the winner's read-compare-write cannot be interleaved. Each
+//! commit bumps the resource's version, so the tag the losers hold is necessarily stale
+//! even when they were writing the same values.
+//!
+//! An absent `ETag` is an unconditional update, which is what the model's optional
+//! member means.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -222,18 +233,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        // The conditional entity tag is bound to a header by the model, so it arrives on
+        // the deserialized input: nothing else is needed from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // ONE hold of the lock covers the precondition check and the write, so two
+        // concurrent conditional updates cannot both observe the same entity tag.
+        let mut store = state.lock();
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(UpdateChannelErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::ChannelGroup.not_found(),
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(UpdateChannelErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::Channel.not_found(),
+            )
+            .into());
+        };
+
+        // The precondition: a presented entity tag that is not the committed one means
+        // somebody else committed first.
+        if input
+            .e_tag
+            .as_deref()
+            .is_some_and(|presented| presented != channel.etag)
+        {
+            return Err(UpdateChannelErrorModeled::ConflictException(
+                crate::state::conflicting_operation(),
+            )
+            .into());
+        }
+
+        // Only the members `UpdateChannelRequest` binds are editable; everything else
+        // (the name, the ARN, the ingest endpoints, `CreatedAt`) is immutable, so the
+        // update leaves it exactly as the create derived it. The switching and
+        // CMSD-header blocks are MATERIALISED, not echoed, by the same functions the
+        // create uses, so an update that omits them leaves the channel with the state the
+        // service reports rather than with nothing.
+        channel.description = input.description;
+        channel.input_switch_configuration =
+            crate::state::materialized_input_switch_configuration(input.input_switch_configuration);
+        channel.output_header_configuration =
+            crate::state::materialized_output_header_configuration(
+                input.output_header_configuration,
+            );
+        channel.multiview_configuration = input.multiview_configuration;
+        channel.commit(crate::state::now());
+
+        // Answer from what was stored, so the response can only carry what a later
+        // `GetChannel` will read.
+        Ok(UpdateChannelOutput {
+            multiview_configuration: channel.multiview_configuration.clone(),
+            // Updating a channel attaches no multiview source channels to it.
+            attached_multiview_channels: None,
+            arn: channel.arn.clone(),
+            channel_name: channel.name.clone(),
+            channel_group_name: channel.group_name.clone(),
+            created_at: channel.created_at,
+            modified_at: channel.modified_at,
+            description: channel.description.clone(),
+            ingest_endpoints: Some(channel.ingest_endpoints.clone()),
+            input_type: channel.input_type.clone(),
+            e_tag: Some(channel.etag.clone()),
+            tags: Some(channel.tags.clone()),
+            input_switch_configuration: Some(channel.input_switch_configuration.clone()),
+            output_header_configuration: Some(channel.output_header_configuration.clone()),
+            output_locking_mode: channel.output_locking_mode.clone(),
+        })
     }
 }

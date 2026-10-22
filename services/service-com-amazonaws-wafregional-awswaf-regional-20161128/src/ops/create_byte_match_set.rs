@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateByteMatchSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateByteMatchSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateByteMatchSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Consumes the caller's change token, mints a `ByteMatchSetId`, and stores a new,
+//! empty `ByteMatchSet` under it, so `GetByteMatchSet` and `UpdateByteMatchSet` both
+//! see the record this call created. Answers the stored record and the change token it
+//! consumed.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateByteMatchSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateByteMatchSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateByteMatchSet"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateByteMatchSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Every ByteMatchSet is a stored record, so the number a caller can create is
+        // bounded, as it is on the real service.
+        if state.byte_match_sets.len() >= crate::state::MAX_BYTE_MATCH_SETS {
+            return Err(CreateByteMatchSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The change-token protocol every mutating AWS WAF Classic call follows: the
+        // token must be one `GetChangeToken` minted and no other mutating call has used,
+        // since "each create, update, or delete request must use a unique change token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateByteMatchSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
+        // ByteMatchSets created with the same `Name` are two distinct resources, each
+        // stored under its own `ByteMatchSetId`.
+        let byte_match_set_id = state.mint_id();
+        // "A ByteMatchSet that contains no ByteMatchTuple objects": the tuples arrive
+        // through `UpdateByteMatchSet`.
+        let entry = crate::state::ByteMatchSetEntry::new(byte_match_set_id.clone(), input.name);
+        // The response is the projection of the record that was STORED, not of the
+        // request.
+        let byte_match_set = entry.to_modelled();
+        state.byte_match_sets.insert(byte_match_set_id, entry);
+
+        Ok(CreateByteMatchSetOutput {
+            byte_match_set: Some(byte_match_set),
+            change_token: Some(input.change_token),
+        })
     }
 }

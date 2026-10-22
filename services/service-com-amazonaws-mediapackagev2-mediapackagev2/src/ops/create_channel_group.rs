@@ -220,6 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identifies the attempt. A retry of this create has the same fingerprint; a
         // different create under the same token does not.
         let tags = input.tags.unwrap_or_default();
+        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
+        // judged against the same bounds before anything is stored.
+        if let Some(rejection) = crate::state::tag_bounds_rejection(&tags) {
+            return Err(CreateChannelGroupErrorModeled::ValidationException(rejection).into());
+        }
         let fingerprint = crate::state::request_fingerprint(&[
             input.channel_group_name.clone(),
             input.description.clone().unwrap_or_default(),
@@ -296,14 +301,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_at = crate::state::now();
         let arn = crate::state::channel_group_arn(&region, &name);
         let egress_domain = crate::state::egress_domain(&region, &name);
-        let etag = crate::state::etag(&[
-            arn.clone(),
-            egress_domain.clone(),
-            input.description.clone().unwrap_or_default(),
-            crate::state::tag_fingerprint(&tags),
-        ]);
 
-        let group = crate::state::ChannelGroup {
+        let mut group = crate::state::ChannelGroup {
             name: name.clone(),
             arn,
             egress_domain,
@@ -312,12 +311,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A group that has only just been created has never been modified, so both
             // stamps are the instant it came into being.
             modified_at: created_at,
-            etag,
+            // The create is commit 1; every later commit bumps it, which is what makes
+            // the entity tag change on each one.
+            version: 1,
+            etag: String::new(),
             tags,
             client_token: input.client_token,
             fingerprint,
             channels: ::std::collections::BTreeMap::new(),
         };
+        // One derivation of the ETag, shared with every update path.
+        group.recompute_etag();
         store.channel_groups.insert(name.clone(), group);
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannelGroup` will read.

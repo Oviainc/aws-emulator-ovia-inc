@@ -80,6 +80,33 @@ pub(crate) fn error_code(payload: &Value) -> String {
         .to_string()
 }
 
+/// The `ValidationExceptionReason` a member outside its declared constraint is
+/// reported under: one of the two values the model's enum holds (the other is
+/// `Other`, for a refusal no field accounts for).
+pub(crate) const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
+/// The fixed, request-independent summary a refusal whose detail is carried in
+/// `fields` states in `message`.
+pub(crate) const FIELD_VALIDATION_SUMMARY: &str =
+    "Input validation failed. Please check the field list for more details.";
+
+/// The `fields` list of a `ValidationException` body as `(fieldName, message)`
+/// pairs, in the order the answer carries them.
+pub(crate) fn fields(payload: &Value) -> Vec<(String, String)> {
+    payload["fields"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            (
+                entry["fieldName"].as_str().unwrap_or_default().to_string(),
+                entry["message"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
 /// The `recommendationId`s of a `ListRecommendations` answer, in order.
 fn ids(payload: &Value) -> Vec<String> {
     payload["items"]
@@ -152,28 +179,30 @@ fn close(actual: f64, expected: f64) -> bool {
 
 /// `UpdateEnrollmentStatus` persists what it was given and `ListEnrollmentStatuses`
 /// reports it: the status, the `includeMemberAccounts` preference, one
-/// `createdTimestamp` set at the first enrollment, and a `lastUpdatedTimestamp`
-/// refreshed by every call.
+/// `createdTimestamp` set when the account's record was created, and a
+/// `lastUpdatedTimestamp` refreshed by every call.
 #[tokio::test]
 async fn enrollment_status_is_stored_and_listed_back() {
     let router = router();
     let account = engine::emulator_account_id();
 
-    // Before any call the account has no enrollment record at all.
-    let empty = ok(
+    // Before any call the account already has a record — Cost Optimization Hub
+    // knows the account — reading `Inactive`, with no `includeMemberAccounts`
+    // preference expressed yet.
+    let initial = ok(
         &router,
         "ListEnrollmentStatuses",
         &json!({"includeOrganizationInfo": false}),
     )
     .await;
     assert_eq!(
-        empty["items"].as_array().map(Vec::len),
-        Some(0),
-        "case before-enrollment: expected no enrollment rows, got {empty}"
+        initial["items"][0]["status"].as_str(),
+        Some("Inactive"),
+        "case before-enrollment: expected the caller's record to read Inactive, got {initial}"
     );
     assert!(
-        empty["includeMemberAccounts"].is_null(),
-        "case before-enrollment: expected no stored includeMemberAccounts, got {empty}"
+        initial["includeMemberAccounts"].is_null(),
+        "case before-enrollment: expected no stored includeMemberAccounts, got {initial}"
     );
 
     // Each row is one UpdateEnrollmentStatus call and what the store must then
@@ -249,9 +278,10 @@ async fn enrollment_status_is_stored_and_listed_back() {
     }
 }
 
-/// `ListEnrollmentStatuses` honours `accountId`, `maxResults` and
-/// `includeOrganizationInfo` against the store, and refuses a `nextToken` it did
-/// not issue.
+/// `ListEnrollmentStatuses` honours `accountId` and `maxResults` against the
+/// store, and refuses a `nextToken` it did not issue. (A request for the
+/// organization's enrollment, or for another account's, is refused — see
+/// `management_account_gating`.)
 #[tokio::test]
 async fn list_enrollment_statuses_filters_and_pages() {
     let router = router();
@@ -264,12 +294,10 @@ async fn list_enrollment_statuses_filters_and_pages() {
     .await;
 
     // (request, expected number of rows)
-    let cases: [(Value, usize); 6] = [
+    let cases: [(Value, usize); 5] = [
         (json!({"includeOrganizationInfo": false}), 1),
-        (json!({"includeOrganizationInfo": true}), 1),
+        (json!({}), 1),
         (json!({"includeOrganizationInfo": false, "accountId": account}), 1),
-        // A 12-digit account that never enrolled has no row to report.
-        (json!({"includeOrganizationInfo": false, "accountId": "123456789012"}), 0),
         (json!({"includeOrganizationInfo": false, "maxResults": 1}), 1),
         // `maxResults` 0 is inside the modelled 0..100 range: an empty page.
         (json!({"includeOrganizationInfo": false, "maxResults": 0}), 0),
@@ -315,6 +343,12 @@ async fn list_enrollment_statuses_filters_and_pages() {
 /// EFFECTIVE record — what the account set, plus the default the service applies
 /// for every member it never set — and the write answers with the same record a
 /// following read does.
+///
+/// Only the members this account may write appear here:
+/// `memberAccountDiscountVisibility` and an explicit
+/// `savingsEstimationMode=AfterDiscounts` belong to the organization's
+/// management account, and their refusal is `management_account_gating`'s
+/// subject.
 #[tokio::test]
 async fn preferences_merge_and_read_back_with_the_service_defaults() {
     let router = router();
@@ -323,9 +357,10 @@ async fn preferences_merge_and_read_back_with_the_service_defaults() {
     // preference. The commitment pair is the model's own: `PreferredCommitment$term`
     // documents "If the value is null, it will default to ThreeYears (highest
     // savings) where applicable" and `$paymentOption` the same for AllUpfront.
+    // `memberAccountDiscountVisibility` has no default: the preference is the
+    // management account's to set, so it is reported only once it is set.
     let defaults = json!({
         "savingsEstimationMode": "AfterDiscounts",
-        "memberAccountDiscountVisibility": "All",
         "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
     });
     let initial = ok(&router, "GetPreferences", &json!({})).await;
@@ -337,22 +372,12 @@ async fn preferences_merge_and_read_back_with_the_service_defaults() {
     // (request, the effective record every later read must report). Rows differ
     // in which members they set — one member, a nested member on its own, two at
     // once, and a request that sets nothing — and every enum value comes from
-    // the model's own enums (SavingsEstimationMode, MemberAccountDiscountVisibility,
-    // Term, PaymentOption).
-    let cases: [(Value, Value); 7] = [
+    // the model's own enums (SavingsEstimationMode, Term, PaymentOption).
+    let cases: [(Value, Value); 5] = [
         (
             json!({"savingsEstimationMode": "BeforeDiscounts"}),
             json!({
                 "savingsEstimationMode": "BeforeDiscounts",
-                "memberAccountDiscountVisibility": "All",
-                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
-            }),
-        ),
-        (
-            json!({"memberAccountDiscountVisibility": "None"}),
-            json!({
-                "savingsEstimationMode": "BeforeDiscounts",
-                "memberAccountDiscountVisibility": "None",
                 "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
             }),
         ),
@@ -362,7 +387,6 @@ async fn preferences_merge_and_read_back_with_the_service_defaults() {
             json!({"preferredCommitment": {"term": "OneYear"}}),
             json!({
                 "savingsEstimationMode": "BeforeDiscounts",
-                "memberAccountDiscountVisibility": "None",
                 "preferredCommitment": {"term": "OneYear", "paymentOption": "AllUpfront"},
             }),
         ),
@@ -371,26 +395,14 @@ async fn preferences_merge_and_read_back_with_the_service_defaults() {
             json!({"preferredCommitment": {"paymentOption": "PartialUpfront"}}),
             json!({
                 "savingsEstimationMode": "BeforeDiscounts",
-                "memberAccountDiscountVisibility": "None",
                 "preferredCommitment": {"term": "OneYear", "paymentOption": "PartialUpfront"},
             }),
         ),
+        // Both nested members at once.
         (
-            json!({"savingsEstimationMode": "AfterDiscounts"}),
+            json!({"preferredCommitment": {"term": "ThreeYears", "paymentOption": "NoUpfront"}}),
             json!({
-                "savingsEstimationMode": "AfterDiscounts",
-                "memberAccountDiscountVisibility": "None",
-                "preferredCommitment": {"term": "OneYear", "paymentOption": "PartialUpfront"},
-            }),
-        ),
-        (
-            json!({
-                "memberAccountDiscountVisibility": "All",
-                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "NoUpfront"},
-            }),
-            json!({
-                "savingsEstimationMode": "AfterDiscounts",
-                "memberAccountDiscountVisibility": "All",
+                "savingsEstimationMode": "BeforeDiscounts",
                 "preferredCommitment": {"term": "ThreeYears", "paymentOption": "NoUpfront"},
             }),
         ),
@@ -398,8 +410,7 @@ async fn preferences_merge_and_read_back_with_the_service_defaults() {
         (
             json!({}),
             json!({
-                "savingsEstimationMode": "AfterDiscounts",
-                "memberAccountDiscountVisibility": "All",
+                "savingsEstimationMode": "BeforeDiscounts",
                 "preferredCommitment": {"term": "ThreeYears", "paymentOption": "NoUpfront"},
             }),
         ),
@@ -503,11 +514,12 @@ async fn recommendations_need_an_enrolled_account_whose_analysis_is_due() {
 }
 
 /// Every `filter` member narrows the list to the rows whose stored value the
-/// filter admits; several members narrow together.
+/// filter admits; several members narrow together. (`accountIds` is the
+/// organization view, refused for this caller — see
+/// `management_account_gating`.)
 #[tokio::test]
 async fn recommendation_filters_select_the_matching_rows() {
     let router = enrolled_router().await;
-    let account = engine::emulator_account_id();
     let volume_arn = engine::emulator_arn("ec2", "us-east-1", "volume/vol-00112233445566003");
 
     // (filter, the ids it must select — in catalog order)
@@ -544,11 +556,6 @@ async fn recommendation_filters_select_the_matching_rows() {
             json!({"recommendationIds": [id("0005"), id("0001")]}),
             vec!["0001", "0005"],
         ),
-        (
-            json!({"accountIds": [account]}),
-            vec!["0001", "0002", "0003", "0004", "0005", "0006", "0007"],
-        ),
-        (json!({"accountIds": ["123456789012"]}), vec![]),
         (
             json!({"resourceIds": ["i-0a1b2c3d4e5f60001"]}),
             vec!["0001", "0002"],
@@ -957,6 +964,11 @@ async fn get_recommendation_rejects_an_unknown_id() {
 /// reported before or after discounts — the same stored prices, read two ways —
 /// and an account that has stated no preference is reported under the default
 /// the service applies (`AfterDiscounts`), the same mode `GetPreferences` names.
+///
+/// `AfterDiscounts` is reachable here only as that default: an explicit write
+/// of it needs member-account discount visibility, which only the
+/// organization's management account can enable, so `UpdatePreferences` refuses
+/// it for this caller (`management_account_gating`).
 #[tokio::test]
 async fn savings_estimation_mode_changes_the_reported_money() {
     let router = enrolled_router().await;
@@ -965,11 +977,12 @@ async fn savings_estimation_mode_changes_the_reported_money() {
     // (stored savingsEstimationMode, expected monthly cost, expected saving).
     // Row 0001 costs 280.32 before a 28.03 savings-plan discount and its
     // recommended resource 140.16 before a 14.02 discount. `None` is the
-    // account that has set no preference, read under the default.
-    let cases: [(Option<&str>, f64, f64); 4] = [
+    // account that has set no preference, read under the default; the rows that
+    // follow are the undiscounted figures an account that chose
+    // `BeforeDiscounts` is shown.
+    let cases: [(Option<&str>, f64, f64); 3] = [
         (None, 252.29, 126.15),
         (Some("BeforeDiscounts"), 280.32, 140.16),
-        (Some("AfterDiscounts"), 252.29, 126.15),
         (Some("BeforeDiscounts"), 280.32, 140.16),
     ];
 

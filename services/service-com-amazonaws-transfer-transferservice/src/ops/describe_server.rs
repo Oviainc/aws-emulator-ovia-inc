@@ -3,9 +3,12 @@
 //! @op DescribeServer
 //!
 //! Rebuilds `DescribedServer` from the stored server. `UserCount` is DERIVED from the
-//! live user map, never read from a stored counter. The only write this reporting
-//! operation makes is materialising the `STARTING` -> `ONLINE` transition the clock
-//! already made due, so two reads at one instant answer the same thing.
+//! live user map, never read from a stored counter; every other member is the stored
+//! server's own, including the ones `CreateServer` defaulted or computed
+//! (`ProtocolDetails`, `S3StorageOptions`, `SecurityPolicyName`, `HostKeyFingerprint`).
+//! The only write this reporting operation makes is materialising the state transition
+//! the clock already made due (`STARTING` -> `ONLINE`, `STOPPING` -> `OFFLINE`), so two
+//! reads at one instant answer the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -176,11 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let server = DescribedServer {
             arn: stored.arn.clone(),
             certificate: stored.certificate.clone(),
-            protocol_details: stored.protocol_details.clone(),
+            protocol_details: Some(stored.protocol_details.clone()),
             domain: Some(stored.domain.clone()),
             endpoint_details: stored.endpoint_details.clone(),
             endpoint_type: Some(stored.endpoint_type.clone()),
-            host_key_fingerprint: stored.host_key_fingerprint.clone(),
+            host_key_fingerprint: Some(stored.host_key_fingerprint.clone()),
             identity_provider_details: stored.identity_provider_details.clone(),
             identity_provider_type: Some(stored.identity_provider_type.clone()),
             logging_role: stored.logging_role.clone(),
@@ -190,17 +193,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             security_policy_name: Some(stored.security_policy_name.clone()),
             server_id: Some(stored.server_id.clone()),
             state: Some(stored.state.clone()),
-            // `Tags` is modelled `len 1..50`, so an untagged server reports it absent
-            // rather than as an empty list.
-            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The server's tag set, as a list — EMPTY when nothing is tagged, which is
+            // what the service reports for an untagged server. `Tags`' modelled
+            // `len 1..50` bounds what a caller may SEND on a tagging request, not what
+            // a description of the server reports.
+            tags: Some(stored.tags.clone()),
             user_count: Some(user_count),
             workflow_details: stored.workflow_details.clone(),
-            // Unlike `Tags` and `HomeDirectoryMappings`, `StructuredLogDestinations` is
+            // Unlike `HomeDirectoryMappings`, `StructuredLogDestinations` is
             // modelled `len 0..1` — an empty list is a legal value and is how the real
             // service reports structured logging turned off — so it is reported as an
             // empty list rather than as absent.
             structured_log_destinations: Some(stored.structured_log_destinations.clone()),
-            s3_storage_options: stored.s3_storage_options.clone(),
+            s3_storage_options: Some(stored.s3_storage_options.clone()),
             // Egress IPs are only meaningful for AS2 servers and the emulator runs no
             // AS2 transport, so there is nothing to report.
             as2_service_managed_egress_ip_addresses: None,

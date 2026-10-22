@@ -24,5 +24,11 @@ Nothing is currently skipped.
 ("shape missing from model: smithy.api#Unit": their `encryptionSettings` /
 `encryptionState` members target a union with a `smithy.api#Unit` arm). Both are
 now hand-authored in `ops/create_policy_store.rs` and `ops/get_policy_store.rs`,
-with that one member declared `unsupported` on the hand-written input/output
-type, so both are wired into the service's `operations(...)` allow-list.
+so both are wired into the service's `operations(...)` allow-list.
+
+`GetPolicyStoreOutput$encryptionState` IS served: `types/get_policy_store_types.rs`
+writes the `EncryptionState` union out by hand, including the empty structure the
+`smithy.api#Unit` arm denotes. `CreatePolicyStoreInput$encryptionSettings` — the
+request member that selects a customer-managed KMS key — is still declared
+`unsupported` on the hand-written input type, so every store this slice creates
+is encrypted with an AWS owned key.

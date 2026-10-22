@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#ListWorkloadSharesInput")]
+// `WorkloadId` is a path label this operation RESOLVES; see the note in
+// `get_workload_types.rs`. `SharedWithPrefix`, `NextToken`, `MaxResults` and `Status`
+// are query members the service validates, so their `@length`/`@pattern`/`@range` and
+// the `ShareStatus` enum set are still enforced at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#ListWorkloadSharesInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListWorkloadSharesInput {
     pub workload_id: String,

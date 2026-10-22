@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHarvestJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHarvestJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Pages over the harvest jobs of one channel group in a stable order,
+//! narrowed by the filters the request carries: `channelName` and `originEndpointName`
+//! restrict the walk to one branch of the hierarchy, and `includeStatus` keeps only the
+//! jobs in that status. Like `GetHarvestJob` it first materialises the status changes
+//! the clock already owed, so a status filter is applied to the statuses the jobs HAVE.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHarvestJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +152,34 @@ impl<Eng> ListHarvestJobs<Eng> {
     }
 }
 
+/// The smallest `MaxResults` the model's `ListResourceMaxResults` range admits.
+const MAX_RESULTS_MIN: usize = 1;
+/// The largest `MaxResults` that range admits.
+const MAX_RESULTS_MAX: usize = 100;
+/// The `MaxResults` the model defaults the member to.
+const MAX_RESULTS_DEFAULT: usize = 10;
+
+/// A harvest job in the form `ListHarvestJobs` reports it: every member of the stored
+/// record except its tags, which the list does not carry.
+fn list_item(job: &crate::state::HarvestJobRecord) -> HarvestJob {
+    HarvestJob {
+        channel_group_name: job.group_name.clone(),
+        channel_name: job.channel_name.clone(),
+        origin_endpoint_name: job.endpoint_name.clone(),
+        destination: job.destination.clone(),
+        harvest_job_name: job.name.clone(),
+        harvested_manifests: job.harvested_manifests.clone(),
+        description: job.description.clone(),
+        schedule_configuration: job.schedule_configuration.clone(),
+        arn: job.arn.clone(),
+        created_at: job.created_at,
+        modified_at: job.modified_at,
+        status: job.status.clone(),
+        error_message: job.error_message.clone(),
+        e_tag: Some(job.etag.clone()),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListHarvestJobs<Eng>
 {
@@ -170,18 +197,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHarvestJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHarvestJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHarvestJobs"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListHarvestJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        let at = crate::state::now();
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(ListHarvestJobsErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::ChannelGroup.not_found(),
+            )
+            .into());
+        };
+        // The status a job HAS at this instant is what the filter is applied to, so the
+        // transitions the clock already owed are materialised before anything is read.
+        for channel in group.channels.values_mut() {
+            for endpoint in channel.origin_endpoints.values_mut() {
+                for job in endpoint.harvest_jobs.values_mut() {
+                    job.materialise_due_transitions(at);
+                }
+            }
+        }
+
+        // The model bounds `MaxResults` to 1..100 and defaults it to 10, and the boundary
+        // validator has already refused anything outside that range, so a value outside
+        // it here means the member was absent: fall back to the modelled default.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(size) if (MAX_RESULTS_MIN..=MAX_RESULTS_MAX).contains(&size) => size,
+            _ => MAX_RESULTS_DEFAULT,
+        };
+
+        // A token names the job the previous page stopped after, so this page starts
+        // strictly beyond it: no job is returned twice and none is skipped.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::page_resume_after(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListHarvestJobsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "The pagination token is not one this service issued"
+                                    .to_string(),
+                            ),
+                            validation_exception_type: Some(
+                                crate::state::VALIDATION_INVALID_PAGINATION_TOKEN.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // One stable order for the whole group: channel name, then endpoint name, then
+        // job name — the order the nested `BTreeMap`s already keep, so the page boundary
+        // is a property of the store rather than of each read. The key a token carries is
+        // that composite, so it stays unambiguous across channels and endpoints.
+        let mut remaining = group
+            .channels
+            .values()
+            .filter(|channel| {
+                input
+                    .channel_name
+                    .as_deref()
+                    .is_none_or(|wanted| channel.name == wanted)
+            })
+            .flat_map(|channel| channel.origin_endpoints.values())
+            .filter(|endpoint| {
+                input
+                    .origin_endpoint_name
+                    .as_deref()
+                    .is_none_or(|wanted| endpoint.name == wanted)
+            })
+            .flat_map(|endpoint| endpoint.harvest_jobs.values())
+            .filter(|job| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| job.status == wanted)
+            })
+            .map(|job| (page_key(job), job))
+            .filter(|(key, _)| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| key.as_str() > after)
+            });
+        let page: Vec<(String, &crate::state::HarvestJobRecord)> =
+            remaining.by_ref().take(page_size).collect();
+        // A token is issued only when a job is actually left over, so the last page of a
+        // list ends without one.
+        let next_token = page
+            .last()
+            .filter(|_| remaining.next().is_some())
+            .map(|(key, _)| crate::state::page_token(key));
+
+        Ok(ListHarvestJobsOutput {
+            items: Some(page.iter().map(|(_, job)| list_item(job)).collect()),
+            next_token,
+        })
     }
+}
+
+/// The composite key a harvest job is ordered and paginated by within its channel group:
+/// channel, then origin endpoint, then job name.
+///
+/// The unit separator cannot appear in any of the three (`ResourceName` is
+/// `^[a-zA-Z0-9_-]+$`), so the joined key orders exactly as the triple does.
+fn page_key(job: &crate::state::HarvestJobRecord) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        job.channel_name, job.endpoint_name, job.name
+    )
 }

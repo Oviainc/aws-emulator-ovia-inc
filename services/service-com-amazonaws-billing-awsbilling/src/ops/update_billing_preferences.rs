@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBillingPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBillingPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBillingPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the billing preference each `billingPreferencesPerKey` entry names under
+//! one feature, in this service's state: a key the request does not name keeps the
+//! value it had, and a sharing change is appended to the record the history
+//! features report. The whole request is validated before anything is written, so
+//! a refused call changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +124,32 @@ pub struct UpdateBillingPreferences<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The member every refusal below names.
+const KEYS_MEMBER: &str = "billingPreferencesPerKey";
+
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+fn invalid_field(member: &str, why: &str) -> UpdateBillingPreferencesError {
+    UpdateBillingPreferencesErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {why}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// Refuse a write the caller has no authority for, in the modeled
+/// `AccessDeniedException` shape (HTTP 403) this operation declares.
+fn access_denied(why: String) -> UpdateBillingPreferencesError {
+    UpdateBillingPreferencesErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: why,
+    })
+    .into()
+}
+
 impl<Eng> UpdateBillingPreferences<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -154,18 +176,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBillingPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBillingPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBillingPreferences"))
+        // Every modeled constraint (`feature` a `BillingFeature` value,
+        // `billingPreferencesPerKey` at least one entry, each entry's `key`
+        // length and pattern and its `value` a `PreferenceValue`) is refused by
+        // the boundary validator before this runs. `billingPreferencesPerKey` is
+        // modeled `@length(min: 1)` — a minimum with NO maximum — so the entry
+        // count is the one caller-chosen factor the boundary does not bound: it
+        // is refused here, FIRST, before any per-entry work and before the
+        // shared store is locked.
+        let _ = ctx;
+        if input.billing_preferences_per_key.len() > crate::state::MAX_KEYS_PER_UPDATE {
+            return Err(invalid_field(
+                KEYS_MEMBER,
+                &format!(
+                    "one request carries at most {} keys",
+                    crate::state::MAX_KEYS_PER_UPDATE
+                ),
+            ));
+        }
+
+        let feature = input.feature.as_str();
+        // "The history features (RI_SHARING_HISTORY and CREDIT_SHARING_HISTORY)
+        // are read-only and cannot be updated." (`feature` doc.)
+        if crate::state::is_history_feature(feature) {
+            return Err(invalid_field(
+                "feature",
+                "a history feature is read-only and cannot be updated",
+            ));
+        }
+
+        // "All keys in a single request ... must not be duplicated." A set
+        // lookup, so the pass costs O(n log n) in the bounded entry count.
+        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for preference in &input.billing_preferences_per_key {
+            if !seen.insert(preference.key.as_str()) {
+                return Err(invalid_field(
+                    KEYS_MEMBER,
+                    &format!("key {} is named more than once", preference.key),
+                ));
+            }
+        }
+
+        // "All keys in a single request must be valid for the specified
+        // feature": the model documents a key form for exactly one feature, so
+        // that is the one checked here. "For CREDIT_PREFERENCE_OPTIONS, all keys
+        // must reference the same creditId."
+        if feature == crate::state::CREDIT_PREFERENCE_OPTIONS_FEATURE {
+            let mut credit: Option<&str> = None;
+            for preference in &input.billing_preferences_per_key {
+                let Some((credit_id, _)) = crate::state::credit_key_parts(&preference.key) else {
+                    return Err(invalid_field(
+                        KEYS_MEMBER,
+                        &format!(
+                            "key {} is not valid for {}: name a credit as credit/{{creditId}}/{{option}}",
+                            preference.key,
+                            crate::state::CREDIT_PREFERENCE_OPTIONS_FEATURE
+                        ),
+                    ));
+                };
+                match credit {
+                    None => credit = Some(credit_id),
+                    Some(first) if first != credit_id => {
+                        return Err(invalid_field(
+                            KEYS_MEMBER,
+                            "every key in one request must reference the same creditId",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        // Only what needs the store is done under the lock, so a caller's batch
+        // never holds the shared mutex for its whole validation.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateBillingPreferencesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billing preference store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A sharing preference is scoped to the caller's consolidated billing
+        // family: "Sharing keys ... may only be set by the management account of
+        // a consolidated billing family", and a family's management account
+        // speaks only for the accounts in that family. The one documented
+        // exception, `credit/{creditId}/status`, is not a sharing key, so a
+        // member account may set it.
+        let caller = crate::state::caller_account_id();
+        for preference in &input.billing_preferences_per_key {
+            if !crate::state::is_sharing_key(feature, &preference.key) {
+                continue;
+            }
+            // The caller is the payer account of its own consolidated billing
+            // family (`state::billing_family_management_account_id`), so this
+            // branch does not fire for the emulator's own identity; it is the
+            // modelled rule, and the refusal that does fire is the
+            // family-membership check below.
+            if !state.is_billing_family_management_account(caller) {
+                return Err(access_denied(format!(
+                    "Account {caller} is not the management account of a consolidated billing \
+                     family, so it cannot set the sharing preference {}",
+                    preference.key
+                )));
+            }
+            if let Some(account) = crate::state::account_list_key_account(&preference.key) {
+                if state.family_account_name(account).is_none() {
+                    return Err(access_denied(format!(
+                        "Account {account} is not a member of this consolidated billing family"
+                    )));
+                }
+            }
+        }
+
+        // The store grows with every new key, so it carries an explicit
+        // ceiling; past it the request is refused rather than letting a caller's
+        // request rate size the process.
+        let adding = state.new_preference_keys(feature, seen.iter().copied());
+        if state.billing_preferences.len() + adding > crate::state::MAX_BILLING_PREFERENCES {
+            return Err(invalid_field(
+                KEYS_MEMBER,
+                &format!(
+                    "this account already holds the maximum of {} billing preference keys",
+                    crate::state::MAX_BILLING_PREFERENCES
+                ),
+            ));
+        }
+
+        // Nothing above wrote, so a refusal leaves the stored preferences as
+        // they were: "keys not present in the request are unchanged" holds for a
+        // refused request too.
+        let now = ::std::time::SystemTime::now();
+        for preference in &input.billing_preferences_per_key {
+            state.set_preference(feature, &preference.key, &preference.value, now);
+        }
+
+        Ok(UpdateBillingPreferencesOutput {})
     }
 }

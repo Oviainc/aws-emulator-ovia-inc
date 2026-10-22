@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the member associations of the calling (administrator) account's hub for
+//! the requested account ids, in the order they were asked for. An id the hub has no
+//! association for is reported in `UnprocessedAccounts` rather than failing the call,
+//! so one unknown id does not hide the members that ARE known.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +116,16 @@ impl From<GetMembersErrorModeled> for GetMembersError {
     }
 }
 
+/// The modelled 400 for an input value outside a documented bound.
+fn invalid_input(message: String) -> GetMembersError {
+    GetMembersError::Modeled(GetMembersErrorModeled::InvalidInputException(
+        InvalidInputException {
+            message: Some(message),
+            code: Some("InvalidInputException".to_string()),
+        },
+    ))
+}
+
 /// The `GetMembers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +162,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMembers"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMembersError::Modeled(GetMembersErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let hub = crate::state::hub_key(ctx);
+        let administrator_id = hub.0.as_str();
+        let region = hub.1.as_str();
+
+        // Reading an administrator account's members needs that account to be
+        // subscribed, exactly as creating them does.
+        let store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(GetMembersErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(administrator_id, region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `AccountIdList` carries no `length` trait, so the batch bound the model
+        // puts on `CreateMembers`' own account list is enforced here: one call reads a
+        // bounded number of associations, holds the state lock for a bounded time and
+        // answers a bounded response.
+        if input.account_ids.len() > crate::state::MAX_MEMBER_BATCH {
+            return Err(invalid_input(format!(
+                "AccountIds must contain at most {} account ids, got {}",
+                crate::state::MAX_MEMBER_BATCH,
+                input.account_ids.len()
+            )));
+        }
+
+        // Same rule as every other member operation: a malformed account id is an
+        // invalid input parameter, so the whole request is refused.
+        if let Some(bad) = input
+            .account_ids
+            .iter()
+            .find(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(invalid_input(format!(
+                "AccountIds must each be {} digits, got '{bad}'",
+                crate::state::ACCOUNT_ID_LEN
+            )));
+        }
+
+        let mut members: Vec<Member> = Vec::new();
+        let mut unprocessed_accounts: Vec<Result2> = Vec::new();
+
+        for account_id in &input.account_ids {
+            let key = crate::state::member_key(&hub, account_id);
+            match store.members.get(&key) {
+                Some(association) => members.push(Member {
+                    account_id: Some(account_id.clone()),
+                    email: association.email.clone(),
+                    // `Member$MasterId` is "replaced by AdministratorId" and carries
+                    // the same account, so both report the administrator.
+                    master_id: Some(administrator_id.to_string()),
+                    administrator_id: Some(administrator_id.to_string()),
+                    member_status: Some(association.member_status.clone()),
+                    invited_at: association.invited_at,
+                    updated_at: Some(association.updated_at),
+                }),
+                None => unprocessed_accounts.push(Result2 {
+                    account_id: Some(account_id.clone()),
+                    processing_result: Some(format!(
+                        "The request is rejected because the account {account_id} is not an \
+                         associated member account of {administrator_id}"
+                    )),
+                }),
+            }
+        }
+
+        Ok(GetMembersOutput {
+            members: Some(members),
+            unprocessed_accounts: Some(unprocessed_accounts),
+        })
     }
 }

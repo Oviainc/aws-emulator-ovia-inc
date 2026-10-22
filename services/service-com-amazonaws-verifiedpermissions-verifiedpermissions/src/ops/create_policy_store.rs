@@ -183,6 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_else(|| "DISABLED".to_string()),
             created_date: created,
             last_updated_date: created,
+            // Set from the service's own default: no request member of any
+            // modelled operation carries a Cedar version.
+            cedar_version: crate::state::DEFAULT_CEDAR_VERSION.to_string(),
+            // A store this operation creates is encrypted with an AWS owned
+            // key: the one request member that selects a customer-managed key,
+            // `CreatePolicyStoreInput$encryptionSettings`, is not served by this
+            // slice (it is declared `unsupported` in
+            // `types/create_policy_store_types.rs`), so nothing can ask for one.
+            encryption: crate::state::StoreEncryption::default(),
             tags: input
                 .tags
                 .clone()

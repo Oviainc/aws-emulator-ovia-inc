@@ -60,7 +60,11 @@
 //! and answers it through the model's `ValidationException` schema with `reason`
 //! set and one `fields` entry per invalid member. A refusal a handler raises for a rule
 //! the model cannot express (an unknown `nextToken`, an `orderBy` dimension that
-//! names no member) fills the same two members in the handler itself.
+//! names no member) fills the same two members through
+//! [`field_validation_exception`], the one place that envelope is built; a
+//! refusal no field accounts for \u2014 a rule about the CALLER rather than about a
+//! value the request carries \u2014 goes through [`other_validation_exception`],
+//! which is what the model's `Other` reason names.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::SerdeError;
@@ -86,12 +90,17 @@ const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 /// The `ValidationExceptionReason` a member outside its declared constraint is
 /// reported under — one of the two values the model's enum holds, the other
 /// (`Other`) being for a refusal no field accounts for.
-const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+pub(crate) const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
+/// The `ValidationExceptionReason` for a refusal no field accounts for: a rule
+/// about the CALLER or about the account's configuration rather than about a
+/// value the request carries.
+pub(crate) const REASON_OTHER: &str = "Other";
 
 /// The top-level `message` of a refusal whose detail is carried in `fields`: the
 /// per-member diagnosis lives in the field list, so the summary points the reader
 /// at it rather than restating one of the entries.
-const FIELD_VALIDATION_SUMMARY: &str =
+pub(crate) const FIELD_VALIDATION_SUMMARY: &str =
     "Input validation failed. Please check the field list for more details.";
 
 /// The path segment the constraint walk spells a step from a collection into one
@@ -249,13 +258,7 @@ fn validation_exception(
     violations: &[Violation],
 ) -> Option<RtResponse> {
     let fields = field_details(violations)?;
-    let refused = ValidationException {
-        message: FIELD_VALIDATION_SUMMARY.to_string(),
-        // Every violation here is a member outside its declared constraint, which
-        // is exactly what this reason names.
-        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
-        fields: Some(fields),
-    };
+    let refused = field_validation_exception(fields);
     protocol
         .serialize_error(
             &refused,
@@ -264,6 +267,86 @@ fn validation_exception(
             VALIDATION_EXCEPTION_STATUS,
         )
         .ok()
+}
+
+/// This service's `ValidationException` for a request refused because of the
+/// members `fields` names: the fixed summary, `reason` =
+/// `FieldValidationFailed`, and the per-member diagnosis in `fields`.
+///
+/// The ONE place that envelope is built, so a refusal a HANDLER raises for a
+/// rule the model cannot express (an unknown `nextToken`, a bound the member's
+/// own `@range` declares) reads exactly like one the constraint walk raised.
+pub(crate) fn field_validation_exception(
+    fields: Vec<ValidationExceptionDetail>,
+) -> ValidationException {
+    ValidationException {
+        message: FIELD_VALIDATION_SUMMARY.to_string(),
+        // Every violation here is a member outside a declared constraint, which
+        // is exactly what this reason names.
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(fields),
+    }
+}
+
+/// This service's `ValidationException` for a request no field accounts for:
+/// one refused for a rule about the caller or about the account's
+/// configuration. `reason` is `Other` and there is no field list, because no
+/// value the request carries is the thing that is wrong; `message` states the
+/// rule.
+pub(crate) fn other_validation_exception(message: impl Into<String>) -> ValidationException {
+    ValidationException {
+        message: message.into(),
+        reason: Some(REASON_OTHER.to_string()),
+        fields: None,
+    }
+}
+
+/// How this service words the refusal of a request for Cost Optimization Hub
+/// data about accounts other than the caller's: it names the data that was asked
+/// for and the reason the caller cannot have it — it is not the organization's
+/// management account. `subject` is the data the request asked for
+/// (`"enrollment statuses"`, `"recommendations"`). The message of the modelled
+/// `AccessDeniedException` the organization-scoped readers answer with.
+pub(crate) fn organization_view_denied(subject: &str) -> String {
+    format!(
+        "Cannot get {subject} for member accounts of the organization. This is because your \
+         account is not the management account of the organization."
+    )
+}
+
+/// This service's refusal of a numeric member outside the range the calling
+/// OPERATION declares for it, or `None` when the value is inside that range (and
+/// when the member was absent, which is no value to bound).
+///
+/// A member's own `@range` is what bounds it, which for `maxResults` is the
+/// operation's own page-size bound rather than the one the shared `MaxResults`
+/// shape carries
+/// (`smithy_query(query="operation", operation="ListRecommendations")`: `range`
+/// min 0 max 1000). The clause the entry states comes from the same
+/// [`requirement`] wording the constraint walk uses, so a handler-enforced
+/// bound reads like a walk-enforced one.
+pub(crate) fn out_of_range(
+    member: &str,
+    value: Option<i32>,
+    min: i64,
+    max: i64,
+) -> Option<ValidationException> {
+    let value = i64::from(value?);
+    let kind = if value < min {
+        ViolationKind::MinValue(min.to_string())
+    } else if value > max {
+        ViolationKind::MaxValue(max.to_string())
+    } else {
+        return None;
+    };
+    // `requirement` words both numeric kinds; the fallback is unreachable, and
+    // is here only because `ViolationKind` is `#[non_exhaustive]`.
+    let message = requirement(&kind)
+        .unwrap_or_else(|| format!("Member must have value between {min} and {max}"));
+    Some(field_validation_exception(vec![ValidationExceptionDetail {
+        field_name: member.to_string(),
+        message,
+    }]))
 }
 
 /// One `fields` entry per invalid MEMBER — `fields` is "the list of fields that
@@ -370,7 +453,7 @@ fn attributed_member(path: &str) -> (String, bool) {
 /// class this file does not word — [`ViolationKind`] is `#[non_exhaustive]`, so one
 /// can be added upstream, and a clause invented for it would be wrong rather than
 /// merely missing.
-fn requirement(kind: &ViolationKind) -> Option<String> {
+pub(crate) fn requirement(kind: &ViolationKind) -> Option<String> {
     Some(match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {

@@ -8,14 +8,21 @@
 //! which is keyed by the view's ARN and ordered, so a list and its pagination are
 //! deterministic.
 //!
-//! Beside it, [`ComAmazonawsBillingAwsbillingState::credits`] holds the account
+//! Its second resource is the account's **billing preferences**:
+//! `UpdateBillingPreferences` writes [`ComAmazonawsBillingAwsbillingState::billing_preferences`]
+//! (and appends to [`ComAmazonawsBillingAwsbillingState::preference_history`] for a
+//! feature the model gives a history feature), and `GetBillingPreferences` reports
+//! exactly what is stored there. Both maps are ordered, so a page boundary is stable.
+//!
+//! Beside them, [`ComAmazonawsBillingAwsbillingState::credits`] holds the account
 //! credits `GetCredits` reports, keyed and ordered by `creditId`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AccessDeniedException, Expression, ValidationException, ValidationExceptionField,
+    BILLING_FEATURE_VALUES,
 };
 
 /// `CUSTOM`, the `BillingViewType` a view created through `CreateBillingView`
@@ -85,6 +92,96 @@ const PRIMARY_VIEW_ID: &str = "primary";
 
 /// The name AWS gives the account's default `PRIMARY` billing view.
 const PRIMARY_VIEW_NAME: &str = "Primary View";
+
+/// The `BillingFeature` values whose preferences are *sharing* preferences.
+///
+/// From the `UpdateBillingPreferences` doc: "Sharing keys (`RI_SHARING`,
+/// `CREDIT_SHARING`, `CREDIT_LEVEL_SHARING`, and sharing keys under
+/// `CREDIT_PREFERENCE_OPTIONS`) may only be set by the management account of a
+/// consolidated billing family."
+pub const SHARING_FEATURES: &[&str] = &["RI_SHARING", "CREDIT_SHARING", "CREDIT_LEVEL_SHARING"];
+
+/// `CREDIT_PREFERENCE_OPTIONS`, the one `BillingFeature` whose keys name a single
+/// credit (`credit/{creditId}/status`, from the `UpdateBillingPreferences` doc).
+pub const CREDIT_PREFERENCE_OPTIONS_FEATURE: &str = "CREDIT_PREFERENCE_OPTIONS";
+
+/// The first segment of a `CREDIT_PREFERENCE_OPTIONS` key, from the documented
+/// `credit/{creditId}/status` form.
+pub const CREDIT_KEY_PREFIX: &str = "credit";
+
+/// The one `CREDIT_PREFERENCE_OPTIONS` option that is NOT a sharing key: the
+/// `UpdateBillingPreferences` doc singles out `credit/{creditId}/status` as
+/// settable "by member accounts for credits they own, or by the management
+/// account for any credit in the family".
+pub const CREDIT_STATUS_OPTION: &str = "status";
+
+/// The suffix the model's own enum uses for a read-only history feature:
+/// `BILLING_FEATURE_VALUES` pairs `RI_SHARING` with `RI_SHARING_HISTORY` and
+/// `CREDIT_SHARING` with `CREDIT_SHARING_HISTORY`, and the
+/// `UpdateBillingPreferences` `feature` doc says those two "are read-only and
+/// cannot be updated".
+pub const HISTORY_FEATURE_SUFFIX: &str = "_HISTORY";
+
+/// The length of an `AccountId`, whose modelled pattern is `^[0-9]{12}$`.
+const ACCOUNT_ID_LEN: usize = 12;
+
+/// The display name the emulator's own account carries inside its consolidated
+/// billing family, which `BillingPreferenceSummary.accountName` reports beside
+/// `accountId`. The account exists before any API call, exactly as the default
+/// `PRIMARY` billing view does with [`PRIMARY_VIEW_NAME`].
+pub const MANAGEMENT_ACCOUNT_NAME: &str = "Management Account";
+
+/// The most billing-preference keys this emulator keeps resident.
+///
+/// `billing_preferences` grows with every new key `UpdateBillingPreferences`
+/// sets, so it needs a ceiling for the same reason `billing_views` does. This is
+/// an emulator resource bound, not a published AWS quota: past it a request that
+/// would add a new key is refused with the modeled `ValidationException` rather
+/// than letting a caller's request rate size the process.
+pub const MAX_BILLING_PREFERENCES: usize = 1024;
+
+/// The most keys one `UpdateBillingPreferences` request may carry.
+///
+/// `billingPreferencesPerKey` is modelled `@length(min: 1)` — a minimum with no
+/// maximum — so the entry count is a caller-chosen factor the boundary validator
+/// cannot bound. Another emulator resource bound, not a published AWS quota: a
+/// request past it is refused with the modeled `ValidationException` before any
+/// per-entry work, so no caller can choose how long a handler runs.
+pub const MAX_KEYS_PER_UPDATE: usize = 100;
+
+/// The most preference changes the history features report.
+///
+/// Also an emulator residency bound: beyond it the OLDEST change is dropped, so
+/// the history stays the most recent window of changes instead of growing
+/// without limit.
+pub const MAX_PREFERENCE_HISTORY: usize = 1024;
+
+/// One recorded change to a billing preference, as a history feature reports it.
+#[derive(Debug, Clone)]
+pub struct PreferenceChange {
+    /// The feature whose preference changed (e.g. `RI_SHARING`), NOT the history
+    /// feature that reports the change.
+    pub feature: String,
+    pub key: String,
+    /// The `PreferenceValue` the key was set to.
+    pub value: String,
+    pub at: SystemTime,
+}
+
+/// One entry `GetBillingPreferences` reports, built from stored state.
+#[derive(Debug, Clone)]
+pub struct PreferenceEntry {
+    /// The feature the request asked for.
+    pub feature: String,
+    pub key: String,
+    pub value: String,
+    /// The account an account-list key names, with its display name — both set
+    /// together or both absent, as `BillingPreferenceSummary` documents.
+    pub account: Option<(String, String)>,
+    /// The `(year, month)` billing period of a recorded change. Set only for the
+    /// history features, per `BillingPreferenceSummary.billingPeriod`.
+    pub billing_period: Option<(i32, i32)>,
+}
 
 /// One persisted billing view.
 ///
@@ -198,6 +295,26 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// Source of the next `billingview/custom-<n>` resource id. Used ONLY to
     /// build an ARN that is then stored in `billing_views`.
     pub next_view_id: u64,
+    /// Every billing preference the account has set, keyed by
+    /// `(BillingFeature, PreferenceKey)` and so ordered by feature then key.
+    /// Bounded by [`MAX_BILLING_PREFERENCES`].
+    pub billing_preferences: BTreeMap<(String, String), String>,
+    /// The record of preference changes, oldest first — what the history
+    /// features report. Bounded by [`MAX_PREFERENCE_HISTORY`], dropping the
+    /// oldest change first.
+    pub preference_history: VecDeque<PreferenceChange>,
+    /// The consolidated billing family: account id -> that account's display
+    /// name, which `accountName` reports beside `accountId`.
+    pub consolidated_billing_family: BTreeMap<String, String>,
+    /// The management (payer) account of that consolidated billing family —
+    /// per the `UpdateBillingPreferences` doc, the only identity that may set a
+    /// sharing preference.
+    ///
+    /// This is the emulated account itself: a standalone account is the payer
+    /// account of its own family, which is NOT the same as being an AWS
+    /// Organizations management account (see
+    /// [`Self::organization_management_account_id`], `None` by default).
+    pub billing_family_management_account_id: String,
     /// The management account of the AWS Organizations organization this
     /// emulated account belongs to, when it belongs to one.
     ///
@@ -244,10 +361,22 @@ impl Default for ComAmazonawsBillingAwsbillingState {
         };
         let mut billing_views = BTreeMap::new();
         billing_views.insert(primary.arn.clone(), primary);
+        // The emulator serves one account, and it is the management account of
+        // its own consolidated billing family: `caller_account_id` signs every
+        // request with it.
+        let mut consolidated_billing_family = BTreeMap::new();
+        consolidated_billing_family.insert(
+            caller_account_id().to_string(),
+            MANAGEMENT_ACCOUNT_NAME.to_string(),
+        );
         Self {
             billing_views,
             idempotency_tokens: HashMap::new(),
             next_view_id: 1,
+            billing_preferences: BTreeMap::new(),
+            preference_history: VecDeque::new(),
+            consolidated_billing_family,
+            billing_family_management_account_id: caller_account_id().to_string(),
             organization_management_account_id: None,
             // A fresh account holds no credits: the modeled `GetCredits`
             // response "returns an empty list when no credits exist".
@@ -296,6 +425,112 @@ impl ComAmazonawsBillingAwsbillingState {
     pub fn has_room_for_another_view(&self, writes_token: bool) -> bool {
         self.billing_views.len() < MAX_BILLING_VIEWS
             && (!writes_token || self.idempotency_tokens.len() < MAX_IDEMPOTENCY_TOKENS)
+    }
+
+    /// Whether `account_id` is the management (payer) account of the
+    /// consolidated billing family — the only identity that may set a sharing
+    /// preference. Distinct from
+    /// [`Self::is_organization_management_account`]: a standalone account is its
+    /// own family's payer account but nobody's organization management account.
+    pub fn is_billing_family_management_account(&self, account_id: &str) -> bool {
+        self.billing_family_management_account_id == account_id
+    }
+
+    /// The display name of a member of the consolidated billing family, or
+    /// `None` for an account outside it.
+    pub fn family_account_name(&self, account_id: &str) -> Option<&str> {
+        self.consolidated_billing_family
+            .get(account_id)
+            .map(String::as_str)
+    }
+
+    /// How many of `keys` are not stored under `feature` yet — the number of
+    /// entries an update would ADD, which is what [`MAX_BILLING_PREFERENCES`]
+    /// bounds.
+    ///
+    /// Walks the stored keys once and strikes each one off a set of the
+    /// requested keys, so the cost is one ordered pass over a store that
+    /// [`MAX_BILLING_PREFERENCES`] bounds plus a set lookup per stored key —
+    /// never a scan per requested key, and no allocation per probe.
+    pub fn new_preference_keys<'a>(
+        &self,
+        feature: &str,
+        keys: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        let mut absent: BTreeSet<&str> = keys.into_iter().collect();
+        for (stored_feature, stored_key) in self.billing_preferences.keys() {
+            if stored_feature == feature {
+                absent.remove(stored_key.as_str());
+            }
+        }
+        absent.len()
+    }
+
+    /// Set one preference, leaving every key the request did not name unchanged,
+    /// and record the change when the feature has a history feature.
+    ///
+    /// A write that does not move the value records nothing: the history is a
+    /// record of CHANGES.
+    pub fn set_preference(&mut self, feature: &str, key: &str, value: &str, at: SystemTime) {
+        let slot = (feature.to_string(), key.to_string());
+        let changed = self.billing_preferences.get(&slot).map(String::as_str) != Some(value);
+        self.billing_preferences.insert(slot, value.to_string());
+        if !changed || history_feature_for(feature).is_none() {
+            return;
+        }
+        self.preference_history.push_back(PreferenceChange {
+            feature: feature.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            at,
+        });
+        while self.preference_history.len() > MAX_PREFERENCE_HISTORY {
+            self.preference_history.pop_front();
+        }
+    }
+
+    /// Every entry the feature `feature` reports, in the order
+    /// `GetBillingPreferences` pages through them.
+    ///
+    /// For a history feature that is the recorded changes to the feature behind
+    /// it, oldest first; for every other feature it is the stored keys in key
+    /// order. A feature nothing has set reports nothing: the model documents no
+    /// key catalog per feature, so the emulator invents no entry for one.
+    pub fn preference_entries(&self, feature: &str) -> Vec<PreferenceEntry> {
+        if let Some(behind) = feature_behind_history(feature) {
+            return self
+                .preference_history
+                .iter()
+                .filter(|change| change.feature == behind)
+                .map(|change| PreferenceEntry {
+                    feature: feature.to_string(),
+                    key: change.key.clone(),
+                    value: change.value.clone(),
+                    account: self.account_of_key(&change.key),
+                    billing_period: billing_period(change.at),
+                })
+                .collect();
+        }
+        self.billing_preferences
+            .iter()
+            .filter(|((stored, _), _)| stored == feature)
+            .map(|((_, key), value)| PreferenceEntry {
+                feature: feature.to_string(),
+                key: key.clone(),
+                value: value.clone(),
+                account: self.account_of_key(key),
+                billing_period: None,
+            })
+            .collect()
+    }
+
+    /// The account id and display name an account-list key names, when the
+    /// account is one this family holds — the only case in which
+    /// `accountId`/`accountName` can both be reported, as the model requires.
+    fn account_of_key(&self, key: &str) -> Option<(String, String)> {
+        let account_id = account_list_key_account(key)?;
+        let name = self.family_account_name(account_id)?;
+        Some((account_id.to_string(), name.to_string()))
     }
 
     /// Whether `account_id` is the management account of the organization this
@@ -366,9 +601,78 @@ impl ComAmazonawsBillingAwsbillingState {
 
 /// The account every caller of this emulator authenticates as: every request
 /// is signed with the emulator's own credentials, so the caller's account is
-/// [`engine::emulator_account_id`].
+/// [`engine::emulator_account_id`] — and therefore the account whose
+/// preferences a request reads or writes.
 pub fn caller_account_id() -> &'static str {
     ::engine::emulator_account_id()
+}
+
+/// Whether `feature` is one of the model's read-only history features.
+pub fn is_history_feature(feature: &str) -> bool {
+    feature_behind_history(feature).is_some()
+}
+
+/// The feature whose changes `feature` records, when `feature` is a history
+/// feature the model declares.
+pub fn feature_behind_history(feature: &str) -> Option<&str> {
+    let behind = feature.strip_suffix(HISTORY_FEATURE_SUFFIX)?;
+    BILLING_FEATURE_VALUES.contains(&behind).then_some(behind)
+}
+
+/// The history feature that records changes to `feature`, when the model
+/// declares one (`RI_SHARING` -> `RI_SHARING_HISTORY`).
+pub fn history_feature_for(feature: &str) -> Option<String> {
+    let history = format!("{feature}{HISTORY_FEATURE_SUFFIX}");
+    BILLING_FEATURE_VALUES
+        .contains(&history.as_str())
+        .then_some(history)
+}
+
+/// The `creditId` and option a `CREDIT_PREFERENCE_OPTIONS` key names, for a key
+/// in the documented `credit/{creditId}/{option}` form; `None` for any other
+/// shape of key.
+pub fn credit_key_parts(key: &str) -> Option<(&str, &str)> {
+    let mut segments = key.split('/');
+    let prefix = segments.next()?;
+    let credit_id = segments.next()?;
+    let option = segments.next()?;
+    let extra = segments.next();
+    if prefix != CREDIT_KEY_PREFIX || credit_id.is_empty() || option.is_empty() || extra.is_some() {
+        return None;
+    }
+    Some((credit_id, option))
+}
+
+/// Whether `key` under `feature` is a sharing key: every key of a sharing
+/// feature, and every `CREDIT_PREFERENCE_OPTIONS` option other than
+/// [`CREDIT_STATUS_OPTION`].
+pub fn is_sharing_key(feature: &str, key: &str) -> bool {
+    if SHARING_FEATURES.contains(&feature) {
+        return true;
+    }
+    feature == CREDIT_PREFERENCE_OPTIONS_FEATURE
+        && credit_key_parts(key).is_some_and(|(_, option)| option != CREDIT_STATUS_OPTION)
+}
+
+/// The account an account-list key names: the key's last `/`-separated segment
+/// when it is a 12-digit account id (`AccountId`'s modelled `^[0-9]{12}$`).
+pub fn account_list_key_account(key: &str) -> Option<&str> {
+    let last = key.split('/').next_back()?;
+    (last.len() == ACCOUNT_ID_LEN && last.bytes().all(|byte| byte.is_ascii_digit())).then_some(last)
+}
+
+/// The billing period an instant falls in, as the modeled `BillingPeriod`
+/// `(year, month)`. `None` only when the clock cannot be rendered.
+pub fn billing_period(at: SystemTime) -> Option<(i32, i32)> {
+    // `Format::DateTime` renders RFC 3339 in UTC, `YYYY-MM-DDThh:mm:ss[.fff]Z`,
+    // so the year is the first four characters and the month the sixth and
+    // seventh.
+    let rendered = ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()?;
+    let year = rendered.get(0..4)?.parse().ok()?;
+    let month = rendered.get(5..7)?.parse().ok()?;
+    Some((year, month))
 }
 
 /// The account id an ARN embeds (its fifth colon-separated segment), when it

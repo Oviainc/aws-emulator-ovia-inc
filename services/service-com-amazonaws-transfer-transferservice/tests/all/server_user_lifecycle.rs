@@ -29,7 +29,9 @@ use crate::harness::{
 /// how many protocols/tags/log destinations the list members hold. The defaults the
 /// first row exercises are the ones the model documents: `Domain` S3,
 /// `IdentityProviderType` SERVICE_MANAGED, `EndpointType` PUBLIC, `IpAddressType` IPV4,
-/// `Protocols` [SFTP], `SecurityPolicyName` TransferSecurityPolicy-2018-11-05.
+/// `Protocols` [SFTP], `SecurityPolicyName` TransferSecurityPolicy-2024-01. The
+/// defaulted `ProtocolDetails`/`S3StorageOptions` members and the computed
+/// `HostKeyFingerprint` have their own suite in `server_config_and_state.rs`.
 #[tokio::test]
 async fn describe_server_rebuilds_every_created_member_from_stored_state() {
     let emulator = Emulator::new();
@@ -44,12 +46,11 @@ async fn describe_server_rebuilds_every_created_member_from_stored_state() {
                 "EndpointType": "PUBLIC",
                 "IpAddressType": "IPV4",
                 "Protocols": ["SFTP"],
-                "SecurityPolicyName": "TransferSecurityPolicy-2018-11-05",
+                "SecurityPolicyName": "TransferSecurityPolicy-2024-01",
                 "UserCount": 0,
-                "Tags": null,
+                "Tags": [],
                 "Certificate": null,
                 "LoggingRole": null,
-                "HostKeyFingerprint": null,
                 "PreAuthenticationLoginBanner": null,
                 "PostAuthenticationLoginBanner": null,
             }),

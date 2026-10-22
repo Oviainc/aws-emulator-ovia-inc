@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBillingPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBillingPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBillingPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the billing preferences stored for ONE feature, straight from this
+//! service's state: the keys `UpdateBillingPreferences` set under that feature, or,
+//! for a history feature, the recorded changes to the feature behind it. The
+//! optional `PREFERENCE_KEY` filter narrows the keys and `maxResults`/`nextToken`
+//! page through them; a feature nothing has set reports an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +129,119 @@ pub struct GetBillingPreferences<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The only `BillingFeatureFilterName` the model declares
+/// (`BILLING_FEATURE_FILTER_NAME_VALUES` in `ops::types`): it matches a
+/// preference key against the filter's values.
+const FILTER_PREFERENCE_KEY: &str = "PREFERENCE_KEY";
+
+/// The page size a request that names none asks for: "The maximum number of
+/// records to return per page. Range: 1 to 50. Default: 50." (`maxResults` doc).
+const DEFAULT_MAX_RESULTS: usize = 50;
+
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+fn invalid_field(member: &str, why: &str) -> GetBillingPreferencesError {
+    GetBillingPreferencesErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {why}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// The opaque `nextToken` for a page of `feature` that ended after `consumed`
+/// entries.
+///
+/// The cursor is a COUNT, not a key: a history feature reports one entry per
+/// recorded change, so one key can appear many times and a key alone cannot name
+/// a position. Hex keeps the token inside the modeled `PageToken` pattern
+/// (`^[-a-zA-Z0-9+=/_]+$`) and length, and carries no meaning a client could
+/// construct one from.
+fn encode_page_token(feature: &str, consumed: usize) -> String {
+    hex::encode(format!("{feature}:{consumed}"))
+}
+
+/// How many entries a `nextToken` already delivered, or a `ValidationException`
+/// when the token is not one this service issued for this feature.
+fn decode_page_token(token: &str, feature: &str) -> Result<usize, GetBillingPreferencesError> {
+    let decoded = hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| {
+            let (stored, consumed) = text.split_once(':')?;
+            Some((stored.to_string(), consumed.parse::<usize>().ok()?))
+        });
+    let Some((stored_feature, consumed)) = decoded else {
+        return Err(GetBillingPreferencesErrorModeled::ValidationException(
+            ValidationException {
+                message: "nextToken is not a token this service issued".to_string(),
+                reason: "cannotParse".to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: "The pagination token is not valid.".to_string(),
+                }]),
+            },
+        )
+        .into());
+    };
+    if stored_feature != feature {
+        return Err(invalid_field(
+            "nextToken",
+            "the pagination token was issued for another feature",
+        ));
+    }
+    Ok(consumed)
+}
+
+/// Refuse a filter name this service does not support, BEFORE any entry is
+/// considered, so the refusal does not depend on the feature having a stored
+/// entry to test the filter against.
+///
+/// `BillingFeatureFilterName` declares exactly one value, which the boundary
+/// validator enforces, so another one here can only mean the model gained a
+/// value this handler has not learned.
+fn validate_filters(input: &GetBillingPreferencesInput) -> Result<(), GetBillingPreferencesError> {
+    for filter in input.filters.iter().flatten() {
+        if filter
+            .name
+            .as_deref()
+            .is_some_and(|name| name != FILTER_PREFERENCE_KEY)
+        {
+            return Err(invalid_field(
+                "filters",
+                "name is not a filter this service supports",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `entry` satisfies every filter the request carries. A filter with no
+/// name, or with no values, selects everything — as `ListBillingViews` treats an
+/// omitted filter in this same service.
+fn matches_filters(
+    entry: &crate::state::PreferenceEntry,
+    input: &GetBillingPreferencesInput,
+) -> bool {
+    for filter in input.filters.iter().flatten() {
+        if filter.name.as_deref() != Some(FILTER_PREFERENCE_KEY) {
+            continue;
+        }
+        match filter.value.as_deref() {
+            Some(values) if !values.is_empty() => {
+                if !values.contains(&entry.key) {
+                    return false;
+                }
+            }
+            _ => continue,
+        }
+    }
+    true
+}
+
 impl<Eng> GetBillingPreferences<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -159,18 +268,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBillingPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBillingPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBillingPreferences"))
+        // Every modeled constraint (`features` exactly one value, `filters`
+        // exactly one, its `value` 1..10, `maxResults` 1..50, the `nextToken`
+        // pattern and length) is refused by the boundary validator before this
+        // runs, so reaching here means the input satisfies all of them.
+        let _ = ctx;
+
+        // `features` is modeled `@length(min: 1, max: 1)` — "Specify exactly one
+        // value" — so the one value it carries is the feature to report. The
+        // input is validated BEFORE the shared store is locked, as the writer
+        // beside this handler does.
+        let Some(feature) = input.features.first() else {
+            return Err(invalid_field("features", "specify exactly one feature"));
+        };
+        validate_filters(&input)?;
+        // The page resumes at the entry the previous page stopped on.
+        let consumed = match input.next_token.as_deref() {
+            Some(token) => decode_page_token(token, feature)?,
+            None => 0,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBillingPreferencesErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing preference store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+
+        let matched: Vec<crate::state::PreferenceEntry> = state
+            .preference_entries(feature)
+            .into_iter()
+            .filter(|entry| matches_filters(entry, &input))
+            .collect();
+
+        let limit = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+        let page: Vec<crate::state::PreferenceEntry> =
+            matched.iter().skip(consumed).take(limit).cloned().collect();
+        let delivered = consumed + page.len();
+        // "Present when more pages are available; null when there are no more
+        // results." (`nextToken` doc.)
+        let next_token = (delivered < matched.len()).then(|| encode_page_token(feature, delivered));
+
+        Ok(GetBillingPreferencesOutput {
+            billing_preferences: page
+                .into_iter()
+                .map(|entry| BillingPreferenceSummary {
+                    feature: entry.feature,
+                    key: entry.key,
+                    value: entry.value,
+                    // `accountName` is "populated together with `accountId`", so
+                    // both come from the one family record or neither is set.
+                    account_name: entry.account.as_ref().map(|(_, name)| name.clone()),
+                    account_id: entry.account.map(|(account_id, _)| account_id),
+                    billing_period: entry
+                        .billing_period
+                        .map(|(year, month)| BillingPeriod { year, month }),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

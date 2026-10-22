@@ -125,8 +125,8 @@ use super::types::*;
 
 use crate::state::{
     apply_lustre_update, apply_ontap_update, apply_open_zfs_update, apply_windows_update,
-    route_table_merge_fits, PendingTransition, TransitionTarget, LIFECYCLE_AVAILABLE,
-    LIFECYCLE_MISCONFIGURED, LIFECYCLE_UPDATING, MAX_ROUTE_TABLE_IDS,
+    file_system_not_found_message, route_table_merge_fits, PendingTransition, TransitionTarget,
+    LIFECYCLE_AVAILABLE, LIFECYCLE_MISCONFIGURED, LIFECYCLE_UPDATING, MAX_ROUTE_TABLE_IDS,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -219,10 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(record) = store.file_systems.get_mut(&input.file_system_id) else {
             return Err(UpdateFileSystemErrorModeled::FileSystemNotFound(FileSystemNotFound {
-                message: Some(format!(
-                    "file system {} does not exist",
-                    input.file_system_id
-                )),
+                // Built from the id the request named, not fixed prose.
+                message: Some(file_system_not_found_message(&input.file_system_id)),
             })
             .into());
         };

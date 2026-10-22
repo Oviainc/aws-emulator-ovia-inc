@@ -228,11 +228,13 @@ async fn the_total_is_deduped_across_recommendation_types() {
     let router = enrolled_router().await;
 
     // (case, the mode to store first) — the absent preference is the store's
-    // initial value, which reports undiscounted figures.
-    let modes: [(&str, Option<&str>); 3] = [
+    // initial value, read under the mode the service applies by default. An
+    // explicit `AfterDiscounts` is the management account's to set (see
+    // `management_account_gating`), so the two reachable states are the default
+    // and an explicit `BeforeDiscounts`.
+    let modes: [(&str, Option<&str>); 2] = [
         ("no stored preference", None),
         ("BeforeDiscounts", Some("BeforeDiscounts")),
-        ("AfterDiscounts", Some("AfterDiscounts")),
     ];
 
     for (case, mode) in modes {
@@ -278,7 +280,6 @@ async fn the_total_is_deduped_across_recommendation_types() {
 #[tokio::test]
 async fn a_filter_narrows_the_rows_before_they_are_grouped() {
     let router = enrolled_router().await;
-    let account = engine::emulator_account_id();
 
     let filters: Vec<Value> = vec![
         json!({}),
@@ -292,9 +293,8 @@ async fn a_filter_narrows_the_rows_before_they_are_grouped() {
         json!({"rollbackPossible": false}),
         json!({"tags": [{"key": "environment", "value": "production"}]}),
         json!({"tags": [{"key": "team"}]}),
-        json!({"accountIds": [account]}),
         // A filter that selects nothing: an empty summary, not a refusal.
-        json!({"accountIds": ["123456789012"]}),
+        json!({"regions": ["eu-west-1"]}),
         json!({"regions": ["us-west-2"], "resourceTypes": ["Ec2Instance"]}),
         json!({"regions": ["us-east-1"], "actionTypes": ["Rightsize"]}),
     ];
@@ -452,7 +452,6 @@ async fn summary_pagination_resumes_where_the_previous_page_ended() {
 #[tokio::test]
 async fn the_savings_percentage_metric_is_reported_only_when_requested() {
     let router = enrolled_router().await;
-    let account = engine::emulator_account_id();
 
     // No metric asked for: nothing to report.
     for request in [
@@ -466,19 +465,24 @@ async fn the_savings_percentage_metric_is_reported_only_when_requested() {
         );
     }
 
-    // (case, filter, whether the metric is defined over that view)
+    // (case, filter, whether the metric is defined over that view). An
+    // `accountIds` filter is the organization view this caller does not have
+    // (`management_account_gating`), so the dimensions left to narrow by are
+    // Region and tags.
     let cases: Vec<(&str, Value, bool)> = vec![
         ("no filter at all", json!({}), true),
         ("by region", json!({"regions": ["us-east-1"]}), true),
-        ("by account id", json!({"accountIds": [account]}), true),
         (
             "by tag",
             json!({"tags": [{"key": "environment", "value": "production"}]}),
             true,
         ),
         (
-            "by region and account id",
-            json!({"regions": ["us-west-2"], "accountIds": [account]}),
+            "by region and tag",
+            json!({
+                "regions": ["us-west-2"],
+                "tags": [{"key": "environment", "value": "staging"}],
+            }),
             true,
         ),
         (

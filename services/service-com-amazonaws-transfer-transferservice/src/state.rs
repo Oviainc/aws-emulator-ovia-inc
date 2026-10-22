@@ -4,20 +4,24 @@
 //!
 //! Everything AWS Transfer Family's server + user lifecycle needs to answer a read
 //! from stored state lives here: the two resource maps, the id-minting counter, the
-//! clock-due server state transition, the ARN shapes, and the opaque pagination
-//! token codec the `List*` operations share.
+//! documented create-time defaults and the clock-due server state transitions (the
+//! `ServerTransition` rule `StartServer`/`StopServer` share), the ARN shapes, and the
+//! opaque pagination token codec the `List*` operations share.
 //!
 //! `UserCount` and `SshPublicKeyCount` are DERIVED at read time ([`
 //! ComAmazonawsTransferTransferserviceState::user_count`],
 //! [`User::ssh_public_key_count`]) rather than stored, so they cannot go stale when a
-//! user or a key is added or removed.
+//! user or a key is added or removed. Every other member a reader reports is RESOLVED
+//! once, when the resource is created or updated, so no reader has to re-apply a
+//! default.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     EndpointDetails, HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails,
-    ResourceNotFoundException, S3StorageOptions, Tag, WorkflowDetails,
+    ProxyConfig, ResourceNotFoundException, S3StorageOptions, SftpPortWithOptions, Tag,
+    WorkflowDetails,
 };
 
 /// The region used for an ARN when the request carries no SigV4 credential scope to
@@ -29,10 +33,45 @@ const ARN_SERVICE: &str = "transfer";
 
 /// The security policy a server gets when `CreateServer` names none.
 ///
-/// AWS Transfer Family's documented default security policy for a new server; it
-/// satisfies `SecurityPolicyName`'s modelled pattern
+/// AWS Transfer Family's current default security policy for a new server
+/// ("TransferSecurityPolicy-2024-01 ... is the default security policy", AWS Transfer
+/// Family User Guide, *Security policies for servers*), confirmed by the recorded
+/// response of a server created without `SecurityPolicyName`. It satisfies
+/// `SecurityPolicyName`'s modelled pattern
 /// `^Transfer[A-Za-z0-9]*SecurityPolicy-[A-Za-z0-9-]+$`.
-pub const DEFAULT_SECURITY_POLICY_NAME: &str = "TransferSecurityPolicy-2018-11-05";
+pub const DEFAULT_SECURITY_POLICY_NAME: &str = "TransferSecurityPolicy-2024-01";
+
+/// `ProtocolDetails.PassiveIp`'s default.
+///
+/// Modelled doc: "The value `PassiveIp=AUTO` is assigned by default"; the recorded
+/// response reports it for every server, whatever its protocols.
+pub const DEFAULT_PASSIVE_IP: &str = "AUTO";
+
+/// `ProtocolDetails.TlsSessionResumptionMode`'s documented default ("If a
+/// TlsSessionResumptionMode value is not specified during CreateServer, it is set to
+/// ENFORCED by default").
+pub const DEFAULT_TLS_SESSION_RESUMPTION_MODE: &str = "ENFORCED";
+
+/// `ProtocolDetails.SetStatOption`'s default: the `SetStatOption` enum's `DEFAULT`
+/// member, i.e. `SETSTAT` is not ignored.
+pub const DEFAULT_SET_STAT_OPTION: &str = "DEFAULT";
+
+/// `ProtocolDetails.SftpPorts`' documented default port ("If you don't specify any
+/// configurations during CreateServer, the service uses port 22 with
+/// SERVER_TALK_FIRST by default").
+pub const DEFAULT_SFTP_PORT: i32 = 22;
+
+/// `SftpPortWithOptions.CommunicationMode`'s documented default — the other half of
+/// the `SftpPorts` default sentence quoted on [`DEFAULT_SFTP_PORT`].
+pub const DEFAULT_COMMUNICATION_MODE: &str = "SERVER_TALK_FIRST";
+
+/// `ProtocolDetails.ProxyConfig.SftpMode`'s documented default ("If you don't specify
+/// a value, the default is NONE").
+pub const DEFAULT_PROXY_SFTP_MODE: &str = "NONE";
+
+/// `S3StorageOptions.DirectoryListingOptimization`'s documented default ("If using the
+/// API or CLI, this is disabled by default").
+pub const DEFAULT_DIRECTORY_LISTING_OPTIMIZATION: &str = "DISABLED";
 
 /// `Domain`'s `S3` value (the `Domain` enum is `[S3, EFS]`).
 pub const DOMAIN_S3: &str = "S3";
@@ -112,14 +151,23 @@ pub const MAX_STORED_SERVERS: usize = 200;
 /// runs. `DeleteUser` releases one record; `DeleteServer` releases all of a server's.
 pub const MAX_USERS_PER_SERVER: usize = 1_000;
 
-/// How long after `CreateServer` a new server leaves `STARTING` for `ONLINE`.
+/// How long after `CreateServer` or `StartServer` a server leaves `STARTING` for
+/// `ONLINE`.
 ///
 /// AWS documents the transition ("it can take a couple of minutes for the server to
 /// be completely operational") but not a span the caller can rely on, so this span is
-/// CHOSEN: long enough that a caller acting straight after `CreateServer` still
-/// observes `STARTING`, short enough not to stall a test. The due instant is stored
+/// CHOSEN: long enough that a caller acting straight after the call still observes
+/// `STARTING`, short enough not to stall a test. The due instant is stored
 /// and materialised on the next read; nothing sleeps for it.
 const SERVER_START_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `StopServer` a server leaves `STOPPING` for `OFFLINE`.
+///
+/// AWS documents the intermediate `STOPPING` state but no span, so this is CHOSEN on
+/// the same basis as [`SERVER_START_SPAN`]: a caller polling straight after
+/// `StopServer` still observes `STOPPING`, and the `OFFLINE` it waits for comes due
+/// shortly after without anything sleeping.
+const SERVER_STOP_SPAN: Duration = Duration::from_millis(500);
 
 /// A server's `State` right after `CreateServer`: instantiated, not yet able to serve
 /// file operations.
@@ -127,6 +175,25 @@ pub const SERVER_STATE_STARTING: &str = "STARTING";
 
 /// A server's `State` once the start the create began has completed.
 pub const SERVER_STATE_ONLINE: &str = "ONLINE";
+
+/// A server's `State` right after `StopServer`: the intermediate state the model
+/// documents as "not fully able to respond, or not fully offline".
+pub const SERVER_STATE_STOPPING: &str = "STOPPING";
+
+/// A server's `State` once the stop has completed: the server exists but cannot
+/// perform file transfer operations.
+pub const SERVER_STATE_OFFLINE: &str = "OFFLINE";
+
+/// A server's `State` when a start failed: the model documents `START_FAILED` as "an
+/// error condition", which a caller answers by starting the server again. Nothing in
+/// this emulator writes it — a start it begins always completes — but the shared
+/// transition rule names it so a retry from it would begin a start rather than be
+/// refused.
+pub const SERVER_STATE_START_FAILED: &str = "START_FAILED";
+
+/// A server's `State` when a stop failed. The counterpart of
+/// [`SERVER_STATE_START_FAILED`], on the same basis.
+pub const SERVER_STATE_STOP_FAILED: &str = "STOP_FAILED";
 
 /// The HTTP status AWS Transfer Family answers `ResourceNotFoundException` with.
 ///
@@ -224,26 +291,34 @@ pub struct Server {
     pub endpoint_type: String,
     pub endpoint_details: Option<EndpointDetails>,
     pub protocols: Vec<String>,
-    pub protocol_details: Option<ProtocolDetails>,
+    /// The protocol settings, with every member the model documents a default for
+    /// already resolved at create time — so a reader reports what the server is
+    /// configured with rather than "unconfigured".
+    pub protocol_details: ProtocolDetails,
     pub logging_role: Option<String>,
     pub security_policy_name: String,
     pub pre_authentication_login_banner: Option<String>,
     pub post_authentication_login_banner: Option<String>,
-    /// The Base64 SHA256 fingerprint of the server's host key.
+    /// The Base64 SHA256 fingerprint of the server's host key, in the
+    /// `SHA256:<base64>` form `ssh-keygen -l` prints.
     ///
-    /// Always `None` today: deriving it means parsing the PEM private key
-    /// `CreateServer`/`ImportHostKey` accept, and `ImportHostKey` is still a 501, so
-    /// there is no honest value to report. Reported as absent rather than invented.
-    pub host_key_fingerprint: Option<String>,
+    /// Computed at create time from a host key the emulator GENERATES for the server
+    /// (as the service does for a server whose host key it manages) — see
+    /// [`mint_host_key_fingerprint`]. Never invented: it is the real fingerprint of
+    /// real key material.
+    pub host_key_fingerprint: String,
     pub structured_log_destinations: Vec<String>,
-    pub s3_storage_options: Option<S3StorageOptions>,
+    /// The S3 storage settings, defaulted at create time like
+    /// [`Self::protocol_details`].
+    pub s3_storage_options: S3StorageOptions,
     pub ip_address_type: String,
     pub workflow_details: Option<WorkflowDetails>,
     pub certificate: Option<String>,
     pub state: String,
     /// The state this server owes the clock, and when it comes due.
     ///
-    /// Set by `CreateServer` to `(now + SERVER_START_SPAN, "ONLINE")`; materialised by
+    /// Set by `CreateServer`/`StartServer` to `(now + SERVER_START_SPAN, "ONLINE")` and
+    /// by `StopServer` to `(now + SERVER_STOP_SPAN, "OFFLINE")`; materialised by
     /// [`Server::settle`] on the next read, never by sleeping.
     pub state_due: Option<(Instant, String)>,
     pub tags: Vec<Tag>,
@@ -263,6 +338,225 @@ impl Server {
             }
         }
     }
+
+    /// Begin the stop the clock will complete: the intermediate `STOPPING` now,
+    /// `OFFLINE` when [`SERVER_STOP_SPAN`] has elapsed.
+    pub fn begin_stop(&mut self, now: Instant) {
+        self.state = SERVER_STATE_STOPPING.to_string();
+        self.state_due = Some((now + SERVER_STOP_SPAN, SERVER_STATE_OFFLINE.to_string()));
+    }
+
+    /// Begin the start the clock will complete: the intermediate `STARTING` now,
+    /// `ONLINE` when [`SERVER_START_SPAN`] has elapsed.
+    pub fn begin_start(&mut self, now: Instant) {
+        self.state = SERVER_STATE_STARTING.to_string();
+        self.state_due = Some((now + SERVER_START_SPAN, SERVER_STATE_ONLINE.to_string()));
+    }
+
+    /// What `StopServer` does to this server, by its current `State`.
+    pub fn stop_decision(&self) -> ServerTransition {
+        ServerTransition::decide(
+            &self.state,
+            SERVER_STATE_ONLINE,
+            SERVER_STATE_OFFLINE,
+            SERVER_STATE_STOPPING,
+            SERVER_STATE_STOP_FAILED,
+        )
+    }
+
+    /// What `StartServer` does to this server, by its current `State`.
+    pub fn start_decision(&self) -> ServerTransition {
+        ServerTransition::decide(
+            &self.state,
+            SERVER_STATE_OFFLINE,
+            SERVER_STATE_ONLINE,
+            SERVER_STATE_STARTING,
+            SERVER_STATE_START_FAILED,
+        )
+    }
+}
+
+/// What a state-changing server call does, given the server's current `State`.
+///
+/// `StartServer` and `StopServer` share ONE rule, so the two handlers cannot drift:
+/// the call begins its transition from the state it is documented to move the server
+/// out of, and from its own failure state, which is what a caller retries; it has "no
+/// impact" on a server that is already in, or already on its way to, the state it
+/// targets; and it is refused when the server is in flight the other way, because
+/// there is then no such transition to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTransition {
+    /// Write the intermediate state now and owe the terminal one to the clock.
+    Begin,
+    /// Nothing to do: answer success and leave the server, and any pending
+    /// transition, exactly as they are.
+    NoImpact,
+    /// Refuse with the modelled `InvalidRequestException`.
+    Refuse,
+}
+
+impl ServerTransition {
+    /// Classify `state` for a call that moves a server out of `from`, towards `target`
+    /// through the intermediate `in_flight`, and that is retried from `failed` — its
+    /// own `*_FAILED` state, which the model documents as "an error condition" of this
+    /// very transition.
+    fn decide(state: &str, from: &str, target: &str, in_flight: &str, failed: &str) -> Self {
+        if state == from || state == failed {
+            Self::Begin
+        } else if state == target || state == in_flight {
+            Self::NoImpact
+        } else {
+            Self::Refuse
+        }
+    }
+}
+
+/// Resolve the `ProtocolDetails` a server is created with.
+///
+/// Every member the model documents a default for is materialised HERE, once, at create
+/// time, so a reader rebuilds the server's real protocol settings instead of reporting
+/// nothing configured. A member the caller supplied is kept exactly as given; only the
+/// absent ones take their default. `As2Transports` has no documented default (it is
+/// meaningful only for AS2 servers), so an absent one stays absent.
+pub fn resolve_protocol_details(requested: Option<ProtocolDetails>) -> ProtocolDetails {
+    let requested = requested.unwrap_or_default();
+    ProtocolDetails {
+        passive_ip: Some(
+            requested
+                .passive_ip
+                .unwrap_or_else(|| DEFAULT_PASSIVE_IP.to_string()),
+        ),
+        tls_session_resumption_mode: Some(
+            requested
+                .tls_session_resumption_mode
+                .unwrap_or_else(|| DEFAULT_TLS_SESSION_RESUMPTION_MODE.to_string()),
+        ),
+        set_stat_option: Some(
+            requested
+                .set_stat_option
+                .unwrap_or_else(|| DEFAULT_SET_STAT_OPTION.to_string()),
+        ),
+        sftp_ports: Some(
+            requested
+                .sftp_ports
+                .filter(|ports| !ports.is_empty())
+                .map(|ports| {
+                    ports
+                        .into_iter()
+                        .map(|port| SftpPortWithOptions {
+                            sftp_port: port.sftp_port,
+                            // `CommunicationMode` is optional per entry and defaults
+                            // the same way the whole-list default does.
+                            communication_mode: Some(port.communication_mode.unwrap_or_else(
+                                || DEFAULT_COMMUNICATION_MODE.to_string(),
+                            )),
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![SftpPortWithOptions {
+                        sftp_port: DEFAULT_SFTP_PORT,
+                        communication_mode: Some(DEFAULT_COMMUNICATION_MODE.to_string()),
+                    }]
+                }),
+        ),
+        as2_transports: requested.as2_transports,
+        proxy_config: Some(ProxyConfig {
+            sftp_mode: Some(
+                requested
+                    .proxy_config
+                    .and_then(|proxy| proxy.sftp_mode)
+                    .unwrap_or_else(|| DEFAULT_PROXY_SFTP_MODE.to_string()),
+            ),
+        }),
+    }
+}
+
+/// Resolve the `S3StorageOptions` a server is created with, on the same rule as
+/// [`resolve_protocol_details`].
+pub fn resolve_s3_storage_options(requested: Option<S3StorageOptions>) -> S3StorageOptions {
+    S3StorageOptions {
+        directory_listing_optimization: Some(
+            requested
+                .and_then(|options| options.directory_listing_optimization)
+                .unwrap_or_else(|| DEFAULT_DIRECTORY_LISTING_OPTIMIZATION.to_string()),
+        ),
+    }
+}
+
+/// Apply the `ProtocolDetails` an update NAMES onto the ones the server already has.
+///
+/// An update changes the members it names and leaves the rest of the server's protocol
+/// settings where they were — then the same create-time resolution runs over the
+/// result, so the stored settings stay fully materialised and no member can fall back
+/// to "unset".
+pub fn merge_protocol_details(
+    stored: &ProtocolDetails,
+    requested: ProtocolDetails,
+) -> ProtocolDetails {
+    resolve_protocol_details(Some(ProtocolDetails {
+        passive_ip: requested.passive_ip.or_else(|| stored.passive_ip.clone()),
+        tls_session_resumption_mode: requested
+            .tls_session_resumption_mode
+            .or_else(|| stored.tls_session_resumption_mode.clone()),
+        set_stat_option: requested
+            .set_stat_option
+            .or_else(|| stored.set_stat_option.clone()),
+        sftp_ports: requested.sftp_ports.or_else(|| stored.sftp_ports.clone()),
+        as2_transports: requested
+            .as2_transports
+            .or_else(|| stored.as2_transports.clone()),
+        proxy_config: requested
+            .proxy_config
+            .or_else(|| stored.proxy_config.clone()),
+    }))
+}
+
+/// Apply the `S3StorageOptions` an update names onto the stored ones, on the same rule
+/// as [`merge_protocol_details`].
+pub fn merge_s3_storage_options(
+    stored: &S3StorageOptions,
+    requested: S3StorageOptions,
+) -> S3StorageOptions {
+    resolve_s3_storage_options(Some(S3StorageOptions {
+        directory_listing_optimization: requested
+            .directory_listing_optimization
+            .or_else(|| stored.directory_listing_optimization.clone()),
+    }))
+}
+
+/// Mint a host key for a new server and return its Base64 SHA256 fingerprint.
+///
+/// AWS generates a host key for a server whose host key it manages, and reports that
+/// key's fingerprint — "equivalent to the output of the `ssh-keygen -l -f` command",
+/// i.e. OpenSSH's `SHA256:<base64 of the SHA256 of the public key blob>`. So this
+/// GENERATES a real Ed25519 SSH host key and asks `ssh-key` — the crate that
+/// implements the OpenSSH key formats — for that key's fingerprint; the value is
+/// computed from real key material rather than invented. The key itself is
+/// per-server and per-run, like the real service's, and is not kept: the emulator
+/// serves no SSH transport, so nothing can use the private half, and nothing may
+/// return it.
+pub fn mint_host_key_fingerprint() -> String {
+    let keypair = ::ssh_key::private::Ed25519Keypair::random(&mut ::ssh_key::rand_core::OsRng);
+    ::ssh_key::PrivateKey::from(keypair)
+        .fingerprint(::ssh_key::HashAlg::Sha256)
+        .to_string()
+}
+
+/// The Base64 SHA256 fingerprint of host key MATERIAL a caller supplied, when the
+/// material is a key the emulator can read.
+///
+/// `CreateServer`/`UpdateServer` accept a `HostKey`; when it is an OpenSSH private key
+/// — what `ssh-keygen` writes — that key IS the server's host key, so the fingerprint
+/// reported for the server is parsed straight out of it and matches what
+/// `ssh-keygen -l` prints for the same file. `None` for material in a format the
+/// emulator cannot read (it implements no other private-key format and serves no SSH
+/// transport): the server then keeps the host key it already has, whose genuine
+/// fingerprint it reports, rather than one invented for material nothing read.
+pub fn supplied_host_key_fingerprint(material: &str) -> Option<String> {
+    ::ssh_key::PrivateKey::from_openssh(material)
+        .ok()
+        .map(|key| key.fingerprint(::ssh_key::HashAlg::Sha256).to_string())
 }
 
 // =============================================================================

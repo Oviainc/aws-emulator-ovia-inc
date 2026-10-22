@@ -9,6 +9,8 @@
 //! `ValidationException`, before anything is written; a body that breaks a
 //! modelled SHAPE constraint never reaches this handler at all — this service's
 //! front door (`crate::service`) refuses it with HTTP 400 `BadRequestException`.
+//! Each list setting's members are stored and reported in one canonical order
+//! (`crate::state::canonical_members`).
 //!
 //! ## Shape of an operation
 //!
@@ -263,17 +265,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(color) = input.account_color {
                 record.account_color = Some(color);
             }
+            // A list setting's members are stored and reported in the service's
+            // own canonical order (`crate::state::canonical_members`): the
+            // sequence a request lists them in carries no meaning, so the same
+            // members read back the same way whichever sequence named them.
             if let Some(services) = input.visible_services {
-                record.visible_services = Some(services);
+                record.set_visible_services(services);
             }
             if let Some(regions) = input.visible_regions {
-                record.visible_regions = Some(regions);
+                record.set_visible_regions(regions);
             }
             // Answer from PERSISTED state, read back after the write, rather than
             // from the input: the response is "the current ... after the update",
-            // which also carries settings this request did not mention. Re-applying
-            // the same request therefore yields the same state and the same body
-            // (`@idempotent`).
+            // which also carries settings this request did not mention, and the
+            // order the setting holds rather than the sequence this request listed.
+            // Re-applying the same request therefore yields the same state and the
+            // same body (`@idempotent`), and so does any permutation of it.
             record.clone()
         };
 

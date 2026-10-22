@@ -23,6 +23,8 @@ mod layer_availability;
 mod lifecycle_policy;
 #[path = "all/lifecycle_policy_preview.rs"]
 mod lifecycle_policy_preview;
+#[path = "all/pull_through_cache_rules.rs"]
+mod pull_through_cache_rules;
 #[path = "all/pull_time_update_exclusion_removal.rs"]
 mod pull_time_update_exclusion_removal;
 #[path = "all/pull_time_update_exclusions.rs"]

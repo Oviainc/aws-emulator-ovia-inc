@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags stored on the managed device or the task whose ARN `resourceArn`
+//! names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `resourceArn` is resolved the way every tagging operation of this service resolves it
+//! ([`crate::state::parse_tagged_resource_arn`]): a value that is not one of this
+//! service's own device or task ARNs never named a resource here and is refused 400
+//! `BadRequestException`; an ARN whose account is not the one this emulator serves is
+//! refused with the modelled `AccessDeniedException` (403) whatever it names, with a
+//! message that names the CALLER's own principal and discloses nothing about the ARN, so
+//! a tag read cannot be used to learn what another account holds; an ARN of this account
+//! that addresses no stored device and no stored task is answered 404 `NotFoundException`.
+//! Everything else is a projection of the stored record's tags.
 //!
 //! ## Shape of an operation
 //!
@@ -83,9 +86,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-snowdevicemanagement-sn
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.snowdevicemanagement#ListTagsForResource")]
+//
+// `extra_errors` widens the set with `AccessDeniedException`, which this SERVICE models
+// ("You don't have sufficient access to perform this action.", HTTP 403) and declares on
+// its id-addressed operations, but does not list on this one: it is the answer an ARN
+// outside the caller's own account earns, and the only one that discloses nothing about
+// what that account holds.
+#[smithy_macros::operation_error(
+    "com.amazonaws.snowdevicemanagement#ListTagsForResource",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -142,18 +155,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // `resourceArn` carries everything this operation addresses, so nothing here is
+        // read from the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the snow-device-management tag store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The tagging operations are NOT behind the account-level device gate: the model
+        // declares no `AccessDeniedException` on them for it, and recorded behaviour has
+        // them answer their own refusals instead. Settling is still owed, because
+        // reading a task's tags has to see the state the clock gave it.
+        store.settle(now);
+
+        let resource = match crate::state::parse_tagged_resource_arn(&input.resource_arn) {
+            Ok(resource) => resource,
+            // Not an ARN of this service at all: the recorded answer of the tagging
+            // APIs to a `resourceArn` they cannot parse is HTTP 400
+            // `BadRequestException`, a code this service's model declares nowhere, so it
+            // comes from the error channel rather than a modeled shape.
+            Err(crate::state::ArnRefusal::Malformed(message)) => {
+                return Err(crate::scaffolded::Scaffolded::bad_request(message));
+            }
+            // Authorization is decided on the ARN the request named, before anything is
+            // looked up, so this answer is the same whether or not that account holds
+            // such a resource. The message the shared parser built is deliberately
+            // DISCARDED: it names the ARN, and the wording the corpus recorded for the
+            // tag READ names the caller's own principal instead, disclosing nothing
+            // about what it was asked about.
+            Err(crate::state::ArnRefusal::ForeignAccount(_)) => {
+                return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: crate::state::access_denied_message(),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "Returns a list of tags for a managed device or task": an ARN that parses but
+        // names no device and no task of this account is answered 404 `NotFoundException`
+        // — not the model's `ResourceNotFoundException`, which is what the device and
+        // task operations answer with — so it too comes from the error channel.
+        let Some(tags) = store.tags_of(&resource) else {
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::TAGGING_NOT_FOUND_MESSAGE,
+            ));
+        };
+
+        // A resource carrying no tags has an EMPTY list of them, which is a different
+        // answer from the member being absent.
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }

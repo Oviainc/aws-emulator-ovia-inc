@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkloadShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkloadShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkloadShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: grants one principal one permission on one workload and persists the
+//! share in [`crate::state`], so `ListWorkloadShares` reads it back. A workload is shared
+//! BY its owning account — the caller — so a request whose `SharedWith` names that same
+//! principal is refused with `ValidationException` (400) and records nothing; the path
+//! `WorkloadId` is resolved by lookup (`ResourceNotFoundException`, 404), a principal the
+//! workload is already shared with is `ConflictException` (409), and the share beyond
+//! this emulator's per-workload ceiling is `ServiceQuotaExceededException` (402).
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +169,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkloadShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkloadShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkloadShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkloadShareErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `PermissionType` is a modelled enum and is NOT in this input's
+        // `skip_validation` list, so the boundary validator refuses an out-of-set value
+        // before this handler runs and this branch is unreachable over HTTP (the enum
+        // rows in `tests/all/workload_shares.rs` are refused there, with the same 400
+        // `ValidationException`). It is kept as defence in depth for a caller that
+        // constructs the input directly, so a share is never recorded with a permission
+        // the enum does not publish.
+        if !PERMISSION_TYPE_VALUES.contains(&input.permission_type.as_str()) {
+            return Err(field_validation(
+                "PermissionType",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    PERMISSION_TYPE_VALUES.join(", ")
+                ),
+            ));
+        }
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "PermissionType": &input.permission_type,
+            "SharedWith": &input.shared_with,
+            "WorkloadId": &input.workload_id,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns the
+        // share the original request created instead of creating a second one.
+        if let Some(token) = store
+            .create_workload_share_tokens
+            .get(&input.client_request_token)
+        {
+            if token.fingerprint != fingerprint {
+                let share_id = token.share_id.clone();
+                return Err(CreateWorkloadShareErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::WORKLOAD_SHARE_RESOURCE_TYPE,
+                        share_id,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(recorded) = store.workload_share(&token.workload_id, &token.share_id) {
+                return Ok(CreateWorkloadShareOutput {
+                    workload_id: Some(recorded.workload_id.clone()),
+                    share_id: Some(recorded.share_id.clone()),
+                });
+            }
+        }
+
+        // "The owner of a workload can share it with other Amazon Web Services accounts
+        // and users" (`CreateWorkloadShare` doc): the workload being shared is resolved by
+        // this lookup, so an id no workload carries is the lookup's 404 whatever its
+        // syntax, and the account that owns it is the principal doing the sharing.
+        let Some(shared_by) = store
+            .workloads
+            .get(&input.workload_id)
+            .map(|workload| workload.owner.clone())
+        else {
+            return Err(CreateWorkloadShareErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+            .into());
+        };
+
+        // A share GRANTS access to a principal that does not have it: the sharer already
+        // has it, so sharing with the sharer's own principal is not a share at all. The
+        // comparison is against the identity that shares the workload — the owning account
+        // this request is attributed to — never against a literal account id.
+        if input.shared_with == shared_by {
+            return Err(field_validation(
+                "SharedWith",
+                &format!(
+                    "Member must not be the principal sharing the workload ({shared_by})"
+                ),
+            ));
+        }
+
+        // One principal holds at most one share of one workload: the permission a second
+        // share would grant belongs to the share that already exists, which
+        // `UpdateWorkloadShare` changes and `DeleteWorkloadShare` revokes.
+        if let Some(existing) = store.workload_share_with(&input.workload_id, &input.shared_with) {
+            let conflict = crate::state::workload_share_conflict(existing);
+            return Err(CreateWorkloadShareErrorModeled::ConflictException(conflict).into());
+        }
+
+        // Shares are metered per workload, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: a share and its create token are both 1:1 with a live grant.
+        if store.workload_shares_of(&input.workload_id).len()
+            >= crate::state::MAX_SHARES_PER_WORKLOAD
+        {
+            return Err(CreateWorkloadShareErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The workload with ID {} already holds the maximum of {} shares",
+                        input.workload_id,
+                        crate::state::MAX_SHARES_PER_WORKLOAD
+                    ),
+                    resource_id: Some(input.workload_id.clone()),
+                    resource_type: Some(crate::state::WORKLOAD_SHARE_RESOURCE_TYPE.to_string()),
+                    // The model publishes no numeric Service Quotas code for this quota,
+                    // so it is named by what it meters; the service code is this service's
+                    // own signing name.
+                    quota_code: "SharesPerWorkload".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let share_id = store.mint_share_id();
+        let record = crate::state::WorkloadShareRecord {
+            share_id: share_id.clone(),
+            workload_id: input.workload_id.clone(),
+            shared_by,
+            shared_with: input.shared_with,
+            permission_type: input.permission_type,
+            // A new share waits on the invitation the principal it was offered to has to
+            // answer; nothing this operation does accepts it on their behalf.
+            status: crate::state::DEFAULT_SHARE_STATUS.to_string(),
+            status_message: None,
+        };
+        store
+            .workload_shares
+            .entry(input.workload_id.clone())
+            .or_default()
+            .insert(share_id.clone(), record);
+        store.create_workload_share_tokens.insert(
+            input.client_request_token,
+            crate::state::CreateWorkloadShareToken {
+                workload_id: input.workload_id.clone(),
+                share_id: share_id.clone(),
+                fingerprint,
+            },
+        );
+
+        Ok(CreateWorkloadShareOutput {
+            workload_id: Some(input.workload_id),
+            share_id: Some(share_id),
+        })
     }
+}
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — preferred over the scaffold's synthetic one
+/// because the modelled shape carries `Reason` and `Fields`, which a client reads.
+fn field_validation(member: &str, constraint: &str) -> CreateWorkloadShareError {
+    CreateWorkloadShareErrorModeled::ValidationException(
+        crate::state::member_constraint_exception(member, constraint),
+    )
+    .into()
 }

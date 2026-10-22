@@ -175,6 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
         let _ = (&input, ctx, &self.engine);
+        // This operation's own `@range` on `maxResults` (min 0, max 1000), which
+        // overrides the narrower range of the `MaxResults` shape it targets and
+        // so is not enforced by the schema's constraint walk (`skip_validation`
+        // on `ListEfficiencyMetricsInput`). A request outside it is refused
+        // whether or not the operation itself is implemented yet.
+        if let Some(refused) =
+            crate::service::out_of_range("maxResults", input.max_results, 0, MAX_RESULTS_MAX)
+        {
+            return Err(ListEfficiencyMetricsErrorModeled::ValidationException(refused).into());
+        }
         // Implement `ListEfficiencyMetrics` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(ListEfficiencyMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
@@ -187,3 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Err(crate::scaffolded::Scaffolded::not_implemented("ListEfficiencyMetrics"))
     }
 }
+
+/// The largest page this operation accepts, from the `@range` its OWN
+/// `maxResults` member declares
+/// (`smithy_query(query="operation", operation="ListEfficiencyMetrics")`:
+/// `maxResults` `range` min 0 max 1000).
+const MAX_RESULTS_MAX: i64 = 1000;

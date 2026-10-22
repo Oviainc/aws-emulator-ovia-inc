@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHarvestJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHarvestJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Records a harvest job against one origin endpoint and reports it as
+//! stored, so a later `GetHarvestJob` returns the same bytes.
+//!
+//! Refusals, in the order they are judged: a schedule whose end is before its start, or
+//! equal to it, is `ValidationException` (400) with `END_TIME_EARLIER_THAN_START_TIME` /
+//! `INVALID_HARVEST_JOB_DURATION`; an unresolved parent chain is
+//! `ResourceNotFoundException` (404) with the service's fixed per-resource sentence; a
+//! name already taken on that endpoint is `ConflictException` (409); a harvested manifest
+//! the endpoint does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`.
+//!
+//! The job is created `QUEUED` and the CLOCK owes it `IN_PROGRESS` (see
+//! `state::HarvestJobRecord::materialise_due_transitions`). This emulator runs no
+//! harvester, so once the scheduled window ends the job reaches the model's `FAILED`
+//! status with a reason that says exactly that, rather than claiming a `COMPLETED`
+//! export nothing performed.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHarvestJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +212,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHarvestJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHarvestJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHarvestJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateHarvestJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Refusals the request carries on its own face, before the store is read.
+        let tags = input.tags.clone().unwrap_or_default();
+        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
+        // judged against the same bounds before anything is stored.
+        if let Some(rejection) = crate::state::tag_bounds_rejection(&tags) {
+            return Err(CreateHarvestJobErrorModeled::ValidationException(rejection).into());
+        }
+        let start = input.schedule_configuration.start_time.as_secs_f64();
+        let end = input.schedule_configuration.end_time.as_secs_f64();
+        if end < start {
+            return Err(CreateHarvestJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "ScheduleConfiguration.EndTime is earlier than \
+                         ScheduleConfiguration.StartTime"
+                            .to_string(),
+                    ),
+                    validation_exception_type: Some(
+                        crate::state::VALIDATION_END_TIME_EARLIER_THAN_START_TIME.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if end == start {
+            return Err(CreateHarvestJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "ScheduleConfiguration describes a zero-length harvest window"
+                            .to_string(),
+                    ),
+                    validation_exception_type: Some(
+                        crate::state::VALIDATION_INVALID_HARVEST_JOB_DURATION.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // `HARVEST_JOB_S3_DESTINATION_MISSING_OR_INCOMPLETE` has no handler check: the
+        // model already refuses an incomplete destination at the boundary, before this
+        // handler runs — `Destination$S3Destination` is `@required`, and so are its
+        // `BucketName` (`@length` 3..63) and `DestinationPath` (`@length` 1..1024,
+        // `@pattern ^[\S]+$`). There is no destination the validator admits that this
+        // handler could still call incomplete.
+
+        let mut store = state.lock();
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(CreateHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::ChannelGroup.not_found(),
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(CreateHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::Channel.not_found(),
+            )
+            .into());
+        };
+        let Some(endpoint) = channel.origin_endpoints.get_mut(&input.origin_endpoint_name)
+        else {
+            return Err(CreateHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::OriginEndpoint.not_found(),
+            )
+            .into());
+        };
+
+        // A harvest job exports manifests the endpoint actually publishes, so each
+        // requested manifest name is resolved against the endpoint's own manifests.
+        if let Some(missing) = unpublished_manifest(&input.harvested_manifests, endpoint) {
+            return Err(CreateHarvestJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "HarvestedManifests names {missing}, which this origin endpoint does \
+                         not publish"
+                    )),
+                    validation_exception_type: Some(
+                        crate::state::VALIDATION_HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let created_at = crate::state::now();
+        // `HarvestJobName` is optional: with none given the service names the job itself,
+        // from the endpoint it belongs to and the instant it was created, so the name is
+        // unique within the endpoint and is reported back for the caller to address it.
+        let name = input.harvest_job_name.clone().unwrap_or_else(|| {
+            let derived = crate::state::etag(&[
+                endpoint.arn.clone(),
+                created_at.as_secs_f64().to_string(),
+                endpoint.harvest_jobs.len().to_string(),
+            ]);
+            derived[..32].to_string()
+        });
+        if endpoint.harvest_jobs.contains_key(&name) {
+            return Err(CreateHarvestJobErrorModeled::ConflictException(
+                crate::state::resource_already_exists(),
+            )
+            .into());
+        }
+        // The endpoint's job map never shrinks (a finished job stays readable), so its
+        // size is bounded here rather than by how many requests arrive.
+        if endpoint.harvest_jobs.len() >= crate::state::MAX_HARVEST_JOBS_PER_ORIGIN_ENDPOINT {
+            return Err(
+                CreateHarvestJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "An origin endpoint holds at most {} harvest jobs",
+                            crate::state::MAX_HARVEST_JOBS_PER_ORIGIN_ENDPOINT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut job = crate::state::HarvestJobRecord {
+            name: name.clone(),
+            group_name: endpoint.group_name.clone(),
+            channel_name: endpoint.channel_name.clone(),
+            endpoint_name: endpoint.name.clone(),
+            arn: crate::state::harvest_job_arn(
+                &region,
+                &endpoint.group_name,
+                &endpoint.channel_name,
+                &endpoint.name,
+                &name,
+            ),
+            description: input.description,
+            harvested_manifests: input.harvested_manifests,
+            schedule_configuration: input.schedule_configuration,
+            destination: input.destination,
+            // A job is accepted into the queue; the clock owes it `IN_PROGRESS`.
+            status: crate::state::HARVEST_JOB_QUEUED.to_string(),
+            error_message: None,
+            created_at,
+            modified_at: created_at,
+            in_progress_at: crate::state::harvest_job_in_progress_at(created_at),
+            version: 1,
+            etag: String::new(),
+            tags,
+        };
+        job.recompute_etag();
+        endpoint.harvest_jobs.insert(name.clone(), job);
+        // Answer from what was stored, so the response can only carry what a later
+        // `GetHarvestJob` will read.
+        let job = &endpoint.harvest_jobs[&name];
+
+        Ok(CreateHarvestJobOutput {
+            channel_group_name: job.group_name.clone(),
+            channel_name: job.channel_name.clone(),
+            origin_endpoint_name: job.endpoint_name.clone(),
+            destination: job.destination.clone(),
+            harvest_job_name: job.name.clone(),
+            harvested_manifests: job.harvested_manifests.clone(),
+            description: job.description.clone(),
+            schedule_configuration: job.schedule_configuration.clone(),
+            arn: job.arn.clone(),
+            created_at: job.created_at,
+            modified_at: job.modified_at,
+            status: job.status.clone(),
+            error_message: job.error_message.clone(),
+            e_tag: Some(job.etag.clone()),
+            tags: Some(job.tags.clone()),
+        })
     }
+}
+
+/// The first manifest name in `requested` that `endpoint` does not publish, or `None`
+/// when every one of them resolves.
+///
+/// A harvested manifest is addressed by the `ManifestName` the endpoint was created with,
+/// per family: HLS and low-latency HLS and DASH each have their own list on the endpoint,
+/// so each requested family is resolved against the matching one.
+fn unpublished_manifest(
+    requested: &HarvestedManifests,
+    endpoint: &crate::state::OriginEndpoint,
+) -> Option<String> {
+    let missing_hls = requested
+        .hls_manifests
+        .iter()
+        .flatten()
+        .map(|manifest| &manifest.manifest_name)
+        .find(|name| {
+            !endpoint
+                .hls_manifests
+                .iter()
+                .any(|published| &published.manifest_name == *name)
+        });
+    let missing_low_latency = requested
+        .low_latency_hls_manifests
+        .iter()
+        .flatten()
+        .map(|manifest| &manifest.manifest_name)
+        .find(|name| {
+            !endpoint
+                .low_latency_hls_manifests
+                .iter()
+                .any(|published| &published.manifest_name == *name)
+        });
+    let missing_dash = requested
+        .dash_manifests
+        .iter()
+        .flatten()
+        .map(|manifest| &manifest.manifest_name)
+        .find(|name| {
+            !endpoint
+                .dash_manifests
+                .iter()
+                .any(|published| &published.manifest_name == *name)
+        });
+    missing_hls
+        .or(missing_low_latency)
+        .or(missing_dash)
+        .cloned()
 }

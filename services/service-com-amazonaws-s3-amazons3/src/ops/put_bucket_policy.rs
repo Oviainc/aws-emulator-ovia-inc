@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Attaches a bucket policy to an existing bucket, which
+//! `GetBucketPolicy` then reports byte for byte. The `Policy` is validated as a policy
+//! document and against the published size limit
+//! ([`crate::state::MAX_BUCKET_POLICY_BYTES`]) first (`MalformedPolicy`, 400) and the
+//! bucket is resolved second (`NoSuchBucket`, 404), so a refused request leaves the
+//! bucket's policy as it was. Neither code is in the model — this operation declares no
+//! errors at all — but they are the codes S3 sends, and a client branches on the code.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +216,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketPolicy"))
+        // The write needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the S3 store is unavailable",
+            ));
+        };
+
+        // A policy that is not a policy document, or one past the published size limit,
+        // is a client error whatever the bucket's state, so both are judged before the
+        // store is read — and the size check is what keeps the stored policy bounded.
+        if input.policy.len() > crate::state::MAX_BUCKET_POLICY_BYTES {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_POLICY_CODE,
+                400,
+                format!(
+                    "A bucket policy carries at most {} bytes; the request carries {}",
+                    crate::state::MAX_BUCKET_POLICY_BYTES,
+                    input.policy.len()
+                ),
+            ));
+        }
+        if !crate::state::is_valid_policy_document(&input.policy) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_POLICY_CODE,
+                400,
+                crate::state::MALFORMED_POLICY_MESSAGE,
+            ));
+        }
+
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                404,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+
+        // One policy per bucket: a later put replaces the one that was there.
+        bucket.policy = Some(input.policy);
+
+        Ok(PutBucketPolicyOutput)
     }
 }

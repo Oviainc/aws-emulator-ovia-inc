@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHarvestJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHarvestJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reports one harvest job as it is stored. Reporting, with one exception
+//! the clock licenses: before answering it materialises the status changes that were
+//! already DUE at this instant whether or not anybody read the job (`QUEUED` ->
+//! `IN_PROGRESS`, and `IN_PROGRESS` -> `FAILED` once the caller's scheduled window has
+//! ended) — see `state::HarvestJobRecord::materialise_due_transitions`. It never moves a
+//! status because a read happened.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHarvestJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +185,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHarvestJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHarvestJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHarvestJob"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetHarvestJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(GetHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::ChannelGroup.not_found(),
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(GetHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::Channel.not_found(),
+            )
+            .into());
+        };
+        let Some(endpoint) = channel.origin_endpoints.get_mut(&input.origin_endpoint_name)
+        else {
+            return Err(GetHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::OriginEndpoint.not_found(),
+            )
+            .into());
+        };
+        let Some(job) = endpoint.harvest_jobs.get_mut(&input.harvest_job_name) else {
+            return Err(GetHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::HarvestJob.not_found(),
+            )
+            .into());
+        };
+        // Only what the clock already owed: a transition that was due at this instant
+        // even if nobody had called.
+        job.materialise_due_transitions(crate::state::now());
+
+        Ok(GetHarvestJobOutput {
+            channel_group_name: job.group_name.clone(),
+            channel_name: job.channel_name.clone(),
+            origin_endpoint_name: job.endpoint_name.clone(),
+            destination: job.destination.clone(),
+            harvest_job_name: job.name.clone(),
+            harvested_manifests: job.harvested_manifests.clone(),
+            description: job.description.clone(),
+            schedule_configuration: job.schedule_configuration.clone(),
+            arn: job.arn.clone(),
+            created_at: job.created_at,
+            modified_at: job.modified_at,
+            status: job.status.clone(),
+            error_message: job.error_message.clone(),
+            e_tag: Some(job.etag.clone()),
+            tags: Some(job.tags.clone()),
+        })
     }
 }

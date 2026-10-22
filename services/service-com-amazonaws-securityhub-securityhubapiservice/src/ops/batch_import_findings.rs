@@ -161,8 +161,6 @@ const MAX_ID_LEN: usize = 512;
 const MAX_TITLE_LEN: usize = 256;
 /// `AwsSecurityFinding$Description`: "Minimum length of 1. Maximum length of 1024."
 const MAX_DESCRIPTION_LEN: usize = 1024;
-/// `AwsSecurityFinding$AwsAccountId`: "Length Constraints: 12."
-const AWS_ACCOUNT_ID_LEN: usize = 12;
 /// `AwsSecurityFinding$Resources`: "Minimum number of 1 item. Maximum number of 32
 /// items."
 const MAX_RESOURCES: usize = 32;
@@ -204,10 +202,13 @@ fn rejection_reason(finding: &AwsSecurityFinding) -> Option<String> {
             finding.description.len()
         ));
     }
-    if finding.aws_account_id.len() != AWS_ACCOUNT_ID_LEN {
+    // `AwsSecurityFinding$AwsAccountId` is an account id ("Length Constraints: 12"),
+    // the same rule `crate::state::is_account_id` holds for every account id member
+    // of this service.
+    if !crate::state::is_account_id(&finding.aws_account_id) {
         return Some(format!(
-            "AwsAccountId must be exactly {AWS_ACCOUNT_ID_LEN} characters, got {}",
-            finding.aws_account_id.len()
+            "AwsAccountId must be {} digits, got '{}'",
+            crate::state::ACCOUNT_ID_LEN, finding.aws_account_id
         ));
     }
     if finding.resources.is_empty() || finding.resources.len() > MAX_RESOURCES {

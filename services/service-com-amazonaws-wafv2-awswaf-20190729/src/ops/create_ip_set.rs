@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIPSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIPSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an IPSet under `(Scope, Name)` and persists it in `crate::state`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIPSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Input: `Name`, `Scope`, `IPAddressVersion`, `Addresses` (all required), plus
+//! `Description` and `Tags`. Output: the `IPSetSummary` of what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -193,17 +188,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIPSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIPSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIPSet"))
+        // request metadata.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(
+                WAFInvalidParameterException {
+                    message: Some(format!(
+                        "Scope {:?} is not one of CLOUDFRONT or REGIONAL",
+                        input.scope
+                    )),
+                    field: Some("SCOPE_VALUE".to_string()),
+                    parameter: Some(input.scope.clone()),
+                    reason: Some(
+                        "the scope names the namespace the IP set lives in".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // WAF's published quota is 10,000 addresses per IP set; past it the real
+        // service answers WAFLimitsExceededException rather than storing the set.
+        if input.addresses.len() > crate::state::MAX_IP_SET_ADDRESSES {
+            return Err(CreateIPSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(format!(
+                        "An IPSet holds at most {} addresses; the request carries {}",
+                        crate::state::MAX_IP_SET_ADDRESSES,
+                        input.addresses.len()
+                    )),
+                    source_type: None,
+                },
+            )
+            .into());
+        }
+
+        // Every entry must be a CIDR block of the declared address family; see
+        // `crate::state::validate_cidr` for the documented rule.
+        for address in &input.addresses {
+            if let Err(reason) = crate::state::validate_cidr(address, &input.ip_address_version) {
+                return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(
+                    WAFInvalidParameterException {
+                        message: Some(reason.clone()),
+                        field: Some("IP_ADDRESS".to_string()),
+                        parameter: Some(address.clone()),
+                        reason: Some(reason),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIPSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        let name_key = (input.scope.clone(), input.name.clone());
+        if state.ip_set_names.contains_key(&name_key) {
+            crate::state::audit(
+                "CreateIPSet",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFDuplicateItemException",
+            );
+            return Err(CreateIPSetErrorModeled::WAFDuplicateItemException(
+                WAFDuplicateItemException {
+                    message: Some(format!(
+                        "An IPSet named {:?} already exists in scope {}",
+                        input.name, input.scope
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if state.ip_sets_in_scope(&input.scope) >= crate::state::MAX_IP_SETS_PER_SCOPE {
+            crate::state::audit(
+                "CreateIPSet",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFLimitsExceededException",
+            );
+            return Err(CreateIPSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(format!(
+                        "You have reached the maximum of {} IPSets in scope {}",
+                        crate::state::MAX_IP_SETS_PER_SCOPE, input.scope
+                    )),
+                    source_type: None,
+                },
+            )
+            .into());
+        }
+
+        let id = crate::state::new_uuid();
+        let lock_token = crate::state::new_uuid();
+        let arn = crate::state::resource_arn(&input.scope, &region, "ipset", &input.name, &id);
+        let ip_set = IPSet {
+            name: input.name.clone(),
+            id: id.clone(),
+            arn: arn.clone(),
+            description: input.description.clone(),
+            ip_address_version: input.ip_address_version.clone(),
+            addresses: input.addresses.clone(),
+        };
+        let summary = IPSetSummary {
+            name: Some(ip_set.name.clone()),
+            id: Some(ip_set.id.clone()),
+            description: ip_set.description.clone(),
+            lock_token: Some(lock_token.clone()),
+            arn: Some(ip_set.arn.clone()),
+        };
+
+        state.arn_index.insert(
+            arn,
+            crate::state::ResourceRef::IpSet {
+                scope: input.scope.clone(),
+                id: id.clone(),
+            },
+        );
+        state.ip_set_names.insert(name_key, id.clone());
+        state.ip_sets.insert(
+            (input.scope.clone(), id.clone()),
+            crate::state::IpSetEntry {
+                scope: input.scope.clone(),
+                ip_set,
+                lock_token,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+        crate::state::audit(
+            "CreateIPSet",
+            &input.scope,
+            &input.name,
+            &id,
+            "created",
+        );
+
+        Ok(CreateIPSetOutput {
+            summary: Some(summary),
+        })
     }
 }

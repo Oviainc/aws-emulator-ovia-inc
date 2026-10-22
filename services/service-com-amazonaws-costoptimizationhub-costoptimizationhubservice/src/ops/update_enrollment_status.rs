@@ -164,8 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::caller_account_id().to_string();
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
         // An absent `includeMemberAccounts` is a request that does not ask for the
-        // organization's member accounts to be enrolled, so it stores `false`.
-        let include_member_accounts = input.include_member_accounts.unwrap_or(false);
+        // organization's member accounts to be enrolled, so it stores `false` —
+        // the member becomes expressed, where the record the store starts with
+        // carries no preference at all.
+        let include_member_accounts = Some(input.include_member_accounts.unwrap_or(false));
 
         let stored_status = {
             let mut store = state.lock();
@@ -176,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     account_id: account_id.clone(),
                     status: input.status.clone(),
                     include_member_accounts,
-                    // Set once, when the account first enrolls.
+                    // Set once, when the account's record is created.
                     created_timestamp: now,
                     last_updated_timestamp: now,
                     recommendations_due_at: None,

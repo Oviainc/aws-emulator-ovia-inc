@@ -5,8 +5,10 @@
 //! Mints a `ServerId` and PERSISTS the server in this service's engine store, so
 //! `DescribeServer` / `ListServers` rebuild their answers from it. Every member the
 //! model gives a documented default (`Domain`, `IdentityProviderType`, `EndpointType`,
-//! `Protocols`, `IpAddressType`, `SecurityPolicyName`) is resolved here, once, at
-//! create time — a reader never re-applies a default.
+//! `Protocols`, `IpAddressType`, `SecurityPolicyName`, and each member of
+//! `ProtocolDetails` and `S3StorageOptions`) is resolved here, once, at create time — a
+//! reader never re-applies a default. The server's host key is minted here too, so
+//! `HostKeyFingerprint` reports a real key's real fingerprint.
 //!
 //! ## Shape of an operation
 //!
@@ -357,15 +359,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_type,
             endpoint_details: input.endpoint_details,
             protocols,
-            protocol_details: input.protocol_details,
+            // Defaulted ONCE, here: every member the model documents a default for is
+            // materialised at create time, so no reader has to re-apply one and a
+            // configuration read-back reports the server as configured.
+            protocol_details: st::resolve_protocol_details(input.protocol_details),
             logging_role: input.logging_role,
             security_policy_name,
             pre_authentication_login_banner: input.pre_authentication_login_banner,
             post_authentication_login_banner: input.post_authentication_login_banner,
-            // No honest value exists yet: see the field's own documentation.
-            host_key_fingerprint: None,
+            // The real fingerprint of the server's host key: of the key the caller
+            // supplied when the emulator can read it, otherwise of one minted for this
+            // server. See `state::supplied_host_key_fingerprint`.
+            host_key_fingerprint: input
+                .host_key
+                .as_deref()
+                .and_then(st::supplied_host_key_fingerprint)
+                .unwrap_or_else(st::mint_host_key_fingerprint),
             structured_log_destinations: input.structured_log_destinations.unwrap_or_default(),
-            s3_storage_options: input.s3_storage_options,
+            s3_storage_options: st::resolve_s3_storage_options(input.s3_storage_options),
             ip_address_type,
             workflow_details: input.workflow_details,
             certificate: input.certificate,

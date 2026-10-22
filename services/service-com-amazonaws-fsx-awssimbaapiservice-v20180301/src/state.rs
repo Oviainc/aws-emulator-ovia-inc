@@ -85,6 +85,11 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// refused with that modelled error, and deleting a file system makes room again.
 pub const MAX_FILE_SYSTEMS: usize = 100;
 
+/// The longest `Message` an error of this service can carry, from the modelled
+/// `ErrorMessage` string's own `length 1..256`
+/// (`smithy_query(query="shape", shape="ErrorMessage")`).
+pub const MAX_ERROR_MESSAGE_LEN: usize = 256;
+
 /// The modelled `ServiceLimit` value that goes with [`MAX_FILE_SYSTEMS`]
 /// (`smithy_query(query="shape", shape="ServiceLimit")`).
 pub const SERVICE_LIMIT_FILE_SYSTEM_COUNT: &str = "FILE_SYSTEM_COUNT";
@@ -242,8 +247,10 @@ pub enum ResourceLookup {
     /// A file system this service stores, by `FileSystemId`.
     FileSystem(String),
     /// An ARN naming a resource type FSx owns that holds no record here:
-    /// `ResourceNotFound`.
-    NotFound,
+    /// `ResourceNotFound`. Carries the resource id from the request's ARN, because the
+    /// error's `Message` is built from the identifier the caller sent (see
+    /// [`resource_not_found_message`]).
+    NotFound(String),
     /// An ARN that names no FSx resource type at all: `NotServiceResourceError`.
     NotFsxResource,
 }
@@ -363,8 +370,9 @@ impl ComAmazonawsFsxAwssimbaapiserviceV20180301State {
         }
         // An FSx resource type this slice does not store yet (a backup, a volume, an SVM)
         // holds no record either, because the operations that would create one are still
-        // 501 — so there is genuinely no such resource.
-        ResourceLookup::NotFound
+        // 501 — so there is genuinely no such resource. The id the ARN named travels with
+        // the answer, so the error can name it.
+        ResourceLookup::NotFound(arn.resource_id)
     }
 
     /// Mint the next `FileSystemId`.
@@ -421,6 +429,57 @@ pub fn request_region(headers: &::http::HeaderMap) -> String {
         .map(|scope| scope.region)
         .filter(|region| !region.is_empty())
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A `Message` clamped to the modelled `ErrorMessage` `length 1..256`, cut on a character
+/// boundary so a truncated message is still valid UTF-8.
+///
+/// Every not-found `Message` below goes through this, so the modelled bound holds whatever
+/// the request carried — it does not depend on an input constraint being enforced ahead of
+/// the handler.
+fn within_error_message_length(mut message: String) -> String {
+    if message.len() > MAX_ERROR_MESSAGE_LEN {
+        let mut cut = MAX_ERROR_MESSAGE_LEN;
+        while cut > 0 && !message.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        message.truncate(cut);
+    }
+    message
+}
+
+/// The `FileSystemNotFound$Message` for an operation addressed by a `FileSystemId`
+/// (`DescribeFileSystems`, `UpdateFileSystem`): a sentence naming the id the caller asked
+/// about, single-quoted and terminated with a period.
+///
+/// FSx builds this `Message` from the request rather than returning fixed prose — the
+/// identifier is what tells a client WHICH of the ids it named was missing — so it is
+/// templated here from the requested id and never hand-written at a call site, and clamped
+/// to the modelled `ErrorMessage` `length 1..256` by [`within_error_message_length`].
+pub fn file_system_not_found_message(file_system_id: &str) -> String {
+    within_error_message_length(format!("File system '{file_system_id}' does not exist."))
+}
+
+/// The `FileSystemNotFound$Message` `DeleteFileSystem` answers with: the requested
+/// `FileSystemId` alone.
+///
+/// Same rule as [`file_system_not_found_message`] — the `Message` is built from the
+/// identifier the caller sent — but this operation's recorded template is the bare id, with
+/// no sentence around it, so it has its own constructor rather than silently reusing the
+/// other one.
+pub fn deleted_file_system_not_found_message(file_system_id: &str) -> String {
+    within_error_message_length(file_system_id.to_string())
+}
+
+/// The `ResourceNotFound$Message` the tagging operations (`TagResource`, `UntagResource`,
+/// `ListTagsForResource`) answer with: a sentence naming the resource id from the request's
+/// `ResourceARN`, single-quoted.
+///
+/// The same rule as [`file_system_not_found_message`], over whatever resource type the ARN
+/// names (a file system, a backup, a volume): the identifier in the request is what tells a
+/// client which resource could not be found.
+pub fn resource_not_found_message(resource_id: &str) -> String {
+    within_error_message_length(format!("Resource '{resource_id}' does not exist"))
 }
 
 /// `arn:aws:fsx:<region>:<account>:<resource_type>/<resource_id>`, through the one

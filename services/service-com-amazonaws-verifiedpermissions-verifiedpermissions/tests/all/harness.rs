@@ -15,13 +15,22 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A router serving only this service, over a fresh shared engine.
 pub fn router() -> MultiServiceRouter {
+    router_with_engine().0
+}
+
+/// The same router, plus the engine it was built on — for a suite that has to
+/// read or seed state no served request can reach. `router()` delegates here so
+/// there is ONE place that decides how the harness is wired.
+pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_verifiedpermissions_verifiedpermissions::EmulatedService::new(engine),
+        service_com_amazonaws_verifiedpermissions_verifiedpermissions::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
     );
-    router
+    (router, engine)
 }
 
 /// Call one operation and return `(http status, parsed body)`.
