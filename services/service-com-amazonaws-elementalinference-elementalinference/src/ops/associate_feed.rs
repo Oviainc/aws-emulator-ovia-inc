@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateFeed
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateFeed`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: claims a persisted feed for one resource (the source media) and appends
+//! the request's outputs to the feed's stored output list, then builds the response from
+//! the stored record. The claim is taken under the state lock, so concurrent calls on one
+//! feed resolve to exactly one winner.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateFeed::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules this handler enforces, all from the modelled contract reproduced below:
+//!
+//! * a feed takes an association only from a status that admits one — `AVAILABLE` (no
+//!   resource yet), or `ACTIVE` for the resource that already holds it; from every
+//!   other status the association is refused with the modelled `ValidationException`,
+//!   naming the status;
+//! * "You can associate only one resource with each feed": a different resource name on
+//!   an already-claimed feed is refused;
+//! * PATCH semantics — "You can add more outputs to the existing outputs. New outputs
+//!   will be appended", and an output that would modify an existing one (same name) is
+//!   refused with the modelled `ConflictException` ("conflicting outputs", per the
+//!   `dryRun` documentation);
+//! * "This name must not resemble an ARN" — the member's own pattern admits `:` and
+//!   `/`, so the boundary validator cannot enforce that one;
+//! * `dryRun` runs every check above and persists NOTHING.
+//!
+//! The scaffold's own notes on the operation shape and on reaching state are kept
+//! below, minus the line that recorded this operation as a stub.
 //!
 //! ## Shape of an operation
 //!
@@ -183,17 +197,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateFeed` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateFeedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let _ = ctx;
+
+        // Request-level checks come first, before the feed is resolved: a malformed
+        // request is malformed whether or not the feed exists.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateFeed"))
+        // `associatedResourceName` "must not resemble an ARN". Its modelled pattern
+        // (`^[\w \-\.',@:;/]*$`) admits both `:` and `/`, so an ARN satisfies it and the
+        // boundary validator lets it through; this is the service's own rule.
+        if resembles_an_arn(&input.associated_resource_name) {
+            return Err(AssociateFeedErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "1 validation error detected: Value '{}' at 'associatedResourceName' \
+                         failed to satisfy constraint: Member must not resemble an ARN.",
+                        input.associated_resource_name
+                    ),
+                },
+            )
+            .into());
+        }
+        // "You can't modify an existing output (for example to change its name).
+        // Instead, use UpdateFeed" — so two outputs named alike in one request cannot
+        // both be appended. Caught here as a conflicting output.
+        if let Some(duplicate) = first_duplicate_name(input.outputs.iter().map(|o| o.name.as_str()))
+        {
+            return Err(AssociateFeedErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "The request lists more than one output named {duplicate}. \
+                     Output names must be unique within a feed."
+                ),
+            })
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateFeedErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = std::time::Instant::now();
+
+        // ONE lock for the whole claim: the status check and the write that takes the
+        // association are a single critical section, so two concurrent calls on one feed
+        // cannot both see it unclaimed. The loser finds the feed ACTIVE under the other
+        // resource's name and is refused below.
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        let Some(feed) = state.feeds.get_mut(&input.id) else {
+            return Err(AssociateFeedErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The feed's status is the precondition: only a feed with no resource yet
+        // (AVAILABLE), or the resource that already holds it (ACTIVE), may associate.
+        // A transient feed (CREATING / UPDATING / DELETING) and a released one
+        // (ARCHIVED) take no association, and "you can associate only one resource with
+        // each feed" rules out a second, different resource on an ACTIVE feed.
+        //
+        // A failed precondition is a ValidationException (400) rather than a
+        // ConflictException: this service classifies "already associated" as a
+        // validation failure, which is what the recorded behaviour of a race between
+        // two associations on one feed shows (the single loser is refused with
+        // `ValidationException`), and what a `DisassociateFeed` on a feed that holds no
+        // resource answers.
+        match feed.status {
+            crate::state::FeedStatus::Available => {}
+            // The same resource re-associating: a PATCH that only appends outputs.
+            crate::state::FeedStatus::Active
+                if feed.associated_resource_name()
+                    == Some(input.associated_resource_name.as_str()) => {}
+            crate::state::FeedStatus::Active => {
+                return Err(AssociateFeedErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "You can't associate this feed. It has status {} which indicate \
+                             that it's already associated with the resource {}. You can \
+                             associate only one resource with each feed.",
+                            feed.status.as_wire(),
+                            feed.associated_resource_name().unwrap_or_default()
+                        ),
+                    },
+                )
+                .into());
+            }
+            status => {
+                return Err(AssociateFeedErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "You can't associate this feed. It has status {} which indicate \
+                             that it can't take an association.",
+                            status.as_wire()
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // An appended output may not collide with one the feed already holds: that
+        // would MODIFY an existing output, which AssociateFeed cannot do.
+        if let Some(existing) = input
+            .outputs
+            .iter()
+            .find(|candidate| feed.outputs.iter().any(|held| held.name == candidate.name))
+        {
+            return Err(AssociateFeedErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Feed {} already has an output named {}. AssociateFeed can only append \
+                     new outputs; use UpdateFeed to modify an existing one.",
+                    feed.id, existing.name
+                ),
+            })
+            .into());
+        }
+
+        // A feed's output list is BOUNDED: an append that would carry it past the
+        // quota is refused rather than grown, which is also what the real service
+        // answers once a quota is exhausted. A call that appends NOTHING grows nothing,
+        // so it is never refused for the quota — a feed whose own outputs already
+        // exceed the bound (CreateFeed and UpdateFeed replace the list outright, so one
+        // request can put it there) can still be claimed.
+        if !input.outputs.is_empty()
+            && feed.outputs.len() + input.outputs.len() > crate::state::MAX_OUTPUTS_PER_FEED
+        {
+            return Err(AssociateFeedErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Feed {} holds {} of the maximum of {} outputs, so it cannot take {} \
+                         more. Remove outputs with UpdateFeed or request a quota increase.",
+                        feed.id,
+                        feed.outputs.len(),
+                        crate::state::MAX_OUTPUTS_PER_FEED,
+                        input.outputs.len()
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Built from the stored record, so it holds whether or not the write below
+        // happens: a dry run answers exactly what the real call would.
+        let output = AssociateFeedOutput {
+            arn: feed.arn.clone(),
+            id: feed.id.clone(),
+        };
+
+        // "Elemental Inference will validate that the real request would succeed without
+        // actually making any changes": every check above has run, and nothing is
+        // written.
+        if input.dry_run {
+            return Ok(output);
+        }
+
+        // "New outputs will be appended" — and an output that entered the feed this way
+        // reports `fromAssociation: true` (`GetOutput$fromAssociation`).
+        feed.outputs
+            .extend(input.outputs.into_iter().map(|output| crate::state::Output {
+                name: output.name,
+                output_config: output.output_config,
+                status: output.status,
+                description: output.description,
+                from_association: true,
+            }));
+        feed.association = Some(FeedAssociation {
+            associated_resource_name: input.associated_resource_name,
+        });
+        // HTTP 200, not 202: the association is complete when the call answers, so the
+        // feed reports the settled ACTIVE status straight away and owes the clock
+        // nothing.
+        feed.status = crate::state::FeedStatus::Active;
+        feed.transition_due_at = None;
+        Ok(output)
     }
+}
+
+/// Whether `name` "resembles an ARN", which `associatedResourceName` must not.
+///
+/// An ARN is `arn:<partition>:<service>:…`, so a value opening with the `arn:` prefix
+/// is one; the prefix is matched case-insensitively over BYTES rather than parsed, so
+/// a name whose fifth byte falls inside a multi-byte character simply does not match.
+fn resembles_an_arn(name: &str) -> bool {
+    name.as_bytes()
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"arn:"))
+}
+
+/// The first name `names` yields twice, if any.
+fn first_duplicate_name<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen = std::collections::BTreeSet::new();
+    names.find(|name| !seen.insert(*name))
 }

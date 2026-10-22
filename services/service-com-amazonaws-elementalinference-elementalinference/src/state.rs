@@ -77,20 +77,25 @@ pub const MAX_DICTIONARIES: usize = 100;
 
 /// The `FeedStatus` values this slice of the service produces.
 ///
-/// The model's enum also carries `ACTIVE` (a feed with an associated resource),
-/// `ARCHIVED` and `DELETED`; the operations that would produce those
-/// (`AssociateFeed`, `DisassociateFeed`) are not implemented yet, so this enum
-/// names only the statuses a feed can actually reach today.
+/// The model's enum also carries `DELETED`; a feed whose deletion has completed is
+/// removed from the store instead (`GetFeed` then answers
+/// `ResourceNotFoundException`), so nothing ever reports that value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedStatus {
     /// The feed has been accepted and is not serviceable yet.
     Creating,
-    /// The feed is settled and serviceable.
+    /// The feed is settled and serviceable, with no resource associated.
     Available,
+    /// A resource (the source media) is associated with the feed: `AssociateFeed`
+    /// claims the feed for one resource, and that claim is what `ACTIVE` reports.
+    Active,
     /// An `UpdateFeed` has been accepted and is being applied.
     Updating,
     /// A `DeleteFeed` has been accepted; the feed disappears when it completes.
     Deleting,
+    /// The feed's resource has been released by `DisassociateFeed`. Terminal: a
+    /// released feed takes no further association.
+    Archived,
 }
 
 impl FeedStatus {
@@ -99,18 +104,42 @@ impl FeedStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
+            Self::Active => "ACTIVE",
             Self::Updating => "UPDATING",
             Self::Deleting => "DELETING",
+            Self::Archived => "ARCHIVED",
         }
     }
 }
 
+/// The message this service renders for `ResourceNotFoundException`.
+///
+/// ElementalInference renders this error with one fixed text, the same whichever
+/// operation refused and whichever id it was given, so the refusal never reports the
+/// id that was probed.
+pub const NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The `OutputStatus` value a disabled output reports — one of the two values that
+/// enum admits (`OUTPUT_STATUS_VALUES`: `DISABLED`, `ENABLED`).
+pub const OUTPUT_STATUS_DISABLED: &str = "DISABLED";
+
+/// The most outputs one feed may hold.
+///
+/// `AssociateFeed` APPENDS outputs ("New outputs will be appended"), so without a
+/// bound a caller could grow one feed's record by another output on every call. AWS
+/// does not publish the figure, so this one is the emulator's own: it is the BOUND on
+/// a feed's output list, and past it `AssociateFeed` refuses with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402) — the answer the real service gives
+/// when a request would exceed a service quota. `CreateFeed` and `UpdateFeed` need no
+/// such bound: each one REPLACES the list, so one request's size bounds it.
+pub const MAX_OUTPUTS_PER_FEED: usize = 20;
+
 /// The `DictionaryStatus` values this slice of the service produces.
 ///
 /// The model's enum also carries `REFERENCED` (a dictionary a feed output points at),
-/// `DELETING` and `DELETED`; the operations that would produce those
-/// (`AssociateFeed`, `DeleteDictionary`) are not implemented yet, so this enum names
-/// only the statuses a dictionary can actually reach today.
+/// `DELETING` and `DELETED`; nothing records a feed output's reference to a
+/// dictionary yet and `DeleteDictionary` is not implemented, so this enum names only
+/// the statuses a dictionary can actually reach today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictionaryStatus {
     /// The dictionary has been accepted and is not usable yet.
@@ -226,6 +255,23 @@ impl Feed {
         self.outputs.iter().map(Output::to_get_output).collect()
     }
 
+    /// Mark every output of this feed `DISABLED`.
+    ///
+    /// `DisassociateFeed` "releases the resource (the source media) that is associated
+    /// with this feed. The outputs in the feed become DISABLED."
+    pub fn disable_outputs(&mut self) {
+        for output in &mut self.outputs {
+            output.status = OUTPUT_STATUS_DISABLED.to_string();
+        }
+    }
+
+    /// The name of the resource currently associated with this feed, if any.
+    pub fn associated_resource_name(&self) -> Option<&str> {
+        self.association
+            .as_ref()
+            .map(|association| association.associated_resource_name.as_str())
+    }
+
     /// The tags of this feed as a `TagMap`, absent when the feed carries none.
     pub fn tag_map(&self) -> Option<std::collections::HashMap<String, String>> {
         if self.tags.is_empty() {
@@ -338,7 +384,8 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                     feed.transition_due_at = None;
                     true
                 }
-                FeedStatus::Available => {
+                // A settled status owes the clock nothing; clear the stale instant.
+                FeedStatus::Available | FeedStatus::Active | FeedStatus::Archived => {
                     feed.transition_due_at = None;
                     true
                 }

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateFeed
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateFeed`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: releases the resource a persisted feed is associated with, disables the
+//! feed's outputs and archives the feed, all against the single stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateFeed::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules this handler enforces, from the modelled contract reproduced below:
+//!
+//! * only a feed that currently HOLDS an association can release one — a feed in any
+//!   other status is refused with the modelled `ValidationException`, naming the status;
+//! * `associatedResourceName` is "the name of the resource currently associated with the
+//!   feed", so a name that is not that resource's is refused;
+//! * on success "the outputs in the feed become DISABLED" and the feed is `ARCHIVED`,
+//!   which is terminal: a released feed takes no further association (the `FeedStatus`
+//!   enum carries `ARCHIVED` and no other operation produces it, and a release is
+//!   recorded as archiving the feed irreversibly);
+//! * `dryRun` runs every check above and persists NOTHING.
+//!
+//! The scaffold's own notes on the operation shape and on reaching state are kept
+//! below, minus the line that recorded this operation as a stub.
 //!
 //! ## Shape of an operation
 //!
@@ -163,17 +171,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateFeed` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateFeedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateFeedErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = std::time::Instant::now();
+
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        let Some(feed) = state.feeds.get_mut(&input.id) else {
+            return Err(DisassociateFeedErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The feed's status is the precondition: releasing a resource is only possible
+        // for the one status that means a resource is held (ACTIVE). Every other status
+        // — a feed that was never associated, one mid-transition, one already released —
+        // has nothing to release. The refusal is a ValidationException (400): that is
+        // what the recorded behaviour of a release on a never-associated feed answers.
+        if feed.status != crate::state::FeedStatus::Active {
+            return Err(DisassociateFeedErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "You can't disassociate this feed. It has status {} which indicate \
+                         that it's not currently associated with a resource.",
+                        feed.status.as_wire()
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // ACTIVE is exactly the status that carries an association, so the name is
+        // there to compare against: the caller must name the resource that actually
+        // holds the feed.
+        let associated = feed.associated_resource_name().unwrap_or_default();
+        if associated != input.associated_resource_name {
+            return Err(DisassociateFeedErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "The resource {} is not associated with this feed. The feed is \
+                         associated with the resource {associated}.",
+                        input.associated_resource_name
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Built from the stored record, so it holds whether or not the write below
+        // happens: a dry run answers exactly what the real call would.
+        let output = DisassociateFeedOutput {
+            arn: feed.arn.clone(),
+            id: feed.id.clone(),
+        };
+
+        // "Elemental Inference will validate that the real request would succeed without
+        // actually making any changes": every check above has run, and nothing is
+        // written.
+        if input.dry_run {
+            return Ok(output);
+        }
+
+        // The resource is released, and "the outputs in the feed become DISABLED".
+        feed.association = None;
+        feed.disable_outputs();
+        // HTTP 200, not 202: the release is complete when the call answers, so the feed
+        // reports the settled ARCHIVED status straight away and owes the clock nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateFeed"))
+        // ARCHIVED, and terminal: `FeedStatus` carries that value and no other
+        // operation in the service produces it, and the recorded behaviour of a release
+        // is that it archives the feed IRREVERSIBLY — a released feed is not handed back
+        // to the pool of feeds a resource can claim.
+        feed.status = crate::state::FeedStatus::Archived;
+        feed.transition_due_at = None;
+        Ok(output)
     }
 }
