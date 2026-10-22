@@ -372,6 +372,46 @@ impl ImageRecord {
     }
 }
 
+/// See [`MAX_REPOSITORIES`]. This one bounds `uploads`, which grows by one entry per
+/// `InitiateLayerUpload` and shrinks when an upload is completed; an upload a client
+/// opened and then abandoned is never reclaimed — the cap is for the life of the
+/// process, and [`LayerUpload::started_at`] is a record of when the upload was opened,
+/// not an expiry the store acts on — so the registry needs a ceiling on how many
+/// in-flight layer uploads it holds at once. Past it the open is refused with the
+/// `ServerException` `InitiateLayerUpload` models: reaching the ceiling is this
+/// registry's own capacity, not a fault in the request.
+pub const MAX_LAYER_UPLOADS: usize = 1_000;
+
+/// The `partSize` `InitiateLayerUpload` reports: the size ECR tells the client to send
+/// future layer parts in.
+///
+/// AWS publishes no single number for it — it is the registry's own answer, which is
+/// why the client is told it rather than assuming one — so this is the emulator's
+/// choice, bounded by the only published constraint on a part: the model caps
+/// `layerPartBlob` at 20971520 bytes, and a part of `partSize` bytes must fit under
+/// that cap.
+pub const REPORTED_LAYER_PART_SIZE: i64 = 10 * 1024 * 1024;
+
+/// One in-flight layer upload: what `InitiateLayerUpload` opened, addressed by the
+/// upload id it handed the client.
+///
+/// `UploadLayerPart` and `CompleteLayerUpload` are the operations that consume one
+/// (both still 501 stubs with issues of their own), so what is kept here is what
+/// opening the upload decided: which repository it is for, the part size the client
+/// was told to send, and when it was opened.
+#[derive(Debug, Clone)]
+pub struct LayerUpload {
+    /// The repository the upload was opened against. An upload id is only valid for
+    /// the repository it was issued for, so every later call names both.
+    pub repository_name: String,
+    /// The `partSize` reported to the client when the upload was opened.
+    pub part_size: i64,
+    /// When `InitiateLayerUpload` opened it. Nothing reads it yet: the first operation
+    /// that does — `UploadLayerPart` or `CompleteLayerUpload`, each a 501 stub with its
+    /// own issue — is the one to decide whether an upload also expires with age.
+    pub started_at: SystemTime,
+}
+
 /// Why an `imageIds` entry resolves to no stored image.
 ///
 /// The variants are named after the `ImageFailureCode` values ECR reports for an
@@ -1360,6 +1400,13 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// what makes a second register of the same principal a duplicate — and a
     /// `BTreeMap` so listing and its pagination tokens have one deterministic order.
     pub pull_time_update_exclusions: BTreeMap<String, SystemTime>,
+    /// In-flight layer uploads by upload id. Registry-wide, because an upload id is
+    /// what `UploadLayerPart` and `CompleteLayerUpload` address an upload by; each
+    /// record names the repository it belongs to, and a call naming a repository that
+    /// no longer exists is refused by the repository lookup before the upload is ever
+    /// reached. An upload opened against a repository later deleted is therefore inert,
+    /// but still counts against [`MAX_LAYER_UPLOADS`] until the process ends.
+    pub uploads: BTreeMap<String, LayerUpload>,
     /// The registry's scanning configuration, exactly as the last
     /// `PutRegistryScanningConfiguration` stored it. `None` until one is stored, which is
     /// the state the documented default describes — see

@@ -21,6 +21,8 @@ mod create_repository_contract;
 mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]
 mod layer_availability;
+#[path = "all/layer_upload_sessions.rs"]
+mod layer_upload_sessions;
 #[path = "all/lifecycle_policy.rs"]
 mod lifecycle_policy;
 #[path = "all/lifecycle_policy_preview.rs"]

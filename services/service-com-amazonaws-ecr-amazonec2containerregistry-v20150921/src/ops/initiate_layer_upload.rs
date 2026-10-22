@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InitiateLayerUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InitiateLayerUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InitiateLayerUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Opens a layer upload against a repository of this registry: it mints an upload id,
+//! records the in-flight upload in [`crate::state`] so `UploadLayerPart` and
+//! `CompleteLayerUpload` can address it, and reports the part size the client is to
+//! send future layer parts in.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +118,83 @@ impl From<InitiateLayerUploadErrorModeled> for InitiateLayerUploadError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> InitiateLayerUploadErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            InitiateLayerUploadErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // `ImageNotFound` cannot arise here: opening an upload resolves no image.
+        _ => InitiateLayerUploadErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
+/// Refuse the request: the audit record for a call that opened no upload, and the
+/// modelled error it answers with. `reason` is this handler's own wording, never the
+/// request's values, so the record carries no caller-supplied text.
+fn refusal(
+    reason: &'static str,
+    caller_akid: &str,
+    error: InitiateLayerUploadErrorModeled,
+) -> InitiateLayerUploadErrorModeled {
+    ::tracing::info!(
+        target: "emulator::audit",
+        audit = true,
+        operation = "InitiateLayerUpload",
+        outcome = "refused",
+        reason,
+        caller_akid = %caller_akid,
+        registry_id = %crate::state::registry_id(),
+        "layer upload refused"
+    );
+    error
+}
+
+/// A fresh `UploadId`: 32 hex digits in the `8-4-4-4-12` layout the model's `UploadId`
+/// pattern requires
+/// (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).
+///
+/// The digits are the leading 16 bytes of a SHA-256 — the crate's existing `sha2`
+/// dependency, the same one that digests a manifest — over three inputs: a per-process
+/// random seed from the standard library's `RandomState` (the OS-seeded randomness
+/// `HashMap` uses), a monotonically increasing counter, and the clock. The seed keeps
+/// two processes apart, and the counter keeps two uploads of one process apart even if
+/// the clock does not advance, so no two uploads — in this repository or any other —
+/// share an id. Nothing in it is derived from the request.
+fn new_upload_id() -> String {
+    use ::sha2::Digest as _;
+    use ::std::hash::{BuildHasher as _, Hasher as _};
+
+    static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+    let counter = MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let mut seeder = ::std::collections::hash_map::RandomState::new().build_hasher();
+    seeder.write_u64(counter);
+    let nanos = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(seeder.finish().to_be_bytes());
+    digest.update(counter.to_be_bytes());
+    digest.update(nanos.to_be_bytes());
+    let hex = ::hex::encode(&digest.finalize()[..16]);
+
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// The `InitiateLayerUpload` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +231,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InitiateLayerUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InitiateLayerUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InitiateLayerUpload"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                InitiateLayerUploadErrorModeled::ServerException(ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        // Request metadata is used for the audit record only: the upload is held in
+        // this registry's state, not in the signing region.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // "If you do not specify a registry, the default registry is assumed" — and the
+        // only registry served here is this emulator's own.
+        crate::state::check_registry(input.registry_id.as_ref())
+            .map_err(|fault| refusal("another registry", &caller_akid, fault_error(fault)))?;
+
+        let mut store = state.lock();
+
+        // The layer is uploaded into a repository, so there has to be one: an upload
+        // against a repository that does not exist is refused rather than opened.
+        store
+            .repository(&input.repository_name)
+            .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
+
+        // The store is bounded: past its cap an upload is not opened. The refusal is
+        // this operation's `ServerException` — reaching the cap is this registry's own
+        // capacity, not a fault in the caller's request. See
+        // [`crate::state::MAX_LAYER_UPLOADS`].
+        if store.uploads.len() >= crate::state::MAX_LAYER_UPLOADS {
+            return Err(refusal(
+                "upload cap reached",
+                &caller_akid,
+                InitiateLayerUploadErrorModeled::ServerException(ServerException {
+                    message: Some(format!(
+                        "this registry already holds the maximum of {} in-flight layer uploads",
+                        crate::state::MAX_LAYER_UPLOADS
+                    )),
+                }),
+            )
+            .into());
+        }
+
+        // The upload id the client addresses this upload by, in the layout the model
+        // gives `UploadId` — see [`new_upload_id`]. Minted only once every check has
+        // passed: a refused call consumes no id.
+        let upload_id = new_upload_id();
+        let part_size = crate::state::REPORTED_LAYER_PART_SIZE;
+        store.uploads.insert(
+            upload_id.clone(),
+            crate::state::LayerUpload {
+                repository_name: input.repository_name,
+                part_size,
+                started_at: ::std::time::SystemTime::now(),
+            },
+        );
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata and server-minted identifiers.
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "InitiateLayerUpload",
+            outcome = "opened",
+            caller_akid = %caller_akid,
+            registry_id = %crate::state::registry_id(),
+            upload_id = %upload_id,
+            "layer upload opened"
+        );
+
+        Ok(InitiateLayerUploadOutput {
+            upload_id: Some(upload_id),
+            part_size: Some(part_size),
+        })
     }
 }
