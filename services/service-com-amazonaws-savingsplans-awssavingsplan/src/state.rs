@@ -1,11 +1,971 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-savingsplans-awssavingsplan service.
+//!
+//! Three things live here, plus the helpers more than one operation needs:
+//!
+//! * the seeded, read-only **offering catalog** `DescribeSavingsPlansOfferings`
+//!   searches and `CreateSavingsPlan` buys from. It is built in `Default`, so
+//!   every offering id is stable for the life of the store;
+//! * the **Savings Plans** this emulator has sold, in purchase order so paging is
+//!   stable, with an id and an ARN index over them;
+//! * the **idempotency** record, so a replayed `clientToken` answers with the plan
+//!   the first call created instead of creating a second one.
 
-/// Per-service state for com-amazonaws-savingsplans-awssavingsplan. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+use std::collections::{BTreeMap, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+// ---------------------------------------------------------------------------
+// Wire vocabulary
+// ---------------------------------------------------------------------------
+
+/// `SavingsPlanState` members this slice produces. The full value set is
+/// [`crate::ops::types::SAVINGS_PLAN_STATE_VALUES`].
+pub const STATE_PAYMENT_PENDING: &str = "payment-pending";
+/// See [`STATE_PAYMENT_PENDING`].
+pub const STATE_ACTIVE: &str = "active";
+/// See [`STATE_PAYMENT_PENDING`].
+pub const STATE_QUEUED: &str = "queued";
+/// See [`STATE_PAYMENT_PENDING`].
+pub const STATE_QUEUED_DELETED: &str = "queued-deleted";
+/// See [`STATE_PAYMENT_PENDING`].
+pub const STATE_RETURNED: &str = "returned";
+/// See [`STATE_PAYMENT_PENDING`]. The state a plan reaches when its term ends.
+pub const STATE_RETIRED: &str = "retired";
+
+/// `SavingsPlanPaymentOption` members (model enum `SavingsPlanPaymentOption`).
+pub const PAYMENT_ALL_UPFRONT: &str = "All Upfront";
+/// See [`PAYMENT_ALL_UPFRONT`].
+pub const PAYMENT_PARTIAL_UPFRONT: &str = "Partial Upfront";
+/// See [`PAYMENT_ALL_UPFRONT`].
+pub const PAYMENT_NO_UPFRONT: &str = "No Upfront";
+
+/// `SavingsPlanOfferingPropertyKey` members (model enum
+/// `SavingsPlanOfferingPropertyKey`): the only two property names an offering
+/// carries.
+pub const PROPERTY_INSTANCE_FAMILY: &str = "instanceFamily";
+/// See [`PROPERTY_INSTANCE_FAMILY`].
+pub const PROPERTY_REGION: &str = "region";
+
+/// The ARN namespace and sigv4 signing name of this service, as the model's
+/// `aws.api#service` trait gives them.
+pub const SERVICE_NAMESPACE: &str = "savingsplans";
+
+// ---------------------------------------------------------------------------
+// Clock
+// ---------------------------------------------------------------------------
+
+/// How long after the purchase call a Savings Plan leaves `payment-pending` for
+/// `active`.
+///
+/// A chosen span, not a documented one: the contract the emulator owes is only
+/// that the transition is not instantaneous, so a caller that describes the plan
+/// straight after purchasing it still observes `payment-pending`.
+pub const ACTIVATION_DELAY_MILLIS: i64 = 500;
+
+/// The return window a purchased Savings Plan has.
+///
+/// AWS documents it ("Returning a Savings Plan", AWS Savings Plans User Guide:
+/// a Savings Plan can be returned *within one hour of purchase*), so the value
+/// is the service's, not ours, and it is what `SavingsPlan.returnableUntil`
+/// reports.
+pub const RETURN_WINDOW_MILLIS: i64 = 60 * 60 * 1000;
+
+/// Wall-clock now, in milliseconds since the Unix epoch.
+///
+/// Total by construction: a clock before 1970, or one too far past it to fit in
+/// `i64` milliseconds, answers with the epoch rather than panicking on the
+/// request path. Neither is reachable on a host whose clock is set at all, and
+/// every instant derived from this value is computed with saturating
+/// arithmetic, so the epoch fallback cannot propagate into an overflow.
+pub fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+/// Render epoch milliseconds the way this service renders a time in a `String`
+/// member (`start`, `end`, `returnableUntil`): RFC 3339 / ISO 8601 in UTC.
+pub fn format_millis(millis: i64) -> String {
+    ::aws_smithy_types::DateTime::from_millis(millis)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// Read a time a request carries back to epoch milliseconds, so a filter on an
+/// instant compares INSTANTS rather than two spellings of one.
+///
+/// Both ISO-8601 spellings are accepted: the `Z` form this service renders and
+/// the explicit-offset form a client may send.
+pub fn parse_millis(value: &str) -> Option<i64> {
+    use ::aws_smithy_types::date_time::Format;
+
+    [Format::DateTime, Format::DateTimeWithOffset]
+        .into_iter()
+        .find_map(|format| ::aws_smithy_types::DateTime::from_str(value, format).ok())
+        .and_then(|time| time.to_millis().ok())
+}
+
+/// Truncate epoch milliseconds to whole seconds: a purchase time is
+/// second-granular (`DateTime` is documented as `YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Saturating, not plain arithmetic: the value can come from the request, and a
+/// total function here is what keeps an extreme one from overflowing rather than
+/// being answered.
+fn truncate_to_second(millis: i64) -> i64 {
+    millis.saturating_sub(millis.rem_euclid(1000))
+}
+
+/// How far either side of now a caller-supplied `purchaseTime` may fall.
+///
+/// A chosen bound, not a documented one: the longest term the catalog sells is
+/// three years, so a purchase dated a decade out is not a purchase. Refusing it
+/// at the edge keeps a request-derived instant away from the term and
+/// return-window arithmetic entirely.
+pub const MAX_PURCHASE_TIME_SKEW_MILLIS: i64 = 10 * 365 * 24 * 60 * 60 * 1000;
+
+/// Refuse a `purchaseTime` further than [`MAX_PURCHASE_TIME_SKEW_MILLIS`] from
+/// now, in either direction.
+pub fn check_purchase_time(purchase_millis: i64, now_millis: i64) -> Result<(), String> {
+    let skew = purchase_millis.saturating_sub(now_millis).saturating_abs();
+    if skew > MAX_PURCHASE_TIME_SKEW_MILLIS {
+        return Err(format!(
+            "purchaseTime must be within {MAX_PURCHASE_TIME_SKEW_MILLIS} ms of now, got '{}'",
+            format_millis(purchase_millis)
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Amounts
+// ---------------------------------------------------------------------------
+
+/// The scale an `Amount` is held at: hundred-thousandths, so every value the
+/// service accepts is an exact integer and no rounding creeps into a stored
+/// amount. This is the precision the documented rule allows ("no more than five
+/// digits after the decimal point").
+pub const AMOUNT_SCALE: i128 = 100_000;
+
+/// The most digits an `Amount` may carry after the decimal point: "You cannot
+/// specify more than five digits after the decimal point".
+pub const MAX_AMOUNT_DIGITS: usize = 5;
+
+/// The smallest hourly commitment `CreateSavingsPlan` accepts, from the
+/// documented rule on `commitment`: "a value between 0.001 and 1 million".
+pub const MIN_COMMITMENT_UNITS: i128 = AMOUNT_SCALE / 1000;
+/// The largest hourly commitment, from the same sentence.
+pub const MAX_COMMITMENT_UNITS: i128 = 1_000_000 * AMOUNT_SCALE;
+
+/// Parse an `Amount` into [`AMOUNT_SCALE`] units, refusing anything that is not
+/// a plain non-negative decimal number with at most [`MAX_AMOUNT_DIGITS`]
+/// decimal places.
+///
+/// `Amount` is an unconstrained string in the model, so the shape of the value
+/// is the handler's to enforce.
+pub fn parse_amount(member: &str, value: &str) -> Result<i128, String> {
+    let trimmed = value.trim();
+    let invalid = || format!("{member} must be a non-negative decimal amount, got '{value}'");
+    let (whole, fraction) = match trimmed.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (trimmed, ""),
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || (trimmed.contains('.') && !digits(fraction)) {
+        return Err(invalid());
+    }
+    if fraction.len() > MAX_AMOUNT_DIGITS {
+        return Err(format!(
+            "{member} cannot specify more than {MAX_AMOUNT_DIGITS} digits after the decimal point, got '{value}'"
+        ));
+    }
+    let whole: i128 = whole.parse().map_err(|_| invalid())?;
+    let mut units = whole.checked_mul(AMOUNT_SCALE).ok_or_else(invalid)?;
+    if !fraction.is_empty() {
+        // Right-pad to the full scale, so ".1" and ".10000" are one value.
+        let padded = format!("{fraction:0<width$}", width = MAX_AMOUNT_DIGITS);
+        units = units
+            .checked_add(padded.parse::<i128>().map_err(|_| invalid())?)
+            .ok_or_else(invalid)?;
+    }
+    Ok(units)
+}
+
+/// Parse and validate `CreateSavingsPlan`'s `commitment` against the rule the
+/// model documents for it: a value between 0.001 and 1 million, with at most
+/// five digits after the decimal point.
+pub fn parse_commitment(value: &str) -> Result<i128, String> {
+    let units = parse_amount("commitment", value)?;
+    if !(MIN_COMMITMENT_UNITS..=MAX_COMMITMENT_UNITS).contains(&units) {
+        return Err(format!(
+            "commitment must be between {} and {}, got '{value}'",
+            format_amount(MIN_COMMITMENT_UNITS),
+            format_amount(MAX_COMMITMENT_UNITS)
+        ));
+    }
+    Ok(units)
+}
+
+/// Render [`AMOUNT_SCALE`] units as an `Amount`: trailing zeros dropped, always
+/// with a decimal point.
+pub fn format_amount(units: i128) -> String {
+    let sign = if units < 0 { "-" } else { "" };
+    let units = units.abs();
+    let mut fraction = format!(
+        "{:0width$}",
+        units % AMOUNT_SCALE,
+        width = MAX_AMOUNT_DIGITS
+    );
+    while fraction.len() > 1 && fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{sign}{}.{fraction}", units / AMOUNT_SCALE)
+}
+
+/// Round `units` up to a whole amount (no fractional part).
+pub fn ceil_to_whole(units: i128) -> i128 {
+    units
+        .saturating_add(AMOUNT_SCALE - 1)
+        .saturating_div(AMOUNT_SCALE)
+        .saturating_mul(AMOUNT_SCALE)
+}
+
+/// Round `units` down to a whole amount (no fractional part).
+pub fn floor_to_whole(units: i128) -> i128 {
+    units.saturating_div(AMOUNT_SCALE).saturating_mul(AMOUNT_SCALE)
+}
+
+/// Whether `units` is a whole amount — the form `upfrontPaymentAmount` must
+/// take ("a whole number between 50 and 99 percent of the total value").
+pub fn is_whole(units: i128) -> bool {
+    units % AMOUNT_SCALE == 0
+}
+
+/// Divide `units` by `divisor`, rounding to the nearest unit: the recurring
+/// payment is the balance spread over the term's hours, and the service holds
+/// it at [`AMOUNT_SCALE`].
+pub fn divide_rounded(units: i128, divisor: i128) -> i128 {
+    if divisor == 0 {
+        return 0;
+    }
+    (units + divisor / 2) / divisor
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+
+/// Encode a page offset into an opaque `PaginationToken`.
+///
+/// Hex keeps the token inside the model's `^[A-Za-z0-9/=\+]+$` pattern, and
+/// `kind` keeps a token minted by one paginator from resuming another's page.
+pub fn encode_page_token(kind: &str, offset: usize) -> String {
+    hex::encode(format!("{kind}:{offset}"))
+}
+
+/// Decode a token [`encode_page_token`] produced, or `None` when it was not
+/// produced by this paginator.
+pub fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
+    let raw = hex::decode(token).ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    text.strip_prefix(kind)?.strip_prefix(':')?.parse().ok()
+}
+
+/// One page of `items` starting at `offset`, plus the offset of the next page
+/// when one remains. `limit` of `None` means "every remaining item".
+pub fn paginate<T: Clone>(
+    items: &[T],
+    offset: usize,
+    limit: Option<usize>,
+) -> (Vec<T>, Option<usize>) {
+    let start = offset.min(items.len());
+    let end = match limit {
+        Some(limit) => start.saturating_add(limit).min(items.len()),
+        None => items.len(),
+    };
+    let page = items[start..end].to_vec();
+    let next = (end < items.len()).then_some(end);
+    (page, next)
+}
+
+/// Whether a list-shaped request filter admits `value`: an absent or empty list
+/// constrains nothing, a populated one admits only the values it names.
+pub fn filter_admits(filter: Option<&Vec<String>>, value: &str) -> bool {
+    match filter {
+        Some(values) if !values.is_empty() => values.iter().any(|v| v == value),
+        _ => true,
+    }
+}
+
+/// The identity of an idempotent request: everything about it that the stored
+/// resource depends on.
+///
+/// A replayed `clientToken` is only idempotent for the SAME request; a token
+/// reused for a different one is refused rather than answered with the first
+/// call's resource, which would report success for a write that never happened.
+pub fn fingerprint(parts: &[(&str, &str)]) -> String {
+    // Every component is length-prefixed, so no two different requests can
+    // encode to the same string however their values are spelled: a tag value
+    // carrying the separator, or a key carrying the `=`, cannot be read as a
+    // different part.
+    parts
+        .iter()
+        .map(|(name, value)| format!("{}:{name}:{}:{value}", name.len(), value.len()))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+/// The most tags one resource may carry.
+///
+/// AWS's documented tag limit ("Tag naming limits and requirements", AWS
+/// General Reference: a maximum of 50 tags per resource). The model declares no
+/// constraint on `TagMap`, so the handler enforces it.
+pub const MAX_TAGS_PER_PLAN: usize = 50;
+
+/// The longest tag key AWS accepts (128 Unicode characters, same source).
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The longest tag value AWS accepts (256 Unicode characters, same source).
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// Refuse a tag set that is larger than the service accepts, or that carries an
+/// over-long key or value. Checked before anything is stored, so a refused
+/// write changes nothing.
+pub fn check_tags(tags: &BTreeMap<String, String>) -> Result<(), String> {
+    if tags.len() > MAX_TAGS_PER_PLAN {
+        return Err(format!(
+            "a Savings Plan cannot carry more than {MAX_TAGS_PER_PLAN} tags, got {}",
+            tags.len()
+        ));
+    }
+    for (key, value) in tags {
+        if key.chars().count() > MAX_TAG_KEY_CHARS {
+            return Err(format!(
+                "a tag key cannot be longer than {MAX_TAG_KEY_CHARS} characters, got {}",
+                key.chars().count()
+            ));
+        }
+        if value.chars().count() > MAX_TAG_VALUE_CHARS {
+            return Err(format!(
+                "the value of tag '{key}' cannot be longer than {MAX_TAG_VALUE_CHARS} characters, got {}",
+                value.chars().count()
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ARNs
+// ---------------------------------------------------------------------------
+
+/// Build the ARN of a Savings Plan.
+///
+/// Savings Plans are account-wide rather than regional, so the ARN's region
+/// segment is empty — the form the model's `SavingsPlanArn` pattern admits
+/// through its `([a-z]{2}-[a-z]+-\d{1}|)` alternative.
+pub fn savings_plan_arn(savings_plan_id: &str) -> String {
+    ::engine::emulator_arn(
+        SERVICE_NAMESPACE,
+        "",
+        &format!("savingsplan/{savings_plan_id}"),
+    )
+}
+
+/// The Savings Plan id inside a `SavingsPlanArn`, or `None` when the ARN names
+/// some other service or some other resource type.
+///
+/// The model's `@pattern` already refused anything that is not ARN-shaped
+/// before the handler ran, so this only has to reject a well-formed ARN that is
+/// not one of ours. The partition is matched as `aws` because the model's own
+/// `SavingsPlanArn` pattern starts `^arn:aws:` — the boundary validator refuses
+/// `aws-cn` and `aws-us-gov` before a handler sees them, so matching a wider
+/// set here would be unreachable.
+pub fn savings_plan_id_from_arn(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some("aws"),
+        Some(SERVICE_NAMESPACE),
+        Some(_region),
+        Some(_account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    resource.strip_prefix("savingsplan/")
+}
+
+// ---------------------------------------------------------------------------
+// The offering catalog
+// ---------------------------------------------------------------------------
+
+/// A Savings Plan offering: one purchasable combination of plan type, payment
+/// option, term and (for the plan types that are scoped to one) region and
+/// instance family. Projected onto the wire as `SavingsPlanOffering`.
+#[derive(Debug, Clone)]
+pub struct Offering {
+    pub offering_id: String,
+    pub product_types: Vec<String>,
+    pub plan_type: String,
+    pub description: String,
+    pub payment_option: String,
+    pub duration_seconds: i64,
+    pub currency: String,
+    pub service_code: String,
+    pub usage_type: String,
+    pub operation: String,
+    /// `(name, value)` pairs, where `name` is a
+    /// `SavingsPlanOfferingPropertyKey`.
+    pub properties: Vec<(String, String)>,
+}
+
+impl Offering {
+    /// The value of the named property, or `None` when this offering does not
+    /// carry it (a Compute Savings Plan is scoped to no region).
+    pub fn property(&self, name: &str) -> Option<&str> {
+        self.properties
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The term, in hours — what an hourly commitment is multiplied by to get
+    /// the total value of the plan. Both terms the catalog sells are whole
+    /// numbers of hours.
+    pub fn term_hours(&self) -> i128 {
+        i128::from(self.duration_seconds / 3600)
+    }
+}
+
+/// The terms AWS sells Savings Plans in: a one-year and a three-year term,
+/// in seconds (`SavingsPlanOffering$durationSeconds`).
+const TERMS: [(i64, &str); 2] = [(31_536_000, "1 year"), (94_608_000, "3 year")];
+
+/// Every `SavingsPlanPaymentOption` the model declares.
+const PAYMENT_OPTIONS: [&str; 3] = [
+    PAYMENT_ALL_UPFRONT,
+    PAYMENT_PARTIAL_UPFRONT,
+    PAYMENT_NO_UPFRONT,
+];
+
+/// The regions the catalog is seeded for, each with the `CurrencyCode` the
+/// region bills in — the three the model's `CurrencyCode` enum declares.
+const REGIONS: [(&str, &str); 3] = [
+    ("us-east-1", "USD"),
+    ("eu-west-1", "EUR"),
+    ("cn-north-1", "CNY"),
+];
+
+/// The EC2 instance families the catalog carries EC2 Instance offerings for
+/// (`SavingsPlanOffering$properties` -> `instanceFamily`).
+const EC2_INSTANCE_FAMILIES: [&str; 2] = ["m5", "c5"];
+
+/// Build the catalog: one offering per plan type x payment option x term, times
+/// the region (and, for EC2 Instance plans, the instance family) each plan type
+/// is scoped to.
+///
+/// The product types of each plan type are the ones AWS covers with it:
+/// Compute Savings Plans apply to EC2, Fargate and Lambda usage in any region;
+/// EC2 Instance Savings Plans to one instance family in one region; SageMaker
+/// and Database Savings Plans to their own products.
+fn seed_offerings(id_seed: u128) -> Vec<Offering> {
+    let mut offerings = Vec::new();
+    for (duration_seconds, term_label) in TERMS {
+        for payment_option in PAYMENT_OPTIONS {
+            offerings.push(offering(
+                "Compute",
+                &["EC2", "Fargate", "Lambda"],
+                &format!("Compute Savings Plans {term_label} {payment_option}"),
+                payment_option,
+                duration_seconds,
+                "USD",
+                "ComputeSavingsPlans",
+                "ComputeSP:Hrs",
+                "",
+                Vec::new(),
+            ));
+            for (region, currency) in REGIONS {
+                for family in EC2_INSTANCE_FAMILIES {
+                    offerings.push(offering(
+                        "EC2Instance",
+                        &["EC2"],
+                        &format!(
+                            "EC2 Instance Savings Plans {family} {region} {term_label} {payment_option}"
+                        ),
+                        payment_option,
+                        duration_seconds,
+                        currency,
+                        "AmazonEC2",
+                        &format!("{region}-EC2SP:{family}"),
+                        "RunInstances",
+                        vec![
+                            (PROPERTY_INSTANCE_FAMILY.to_string(), family.to_string()),
+                            (PROPERTY_REGION.to_string(), region.to_string()),
+                        ],
+                    ));
+                }
+                offerings.push(offering(
+                    "SageMaker",
+                    &["SageMaker"],
+                    &format!("SageMaker Savings Plans {region} {term_label} {payment_option}"),
+                    payment_option,
+                    duration_seconds,
+                    currency,
+                    "AmazonSageMaker",
+                    &format!("{region}-SageMakerSP:Hrs"),
+                    "RunInstance",
+                    vec![(PROPERTY_REGION.to_string(), region.to_string())],
+                ));
+                offerings.push(offering(
+                    "Database",
+                    &["RDS", "DocDB", "Neptune", "ElastiCache"],
+                    &format!("Database Savings Plans {region} {term_label} {payment_option}"),
+                    payment_option,
+                    duration_seconds,
+                    currency,
+                    "AmazonRDS",
+                    &format!("{region}-DatabaseSP:Hrs"),
+                    "CreateDBInstance",
+                    vec![(PROPERTY_REGION.to_string(), region.to_string())],
+                ));
+            }
+        }
+    }
+    for (index, entry) in offerings.iter_mut().enumerate() {
+        entry.offering_id = mint_id(id_seed, index as u64);
+    }
+    offerings
+}
+
+/// Mint an id in the v4 UUID form: `counter` makes it unique within the store
+/// and `seed` makes it unguessable from one store to the next, and the two are
+/// run through SHA-256 so no request value can be read back out of an id.
+///
+/// The form is what matters on the wire: the model's `UUID` pattern (and the
+/// `SavingsPlanArn` pattern's `[1-5]`/`[89ab]` nibbles) require hyphenated
+/// lowercase hex with the RFC 4122 version and variant bits set, which is what
+/// this writes.
+fn mint_id(seed: u128, counter: u64) -> String {
+    let digest = Sha256::digest(format!("{seed}/{counter}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// A per-store seed for [`mint_id`].
+fn id_seed() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default()
+}
+
+/// One catalog entry. Its `offering_id` is assigned by [`seed_offerings`] once
+/// the catalog is built, so an offering keeps one id for the life of the store,
+/// the way a real offering id outlives any one request.
+#[allow(clippy::too_many_arguments)]
+fn offering(
+    plan_type: &str,
+    product_types: &[&str],
+    description: &str,
+    payment_option: &str,
+    duration_seconds: i64,
+    currency: &str,
+    service_code: &str,
+    usage_type: &str,
+    operation: &str,
+    properties: Vec<(String, String)>,
+) -> Offering {
+    Offering {
+        offering_id: String::new(),
+        product_types: product_types.iter().map(|p| (*p).to_string()).collect(),
+        plan_type: plan_type.to_string(),
+        description: description.to_string(),
+        payment_option: payment_option.to_string(),
+        duration_seconds,
+        currency: currency.to_string(),
+        service_code: service_code.to_string(),
+        usage_type: usage_type.to_string(),
+        operation: operation.to_string(),
+        properties,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Purchased plans
+// ---------------------------------------------------------------------------
+
+/// A purchased Savings Plan, as this service stores it. Projected onto the wire
+/// as `SavingsPlan` by [`SavingsPlanRecord::project`].
+#[derive(Debug, Clone)]
+pub struct SavingsPlanRecord {
+    pub savings_plan_id: String,
+    pub savings_plan_arn: String,
+    pub offering_id: String,
+    pub description: String,
+    /// The plan's term start, epoch millis: the purchase time.
+    pub start_millis: i64,
+    /// The plan's term end, epoch millis: `start` plus the term duration.
+    pub end_millis: i64,
+    pub state: String,
+    /// When the clock owes this plan its move out of `queued`.
+    pub pending_due_millis: i64,
+    /// When the clock owes this plan its move out of `payment-pending`.
+    pub active_due_millis: i64,
+    pub region: Option<String>,
+    pub ec2_instance_family: Option<String>,
+    pub savings_plan_type: String,
+    pub payment_option: String,
+    pub product_types: Vec<String>,
+    pub currency: String,
+    pub commitment: String,
+    pub upfront_payment_amount: String,
+    pub recurring_payment_amount: String,
+    pub term_duration_in_seconds: i64,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl SavingsPlanRecord {
+    /// Whether a return can still be requested for this plan: it must be in a
+    /// paid-for state and still inside its one-hour window.
+    pub fn is_returnable(&self, now_millis: i64) -> bool {
+        matches!(
+            self.state.as_str(),
+            STATE_PAYMENT_PENDING | STATE_ACTIVE
+        ) && now_millis <= self.return_window_closes_millis()
+    }
+
+    /// The instant this plan's return window closes. Saturating: `start_millis`
+    /// carries a caller-supplied purchase time.
+    pub fn return_window_closes_millis(&self) -> i64 {
+        self.start_millis.saturating_add(RETURN_WINDOW_MILLIS)
+    }
+
+    /// `returnableUntil`: "the time until when a return for the Savings Plan can
+    /// be requested. If the Savings Plan is not returnable, the field reflects
+    /// the Savings Plans start time."
+    pub fn returnable_until_millis(&self, now_millis: i64) -> i64 {
+        if self.is_returnable(now_millis) {
+            self.return_window_closes_millis()
+        } else {
+            self.start_millis
+        }
+    }
+
+    /// Merge `tags` into this plan's tags, refusing the WHOLE write when the
+    /// result would break [`check_tags`] — so a refused `TagResource` leaves the
+    /// stored tag set exactly as it was, and no caller can grow it past the
+    /// service's tag limit.
+    pub fn merge_tags(
+        &mut self,
+        tags: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<(), String> {
+        let mut merged = self.tags.clone();
+        merged.extend(tags);
+        check_tags(&merged)?;
+        self.tags = merged;
+        Ok(())
+    }
+
+    /// Whether a `SavingsPlanFilter` admits this plan. `name` is a
+    /// `SavingsPlansFilterName`; a filter with no values constrains nothing.
+    pub fn matches_filter(&self, name: &str, values: Option<&Vec<String>>) -> bool {
+        // An amount or term filter compares NUMBERS and an instant filter
+        // compares INSTANTS, so a filter spelled "0.100" matches a commitment
+        // held as "0.1" and one spelled with an offset matches the same moment.
+        let (field, kind): (Option<String>, FilterKind) = match name {
+            "region" => (self.region.clone(), FilterKind::Text),
+            "ec2-instance-family" | "instance-family" => {
+                (self.ec2_instance_family.clone(), FilterKind::Text)
+            }
+            "commitment" => (Some(self.commitment.clone()), FilterKind::Number),
+            "upfront" => (Some(self.upfront_payment_amount.clone()), FilterKind::Number),
+            "term" => (
+                Some(self.term_duration_in_seconds.to_string()),
+                FilterKind::Number,
+            ),
+            "savings-plan-type" => (Some(self.savings_plan_type.clone()), FilterKind::Text),
+            "payment-option" => (Some(self.payment_option.clone()), FilterKind::Text),
+            "start" => (
+                Some(format_millis(self.start_millis)),
+                FilterKind::Instant(self.start_millis),
+            ),
+            "end" => (
+                Some(format_millis(self.end_millis)),
+                FilterKind::Instant(self.end_millis),
+            ),
+            _ => (None, FilterKind::Text),
+        };
+        match (values, field) {
+            (Some(values), _) if values.is_empty() => true,
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(values), Some(field)) => values.iter().any(|value| {
+                if *value == field {
+                    return true;
+                }
+                match kind {
+                    FilterKind::Text => false,
+                    FilterKind::Number => match (
+                        parse_amount(name, value).ok(),
+                        parse_amount(name, &field).ok(),
+                    ) {
+                        (Some(left), Some(right)) => left == right,
+                        _ => false,
+                    },
+                    FilterKind::Instant(millis) => parse_millis(value) == Some(millis),
+                }
+            }),
+        }
+    }
+}
+
+/// How a `SavingsPlanFilter`'s value is compared with the member it names.
+#[derive(Debug, Clone, Copy)]
+enum FilterKind {
+    /// Compared as text, the way the model's enum-valued members are.
+    Text,
+    /// Compared as a number, so two spellings of one amount are one value.
+    Number,
+    /// Compared as an instant (epoch millis), for the same reason.
+    Instant(i64),
+}
+
+/// The most Savings Plans this account may hold.
+///
+/// A quota, answered with the service's own modelled
+/// `ServiceQuotaExceededException`: the store keeps every plan ever purchased
+/// (a Savings Plan is never deleted — it is returned, cancelled or retired),
+/// so without a ceiling one caller could grow it for the life of the process.
+pub const MAX_PLANS_PER_ACCOUNT: usize = 1000;
+
+/// Per-service state for com-amazonaws-savingsplans-awssavingsplan. A handler
+/// reaches it through [`service_state`].
+#[derive(Debug)]
 pub struct ComAmazonawsSavingsplansAwssavingsplanState {
-    // TODO: add service-specific state fields
+    /// The seeded, read-only catalog.
+    offerings: Vec<Offering>,
+    /// Every plan sold, in purchase order.
+    plans: Vec<SavingsPlanRecord>,
+    /// `savingsPlanId` -> index into `plans`.
+    plan_index: HashMap<String, usize>,
+    /// `savingsPlanArn` -> index into `plans`.
+    arn_index: HashMap<String, usize>,
+    /// `<operation>/<clientToken>` -> the request that token's first call
+    /// carried (its [`fingerprint`]) and the `savingsPlanId` it resolved to.
+    idempotency: HashMap<String, (String, String)>,
+    /// This store's id seed, and how many ids it has minted: see [`mint_id`].
+    id_seed: u128,
+    minted_ids: u64,
+}
+
+impl Default for ComAmazonawsSavingsplansAwssavingsplanState {
+    fn default() -> Self {
+        let seed = id_seed();
+        let offerings = seed_offerings(seed);
+        Self {
+            minted_ids: offerings.len() as u64,
+            offerings,
+            plans: Vec::new(),
+            plan_index: HashMap::new(),
+            arn_index: HashMap::new(),
+            idempotency: HashMap::new(),
+            id_seed: seed,
+        }
+    }
+}
+
+impl ComAmazonawsSavingsplansAwssavingsplanState {
+    /// Mint a fresh id for a resource this store is creating. See [`mint_id`].
+    pub fn next_id(&mut self) -> String {
+        self.minted_ids = self.minted_ids.saturating_add(1);
+        mint_id(self.id_seed, self.minted_ids)
+    }
+
+    /// The whole catalog, in catalog order.
+    pub fn offerings(&self) -> &[Offering] {
+        &self.offerings
+    }
+
+    /// The catalog entry with this offering id.
+    pub fn offering(&self, offering_id: &str) -> Option<&Offering> {
+        self.offerings
+            .iter()
+            .find(|offering| offering.offering_id == offering_id)
+    }
+
+    /// Every plan sold, in purchase order.
+    pub fn plans(&self) -> &[SavingsPlanRecord] {
+        &self.plans
+    }
+
+    /// The plan with this id.
+    pub fn plan(&self, savings_plan_id: &str) -> Option<&SavingsPlanRecord> {
+        self.plan_index
+            .get(savings_plan_id)
+            .and_then(|index| self.plans.get(*index))
+    }
+
+    /// The plan with this id, mutably.
+    pub fn plan_mut(&mut self, savings_plan_id: &str) -> Option<&mut SavingsPlanRecord> {
+        let index = *self.plan_index.get(savings_plan_id)?;
+        self.plans.get_mut(index)
+    }
+
+    /// The plan with this ARN.
+    pub fn plan_by_arn(&self, arn: &str) -> Option<&SavingsPlanRecord> {
+        self.arn_index
+            .get(arn)
+            .and_then(|index| self.plans.get(*index))
+    }
+
+    /// The plan with this ARN, mutably.
+    pub fn plan_by_arn_mut(&mut self, arn: &str) -> Option<&mut SavingsPlanRecord> {
+        let index = *self.arn_index.get(arn)?;
+        self.plans.get_mut(index)
+    }
+
+    /// Whether another purchase would exceed [`MAX_PLANS_PER_ACCOUNT`].
+    pub fn at_plan_quota(&self) -> bool {
+        self.plans.len() >= MAX_PLANS_PER_ACCOUNT
+    }
+
+    /// Record a newly purchased plan, keeping both indexes in step.
+    pub fn insert_plan(&mut self, record: SavingsPlanRecord) {
+        let index = self.plans.len();
+        self.plan_index
+            .insert(record.savings_plan_id.clone(), index);
+        self.arn_index.insert(record.savings_plan_arn.clone(), index);
+        self.plans.push(record);
+    }
+
+    /// What an earlier call with this `clientToken` carried and resolved to:
+    /// `(fingerprint, savingsPlanId)`.
+    pub fn idempotent(&self, operation: &str, client_token: &str) -> Option<(&str, &str)> {
+        self.idempotency
+            .get(&format!("{operation}/{client_token}"))
+            .map(|(fingerprint, id)| (fingerprint.as_str(), id.as_str()))
+    }
+
+    /// Remember the request this `clientToken` carried and the plan it resolved
+    /// to, so a replay of the SAME request answers with that plan and a replay
+    /// of a different one can be refused.
+    pub fn remember_idempotent(
+        &mut self,
+        operation: &str,
+        client_token: &str,
+        fingerprint: &str,
+        savings_plan_id: &str,
+    ) {
+        self.idempotency.insert(
+            format!("{operation}/{client_token}"),
+            (fingerprint.to_string(), savings_plan_id.to_string()),
+        );
+    }
+
+    /// Apply every state transition the clock already owes at `now_millis`.
+    ///
+    /// A queued purchase becomes payable at its purchase time, a payable plan
+    /// becomes active once its payment has settled, and an active plan retires
+    /// when its term ends. Each was owed at that instant whether or not anybody
+    /// called, so a reporting operation materialises them before it answers
+    /// rather than inventing them.
+    pub fn materialize_due(&mut self, now_millis: i64) {
+        for plan in &mut self.plans {
+            if plan.state == STATE_QUEUED && now_millis >= plan.pending_due_millis {
+                plan.state = STATE_PAYMENT_PENDING.to_string();
+            }
+            if plan.state == STATE_PAYMENT_PENDING && now_millis >= plan.active_due_millis {
+                plan.state = STATE_ACTIVE.to_string();
+            }
+            if matches!(plan.state.as_str(), STATE_PAYMENT_PENDING | STATE_ACTIVE)
+                && now_millis >= plan.end_millis
+            {
+                plan.state = STATE_RETIRED.to_string();
+            }
+        }
+    }
+}
+
+/// Build the record for a purchase of `offering`.
+///
+/// `start_millis` is the purchase time: a purchase dated in the future is
+/// *queued* (it has not been paid for yet), one dated now or earlier is
+/// `payment-pending` until its payment settles.
+#[allow(clippy::too_many_arguments)]
+pub fn purchase(
+    offering: &Offering,
+    savings_plan_id: String,
+    commitment: &str,
+    upfront_payment_amount: i128,
+    recurring_payment_amount: i128,
+    purchase_millis: i64,
+    now_millis: i64,
+    tags: BTreeMap<String, String>,
+) -> SavingsPlanRecord {
+    let start_millis = truncate_to_second(purchase_millis);
+    let queued = start_millis > now_millis;
+    SavingsPlanRecord {
+        savings_plan_arn: savings_plan_arn(&savings_plan_id),
+        savings_plan_id,
+        offering_id: offering.offering_id.clone(),
+        description: offering.description.clone(),
+        start_millis,
+        // Saturating throughout: `start_millis` carries a caller-supplied
+        // purchase time, so none of this arithmetic may be partial.
+        end_millis: start_millis.saturating_add(offering.duration_seconds.saturating_mul(1000)),
+        state: if queued {
+            STATE_QUEUED.to_string()
+        } else {
+            STATE_PAYMENT_PENDING.to_string()
+        },
+        pending_due_millis: start_millis,
+        active_due_millis: if queued {
+            start_millis.saturating_add(ACTIVATION_DELAY_MILLIS)
+        } else {
+            now_millis.saturating_add(ACTIVATION_DELAY_MILLIS)
+        },
+        region: offering.property(PROPERTY_REGION).map(str::to_string),
+        ec2_instance_family: offering
+            .property(PROPERTY_INSTANCE_FAMILY)
+            .map(str::to_string),
+        savings_plan_type: offering.plan_type.clone(),
+        payment_option: offering.payment_option.clone(),
+        product_types: offering.product_types.clone(),
+        currency: offering.currency.clone(),
+        commitment: commitment.to_string(),
+        upfront_payment_amount: format_amount(upfront_payment_amount),
+        recurring_payment_amount: format_amount(recurring_payment_amount),
+        term_duration_in_seconds: offering.duration_seconds,
+        tags,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSavingsPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSavingsPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSavingsPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Buys an offering out of the seeded catalog in [`crate::state`] and persists
+//! the resulting Savings Plan, so a later `DescribeSavingsPlans` sees it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +143,232 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSavingsPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSavingsPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSavingsPlan"))
+        use crate::state::{
+            PAYMENT_ALL_UPFRONT, PAYMENT_NO_UPFRONT, PAYMENT_PARTIAL_UPFRONT,
+        };
+
+        let now = crate::state::now_millis();
+        let commitment = crate::state::parse_commitment(&input.commitment).map_err(validation)?;
+        // The purchase time AS SUPPLIED, for the idempotency fingerprint: a
+        // replay of the same request must fingerprint the same however much
+        // later it arrives, so the server-derived default below must not reach
+        // it.
+        let supplied_purchase_time = input
+            .purchase_time
+            .as_ref()
+            .and_then(|time| time.to_millis().ok())
+            .map(|millis| millis.to_string())
+            .unwrap_or_default();
+        let purchase_millis = match input.purchase_time.as_ref() {
+            Some(time) => {
+                let millis = time.to_millis().map_err(|_| {
+                    validation("purchaseTime is not a representable time".to_string())
+                })?;
+                // Bound the request-derived instant here, so no later
+                // arithmetic on it can be handed an extreme value.
+                crate::state::check_purchase_time(millis, now).map_err(validation)?;
+                millis
+            }
+            None => now,
+        };
+        // The purchase's own tags are bounded by the same rule `TagResource`
+        // enforces, so a plan cannot be created over the tag limit either.
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        crate::state::check_tags(&tags).map_err(validation)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSavingsPlanErrorModeled::InternalServerException(InternalServerException {
+                message: "the savingsplans store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // `clientToken` makes the purchase idempotent: a replay of the SAME
+        // request answers with the plan the first call created and buys
+        // nothing, while the same token carrying a DIFFERENT purchase is
+        // refused rather than answered with the first plan. The fingerprint is
+        // taken over the request as the client sent it, so a replay minutes
+        // later still fingerprints the same.
+        let client_token = input.client_token.as_deref().filter(|t| !t.is_empty());
+        let stored_commitment = crate::state::format_amount(commitment);
+        let mut named: Vec<(String, String)> = vec![
+            (
+                "savingsPlanOfferingId".to_string(),
+                input.savings_plan_offering_id.clone(),
+            ),
+            ("commitment".to_string(), stored_commitment.clone()),
+            (
+                "upfrontPaymentAmount".to_string(),
+                input.upfront_payment_amount.clone().unwrap_or_default(),
+            ),
+            ("purchaseTime".to_string(), supplied_purchase_time),
+        ];
+        named.extend(
+            tags.iter()
+                .map(|(key, value)| (format!("tag/{key}"), value.clone())),
+        );
+        let parts: Vec<(&str, &str)> = named
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let request_fingerprint = crate::state::fingerprint(&parts);
+        if let Some(token) = client_token {
+            if let Some((seen, existing)) = store.idempotent(Self::NAME, token) {
+                if seen != request_fingerprint {
+                    return Err(validation(format!(
+                        "clientToken '{token}' was already used for a different \
+                         CreateSavingsPlan request"
+                    )));
+                }
+                return Ok(CreateSavingsPlanOutput {
+                    savings_plan_id: Some(existing.to_string()),
+                });
+            }
+        }
+
+        let offering = store
+            .offering(&input.savings_plan_offering_id)
+            .cloned()
+            .ok_or_else(|| {
+                CreateSavingsPlanErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no Savings Plan offering with id '{}'",
+                            input.savings_plan_offering_id
+                        ),
+                    },
+                )
+            })?;
+
+        // A plan is never deleted, only returned, cancelled or retired, so the
+        // account's plan quota is the ceiling on the store.
+        if store.at_plan_quota() {
+            return Err(CreateSavingsPlanErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} Savings Plans",
+                        crate::state::MAX_PLANS_PER_ACCOUNT
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The total value of the plan: the hourly commitment over the whole
+        // term, in `AMOUNT_SCALE` units throughout, so every amount the service
+        // stores is exact.
+        let term_hours = offering.term_hours();
+        let total = commitment.saturating_mul(term_hours);
+        let supplied_upfront = match input.upfront_payment_amount.as_deref() {
+            Some(amount) => Some(
+                crate::state::parse_amount("upfrontPaymentAmount", amount).map_err(validation)?,
+            ),
+            None => None,
+        };
+
+        // How the term is paid for follows the offering's payment option:
+        // everything up front, nothing up front, or a whole-number share up
+        // front with the rest spread over the term's hours. `upfrontPaymentAmount`
+        // "is only supported if the payment option is Partial Upfront".
+        let (upfront, recurring) = match offering.payment_option.as_str() {
+            PAYMENT_ALL_UPFRONT => {
+                reject_unsupported_upfront(supplied_upfront.is_some(), PAYMENT_ALL_UPFRONT)?;
+                (total, 0)
+            }
+            PAYMENT_NO_UPFRONT => {
+                reject_unsupported_upfront(supplied_upfront.is_some(), PAYMENT_NO_UPFRONT)?;
+                (0, commitment)
+            }
+            PAYMENT_PARTIAL_UPFRONT => {
+                // "a whole number between 50 and 99 percent of the total value
+                // of the Savings Plan" — so the window the request must sit in
+                // is the whole numbers from 50% rounded up to 99% rounded down.
+                let min = crate::state::ceil_to_whole(crate::state::divide_rounded(total, 2));
+                let max = crate::state::floor_to_whole(total.saturating_mul(99) / 100);
+                let upfront = match supplied_upfront {
+                    Some(upfront) => {
+                        if !crate::state::is_whole(upfront) {
+                            return Err(validation(format!(
+                                "upfrontPaymentAmount must be a whole number, got '{}'",
+                                crate::state::format_amount(upfront)
+                            )));
+                        }
+                        if upfront < min || upfront > max {
+                            return Err(validation(format!(
+                                "upfrontPaymentAmount must be a whole number between 50 and 99 \
+                                 percent of the total value of the Savings Plan ({} to {}), got \
+                                 '{}'",
+                                crate::state::format_amount(min),
+                                crate::state::format_amount(max),
+                                crate::state::format_amount(upfront)
+                            )));
+                        }
+                        upfront
+                    }
+                    // Unspecified: the smallest whole number that is at least
+                    // half of the plan's total value.
+                    None => min,
+                };
+                (
+                    upfront,
+                    crate::state::divide_rounded(total - upfront, term_hours),
+                )
+            }
+            other => {
+                return Err(CreateSavingsPlanErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!("offering has an unknown payment option '{other}'"),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let savings_plan_id = store.next_id();
+        let record = crate::state::purchase(
+            &offering,
+            savings_plan_id.clone(),
+            // The commitment as the service holds it: the parsed decimal
+            // rendered in the `Amount` form every other amount uses, not the
+            // request's spelling of it.
+            &stored_commitment,
+            upfront,
+            recurring,
+            purchase_millis,
+            now,
+            tags,
+        );
+        store.insert_plan(record);
+        if let Some(token) = client_token {
+            store.remember_idempotent(Self::NAME, token, &request_fingerprint, &savings_plan_id);
+        }
+
+        Ok(CreateSavingsPlanOutput {
+            savings_plan_id: Some(savings_plan_id),
+        })
     }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+fn validation(message: String) -> CreateSavingsPlanError {
+    CreateSavingsPlanErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
+/// Refuse an `upfrontPaymentAmount` on an offering whose payment option does
+/// not take one.
+fn reject_unsupported_upfront(
+    supplied: bool,
+    payment_option: &str,
+) -> Result<(), CreateSavingsPlanError> {
+    if supplied {
+        return Err(validation(format!(
+            "upfrontPaymentAmount is only supported if the payment option is \
+             {}, and this offering is {payment_option}",
+            crate::state::PAYMENT_PARTIAL_UPFRONT
+        )));
+    }
+    Ok(())
 }
