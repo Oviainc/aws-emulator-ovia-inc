@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLaunchConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLaunchConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLaunchConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored launch configurations, name-ordered, filtered by the
+//! requested names and paged by `MaxRecords`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLaunchConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLaunchConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLaunchConfigurations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeLaunchConfigurationsErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(DescribeLaunchConfigurationsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some("The NextToken value is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let wanted = input.launch_configuration_names.unwrap_or_default();
+        // `MaxRecords` has a documented range; a page size outside it is refused,
+        // not quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MaxRecords value {max_records} is not valid: it must be between 1 and {}",
+                crate::state::MAX_MAX_RECORDS
+            )));
+        }
+        if wanted.len() > crate::state::max_filter_names(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The LaunchConfigurationNames value names {} launch configurations, more than the \
+                 {} this request allows: raise MaxRecords to describe more of them in one call",
+                wanted.len(),
+                crate::state::max_filter_names(input.max_records)
+            )));
+        }
+        let mut state = state.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let matching: Vec<LaunchConfiguration> = state
+            .launch_configurations
+            .values()
+            .filter(|config| wanted.is_empty() || wanted.contains(&config.name))
+            .map(launch_configuration_view)
+            .collect();
+        // A token the service issued always points inside the list it was issued
+        // for; one that points past the end was not issued for this list.
+        if offset > 0 && offset >= matching.len() {
+            return Err(DescribeLaunchConfigurationsErrorModeled::InvalidNextToken(
+                InvalidNextToken {
+                    message: Some("The NextToken value is not valid.".to_string()),
+                },
+            )
+            .into());
+        }
+        let (launch_configurations, next_token) =
+            crate::state::page(&matching, offset, input.max_records);
+
+        Ok(DescribeLaunchConfigurationsOutput {
+            launch_configurations,
+            next_token,
+        })
+    }
+}
+
+/// The `LaunchConfiguration` the service reports for a stored one.
+fn launch_configuration_view(
+    stored: &crate::state::StoredLaunchConfiguration,
+) -> LaunchConfiguration {
+    LaunchConfiguration {
+        launch_configuration_name: stored.name.clone(),
+        launch_configuration_arn: Some(stored.arn.clone()),
+        image_id: stored.image_id.clone(),
+        key_name: stored.key_name.clone(),
+        security_groups: Some(stored.security_groups.clone()),
+        classic_link_vpc_id: stored.classic_link_vpc_id.clone(),
+        classic_link_vpc_security_groups: Some(stored.classic_link_vpc_security_groups.clone()),
+        user_data: stored.user_data.clone(),
+        instance_type: stored.instance_type.clone(),
+        kernel_id: stored.kernel_id.clone(),
+        ramdisk_id: stored.ramdisk_id.clone(),
+        block_device_mappings: Some(stored.block_device_mappings.clone()),
+        instance_monitoring: Some(InstanceMonitoring {
+            enabled: Some(stored.instance_monitoring_enabled),
+        }),
+        spot_price: stored.spot_price.clone(),
+        iam_instance_profile: stored.iam_instance_profile.clone(),
+        created_time: crate::state::to_date_time(stored.created_time),
+        ebs_optimized: Some(stored.ebs_optimized),
+        associate_public_ip_address: stored.associate_public_ip,
+        placement_tenancy: stored.placement_tenancy.clone(),
+        metadata_options: stored.metadata_options.clone(),
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAutoScalingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAutoScalingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAutoScalingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists the whole Auto Scaling group under its name — sizes, zones, health
+//! check, launch source, tags, ARN and creation time — and launches the group's
+//! initial `DesiredCapacity` instances, each reported `Pending` until the
+//! lifecycle transition the clock owes comes due.
 //!
 //! ## Shape of an operation
 //!
@@ -351,18 +347,274 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAutoScalingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAutoScalingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAutoScalingGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAutoScalingGroupErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Reading an existing instance's configuration to build the group from it
+        // needs that instance's own state, which lives in EC2 and not here.
+        if input.instance_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "CreateAutoScalingGroup with InstanceId needs the configuration of a \
+                              running EC2 instance, which this emulator does not hold"
+                        .to_string(),
+                },
+            ));
+        }
+
+        let name = input.auto_scaling_group_name.clone();
+        if !crate::state::is_valid_group_name(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The AutoScalingGroupName may contain only ASCII characters 33 to 126, and may \
+                 not contain a colon (:)",
+            ));
+        }
+        if input.availability_zones.is_some() && input.availability_zone_ids.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You cannot specify both AvailabilityZones and AvailabilityZoneIds in the same \
+                 request",
+            ));
+        }
+        if let Some(lifetime) = input.max_instance_lifetime {
+            if !crate::state::is_valid_max_instance_lifetime(lifetime) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The MaxInstanceLifetime value {lifetime} is not valid: it must be either 0 \
+                     or at least {} seconds",
+                    crate::state::MIN_MAX_INSTANCE_LIFETIME
+                )));
+            }
+        }
+        if let Some(health_check_type) = input.health_check_type.as_deref() {
+            if !crate::state::is_valid_health_check_type(health_check_type) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The HealthCheckType value {health_check_type} is not valid: it must be a \
+                     comma-separated list of {:?}",
+                    crate::state::HEALTH_CHECK_TYPES
+                )));
+            }
+        }
+        if let Some(policy) = input
+            .termination_policies
+            .iter()
+            .flatten()
+            .find(|policy| !crate::state::is_valid_termination_policy(policy))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The TerminationPolicies value {policy} is not valid: it must be one of {:?} or a \
+                 Lambda function ARN",
+                crate::state::TERMINATION_POLICIES
+            )));
+        }
+        if let Some(capacity_type) = input.desired_capacity_type.as_deref() {
+            if !crate::state::DESIRED_CAPACITY_TYPES.contains(&capacity_type) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The DesiredCapacityType value {capacity_type} is not valid: it must be one \
+                     of {:?}",
+                    crate::state::DESIRED_CAPACITY_TYPES
+                )));
+            }
+        }
+        if input.launch_configuration_name.is_none()
+            && input.launch_template.is_none()
+            && input.mixed_instances_policy.is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, \
+                 InstanceId or MixedInstancesPolicy",
+            ));
+        }
+        if input.min_size < 0 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MinSize must not be negative, but it is {}",
+                input.min_size
+            )));
+        }
+        if input.max_size < input.min_size {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MinSize must be less than or equal to the MaxSize, but MinSize is {} and \
+                 MaxSize is {}",
+                input.min_size, input.max_size
+            )));
+        }
+        let desired_capacity = input.desired_capacity.unwrap_or(input.min_size);
+        if desired_capacity < input.min_size || desired_capacity > input.max_size {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The DesiredCapacity must be between the MinSize and the MaxSize, but \
+                 DesiredCapacity is {desired_capacity} and the range is [{}, {}]",
+                input.min_size, input.max_size
+            )));
+        }
+        // The checks above are all RELATIVE, so none of them bounds the absolute
+        // size: every unit of capacity is a stored instance, and the service has a
+        // quota for exactly that reason. Refuse past the ceiling before anything is
+        // allocated or the store is locked.
+        if let Some(size) = crate::state::size_past_ceiling(&[
+            input.min_size,
+            input.max_size,
+            desired_capacity,
+        ]) {
+            return Err(CreateAutoScalingGroupErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(format!(
+                        "The group size {size} exceeds the limit of {} instances per Auto Scaling \
+                         group",
+                        crate::state::MAX_GROUP_CAPACITY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let availability_zones = input.availability_zones.clone().unwrap_or_default();
+        if availability_zones.is_empty() && input.vpc_zone_identifier.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "At least one Availability Zone or VPC Subnet is required: specify \
+                 AvailabilityZones or VPCZoneIdentifier",
+            ));
+        }
+        // An instance is reported in the Availability Zone it runs in. Resolving
+        // that zone from a subnet id alone needs the subnet's own state, which
+        // lives in EC2, so a group that has to launch instances and names only
+        // subnets is something this emulator cannot answer faithfully.
+        if availability_zones.is_empty() && desired_capacity > 0 {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "launching instances for a group that names only VPCZoneIdentifier \
+                              needs each subnet's Availability Zone, which this emulator does not \
+                              hold: pass AvailabilityZones as well"
+                        .to_string(),
+                },
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        if state.groups.contains_key(&name) {
+            return Err(CreateAutoScalingGroupErrorModeled::AlreadyExistsFault(
+                AlreadyExistsFault {
+                    message: Some(format!(
+                        "AutoScalingGroup by this name already exists - A group with the name \
+                         {name} already exists"
+                    )),
+                },
+            )
+            .into());
+        }
+        if state.groups.len() >= crate::state::MAX_GROUPS {
+            return Err(CreateAutoScalingGroupErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(format!(
+                        "You have already reached the limit of {} Auto Scaling groups",
+                        crate::state::MAX_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(configuration) = input.launch_configuration_name.as_deref() {
+            if !state.launch_configurations.contains_key(configuration) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Launch configuration name not found - No launch configuration found with the \
+                     name {configuration}"
+                )));
+            }
+        }
+
+        let resource_id = state.mint_resource_id();
+        let arn = crate::state::group_arn(&region, &resource_id, &name);
+        let tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| Tag {
+                // A tag on an Auto Scaling group is reported against that group,
+                // whatever resource the request named.
+                resource_id: Some(name.clone()),
+                resource_type: Some(GROUP_RESOURCE_TYPE.to_string()),
+                key: tag.key,
+                value: tag.value,
+                propagate_at_launch: tag.propagate_at_launch,
+            })
+            .collect();
+        let group = crate::state::StoredGroup {
+            name: name.clone(),
+            arn,
+            launch_configuration_name: input.launch_configuration_name,
+            launch_template: input.launch_template,
+            mixed_instances_policy: input.mixed_instances_policy,
+            min_size: input.min_size,
+            max_size: input.max_size,
+            // The group starts empty: `apply_capacity` below launches what the
+            // requested desired capacity needs.
+            desired_capacity: 0,
+            default_cooldown: input
+                .default_cooldown
+                .unwrap_or(crate::state::DEFAULT_COOLDOWN_SECONDS),
+            availability_zones,
+            availability_zone_ids: input.availability_zone_ids,
+            load_balancer_names: input.load_balancer_names,
+            target_group_arns: input.target_group_ar_ns,
+            health_check_type: input
+                .health_check_type
+                .unwrap_or_else(|| crate::state::DEFAULT_HEALTH_CHECK_TYPE.to_string()),
+            health_check_grace_period: Some(
+                input
+                    .health_check_grace_period
+                    .unwrap_or(crate::state::DEFAULT_HEALTH_CHECK_GRACE_PERIOD),
+            ),
+            placement_group: input.placement_group,
+            vpc_zone_identifier: input.vpc_zone_identifier,
+            termination_policies: input.termination_policies.unwrap_or_else(|| {
+                vec![crate::state::DEFAULT_TERMINATION_POLICY.to_string()]
+            }),
+            new_instances_protected_from_scale_in: input
+                .new_instances_protected_from_scale_in
+                .unwrap_or(false),
+            service_linked_role_arn: input.service_linked_role_arn,
+            max_instance_lifetime: input.max_instance_lifetime,
+            capacity_rebalance: input.capacity_rebalance,
+            context: input.context,
+            desired_capacity_type: input.desired_capacity_type,
+            default_instance_warmup: input.default_instance_warmup,
+            traffic_sources: input.traffic_sources,
+            instance_maintenance_policy: input.instance_maintenance_policy,
+            availability_zone_distribution: input.availability_zone_distribution,
+            availability_zone_impairment_policy: input.availability_zone_impairment_policy,
+            capacity_reservation_specification: input.capacity_reservation_specification,
+            instance_lifecycle_policy: input.instance_lifecycle_policy,
+            operator: input.operator,
+            deletion_protection: input.deletion_protection,
+            tags,
+            status: None,
+            created_time: now,
+            instances: Vec::new(),
+            cooldown_until: None,
+            pending_capacity: None,
+        };
+        state.groups.insert(name.clone(), group);
+
+        let cause = crate::state::AutoScalingState::capacity_change_cause(
+            "an Auto Scaling group was created",
+            0,
+            desired_capacity,
+        );
+        state.apply_capacity(&name, desired_capacity, &cause, now);
+
+        crate::state::audit(ctx.parts(), "CreateAutoScalingGroup", &name, "created");
+        Ok(CreateAutoScalingGroupOutput)
     }
 }
+
+/// The `ResourceType` a tag on an Auto Scaling group is reported under.
+const GROUP_RESOURCE_TYPE: &str = "auto-scaling-group";
