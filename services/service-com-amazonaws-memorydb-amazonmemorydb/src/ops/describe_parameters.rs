@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers from [`crate::state`] — the engine default parameters of the
+//! FAMILY the named group was created with, each carrying the value an
+//! `UpdateParameterGroup` persisted for this group when one changed it, in name order
+//! and paged by `MaxResults`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +151,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeParameters"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than
+            // answered with a canned parameter list.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        if input.max_results.is_some_and(|max| max < 1) {
+            // A page size below 1 names no page: refused with this operation's own
+            // modelled invalid-value error rather than served as an empty page.
+            return Err(DescribeParametersErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some("MaxResults must be at least 1.".to_string()),
+                },
+            )
+            .into());
+        }
+        let mut state = state.lock();
+        // The only write a describe makes: the status transitions the clock already
+        // owed the stored clusters and ACLs at this instant.
+        state.settle(std::time::Instant::now());
+
+        let Some(group) = state.parameter_groups.get(&input.parameter_group_name) else {
+            return Err(DescribeParametersErrorModeled::ParameterGroupNotFoundFault(
+                ParameterGroupNotFoundFault {
+                    message: Some(format!(
+                        "Parameter group {} not found.",
+                        input.parameter_group_name
+                    )),
+                },
+            )
+            .into());
+        };
+        // The group's FAMILY decides which parameters it has and the group's own stored
+        // values decide what each one reports, so both halves of the answer come from
+        // state rather than from the request.
+        let entries = group.parameters();
+
+        let (parameters, next_token) = crate::state::paginate(
+            entries,
+            crate::state::page_limit(input.max_results),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            DescribeParametersErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(
+                        "NextToken does not name a position in this listing.".to_string(),
+                    ),
+                },
+            )
+        })?;
+        Ok(DescribeParametersOutput {
+            parameters: Some(parameters),
+            next_token,
+        })
     }
 }
+

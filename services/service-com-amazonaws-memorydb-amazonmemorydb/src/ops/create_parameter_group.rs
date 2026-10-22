@@ -204,6 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             family: input.family,
             description: input.description,
             arn: arn.clone(),
+            // A fresh group overrides nothing: every parameter it reports is its
+            // family's engine default until an `UpdateParameterGroup` changes one.
+            parameter_values: std::collections::BTreeMap::new(),
         };
 
         let tags = crate::state::tag_pairs(input.tags.as_ref());
