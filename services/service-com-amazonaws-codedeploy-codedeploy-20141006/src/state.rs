@@ -107,6 +107,16 @@ pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
 /// deployments, oldest first, so a caller cannot grow the store without limit.
 pub const MAX_DEPLOYMENT_HISTORY: usize = 500;
 
+/// How many on-premises instance records the store keeps.
+///
+/// CodeDeploy publishes no quota for registered on-premises instances, so this
+/// bound is CHOSEN, and it is what keeps a loop of registrations from growing
+/// the store without limit. It is applied first as RETENTION — a record that is
+/// no longer REGISTERED is dropped, oldest first, to make room for a new
+/// registration — and only a registry whose every record is still registered
+/// refuses a further registration, which is the one case no eviction can serve.
+pub const MAX_ON_PREMISES_INSTANCES: usize = 1_000;
+
 /// A registered application, with the deployment groups that belong to it.
 #[derive(Debug, Clone)]
 pub struct Application {
@@ -205,6 +215,37 @@ pub struct DeploymentConfig {
     pub create_time_ms: i64,
 }
 
+/// A registered on-premises instance.
+///
+/// The record OUTLIVES its registration: CodeDeploy keeps a deregistered
+/// instance, with the instant it was deregistered, which is what lets
+/// `ListOnPremisesInstances` answer the `Deregistered` registration status and
+/// `GetOnPremisesInstance` report a `deregisterTime`.
+#[derive(Debug, Clone)]
+pub struct OnPremisesInstance {
+    pub instance_name: String,
+    pub instance_arn: String,
+    /// The ONE IAM ARN the registration was made with: an instance carries an
+    /// IAM user ARN or an IAM session ARN, never both.
+    pub iam_user_arn: Option<String>,
+    /// See [`OnPremisesInstance::iam_user_arn`].
+    pub iam_session_arn: Option<String>,
+    pub register_time_ms: i64,
+    /// `None` while the instance is registered; the instant it was deregistered
+    /// once it is not.
+    pub deregister_time_ms: Option<i64>,
+    pub tags: Vec<Tag>,
+}
+
+impl OnPremisesInstance {
+    /// Whether this instance is currently registered, as the model's
+    /// `RegistrationStatus` (`smithy_query(query="shape",shape="RegistrationStatus")`:
+    /// Registered | Deregistered) distinguishes the two.
+    pub fn is_registered(&self) -> bool {
+        self.deregister_time_ms.is_none()
+    }
+}
+
 /// Per-service state for com-amazonaws-codedeploy-codedeploy-20141006. A handler reaches it through [`with_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodedeployCodedeploy20141006State {
@@ -224,6 +265,21 @@ pub struct ComAmazonawsCodedeployCodedeploy20141006State {
     pending_deployments: Vec<String>,
     /// Deployment configurations by `deploymentConfigName`.
     pub deployment_configs: HashMap<String, DeploymentConfig>,
+    /// On-premises instances by `instanceName`, registered and deregistered
+    /// alike — a deregistered instance keeps its record.
+    pub on_premises_instances: HashMap<String, OnPremisesInstance>,
+    /// Registration order of on-premises instance names, so
+    /// `ListOnPremisesInstances` is deterministic and pages stably.
+    pub on_premises_instance_order: Vec<String>,
+    /// The name of the instance each IAM ARN currently backs, so the
+    /// duplicate-IAM-ARN refusal is a LOOKUP rather than a scan of the whole
+    /// registry under the store lock.
+    ///
+    /// It carries an entry only while that instance is REGISTERED, which
+    /// [`ComAmazonawsCodedeployCodedeploy20141006State::register_on_premises_instance`]
+    /// maintains; an operation that deregisters an instance drops its entry
+    /// through [`ComAmazonawsCodedeployCodedeploy20141006State::release_iam_arns_of`].
+    iam_arn_owners: HashMap<String, String>,
     /// Counter behind every minted identifier, so two ids from one process can
     /// never collide.
     pub next_id: u64,
@@ -377,12 +433,105 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
         }
     }
 
+    /// The instance `iam_arn` currently backs, if any.
+    ///
+    /// A LOOKUP, not a scan: the per-registration work does not grow with how
+    /// many instances the store holds, so one caller's registrations cannot
+    /// lengthen every other caller's time under the store lock.
+    pub fn instance_registered_with(&self, iam_arn: &str) -> Option<&OnPremisesInstance> {
+        self.iam_arn_owners
+            .get(iam_arn)
+            .and_then(|name| self.on_premises_instances.get(name))
+            .filter(|instance| instance.is_registered())
+    }
+
+    /// Record `instance` as this store's newest registration, keeping the
+    /// registry bounded by [`MAX_ON_PREMISES_INSTANCES`].
+    ///
+    /// `false` means the registry is full of instances that are all still
+    /// REGISTERED, so nothing can be evicted to make room and the caller must
+    /// refuse the request rather than grow the store. Re-registering a name the
+    /// store already holds replaces that record and needs no room at all.
+    pub fn register_on_premises_instance(&mut self, instance: OnPremisesInstance) -> bool {
+        let name = instance.instance_name.clone();
+        let replacing = self.on_premises_instances.contains_key(&name);
+        if !replacing {
+            self.evict_deregistered_instances(MAX_ON_PREMISES_INSTANCES - 1);
+            if self.on_premises_instances.len() >= MAX_ON_PREMISES_INSTANCES {
+                return false;
+            }
+            self.on_premises_instance_order.push(name.clone());
+        }
+        // The IAM ARN this name used to hold is free again; the new one is now
+        // taken. Both are single-key operations on the index.
+        self.release_iam_arns_of(&name);
+        for arn in [&instance.iam_user_arn, &instance.iam_session_arn]
+            .into_iter()
+            .flatten()
+        {
+            self.iam_arn_owners.insert(arn.clone(), name.clone());
+        }
+        self.on_premises_instances.insert(name, instance);
+        true
+    }
+
+    /// Free the IAM ARNs the instance named `name` holds, so they back no
+    /// registered instance any more. Called when its registration ends — by a
+    /// re-registration here, and by an operation that deregisters it.
+    pub fn release_iam_arns_of(&mut self, name: &str) {
+        let Some(instance) = self.on_premises_instances.get(name) else {
+            return;
+        };
+        let held: Vec<String> = [&instance.iam_user_arn, &instance.iam_session_arn]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        for arn in held {
+            if self.iam_arn_owners.get(&arn).is_some_and(|owner| owner == name) {
+                self.iam_arn_owners.remove(&arn);
+            }
+        }
+    }
+
+    /// Drop on-premises instance records that are no longer REGISTERED, oldest
+    /// first, until the registry holds at most `target` of them.
+    ///
+    /// Retention, not a reporting-time mutation: it only ever drops records a
+    /// caller already deregistered, and it runs on the registering call that
+    /// needs the room.
+    fn evict_deregistered_instances(&mut self, target: usize) {
+        if self.on_premises_instances.len() <= target {
+            return;
+        }
+        let mut excess = self.on_premises_instances.len() - target;
+        let instances = &mut self.on_premises_instances;
+        let owners = &mut self.iam_arn_owners;
+        self.on_premises_instance_order.retain(|name| {
+            let Some(instance) = instances.get(name) else {
+                // Not in the registry at all: the order list is stale here.
+                return false;
+            };
+            if excess == 0 || instance.is_registered() {
+                return true;
+            }
+            for arn in [&instance.iam_user_arn, &instance.iam_session_arn]
+                .into_iter()
+                .flatten()
+            {
+                owners.remove(arn);
+            }
+            instances.remove(name);
+            excess -= 1;
+            false
+        });
+    }
+
     /// Mint an identifier shaped like the UUID CodeDeploy answers with for an
     /// application, a deployment group or a deployment configuration.
     pub fn mint_uuid(&mut self, kind: &str) -> String {
         mint_uuid_from(&mut self.next_id, kind)
     }
-
     /// Mint a `d-XXXXXXXXX` deployment id: the `d-` prefix and nine characters
     /// from CodeDeploy's uppercase-alphanumeric deployment-id alphabet.
     pub fn mint_deployment_id(&mut self) -> String {
@@ -492,6 +641,133 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCodedeployCodedeploy20141006State>)
+}
+
+/// This service's ARN namespace
+/// (`smithy_query(query="service_info")`: `arnNamespace` `codedeploy`).
+const ARN_SERVICE: &str = "codedeploy";
+
+/// The region an emitted ARN carries when the request carries no SigV4
+/// credential scope to take one from (an anonymous or host-routed request).
+const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region this request was signed for, defaulting to [`DEFAULT_REGION`].
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// The ARN of an on-premises instance:
+/// `arn:aws:codedeploy:<region>:<account>:instance/<instanceName>`, the form the
+/// CodeDeploy User Guide shows for a registered on-premises instance
+/// ("arn:aws:codedeploy:us-west-2:111122223333:instance/AssetTag12010298EX").
+/// The account segment comes from the engine, never from a literal.
+pub fn instance_arn(region: &str, instance_name: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("instance/{instance_name}"))
+}
+
+/// Why CodeDeploy will not accept a name a caller sent for an on-premises
+/// instance. Each operation maps it to the modelled error IT declares, so the
+/// two refusals stay one rule shared by every on-premises operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameRefusal {
+    /// The caller sent no name at all (absent, empty, or only whitespace).
+    Missing,
+    /// The caller sent a name outside the form CodeDeploy accepts.
+    Malformed,
+}
+
+/// The longest resource name CodeDeploy accepts, as the model states it for
+/// every name member it constrains (`smithy_query(query="shape",shape="ApplicationName")`:
+/// `@length(min: 1, max: 100)`).
+pub const MAX_NAME_LENGTH: usize = 100;
+
+/// The characters a CodeDeploy resource name is made of, as the model states it
+/// for every name member it constrains
+/// (`smithy_query(query="shape",shape="ApplicationName")`: pattern
+/// `^[A-Za-z0-9+=,.@_-]*$`).
+fn is_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || "+=,.@_-".contains(character)
+}
+
+/// Check `name` against the form CodeDeploy accepts for an on-premises instance
+/// name: at least one character, at most [`MAX_NAME_LENGTH`], all of them from
+/// the service's resource-name character set.
+///
+/// `InstanceName` carries no `@length` or `@pattern` of its own in the model, so
+/// the boundary validator lets every string through and this is where the form
+/// is decided.
+pub fn check_instance_name(name: &str) -> Result<(), NameRefusal> {
+    if name.trim().is_empty() {
+        return Err(NameRefusal::Missing);
+    }
+    if name.chars().count() > MAX_NAME_LENGTH || !name.chars().all(is_name_character) {
+        return Err(NameRefusal::Malformed);
+    }
+    Ok(())
+}
+
+/// Whether `candidate` is an ARN of `service` naming a `resource_type` resource.
+///
+/// Six colon-separated fields — `arn:<partition>:<service>:<region>:<account>:<resource>`
+/// — is the ARN form AWS documents, with the resource part opening on the
+/// resource type. IAM and STS ARNs are global, so the region field is allowed to
+/// be empty; the partition, the account and the resource identifier are not.
+fn is_arn_of(candidate: &str, service: &str, resource_type: &str) -> bool {
+    let mut fields = candidate.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(found_service),
+        Some(_region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return false;
+    };
+    !partition.is_empty()
+        && found_service == service
+        && !account.is_empty()
+        && resource
+            .strip_prefix(resource_type)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|identifier| !identifier.is_empty())
+}
+
+/// Whether `candidate` is an IAM user ARN — `arn:aws:iam::<account>:user/<name>`,
+/// the form `RegisterOnPremisesInstance$iamUserArn` documents ("The ARN of the
+/// user to associate with the on-premises instance").
+pub fn is_iam_user_arn(candidate: &str) -> bool {
+    is_arn_of(candidate, "iam", "user")
+}
+
+/// Whether `candidate` is an IAM session ARN —
+/// `arn:aws:sts::<account>:assumed-role/<role>/<session>`, the form an STS
+/// assumed-role session carries, which is what
+/// `RegisterOnPremisesInstance$iamSessionArn` associates with the instance.
+pub fn is_iam_session_arn(candidate: &str) -> bool {
+    is_arn_of(candidate, "sts", "assumed-role")
+}
+
+/// A stored on-premises instance as the modelled `InstanceInfo`.
+pub fn instance_info(instance: &OnPremisesInstance) -> crate::ops::types::InstanceInfo {
+    crate::ops::types::InstanceInfo {
+        instance_name: Some(instance.instance_name.clone()),
+        iam_session_arn: instance.iam_session_arn.clone(),
+        iam_user_arn: instance.iam_user_arn.clone(),
+        instance_arn: Some(instance.instance_arn.clone()),
+        register_time: Some(timestamp(instance.register_time_ms)),
+        deregister_time: instance.deregister_time_ms.map(timestamp),
+        tags: non_empty(&instance.tags),
+    }
 }
 
 /// How many items one page of a listing carries.

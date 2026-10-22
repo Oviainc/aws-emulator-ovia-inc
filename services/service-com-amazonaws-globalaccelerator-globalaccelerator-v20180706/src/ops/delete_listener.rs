@@ -3,7 +3,9 @@
 //! @op DeleteListener
 //! Removes the listener from [`crate::state`] and from its parent accelerator's child
 //! list, so the next `ListListeners`/`DescribeListener` no longer sees it. An ARN the
-//! store does not hold is `ListenerNotFoundException`.
+//! store does not hold is `ListenerNotFoundException`, and a listener that still has
+//! endpoint groups is `AssociatedEndpointGroupFoundException`: "You must remove all
+//! dependent resources from a listener before you can delete it."
 //!
 //! ## Shape of an operation
 //!
@@ -165,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        let Some(record) = store.listeners.remove(&input.listener_arn) else {
+        let Some(record) = store.listeners.get(&input.listener_arn) else {
             return Err(DeleteListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
                     message: Some(crate::state::listener_not_found_message(
@@ -176,8 +178,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if let Some(parent) = store.accelerators.get_mut(&record.accelerator_arn) {
-            parent.listener_arns.retain(|arn| *arn != record.arn);
+        // "The listener that you specified has an endpoint group associated with it. You
+        // must remove all dependent resources from a listener before you can delete it."
+        // (`AssociatedEndpointGroupFoundException`.) Checked BEFORE the record is
+        // removed, so a refused delete leaves the listener exactly as it was.
+        if !record.endpoint_group_arns.is_empty() {
+            return Err(
+                DeleteListenerErrorModeled::AssociatedEndpointGroupFoundException(
+                    AssociatedEndpointGroupFoundException {
+                        message: Some(crate::state::associated_endpoint_group_found_message(
+                            &input.listener_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let accelerator_arn = record.accelerator_arn.clone();
+        store.listeners.remove(&input.listener_arn);
+        if let Some(parent) = store.accelerators.get_mut(&accelerator_arn) {
+            parent.listener_arns.retain(|arn| *arn != input.listener_arn);
         }
         // The idempotency record this listener's token minted is released with it.
         store.prune_idempotency();

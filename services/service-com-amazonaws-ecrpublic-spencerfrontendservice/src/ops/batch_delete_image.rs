@@ -217,10 +217,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .is_some_and(|digest| !digest.is_empty());
             if by_digest {
                 // "You can completely delete an image (and all of its tags) by
-                // specifying the digest of the image in your request."
+                // specifying the digest of the image in your request." Every tag that
+                // went with it is part of what this call removed, so each one is
+                // reported beside the digest; an image that carried none is reported by
+                // digest alone.
                 if let Some(removed) = repository.images.remove(&digest) {
                     for stale in &removed.tags {
                         repository.tag_index.remove(stale);
+                    }
+                    if removed.tags.is_empty() {
+                        deleted.push(ImageIdentifier {
+                            image_digest: Some(digest.clone()),
+                            image_tag: None,
+                        });
+                    } else {
+                        for detached in &removed.tags {
+                            deleted.push(ImageIdentifier {
+                                image_digest: Some(digest.clone()),
+                                image_tag: Some(detached.clone()),
+                            });
+                        }
                     }
                 }
             } else if let Some(tag) = tag {
@@ -238,12 +254,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if now_untagged {
                     repository.images.remove(&digest);
                 }
+                deleted.push(ImageIdentifier {
+                    image_digest: Some(digest),
+                    image_tag: Some(tag.to_string()),
+                });
             }
-            deleted.push(ImageIdentifier {
-                image_digest: Some(digest),
-                image_tag: tag.map(ToString::to_string),
-            });
         }
+
+        // An image this call removed is no longer one a manifest list stored beside it
+        // is the max over, so the sizes this repository reports are recomputed now that
+        // the image set has changed.
+        repository.refresh_image_sizes();
         drop(store);
 
         Ok(BatchDeleteImageOutput {

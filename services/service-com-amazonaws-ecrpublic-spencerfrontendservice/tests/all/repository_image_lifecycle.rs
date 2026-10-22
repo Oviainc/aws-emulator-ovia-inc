@@ -389,9 +389,9 @@ async fn create_repository_reports_the_catalog_data_it_stored() {
     );
     assert_eq!(
         catalog["marketplaceCertified"],
-        json!(false),
-        "expected a repository created through the API not to be Marketplace certified, \
-         got {catalog}"
+        Value::Null,
+        "expected no Marketplace certification statement about a repository created \
+         through the API, got {catalog}"
     );
     assert_eq!(
         catalog["logoUrl"].as_str().unwrap_or_default(),
@@ -417,8 +417,8 @@ async fn create_repository_reports_the_catalog_data_it_stored() {
     );
     assert_eq!(
         bare["catalogData"]["marketplaceCertified"],
-        json!(false),
-        "expected marketplaceCertified false, got {bare}"
+        Value::Null,
+        "expected marketplaceCertified to be absent, got {bare}"
     );
 }
 
@@ -481,6 +481,10 @@ struct ManifestCase {
     manifest_media_type: Option<&'static str>,
     /// The `artifactMediaType` the manifest's `config` states, if any.
     artifact_media_type: Option<&'static str>,
+    /// The `imageSizeInBytes` the manifest's layer descriptors add up to, or `None`
+    /// when the document references no sized content. Covered exhaustively by
+    /// `tests/all/response_field_fidelity.rs`.
+    image_size: Option<i64>,
 }
 
 /// Manifests spanning what a pushed document can be: an OCI image manifest carrying both
@@ -495,11 +499,15 @@ fn manifest_cases() -> Vec<ManifestCase> {
                 "schemaVersion": 2,
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "size": 7},
-                "layers": [],
+                "layers": [
+                    {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 12},
+                    {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": 34},
+                ],
             })
             .to_string(),
             manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json"),
             artifact_media_type: Some("application/vnd.oci.image.config.v1+json"),
+            image_size: Some(46),
         },
         ManifestCase {
             case: "docker manifest list, no config",
@@ -513,18 +521,21 @@ fn manifest_cases() -> Vec<ManifestCase> {
                 "application/vnd.docker.distribution.manifest.list.v2+json",
             ),
             artifact_media_type: None,
+            image_size: None,
         },
         ManifestCase {
             case: "json with no media types at all",
             manifest: json!({"schemaVersion": 1, "name": "plain"}).to_string(),
             manifest_media_type: None,
             artifact_media_type: None,
+            image_size: None,
         },
         ManifestCase {
             case: "not a json document",
             manifest: "this is not a manifest".to_string(),
             manifest_media_type: None,
             artifact_media_type: None,
+            image_size: None,
         },
         ManifestCase {
             case: "large manifest with multi-byte characters",
@@ -535,6 +546,7 @@ fn manifest_cases() -> Vec<ManifestCase> {
             .to_string(),
             manifest_media_type: None,
             artifact_media_type: None,
+            image_size: None,
         },
     ]
 }
@@ -617,8 +629,9 @@ async fn put_image_digests_the_manifest_and_describe_images_reports_the_stored_b
         );
         assert_eq!(
             detail["imageSizeInBytes"].as_i64(),
-            Some(manifest_case.manifest.len() as i64),
-            "case {case:?}: expected the manifest's byte length, got {detail}"
+            manifest_case.image_size,
+            "case {case:?}: expected the size of the layer content the manifest \
+             references, got {detail}"
         );
         assert_eq!(
             detail["imageTags"], json!([tag]),
@@ -1162,8 +1175,8 @@ async fn batch_delete_image_removes_what_it_reports_and_reports_what_it_cannot()
     .await;
     assert_eq!(
         by_digest["imageIds"],
-        json!([{"imageDigest": double_digest}]),
-        "expected the deleted digest to be reported, got {by_digest}"
+        json!([{"imageDigest": double_digest, "imageTag": "second"}]),
+        "expected the deleted digest and the tag it carried to be reported, got {by_digest}"
     );
     let left = ok(
         &router,

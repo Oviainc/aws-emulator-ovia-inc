@@ -129,7 +129,10 @@ async fn describe(
 }
 
 /// Every entry of one engine, deprecated ones included, in reported order.
-async fn all_versions_of(router: &MultiServiceRouter, engine: &str) -> Vec<Version> {
+///
+/// `pub(crate)` so the catalogue-population suite reads an engine's builds through the
+/// same helper rather than a second copy of it.
+pub(crate) async fn all_versions_of(router: &MultiServiceRouter, engine: &str) -> Vec<Version> {
     let (reported, marker) = describe(
         router,
         &format!("every version of {engine}"),
@@ -642,54 +645,81 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
         .collect();
 
     // Paging at the smallest page size the operation accepts must visit every entry
-    // exactly once, in the same order, and terminate.
-    let mut seen: Vec<(String, String)> = Vec::new();
-    let mut marker: Option<String> = None;
-    let mut pages = 0usize;
-    loop {
-        let mut params: Vec<(&str, String)> = vec![
-            ("MaxRecords", "20".to_string()),
-            ("IncludeAll", "true".to_string()),
-        ];
-        if let Some(marker) = &marker {
-            params.push(("Marker", marker.clone()));
-        }
-        let (page, next) = describe(&router, "paged report", &params).await;
-        assert!(
-            !page.is_empty(),
-            "case \"paged report\": a Marker was returned, so the next page must carry \
-             entries"
-        );
-        assert!(
-            page.len() <= 20,
-            "case \"paged report\": a page must hold at most MaxRecords entries, got {}",
-            page.len()
-        );
-        seen.extend(
-            page.iter()
-                .map(|version| (version.engine.clone(), version.engine_version.clone())),
-        );
-        pages += 1;
-        assert!(
-            pages < 50,
-            "case \"paged report\": paging did not terminate after {pages} pages"
-        );
-        match next {
-            Some(next) => marker = Some(next),
-            None => break,
-        }
-    }
+    // exactly once, in the same order, and terminate — the per-page guards live in
+    // `walk_every_version`.
+    let seen: Vec<(String, String)> = walk_every_version(&router, "paged report", 20)
+        .await
+        .iter()
+        .map(|version| (version.engine.clone(), version.engine_version.clone()))
+        .collect();
     assert_eq!(
         seen, expected,
         "case \"paged report\": paging must visit every entry exactly once, in the \
          report's own order"
     );
     assert!(
-        pages > 1,
-        "case \"paged report\": a page size of 20 must take more than one page, got \
-         {pages} for {} entries",
+        expected.len() > 20,
+        "case \"paged report\": a page size of 20 must take more than one page, so the \
+         report must carry more than 20 entries, got {}",
         expected.len()
     );
+}
+
+/// One page of the WHOLE report (`IncludeAll`, no narrowing) at `page_size`, resumed at
+/// `marker`: the entries it reported and the `Marker` it carried.
+///
+/// `pub(crate)` because the catalogue-population suite walks the same report; the paging
+/// guards every walk owes belong in one place.
+pub(crate) async fn page_of_every_version(
+    router: &MultiServiceRouter,
+    case: &str,
+    page_size: usize,
+    marker: Option<&str>,
+) -> (Vec<Version>, Option<String>) {
+    let mut params: Vec<(&str, String)> = vec![
+        ("MaxRecords", page_size.to_string()),
+        ("IncludeAll", "true".to_string()),
+    ];
+    if let Some(marker) = marker {
+        params.push(("Marker", marker.to_string()));
+    }
+    let (page, next) = describe(router, case, &params).await;
+    assert!(
+        page.len() <= page_size,
+        "case {case:?}: a page must hold at most MaxRecords={page_size} entries, got {}",
+        page.len()
+    );
+    (page, next)
+}
+
+/// The whole report, walked one page of `page_size` at a time: a page the report issued a
+/// `Marker` for carries entries, no page exceeds `MaxRecords`, and the walk terminates.
+pub(crate) async fn walk_every_version(
+    router: &MultiServiceRouter,
+    case: &str,
+    page_size: usize,
+) -> Vec<Version> {
+    let mut seen: Vec<Version> = Vec::new();
+    let mut marker: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let (page, next) = page_of_every_version(router, case, page_size, marker.as_deref()).await;
+        assert!(
+            !page.is_empty(),
+            "case {case:?}: a page the report issued a Marker for must carry entries"
+        );
+        seen.extend(page);
+        pages += 1;
+        assert!(
+            pages < 500,
+            "case {case:?}: paging did not terminate after {pages} pages"
+        );
+        match next {
+            Some(next) => marker = Some(next),
+            None => break,
+        }
+    }
+    seen
 }
 
 // ---------------------------------------------------------------------------
