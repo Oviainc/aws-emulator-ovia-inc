@@ -19,7 +19,9 @@
 //!   [`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::purchase_options`]);
 //! * the listing match set `SearchListings` pages over and `SearchFacets` counts facets
 //!   from ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::search_matches`],
-//!   [`matches_every_search_filter`]).
+//!   [`matches_every_search_filter`]);
+//! * the member-`@pattern` check the framework's input walk cannot make for an
+//!   unanchored expression ([`validate_member_patterns`]).
 
 use std::collections::BTreeMap;
 
@@ -959,6 +961,158 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState>)
+}
+
+// ---------------------------------------------------------------------------
+// A member's modelled `@pattern` holds over the WHOLE value.
+// ---------------------------------------------------------------------------
+
+// Smithy specifies `@pattern` as a *find* — the expression has to match SOMEWHERE in the
+// value — and the framework's input walk implements exactly that
+// (`vendor/smithy-schema-server/src/constraints.rs`: "Smithy pattern semantics are a
+// *find* … which is exactly `regex::Regex::is_match`"). AWS enforces the member's pattern
+// over the whole value instead. For an expression a model ANCHORS with `^` / `$` the two
+// readings coincide, so the walk already refuses exactly what AWS refuses, and every
+// pattern-bearing member of this service is anchored
+// (`smithy_query(query="shape",shape="ListingId,ProductId,OfferId,OfferSetId,Locale,NextToken,SearchFilterValue,PurchaseOptionFilterValue")`)
+// except ONE: `SearchText`'s `[^\n]*`
+// (`smithy_query(query="shape",shape="SearchText")`), which is *found* in every value
+// there is — including one carrying a line feed, which as a whole it does not match. So
+// `searchText`, the member `SearchFacetsInput` and `SearchListingsInput` both carry, is
+// the member whose pattern this service has to check itself.
+//
+// NOTHING about constraint checking is reimplemented here: the member's own modelled
+// expression is read off its schema, anchored, and re-declared in the framework's own form
+// (a [`TraitMap`] carrying a [`PatternTrait`]) hung on a member schema of the same name,
+// and the check is [`validate`] — the same walk the request boundary runs — reported
+// through [`crate::service::constraint_envelope`], so a refusal made here reads exactly
+// like one made there.
+
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{validate, PatternTrait};
+use std::sync::LazyLock;
+
+/// This service's Smithy namespace, for the shadow member schema below.
+const NAMESPACE: &str = "com.amazonaws.marketplacediscovery";
+
+/// The `@pattern` the model declares for `searchText`, anchored at both ends so the WHOLE
+/// value has to match it.
+///
+/// Read off the member's own schema (so it cannot drift from the model), wrapped in a
+/// non-capturing group that keeps a top-level alternation inside the anchors, and rendered
+/// with each control character as its regex escape — the model spells `SearchText`'s class
+/// with a LITERAL line feed, which `\n` matches identically while keeping the constraint
+/// clause on one line. `None` when the model gives the member no pattern, which is nothing
+/// to check.
+static ANCHORED_SEARCH_TEXT_PATTERN: LazyLock<Option<String>> = LazyLock::new(|| {
+    let modelled = modelled_member_pattern(crate::ops::types::SEARCH_FACETS_INPUT_SCHEMA, "searchText")?;
+    Some(format!("^(?:{})$", control_characters_escaped(modelled)))
+});
+
+/// `searchText`'s constraints for the whole-value walk: the anchored pattern, and nothing
+/// else — the member's `@length` is enforced by the boundary walk already (and the expression below is borrowed from the
+/// static above, which is what gives `PatternTrait::new` the `&'static str` it takes).
+static SEARCH_TEXT_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    if let Some(anchored) = ANCHORED_SEARCH_TEXT_PATTERN.as_deref() {
+        traits.insert(Box::new(PatternTrait::new(anchored)));
+    }
+    traits
+});
+
+/// The `searchText` member schema the walk reads: its name gives the violation path and its
+/// trait map carries the constraint.
+static M_SEARCH_TEXT: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.marketplacediscovery#WholeValueSearchText$searchText",
+        NAMESPACE,
+        "searchText",
+    ),
+    ShapeType::String,
+    "searchText",
+    0,
+)
+.with_traits(&SEARCH_TEXT_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`WholeValueSearchText`] WRITES, and a root struct schema
+/// carries no member name, so it contributes no path segment.
+static WHOLE_VALUE_SEARCH_TEXT_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.marketplacediscovery#WholeValueSearchText",
+        NAMESPACE,
+        "WholeValueSearchText",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One request's `searchText`, written for the validating walk the way the codec writes a
+/// string member.
+struct WholeValueSearchText<'a> {
+    search_text: &'a str,
+}
+
+impl SerializableStruct for WholeValueSearchText<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_SEARCH_TEXT, self.search_text)
+    }
+}
+
+/// Refuse a `searchText` whose WHOLE value does not match the member's modelled
+/// `@pattern`, or pass it through.
+///
+/// `Err` is this service's constraint report for the violation — the same envelope and
+/// clause the boundary walk's refusals carry — so the caller answers it with the modelled
+/// `ValidationException` (HTTP 400). An absent `searchText` is nothing to check.
+pub fn validate_search_text(search_text: Option<&str>) -> Result<(), String> {
+    let Some(search_text) = search_text else {
+        return Ok(());
+    };
+    let violations = validate(
+        &WholeValueSearchText { search_text },
+        &WHOLE_VALUE_SEARCH_TEXT_SCHEMA,
+    );
+    match crate::service::constraint_envelope(&violations) {
+        None => Ok(()),
+        Some(message) => Err(message),
+    }
+}
+
+/// The `@pattern` expression the model declares for one member of `input_schema`, or
+/// `None` for a member it declares none for (or does not declare at all).
+///
+/// Public so a test can assert that the two inputs carrying `searchText` declare the same
+/// expression, which is what makes checking one of them enough.
+pub fn modelled_member_pattern(input_schema: &Schema, member: &str) -> Option<&'static str> {
+    let member_schema = input_schema
+        .members()
+        .iter()
+        .find(|candidate| candidate.member_name() == Some(member))?;
+    let pattern = member_schema.traits()?.get(&PatternTrait::TRAIT_ID)?;
+    Some(pattern.as_any().downcast_ref::<PatternTrait>()?.regex)
+}
+
+/// A regular expression with each ASCII control character written as the escape that
+/// matches the same character: a COSMETIC rewrite, equivalent to the model's own
+/// expression for the regex engine, so a refusal quoting the expression stays on one line
+/// instead of breaking across two.
+fn control_characters_escaped(pattern: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(pattern.len());
+    for c in pattern.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if other.is_control() => {
+                let _ = write!(out, "\\x{{{:x}}}", other as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

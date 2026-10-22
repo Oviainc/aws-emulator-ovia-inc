@@ -27,3 +27,5 @@ mod signing_name_claims;
 mod state_roundtrip;
 #[path = "all/validation_message_rules.rs"]
 mod validation_message_rules;
+#[path = "all/whole_value_patterns.rs"]
+mod whole_value_patterns;
