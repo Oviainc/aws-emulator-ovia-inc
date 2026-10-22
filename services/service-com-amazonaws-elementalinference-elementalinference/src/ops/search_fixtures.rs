@@ -251,18 +251,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "endDate '{end_date}' is not a valid date. Specify the date in ISO 8601 format, as YYYY-MM-DD."
             )));
         };
+        // The ORDER of the two members is the rule, so the refusal is not about either
+        // date's own validity and its message names the members rather than the values
+        // they carried (`crate::state::END_DATE_BEFORE_START_DATE_MESSAGE`).
         if end_day < start_day {
-            return Err(validation(format!(
-                "endDate '{end_date}' must not precede startDate '{}'.",
-                input.start_date
-            )));
+            return Err(validation(
+                crate::state::END_DATE_BEFORE_START_DATE_MESSAGE.to_string(),
+            ));
         }
         // "The window from startDate through endDate must not exceed seven days"
-        // (`SearchFixturesRequest$endDate`), counting both ends.
+        // (`SearchFixturesRequest$endDate`), counting both ends. Another rule about the
+        // relation between the two members, so another invariant sentence: the
+        // documented bound, with neither the dates nor the span they computed to.
         let window_days = end_day - start_day + 1;
         if window_days > crate::state::MAX_SEARCH_WINDOW_DAYS {
             return Err(validation(format!(
-                "The window from startDate through endDate must not exceed {} days; this request covers {window_days} days.",
+                "The window from startDate through endDate must not exceed {} days.",
                 crate::state::MAX_SEARCH_WINDOW_DAYS
             )));
         }

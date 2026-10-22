@@ -191,15 +191,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A `fixtureId` the data source does not recognise is refused as INPUT,
             // not reported as a missing resource: the recorded behaviour of this
             // operation for an id that names no fixture is error code
-            // `ValidationException` (HTTP 400). The message names the member at fault
-            // without echoing the value, as this service's not-found wording does
-            // (`crate::state::NOT_FOUND_MESSAGE`).
+            // `ValidationException` (HTTP 400).
+            //
+            // The rule that refused is about ONE value the request supplied — the
+            // identifier that resolved to nothing — so the message is built from the
+            // request and NAMES that identifier, and then says what to do about it.
+            // (This is the one shape of refusal that does name a value: a message is
+            // invariant only where the rule is about state or about a relation between
+            // members, and reports a value only where that value is the caller's own.)
             return Err(GetFixtureErrorModeled::ValidationException(
                 ValidationException {
-                    message: "The fixtureId that you specified is not valid. Obtain a \
-                              fixtureId from SearchFixtures, or from the clipping output \
-                              of a feed."
-                        .to_string(),
+                    message: format!(
+                        "Can't find fixture {}. Use a different fixtureId and try again.",
+                        input.fixture_id
+                    ),
                 },
             )
             .into());

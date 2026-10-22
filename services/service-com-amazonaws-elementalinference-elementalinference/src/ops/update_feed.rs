@@ -227,10 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A feed whose deletion has been accepted is on its way out; updating it
         // would cancel a deletion the clock already owes, so it is refused with the
-        // modelled ConflictException (HTTP 409).
+        // modelled ConflictException (HTTP 409). The rule is a property of the stored
+        // feed, so the message is that rule's invariant sentence and reports no value.
         if feed.status == crate::state::FeedStatus::Deleting {
             return Err(UpdateFeedErrorModeled::ConflictException(ConflictException {
-                message: format!("Feed {} is being deleted and cannot be updated.", input.id),
+                message: crate::state::FEED_BEING_DELETED_MESSAGE.to_string(),
             })
             .into());
         }

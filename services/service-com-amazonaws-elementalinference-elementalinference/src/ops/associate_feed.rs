@@ -10,10 +10,13 @@
 //!
 //! * a feed takes an association only from a status that admits one — `AVAILABLE` (no
 //!   resource yet), or `ACTIVE` for the resource that already holds it; from every
-//!   other status the association is refused with the modelled `ValidationException`,
-//!   naming the status;
+//!   other status the association is refused with the modelled `ValidationException`;
 //! * "You can associate only one resource with each feed": a different resource name on
 //!   an already-claimed feed is refused;
+//! * a refusal decided from the STORED feed carries that rule's invariant sentence
+//!   (`crate::state::FEED_ALREADY_ASSOCIATED_MESSAGE`,
+//!   `crate::state::FEED_NOT_ASSOCIABLE_MESSAGE`): the message interpolates no value
+//!   read out of state — not the feed's status and not the resource that holds it;
 //! * PATCH semantics — "You can add more outputs to the existing outputs. New outputs
 //!   will be appended", and an output that would modify an existing one (same name) is
 //!   refused with the modelled `ConflictException` ("conflicting outputs", per the
@@ -277,28 +280,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::FeedStatus::Active
                 if feed.associated_resource_name()
                     == Some(input.associated_resource_name.as_str()) => {}
+            // "You can associate only one resource with each feed": the refusal is
+            // decided by the association the feed already holds, so its message is that
+            // rule's invariant sentence and interpolates neither the feed's status nor
+            // the resource that holds it — a caller that named a different resource
+            // learns that the feed is taken, not by whom.
             crate::state::FeedStatus::Active => {
                 return Err(AssociateFeedErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "You can't associate this feed. It has status {} which indicate \
-                             that it's already associated with the resource {}. You can \
-                             associate only one resource with each feed.",
-                            feed.status.as_wire(),
-                            feed.associated_resource_name().unwrap_or_default()
-                        ),
+                        message: crate::state::FEED_ALREADY_ASSOCIATED_MESSAGE.to_string(),
                     },
                 )
                 .into());
             }
-            status => {
+            // Every other status admits no association at all. Again a property of the
+            // stored feed rather than of any value the request carried, so again the
+            // rule's invariant sentence, with no status in it.
+            _ => {
                 return Err(AssociateFeedErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "You can't associate this feed. It has status {} which indicate \
-                             that it can't take an association.",
-                            status.as_wire()
-                        ),
+                        message: crate::state::FEED_NOT_ASSOCIABLE_MESSAGE.to_string(),
                     },
                 )
                 .into());
@@ -331,15 +332,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !input.outputs.is_empty()
             && feed.outputs.len() + input.outputs.len() > crate::state::MAX_OUTPUTS_PER_FEED
         {
+            // The quota is the rule, so the message states the quota: the number of
+            // outputs the stored feed currently holds is state the refusal does not
+            // report, exactly as CreateFeed's and CreateDictionary's quota refusals
+            // state their bound without reporting how much of it is in use.
             return Err(AssociateFeedErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
-                        "Feed {} holds {} of the maximum of {} outputs, so it cannot take {} \
-                         more. Remove outputs with UpdateFeed or request a quota increase.",
-                        feed.id,
-                        feed.outputs.len(),
-                        crate::state::MAX_OUTPUTS_PER_FEED,
-                        input.outputs.len()
+                        "You can't add these outputs because a feed holds at most {} outputs. \
+                         Remove outputs with UpdateFeed or request a quota increase.",
+                        crate::state::MAX_OUTPUTS_PER_FEED
                     ),
                 },
             )

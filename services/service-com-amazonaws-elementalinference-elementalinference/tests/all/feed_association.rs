@@ -17,8 +17,9 @@
 //! * a feed takes an association only from a status that admits one — `AVAILABLE`, or
 //!   `ACTIVE` for the resource that already holds it; from any other status, and for a
 //!   second, different resource ("you can associate only one resource with each feed"),
-//!   the call is refused with the modelled `ValidationException` naming the status, and
-//!   the stored feed is left exactly as it was;
+//!   the call is refused with the modelled `ValidationException` carrying that rule's
+//!   invariant sentence, and the stored feed is left exactly as it was (how a refusal is
+//!   WORDED is `error_message_rule.rs`);
 //! * an output that would MODIFY an existing one (same name) is a `ConflictException`,
 //!   and a feed's output list is BOUNDED: an append past the quota answers the modelled
 //!   `ServiceQuotaExceededException`;
@@ -34,7 +35,10 @@
 
 use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
 use serde_json::{json, Value};
-use service_com_amazonaws_elementalinference_elementalinference::state::MAX_OUTPUTS_PER_FEED;
+use service_com_amazonaws_elementalinference_elementalinference::state::{
+    FEED_ALREADY_ASSOCIATED_MESSAGE, FEED_NOT_ASSOCIABLE_MESSAGE, FEED_NOT_ASSOCIATED_MESSAGE,
+    MAX_OUTPUTS_PER_FEED,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
@@ -356,9 +360,10 @@ async fn a_second_resource_is_refused_and_the_first_claim_stands() {
             json!("ValidationException"),
             "case {other:?}: that 400 is a ValidationException, got {error}"
         );
-        assert!(
-            error["message"].as_str().is_some_and(|m| m.contains("ACTIVE")),
-            "case {other:?}: the refusal names the feed's status, got {}",
+        assert_eq!(
+            error["message"],
+            json!(FEED_ALREADY_ASSOCIATED_MESSAGE),
+            "case {other:?}: the refusal carries the rule's invariant sentence, got {}",
             error["message"]
         );
 
@@ -380,8 +385,8 @@ async fn a_second_resource_is_refused_and_the_first_claim_stands() {
 }
 
 /// A feed takes an association only from a status that admits one: from every other
-/// status the call is refused with the modelled `ValidationException` naming the status,
-/// and nothing is written.
+/// status the call is refused with the modelled `ValidationException` carrying the
+/// rule's invariant sentence, and nothing is written.
 #[tokio::test]
 async fn associate_is_refused_from_every_status_that_takes_no_association() {
     let router = router();
@@ -449,11 +454,11 @@ async fn associate_is_refused_from_every_status_that_takes_no_association() {
             json!("ValidationException"),
             "case {status_under_test:?}: that 400 is a ValidationException, got {error}"
         );
-        assert!(
-            error["message"]
-                .as_str()
-                .is_some_and(|m| m.contains(status_under_test)),
-            "case {status_under_test:?}: the refusal names the status, got {}",
+        assert_eq!(
+            error["message"],
+            json!(FEED_NOT_ASSOCIABLE_MESSAGE),
+            "case {status_under_test:?}: the refusal carries the rule's invariant sentence, \
+             got {}",
             error["message"]
         );
 
@@ -887,7 +892,8 @@ async fn disassociate_with_a_name_that_is_not_the_associated_resource_is_refused
 }
 
 /// A feed that is not currently associated has nothing to release, so DisassociateFeed
-/// is refused with the modelled `ValidationException` naming the status.
+/// is refused with the modelled `ValidationException` carrying that rule's invariant
+/// sentence.
 #[tokio::test]
 async fn disassociate_is_refused_from_every_status_that_holds_no_resource() {
     let router = router();
@@ -916,11 +922,11 @@ async fn disassociate_is_refused_from_every_status_that_holds_no_resource() {
             json!("ValidationException"),
             "case {status_under_test:?}: that 400 is a ValidationException, got {error}"
         );
-        assert!(
-            error["message"]
-                .as_str()
-                .is_some_and(|m| m.contains(status_under_test)),
-            "case {status_under_test:?}: the refusal names the status, got {}",
+        assert_eq!(
+            error["message"],
+            json!(FEED_NOT_ASSOCIATED_MESSAGE),
+            "case {status_under_test:?}: the refusal carries the rule's invariant sentence, \
+             got {}",
             error["message"]
         );
     }

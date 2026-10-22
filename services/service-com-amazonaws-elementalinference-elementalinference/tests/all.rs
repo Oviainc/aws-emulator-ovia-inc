@@ -15,6 +15,8 @@
 mod dictionary_lifecycle;
 #[path = "all/error_contract.rs"]
 mod error_contract;
+#[path = "all/error_message_rule.rs"]
+mod error_message_rule;
 #[path = "all/feed_association.rs"]
 mod feed_association;
 #[path = "all/feed_lifecycle.rs"]

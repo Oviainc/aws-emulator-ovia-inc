@@ -7,9 +7,13 @@
 //! The rules this handler enforces, from the modelled contract reproduced below:
 //!
 //! * only a feed that currently HOLDS an association can release one — a feed in any
-//!   other status is refused with the modelled `ValidationException`, naming the status;
+//!   other status is refused with the modelled `ValidationException`;
 //! * `associatedResourceName` is "the name of the resource currently associated with the
 //!   feed", so a name that is not that resource's is refused;
+//! * both of those refusals are decided from the STORED feed, so each carries its
+//!   rule's invariant sentence (`crate::state::FEED_NOT_ASSOCIATED_MESSAGE`,
+//!   `crate::state::WRONG_ASSOCIATED_RESOURCE_MESSAGE`) and interpolates no value read
+//!   out of state — neither the feed's status nor the resource that does hold it;
 //! * on success "the outputs in the feed become DISABLED" and the feed is `ARCHIVED`,
 //!   which is terminal: a released feed takes no further association (the `FeedStatus`
 //!   enum carries `ARCHIVED` and no other operation produces it, and a release is
@@ -204,14 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // A feed whose deletion has been accepted is DELETING, so it is refused here
         // too: the release can neither run nor discard the removal the clock owes.
+        //
+        // The rule is a property of the stored feed, so the message is that rule's
+        // invariant sentence and carries no status.
         if feed.status != crate::state::FeedStatus::Active {
             return Err(DisassociateFeedErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "You can't disassociate this feed. It has status {} which indicate \
-                         that it's not currently associated with a resource.",
-                        feed.status.as_wire()
-                    ),
+                    message: crate::state::FEED_NOT_ASSOCIATED_MESSAGE.to_string(),
                 },
             )
             .into());
@@ -219,16 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // ACTIVE is exactly the status that carries an association, so the name is
         // there to compare against: the caller must name the resource that actually
-        // holds the feed.
-        let associated = feed.associated_resource_name().unwrap_or_default();
-        if associated != input.associated_resource_name {
+        // holds the feed. The mismatch is decided from the stored association, so the
+        // message is the rule's invariant sentence: it reports neither the name the
+        // request carried nor the resource the feed is really associated with, which a
+        // caller that named a different one is not entitled to learn.
+        if feed.associated_resource_name() != Some(input.associated_resource_name.as_str()) {
             return Err(DisassociateFeedErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "The resource {} is not associated with this feed. The feed is \
-                         associated with the resource {associated}.",
-                        input.associated_resource_name
-                    ),
+                    message: crate::state::WRONG_ASSOCIATED_RESOURCE_MESSAGE.to_string(),
                 },
             )
             .into());

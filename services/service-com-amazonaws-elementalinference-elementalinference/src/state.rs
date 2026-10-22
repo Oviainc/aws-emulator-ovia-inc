@@ -131,6 +131,51 @@ impl FeedStatus {
 /// id that was probed.
 pub const NOT_FOUND_MESSAGE: &str = "Resource not found";
 
+/// The messages this service renders for the refusals its handlers decide from STORED
+/// STATE or from a relation between request members.
+///
+/// A refusal's message follows the RULE that refused the request, not the request's or
+/// the record's values: where the violated rule is a property of the stored resource,
+/// or a relation between two members, no single value is what is at fault, so the
+/// message is the rule's invariant sentence — the same text whatever the request named
+/// and whatever the record holds. That is also what makes a message matchable by a
+/// client, and it is what keeps one caller's refusal from disclosing another caller's
+/// association or a resource's internal status. Only a rule about ONE value's own
+/// validity (a member whose value violates its constraint, an identifier that resolved
+/// to nothing) names a value, and then it names the value the REQUEST supplied.
+///
+/// `AssociateFeed` on a feed that already holds an association: the recorded refusal is
+/// this sentence, naming neither the resource that holds the feed nor the feed's status.
+pub const FEED_ALREADY_ASSOCIATED_MESSAGE: &str = "The feed is already associated with a resource.";
+
+/// `AssociateFeed` on a feed whose status admits no association at all (every status
+/// other than `AVAILABLE`, and `ACTIVE`, which [`FEED_ALREADY_ASSOCIATED_MESSAGE`]
+/// covers): the rule is a property of the stored feed, so the sentence carries no
+/// status.
+pub const FEED_NOT_ASSOCIABLE_MESSAGE: &str =
+    "You can't associate this feed because its current status doesn't allow an association.";
+
+/// `DisassociateFeed` naming a resource that is not the one associated with the feed:
+/// the recorded refusal is this sentence, naming neither the rejected name nor the
+/// resource that does hold the feed.
+pub const WRONG_ASSOCIATED_RESOURCE_MESSAGE: &str =
+    "You can't disassociate this feed because it isn't associated with the resource you \
+     specified. Specify the correct resource.";
+
+/// `DisassociateFeed` on a feed that holds no resource to release: again a property of
+/// the stored feed, so the sentence carries no status.
+pub const FEED_NOT_ASSOCIATED_MESSAGE: &str =
+    "You can't disassociate this feed because it isn't associated with a resource.";
+
+/// `UpdateFeed` on a feed whose deletion has already been accepted: a property of the
+/// stored feed, so the sentence names neither the feed nor its status.
+pub const FEED_BEING_DELETED_MESSAGE: &str =
+    "You can't update this feed because it is being deleted.";
+
+/// `SearchFixtures` with `endDate` before `startDate`: the rule is the ORDER of the two
+/// members, so the recorded refusal names the members and not the dates they carried.
+pub const END_DATE_BEFORE_START_DATE_MESSAGE: &str = "endDate must not be earlier than startDate.";
+
 /// The `OutputStatus` value a disabled output reports — one of the two values that
 /// enum admits (`OUTPUT_STATUS_VALUES`: `DISABLED`, `ENABLED`).
 pub const OUTPUT_STATUS_DISABLED: &str = "DISABLED";
