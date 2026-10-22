@@ -7,7 +7,7 @@
 //! resolution and the PEM bodies the service hands back. Handlers hold no state of
 //! their own — they reach this store through [`service_state`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -82,6 +82,14 @@ pub const DELETE_INVALID_STATE_MESSAGE: &str =
     "A private CA can be deleted only if it is in the PENDING_CERTIFICATE, CREATING, \
      EXPIRED, DISABLED, or FAILED state. To delete a CA in the ACTIVE state, you must \
      first disable it.";
+
+/// What Amazon Web Services Private CA answers when a deleted CA is asked to change:
+/// one sentence about the CA's state, naming no request of its own. A CA in `DELETED` is
+/// waiting to be restored or permanently deleted, so what it holds is not writable until
+/// `RestoreCertificateAuthority` puts it back into the status it was deleted from.
+pub const DELETED_INVALID_STATE_MESSAGE: &str =
+    "The certificate authority is in the DELETED state, which does not allow this action. \
+     Restore it first.";
 
 /// The restoration window a deletion opens when the request names none: "By default, if
 /// you do not set the PermanentDeletionTimeInDays parameter, the CA remains restorable
@@ -442,6 +450,12 @@ impl CertificateAuthorityRecord {
         DELETABLE_STATUSES.contains(&self.status.as_str())
     }
 
+    /// Whether this CA has been deleted and not restored, so a write to what it holds is
+    /// refused with the modelled `InvalidStateException`.
+    pub fn is_deleted(&self) -> bool {
+        self.status == STATUS_DELETED
+    }
+
     /// The restoration window a deletion of this CA opens when the request asked for
     /// `requested_days`: that many days, 30 when the request named none, and none at all
     /// from a status a deletion assigns no restoration period to
@@ -572,6 +586,81 @@ pub fn reported_revocation_configuration(
                 .unwrap_or_default(),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+/// Most tags ONE private CA holds at once: "You can associate up to 50 tags with a
+/// private CA." (`TooManyTagsException` and the `Tag` shape's documentation).
+///
+/// `TagList`'s `len 1..50` bounds a single REQUEST's list, which the boundary validator
+/// already refuses past; this bounds the RESOURCE, so two accepted requests of thirty
+/// tags each cannot leave a CA holding sixty.
+pub const MAX_TAGS_PER_CERTIFICATE_AUTHORITY: usize = 50;
+
+/// Why `tags` is not a usable tag set, or `None` when it is.
+///
+/// Two rules hold for every tag set this service reads, whichever operation carries it:
+/// the `aws:` prefix is reserved for the tags Amazon Web Services itself applies, and a
+/// key identifies one tag of a resource, so one request cannot name the same key twice.
+/// Each caller lifts the reason into its own modelled `InvalidTagException`.
+pub fn invalid_tag_reason(tags: &[Tag]) -> Option<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for tag in tags {
+        if tag.key.starts_with("aws:") {
+            return Some(RESERVED_TAG_MESSAGE.to_string());
+        }
+        if !seen.insert(tag.key.as_str()) {
+            return Some(format!("the tag key '{}' is given twice", tag.key));
+        }
+    }
+    None
+}
+
+/// How many tags a resource holding `existing` would hold once `tags` were applied to
+/// it, counted BEFORE anything is written so a refusal leaves the resource untouched.
+///
+/// A key the resource already carries takes a new value rather than becoming a second
+/// tag, so only the keys it does not carry yet add to the count.
+pub fn tag_count_after(existing: &[Tag], tags: &[Tag]) -> usize {
+    let mut keys: HashSet<&str> = existing.iter().map(|tag| tag.key.as_str()).collect();
+    for tag in tags {
+        keys.insert(tag.key.as_str());
+    }
+    keys.len()
+}
+
+/// Apply `tags` to the tag set `existing`: a key the resource already carries takes the
+/// new value (in place, so the resource's tag order does not change), and a key it does
+/// not carry is appended.
+pub fn apply_tags(existing: &mut Vec<Tag>, tags: Vec<Tag>) {
+    for tag in tags {
+        match existing.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value,
+            None => existing.push(tag),
+        }
+    }
+}
+
+/// Remove `tags` from the tag set `existing`.
+///
+/// "If you do not specify the value portion of the tag when calling this action, the tag
+/// will be removed regardless of value. If you specify a value, the tag is removed only
+/// if it is associated with the specified value."
+/// (`UntagCertificateAuthority` documentation.) `TagValue`'s `len 0..256` makes the empty
+/// string a value a tag can carry, and a tag stored without one carries exactly that, so
+/// the two compare equal.
+pub fn remove_tags(existing: &mut Vec<Tag>, tags: &[Tag]) {
+    existing.retain(|held| {
+        !tags.iter().any(|removed| {
+            removed.key == held.key
+                && removed.value.as_ref().is_none_or(|value| {
+                    value.as_str() == held.value.as_deref().unwrap_or_default()
+                })
+        })
+    });
 }
 
 /// An idempotency token's record: what it minted and when it stops being honoured.

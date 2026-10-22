@@ -16,9 +16,9 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Application, BootstrapActionConfig, Cluster, ClusterStateChangeReason, ClusterStatus,
     ClusterSummary, ClusterTimeline, Configuration, Ec2InstanceAttributes, HadoopStepConfig,
-    JobFlowInstancesConfig, KerberosAttributes, MonitoringConfiguration, OSRelease,
-    PlacementGroupConfig, SimplifiedApplication, Step, StepConfig, StepStatus, StepSummary,
-    StepTimeline, Tag,
+    JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy, MonitoringConfiguration,
+    OSRelease, PlacementGroupConfig, SimplifiedApplication, Step, StepConfig, StepStatus,
+    StepSummary, StepTimeline, Tag,
 };
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
@@ -57,6 +57,36 @@ pub mod instance_collection_type {
 /// `com.amazonaws.emr#ClusterStateChangeReasonCode`, for the codes this emulator sets.
 pub mod cluster_state_change_reason_code {
     pub const USER_REQUEST: &str = "USER_REQUEST";
+}
+
+/// How a cluster-scoped operation that models no client error refuses a `ClusterId` the
+/// service holds no cluster for.
+///
+/// AWS does not document the wording, so the text is built from the request: it names
+/// the id the caller asked for. What IS the contract is the refusal itself — HTTP 400
+/// with the error code `ValidationException` — rather than an empty success.
+pub fn unknown_cluster_message(cluster_id: &str) -> String {
+    format!("Cluster id '{cluster_id}' is not valid.")
+}
+
+/// Refuse a `ManagedScalingPolicy` whose compute limits cannot hold together.
+///
+/// `MinimumCapacityUnits` is "the lower boundary of Amazon EC2 units" and
+/// `MaximumCapacityUnits` "the upper boundary of Amazon EC2 units"
+/// (`ComputeLimits` member docs, Smithy model), so a minimum above the maximum names no
+/// range the scaling activity could stay inside. Answers the refusal text, which names
+/// the members and the values the request carried.
+pub fn validate_managed_scaling_policy(policy: &ManagedScalingPolicy) -> Result<(), String> {
+    if let Some(limits) = policy.compute_limits.as_ref() {
+        if limits.minimum_capacity_units > limits.maximum_capacity_units {
+            return Err(format!(
+                "ComputeLimits.MinimumCapacityUnits {} is above \
+                 ComputeLimits.MaximumCapacityUnits {}",
+                limits.minimum_capacity_units, limits.maximum_capacity_units
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The region an ARN carries when the caller's request names none.
@@ -709,6 +739,10 @@ pub struct ClusterRecord {
     pub kerberos_attributes: Option<KerberosAttributes>,
     pub monitoring_configuration: Option<MonitoringConfiguration>,
     pub instances: InstancesRecord,
+    /// The managed scaling policy attached to this cluster, by `RunJobFlow` or by
+    /// `PutManagedScalingPolicy`, and `None` once `RemoveManagedScalingPolicy` has taken
+    /// it off. `GetManagedScalingPolicy` reports exactly this.
+    pub managed_scaling_policy: Option<ManagedScalingPolicy>,
     pub tags: Vec<Tag>,
     pub status: ClusterStatusRecord,
     /// Steps in submission order. `ListSteps` reverses this.
