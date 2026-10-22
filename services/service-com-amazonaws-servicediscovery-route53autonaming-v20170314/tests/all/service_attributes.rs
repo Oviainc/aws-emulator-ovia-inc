@@ -158,12 +158,13 @@ async fn every_admissible_key_and_value_round_trips_unchanged() {
 /// One past either declared length bound is refused and stores nothing, as is a
 /// collection below its declared minimum.
 ///
-/// Each row names the code it expects, because the refuser differs: the centralized
-/// request walk refuses the bounds it checks itself with its own `ValidationException`
-/// (a collection's entry count, a map VALUE's own length), and the handler answers the
-/// `InvalidInput` this model documents for a value that "might exceed length
-/// constraints" for the one bound the walk does not see — a map KEY's length
-/// ("Map *keys* are not covered", `vendor/smithy-schema-server/src/constraints.rs`).
+/// Each row expects `InvalidInput`, whichever side refuses it: the handler answers it
+/// for the one bound the centralized request walk does not see — a map KEY's length
+/// ("Map *keys* are not covered", `vendor/smithy-schema-server/src/constraints.rs`) —
+/// and the walk's own refusals (a collection's entry count, a map VALUE's own length)
+/// are worded with the same code by this service's `override_refusal` seam, because
+/// `InvalidInput` is the only client-input error this model declares ("a string value
+/// might exceed length constraints").
 #[tokio::test]
 async fn a_key_or_value_past_its_declared_bound_is_refused() {
     let router = emulator();
@@ -180,13 +181,13 @@ async fn a_key_or_value_past_its_declared_bound_is_refused() {
             "one past the value maximum",
             "k".to_string(),
             "v".repeat(MAX_VALUE_LEN + 1),
-            "ValidationException",
+            "InvalidInput",
         ),
         (
             "a multi-byte value past the maximum",
             "k".to_string(),
             "é".repeat(MAX_VALUE_LEN + 1),
-            "ValidationException",
+            "InvalidInput",
         ),
     ] {
         let (status, code) = failure(
@@ -227,19 +228,19 @@ async fn a_key_or_value_past_its_declared_bound_is_refused() {
             "an empty attribute map",
             "UpdateServiceAttributes",
             json!({ "ServiceId": service_id, "Attributes": {} }),
-            "ValidationException",
+            "InvalidInput",
         ),
         (
             "an empty key list",
             "DeleteServiceAttributes",
             json!({ "ServiceId": service_id, "Attributes": [] }),
-            "ValidationException",
+            "InvalidInput",
         ),
         (
             "a key list entry past the key maximum",
             "DeleteServiceAttributes",
             json!({ "ServiceId": service_id, "Attributes": ["k".repeat(MAX_KEY_LEN + 1)] }),
-            "ValidationException",
+            "InvalidInput",
         ),
     ] {
         let (status, code) = failure(&router, operation, body).await;
@@ -533,7 +534,8 @@ async fn the_total_attributes_a_service_holds_is_capped_at_the_documented_quota(
     );
 
     // A single request past the quota is refused too — by the walk, which refuses the
-    // map's declared entry maximum before the handler sees it.
+    // map's declared entry maximum before the handler sees it, worded with this
+    // service's own `InvalidInput` by the `override_refusal` seam.
     let pairs: Vec<(String, String)> = (0..=MAX_ATTRIBUTES)
         .map(|index| (format!("bulk-{index}"), index.to_string()))
         .collect();
@@ -548,7 +550,7 @@ async fn the_total_attributes_a_service_holds_is_capped_at_the_documented_quota(
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (400, "ValidationException"),
+        (400, "InvalidInput"),
         "a single request of {} attributes is refused, got {status} {code}",
         MAX_ATTRIBUTES + 1
     );
