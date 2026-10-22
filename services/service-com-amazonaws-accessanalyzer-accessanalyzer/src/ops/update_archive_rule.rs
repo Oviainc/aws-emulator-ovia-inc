@@ -177,11 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.analyzer_name)
             .ok_or_else(|| {
                 UpdateArchiveRuleErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("Analyzer {} does not exist", input.analyzer_name),
-                        resource_id: input.analyzer_name.clone(),
-                        resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
-                    },
+                    crate::state::analyzer_not_found(&input.analyzer_name),
                 )
             })?;
 
@@ -192,14 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.rule_name)
             .ok_or_else(|| {
                 UpdateArchiveRuleErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Archive rule {} does not exist for analyzer {}",
-                            input.rule_name, input.analyzer_name
-                        ),
-                        resource_id: input.rule_name.clone(),
-                        resource_type: crate::state::ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
-                    },
+                    crate::state::archive_rule_not_found(&input.rule_name),
                 )
             })?;
 

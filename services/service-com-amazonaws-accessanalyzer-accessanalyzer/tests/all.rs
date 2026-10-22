@@ -15,6 +15,8 @@
 mod analyzer_lifecycle;
 #[path = "all/archive_rule_update.rs"]
 mod archive_rule_update;
+#[path = "all/error_payloads.rs"]
+mod error_payloads;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/state_roundtrip.rs"]

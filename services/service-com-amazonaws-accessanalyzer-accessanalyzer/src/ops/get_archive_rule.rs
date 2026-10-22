@@ -149,25 +149,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
+        // Each refusal carries a fixed text and reports WHICH resource was missing in
+        // the modelled `resourceId`/`resourceType` members, so an absent analyzer and an
+        // absent rule are told apart by `resourceType`, not by prose.
         let analyzer = state.analyzers.get(&input.analyzer_name).ok_or_else(|| {
-            GetArchiveRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Analyzer {} does not exist", input.analyzer_name),
-                resource_id: input.analyzer_name.clone(),
-                resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
-            })
+            GetArchiveRuleErrorModeled::ResourceNotFoundException(
+                crate::state::analyzer_not_found(&input.analyzer_name),
+            )
         })?;
         let rule = analyzer
             .archive_rules
             .get(&input.rule_name)
             .ok_or_else(|| {
-                GetArchiveRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "Archive rule {} does not exist for analyzer {}",
-                        input.rule_name, input.analyzer_name
-                    ),
-                    resource_id: input.rule_name.clone(),
-                    resource_type: crate::state::ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
-                })
+                GetArchiveRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::archive_rule_not_found(&input.rule_name),
+                )
             })?;
 
         Ok(GetArchiveRuleOutput {

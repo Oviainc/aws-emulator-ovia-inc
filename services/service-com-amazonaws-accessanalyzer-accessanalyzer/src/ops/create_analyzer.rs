@@ -178,14 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if state.analyzers.contains_key(&input.analyzer_name) {
-            return Err(CreateAnalyzerErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Analyzer {} already exists in this account and Region",
-                    input.analyzer_name
-                ),
-                resource_id: input.analyzer_name.clone(),
-                resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
-            })
+            // A duplicate name is refused with a FIXED text; the name travels in the
+            // modelled `resourceId`/`resourceType` members.
+            return Err(CreateAnalyzerErrorModeled::ConflictException(
+                crate::state::analyzer_name_conflict(&input.analyzer_name),
+            )
             .into());
         }
 
@@ -193,15 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The emulator's own store ceiling, expressed with the quota error this
             // operation models (HTTP 402) rather than by growing without bound.
             return Err(CreateAnalyzerErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "Cannot create analyzer {}: this account and Region already hold {} analyzers",
-                        input.analyzer_name,
-                        crate::state::MAX_ANALYZERS
-                    ),
-                    resource_id: input.analyzer_name.clone(),
-                    resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::analyzer_quota_exceeded(&input.analyzer_name),
             )
             .into());
         }

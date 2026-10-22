@@ -16,8 +16,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AnalyzerConfiguration, AnalyzerSummary, ArchiveRuleSummary, Criterion, InternalServerException,
-    StatusReason, ValidationException, ValidationExceptionField,
+    AnalyzerConfiguration, AnalyzerSummary, ArchiveRuleSummary, ConflictException, Criterion,
+    InternalServerException, ResourceNotFoundException, ServiceQuotaExceededException, StatusReason,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The status a customer-managed analyzer is in once `CreateAnalyzer` returns.
@@ -42,6 +43,110 @@ pub const ANALYZER_RESOURCE_TYPE: &str = "analyzer";
 
 /// The `resourceType` an archive-rule-scoped error reports.
 pub const ARCHIVE_RULE_RESOURCE_TYPE: &str = "archive-rule";
+
+// ---------------------------------------------------------------------------
+// Resource-scoped refusals.
+//
+// `ResourceNotFoundException`, `ConflictException` and
+// `ServiceQuotaExceededException` all declare `resourceId` AND `resourceType` as
+// REQUIRED members beside `message`
+// (`smithy_query(query="shape",shape="ResourceNotFoundException,ConflictException,\
+// ServiceQuotaExceededException")`), i.e. the model itself says WHICH resource a
+// refusal is about travels in those two structured members. The `message` is
+// therefore a FIXED text for the (error, resource kind) pair and is never composed
+// from the request: a client that wants the identifier reads `resourceId`, and a
+// client that classifies the refusal by message text sees the same string whatever
+// it asked for. Every handler in this service builds these three errors through the
+// constructors below, so no call site can reintroduce an interpolated message.
+// ---------------------------------------------------------------------------
+
+/// The fixed `message` of a `ResourceNotFoundException` for an analyzer this account
+/// and Region does not hold — a name that never existed and one read back after
+/// `DeleteAnalyzer` are the same refusal, so they carry the same text.
+pub const ANALYZER_NOT_FOUND_MESSAGE: &str = "Analyzer not found";
+
+/// The fixed `message` of a `ConflictException` for a `CreateAnalyzer` whose
+/// `analyzerName` is already in use. The conflict is STATE, not invalid input: once
+/// the stored analyzer is deleted the identical call succeeds.
+pub const ANALYZER_NAME_CONFLICT_MESSAGE: &str = "Analyzer with the same name already exists";
+
+/// The fixed `message` of the `ServiceQuotaExceededException` (HTTP 402) that answers
+/// a create past this emulator's analyzer ceiling. The ceiling is a property of the
+/// account and Region, not of the request, so the text names neither.
+pub const ANALYZER_QUOTA_EXCEEDED_MESSAGE: &str =
+    "Service quota met for analyzers in this account and Region";
+
+/// The fixed `message` of a `ResourceNotFoundException` for an archive rule the named
+/// analyzer does not hold. AWS publishes no text for this refusal, so the wording is
+/// the emulator's; what the model fixes is that it is CONSTANT and that the rule name
+/// travels in `resourceId`.
+pub const ARCHIVE_RULE_NOT_FOUND_MESSAGE: &str = "Archive rule not found";
+
+/// The fixed `message` of a `ConflictException` for a `CreateArchiveRule` whose
+/// `ruleName` the analyzer already holds. Same provenance as
+/// [`ARCHIVE_RULE_NOT_FOUND_MESSAGE`].
+pub const ARCHIVE_RULE_NAME_CONFLICT_MESSAGE: &str =
+    "Archive rule with the same name already exists";
+
+/// The fixed `message` of the `ServiceQuotaExceededException` that answers a rule
+/// create past this emulator's per-analyzer ceiling.
+pub const ARCHIVE_RULE_QUOTA_EXCEEDED_MESSAGE: &str =
+    "Service quota met for archive rules on this analyzer";
+
+/// The 404 for an analyzer that is not stored: fixed text, identifier in the modelled
+/// `resourceId`/`resourceType` members.
+pub fn analyzer_not_found(analyzer_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: ANALYZER_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: analyzer_name.to_string(),
+        resource_type: ANALYZER_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The 409 for a `analyzerName` already in use.
+pub fn analyzer_name_conflict(analyzer_name: &str) -> ConflictException {
+    ConflictException {
+        message: ANALYZER_NAME_CONFLICT_MESSAGE.to_string(),
+        resource_id: analyzer_name.to_string(),
+        resource_type: ANALYZER_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The 402 for a create past [`MAX_ANALYZERS`].
+pub fn analyzer_quota_exceeded(analyzer_name: &str) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: ANALYZER_QUOTA_EXCEEDED_MESSAGE.to_string(),
+        resource_id: analyzer_name.to_string(),
+        resource_type: ANALYZER_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The 404 for an archive rule the analyzer does not hold.
+pub fn archive_rule_not_found(rule_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: ARCHIVE_RULE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: rule_name.to_string(),
+        resource_type: ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The 409 for a `ruleName` the analyzer already holds.
+pub fn archive_rule_name_conflict(rule_name: &str) -> ConflictException {
+    ConflictException {
+        message: ARCHIVE_RULE_NAME_CONFLICT_MESSAGE.to_string(),
+        resource_id: rule_name.to_string(),
+        resource_type: ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The 402 for a rule create past [`MAX_ARCHIVE_RULES_PER_ANALYZER`].
+pub fn archive_rule_quota_exceeded(rule_name: &str) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: ARCHIVE_RULE_QUOTA_EXCEEDED_MESSAGE.to_string(),
+        resource_id: rule_name.to_string(),
+        resource_type: ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
+    }
+}
 
 /// How many analyzers this emulator will hold.
 ///

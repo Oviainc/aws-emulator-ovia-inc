@@ -182,11 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.analyzer_name)
             .ok_or_else(|| {
                 CreateArchiveRuleErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("Analyzer {} does not exist", input.analyzer_name),
-                        resource_id: input.analyzer_name.clone(),
-                        resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
-                    },
+                    crate::state::analyzer_not_found(&input.analyzer_name),
                 )
             })?;
 
@@ -203,14 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if analyzer.archive_rules.contains_key(&input.rule_name) {
-            return Err(CreateArchiveRuleErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Archive rule {} already exists for analyzer {}",
-                    input.rule_name, input.analyzer_name
-                ),
-                resource_id: input.rule_name.clone(),
-                resource_type: crate::state::ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
-            })
+            // Fixed text; the rule name travels in the modelled `resourceId`.
+            return Err(CreateArchiveRuleErrorModeled::ConflictException(
+                crate::state::archive_rule_name_conflict(&input.rule_name),
+            )
             .into());
         }
 
@@ -222,16 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The emulator's own per-analyzer ceiling, expressed with the quota error
             // this operation models (HTTP 402) rather than by growing without bound.
             return Err(CreateArchiveRuleErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "Cannot create archive rule {}: analyzer {} already holds {} rules",
-                        input.rule_name,
-                        input.analyzer_name,
-                        crate::state::MAX_ARCHIVE_RULES_PER_ANALYZER
-                    ),
-                    resource_id: input.rule_name.clone(),
-                    resource_type: crate::state::ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::archive_rule_quota_exceeded(&input.rule_name),
             )
             .into());
         }

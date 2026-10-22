@@ -145,12 +145,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
+        // The refusal's text is fixed; the name asked for travels in the modelled
+        // `resourceId`/`resourceType` members (see `crate::state::analyzer_not_found`).
         let analyzer = state.analyzers.get(&input.analyzer_name).ok_or_else(|| {
-            GetAnalyzerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Analyzer {} does not exist", input.analyzer_name),
-                resource_id: input.analyzer_name.clone(),
-                resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
-            })
+            GetAnalyzerErrorModeled::ResourceNotFoundException(crate::state::analyzer_not_found(
+                &input.analyzer_name,
+            ))
         })?;
 
         Ok(GetAnalyzerOutput {

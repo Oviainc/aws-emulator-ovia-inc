@@ -171,11 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored ON the analyzer record, so no rule outlives its analyzer.
         if state.analyzers.remove(&input.analyzer_name).is_none() {
             return Err(DeleteAnalyzerErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Analyzer {} does not exist", input.analyzer_name),
-                    resource_id: input.analyzer_name.clone(),
-                    resource_type: crate::state::ANALYZER_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::analyzer_not_found(&input.analyzer_name),
             )
             .into());
         }
