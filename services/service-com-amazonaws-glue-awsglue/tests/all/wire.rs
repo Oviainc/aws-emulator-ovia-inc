@@ -16,9 +16,15 @@ use smithy_server_runtime::MultiServiceRouter;
 pub const ACCOUNT_ID: &str = "000000000000";
 
 /// The access key id every request here is signed with. The router routes on the
-/// SigV4 credential scope's service field (`glue`), and `CreatedBy` is derived from
-/// the key id, so both are pinned by this one header.
+/// SigV4 credential scope's service field (`glue`), so this one header is what gets a
+/// request to this service. It is a credential id, NOT a principal: the catalog never
+/// renders it into an ARN (see [`CALLER_PRINCIPAL`]).
 pub const AKID: &str = "AKIDGLUETEST";
+
+/// The principal ARN every request here speaks for: the emulator's single long-term
+/// identity, the one `sts:GetCallerIdentity` reports (`arn:aws:iam::<account>:user/
+/// emulator`). This is what the catalog records in `Table$CreatedBy`.
+pub const CALLER_PRINCIPAL: &str = "arn:aws:iam::000000000000:user/emulator";
 
 /// A SigV4 `Authorization` header scoped to `glue`: the routing signal the router
 /// reads first. Authentication is off on the test router, so the signature is not

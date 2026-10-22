@@ -7,7 +7,12 @@
 //! A pure read: it rebuilds the `Table` output shape from the stored record, so the
 //! `StorageDescriptor` and `PartitionKeys` sent to `CreateTable` come back unchanged
 //! beside the server-set `DatabaseName`, `CatalogId`, `CreateTime`, `UpdateTime` and
-//! `VersionId`. An absent catalog, database or table is `EntityNotFoundException`.
+//! `VersionId`. The members the catalog itself determines are answered definitely
+//! rather than omitted: `IsMultiDialectView`, `IsMaterializedView` and
+//! `IsRegisteredWithLakeFormation` as explicit booleans, and
+//! `StorageDescriptor.SortColumns` as an empty list for a table that defines no sort
+//! order (see `crate::state::to_storage_descriptor`). An absent catalog, database or
+//! table is `EntityNotFoundException`.
 //!
 //! `TransactionId`, `QueryAsOfTime` and `IncludeStatusDetails` are REFUSED rather than
 //! ignored, and `AttributesToGet` is honoured: `DEFAULT` is the Hive-style definition

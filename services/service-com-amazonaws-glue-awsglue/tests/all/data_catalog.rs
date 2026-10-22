@@ -24,7 +24,9 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, ok, ACCOUNT_ID, AKID};
+use crate::wire::{
+    assert_echoed, call, emulator, emulator_on, error_code, ok, ACCOUNT_ID, CALLER_PRINCIPAL,
+};
 
 /// A `CreateDatabase` body for `name`, with no optional members beyond the name.
 fn database_body(name: &str) -> Value {
@@ -225,15 +227,15 @@ async fn created_resources_are_read_back_from_the_store() {
         );
         assert_eq!(
             table["VersionId"],
-            json!("1"),
-            "case {case}: a freshly created table is version 1, got {:?}",
+            json!("0"),
+            "case {case}: the version a create makes is the first of the table's history, \
+             \"0\", got {:?}",
             table["VersionId"]
         );
-        assert!(
-            table["CreatedBy"]
-                .as_str()
-                .is_some_and(|who| who.contains(AKID)),
-            "case {case}: Table.CreatedBy names the calling principal, got {:?}",
+        assert_eq!(
+            table["CreatedBy"],
+            json!(CALLER_PRINCIPAL),
+            "case {case}: Table.CreatedBy is the principal ARN the request speaks for, got {:?}",
             table["CreatedBy"]
         );
         assert!(
@@ -958,6 +960,26 @@ async fn unsupported_members_are_refused_not_silently_dropped() {
                     "PartitionKeys": [ { "Name": "dt", "Type": "string" } ]
                 },
                 "PartitionIndexes": [ { "IndexName": "dt_idx", "Keys": [ "dt" ] } ]
+            }),
+        ),
+        (
+            "CreateTable with a ViewDefinition",
+            "CreateTable",
+            json!({
+                "DatabaseName": "guarded_db",
+                "TableInput": {
+                    "Name": "dialect_view",
+                    "TableType": "VIRTUAL_VIEW",
+                    "ViewDefinition": {
+                        "Representations": [
+                            {
+                                "Dialect": "ATHENA",
+                                "DialectVersion": "3",
+                                "ViewOriginalText": "SELECT 1"
+                            }
+                        ]
+                    }
+                }
             }),
         ),
         (

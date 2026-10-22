@@ -12,6 +12,11 @@
 //! A `CatalogId` this emulator does not hold is refused rather than created: see
 //! [`crate::state::is_known_catalog`].
 //!
+//! A create that names no `CreateTableDefaultPermissions` records the catalog's default
+//! grant instead (`ALL` to `IAM_ALLOWED_PRINCIPALS` — see
+//! [`crate::state::default_create_table_default_permissions`]); an explicitly EMPTY list
+//! is stored as sent, because the two say opposite things about who may create tables.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

@@ -20,10 +20,10 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Column, Crawler, CrawlerTargets, CreateCrawlerInput, Database, DatabaseIdentifier, DatabaseInput,
-    FederatedDatabase, FederatedTable, LakeFormationConfiguration, LineageConfiguration,
-    PrincipalPermissions, RecrawlPolicy, Schedule, SchemaChangePolicy, StorageDescriptor, Table,
-    TableIdentifier, TableInput,
+    Column, Crawler, CrawlerTargets, CreateCrawlerInput, Database, DataLakePrincipal,
+    DatabaseIdentifier, DatabaseInput, FederatedDatabase, FederatedTable,
+    LakeFormationConfiguration, LineageConfiguration, PrincipalPermissions, RecrawlPolicy, Schedule,
+    SchemaChangePolicy, StorageDescriptor, Table, TableIdentifier, TableInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -61,11 +61,52 @@ pub const CRAWLER_STATE_READY: &str = "READY";
 /// all, so `NOT_SCHEDULED` is not reachable from a create alone.
 pub const SCHEDULE_STATE_SCHEDULED: &str = "SCHEDULED";
 
-/// The `Version` a crawler carries straight after `CreateCrawler`, mirroring
-/// [`FIRST_TABLE_VERSION_ID`] for tables: the first version of a resource is 1, and an
-/// update moves it on. The model's `@default` of 0 on `Crawler$Version` is what an
-/// ABSENT long deserializes to, not the version of a stored crawler.
+/// The `Version` a crawler carries straight after `CreateCrawler`: the first version of
+/// a crawler is 1, and an update moves it on. The model's `@default` of 0 on
+/// `Crawler$Version` is what an ABSENT long deserializes to, not the version of a stored
+/// crawler. (A table's first version is numbered differently — see
+/// [`FIRST_TABLE_VERSION_ID`] — because the catalog's table version history starts at
+/// 0.)
 pub const FIRST_CRAWLER_VERSION: i64 = 1;
+
+/// The Lake Formation principal that stands for "whoever IAM already allows": the
+/// `DataLakePrincipalIdentifier` of the grant a Data Catalog database carries while
+/// nothing has narrowed it to Lake Formation permissions. Spelled exactly like this on
+/// the wire, and the same principal
+/// `services/service-com-amazonaws-lakeformation-awslakeformation/src/state.rs` holds the
+/// matching database grant under.
+pub const IAM_ALLOWED_PRINCIPALS: &str = "IAM_ALLOWED_PRINCIPALS";
+
+/// The permission that default grant carries.
+///
+/// From the documented Lake Formation default, not chosen: Lake Formation's
+/// `DataLakeSettings$CreateDatabaseDefaultPermissions` documents that "A value that
+/// assigns ALL to IAM_ALLOWED_PRINCIPALS indicates access control by IAM permissions.
+/// This is referred to as the setting \"Use only IAM access control\", and is for
+/// backward compatibility with the Glue permission model", and that "The only permitted
+/// values are an empty array or an array that contains a single JSON object that grants
+/// ALL to IAM_ALLOWED_PRINCIPALS". `ALL` is also one of the modelled `Permission` enum's
+/// values (`ALL`, `SELECT`, `ALTER`, `DROP`, `DELETE`, `INSERT`, `CREATE_DATABASE`,
+/// `CREATE_TABLE`, `DATA_LOCATION_ACCESS`).
+pub const PERMISSION_ALL: &str = "ALL";
+
+/// The `CreateTableDefaultPermissions` a database gets when its create named none.
+///
+/// `Database$CreateTableDefaultPermissions` "creates a set of default permissions on the
+/// table for principals. Used by Lake Formation": a database the caller did not govern
+/// with Lake Formation is open to every IAM-allowed principal, which the catalog records
+/// as the single `ALL` grant to [`IAM_ALLOWED_PRINCIPALS`] rather than as no grant at
+/// all. The distinction matters to the reader: an EMPTY grant list is the opposite
+/// governance decision ("nobody, until Lake Formation grants it"), so it is stored only
+/// when the client sends one.
+pub fn default_create_table_default_permissions() -> Vec<PrincipalPermissions> {
+    vec![PrincipalPermissions {
+        principal: Some(DataLakePrincipal {
+            data_lake_principal_identifier: Some(IAM_ALLOWED_PRINCIPALS.to_string()),
+        }),
+        permissions: Some(vec![PERMISSION_ALL.to_string()]),
+    }]
+}
 
 /// Per-service state for com-amazonaws-glue-awsglue. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -148,7 +189,10 @@ pub struct DatabaseEntry {
     pub description: Option<String>,
     pub location_uri: Option<String>,
     pub parameters: Option<HashMap<String, String>>,
-    pub create_table_default_permissions: Option<Vec<PrincipalPermissions>>,
+    /// The Lake Formation default grants for tables created in this database. Always a
+    /// definite list: the create either sent one (an empty list included) or the
+    /// catalog's default from [`default_create_table_default_permissions`] was recorded.
+    pub create_table_default_permissions: Vec<PrincipalPermissions>,
     pub target_database: Option<DatabaseIdentifier>,
     pub federated_database: Option<FederatedDatabase>,
     pub catalog_id: String,
@@ -178,7 +222,12 @@ impl DatabaseEntry {
             description: input.description.clone(),
             location_uri: input.location_uri.clone(),
             parameters: input.parameters.clone(),
-            create_table_default_permissions: input.create_table_default_permissions.clone(),
+            // Recorded at create, not filled in per read, so every later read of this
+            // database reports the same grants.
+            create_table_default_permissions: input
+                .create_table_default_permissions
+                .clone()
+                .unwrap_or_else(default_create_table_default_permissions),
             target_database: input.target_database.clone(),
             federated_database: input.federated_database.clone(),
             catalog_id: catalog_id.to_string(),
@@ -196,7 +245,7 @@ impl DatabaseEntry {
             location_uri: self.location_uri.clone(),
             parameters: self.parameters.clone(),
             create_time: Some(to_date_time(self.create_time)),
-            create_table_default_permissions: self.create_table_default_permissions.clone(),
+            create_table_default_permissions: Some(self.create_table_default_permissions.clone()),
             target_database: self.target_database.clone(),
             catalog_id: Some(self.catalog_id.clone()),
             federated_database: self.federated_database.clone(),
@@ -238,7 +287,8 @@ pub struct TableEntry {
     pub create_time: SystemTime,
     /// Server-set; moves with every write to this table.
     pub update_time: SystemTime,
-    /// Server-set version counter, `"1"` for a freshly created table.
+    /// Server-set version counter, [`FIRST_TABLE_VERSION_ID`] for a freshly created
+    /// table.
     pub version_id: String,
     /// Server-set: the principal that issued the create.
     pub created_by: Option<String>,
@@ -291,7 +341,7 @@ impl TableEntry {
             last_access_time: self.last_access_time,
             last_analyzed_time: self.last_analyzed_time,
             retention: self.retention,
-            storage_descriptor: self.storage_descriptor.clone(),
+            storage_descriptor: self.storage_descriptor.as_ref().map(to_storage_descriptor),
             partition_keys: self.partition_keys.clone(),
             view_original_text: self.view_original_text.clone(),
             view_expanded_text: self.view_expanded_text.clone(),
@@ -303,13 +353,39 @@ impl TableEntry {
             catalog_id: Some(self.catalog_id.clone()),
             version_id: Some(self.version_id.clone()),
             federated_table: self.federated_table.clone(),
+            // `Table$ViewDefinition` is "all the information that defines the view": no
+            // stored table has one, because `CreateTable` REFUSES a `ViewDefinition`
+            // rather than dropping it (see `ops/create_table.rs`).
             view_definition: None,
-            is_multi_dialect_view: None,
-            is_materialized_view: None,
+            // `IsMultiDialectView` and `IsMaterializedView` are three-state
+            // `NullableBoolean` members the catalog answers DEFINITELY on every read: a
+            // table is one of them exactly when the catalog holds the matching view
+            // definition for it. No stored table does (see `view_definition` above), so
+            // both are `false` — reported rather than omitted, so a client branching on
+            // three states never reads "unknown" for a table whose kind the catalog
+            // knows.
+            is_multi_dialect_view: Some(false),
+            is_materialized_view: Some(false),
             iceberg_table_metadata: None,
             status: None,
             rls_properties: None,
         }
+    }
+}
+
+/// Project a stored `StorageDescriptor` the way the Data Catalog reports one.
+///
+/// `StorageDescriptor$SortColumns` is "a list specifying the sort order of each bucket in
+/// the table" — part of the table definition the catalog holds, so a table that defines
+/// no sort order has an EMPTY sort order rather than an unknown one, and the catalog
+/// reports `[]`. A client that iterates it then loops zero times instead of having to
+/// handle an absent member. Every other member is reported exactly as it was stored: a
+/// member the client never sent is one the catalog does not determine, so it stays
+/// absent.
+pub fn to_storage_descriptor(stored: &StorageDescriptor) -> StorageDescriptor {
+    StorageDescriptor {
+        sort_columns: Some(stored.sort_columns.clone().unwrap_or_default()),
+        ..stored.clone()
     }
 }
 
@@ -456,7 +532,13 @@ pub fn is_cron_expression(expression: &str) -> bool {
 }
 
 /// The `VersionId` a table carries straight after `CreateTable`.
-pub const FIRST_TABLE_VERSION_ID: &str = "1";
+///
+/// The catalog's table version history starts at 0: the version a create makes is
+/// version `"0"`, and each update appends the next one. So a table that has never been
+/// updated reports `"0"`, and that is the id `GetTableVersion`/`DeleteTableVersion`
+/// address its only version by — numbering the first version `"1"` left version `"0"`
+/// unfetchable. `VersionString` is a string, so the id is formatted as one.
+pub const FIRST_TABLE_VERSION_ID: &str = "0";
 
 /// Fold a database or table name the way the catalog stores it: ASCII-lowercased.
 /// Applied on both write and lookup, so a name is reachable by any casing the client
@@ -467,23 +549,26 @@ pub fn fold_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-/// The principal fragment of the caller's identity, from the SigV4 credential scope.
+/// The IAM user name of the identity this emulator's long-term credentials speak for.
 ///
-/// The access key id is request text, so a value that is not shaped like one (empty,
-/// over-long, or carrying anything but ASCII alphanumerics) is replaced by a fixed
-/// `emulator` principal rather than being spliced into an ARN. `extract_akid` itself
-/// performs no verification — the emulator verifies signatures at its boundary, and
-/// with authentication off there is nothing to verify.
-pub fn caller_principal(headers: &::http::HeaderMap) -> String {
-    let akid = ::engine::extract_akid(headers);
-    let shaped_like_an_access_key_id = !akid.is_empty()
-        && akid.len() <= 128
-        && akid.chars().all(|character| character.is_ascii_alphanumeric());
-    if shaped_like_an_access_key_id {
-        akid
-    } else {
-        "emulator".to_string()
-    }
+/// The emulator publishes exactly ONE long-term identity, and STS is what defines it:
+/// `GetCallerIdentity` answers `arn:aws:iam::<account>:user/emulator` for every request
+/// whose access key id names no session (`AMBIENT_USER_NAME` in
+/// `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/src/state.rs`).
+const AMBIENT_USER_NAME: &str = "emulator";
+
+/// The principal that made this request, as the ARN the catalog records in
+/// `Table$CreatedBy` ("The person or entity who created the table").
+///
+/// Server-derived from the emulator's own identity contract, never from the request: it
+/// is the ARN of the identity a request signed with this emulator's credentials speaks
+/// for, which is the one [`AMBIENT_USER_NAME`] names — so Glue and STS agree on who the
+/// caller is. An access key id is a credential id, not a user name, so it is never
+/// rendered into an IAM ARN: that is a principal no AWS rule produces. The value is
+/// therefore the same on every call and across restarts, exactly as the IAM identity
+/// behind one set of credentials is.
+pub fn request_principal() -> String {
+    ::engine::emulator_arn("iam", "", &format!("user/{AMBIENT_USER_NAME}"))
 }
 
 /// The `CatalogId` a request addresses: the one it names, else this emulator's

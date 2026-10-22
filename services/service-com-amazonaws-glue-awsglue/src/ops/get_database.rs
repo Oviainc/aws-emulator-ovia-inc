@@ -5,7 +5,10 @@
 //! This is the ONLY file to touch for this operation.
 //!
 //! A pure read: it rebuilds the `Database` output shape from the stored record and
-//! writes nothing. An absent catalog or database is `EntityNotFoundException`.
+//! writes nothing — including the `CreateTableDefaultPermissions` the create recorded,
+//! which is the catalog's `ALL`-to-`IAM_ALLOWED_PRINCIPALS` default when the create
+//! named no grants (see `crate::state::default_create_table_default_permissions`). An
+//! absent catalog or database is `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!

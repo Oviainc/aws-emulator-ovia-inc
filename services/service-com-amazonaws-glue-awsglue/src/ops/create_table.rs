@@ -6,11 +6,15 @@
 //!
 //! Persists the table inside its parent database and sets the server-derived members
 //! `DatabaseName`, `CatalogId`, `CreateTime`, `UpdateTime`, `VersionId` and `CreatedBy`,
-//! none of which exist on `TableInput`. An absent database is `EntityNotFoundException`;
-//! a duplicate (folded) table name is `AlreadyExistsException`.
+//! none of which exist on `TableInput`. The version a create makes is the first of the
+//! table's version history, `VersionId` `"0"`, and `CreatedBy` is the ARN of the identity
+//! the request speaks for (the one STS reports for it). An absent database is
+//! `EntityNotFoundException`; a duplicate (folded) table name is `AlreadyExistsException`.
 //!
 //! The `OpenTableFormatInput` create path (an Iceberg table whose metadata this
-//! emulator does not maintain) still answers 501.
+//! emulator does not maintain) still answers 501, and so does a `TableInput` carrying a
+//! `ViewDefinition`: a Glue view's dialect representations are a layer this slice does
+//! not keep.
 //!
 //! ## Shape of an operation
 //!
@@ -211,6 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A Glue view (`TableInput$ViewDefinition`) is a different kind of catalog
+        // entity: its dialect representations, version token and refresh state are a
+        // layer this slice does not keep, and storing a table while dropping the
+        // definition that makes it a view would answer 200 for work nothing did — and
+        // make `GetTable` report `IsMultiDialectView`/`IsMaterializedView` false for a
+        // table the caller created as a view. So the view create is refused.
+        if table_input.view_definition.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateTable with ViewDefinition",
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateTableErrorModeled::InternalServiceException(
                 InternalServiceException {
@@ -222,19 +238,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
         let folded_table = crate::state::fold_name(&table_input.name);
-        // `CreatedBy` is "the person or entity who created the table": the caller this
-        // request was signed by, read off its SigV4 credential scope. That key id is
-        // request text, so only what an access key id can contain is carried into the
-        // ARN; anything else is attributed to this emulator instead of letting a client
-        // write arbitrary text into a value shaped like a principal.
-        let created_by = ::engine::emulator_arn(
-            "iam",
-            "",
-            &format!(
-                "user/{}",
-                crate::state::caller_principal(&ctx.parts().headers)
-            ),
-        );
+        // `CreatedBy` is "the person or entity who created the table": the identity this
+        // request speaks for. The emulator publishes one long-term identity, the one STS
+        // reports for these credentials, so that is the principal recorded here — never a
+        // name built out of the request's access key id, which is a credential id and not
+        // a principal any AWS rule renders into an IAM ARN.
+        let created_by = crate::state::request_principal();
+        let _ = ctx;
 
         let mut store = state.lock();
         // The store is resident memory and this create is reachable by any caller, so
