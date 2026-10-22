@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptConnectionInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptConnectionInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptConnectionInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes a stored invitation from `PENDING` to `ACCEPTED`, creates and STORES the
+//! connection it produces, links that connection back onto the invitation and
+//! returns the stored connection.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +126,19 @@ impl From<AcceptConnectionInvitationErrorModeled> for AcceptConnectionInvitation
     }
 }
 
+/// The stored connection as the modelled `Connection` shape: every member comes from
+/// the record this service persisted.
+fn connection_for(record: &crate::state::ConnectionRecord) -> Connection {
+    Connection {
+        catalog: record.catalog.clone(),
+        id: record.id.clone(),
+        arn: record.arn.clone(),
+        other_participant_account_id: record.other_participant_account_id.clone(),
+        updated_at: ::aws_smithy_types::DateTime::from(record.updated_at),
+        connection_types: record.connection_type_details(),
+    }
+}
+
 /// The `AcceptConnectionInvitation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +175,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptConnectionInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptConnectionInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptConnectionInvitation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AcceptConnectionInvitationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PartnerCentralAccount store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        let now = ::std::time::SystemTime::now();
+        state.materialise_due_transitions(now);
+
+        // A retry carrying the `ClientToken` of an acceptance this service already
+        // served answers with the connection it created then: it neither mints a
+        // second connection nor fails on the invitation it has already moved out of
+        // `PENDING`.
+        let fingerprint = crate::state::fingerprint(&[&input.catalog, &input.identifier]);
+        if let Some(replay) = state.replay(Self::NAME, &input.client_token) {
+            if replay.fingerprint != fingerprint {
+                return Err(AcceptConnectionInvitationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "The ClientToken {} was already used for a different AcceptConnectionInvitation request.",
+                            input.client_token
+                        ),
+                        reason: crate::state::REASON_CONFLICT_CLIENT_TOKEN.to_string(),
+                    },
+                )
+                .into());
+            }
+            let key = (input.catalog.clone(), replay.resource_id.clone());
+            if let Some(connection) = state.connections.get(&key) {
+                return Ok(AcceptConnectionInvitationOutput {
+                    connection: connection_for(connection),
+                });
+            }
+        }
+
+        let invitation_key = (input.catalog.clone(), input.identifier.clone());
+        let invitation = state.invitations.get(&invitation_key).ok_or_else(|| {
+            AcceptConnectionInvitationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Connection invitation {} was not found in catalog {}.",
+                        input.identifier, input.catalog
+                    ),
+                    reason: crate::state::REASON_CONNECTION_INVITATION_NOT_FOUND.to_string(),
+                },
+            )
+        })?;
+
+        // Only a `PENDING` invitation can be answered: one already accepted,
+        // rejected, cancelled or expired is a conflict with the state it is in.
+        if invitation.status != crate::state::INVITATION_PENDING {
+            return Err(AcceptConnectionInvitationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Connection invitation {} is {} and can no longer be accepted.",
+                        invitation.id, invitation.status
+                    ),
+                    reason: crate::state::REASON_INCOMPATIBLE_CONNECTION_INVITATION_STATE
+                        .to_string(),
+                },
+            )
+            .into());
+        }
+
+        let connection_type = invitation.connection_type.clone();
+        let detail = crate::state::ConnectionTypeDetailRecord {
+            created_at: now,
+            inviter_email: invitation.inviter_email.clone(),
+            inviter_name: invitation.inviter_name.clone(),
+            status: crate::state::CONNECTION_TYPE_ACTIVE.to_string(),
+            canceled_at: None,
+            canceled_by: None,
+            cancellation_reason: None,
+            other_participant_identifier: invitation.other_participant_identifier.clone(),
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        // The store a caller can grow is bounded: past the ceiling the acceptance is
+        // refused with the modelled quota error rather than accepted, and the
+        // invitation stays `PENDING`.
+        if state.connections.len() >= crate::state::MAX_CONNECTIONS {
+            return Err(
+                AcceptConnectionInvitationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "This account already holds {} connections, the most this catalog stores.",
+                            crate::state::MAX_CONNECTIONS
+                        ),
+                        reason: crate::state::REASON_LIMIT_EXCEEDED_ACTIVE_CONNECTION.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+        let connection_id = state.mint_connection_id();
+        let connection = crate::state::ConnectionRecord {
+            catalog: input.catalog.clone(),
+            arn: crate::state::connection_arn(&region, &input.catalog, &connection_id),
+            id: connection_id.clone(),
+            // The account every emulated participant presents (`engine`'s canonical
+            // account id), as `AwsAccountId`'s `^[0-9]{12}$` requires.
+            other_participant_account_id: ::engine::emulator_account_id().to_string(),
+            updated_at: now,
+            connection_types: [(connection_type, detail)].into_iter().collect(),
+        };
+        state
+            .connections
+            .insert((input.catalog.clone(), connection_id.clone()), connection);
+
+        // The invitation records the answer and the connection it produced.
+        if let Some(invitation) = state.invitations.get_mut(&invitation_key) {
+            invitation.status = crate::state::INVITATION_ACCEPTED.to_string();
+            invitation.updated_at = now;
+            invitation.connection_id = Some(connection_id.clone());
+        }
+        state.record_idempotent_call(
+            Self::NAME,
+            &input.client_token,
+            &connection_id,
+            &fingerprint,
+        );
+
+        let stored = state
+            .connections
+            .get(&(input.catalog, connection_id))
+            .expect("the connection just inserted is in the store");
+        Ok(AcceptConnectionInvitationOutput {
+            connection: connection_for(stored),
+        })
     }
 }

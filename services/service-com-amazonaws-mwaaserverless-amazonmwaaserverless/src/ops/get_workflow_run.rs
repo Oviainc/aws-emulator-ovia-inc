@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflowRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflowRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports a persisted run from this service's store (`crate::state`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflowRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is a reporting operation, so the only write it makes is to materialise the
+//! status change the CLOCK already made due — the run's exit from `QUEUED`, owed at the
+//! same instant whether or not anybody called (see `crate::state::WorkflowRun::settle`).
+//! It moves no status, consumes no quota and bumps no counter because the run was read.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +99,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -176,18 +174,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflowRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflowRun"))
+        // `ctx` carries only request metadata; the run is identified by its input.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWorkflowRunErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        let workflow = store
+            .workflows
+            .get_mut(&input.workflow_arn)
+            .ok_or_else(|| {
+                GetWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("No workflow found for {}", input.workflow_arn),
+                    resource_id: input.workflow_arn.clone(),
+                    resource_type: "workflow".to_string(),
+                })
+            })?;
+        let run = workflow.runs.get_mut(&input.run_id).ok_or_else(|| {
+            GetWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "Workflow {} has no run {}",
+                    input.workflow_arn, input.run_id
+                ),
+                resource_id: input.run_id.clone(),
+                resource_type: "workflow-run".to_string(),
+            })
+        })?;
+
+        // The ONE write a read may make: the transition the clock already owed.
+        run.settle(now);
+
+        Ok(GetWorkflowRunOutput {
+            workflow_arn: Some(run.workflow_arn.clone()),
+            workflow_version: Some(run.workflow_version.clone()),
+            run_id: Some(run.run_id.clone()),
+            run_type: Some(run.run_type.clone()),
+            override_parameters: Some(
+                run.override_parameters
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            run_detail: Some(WorkflowRunDetail {
+                workflow_arn: Some(run.workflow_arn.clone()),
+                workflow_version: Some(run.workflow_version.clone()),
+                run_id: Some(run.run_id.clone()),
+                run_type: Some(run.run_type.clone()),
+                started_on: Some(crate::state::timestamp(run.started_on)),
+                created_at: Some(crate::state::timestamp(run.created_at)),
+                // Null while the run is not complete, per the member docs.
+                completed_on: run.completed_on.map(crate::state::timestamp),
+                modified_at: Some(crate::state::timestamp(run.modified_at)),
+                duration: run.duration,
+                error_message: run.error_message.clone(),
+                task_instances: Some(run.task_instances.clone()),
+                run_state: Some(run.status.clone()),
+            }),
+        })
     }
 }

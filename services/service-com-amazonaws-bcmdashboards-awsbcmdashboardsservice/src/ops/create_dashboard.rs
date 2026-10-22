@@ -7,6 +7,10 @@
 //! `createdAt`/`updatedAt` taken at the moment of the call) in this service's state, and
 //! returns the ARN it stored the record under.
 //!
+//! Being state-changing, it emits the audit record `crate::state::record_state_change`
+//! writes (timestamp, source, presented access key id, operation, resource, outcome) on
+//! both the success and the quota-refusal path.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -159,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDashboardErrorModeled::InternalServerException(InternalServerException {
                 message: "the dashboard store is unavailable".to_string(),
@@ -172,6 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its own modelled `ServiceQuotaExceededException` (HTTP 402) instead of growing
         // the store without end.
         if state.dashboards.len() >= crate::state::MAX_DASHBOARDS {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                "-",
+                "ServiceQuotaExceededException",
+            );
             return Err(CreateDashboardErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -201,6 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_tags: input.resource_tags.unwrap_or_default(),
         };
         state.dashboards.insert(arn.clone(), dashboard);
+
+        // The record this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &arn, "SUCCESS");
 
         Ok(CreateDashboardOutput { arn })
     }

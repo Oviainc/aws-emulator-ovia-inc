@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTokenBalances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTokenBalances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTokenBalances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the holdings of one network's ledger (`crate::state::NetworkLedger`) that
+//! the request's `tokenFilter`/`ownerFilter` select, projected onto `TokenBalance` by
+//! `crate::state::StoredHolding::token_balance` — the same projection `GetTokenBalance`
+//! uses, so the two always report the same balance for the same key.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTokenBalances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTokenBalancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTokenBalances"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTokenBalancesErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+
+        let filter = &input.token_filter;
+        let owner = input.owner_filter.as_ref().map(|owner| owner.address.clone());
+        // The operation's documentation enumerates the three listings it serves: the
+        // balances owned by an address, the balances for all tokens created by a
+        // contract, and the balances for a given token. Each one narrows the network by
+        // an owner, a contract or a token, so a request that narrows it by none of the
+        // three asks for something the operation does not offer.
+        if owner.is_none() && filter.contract_address.is_none() && filter.token_id.is_none() {
+            return Err(ListTokenBalancesErrorModeled::ValidationException(
+                crate::state::field_validation_exception(
+                    "tokenFilter",
+                    "one of ownerFilter.address, tokenFilter.contractAddress or tokenFilter.tokenId must be specified",
+                ),
+            )
+            .into());
+        }
+
+        // Every balance in one response is reported as of the same instant, and
+        // `ListTokenBalances` takes no instant to report as of, so it is the current
+        // time — the default `TokenBalance$atBlockchainInstant` documents.
+        let asked_at = crate::state::now_secs();
+
+        let all: Vec<(String, TokenBalance)> = state
+            .ledger(&filter.network)
+            .into_iter()
+            .flat_map(|ledger| ledger.holdings.iter())
+            .filter(|(key, _)| {
+                key.matches_token(filter.contract_address.as_deref(), filter.token_id.as_deref())
+            })
+            .filter(|(key, _)| {
+                owner
+                    .as_deref()
+                    .is_none_or(|wanted| key.owner_address == wanted)
+            })
+            .filter_map(|(key, holding)| {
+                let record = holding.balance_at(None)?;
+                Some((
+                    key.resource_id(),
+                    holding.token_balance(&filter.network, key, asked_at, record),
+                ))
+            })
+            .collect();
+
+        let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListTokenBalancesErrorModeled::ValidationException(
+                    crate::state::invalid_page_token(&error),
+                )
+            })?;
+
+        Ok(ListTokenBalancesOutput {
+            token_balances: page.items,
+            next_token: page.next_token,
+        })
     }
 }

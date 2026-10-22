@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStreamGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStreamGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStreamGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the deletion of a stored stream group: it stops the streams in
+//! progress, removes the application associations that referred to the group, and
+//! drops the record once the clock owes the deletion.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +177,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStreamGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStreamGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStreamGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteStreamGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize(now);
+
+        let Some(group) = state.stream_group(&input.identifier) else {
+            return Err(DeleteStreamGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no stream group matches identifier {}", input.identifier),
+                },
+            )
+            .into());
+        };
+        // @idempotent: a repeat of the call that already started the deletion leaves
+        // the record exactly as it is.
+        if group.status == crate::state::STREAM_GROUP_DELETING {
+            return Ok(DeleteStreamGroupOutput);
+        }
+        let group_arn = group.arn.clone();
+
+        // "When you delete a stream group, any application associations referring to
+        // that stream group are automatically removed."
+        for application in state.applications.values_mut() {
+            let before = application.associated_stream_groups.len();
+            application
+                .associated_stream_groups
+                .retain(|arn| *arn != group_arn);
+            application
+                .replications
+                .retain(|replication| replication.stream_group_arn != group_arn);
+            if application.associated_stream_groups.len() != before {
+                application.last_updated_at = now;
+            }
+        }
+
+        let group = state
+            .stream_group_mut(&input.identifier)
+            .expect("the stream group was found immediately above");
+        // "This operation stops streams in progress and prevents new streams from
+        // starting."
+        for session in group.sessions.values_mut() {
+            if !session.is_terminal() {
+                session.status = crate::state::SESSION_TERMINATED.to_string();
+                session.status_reason =
+                    Some(crate::state::SESSION_REASON_API_TERMINATED.to_string());
+                session.last_updated_at = now;
+                session.status_due_at = None;
+            }
+        }
+        // "During the deletion process, the stream group's status is DELETING." The
+        // clock owes the record's removal.
+        group.status = crate::state::STREAM_GROUP_DELETING.to_string();
+        group.last_updated_at = now;
+        group.status_due_at = Some(now + crate::state::TRANSITION);
+        Ok(DeleteStreamGroupOutput)
     }
 }

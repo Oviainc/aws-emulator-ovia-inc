@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResponsePlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResponsePlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResponsePlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -107,13 +98,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssmincidents-ssminciden
 // here — hence the `CreateResponsePlanError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssmincidents#CreateResponsePlan")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssmincidents#CreateResponsePlan",
+    // The service models `ServiceQuotaExceededException` (`CreateReplicationSet`
+    // declares it) but this operation does not list it. Widened in so the handler can
+    // refuse once the store holds `MAX_RESPONSE_PLANS` plans, which is what keeps the
+    // memory a caller can make this process hold bounded.
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateResponsePlanErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -169,18 +168,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResponsePlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResponsePlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResponsePlan"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateResponsePlanErrorModeled::InternalServerException(InternalServerException {
+                message: "the ssm-incidents state store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a replay of the same token must answer
+        // with the ARN the first call minted rather than mint a second plan.
+        let client_token = input.client_token.as_deref();
+        if let Some(arn) = state.replayed_arn(Self::NAME, client_token) {
+            return Ok(CreateResponsePlanOutput { arn });
+        }
+
+        // Response-plan names are unique within the account: the ARN is derived from
+        // the name, so a name already in the store is a conflicting create.
+        let arn = crate::state::response_plan_arn(&input.name);
+        if state.response_plans.contains_key(&arn) {
+            return Err(CreateResponsePlanErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "A response plan named {} already exists in this account",
+                    input.name
+                ),
+                resource_identifier: Some(arn.clone()),
+                resource_type: Some(crate::state::RESOURCE_TYPE_RESPONSE_PLAN.to_string()),
+                retry_after: None,
+            })
+            .into());
+        }
+
+        // The store holds at most `MAX_RESPONSE_PLANS` plans, so no sequence of
+        // requests can make this process hold response-plan memory without limit.
+        if !state.accepts_another_response_plan() {
+            return Err(CreateResponsePlanErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The account has reached its quota of {} response plans",
+                        crate::state::MAX_RESPONSE_PLANS
+                    ),
+                    resource_identifier: Some(arn),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RESPONSE_PLAN.to_string()),
+                    service_code: SERVICE_CODE_VALUES
+                        .first()
+                        .map(|code| (*code).to_string())
+                        .unwrap_or_default(),
+                    quota_code: crate::state::QUOTA_CODE_RESPONSE_PLANS.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let plan = crate::state::ResponsePlan {
+            arn: arn.clone(),
+            name: input.name,
+            display_name: input.display_name,
+            incident_template: input.incident_template,
+            chat_channel: input.chat_channel,
+            engagements: input.engagements,
+            actions: input.actions,
+            integrations: input.integrations,
+            tags: input.tags.unwrap_or_default(),
+            created_time: crate::state::now(),
+        };
+        state.response_plans.insert(arn.clone(), plan);
+        state.remember_arn(Self::NAME, client_token, &arn);
+
+        Ok(CreateResponsePlanOutput { arn })
     }
 }

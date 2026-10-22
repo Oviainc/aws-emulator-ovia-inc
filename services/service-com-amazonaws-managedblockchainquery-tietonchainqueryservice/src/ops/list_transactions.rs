@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTransactions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTransactions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTransactions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the transactions one address took part in on one network, out of that
+//! network's ledger (`crate::state::NetworkLedger`). Every item is projected from a
+//! STORED transaction by `crate::state::StoredTransaction::output_item`, and
+//! `nextToken` is a real resumable cursor into the matched, ordered listing.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTransactions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTransactionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTransactions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTransactionsErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let state = state.lock();
+
+        // `fromBlockchainInstant`/`toBlockchainInstant` bound the window the listing
+        // covers; a window that ends before it starts selects nothing a caller could
+        // have meant, so it is refused rather than answered with an empty page.
+        let from = crate::state::instant_to_secs(input.from_blockchain_instant.as_ref());
+        let to = crate::state::instant_to_secs(input.to_blockchain_instant.as_ref());
+        if let (Some(earliest), Some(latest)) = (from, to) {
+            if earliest > latest {
+                return Err(ListTransactionsErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(
+                        "fromBlockchainInstant",
+                        "fromBlockchainInstant must not be later than toBlockchainInstant",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // `ListTransactionsSort$sortOrder`: "Not providing SortOrder will default to
+        // ASCENDING." `sortBy` declares exactly one value, TRANSACTION_TIMESTAMP, which
+        // is the order the ledger is already keyed in.
+        let descending = input
+            .sort
+            .as_ref()
+            .and_then(|sort| sort.sort_order.as_deref())
+            .is_some_and(|order| order == crate::state::SORT_DESCENDING);
+
+        let wanted_statuses = input
+            .confirmation_status_filter
+            .as_ref()
+            .map(|filter| filter.include.clone());
+
+        let mut matching: Vec<&crate::state::StoredTransaction> = state
+            .ledger(&input.network)
+            .map(|ledger| ledger.for_address(&input.address))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|transaction| {
+                from.is_none_or(|earliest| transaction.transaction_timestamp >= earliest)
+            })
+            .filter(|transaction| {
+                to.is_none_or(|latest| transaction.transaction_timestamp <= latest)
+            })
+            .filter(|transaction| {
+                wanted_statuses
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(&transaction.confirmation_status))
+            })
+            .collect();
+        if descending {
+            matching.reverse();
+        }
+
+        let all: Vec<(String, TransactionOutputItem)> = matching
+            .into_iter()
+            .map(|transaction| {
+                (
+                    crate::state::normalize_hash(&transaction.transaction_hash),
+                    transaction.output_item(),
+                )
+            })
+            .collect();
+
+        let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListTransactionsErrorModeled::ValidationException(
+                    crate::state::invalid_page_token(&error),
+                )
+            })?;
+
+        Ok(ListTransactionsOutput {
+            transactions: page.items,
+            next_token: page.next_token,
+        })
     }
 }

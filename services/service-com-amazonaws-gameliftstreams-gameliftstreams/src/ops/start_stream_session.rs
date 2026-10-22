@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartStreamSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartStreamSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates and PERSISTS a stream session under its stream group, in `ACTIVATING`
+//! status.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartStreamSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A session reaches `ACTIVE` only once a stream server has started the content
+//! and answered the client's WebRTC offer (`SignalResponse` is "the WebRTC answer
+//! string that the stream server generates in response to the SignalRequest"), and
+//! this emulator runs no stream server. The resource, its ARN, its stored
+//! configuration and its status lifecycle are real; the placement resolves into the
+//! modelled failure state (`ERROR` with `StatusReason` `internalError`) rather than
+//! reporting a stream that never started. See `crate::state::StreamSession::advance`.
 //!
 //! ## Shape of an operation
 //!
@@ -268,6 +269,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The pixel budget of a stream session's virtual monitor: `Resolution`'s
+/// documentation — "The total number of pixels (width x height) must not exceed
+/// 2,073,600 (equivalent to 1920 x 1080)."
+const MAX_RESOLUTION_PIXELS: i64 = 2_073_600;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -341,18 +347,244 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartStreamSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartStreamSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartStreamSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartStreamSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize(now);
+
+        let Some(group) = state.stream_group(&input.identifier) else {
+            return Err(StartStreamSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no stream group matches identifier {}", input.identifier),
+                },
+            )
+            .into());
+        };
+        let group_id = group.id.clone();
+
+        // A replayed `ClientToken` answers with the session the first request
+        // created.
+        let replayed = state.replayed(Self::NAME, input.client_token.as_deref());
+        let replayed = replayed.filter(|session_id| {
+            state.stream_groups[&group_id]
+                .sessions
+                .contains_key(session_id)
+        });
+
+        let session_id = match replayed {
+            Some(session_id) => session_id,
+            None => {
+                let group = &state.stream_groups[&group_id];
+                // "Prerequisites: You must have a stream group in ACTIVE status."
+                if group.status != crate::state::STREAM_GROUP_ACTIVE {
+                    return Err(StartStreamSessionErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "stream group {} is in {} status; a stream session can only \
+                                 start in a stream group in ACTIVE status",
+                                group.id, group.status
+                            ),
+                        },
+                    )
+                    .into());
+                }
+
+                let Some(application) = state.application(&input.application_identifier) else {
+                    return Err(StartStreamSessionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "no application matches ApplicationIdentifier {}",
+                                input.application_identifier
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                let application_arn = application.arn.clone();
+
+                let group = &state.stream_groups[&group_id];
+                // "You must have at least one application associated to the stream
+                // group."
+                if !group.associated_applications.contains(&application_arn) {
+                    return Err(StartStreamSessionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "application {} is not associated with stream group {}",
+                                input.application_identifier, group.id
+                            ),
+                        },
+                    )
+                    .into());
+                }
+
+                // "For stream groups that have multiple locations, provide a set of
+                // locations ordered by priority. Amazon GameLift Streams will start a
+                // single stream session in the next available location." With no
+                // `Locations`, the group's own first location hosts the stream.
+                let requested = input.locations.clone().unwrap_or_default();
+                let location = if requested.is_empty() {
+                    group.locations.first().map(|slot| slot.name.clone())
+                } else {
+                    requested
+                        .iter()
+                        .find(|location| group.has_location(location))
+                        .cloned()
+                };
+                let Some(location) = location else {
+                    return Err(StartStreamSessionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: if requested.is_empty() {
+                                format!(
+                                    "stream group {} has no location that can host a stream \
+                                     session",
+                                    group.id
+                                )
+                            } else {
+                                format!(
+                                    "stream group {} holds none of the requested Locations: {}",
+                                    group.id,
+                                    requested.join(", ")
+                                )
+                            },
+                        },
+                    )
+                    .into());
+                };
+
+                // `Resolution` — "The value must be an even number" (Width, Height)
+                // and "The total number of pixels (width x height) must not exceed
+                // 2,073,600". Neither rule is expressible in the model, so both are
+                // refused here with the modelled client-input error.
+                if let Some(resolution) = input
+                    .display_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.resolution.as_ref())
+                {
+                    let (width, height) = (resolution.width, resolution.height);
+                    if width % 2 != 0 || height % 2 != 0 {
+                        return Err(StartStreamSessionErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "DisplayConfiguration.Resolution must have an even Width \
+                                     and Height, got {width}x{height}"
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                    if i64::from(width) * i64::from(height) > MAX_RESOLUTION_PIXELS {
+                        return Err(StartStreamSessionErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "DisplayConfiguration.Resolution must not exceed \
+                                     {MAX_RESOLUTION_PIXELS} pixels, got {width}x{height}"
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+
+                // The emulator's own bound on the per-group session store. Sessions
+                // that reached a terminal status are released first (oldest first);
+                // only a group whose LIVE sessions fill the bound is refused, which
+                // is what the real service's capacity limit refuses too.
+                let group = state
+                    .stream_groups
+                    .get_mut(&group_id)
+                    .expect("the stream group was resolved above");
+                if !group.make_room_for_a_session() {
+                    return Err(StartStreamSessionErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "stream group {} is already running the maximum of {} stream \
+                                 sessions; terminate one before starting another",
+                                group_id,
+                                crate::state::SESSIONS_PER_STREAM_GROUP
+                            ),
+                        },
+                    )
+                    .into());
+                }
+
+                let region = crate::state::region_of(ctx.parts());
+                let session_id = state.mint_id("ss-");
+                let arn =
+                    crate::state::stream_session_arn(&region, &group_id, &session_id);
+                let session = crate::state::StreamSession {
+                    id: session_id.clone(),
+                    arn,
+                    stream_group_id: group_id.clone(),
+                    application_arn,
+                    description: input.description,
+                    user_id: input.user_id,
+                    // "Session transitions to ACTIVATING status."
+                    status: crate::state::SESSION_ACTIVATING.to_string(),
+                    status_reason: None,
+                    protocol: input.protocol,
+                    location,
+                    signal_request: input.signal_request,
+                    signal_response: None,
+                    web_sdk_protocol_url: None,
+                    connection_timeout_seconds: input.connection_timeout_seconds,
+                    session_length_seconds: input.session_length_seconds,
+                    additional_launch_args: input.additional_launch_args.unwrap_or_default(),
+                    additional_environment_variables: input
+                        .additional_environment_variables
+                        .unwrap_or_default(),
+                    performance_stats_configuration: input.performance_stats_configuration,
+                    display_configuration: input.display_configuration,
+                    role_arn: input.role_arn,
+                    log_file_location_uri: None,
+                    created_at: now,
+                    last_updated_at: now,
+                    status_due_at: Some(now + crate::state::TRANSITION),
+                };
+                let group = state
+                    .stream_groups
+                    .get_mut(&group_id)
+                    .expect("the stream group was resolved above");
+                group.sessions.insert(session_id.clone(), session);
+                state.remember(Self::NAME, input.client_token.as_deref(), &session_id);
+                session_id
+            }
+        };
+
+        let session = &state.stream_groups[&group_id].sessions[&session_id];
+        Ok(StartStreamSessionOutput {
+            arn: Some(session.arn.clone()),
+            description: session.description.clone(),
+            stream_group_id: Some(session.stream_group_id.clone()),
+            user_id: session.user_id.clone(),
+            status: Some(session.status.clone()),
+            status_reason: session.status_reason.clone(),
+            protocol: Some(session.protocol.clone()),
+            location: Some(session.location.clone()),
+            signal_request: Some(session.signal_request.clone()),
+            signal_response: session.signal_response.clone(),
+            connection_timeout_seconds: session.connection_timeout_seconds,
+            session_length_seconds: session.session_length_seconds,
+            additional_launch_args: Some(session.additional_launch_args.clone()),
+            additional_environment_variables: Some(
+                session.additional_environment_variables.clone(),
+            ),
+            performance_stats_configuration: session.performance_stats_configuration.clone(),
+            log_file_location_uri: session.log_file_location_uri.clone(),
+            web_sdk_protocol_url: session.web_sdk_protocol_url.clone(),
+            last_updated_at: Some(crate::state::timestamp(session.last_updated_at)),
+            created_at: Some(crate::state::timestamp(session.created_at)),
+            application_arn: Some(session.application_arn.clone()),
+            export_files_metadata: None,
+            role_arn: session.role_arn.clone(),
+            display_configuration: session.display_configuration.clone(),
+        })
     }
 }

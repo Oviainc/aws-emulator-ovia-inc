@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a workflow plus its first immutable version and persists both in
+//! this service's store (`crate::state`). Every value in the response is read back out
+//! of that record, so `GetWorkflow`/`ListWorkflows` report exactly what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -178,6 +172,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -253,18 +249,214 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkflow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        let fingerprint = request_fingerprint(&input);
+        let mut store = state.lock();
+
+        // A repeated @idempotencyToken replays its first answer rather than minting a
+        // second workflow; the same token with a different request is a conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(recorded) = store.idempotency.get(&token_key(token)).cloned() {
+                if recorded.request_fingerprint() != fingerprint {
+                    return Err(CreateWorkflowErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "ClientToken {token} was already used for a CreateWorkflow \
+                                 request with different parameters"
+                            ),
+                            resource_id: recorded.workflow_arn().to_string(),
+                            resource_type: "workflow".to_string(),
+                        },
+                    )
+                    .into());
+                }
+                let workflow = store
+                    .workflows
+                    .get(recorded.workflow_arn())
+                    .ok_or_else(unavailable)?;
+                return Ok(response_for(workflow));
+            }
+        }
+
+        // "You must use unique workflow names within your account" — a second create
+        // under a name already in the store is a conflict, not a second workflow.
+        if let Some(existing) = store.workflow_names.get(&input.name) {
+            return Err(
+                CreateWorkflowErrorModeled::ConflictException(ConflictException {
+                    message: format!("A workflow named {} already exists", input.name),
+                    resource_id: existing.clone(),
+                    resource_type: "workflow".to_string(),
+                })
+                .into(),
+            );
+        }
+
+        // The emulator's own ceiling on this caller-driven store, refused with the
+        // error the model already declares for exceeding a workflow quota.
+        if store.workflows.len() >= crate::state::MAX_WORKFLOWS {
+            return Err(CreateWorkflowErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This emulator holds at most {} workflows for the account",
+                        crate::state::MAX_WORKFLOWS
+                    ),
+                    resource_id: input.name.clone(),
+                    resource_type: "workflow".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                    quota_code: "WorkflowsPerAccount".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let nonce = store.next_nonce(now);
+        let arn = crate::state::mint_workflow_arn(&region, &input.name, &nonce);
+        let version = crate::state::mint_workflow_version(&arn, &fingerprint, &nonce);
+        let revision_id = crate::state::mint_revision_id(&arn, &version);
+
+        // The definition snapshot the docs describe: "takes a snapshot of the definition
+        // at creation time, so subsequent changes to the S3 object will not affect the
+        // workflow unless you create a new version".
+        let snapshot = crate::state::WorkflowSnapshot {
+            definition_s3_location: input.definition_s3_location.clone(),
+            code: input.code.clone(),
+            role_arn: input.role_arn.clone(),
+            description: input.description.clone(),
+            encryption_configuration: input.encryption_configuration.clone(),
+            logging_configuration: input.logging_configuration.clone(),
+            engine_version: input.engine_version,
+            network_configuration: input.network_configuration.clone(),
+            trigger_mode: input.trigger_mode.clone(),
+        };
+
+        let workflow = crate::state::Workflow {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            // READY is documented as "workflow is ready to run": a created workflow is
+            // returned ready, so it owes no later transition.
+            status: crate::state::WORKFLOW_STATUS_READY.to_string(),
+            created_at: now,
+            modified_at: now,
+            code_snapshotted_at: now,
+            current_version: version.clone(),
+            revision_id,
+            versions: vec![crate::state::WorkflowVersionRecord {
+                version,
+                created_at: now,
+                is_latest: true,
+                snapshot,
+            }],
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+            runs: BTreeMap::new(),
+        };
+
+        store.workflow_names.insert(input.name.clone(), arn.clone());
+        store.workflows.insert(arn.clone(), workflow);
+        if let Some(token) = input.client_token.as_deref() {
+            store.idempotency.record(
+                token_key(token),
+                crate::state::IdempotentResult::CreateWorkflow {
+                    request_fingerprint: fingerprint,
+                    workflow_arn: arn.clone(),
+                },
+            );
+        }
+
+        // Read the response back out of the stored record, so the answer can only ever
+        // be what was persisted.
+        let stored = store.workflows.get(&arn).ok_or_else(unavailable)?;
+        Ok(response_for(stored))
     }
+}
+
+/// The idempotency-ledger key for a `ClientToken` of THIS operation, so one token
+/// used on two different operations records two entries.
+fn token_key(client_token: &str) -> String {
+    format!("CreateWorkflow:{client_token}")
+}
+
+/// The modelled server error for a store this handler could not reach.
+fn unavailable() -> CreateWorkflowError {
+    CreateWorkflowErrorModeled::InternalServerException(InternalServerException {
+        message: "the com.amazonaws.mwaaserverless workflow store is unavailable".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// The `CreateWorkflowResponse` for a stored workflow — every member read out of
+/// the record.
+fn response_for(workflow: &crate::state::Workflow) -> CreateWorkflowOutput {
+    CreateWorkflowOutput {
+        workflow_arn: workflow.arn.clone(),
+        created_at: Some(crate::state::timestamp(workflow.created_at)),
+        revision_id: Some(workflow.revision_id.clone()),
+        workflow_status: Some(workflow.status.clone()),
+        workflow_version: Some(workflow.current_version.clone()),
+        is_latest_version: Some(
+            workflow
+                .version(Some(&workflow.current_version))
+                .is_some_and(|rec| rec.is_latest),
+        ),
+        warnings: None,
+    }
+}
+
+/// A stable digest of the request, so a repeated `ClientToken` can be told apart
+/// from a token reused for a different request.
+fn request_fingerprint(input: &CreateWorkflowInput) -> String {
+    let mut fields: Vec<String> = vec![
+        input.name.clone(),
+        input.role_arn.clone(),
+        input.description.clone().unwrap_or_default(),
+        input.trigger_mode.clone().unwrap_or_default(),
+        input
+            .engine_version
+            .map(|version| version.to_string())
+            .unwrap_or_default(),
+        input.definition_s3_location.bucket.clone(),
+        input.definition_s3_location.object_key.clone(),
+        input
+            .definition_s3_location
+            .version_id
+            .clone()
+            .unwrap_or_default(),
+    ];
+    match input.code.as_ref() {
+        Some(Code::S3Location(location)) => {
+            fields.push(location.bucket.clone());
+            fields.push(location.object_key.clone());
+            fields.push(location.version_id.clone().unwrap_or_default());
+        }
+        None => fields.push(String::new()),
+    }
+    if let Some(encryption) = input.encryption_configuration.as_ref() {
+        fields.push(encryption.r#type.clone());
+        fields.push(encryption.kms_key_id.clone().unwrap_or_default());
+    }
+    if let Some(logging) = input.logging_configuration.as_ref() {
+        fields.push(logging.log_group_name.clone());
+    }
+    if let Some(network) = input.network_configuration.as_ref() {
+        fields.extend(network.security_group_ids.clone().unwrap_or_default());
+        fields.extend(network.subnet_ids.clone().unwrap_or_default());
+    }
+    // Tags are an unordered map on the wire, so fingerprint them in key order.
+    let mut tags: Vec<(String, String)> =
+        input.tags.clone().unwrap_or_default().into_iter().collect();
+    tags.sort();
+    for (key, value) in tags {
+        fields.push(key);
+        fields.push(value);
+    }
+    let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+    crate::state::digest(&borrowed)
 }

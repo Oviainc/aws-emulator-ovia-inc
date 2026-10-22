@@ -1,11 +1,542 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-managedblockchainquery-tietonchainqueryservice service.
+//!
+//! ManagedBlockchain Query is a READ-ONLY query service over blockchain data: every
+//! modelled operation carries `@readonly` and the model declares no `Create*`, so
+//! nothing a caller does can add to the ledger. The ledger therefore has to exist
+//! before the first request, and it does — [`Default`] builds a deterministic fixture
+//! ledger for every value of the model's `QueryNetwork` enum, and every implemented
+//! operation computes its answer by reading that ledger.
+//!
+//! The fixture is built so the operations are mutually consistent:
+//!
+//! * a transaction `ListTransactions` returns is fetchable by `GetTransaction`;
+//! * its events are exactly what `ListTransactionEvents` returns;
+//! * every balance `GetTokenBalance`/`ListTokenBalances` reports is DERIVED from the
+//!   opening balances plus those events ([`derive_holdings`]) rather than written down
+//!   beside them, so a reported balance can never disagree with the transfers that
+//!   produced it.
+//!
+//! The stored half is [`StoredTransaction`] / [`StoredEvent`] / [`StoredHolding`]; the
+//! wire half (`Transaction`, `TransactionOutputItem`, `TransactionEvent`,
+//! `TokenBalance`) is PROJECTED from it by the methods below, so no handler assembles a
+//! response member by hand.
+
+use std::collections::{BTreeMap, HashMap};
+
+use sha2::{Digest, Sha256};
+
+use crate::ops::types::{
+    BlockchainInstant, ContractMetadata, InternalServerException, OwnerIdentifier, TokenBalance,
+    TokenIdentifier, Transaction, TransactionEvent, TransactionOutputItem, ValidationException,
+    ValidationExceptionField, QUERY_NETWORK_VALUES,
+};
+
+// ---------------------------------------------------------------------------
+// Modelled vocabulary
+// ---------------------------------------------------------------------------
+
+/// `ConfirmationStatus` values, from the model's own
+/// [`crate::ops::types::CONFIRMATION_STATUS_VALUES`].
+pub const CONFIRMATION_FINAL: &str = "FINAL";
+/// See [`CONFIRMATION_FINAL`].
+pub const CONFIRMATION_NONFINAL: &str = "NONFINAL";
+
+/// `ExecutionStatus` values, from the model's own
+/// [`crate::ops::types::EXECUTION_STATUS_VALUES`].
+pub const EXECUTION_SUCCEEDED: &str = "SUCCEEDED";
+/// See [`EXECUTION_SUCCEEDED`].
+pub const EXECUTION_FAILED: &str = "FAILED";
+
+/// `SortOrder` values, from the model's own [`crate::ops::types::SORT_ORDER_VALUES`].
+pub const SORT_ASCENDING: &str = "ASCENDING";
+/// See [`SORT_ASCENDING`].
+pub const SORT_DESCENDING: &str = "DESCENDING";
+
+/// The `tokenId` of Ether, the native token of the Ethereum networks.
+///
+/// `TokenIdentifier$tokenId`'s documentation: "For native tokens, use the 3 character
+/// abbreviation that best matches your token. For example, `btc` for Bitcoin, `eth` for
+/// Ether".
+pub const NATIVE_TOKEN_ETH: &str = "eth";
+/// The `tokenId` of Bitcoin; see [`NATIVE_TOKEN_ETH`] for where the spelling comes from.
+pub const NATIVE_TOKEN_BTC: &str = "btc";
+
+/// The only value the model's `ResourceType` enum declares, so it is the
+/// `resourceType` every `ResourceNotFoundException` this service raises carries.
+pub const RESOURCE_TYPE: &str = "collection";
+
+/// The `ValidationExceptionReason` for a request member whose value this service
+/// refuses, from the model's own `VALIDATION_EXCEPTION_REASON_VALUES`.
+pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// The largest page any listing returns, and the page size used when the caller names
+/// no `maxResults`.
+///
+/// Both halves of the model agree on this number: `maxResults` carries
+/// `@range(min: 1, max: 250)` on every paginated operation, and each output list
+/// carries `@length(min: 0, max: 250)`.
+pub const MAX_PAGE_SIZE: i32 = 250;
+
+/// Whether `network` is one of the model's two Bitcoin networks.
+///
+/// The Bitcoin and Ethereum networks differ in what a transaction carries — a Bitcoin
+/// transaction has a `transactionId` and no gas, an Ethereum one has gas and a
+/// signature — so the fixture builds the two kinds differently.
+pub fn is_bitcoin(network: &str) -> bool {
+    network.starts_with("BITCOIN_")
+}
+
+// ---------------------------------------------------------------------------
+// Stored records
+// ---------------------------------------------------------------------------
+
+/// A transaction's position in the ledger: `(transactionTimestamp, transactionIndex,
+/// transactionHash)`.
+///
+/// Ordered first by timestamp and then by the index within the block, so iterating the
+/// `BTreeMap` keyed by it walks the chain in the order it was written — which is the
+/// order `ListTransactions` sorts by (`ListTransactionsSortBy` declares exactly one
+/// value, `TRANSACTION_TIMESTAMP`). The hash is the tie-breaker that makes the key
+/// total.
+pub type TxKey = (i64, i64, String);
+
+/// A stored transaction: the state `Transaction` and `TransactionOutputItem` are
+/// rebuilt from.
+#[derive(Debug, Clone)]
+pub struct StoredTransaction {
+    pub network: String,
+    /// The hash as the ledger spells it: `0x`-prefixed on the Ethereum networks, bare
+    /// hex on the Bitcoin ones. Lookups go through [`normalize_hash`], so a caller may
+    /// spell it either way.
+    pub transaction_hash: String,
+    /// Set only on the Bitcoin networks — `GetTransactionInput$transactionId`'s
+    /// documentation: "transactionId is only supported on the Bitcoin networks".
+    pub transaction_id: Option<String>,
+    pub block_hash: Option<String>,
+    pub block_number: Option<String>,
+    /// Seconds since the Unix epoch; `BlockchainInstant$time` is "only be recorded up
+    /// to the second".
+    pub transaction_timestamp: i64,
+    pub transaction_index: i64,
+    pub number_of_transactions: i64,
+    pub to: String,
+    pub from: Option<String>,
+    pub contract_address: Option<String>,
+    pub gas_used: Option<i128>,
+    pub cumulative_gas_used: Option<i128>,
+    pub effective_gas_price: Option<i128>,
+    pub transaction_fee: Option<i128>,
+    pub signature_v: Option<i32>,
+    pub signature_r: Option<String>,
+    pub signature_s: Option<String>,
+    /// One of [`CONFIRMATION_FINAL`] / [`CONFIRMATION_NONFINAL`].
+    pub confirmation_status: String,
+    /// One of [`EXECUTION_SUCCEEDED`] / [`EXECUTION_FAILED`]; absent on the Bitcoin
+    /// networks, which have no contract execution to succeed or fail.
+    pub execution_status: Option<String>,
+    /// The events this transaction emitted, in emission order — which is the order
+    /// `ListTransactionEvents` returns them in.
+    pub events: Vec<StoredEvent>,
+}
+
+impl StoredTransaction {
+    /// This transaction's key in the ledger.
+    pub fn key(&self) -> TxKey {
+        (
+            self.transaction_timestamp,
+            self.transaction_index,
+            normalize_hash(&self.transaction_hash),
+        )
+    }
+
+    /// Project the stored transaction onto the modelled `Transaction`.
+    pub fn transaction(&self) -> Transaction {
+        Transaction {
+            network: self.network.clone(),
+            block_hash: self.block_hash.clone(),
+            transaction_hash: self.transaction_hash.clone(),
+            block_number: self.block_number.clone(),
+            transaction_timestamp: instant_secs(self.transaction_timestamp),
+            transaction_index: self.transaction_index,
+            number_of_transactions: self.number_of_transactions,
+            to: self.to.clone(),
+            from: self.from.clone(),
+            contract_address: self.contract_address.clone(),
+            gas_used: self.gas_used.map(|amount| amount.to_string()),
+            cumulative_gas_used: self.cumulative_gas_used.map(|amount| amount.to_string()),
+            effective_gas_price: self.effective_gas_price.map(|amount| amount.to_string()),
+            signature_v: self.signature_v,
+            signature_r: self.signature_r.clone(),
+            signature_s: self.signature_s.clone(),
+            transaction_fee: self.transaction_fee.map(|amount| amount.to_string()),
+            transaction_id: self.transaction_id.clone(),
+            confirmation_status: Some(self.confirmation_status.clone()),
+            execution_status: self.execution_status.clone(),
+        }
+    }
+
+    /// Project the stored transaction onto the modelled `TransactionOutputItem`, the
+    /// summary `ListTransactions` returns.
+    pub fn output_item(&self) -> TransactionOutputItem {
+        TransactionOutputItem {
+            transaction_hash: self.transaction_hash.clone(),
+            transaction_id: self.transaction_id.clone(),
+            network: self.network.clone(),
+            transaction_timestamp: instant_secs(self.transaction_timestamp),
+            confirmation_status: Some(self.confirmation_status.clone()),
+        }
+    }
+
+    /// Project the stored events onto the modelled `TransactionEvent`s.
+    ///
+    /// `network`, `transactionHash`, `transactionId`, `blockchainInstant` and
+    /// `confirmationStatus` are properties of the TRANSACTION, so they come from it
+    /// rather than being stored a second time on each event.
+    pub fn events(&self) -> Vec<TransactionEvent> {
+        self.events
+            .iter()
+            .map(|event| TransactionEvent {
+                network: self.network.clone(),
+                transaction_hash: self.transaction_hash.clone(),
+                event_type: event.event_type.clone(),
+                from: event.from.clone(),
+                to: event.to.clone(),
+                value: event.value.map(|amount| amount.to_string()),
+                contract_address: event.contract_address.clone(),
+                token_id: event.token_id.clone(),
+                transaction_id: self.transaction_id.clone(),
+                vout_index: event.vout_index,
+                vout_spent: event.vout_spent,
+                spent_vout_transaction_id: event.spent_vout_transaction_id.clone(),
+                spent_vout_transaction_hash: event.spent_vout_transaction_hash.clone(),
+                spent_vout_index: event.spent_vout_index,
+                blockchain_instant: Some(BlockchainInstant {
+                    time: Some(instant_secs(self.transaction_timestamp)),
+                }),
+                confirmation_status: Some(self.confirmation_status.clone()),
+            })
+            .collect()
+    }
+
+    /// Every address this transaction involves: its own `from`/`to`, plus the `from`
+    /// and `to` of each event it emitted.
+    ///
+    /// The events matter: a token transfer's `to` is the token CONTRACT, and the wallet
+    /// that received the tokens appears only on the transfer event, so an address-scoped
+    /// listing that looked at the transaction alone would miss it.
+    pub fn addresses(&self) -> Vec<&str> {
+        let mut addresses = vec![self.to.as_str()];
+        if let Some(from) = &self.from {
+            addresses.push(from.as_str());
+        }
+        for event in &self.events {
+            if let Some(from) = &event.from {
+                addresses.push(from.as_str());
+            }
+            if let Some(to) = &event.to {
+                addresses.push(to.as_str());
+            }
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    }
+}
+
+/// A stored transaction event: the state `TransactionEvent` is rebuilt from, holding
+/// only what belongs to the EVENT (see [`StoredTransaction::events`]).
+#[derive(Debug, Clone, Default)]
+pub struct StoredEvent {
+    /// One of the model's `QueryTransactionEventType` values, listed in this crate as
+    /// [`crate::ops::types::QUERY_TRANSACTION_EVENT_TYPE_VALUES`].
+    pub event_type: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub value: Option<i128>,
+    pub contract_address: Option<String>,
+    pub token_id: Option<String>,
+    pub vout_index: Option<i32>,
+    pub vout_spent: Option<bool>,
+    pub spent_vout_transaction_id: Option<String>,
+    pub spent_vout_transaction_hash: Option<String>,
+    pub spent_vout_index: Option<i32>,
+}
+
+impl StoredEvent {
+    /// The token whose balance this event moves, as the `(contractAddress, tokenId)`
+    /// pair a [`HoldingKey`] is built from — or `None` for an event that moves no
+    /// balance.
+    ///
+    /// Which pair identifies the token follows from the event's type, the way the token
+    /// standards define it: a native transfer moves the network's native token (no
+    /// contract, the documented 3-character abbreviation as `tokenId`), an ERC-20 event
+    /// moves one fungible balance per contract (a contract and no `tokenId`), and an
+    /// ERC-721/ERC-1155 event moves one token of a contract (a contract AND a
+    /// `tokenId`).
+    pub fn holding(&self) -> Option<(Option<String>, Option<String>)> {
+        match self.event_type.as_str() {
+            "ETH_TRANSFER" | "INTERNAL_ETH_TRANSFER" => {
+                Some((None, Some(NATIVE_TOKEN_ETH.to_string())))
+            }
+            "BITCOIN_VIN" | "BITCOIN_VOUT" => Some((None, Some(NATIVE_TOKEN_BTC.to_string()))),
+            kind if kind.starts_with("ERC20_") => self
+                .contract_address
+                .clone()
+                .map(|contract| (Some(contract), None)),
+            "ERC721_TRANSFER" | "ERC1155_TRANSFER" => {
+                match (&self.contract_address, &self.token_id) {
+                    (Some(contract), Some(token_id)) => {
+                        Some((Some(contract.clone()), Some(token_id.clone())))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What identifies one holding: the token (as a `TokenIdentifier` names it) and its
+/// owner.
+///
+/// `Ord` is derived so the `BTreeMap` keyed by it iterates contract-major, which is the
+/// stable order `ListTokenBalances` pages over.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HoldingKey {
+    /// Absent for a native token (BTC, ETH), which has no contract.
+    pub contract_address: Option<String>,
+    /// Absent for an ERC-20 balance, which is one fungible balance per contract.
+    pub token_id: Option<String>,
+    pub owner_address: String,
+}
+
+impl HoldingKey {
+    /// Whether a `TokenFilter`/`TokenIdentifier` naming `contract_address` and
+    /// `token_id` selects this holding: a member the filter does not name matches
+    /// anything, and one it does name must match exactly.
+    pub fn matches_token(&self, contract_address: Option<&str>, token_id: Option<&str>) -> bool {
+        contract_address.is_none_or(|wanted| self.contract_address.as_deref() == Some(wanted))
+            && token_id.is_none_or(|wanted| self.token_id.as_deref() == Some(wanted))
+    }
+
+    /// Project the token half of this key onto the modelled `TokenIdentifier`.
+    pub fn token_identifier(&self, network: &str) -> TokenIdentifier {
+        TokenIdentifier {
+            network: network.to_string(),
+            contract_address: self.contract_address.clone(),
+            token_id: self.token_id.clone(),
+        }
+    }
+
+    /// Project the owner half of this key onto the modelled `OwnerIdentifier`.
+    pub fn owner_identifier(&self) -> OwnerIdentifier {
+        OwnerIdentifier {
+            address: self.owner_address.clone(),
+        }
+    }
+
+    /// The `resourceId` an error about this holding reports, and the key
+    /// `ListTokenBalances` pages over.
+    ///
+    /// Unambiguous despite joining three members: `ChainAddress` is
+    /// `^[-A-Za-z0-9]{13,74}$` and `QueryTokenId` is `^[a-zA-Z0-9]{1,66}$`, so no member
+    /// can contain the `/` separator, and neither can equal the `-` that stands in for
+    /// an absent one (an address is at least 13 characters, and a `tokenId` admits no
+    /// `-` at all).
+    pub fn resource_id(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.contract_address.as_deref().unwrap_or("-"),
+            self.token_id.as_deref().unwrap_or("-"),
+            self.owner_address
+        )
+    }
+}
+
+/// One balance the ledger recorded, and when.
+#[derive(Debug, Clone, Copy)]
+pub struct BalanceAt {
+    /// Seconds since the Unix epoch.
+    pub time: i64,
+    pub balance: i128,
+}
+
+/// A stored holding: the balance history of one (token, owner) pair, ascending by time.
+///
+/// A history rather than a single number because `GetTokenBalance` takes an
+/// `atBlockchainInstant`, and a point-in-time balance cannot be answered from the
+/// current one.
+#[derive(Debug, Clone, Default)]
+pub struct StoredHolding {
+    pub history: Vec<BalanceAt>,
+}
+
+impl StoredHolding {
+    /// Record `balance` as the holding's balance from `time` on. A second record at the
+    /// same instant replaces the first, so several events in one block settle to the
+    /// balance the last of them left.
+    pub fn record(&mut self, time: i64, balance: i128) {
+        match self.history.last_mut() {
+            Some(last) if last.time == time => last.balance = balance,
+            _ => self.history.push(BalanceAt { time, balance }),
+        }
+    }
+
+    /// The balance as of `at` — the last record at or before that instant — or the
+    /// current balance when no instant is asked for.
+    ///
+    /// `None` when the ledger knows no balance for this holding at that instant, which
+    /// is what an owner who had not yet received the token looks like.
+    pub fn balance_at(&self, at: Option<i64>) -> Option<BalanceAt> {
+        match at {
+            None => self.history.last().copied(),
+            Some(instant) => self
+                .history
+                .iter()
+                .rev()
+                .find(|record| record.time <= instant)
+                .copied(),
+        }
+    }
+
+    /// Project this holding onto the modelled `TokenBalance`.
+    ///
+    /// `atBlockchainInstant` is the instant the balance was ASKED for —
+    /// `TokenBalance$atBlockchainInstant` is "the time for when the TokenBalance is
+    /// requested or the current time if a time is not provided in the request" — while
+    /// `lastUpdatedTime` is "the `Timestamp` of the last transaction at which the
+    /// balance for the token in the wallet was updated", so it is the time of the
+    /// record the balance was read from.
+    pub fn token_balance(
+        &self,
+        network: &str,
+        key: &HoldingKey,
+        asked_at: i64,
+        record: BalanceAt,
+    ) -> TokenBalance {
+        TokenBalance {
+            owner_identifier: Some(key.owner_identifier()),
+            token_identifier: Some(key.token_identifier(network)),
+            balance: record.balance.to_string(),
+            at_blockchain_instant: BlockchainInstant {
+                time: Some(instant_secs(asked_at)),
+            },
+            last_updated_time: Some(BlockchainInstant {
+                time: Some(instant_secs(record.time)),
+            }),
+        }
+    }
+}
+
+/// A stored asset contract.
+///
+/// Present now so the later `GetAssetContract`/`ListAssetContracts` slice reads the
+/// same store the transaction and balance operations do; those two operations are still
+/// scaffolded and answer 501.
+#[derive(Debug, Clone)]
+pub struct StoredContract {
+    pub network: String,
+    pub contract_address: String,
+    /// One of the model's `QueryTokenStandard` values, listed in this crate as
+    /// [`crate::ops::types::QUERY_TOKEN_STANDARD_VALUES`].
+    pub token_standard: String,
+    pub deployer_address: String,
+    pub metadata: Option<ContractMetadata>,
+}
+
+/// One network's ledger.
+#[derive(Debug, Default)]
+pub struct NetworkLedger {
+    /// Every transaction on this network, keyed by [`TxKey`] so iteration is in chain
+    /// order.
+    pub transactions: BTreeMap<TxKey, StoredTransaction>,
+    /// `transactionHash` (normalised) -> the key in `transactions`.
+    by_hash: HashMap<String, TxKey>,
+    /// `transactionId` (normalised) -> the key in `transactions`.
+    by_id: HashMap<String, TxKey>,
+    /// Every address that appears on a transaction -> that transaction's key, in chain
+    /// order.
+    by_address: HashMap<String, Vec<TxKey>>,
+    /// Every holding on this network, derived from the transactions by
+    /// [`derive_holdings`].
+    pub holdings: BTreeMap<HoldingKey, StoredHolding>,
+    /// Every asset contract on this network, keyed by contract address.
+    pub contracts: BTreeMap<String, StoredContract>,
+}
+
+impl NetworkLedger {
+    /// Store `transaction` and index it by hash, id and participating address.
+    ///
+    /// The only way a transaction enters a ledger, so the indexes cannot drift from the
+    /// `transactions` map.
+    pub fn insert_transaction(&mut self, transaction: StoredTransaction) {
+        let key = transaction.key();
+        self.by_hash
+            .insert(normalize_hash(&transaction.transaction_hash), key.clone());
+        if let Some(id) = &transaction.transaction_id {
+            self.by_id.insert(normalize_hash(id), key.clone());
+        }
+        for address in transaction.addresses() {
+            let keys = self.by_address.entry(address.to_string()).or_default();
+            keys.push(key.clone());
+            // Chain order, which is the order `ListTransactions` reports them in.
+            keys.sort();
+            keys.dedup();
+        }
+        self.transactions.insert(key, transaction);
+    }
+
+    /// The transaction with this `transactionHash`, however the caller spelled it.
+    pub fn by_hash(&self, hash: &str) -> Option<&StoredTransaction> {
+        let key = self.by_hash.get(&normalize_hash(hash))?;
+        self.transactions.get(key)
+    }
+
+    /// The transaction with this `transactionId`, however the caller spelled it.
+    pub fn by_id(&self, id: &str) -> Option<&StoredTransaction> {
+        let key = self.by_id.get(&normalize_hash(id))?;
+        self.transactions.get(key)
+    }
+
+    /// Every transaction `address` took part in, in chain order.
+    pub fn for_address(&self, address: &str) -> Vec<&StoredTransaction> {
+        self.by_address
+            .get(address)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.transactions.get(key))
+            .collect()
+    }
+}
 
 /// Per-service state for com-amazonaws-managedblockchainquery-tietonchainqueryservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
-    // TODO: add service-specific state fields
+    /// One ledger per value of the model's `QueryNetwork` enum.
+    pub networks: BTreeMap<String, NetworkLedger>,
+}
+
+/// The ledger the emulator serves. There is no write API, so this is the only thing
+/// that ever populates the store.
+impl Default for ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
+    fn default() -> Self {
+        Self {
+            networks: seed_networks(),
+        }
+    }
+}
+
+impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
+    /// The ledger for `network`, or `None` for a network this emulator holds none for.
+    ///
+    /// The boundary validator has already refused any value the `QueryNetwork` enum
+    /// does not declare by the time a handler runs, so in practice every network
+    /// resolves.
+    pub fn ledger(&self, network: &str) -> Option<&NetworkLedger> {
+        self.networks.get(network)
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -13,8 +544,769 @@ pub struct ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
 /// Answer `None` with a modelled server error, never with a fresh engine.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
-) -> Option<::engine::ServiceState<ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState>> {
+) -> Option<::engine::ServiceState<ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState>>
+{
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
-        .map(::engine::InMemoryEngine::state::<ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState>)
+        .map(::engine::InMemoryEngine::state::<
+            ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState,
+        >)
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// A `BlockchainInstant`-grade timestamp from whole seconds.
+///
+/// `BlockchainInstant$time`'s documentation: "This `timestamp` will only be recorded up
+/// to the second", so every instant this service reports is whole seconds.
+pub fn instant_secs(secs: i64) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs(secs)
+}
+
+/// The whole seconds of a `BlockchainInstant` a request carried, if it carried a time.
+pub fn instant_to_secs(instant: Option<&BlockchainInstant>) -> Option<i64> {
+    instant.and_then(|instant| instant.time).map(|time| time.secs())
+}
+
+/// Now, in whole seconds since the Unix epoch.
+pub fn now_secs() -> i64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// A transaction hash or id reduced to the form the ledger is keyed by.
+///
+/// The modelled `QueryTransactionHash`/`QueryTransactionId` pattern
+/// `^(0x[A-Fa-f0-9]{64}|[A-Fa-f0-9]{64})$` admits the same 64 hex digits with or without
+/// the `0x` prefix and in either letter case, so every one of those spellings names ONE
+/// transaction and a lookup has to see them as equal.
+pub fn normalize_hash(value: &str) -> String {
+    value
+        .strip_prefix("0x")
+        .unwrap_or(value)
+        .to_ascii_lowercase()
+}
+
+/// One page of a listing: the items on it, and the token that resumes after them.
+#[derive(Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_token: Option<String>,
+}
+
+/// A `nextToken` this service did not issue, or that names no position in the listing
+/// being paged. Each handler renders it as its own modelled `ValidationException`.
+#[derive(Debug)]
+pub struct InvalidPageToken(pub String);
+
+/// How a request names one transaction: by `transactionHash` or by `transactionId`.
+///
+/// Shared by `GetTransaction` and `ListTransactionEvents`, which model the same pair of
+/// members and so accept the same combinations.
+#[derive(Debug)]
+pub enum TransactionSelector {
+    Hash(String),
+    Id(String),
+}
+
+impl TransactionSelector {
+    /// Which transaction a request's `transactionHash`/`transactionId` name, refusing
+    /// the combinations this service does not accept.
+    ///
+    /// Both members are modelled OPTIONAL, so the boundary validator lets through a
+    /// request naming NEITHER or BOTH, while a transaction-scoped read needs exactly
+    /// one. And `transactionId` is a Bitcoin identifier — the member's own
+    /// documentation: "transactionId is only supported on the Bitcoin networks" — so it
+    /// is refused on any other network.
+    pub fn from_input(
+        network: &str,
+        hash: Option<&str>,
+        id: Option<&str>,
+    ) -> Result<Self, ValidationException> {
+        match (hash, id) {
+            (Some(_), Some(_)) => Err(field_validation_exception(
+                "transactionHash",
+                "Only one of transactionHash or transactionId may be specified",
+            )),
+            (None, None) => Err(field_validation_exception(
+                "transactionHash",
+                "One of transactionHash or transactionId must be specified",
+            )),
+            (Some(hash), None) => Ok(Self::Hash(hash.to_string())),
+            (None, Some(id)) if is_bitcoin(network) => Ok(Self::Id(id.to_string())),
+            (None, Some(_)) => Err(field_validation_exception(
+                "transactionId",
+                format!(
+                    "transactionId is only supported on the Bitcoin networks, not {network}"
+                ),
+            )),
+        }
+    }
+
+    /// The identifier as the request spelled it, for an error's `resourceId`.
+    pub fn identifier(&self) -> &str {
+        match self {
+            Self::Hash(hash) => hash,
+            Self::Id(id) => id,
+        }
+    }
+
+    /// Which member the identifier came from, for an error message.
+    pub fn member(&self) -> &'static str {
+        match self {
+            Self::Hash(_) => "transactionHash",
+            Self::Id(_) => "transactionId",
+        }
+    }
+
+    /// The transaction it names, or `None` when the ledger holds none.
+    pub fn resolve<'ledger>(
+        &self,
+        ledger: &'ledger NetworkLedger,
+    ) -> Option<&'ledger StoredTransaction> {
+        match self {
+            Self::Hash(hash) => ledger.by_hash(hash),
+            Self::Id(id) => ledger.by_id(id),
+        }
+    }
+}
+
+/// Take one page out of an ordered listing.
+///
+/// `all` is every item that matches the request, in the order the response reports
+/// them, paired with the key that identifies the item within the listing. The page holds
+/// at most `max_results` items and carries a token only when further items remain, so a
+/// caller that follows tokens to exhaustion sees every item exactly once. The token
+/// names the first item NOT on the page, which is why resuming is an exact key match
+/// and works for either `sortOrder`.
+pub fn page<T>(
+    all: Vec<(String, T)>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Result<Page<T>, InvalidPageToken> {
+    let start = match next_token {
+        None => 0,
+        Some(token) => {
+            let key =
+                decode_page_token(token).ok_or_else(|| InvalidPageToken(token.to_string()))?;
+            all.iter()
+                .position(|(candidate, _)| *candidate == key)
+                .ok_or_else(|| InvalidPageToken(token.to_string()))?
+        }
+    };
+    // `maxResults` carries `@range(min: 1, max: 250)`, so the boundary validator has
+    // already refused anything outside it; absent, the page is the modelled maximum.
+    let limit = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize;
+
+    let mut rest = all.into_iter().skip(start);
+    let items: Vec<T> = rest.by_ref().take(limit).map(|(_, item)| item).collect();
+    let next_token = rest.next().map(|(key, _)| encode_page_token(&key));
+    Ok(Page { items, next_token })
+}
+
+/// Marks a continuation token as this service's, and at which version it was issued.
+const PAGE_TOKEN_PREFIX: &str = "managedblockchain-query:v1:";
+
+/// Encode a listing key as an opaque continuation token.
+///
+/// The key is prefixed with a version marker before hex-encoding, so the token is
+/// opaque to a client AND a value this service did not issue is refused rather than
+/// resumed from. It stays a pure function of the key, so no cursor state is held
+/// server-side — which matters for a read-only service whose reads must not write.
+fn encode_page_token(key: &str) -> String {
+    ::hex::encode(format!("{PAGE_TOKEN_PREFIX}{key}"))
+}
+
+/// The inverse of [`encode_page_token`]; `None` for anything this service did not issue.
+fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(PAGE_TOKEN_PREFIX).map(str::to_string)
+}
+
+/// This service's modelled `ValidationException` for a request member it refuses.
+///
+/// `fieldList` names the member that was wrong, which is how a client learns what to
+/// fix, and `reason` is the model's own `fieldValidationFailed`.
+pub fn field_validation_exception(name: &str, message: impl Into<String>) -> ValidationException {
+    let message = message.into();
+    ValidationException {
+        message: message.clone(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: name.to_string(),
+            message,
+        }]),
+    }
+}
+
+/// Render a refused `nextToken` as this service's modelled `ValidationException`.
+pub fn invalid_page_token(error: &InvalidPageToken) -> ValidationException {
+    field_validation_exception(
+        "nextToken",
+        format!("'{}' is not a valid pagination token", error.0),
+    )
+}
+
+/// This service's modelled `ResourceNotFoundException` for a resource the ledger does
+/// not hold.
+///
+/// `resourceType` is [`RESOURCE_TYPE`] because that is the only value the model's
+/// `ResourceType` enum declares.
+pub fn not_found(
+    resource_id: impl Into<String>,
+    message: impl Into<String>,
+) -> crate::ops::types::ResourceNotFoundException {
+    crate::ops::types::ResourceNotFoundException {
+        message: message.into(),
+        resource_id: resource_id.into(),
+        resource_type: RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The modelled server error every handler answers with when [`service_state`] finds no
+/// store (this service mounted on an engine that holds none).
+pub fn store_unavailable() -> InternalServerException {
+    InternalServerException {
+        message: "the managedblockchain-query ledger is unavailable".to_string(),
+        // Nothing about a missing store resolves with time, so no retry hint.
+        retry_after_seconds: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The fixture ledger
+// ---------------------------------------------------------------------------
+
+/// The instant the fixture ledger's opening balances are recorded at:
+/// 2024-01-01T00:00:00Z, in seconds since the Unix epoch.
+const LEDGER_EPOCH: i64 = 1_704_067_200;
+
+/// The interval between the fixture's blocks, in seconds.
+const BLOCK_INTERVAL: i64 = 600;
+
+/// One Ether in wei, the unit every native Ethereum balance is held in.
+const ETH: i128 = 1_000_000_000_000_000_000;
+
+/// One Bitcoin in satoshi, the unit every native Bitcoin balance is held in.
+const BTC: i128 = 100_000_000;
+
+/// The gas price every fixture Ethereum transaction paid, in wei (20 gwei).
+const EFFECTIVE_GAS_PRICE: i128 = 20_000_000_000;
+
+/// The block number the fixture's first Ethereum block takes. Chosen only so the
+/// fixture's block numbers look like a mainnet block height; nothing reads the value.
+const ETHEREUM_FIRST_BLOCK: i64 = 19_000_000;
+
+/// The block height the fixture's first Bitcoin block takes; see
+/// [`ETHEREUM_FIRST_BLOCK`].
+const BITCOIN_FIRST_BLOCK: i64 = 820_000;
+
+/// One transaction of the fixture, before the ledger-wide values (timestamps, block
+/// identity, cumulative gas, fees) are computed for it.
+struct SeedTx {
+    hash: String,
+    transaction_id: Option<String>,
+    /// Which fixture block this transaction is in, counting from 0.
+    block: i64,
+    from: Option<String>,
+    to: String,
+    contract_address: Option<String>,
+    gas_used: Option<i128>,
+    confirmation_status: &'static str,
+    execution_status: Option<&'static str>,
+    events: Vec<StoredEvent>,
+}
+
+/// The fixture ledger, one per value of the model's `QueryNetwork` enum.
+fn seed_networks() -> BTreeMap<String, NetworkLedger> {
+    QUERY_NETWORK_VALUES
+        .iter()
+        .map(|network| {
+            let ledger = if is_bitcoin(network) {
+                seed_bitcoin_ledger(network)
+            } else {
+                seed_ethereum_ledger(network)
+            };
+            ((*network).to_string(), ledger)
+        })
+        .collect()
+}
+
+/// A deterministic 64-character lowercase hex digest of `seed`.
+///
+/// SHA-256 so each fixture identifier is a fresh-looking 32-byte value of exactly the
+/// length the modelled hash patterns demand, and the same every run.
+fn digest_hex(seed: &str) -> String {
+    ::hex::encode(Sha256::digest(seed.as_bytes()))
+}
+
+/// A deterministic Ethereum-shaped address for `label` on `network`: `0x` plus 20
+/// bytes, matching `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$`.
+fn ethereum_address(network: &str, label: &str) -> String {
+    format!("0x{}", &digest_hex(&format!("{network}/address/{label}"))[..40])
+}
+
+/// A deterministic Bitcoin-shaped address for `label` on `network`: a `1` prefix plus
+/// 32 base58 characters, matching `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$`.
+///
+/// Base58 (and not hex or base64) because a Bitcoin address is base58: the alphabet
+/// excludes `0`, `O`, `I` and `l`, so a fixture address cannot be misread.
+fn bitcoin_address(network: &str, label: &str) -> String {
+    const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let digest = Sha256::digest(format!("{network}/address/{label}").as_bytes());
+    let mut address = String::from("1");
+    for byte in digest.iter() {
+        address.push(BASE58[*byte as usize % BASE58.len()] as char);
+    }
+    address
+}
+
+/// The Ethereum fixture: three wallets, two contracts and six transactions whose events
+/// move native Ether, an ERC-20 balance and two ERC-721 tokens.
+fn seed_ethereum_ledger(network: &str) -> NetworkLedger {
+    let wallet_a = ethereum_address(network, "wallet-a");
+    let wallet_b = ethereum_address(network, "wallet-b");
+    let wallet_c = ethereum_address(network, "wallet-c");
+    let erc20 = ethereum_address(network, "contract-erc20");
+    let erc721 = ethereum_address(network, "contract-erc721");
+
+    let hash = |label: &str| format!("0x{}", digest_hex(&format!("{network}/tx/{label}")));
+
+    let contracts = vec![
+        StoredContract {
+            network: network.to_string(),
+            contract_address: erc20.clone(),
+            token_standard: "ERC20".to_string(),
+            deployer_address: wallet_a.clone(),
+            metadata: Some(ContractMetadata {
+                name: Some("Emulated Fungible Token".to_string()),
+                symbol: Some("EFT".to_string()),
+                decimals: Some(18),
+            }),
+        },
+        StoredContract {
+            network: network.to_string(),
+            contract_address: erc721.clone(),
+            token_standard: "ERC721".to_string(),
+            deployer_address: wallet_b.clone(),
+            metadata: Some(ContractMetadata {
+                name: Some("Emulated Collectible".to_string()),
+                symbol: Some("EMCOL".to_string()),
+                // ERC-721 tokens are non-fungible, so there is nothing to subdivide.
+                decimals: None,
+            }),
+        },
+    ];
+
+    // The balances the ledger opens with, at `LEDGER_EPOCH`. Every later balance is
+    // these plus the events below, never a number written down on its own.
+    let opening = vec![
+        (native_eth(&wallet_a), 5 * ETH),
+        (native_eth(&wallet_b), 2 * ETH),
+        (native_eth(&wallet_c), 0),
+        (erc20_holding(&erc20, &wallet_a), 1_000_000_000),
+        (erc20_holding(&erc20, &wallet_b), 0),
+        (erc20_holding(&erc20, &wallet_c), 0),
+        (nft_holding(&erc721, "1", &wallet_a), 1),
+        (nft_holding(&erc721, "2", &wallet_b), 1),
+    ];
+
+    let seeds = vec![
+        // A plain Ether transfer: the transaction's own `to` is the recipient.
+        SeedTx {
+            hash: hash("eth-transfer-1"),
+            transaction_id: None,
+            block: 0,
+            from: Some(wallet_a.clone()),
+            to: wallet_b.clone(),
+            contract_address: None,
+            gas_used: Some(21_000),
+            confirmation_status: CONFIRMATION_FINAL,
+            execution_status: Some(EXECUTION_SUCCEEDED),
+            events: vec![StoredEvent {
+                event_type: "ETH_TRANSFER".to_string(),
+                from: Some(wallet_a.clone()),
+                to: Some(wallet_b.clone()),
+                value: Some(ETH),
+                ..StoredEvent::default()
+            }],
+        },
+        // An ERC-20 transfer: the transaction's `to` is the CONTRACT, and the wallet
+        // that received the tokens appears only on the event.
+        SeedTx {
+            hash: hash("erc20-transfer-1"),
+            transaction_id: None,
+            block: 0,
+            from: Some(wallet_a.clone()),
+            to: erc20.clone(),
+            contract_address: Some(erc20.clone()),
+            gas_used: Some(52_000),
+            confirmation_status: CONFIRMATION_FINAL,
+            execution_status: Some(EXECUTION_SUCCEEDED),
+            events: vec![StoredEvent {
+                event_type: "ERC20_TRANSFER".to_string(),
+                from: Some(wallet_a.clone()),
+                to: Some(wallet_c.clone()),
+                value: Some(250_000_000),
+                contract_address: Some(erc20.clone()),
+                ..StoredEvent::default()
+            }],
+        },
+        // An ERC-721 transfer: one token of a contract moves, so the event carries both
+        // the contract and the `tokenId`.
+        SeedTx {
+            hash: hash("erc721-transfer-1"),
+            transaction_id: None,
+            block: 1,
+            from: Some(wallet_a.clone()),
+            to: erc721.clone(),
+            contract_address: Some(erc721.clone()),
+            gas_used: Some(84_000),
+            confirmation_status: CONFIRMATION_FINAL,
+            execution_status: Some(EXECUTION_SUCCEEDED),
+            events: vec![StoredEvent {
+                event_type: "ERC721_TRANSFER".to_string(),
+                from: Some(wallet_a.clone()),
+                to: Some(wallet_b.clone()),
+                value: Some(1),
+                contract_address: Some(erc721.clone()),
+                token_id: Some("1".to_string()),
+                ..StoredEvent::default()
+            }],
+        },
+        // A transfer that has not reached finality yet.
+        SeedTx {
+            hash: hash("eth-transfer-2"),
+            transaction_id: None,
+            block: 1,
+            from: Some(wallet_b.clone()),
+            to: wallet_c.clone(),
+            contract_address: None,
+            gas_used: Some(21_000),
+            confirmation_status: CONFIRMATION_NONFINAL,
+            execution_status: Some(EXECUTION_SUCCEEDED),
+            events: vec![StoredEvent {
+                event_type: "ETH_TRANSFER".to_string(),
+                from: Some(wallet_b.clone()),
+                to: Some(wallet_c.clone()),
+                value: Some(ETH / 2),
+                ..StoredEvent::default()
+            }],
+        },
+        // A transaction that reverted: it is on the chain and `GetTransaction` returns
+        // it, but it emitted no events and moved no value.
+        SeedTx {
+            hash: hash("erc20-reverted"),
+            transaction_id: None,
+            block: 2,
+            from: Some(wallet_c.clone()),
+            to: erc20.clone(),
+            contract_address: Some(erc20.clone()),
+            gas_used: Some(23_000),
+            confirmation_status: CONFIRMATION_FINAL,
+            execution_status: Some(EXECUTION_FAILED),
+            events: Vec::new(),
+        },
+        // One transaction, two events: `ListTransactionEvents` returns them in the
+        // order they were emitted.
+        SeedTx {
+            hash: hash("multi-event"),
+            transaction_id: None,
+            block: 2,
+            from: Some(wallet_c.clone()),
+            to: erc20.clone(),
+            contract_address: Some(erc20.clone()),
+            gas_used: Some(96_000),
+            confirmation_status: CONFIRMATION_NONFINAL,
+            execution_status: Some(EXECUTION_SUCCEEDED),
+            events: vec![
+                StoredEvent {
+                    event_type: "ERC20_TRANSFER".to_string(),
+                    from: Some(wallet_c.clone()),
+                    to: Some(wallet_b.clone()),
+                    value: Some(100_000_000),
+                    contract_address: Some(erc20.clone()),
+                    ..StoredEvent::default()
+                },
+                StoredEvent {
+                    event_type: "INTERNAL_ETH_TRANSFER".to_string(),
+                    from: Some(wallet_c.clone()),
+                    to: Some(wallet_a.clone()),
+                    value: Some(ETH / 100),
+                    ..StoredEvent::default()
+                },
+            ],
+        },
+    ];
+
+    build_ledger(network, seeds, opening, contracts)
+}
+
+/// The Bitcoin fixture: three wallets and four transactions, each spending one input
+/// and creating one output, so every balance moves through a `BITCOIN_VIN` /
+/// `BITCOIN_VOUT` pair.
+fn seed_bitcoin_ledger(network: &str) -> NetworkLedger {
+    let wallet_a = bitcoin_address(network, "wallet-a");
+    let wallet_b = bitcoin_address(network, "wallet-b");
+    let wallet_c = bitcoin_address(network, "wallet-c");
+
+    // A Bitcoin transaction hash is conventionally written bare, without a `0x`
+    // prefix; the modelled pattern admits both spellings and `normalize_hash` makes
+    // them equal.
+    let hash = |label: &str| digest_hex(&format!("{network}/tx/{label}"));
+    let txid = |label: &str| digest_hex(&format!("{network}/txid/{label}"));
+
+    let opening = vec![
+        (native_btc(&wallet_a), 5 * BTC),
+        (native_btc(&wallet_b), BTC),
+        (native_btc(&wallet_c), 0),
+    ];
+
+    // (label, from, to, value sent, fee)
+    let transfers: [(&str, &String, &String, i128, i128); 4] = [
+        ("vin-vout-1", &wallet_a, &wallet_b, 3 * BTC / 2, 10_000),
+        ("vin-vout-2", &wallet_b, &wallet_c, BTC / 2, 12_000),
+        ("vin-vout-3", &wallet_a, &wallet_c, BTC / 4, 8_000),
+        ("vin-vout-4", &wallet_c, &wallet_a, BTC / 10, 9_000),
+    ];
+
+    let seeds = transfers
+        .iter()
+        .enumerate()
+        .map(|(index, (label, from, to, value, fee))| SeedTx {
+            hash: hash(label),
+            transaction_id: Some(txid(label)),
+            block: index as i64 / 2,
+            from: Some((*from).clone()),
+            to: (*to).clone(),
+            contract_address: None,
+            // Bitcoin has no gas: the fee is the difference between what the inputs
+            // spent and what the outputs created, which `build_ledger` computes.
+            gas_used: None,
+            confirmation_status: if index == 2 {
+                CONFIRMATION_NONFINAL
+            } else {
+                CONFIRMATION_FINAL
+            },
+            // There is no contract execution to succeed or fail on Bitcoin.
+            execution_status: None,
+            events: vec![
+                StoredEvent {
+                    event_type: "BITCOIN_VIN".to_string(),
+                    from: Some((*from).clone()),
+                    // The input spends the whole previous output, fee included.
+                    value: Some(value + fee),
+                    spent_vout_transaction_hash: Some(hash(&format!("{label}/funding"))),
+                    spent_vout_transaction_id: Some(txid(&format!("{label}/funding"))),
+                    spent_vout_index: Some(0),
+                    ..StoredEvent::default()
+                },
+                StoredEvent {
+                    event_type: "BITCOIN_VOUT".to_string(),
+                    to: Some((*to).clone()),
+                    value: Some(*value),
+                    vout_index: Some(0),
+                    vout_spent: Some(false),
+                    ..StoredEvent::default()
+                },
+            ],
+        })
+        .collect();
+
+    // The Bitcoin networks have no asset contracts: `GetAssetContract`'s documentation
+    // is explicit that "the Bitcoin blockchain networks do not support this operation".
+    build_ledger(network, seeds, opening, Vec::new())
+}
+
+/// The [`HoldingKey`] of a native Ether balance.
+fn native_eth(owner: &str) -> HoldingKey {
+    HoldingKey {
+        contract_address: None,
+        token_id: Some(NATIVE_TOKEN_ETH.to_string()),
+        owner_address: owner.to_string(),
+    }
+}
+
+/// The [`HoldingKey`] of a native Bitcoin balance.
+fn native_btc(owner: &str) -> HoldingKey {
+    HoldingKey {
+        contract_address: None,
+        token_id: Some(NATIVE_TOKEN_BTC.to_string()),
+        owner_address: owner.to_string(),
+    }
+}
+
+/// The [`HoldingKey`] of an ERC-20 balance: one fungible balance per contract, so no
+/// `tokenId`.
+fn erc20_holding(contract: &str, owner: &str) -> HoldingKey {
+    HoldingKey {
+        contract_address: Some(contract.to_string()),
+        token_id: None,
+        owner_address: owner.to_string(),
+    }
+}
+
+/// The [`HoldingKey`] of a non-fungible balance: one token of a contract, so both a
+/// contract and a `tokenId`.
+fn nft_holding(contract: &str, token_id: &str, owner: &str) -> HoldingKey {
+    HoldingKey {
+        contract_address: Some(contract.to_string()),
+        token_id: Some(token_id.to_string()),
+        owner_address: owner.to_string(),
+    }
+}
+
+/// Turn the fixture's transactions into a ledger, computing everything that depends on
+/// the ledger as a whole: block identity and timestamps, each transaction's index
+/// within its block and the number of transactions in it, cumulative gas, the fee, and
+/// the holdings the events settle to.
+fn build_ledger(
+    network: &str,
+    seeds: Vec<SeedTx>,
+    opening: Vec<(HoldingKey, i128)>,
+    contracts: Vec<StoredContract>,
+) -> NetworkLedger {
+    let mut ledger = NetworkLedger::default();
+    for contract in contracts {
+        ledger
+            .contracts
+            .insert(contract.contract_address.clone(), contract);
+    }
+
+    let bitcoin = is_bitcoin(network);
+    let first_block = if bitcoin {
+        BITCOIN_FIRST_BLOCK
+    } else {
+        ETHEREUM_FIRST_BLOCK
+    };
+    // How many transactions each block holds — `Transaction$numberOfTransactions` is
+    // "the number of transactions in the block", so it is counted, not declared.
+    let mut per_block: BTreeMap<i64, i64> = BTreeMap::new();
+    for seed in &seeds {
+        *per_block.entry(seed.block).or_default() += 1;
+    }
+
+    let mut index_in_block: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut cumulative_gas: BTreeMap<i64, i128> = BTreeMap::new();
+
+    for seed in seeds {
+        let index = *index_in_block
+            .entry(seed.block)
+            .and_modify(|next| *next += 1)
+            .or_insert(0);
+        let cumulative = seed.gas_used.map(|gas| {
+            let running = cumulative_gas.entry(seed.block).or_default();
+            *running += gas;
+            *running
+        });
+        // An Ethereum transaction's fee is the gas it burned at the price it paid; a
+        // Bitcoin transaction's is what its inputs spent beyond what its outputs
+        // created.
+        let fee = if bitcoin {
+            Some(event_total(&seed.events, "BITCOIN_VIN") - event_total(&seed.events, "BITCOIN_VOUT"))
+        } else {
+            seed.gas_used.map(|gas| gas * EFFECTIVE_GAS_PRICE)
+        };
+        let block_identifier = digest_hex(&format!("{network}/block/{}", seed.block));
+        let block_hash = if bitcoin {
+            block_identifier
+        } else {
+            format!("0x{block_identifier}")
+        };
+        let signature = |part: &str| format!("0x{}", digest_hex(&format!("{}/sig/{part}", seed.hash)));
+
+        ledger.insert_transaction(StoredTransaction {
+            network: network.to_string(),
+            transaction_hash: seed.hash.clone(),
+            transaction_id: seed.transaction_id.clone(),
+            block_hash: Some(block_hash),
+            block_number: Some((first_block + seed.block).to_string()),
+            transaction_timestamp: LEDGER_EPOCH + (seed.block + 1) * BLOCK_INTERVAL,
+            transaction_index: index,
+            number_of_transactions: per_block.get(&seed.block).copied().unwrap_or(1),
+            to: seed.to.clone(),
+            from: seed.from.clone(),
+            contract_address: seed.contract_address.clone(),
+            gas_used: seed.gas_used,
+            cumulative_gas_used: cumulative,
+            effective_gas_price: seed.gas_used.map(|_| EFFECTIVE_GAS_PRICE),
+            transaction_fee: fee,
+            // The signature is an Ethereum transaction's; a Bitcoin transaction signs
+            // each input instead, which the modelled `Transaction` has no member for.
+            signature_v: (!bitcoin).then_some(27 + (index as i32 % 2)),
+            signature_r: (!bitcoin).then(|| signature("r")),
+            signature_s: (!bitcoin).then(|| signature("s")),
+            confirmation_status: seed.confirmation_status.to_string(),
+            execution_status: seed.execution_status.map(str::to_string),
+            events: seed.events,
+        });
+    }
+
+    ledger.holdings = derive_holdings(&ledger.transactions, &opening, LEDGER_EPOCH);
+    ledger
+}
+
+/// The total value the events of one transaction carry for `event_type`.
+fn event_total(events: &[StoredEvent], event_type: &str) -> i128 {
+    events
+        .iter()
+        .filter(|event| event.event_type == event_type)
+        .filter_map(|event| event.value)
+        .sum()
+}
+
+/// Derive every holding from the opening balances and the stored transactions.
+///
+/// This is why a balance can never disagree with the events that produced it: the
+/// balance operations read holdings, and holdings exist only as the result of replaying
+/// the events `ListTransactionEvents` returns, in chain order. A transaction whose
+/// `executionStatus` is `FAILED` moved no value, so it is skipped.
+///
+/// Only the value an event carries moves a balance. On the Bitcoin networks the fee is
+/// already part of that: the `BITCOIN_VIN` event spends the whole previous output and
+/// the `BITCOIN_VOUT` event creates less, so the difference leaves the sender. On the
+/// Ethereum networks the gas fee is reported on the transaction
+/// (`Transaction$transactionFee`) but is not an event, so the native balances here
+/// reconcile with the transfer events alone and are not fee-inclusive.
+fn derive_holdings(
+    transactions: &BTreeMap<TxKey, StoredTransaction>,
+    opening: &[(HoldingKey, i128)],
+    opened_at: i64,
+) -> BTreeMap<HoldingKey, StoredHolding> {
+    let mut holdings: BTreeMap<HoldingKey, StoredHolding> = BTreeMap::new();
+    for (key, balance) in opening {
+        holdings
+            .entry(key.clone())
+            .or_default()
+            .record(opened_at, *balance);
+    }
+
+    for transaction in transactions.values() {
+        if transaction.execution_status.as_deref() == Some(EXECUTION_FAILED) {
+            continue;
+        }
+        for event in &transaction.events {
+            let Some(value) = event.value else { continue };
+            let Some((contract_address, token_id)) = event.holding() else {
+                continue;
+            };
+            for (owner, delta) in [(&event.from, -value), (&event.to, value)] {
+                let Some(owner) = owner else { continue };
+                let key = HoldingKey {
+                    contract_address: contract_address.clone(),
+                    token_id: token_id.clone(),
+                    owner_address: owner.clone(),
+                };
+                let holding = holdings.entry(key).or_default();
+                let current = holding.history.last().map_or(0, |record| record.balance);
+                holding.record(transaction.transaction_timestamp, current + delta);
+            }
+        }
+    }
+
+    holdings
 }
