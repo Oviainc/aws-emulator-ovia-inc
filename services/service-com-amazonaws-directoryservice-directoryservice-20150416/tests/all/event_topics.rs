@@ -91,7 +91,10 @@ fn reported_names(topics: &[Value]) -> BTreeSet<String> {
 }
 
 /// Seconds since the epoch, the unit an `awsJson1_1` timestamp is rendered in.
-fn epoch_seconds(at: SystemTime) -> f64 {
+///
+/// Shared with `tests/all/directory_networking_and_settings.rs`, which compares a
+/// seeded instant with what the wire carries the same way.
+pub(crate) fn epoch_seconds(at: SystemTime) -> f64 {
     at.duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_secs_f64()

@@ -16,9 +16,10 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     ActionConfigurationProperty, ActionState, ActionType, ActionTypeId, ActionTypeSettings,
-    ArtifactDetails, CurrentRevision, ExecutionDetails, ExecutionTrigger, PipelineDeclaration,
-    PipelineExecution, PipelineExecutionSummary, PipelineMetadata, PipelineSummary,
-    ResolvedPipelineVariable, SourceRevision, StageState, Tag, ThirdPartyJob, TransitionState,
+    ArtifactDetails, Condition, ConditionState, CurrentRevision, ExecutionDetails,
+    ExecutionTrigger, PipelineDeclaration, PipelineExecution, PipelineExecutionSummary,
+    PipelineMetadata, PipelineSummary, ResolvedPipelineVariable, RuleState, SourceRevision,
+    StageConditionState, StageState, Tag, ThirdPartyJob, TransitionState,
 };
 
 /// The region an ARN carries when the request names none.
@@ -980,10 +981,11 @@ impl Pipeline {
     ///
     /// Every member is read from stored state: the stage and action names from the
     /// stored declaration, the inbound transition state from what the transition
-    /// calls persisted. The members the stage- and action-execution plane owns
-    /// (`latestExecution`, `inboundExecution(s)`, an action's revision and
-    /// execution, the condition states) are absent, because this slice runs no such
-    /// plane and so has no outcome to report for them.
+    /// calls persisted, and each condition set's rules from the conditions the stage
+    /// declares. The members the stage-, action- and rule-execution plane owns
+    /// (`latestExecution`, `inboundExecution(s)`, an action's revision and execution,
+    /// a condition's or a rule's execution) are absent, because this slice runs no
+    /// such plane and so has no outcome to report for them.
     pub fn stage_states(&self) -> Vec<StageState> {
         self.declaration
             .stages
@@ -1008,9 +1010,25 @@ impl Pipeline {
                         .collect(),
                 ),
                 latest_execution: None,
-                before_entry_condition_state: None,
-                on_success_condition_state: None,
-                on_failure_condition_state: None,
+                // A condition set has a state exactly when the stage declares it:
+                // `beforeEntry` and `onSuccess` carry their conditions directly,
+                // while `onFailure` also carries the stage's failure `result` and
+                // retry configuration, which are declaration rather than state.
+                before_entry_condition_state: stage
+                    .before_entry
+                    .as_ref()
+                    .map(|before_entry| condition_state(&before_entry.conditions)),
+                on_success_condition_state: stage
+                    .on_success
+                    .as_ref()
+                    .map(|on_success| condition_state(&on_success.conditions)),
+                on_failure_condition_state: stage
+                    .on_failure
+                    .as_ref()
+                    .and_then(|on_failure| on_failure.conditions.as_deref())
+                    .map(condition_state),
+                // `RetryStageMetadata` counts the retry attempts a stage has had, so
+                // a stage nothing has retried carries none.
                 retry_stage_metadata: None,
             })
             .collect()
@@ -1060,6 +1078,42 @@ impl Pipeline {
             created: Some(to_date_time(self.created)),
             updated: Some(to_date_time(self.updated)),
         }
+    }
+}
+
+/// The `StageConditionState` of one declared condition set: one `ConditionState` per
+/// declared condition, each naming the condition's rules.
+///
+/// A condition is EVALUATED by the rule plane, which this slice does not run, so
+/// neither the set, nor a condition in it, nor a rule of it carries an execution: what
+/// is reported is the declaration the store holds, exactly as a stage's action states
+/// report the declared actions by name.
+fn condition_state(conditions: &[Condition]) -> StageConditionState {
+    StageConditionState {
+        latest_execution: None,
+        condition_states: Some(
+            conditions
+                .iter()
+                .map(|condition| ConditionState {
+                    latest_execution: None,
+                    // `Condition$rules` is optional, so a condition declaring no rule
+                    // reports no rule states rather than an empty list — the same way
+                    // a stage declaring no condition set reports none.
+                    rule_states: condition.rules.as_ref().map(|rules| {
+                        rules
+                            .iter()
+                            .map(|rule| RuleState {
+                                rule_name: Some(rule.name.clone()),
+                                current_revision: None,
+                                latest_execution: None,
+                                entity_url: None,
+                                revision_url: None,
+                            })
+                            .collect()
+                    }),
+                })
+                .collect(),
+        ),
     }
 }
 

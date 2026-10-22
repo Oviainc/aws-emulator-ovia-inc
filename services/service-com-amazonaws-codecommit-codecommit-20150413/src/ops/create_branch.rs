@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBranch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBranch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBranch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: points a new branch — the git reference `refs/heads/<branchName>` — at a
+//! commit the repository holds, writing it into `crate::state` where `GetBranch` reads it.
+//! The repository's default branch is left alone, as this operation's documentation says.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +185,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBranch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBranchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBranch"))
+        let _ = ctx;
+        // Every member is `@required` and carries the model's own constraints, so an
+        // absent member is already refused at the boundary (as the matching
+        // `*RequiredException`) and so is a length or pattern violation (as
+        // `InvalidBranchNameException` / `InvalidCommitIdException` /
+        // `InvalidRepositoryNameException` — see `crate::service::refusal_for`). What
+        // reaches here is a name or an id whose SHAPE the model does not express.
+        if !crate::state::is_valid_branch_name(&input.branch_name) {
+            return Err(CreateBranchErrorModeled::InvalidBranchNameException(
+                InvalidBranchNameException {
+                    message: Some(format!(
+                        "the reference name {} is not valid",
+                        input.branch_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if !crate::state::is_object_id(&input.commit_id) {
+            return Err(CreateBranchErrorModeled::InvalidCommitIdException(
+                InvalidCommitIdException {
+                    message: Some(format!("the commit id {} is not valid", input.commit_id)),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                CreateBranchErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(format!(
+                            "the repository {} does not exist",
+                            input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // A branch is a reference TO a commit, so the commit has to be one this
+        // repository holds before any reference can point at it.
+        if !repository.commits.contains_key(&input.commit_id) {
+            return Err(CreateBranchErrorModeled::CommitDoesNotExistException(
+                CommitDoesNotExistException {
+                    message: Some(format!(
+                        "the commit {} does not exist in the repository {}",
+                        input.commit_id, input.repository_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // Branch names are unique within a repository, so creating one that already
+        // exists is refused rather than repointing it.
+        if repository.branches.contains_key(&input.branch_name) {
+            return Err(CreateBranchErrorModeled::BranchNameExistsException(
+                BranchNameExistsException {
+                    message: Some(format!(
+                        "the branch {} already exists in the repository {}",
+                        input.branch_name, input.repository_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // What one repository can cost: a branch tip is never pruned, so the number
+        // of references a caller may add is the emulator's own bound, kept below the
+        // retained-commit bound it would otherwise defeat. The model has no error for
+        // it.
+        if repository.branches.len() >= crate::state::MAX_BRANCHES_PER_REPOSITORY {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds at most {} branches per repository",
+                crate::state::MAX_BRANCHES_PER_REPOSITORY
+            )));
+        }
+
+        repository.branches.insert(
+            input.branch_name.clone(),
+            crate::state::Branch {
+                name: input.branch_name.clone(),
+                commit_id: input.commit_id.clone(),
+            },
+        );
+        // Adding a reference modifies the repository, and `lastModifiedDate` is "the
+        // date and time the repository was last modified"
+        // (`smithy_query(query="doc",shape="RepositoryMetadata",member="lastModifiedDate")`),
+        // so it moves here exactly as it does for a write through `PutFile`. What this
+        // call does NOT change is the default branch: "Calling the create branch
+        // operation does not set a repository's default branch. To do this, call the
+        // update default branch operation."
+        repository.last_modified_date = std::time::SystemTime::now();
+
+        Ok(CreateBranchOutput)
     }
 }

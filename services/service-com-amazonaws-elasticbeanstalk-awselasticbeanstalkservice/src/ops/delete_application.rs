@@ -156,6 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DeleteApplicationError::internal_failure("the Elastic Beanstalk store is unavailable")
         })?;
         let mut store = state.lock();
+        // Every event this call records belongs to this one request's activity.
+        let request_id = crate::state::new_request_id();
         store.materialize_due_transitions();
 
         if !store.applications.contains_key(&input.application_name) {
@@ -201,12 +203,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            let mut starting: Vec<crate::state::EventSubject> = Vec::new();
             for environment_id in running {
                 if let Some(environment) = store.environments.get_mut(&environment_id) {
                     if environment.status != crate::state::STATUS_TERMINATING {
-                        environment.begin_termination();
+                        environment.begin_termination(&request_id);
+                        starting.push(environment.event_subject());
                     }
                 }
+            }
+            // "running environments will be terminated before deleting the
+            // application" — each forced termination is its own activity, so
+            // each records the event a TerminateEnvironment call would.
+            for subject in starting {
+                store.record_event(
+                    &request_id,
+                    crate::state::SEVERITY_INFO,
+                    "terminateEnvironment is starting.",
+                    subject,
+                );
             }
         }
 
@@ -218,6 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .application_versions
             .retain(|(application_name, _), _| *application_name != input.application_name);
+
+        store.record_event(
+            &request_id,
+            crate::state::SEVERITY_INFO,
+            "deleteApplication completed successfully.",
+            crate::state::EventSubject {
+                application_name: Some(input.application_name.clone()),
+                ..Default::default()
+            },
+        );
 
         Ok(DeleteApplicationOutput)
     }

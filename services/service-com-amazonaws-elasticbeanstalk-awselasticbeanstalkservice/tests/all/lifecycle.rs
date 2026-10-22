@@ -31,9 +31,10 @@
 //! tags of the same name so a `<member>` inside a `<member>` is read whole.
 //!
 //! This module also OWNS that harness for the suites beside it: `Emulator`,
-//! `Answer` and the element reader are `pub(crate)`, so `all/operations_role.rs`
-//! and `all/solution_stacks.rs` drive the same router over the same wire rather
-//! than each repeating one.
+//! `Answer` and the element reader are `pub(crate)`, so the other suites in this
+//! test target — `all/operations_role.rs`, `all/solution_stacks.rs`,
+//! `all/events.rs` and the rest — drive the same router over the same wire
+//! rather than each repeating one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,6 +153,19 @@ impl Answer {
     /// The first value at `path` (see [`Answer::values_at`]).
     pub(crate) fn value(&self, path: &str) -> Option<&str> {
         self.values_at(path).into_iter().next()
+    }
+
+    /// Every element at `path` as an [`Answer`] over its OWN inner XML, so a
+    /// test reading several members of one list element keeps them together
+    /// instead of re-aligning one flat list per member.
+    pub(crate) fn elements_at(&self, path: &str) -> Vec<Answer> {
+        self.values_at(path)
+            .into_iter()
+            .map(|inner| Answer {
+                status: self.status,
+                body: inner.to_string(),
+            })
+            .collect()
     }
 
     /// As [`Answer::value`], failing the named case when the element is absent.

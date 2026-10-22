@@ -2,7 +2,8 @@
 
 //! @op CreateApplication
 //! Implemented: stores the application and answers with the `ApplicationDescription`
-//! built from what was stored. This is the ONLY file to touch for this operation.
+//! built from what was stored, and records the event `DescribeEvents` reports for it.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,9 +197,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "Creates an application that has … no application versions."
         let description = application.to_description(Vec::new());
+        let application_name = application.name.clone();
         store
             .applications
             .insert(application.name.clone(), application);
+
+        // The activity this call performed, recorded for `DescribeEvents`.
+        store.record_event(
+            &crate::state::new_request_id(),
+            crate::state::SEVERITY_INFO,
+            "createApplication completed successfully.",
+            crate::state::EventSubject {
+                application_name: Some(application_name),
+                ..Default::default()
+            },
+        );
 
         Ok(CreateApplicationOutput {
             application: Some(description),

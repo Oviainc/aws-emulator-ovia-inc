@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at — its text is the one the caller sees.
         if !store.outposts.contains_key(&input.outpost_id) {
             return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(&input.outpost_id),
+                crate::state::not_found(),
             )
             .into());
         }
@@ -188,8 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint of this caller's on that Outpost is the modelled 404 — which
         // is also what a repeated delete answers, the first one having removed
         // the record. The message is the same service constant the Outpost's
-        // form selects: the service does not report which half of the pair
-        // failed to resolve.
+        // own failure carries: the service does not report which half of the
+        // pair failed to resolve.
         let key = (input.outpost_id.clone(), input.endpoint_id.clone());
         let owned = store
             .endpoints
@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|endpoint| endpoint.owner_account == caller);
         if !owned {
             return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(&input.outpost_id),
+                crate::state::not_found(),
             )
             .into());
         }

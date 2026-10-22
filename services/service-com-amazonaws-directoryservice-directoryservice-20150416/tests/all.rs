@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/directory_lifecycle.rs"]
 mod directory_lifecycle;
+#[path = "all/directory_networking_and_settings.rs"]
+mod directory_networking_and_settings;
 #[path = "all/event_topics.rs"]
 mod event_topics;
 #[path = "all/microsoft_ad.rs"]

@@ -19,6 +19,8 @@ mod custom_line_item_and_create_name_refusals;
 mod pricing_rule_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_surface.rs"]
+mod tagging_surface;
 #[path = "all/validation_exception_message.rs"]
 mod validation_exception_message;
 #[path = "all/validation_messages.rs"]

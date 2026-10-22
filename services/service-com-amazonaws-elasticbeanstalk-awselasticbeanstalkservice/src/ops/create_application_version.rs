@@ -199,6 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // Every event this call records belongs to this one request's activity.
+        let request_id = crate::state::new_request_id();
 
         if !store.applications.contains_key(&input.application_name) {
             // `AutoCreateApplication`: "Set to true to create an application with
@@ -238,6 +240,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .applications
                 .insert(application.name.clone(), application);
+            // Auto-creation is a create, so it records the same event
+            // `CreateApplication` does.
+            store.record_event(
+                &request_id,
+                crate::state::SEVERITY_INFO,
+                "createApplication completed successfully.",
+                crate::state::EventSubject {
+                    application_name: Some(input.application_name.clone()),
+                    ..Default::default()
+                },
+            );
         }
 
         let key = (input.application_name.clone(), input.version_label.clone());
@@ -289,6 +302,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let description = version.to_description();
         store.application_versions.insert(key, version);
+
+        store.record_event(
+            &request_id,
+            crate::state::SEVERITY_INFO,
+            "createApplicationVersion completed successfully.",
+            crate::state::EventSubject {
+                application_name: Some(input.application_name.clone()),
+                version_label: Some(input.version_label.clone()),
+                ..Default::default()
+            },
+        );
 
         Ok(CreateApplicationVersionOutput {
             application_version: Some(description),

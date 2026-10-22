@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddIpRoutes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddIpRoutes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddIpRoutes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Routes IP address blocks to a stored directory: each block is persisted once, under
+//! the modelled `Adding` status that the clock moves to `Added`, and a request that
+//! names a block the directory already routes, or that would take it past the 100-block
+//! limit, is refused without adding anything.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddIpRoutes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddIpRoutesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddIpRoutes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the
+        // request's route list is bounded and shaped before anything is allocated from
+        // it. The ordering is deliberate: a request that no directory could ever accept
+        // — an empty list, a route naming no single block, or more blocks than any
+        // directory may hold — is refused on the INPUT, before the directory is
+        // resolved, so such a request is answered the same way whether or not the id
+        // names a stored directory.
+        if input.ip_routes.is_empty() {
+            return Err(invalid_parameter(
+                "IpRoutes must name at least one IP address block".to_string(),
+            ));
+        }
+        if input.ip_routes.len() > crate::state::MAX_IP_ROUTES {
+            return Err(route_limit_exceeded(input.ip_routes.len()));
+        }
+
+        // Each `IpRoute` is the block it routes, and the model makes both members
+        // optional, so a route that names neither (or both) identifies no single block
+        // and is refused naming the members.
+        let mut requested: Vec<crate::state::IpRouteRecord> = Vec::new();
+        let now = ::std::time::SystemTime::now();
+        for route in input.ip_routes {
+            match (route.cidr_ip.as_deref(), route.cidr_ipv6.as_deref()) {
+                (None, None) => {
+                    return Err(invalid_parameter(
+                        "each IpRoute must carry either CidrIp or CidrIpv6".to_string(),
+                    ))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(invalid_parameter(
+                        "each IpRoute must carry exactly one of CidrIp or CidrIpv6, not both"
+                            .to_string(),
+                    ))
+                }
+                _ => {}
+            }
+            requested.push(crate::state::IpRouteRecord {
+                cidr_ip: route.cidr_ip,
+                cidr_ipv6: route.cidr_ipv6,
+                description: route.description,
+                // The block is not in service the instant this call answers: the move
+                // to `Added` is owed by the clock, like a create's stage transition.
+                status: crate::state::IP_ROUTE_STATUS_ADDING.to_string(),
+                status_due_at: Some(now + crate::state::TRANSITION_SPAN),
+                added_at: now,
+            });
+        }
+
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                AddIpRoutesErrorModeled::EntityDoesNotExistException(EntityDoesNotExistException {
+                    message: Some(crate::state::no_such_directory(&input.directory_id)),
+                    request_id: None,
+                })
+            })?;
+
+        // Routing an address block changes the directory's own networking, so it needs
+        // a directory that is in service: one still being built by the transition its
+        // create owes is unavailable, which is the modelled refusal for exactly that.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                AddIpRoutesErrorModeled::DirectoryUnavailableException(
+                    DirectoryUnavailableException {
+                        message: Some(format!(
+                            "Directory {id} is in stage {stage} and is not available for \
+                             IP route changes",
+                            id = directory.directory_id,
+                            stage = directory.stage
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The whole request is checked BEFORE anything is written, so a request that
+        // repeats a block — one the directory already routes, or one it names twice —
+        // or that would take the directory past the limit leaves the stored routes
+        // exactly as they were.
+        let mut merged = directory.ip_routes.clone();
+        for record in requested {
+            let block = record.block().to_string();
+            if merged.contains_key(&block) {
+                return Err(AddIpRoutesErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!(
+                            "Directory {id} already routes the address block {block}",
+                            id = directory.directory_id
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into());
+            }
+            merged.insert(block, record);
+        }
+        if merged.len() > crate::state::MAX_IP_ROUTES {
+            return Err(route_limit_exceeded(merged.len()));
+        }
+        directory.ip_routes = merged;
+
+        // `UpdateSecurityGroupForDirectoryControllers` asks for the directory
+        // controllers' security group to be rewritten. That group lives in the VPC data
+        // plane this emulator does not have, so the member is accepted and nothing is
+        // invented for it: no security group is reported anywhere.
+        Ok(AddIpRoutesOutput {})
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> AddIpRoutesError {
+    AddIpRoutesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        request_id: None,
+    })
+    .into()
+}
+
+/// Refuse the request with the modelled `IpRouteLimitExceededException`, naming the
+/// bound and the count that broke it.
+fn route_limit_exceeded(count: usize) -> AddIpRoutesError {
+    AddIpRoutesErrorModeled::IpRouteLimitExceededException(IpRouteLimitExceededException {
+        message: Some(format!(
+            "A directory may route at most {max} IP address blocks; the request would \
+             leave {count}",
+            max = crate::state::MAX_IP_ROUTES
+        )),
+        request_id: None,
+    })
+    .into()
 }

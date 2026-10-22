@@ -72,6 +72,10 @@ pub(crate) struct Reply {
 /// mounted on it, reached the way the production router reaches it.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The same engine the mounted service holds, kept so a suite can assert about the
+    /// STORE itself — what a response cannot show, such as a collection staying bounded
+    /// however many requests have run (see [`Emulator::engine`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -79,8 +83,14 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The shared engine behind this emulator, for the one thing a response cannot
+    /// show: how much the store holds.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {

@@ -94,6 +94,78 @@ impl StoredDatum {
     }
 }
 
+/// The basic statistics of a span of ONE series' datapoints.
+///
+/// One fold over the four aggregates every [`StoredDatum`] carries, so every reader that
+/// aggregates a span of a series — `GetMetricStatistics`' per-period windows, and the
+/// hourly load buckets Application Auto Scaling's predictive forecast is computed from —
+/// computes a statistic the same way and the two cannot drift. The names are the model's
+/// own `Statistic` enum values (`STATISTIC_VALUES`); the EXTENDED (percentile) statistics
+/// are deliberately not part of this fold, because they need the individual published
+/// values rather than these aggregates.
+#[derive(Debug, Clone, Copy)]
+pub struct BasicStatistics {
+    /// How many observations the span stands for.
+    pub sample_count: f64,
+    /// The sum of those observations.
+    pub sum: f64,
+    /// The smallest of them, `f64::INFINITY` over no observation at all.
+    pub minimum: f64,
+    /// The largest of them, `f64::NEG_INFINITY` over no observation at all.
+    pub maximum: f64,
+}
+
+/// The fold's identity: no observation, and the two infinities a min/max fold starts from.
+impl Default for BasicStatistics {
+    fn default() -> Self {
+        Self {
+            sample_count: 0.0,
+            sum: 0.0,
+            minimum: f64::INFINITY,
+            maximum: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl BasicStatistics {
+    /// Fold every datapoint of a span.
+    pub fn of<'a>(data: impl IntoIterator<Item = &'a StoredDatum>) -> Self {
+        let mut folded = Self::default();
+        for datum in data {
+            folded.add(datum);
+        }
+        folded
+    }
+
+    /// Fold one more datapoint into the span.
+    pub fn add(&mut self, datum: &StoredDatum) {
+        self.sample_count += datum.sample_count;
+        self.sum += datum.sum;
+        self.minimum = self.minimum.min(datum.minimum);
+        self.maximum = self.maximum.max(datum.maximum);
+    }
+
+    /// The mean of the observations, when there is one: the sum over the sample count,
+    /// which no observation at all does not have.
+    pub fn average(&self) -> Option<f64> {
+        let average = self.sum / self.sample_count;
+        average.is_finite().then_some(average)
+    }
+
+    /// One statistic by the name the model gives it, or `None` for a name outside the basic
+    /// five and for a statistic no observation in the span defines.
+    pub fn named(&self, statistic: &str) -> Option<f64> {
+        match statistic {
+            "SampleCount" => Some(self.sample_count),
+            "Sum" => Some(self.sum),
+            "Average" => self.average(),
+            "Minimum" => self.minimum.is_finite().then_some(self.minimum),
+            "Maximum" => self.maximum.is_finite().then_some(self.maximum),
+            _ => None,
+        }
+    }
+}
+
 /// A stored metric alarm: the modelled shape `DescribeAlarms` returns, plus the tags
 /// `PutMetricAlarm` accepted (no `MetricAlarm` member carries them).
 #[derive(Debug, Clone, Default)]

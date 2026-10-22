@@ -248,6 +248,9 @@ impl BillingGroupRecord {
 /// * the idempotency index is capped at [`MAX_IDEMPOTENCY_TOKENS`], evicts
 ///   oldest-first, and additionally drops the entries that point at a deleted
 ///   group.
+/// * a resource's `tags` map is part of its record, so it is reclaimed with the
+///   resource and bounded by [`MAX_TAGS_PER_RESOURCE`] — a `TagResource` whose merge
+///   would take one past that cap is refused rather than stored.
 ///
 /// A read never writes. The response side is capped too: every page is at most
 /// the request's `MaxResults`, or [`DEFAULT_PAGE_SIZE`] when it names none.
@@ -438,6 +441,153 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .map(String::as_str)
             .filter(|existing| *existing != group_arn)
     }
+
+    /// The tags stored for the resource a tagging `ResourceArn` names, or `None` when
+    /// this service holds no such resource — the decision every tagging operation's
+    /// not-found answer is made from.
+    ///
+    /// Tags live ON the resource record (the same map `CreateBillingGroup` /
+    /// `CreatePricingPlan` persisted their `Tags` into), so there is one copy of a
+    /// resource's tags and a delete reclaims them with the resource.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        let resource = parse_taggable_arn(resource_arn)?;
+        match resource.kind {
+            TaggableResourceKind::BillingGroup => self
+                .billing_groups
+                .get(&resource.arn)
+                .map(|record| &record.tags),
+            TaggableResourceKind::PricingPlan => self
+                .pricing_plans
+                .get(&resource.arn)
+                .map(|record| &record.tags),
+            // Nothing in this slice persists a pricing rule or a custom line item
+            // (`CreatePricingRule` and `CreateCustomLineItem` are still scaffolds), so
+            // no ARN of either kind names a resource that exists yet.
+            TaggableResourceKind::PricingRule | TaggableResourceKind::CustomLineItem => None,
+        }
+    }
+
+    /// [`resource_tags`](Self::resource_tags), for a tagging operation that WRITES.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        let resource = parse_taggable_arn(resource_arn)?;
+        match resource.kind {
+            TaggableResourceKind::BillingGroup => self
+                .billing_groups
+                .get_mut(&resource.arn)
+                .map(|record| &mut record.tags),
+            TaggableResourceKind::PricingPlan => self
+                .pricing_plans
+                .get_mut(&resource.arn)
+                .map(|record| &mut record.tags),
+            TaggableResourceKind::PricingRule | TaggableResourceKind::CustomLineItem => None,
+        }
+    }
+}
+
+/// The resource kinds this service's tagging surface addresses, as the resource
+/// segment of the modelled tagging `Arn` spells them
+/// (`smithy_query(query="operation",operation="TagResource")`:
+/// `billinggroup/?[0-9]{12}`, `pricingplan/[a-zA-Z0-9]{10}`,
+/// `pricingrule/[a-zA-Z0-9]{10}` and `(customlineitem/)?[a-zA-Z0-9]{10}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggableResourceKind {
+    BillingGroup,
+    PricingPlan,
+    PricingRule,
+    CustomLineItem,
+}
+
+impl TaggableResourceKind {
+    /// Every kind, in the order the `Arn` pattern enumerates them.
+    pub const ALL: [Self; 4] = [
+        Self::BillingGroup,
+        Self::PricingPlan,
+        Self::PricingRule,
+        Self::CustomLineItem,
+    ];
+
+    /// The resource segment's prefix, which is also how this service's errors name
+    /// the kind (`ConflictException.ResourceType` spells a plan `pricingplan`).
+    pub fn segment(self) -> &'static str {
+        match self {
+            Self::BillingGroup => "billinggroup",
+            Self::PricingPlan => "pricingplan",
+            Self::PricingRule => "pricingrule",
+            Self::CustomLineItem => "customlineitem",
+        }
+    }
+}
+
+/// A resource a tagging operation addressed: which kind its ARN names, that ARN in the
+/// ONE spelling this service's maps are keyed by (see the module header), and the bare
+/// resource id.
+#[derive(Debug, Clone)]
+pub struct TaggableResource {
+    pub kind: TaggableResourceKind,
+    pub id: String,
+    pub arn: String,
+}
+
+/// Read a tagging `ResourceArn` into the resource it names, `None` when it names no
+/// resource of this service at all.
+///
+/// The modelled `Arn` accepts the full ARN of any of the four taggable kinds — with the
+/// `billinggroup` separator OPTIONAL — or a bare custom-line-item id, so one value has
+/// several spellings and they must all resolve to the one key the maps use. The
+/// partition and account segments are KEPT: another account's (or another partition's)
+/// ARN names a resource this emulator does not hold, which is a not-found rather than a
+/// hit on the same-id local resource. A region segment is kept the same way: this
+/// service is global, so every ARN it mints carries the empty region [`ARN_REGION`] and
+/// an ARN naming a region names no resource of this service.
+pub fn parse_taggable_arn(value: &str) -> Option<TaggableResource> {
+    let (partition, account, resource) = match value.strip_prefix("arn:") {
+        Some(rest) => {
+            let mut segments = rest.splitn(5, ':');
+            let partition = segments.next()?;
+            let service = segments.next()?;
+            let region = segments.next()?;
+            let account = segments.next()?;
+            let resource = segments.next()?;
+            if service != ARN_SERVICE || region != ARN_REGION {
+                return None;
+            }
+            (
+                partition.to_string(),
+                account.to_string(),
+                resource.to_string(),
+            )
+        }
+        // The only form the pattern admits with no ARN prefix is a custom line item id
+        // (`^(arn:aws(-cn)?:billingconductor::[0-9]{12}:customlineitem/)?[a-zA-Z0-9]{10}$`),
+        // so a bare value names a custom line item of this emulator's own account.
+        None => (
+            "aws".to_string(),
+            ::engine::emulator_account_id().to_string(),
+            format!("customlineitem/{value}"),
+        ),
+    };
+
+    let kind = TaggableResourceKind::ALL
+        .into_iter()
+        .find(|kind| resource.starts_with(kind.segment()))?;
+    // `billinggroup/?` — the separator the pattern makes optional, so both spellings of
+    // one resource resolve to the same id.
+    let rest = &resource[kind.segment().len()..];
+    let id = rest.strip_prefix('/').unwrap_or(rest);
+    if id.is_empty() {
+        return None;
+    }
+    Some(TaggableResource {
+        kind,
+        id: id.to_string(),
+        arn: format!(
+            "arn:{partition}:{ARN_SERVICE}::{account}:{}/{id}",
+            kind.segment()
+        ),
+    })
 }
 
 /// A `ClientToken` is scoped to the operation that minted it: two operations may
@@ -489,6 +639,48 @@ pub const MAX_ACCOUNTS_PER_BILLING_GROUP: usize = 1000;
 
 /// The Service Quotas-style service code this service's limit errors carry.
 pub const SERVICE_CODE: &str = "billingconductor";
+
+/// How many tags one resource holds.
+///
+/// The modelled `TagMap`'s own `@length` maximum
+/// (`smithy_query(query="shape",shape="TagMap")`: len 1..200) — the same bound the
+/// boundary already enforces on ONE request's map, applied to what a resource
+/// ACCUMULATES over several `TagResource` calls. A merge that would take a resource
+/// past it is REFUSED with the modelled `ValidationException` rather than stored, so a
+/// caller cannot grow one resource's tag map without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The wire error code a tagging operation answers when its `ResourceArn` names no
+/// resource of this service.
+///
+/// NOT a shape this service's model declares — the model lists
+/// `ResourceNotFoundException` (404) for these operations — but the code the real
+/// service answers the tagging surface with, as recorded by the behavioral corpus:
+/// HTTP 404, error code `NotFoundException`, message "Resource was not found" (see
+/// `issues/.../20261022T200837Z-billingconductor-tagresource-stub.md`, whose check
+/// asserts `tag_code == "NotFoundException"`, and cause 6 of
+/// `...-billingconductor-payer-account-authorization-gate-absent-across-the.md`, which
+/// records the same code, status and message). The code and the status are what a
+/// client classifies on, so they follow the recording rather than the model.
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The status [`TAGGING_NOT_FOUND_CODE`] is served on (recorded: HTTP 404, the same
+/// status the model gives `ResourceNotFoundException`).
+pub const TAGGING_NOT_FOUND_STATUS: u16 = 404;
+
+/// The message the real service's tagging not-found carries. It names nothing from the
+/// request, so it is the same sentence for every resource.
+pub const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The tagging not-found failure, as a tagging handler returns it: the recorded code
+/// and status under the operation's own error channel.
+pub fn tagging_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        TAGGING_NOT_FOUND_CODE,
+        TAGGING_NOT_FOUND_STATUS,
+        TAGGING_NOT_FOUND_MESSAGE,
+    )
+}
 
 /// The page size the list operations apply when the request names none.
 ///
