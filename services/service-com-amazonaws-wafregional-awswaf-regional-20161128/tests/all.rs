@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
+#[path = "all/rule_group_lifecycle.rs"]
+mod rule_group_lifecycle;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
 #[path = "all/sql_injection_match_set.rs"]

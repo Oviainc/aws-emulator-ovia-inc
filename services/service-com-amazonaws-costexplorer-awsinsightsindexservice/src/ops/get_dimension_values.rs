@@ -5,6 +5,13 @@
 //! asserts NOTHING about `GetDimensionValues`'s real behaviour. Implement it here — this is
 //! the ONLY file to touch for this operation.
 //!
+//! RETRIEVAL is what is still scaffolded: the emulator holds no cost-and-usage data for a
+//! dimension to be read out of, so an admissible request still answers 501. The one piece
+//! of this operation's contract that IS enforced here is its own narrower `Context` rule —
+//! see [`ADMISSIBLE_CONTEXTS`] — because a refusal is not retrieval, and answering 501 for
+//! a request the service refuses would report "not written yet" for a request that can
+//! never succeed.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`GetDimensionValues::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -155,6 +162,35 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `Context` values THIS operation admits — a proper subset of the modelled
+/// `com.amazonaws.costexplorer#Context` enum, which also carries `SAVINGS_PLANS`.
+///
+/// Source: the model's own documentation for `GetDimensionValuesRequest$Context` —
+/// "The context for the call to `GetDimensionValues`. This can be `RESERVATIONS` or
+/// `COST_AND_USAGE`. The default value is `COST_AND_USAGE`." (`smithy_query(query="doc",
+/// shape="GetDimensionValuesRequest", member="Context")`). `SAVINGS_PLANS` is modelled on
+/// the shared enum for the Savings Plans consumers, not for this operation, so it is
+/// refused here even though the enum-set validator at the boundary accepts it.
+pub const ADMISSIBLE_CONTEXTS: [&str; 2] = ["COST_AND_USAGE", "RESERVATIONS"];
+
+/// What Cost Explorer answers for a `Context` outside [`ADMISSIBLE_CONTEXTS`].
+///
+/// A FIXED sentence naming the admissible values: it neither echoes the rejected value
+/// nor enumerates the modelled enum, so it cannot advertise `SAVINGS_PLANS` as valid for
+/// this operation. The boundary validator's generic enum report does both, which is why
+/// `crate::service` reroutes a `context` enum refusal to this text.
+pub const CONTEXT_REJECTION_MESSAGE: &str =
+    "Only COST_AND_USAGE and RESERVATIONS are valid values for context";
+
+/// Whether `context` is one this operation admits. An absent `Context` is admissible:
+/// the model documents `COST_AND_USAGE` as the default.
+pub fn context_is_admissible(context: Option<&str>) -> bool {
+    match context {
+        Some(value) => ADMISSIBLE_CONTEXTS.contains(&value),
+        None => true,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -231,7 +267,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        let _ = (ctx, &self.engine);
+
+        // This operation's `Context` is narrower than the enum shape it targets, and the
+        // boundary enum-set validator can only check the shape. A value the shape allows
+        // but this operation does not (`SAVINGS_PLANS`) therefore arrives here, and is
+        // refused with the same fixed sentence the boundary refusal is reworded to in
+        // `crate::service::EmulatedService::override_refusal` — one rule, one wording,
+        // whichever layer catches the value.
+        if !context_is_admissible(input.context.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                CONTEXT_REJECTION_MESSAGE,
+            ));
+        }
+
         // Implement `GetDimensionValues` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(GetDimensionValuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.

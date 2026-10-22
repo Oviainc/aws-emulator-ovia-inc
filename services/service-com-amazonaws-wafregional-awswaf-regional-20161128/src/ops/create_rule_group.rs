@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a new, EMPTY `RuleGroup` under a freshly minted `RuleGroupId` and answers the
+//! projection of the record that was stored, together with the change token the call
+//! consumed. The rules themselves arrive later: "You use UpdateRuleGroup to add rules to
+//! the rule group."
+//!
+//! `MetricName` is checked against the character set and reserved names its own
+//! documentation states. `Name` is checked only against its modelled `@length` and
+//! `@pattern` (which the request walk applies before this handler runs): AWS documents
+//! no further rule for `ResourceName`, so none is invented here, and
+//! `WAFDisallowedNameException` is answered for the metric name alone. `Tags` are
+//! bounded by the per-resource tag quota and otherwise stored as given: AWS's content
+//! rules for a tag key or value are not stated in this model, so no tag-content refusal
+//! is invented and `WAFTagOperationException` is left to whoever implements
+//! `TagResource` against documented rules. The stored tags are UNOBSERVABLE until then:
+//! `TagResource`, `UntagResource` and `ListTagsForResource` are still scaffold stubs, so
+//! the only testable effect of `Tags` here is the quota refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +179,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRuleGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRuleGroupErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `MetricName`'s documented character set and reserved names. The modelled
+        // `@length` and `@pattern` are refused before this handler runs; what is left
+        // is "only alphanumeric characters (A-Z, a-z, 0-9) ... can't contain whitespace
+        // or metric names reserved for AWS WAF".
+        if !crate::state::metric_name_is_allowed(&input.metric_name) {
+            return Err(CreateRuleGroupErrorModeled::WAFDisallowedNameException(
+                WAFDisallowedNameException {
+                    message: Some(crate::state::MESSAGE_DISALLOWED_NAME.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Every rule group is a stored record, and the service publishes a per-account
+        // quota for them, so the number a caller can create is bounded.
+        if state.rule_groups.len() >= crate::state::MAX_RULE_GROUPS {
+            return Err(CreateRuleGroupErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The tag set each record carries is bounded too: the model bounds `TagList`
+        // only from below (`len 1..`), so the per-resource tag quota is what caps it.
+        if input.tags.as_ref().map_or(0, Vec::len) > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateRuleGroupErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The change-token protocol every mutating AWS WAF Classic call follows: the
+        // token must be one `GetChangeToken` minted and no other mutating call has
+        // used, since "each create, update, or delete request must use a unique change
+        // token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateRuleGroupErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
+        // rule groups created with the same `Name` are two distinct resources, each
+        // stored under its own `RuleGroupId`.
+        let rule_group_id = state.mint_id();
+        // A new rule group holds no rules: they arrive through `UpdateRuleGroup`.
+        let mut entry = crate::state::RuleGroupEntry::new(
+            rule_group_id.clone(),
+            input.name,
+            input.metric_name,
+        );
+        // A tag set is keyed by `Key`, so a key repeated in one request keeps the last
+        // value given for it.
+        for tag in input.tags.into_iter().flatten() {
+            entry.tags.insert(tag.key, tag.value);
+        }
+        // The response is the projection of the record that was STORED, not of the
+        // request.
+        let rule_group = entry.to_modelled();
+        state.rule_groups.insert(rule_group_id, entry);
+
+        Ok(CreateRuleGroupOutput {
+            rule_group: Some(rule_group),
+            change_token: Some(input.change_token),
+        })
     }
 }

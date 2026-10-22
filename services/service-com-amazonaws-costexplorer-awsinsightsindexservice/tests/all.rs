@@ -13,5 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/cost_category_definitions.rs"]
 mod cost_category_definitions;
+#[path = "all/get_dimension_values_context.rs"]
+mod get_dimension_values_context;
+// The shared HTTP harness every suite above drives the service through. Declared before
+// nothing in particular — a test-target crate root's `mod`s are order-independent — but
+// kept with the suites so a new suite sees it.
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
