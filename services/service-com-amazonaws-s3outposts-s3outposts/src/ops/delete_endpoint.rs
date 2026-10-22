@@ -173,10 +173,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::caller_account();
         let mut store = state.lock();
 
-        // The endpoint is named by the (Outpost, endpoint) pair, and only its
-        // own account can delete it: a pair that names no endpoint of this
-        // caller's is the modelled 404 — which is also what a repeated delete
-        // answers, the first one having removed the record.
+        // The Outpost is resolved FIRST: an endpoint is named by the (Outpost,
+        // endpoint) pair, so an Outpost that resolves to nothing this caller has
+        // access to is the modelled 404 before any endpoint under it is looked
+        // at — its text is the one the caller sees.
+        if !store.outposts.contains_key(&input.outpost_id) {
+            return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(&input.outpost_id),
+            )
+            .into());
+        }
+
+        // Only the endpoint's own account can delete it: a pair that names no
+        // endpoint of this caller's on that Outpost is the modelled 404 — which
+        // is also what a repeated delete answers, the first one having removed
+        // the record. The message is the same service constant the Outpost's
+        // form selects: the service does not report which half of the pair
+        // failed to resolve.
         let key = (input.outpost_id.clone(), input.endpoint_id.clone());
         let owned = store
             .endpoints
@@ -184,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|endpoint| endpoint.owner_account == caller);
         if !owned {
             return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::endpoint_not_found(&input.outpost_id, &input.endpoint_id),
+                crate::state::not_found(&input.outpost_id),
             )
             .into());
         }

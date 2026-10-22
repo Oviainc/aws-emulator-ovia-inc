@@ -474,7 +474,7 @@ pub fn is_outpost_id(value: &str) -> bool {
     if let Some(hex) = value.strip_prefix("op-") {
         return hex.len() == 17 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     }
-    value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
+    is_account_outpost_id(value)
 }
 
 /// True when `value` satisfies `EndpointId`'s `^[a-zA-Z0-9]{19}$`.
@@ -500,21 +500,55 @@ pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
         .then(|| (outpost_id.to_string(), endpoint_id.to_string()))
 }
 
-/// The `ResourceNotFoundException` payload for an Outpost id that names no
-/// Outpost this caller has access to.
-pub fn outpost_not_found(outpost_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Outpost {outpost_id} not found")),
+/// The `ResourceNotFoundException$Message` an unresolvable reference carries
+/// when the `OutpostId` names a physical Outpost directly — the `op-` and `ec2`
+/// branches of `OutpostId`'s pattern, which are exactly the two branches
+/// `OutpostArn`'s pattern
+/// `^arn:…:outposts:…:outpost/(op-[a-f0-9]{17}|ec2)$` admits.
+///
+/// Such an id names a piece of hardware that may belong to an account the
+/// caller cannot see at all, so the service MASKS the lookup: it reports neither
+/// which id failed nor whether the Outpost exists. Recorded behaviour — the
+/// model carries no message text for `ResourceNotFoundException`.
+pub const MASKED_NOT_FOUND_MESSAGE: &str = "Access Denied";
+
+/// The `ResourceNotFoundException$Message` an unresolvable reference carries
+/// when the `OutpostId` is in the 12-digit account-id branch of the pattern —
+/// the one branch no `OutpostArn` admits, so it cannot name an Outpost resource
+/// and nothing is masked.
+///
+/// Recorded behaviour, like [`MASKED_NOT_FOUND_MESSAGE`]: the text is a service
+/// constant, never built from the request.
+pub const OUTPOST_NOT_FOUND_MESSAGE: &str =
+    "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
+
+/// True when `value` is the 12-digit (`\d{12}`) branch of `OutpostId`'s
+/// `^(op-[a-f0-9]{17}|\d{12}|ec2)$` — the account-id form.
+pub fn is_account_outpost_id(value: &str) -> bool {
+    value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The fixed `Message` this service answers an unresolvable reference under
+/// `outpost_id` with.
+///
+/// It is selected by the FORM of the `OutpostId` alone, never by the ids in the
+/// request and never by which resource failed to resolve: every reference below
+/// an Outpost is resolved by first resolving that Outpost, so the Outpost-level
+/// text is the only one a caller ever sees.
+pub fn not_found_message(outpost_id: &str) -> &'static str {
+    if is_account_outpost_id(outpost_id) {
+        OUTPOST_NOT_FOUND_MESSAGE
+    } else {
+        MASKED_NOT_FOUND_MESSAGE
     }
 }
 
-/// The `ResourceNotFoundException` payload for an endpoint that this caller has
-/// no endpoint of on that Outpost.
-pub fn endpoint_not_found(outpost_id: &str, endpoint_id: &str) -> ResourceNotFoundException {
+/// The `ResourceNotFoundException` payload for a reference under `outpost_id`
+/// that resolves to nothing this caller has access to — the Outpost itself, or
+/// an endpoint on it.
+pub fn not_found(outpost_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "Endpoint {endpoint_id} not found on Outpost {outpost_id}"
-        )),
+        message: Some(not_found_message(outpost_id).to_string()),
     }
 }
 
