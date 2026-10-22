@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFolder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFolder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFolder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a folder under an existing parent folder and STORES it, so the minted id is
+//! the key a later `DescribeFolderContents` resolves.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +159,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFolder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFolderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFolder"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFolderErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("One or more of the dependencies is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // A folder is created IN a folder, so an unknown parent is the modelled 404 and
+        // nothing is stored.
+        if !state.folders.contains_key(&input.parent_folder_id) {
+            return Err(CreateFolderErrorModeled::EntityNotExistsException(
+                EntityNotExistsException {
+                    message: Some("The resource does not exist.".to_string()),
+                    entity_ids: Some(vec![input.parent_folder_id.clone()]),
+                },
+            )
+            .into());
+        }
+
+        // `LimitExceededException`'s own documentation in this model: "The maximum of
+        // 100,000 files and folders under the parent folder has been exceeded." The
+        // store as a whole is capped too, so one caller cannot grow the process without
+        // limit by creating folders that each hold children of their own.
+        let message = if state.count_children(&input.parent_folder_id)
+            >= crate::state::MAX_CHILDREN_PER_FOLDER
+        {
+            Some(crate::state::FOLDER_FULL_MESSAGE)
+        } else if state.total_resources() >= crate::state::MAX_STORED_RESOURCES {
+            Some(crate::state::STORE_FULL_MESSAGE)
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            return Err(CreateFolderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_id("folder");
+        let created = state.now();
+        state.folders.insert(
+            id.clone(),
+            crate::state::Folder {
+                id: id.clone(),
+                name: input.name.clone(),
+                creator_id: crate::state::synthetic_user_id(),
+                parent_folder_id: Some(input.parent_folder_id.clone()),
+                created,
+                modified: created,
+                resource_state: crate::state::RESOURCE_STATE_ACTIVE.to_string(),
+                labels: Vec::new(),
+                custom_metadata: ::std::collections::HashMap::new(),
+            },
+        );
+        // The parent's contents changed, so the parent was updated: its `Signature` is
+        // derived from the child set and its `ModifiedTimestamp` advances with it.
+        if let Some(parent) = state.folders.get_mut(&input.parent_folder_id) {
+            parent.modified = created;
+        }
+
+        // Describe the folder as STORED, not the value just built, so this response and
+        // every later read of the same folder come from one place.
+        let Some(stored) = state.folders.get(&id).cloned() else {
+            return Err(CreateFolderErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("One or more of the dependencies is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+        let metadata = state.child_index().folder_metadata(&stored);
+        Ok(CreateFolderOutput {
+            metadata: Some(metadata),
+        })
     }
 }

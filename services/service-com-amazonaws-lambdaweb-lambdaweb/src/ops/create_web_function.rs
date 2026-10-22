@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a new web function and, when the request carries a `revisionConfig`, its
+//! initial revision; every member of the response is read back out of the store.
+//!
+//! `endpointConfig` is NOT served here: the endpoint operations of this service are
+//! still scaffolded, so a request that asks for an initial endpoint is answered with
+//! the scaffold's 501 and stores nothing, rather than silently creating a function
+//! without the endpoint it asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +185,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebFunction"))
+        // The model bounds `functionName`'s length only; the member's own
+        // documentation states the narrower rule the service enforces, so it is
+        // refused here rather than at the boundary.
+        if let Some(message) = crate::state::function_name_violation(&input.function_name) {
+            return Err(
+                CreateWebFunctionErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        // The initial endpoint belongs to the endpoint slice of this service, every
+        // operation of which is still a stub. Refused BEFORE anything is stored, so
+        // the call creates nothing at all.
+        if input.endpoint_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateWebFunction's endpointConfig",
+            ));
+        }
+
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWebFunctionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialise_due_transitions(now);
+
+        // A web function's name is its identity, so a create under a name that is
+        // already taken conflicts with the stored resource.
+        if let Some(existing) = state.functions.get(&input.function_name) {
+            return Err(CreateWebFunctionErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "A web function named {} already exists.",
+                    existing.function_name
+                ),
+                resource_id: Some(existing.function_arn.clone()),
+                resource_type: Some("WebFunction".to_string()),
+            })
+            .into());
+        }
+
+        if state.functions.len() >= crate::state::MAX_WEB_FUNCTIONS {
+            return Err(CreateWebFunctionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of web functions ({}) for this account",
+                        crate::state::MAX_WEB_FUNCTIONS
+                    ),
+                    resource_id: None,
+                    resource_type: Some("WebFunction".to_string()),
+                    service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        // The ARN names the region the call was signed for and the emulator's
+        // canonical account, never anything the request body supplied.
+        let region = crate::state::request_region(ctx.parts());
+        let function_arn = crate::state::function_arn(&region, &input.function_name);
+        state.functions.insert(
+            input.function_name.clone(),
+            crate::state::WebFunction {
+                function_name: input.function_name.clone(),
+                function_arn,
+                // A function the service reports as `Pending` turns `Active` only
+                // once the clock has made that transition due, and
+                // `PROVISIONING_DELAY` is never zero — so a caller reading straight
+                // back still sees `Pending`.
+                state: crate::state::FunctionState::Pending,
+                state_reason: crate::state::FUNCTION_PENDING_REASON.to_string(),
+                created_at: now,
+                updated_at: now,
+                activates_at: Some(now + crate::state::PROVISIONING_DELAY),
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+                revisions: ::std::collections::BTreeMap::new(),
+                latest_revision_id: None,
+            },
+        );
+
+        if let Some(config) = input.revision_config {
+            state.add_revision(
+                &input.function_name,
+                crate::state::NewRevision {
+                    description: config.description,
+                    kms_key_arn: config.kms_key_arn,
+                    build_config: config.build_config,
+                    service_config: config.service_config,
+                },
+                now,
+            );
+        }
+
+        // Every member below comes out of the stored record — including the revision
+        // summary, which is read back through the function's latest revision id.
+        let stored = state
+            .functions
+            .get(&input.function_name)
+            .expect("the function inserted above is in the store");
+        // The audit record for a state change: who, what, outcome. No secret and no
+        // credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        ::tracing::info!(
+            operation = "CreateWebFunction",
+            akid = %akid,
+            function_name = %stored.function_name,
+            function_arn = %stored.function_arn,
+            outcome = "created",
+            "web function created"
+        );
+        Ok(CreateWebFunctionOutput {
+            function_name: stored.function_name.clone(),
+            function_arn: stored.function_arn.clone(),
+            state: stored.state.wire().to_string(),
+            state_reason: stored.state_reason.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(stored.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(stored.updated_at),
+            revision: stored.latest_revision().map(crate::state::Revision::summary),
+            // This slice stores no endpoint, and a request that asked for one was
+            // refused above.
+            endpoint: None,
+            tags: stored.modeled_tags(),
+        })
     }
 }

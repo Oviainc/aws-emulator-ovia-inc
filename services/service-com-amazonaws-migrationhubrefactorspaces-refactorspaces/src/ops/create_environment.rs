@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an environment, mints its `^env-[0-9A-Za-z]{10}$` id and its ARN, stores the
+//! record, and answers out of the stored record — never out of the request body.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +184,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Refactor Spaces store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Apply any CREATING -> ACTIVE move the clock already owes before answering, so an
+        // idempotent replay reports the same state a GetEnvironment would.
+        state.materialise_due_states();
+
+        // `ClientToken` is `@idempotencyToken`: a repeated request carrying the token of
+        // an earlier one answers with the environment that one created, rather than
+        // minting a second environment. A request that reuses a token but asks for a
+        // DIFFERENT environment is not a replay — it is two creations under one token —
+        // so it is refused with the modelled ConflictException rather than answered with
+        // a record the caller did not ask for.
+        if let Some(client_token) = input.client_token.as_deref() {
+            if let Some(existing) = state.environment_by_client_token(client_token) {
+                if !created_from(existing, &input) {
+                    return Err(CreateEnvironmentErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "ClientToken {client_token} already created environment {} \
+                                 from different parameters",
+                                existing.environment_id
+                            ),
+                            resource_id: existing.environment_id.clone(),
+                            resource_type: crate::state::RESOURCE_TYPE_ENVIRONMENT.to_string(),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(output_of(existing));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        // The store grows by one environment per call and lives for the life of the
+        // process, so the growth is capped; past the cap the service answers the quota
+        // error it models rather than accepting another entry.
+        if state.environments.len() >= crate::state::MAX_ENVIRONMENTS {
+            return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the number of environments would exceed the limit of {}",
+                        crate::state::MAX_ENVIRONMENTS
+                    ),
+                    // The quota is per account, so the account is what ran out of room;
+                    // `ResourceType` names the kind of resource being counted.
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::RESOURCE_TYPE_ENVIRONMENT.to_string(),
+                    // AWS publishes no quota code for this limit, and this cap is the
+                    // emulator's own, so there is none to report.
+                    quota_code: None,
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+        let Some(environment_id) = state.mint_id("env") else {
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "could not mint a fresh environment identifier".to_string(),
+                },
+            )
+            .into());
+        };
+        // The real service provisions a transit gateway only for a TRANSIT_GATEWAY
+        // environment; a NONE environment has no transit gateway to report.
+        let transit_gateway_id = if input.network_fabric_type == "TRANSIT_GATEWAY" {
+            let Some(id) = state.mint_transit_gateway_id() else {
+                return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "could not mint a fresh transit gateway identifier"
+                            .to_string(),
+                    },
+                )
+                .into());
+            };
+            Some(id)
+        } else {
+            None
+        };
+        let created_time = ::aws_smithy_types::DateTime::from(std::time::SystemTime::now());
+
+        let environment = crate::state::Environment {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &format!("environment/{environment_id}"),
+            ),
+            environment_id,
+            name: input.name,
+            description: input.description,
+            network_fabric_type: input.network_fabric_type,
+            transit_gateway_id,
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+            // The real service answers CREATING here and reaches ACTIVE on its own; the
+            // clock owes that move, so it is recorded as due rather than applied now.
+            state: crate::state::STATE_CREATING.to_string(),
+            active_at: Some(std::time::Instant::now() + crate::state::PROVISIONING_SPAN),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_time,
+            last_updated_time: created_time,
+            client_token: input.client_token,
+            applications: Vec::new(),
+        };
+
+        state.environments.push(environment);
+        // Answered from the stored record, so what this call reports and what a later
+        // GetEnvironment reports cannot disagree.
+        let stored = state
+            .environments
+            .last()
+            .expect("the environment just pushed is in the store");
+        Ok(output_of(stored))
+    }
+}
+
+/// Whether `environment` is the one `input` asks for: every member the create persists,
+/// so a `ClientToken` replay is only treated as a replay of the SAME request.
+fn created_from(
+    environment: &crate::state::Environment,
+    input: &CreateEnvironmentInput,
+) -> bool {
+    environment.name == input.name
+        && environment.network_fabric_type == input.network_fabric_type
+        && environment.description == input.description
+        && environment.tags
+            == input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<String, String>>()
+}
+
+/// Project a stored environment onto this operation's output shape.
+fn output_of(environment: &crate::state::Environment) -> CreateEnvironmentOutput {
+    CreateEnvironmentOutput {
+        name: Some(environment.name.clone()),
+        arn: Some(environment.arn.clone()),
+        description: environment.description.clone(),
+        environment_id: Some(environment.environment_id.clone()),
+        network_fabric_type: Some(environment.network_fabric_type.clone()),
+        owner_account_id: Some(environment.owner_account_id.clone()),
+        state: Some(environment.state.clone()),
+        tags: (!environment.tags.is_empty())
+            .then(|| environment.tags.clone().into_iter().collect()),
+        last_updated_time: Some(environment.last_updated_time),
+        created_time: Some(environment.created_time),
     }
 }

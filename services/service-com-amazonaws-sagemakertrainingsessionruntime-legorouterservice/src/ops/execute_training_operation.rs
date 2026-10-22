@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteTrainingOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteTrainingOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Submits one asynchronous training operation against a training session, in its
+//! sequence-number slot, and answers the operation id a later
+//! `GetTrainingOperationResult` resolves.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteTrainingOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This runtime service models no create operation for a session — the SageMaker
+//! control plane creates them — so the first submit against a name materialises the
+//! session's runtime record (`crate::state::session_for_submit`).
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +164,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteTrainingOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteTrainingOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteTrainingOperation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ExecuteTrainingOperationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the training session runtime store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The modelled constraints (the label's length and pattern, `sequenceNumber`'s
+        // minimum, exactly one union member) are refused before this handler runs; what
+        // is left are the rules the model states in prose.
+        if let Err(reason) = crate::state::validate_operation_config(&input.operation_config) {
+            return Err(ExecuteTrainingOperationErrorModeled::ValidationException(
+                ValidationException { message: reason },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = crate::state::training_request_fingerprint(
+            input.sequence_number,
+            &input.operation_config,
+        );
+        let mut store = state.lock();
+        let Some(session) = store.session_for_submit(&input.training_session_name, now) else {
+            return Err(ExecuteTrainingOperationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: format!(
+                        "This emulator holds the {} training sessions it retains and every \
+                         one still has an operation in flight; retry once one of them has \
+                         settled.",
+                        crate::state::MAX_SESSIONS
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "If you retry a request with the same client token and the same parameters, the
+        // service ignores the request but does not return an error" — so a token this
+        // session has already seen, with the parameters it was first used for, answers
+        // the operation id the first call minted and nothing else happens. The same token
+        // with DIFFERENT parameters is not that retry, and is a conflict rather than a
+        // silent discard of the operation the caller asked for.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = session.client_tokens.get(token).cloned() {
+                let replays = session
+                    .training_ops
+                    .get(&existing)
+                    .is_some_and(|op| op.request_fingerprint == fingerprint);
+                if replays {
+                    return Ok(ExecuteTrainingOperationOutput {
+                        operation_id: existing,
+                    });
+                }
+                return Err(ExecuteTrainingOperationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Client token {token} was already used for operation {existing} \
+                             of training session {} with different parameters.",
+                            input.training_session_name
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The training session processes operations strictly in sequence number order":
+        // a slot that is taken, or that the session has already executed past, cannot
+        // accept another operation.
+        if input.sequence_number < session.next_sequence_number {
+            return Err(ExecuteTrainingOperationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Training session {} has already executed sequence number {}; the \
+                         next sequence number it accepts is {}.",
+                        session.name, input.sequence_number, session.next_sequence_number
+                    ),
+                },
+            )
+            .into());
+        }
+        if let Some(existing) = session.sequence_index.get(&input.sequence_number) {
+            return Err(ExecuteTrainingOperationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Sequence number {} of training session {} is already held by \
+                         operation {existing}.",
+                        input.sequence_number, session.name
+                    ),
+                },
+            )
+            .into());
+        }
+        if session.training_ops.len() >= crate::state::MAX_OPERATIONS_PER_SESSION {
+            return Err(ExecuteTrainingOperationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Training session {} holds the {} training operations this \
+                         emulator retains per session and cannot accept another.",
+                        session.name,
+                        crate::state::MAX_OPERATIONS_PER_SESSION
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let operation_id = session.mint_operation_id(crate::state::TRAINING_NAMESPACE, now);
+        // A save operation's model package ARN is minted here, from the region THIS
+        // request was signed for, so the ARN a later poll reports does not depend on who
+        // polled; the checkpoint itself is published when the operation completes.
+        let reserved = match &input.operation_config {
+            OperationConfig::saveWeights(_) | OperationConfig::saveState(_) => {
+                Some(session.reserve_checkpoint(&region))
+            }
+            _ => None,
+        };
+        session.training_ops.insert(
+            operation_id.clone(),
+            crate::state::TrainingOp {
+                operation_id: operation_id.clone(),
+                sequence_number: input.sequence_number,
+                client_token: input.client_token.clone(),
+                request_fingerprint: fingerprint,
+                config: input.operation_config,
+                status: crate::state::STATUS_PENDING,
+                result: None,
+                error_details: None,
+                submitted_at: now,
+                due_at: None,
+                reserved,
+            },
+        );
+        session
+            .sequence_index
+            .insert(input.sequence_number, operation_id.clone());
+        if let Some(token) = input.client_token {
+            session.client_tokens.insert(token, operation_id.clone());
+        }
+        // Let the queue start the operation that is now at its head, so a submit that
+        // fills the session's next slot leaves that operation `InProgress` rather than
+        // waiting for the first poll to start it.
+        session.advance(now);
+
+        Ok(ExecuteTrainingOperationOutput { operation_id })
     }
 }

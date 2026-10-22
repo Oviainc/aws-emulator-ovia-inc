@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBenefitApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBenefitApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the supplied members to one stored benefit application in [`crate::state`],
+//! bumps its revision and `UpdatedAt`, and reports the new revision.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBenefitApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Optimistic concurrency: the request's `Revision` must be the application's current
+//! one, so an update built on a stale read is refused with the modelled
+//! `ConflictException` rather than silently overwriting a newer write.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBenefitApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBenefitApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBenefitApplication"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBenefitApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        if let Some(why) = crate::state::details_rejection(input.benefit_application_details.as_ref())
+        {
+            return Err(UpdateBenefitApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: why.clone(),
+                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+                    field_list: Some(crate::state::validation_field(
+                        "BenefitApplicationDetails",
+                        &why,
+                        crate::state::VALIDATION_CODE_INVALID_VALUE,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let principal = crate::state::caller_principal(ctx);
+        let now = crate::state::now_millis();
+
+        let mut store = state.lock();
+        let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
+            return Err(
+                UpdateBenefitApplicationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "benefit application {} does not exist in catalog {}",
+                            input.identifier, input.catalog
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if application.revision_text() != input.revision {
+            return Err(UpdateBenefitApplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "benefit application {} is at revision {}, not {}",
+                        application.id,
+                        application.revision_text(),
+                        input.revision
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Only the members the request carried are applied: an absent one leaves the
+        // stored value alone, which is what lets a caller update one field without
+        // having to resend the rest.
+        if let Some(name) = input.name {
+            application.name = Some(name);
+        }
+        if let Some(description) = input.description {
+            application.description = Some(description);
+        }
+        if let Some(details) = input.benefit_application_details {
+            application.benefit_application_details = Some(details);
+        }
+        if let Some(contacts) = input.partner_contacts {
+            application.partner_contacts = contacts;
+        }
+        if let Some(files) = input.file_details {
+            application.file_details = files
+                .iter()
+                .map(|file| crate::state::file_detail(file, &principal, now))
+                .collect();
+        }
+        application.revise(now);
+
+        Ok(UpdateBenefitApplicationOutput {
+            id: Some(application.id.clone()),
+            arn: Some(application.arn.clone()),
+            revision: Some(application.revision_text()),
+        })
     }
 }

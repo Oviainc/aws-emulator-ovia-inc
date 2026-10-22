@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque list-pagination cursors: the membership id, hex-encoded.
+hex = { workspace = true }
+# The mixing step behind minted UUID resource ids.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

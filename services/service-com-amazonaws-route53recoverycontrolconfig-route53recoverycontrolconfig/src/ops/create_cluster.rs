@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: mints a cluster ARN and its five Regional data-plane endpoints,
+//! creates the cluster's default control panel alongside it, and persists both in
+//! [`crate::state`]; `DescribeCluster` projects the same stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The cluster's `Status` is DERIVED from the instant its deployment became due, so it
+//! reads `PENDING` right after this call and `DEPLOYED` once that instant has passed
+//! without any operation writing it.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +163,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `NetworkType` is an enum member with no declared default, so a cluster
+        // created without one is the IPv4 cluster AWS creates by default.
+        let network_type = input
+            .network_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_NETWORK_TYPE.to_string());
+        if !NETWORK_TYPE_VALUES.contains(&network_type.as_str()) {
+            return Err(CreateClusterErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "NetworkType must be one of {}, got \"{network_type}\"",
+                    NETWORK_TYPE_VALUES.join(", ")
+                ),
+            })
+            .into());
+        }
+
+        // The request this `ClientToken` stands for, so a replay of the SAME request
+        // returns the first cluster and a replay with different parameters is refused.
+        let fingerprint = format!(
+            "{}|{network_type}|{}",
+            input.cluster_name,
+            crate::state::tags_fingerprint(input.tags.as_ref())
+        );
+        let mut guard = state.lock();
+
+        match guard.token_outcome(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenOutcome::Replay(arn) => {
+                if let Some(record) = guard.clusters.get(&arn) {
+                    return Ok(CreateClusterOutput {
+                        cluster: Some(record.to_cluster()),
+                    });
+                }
+            }
+            crate::state::TokenOutcome::Mismatch => {
+                return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
+                    message: "ClientToken was already used for a CreateCluster request with \
+                              different parameters"
+                        .to_string(),
+                })
+                .into());
+            }
+            crate::state::TokenOutcome::Fresh => {}
+        }
+
+        // A cluster name identifies the cluster within the account that owns it.
+        if guard
+            .clusters
+            .values()
+            .any(|cluster| cluster.name == input.cluster_name)
+        {
+            return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "a cluster named \"{}\" already exists in this account",
+                    input.cluster_name
+                ),
+            })
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit. This
+        // call stores two records — the cluster and its default control panel — so both
+        // ceilings have to have room.
+        if guard.clusters_full() || guard.control_panels_full() {
+            return Err(CreateClusterErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account may hold at most {} clusters and {} control panels",
+                        crate::state::MAX_CLUSTERS,
+                        crate::state::MAX_CONTROL_PANELS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let cluster_id = guard.mint_id();
+        let cluster_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            crate::state::ARN_REGION,
+            &format!("cluster/{cluster_id}"),
+        );
+        let panel_id = guard.mint_id();
+        let default_panel_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            crate::state::ARN_REGION,
+            &format!("controlpanel/{panel_id}"),
+        );
+        let owner = ::engine::emulator_account_id().to_string();
+        let cluster_seq = guard.next_seq();
+        let panel_seq = guard.next_seq();
+        let due = crate::state::deploy_due();
+
+        guard.clusters.insert(
+            cluster_arn.clone(),
+            crate::state::ClusterRecord {
+                seq: cluster_seq,
+                arn: cluster_arn.clone(),
+                name: input.cluster_name,
+                owner: owner.clone(),
+                endpoints: crate::state::cluster_endpoints(&cluster_id, &network_type),
+                network_type,
+                tags: crate::state::tags_map(input.tags),
+                default_control_panel_arn: default_panel_arn.clone(),
+                deploy_due: due,
+            },
+        );
+
+        // AWS creates a cluster together with a default control panel; it is what
+        // `CreateRoutingControl` attaches to when the request names no control panel.
+        guard.control_panels.insert(
+            default_panel_arn.clone(),
+            crate::state::ControlPanelRecord {
+                seq: panel_seq,
+                arn: default_panel_arn,
+                cluster_arn: cluster_arn.clone(),
+                name: crate::state::DEFAULT_CONTROL_PANEL_NAME.to_string(),
+                owner,
+                default_control_panel: true,
+                tags: std::collections::BTreeMap::new(),
+                deploy_due: due,
+            },
+        );
+
+        guard.remember_token(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &cluster_arn,
+        );
+
+        // Answer from the STORED record, so this body is what `DescribeCluster` answers
+        // with later.
+        Ok(CreateClusterOutput {
+            cluster: guard
+                .clusters
+                .get(&cluster_arn)
+                .map(crate::state::ClusterRecord::to_cluster),
+        })
     }
 }
+
+/// The `NetworkType` a cluster takes when the request names none: the model declares no
+/// default for the member, and AWS creates an IPv4 cluster unless asked for a
+/// dual-stack one.
+const DEFAULT_NETWORK_TYPE: &str = "IPV4";

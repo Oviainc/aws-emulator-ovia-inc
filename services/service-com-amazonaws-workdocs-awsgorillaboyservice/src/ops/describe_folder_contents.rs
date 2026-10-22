@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFolderContents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFolderContents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFolderContents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the subfolders and documents parented to `FolderId` in state, honouring the
+//! `Type` filter, the `Sort`/`Order` criteria, `Include` and `Limit`/`Marker` paging.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +164,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFolderContents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFolderContentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFolderContents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeFolderContentsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("One or more of the dependencies is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `FolderContentType`'s values are already enforced by the boundary validator; a
+        // request that names no `Type` filters nothing out.
+        let content_type = input
+            .r#type
+            .clone()
+            .unwrap_or_else(|| crate::state::FOLDER_CONTENT_ALL.to_string());
+        let sort = input
+            .sort
+            .clone()
+            .unwrap_or_else(|| crate::state::SORT_DATE.to_string());
+        let order = input
+            .order
+            .clone()
+            .unwrap_or_else(|| crate::state::ORDER_ASCENDING.to_string());
+        // "The contents to include. Specify "INITIALIZED" to include initialized
+        // documents." — a comma-separated field-name list.
+        let include_initialized = input.include.as_deref().is_some_and(|include| {
+            include
+                .split(',')
+                .any(|field| field == crate::state::INCLUDE_INITIALIZED)
+        });
+        // The marker is bound to the query it was issued for, so one from a different
+        // listing is refused rather than resolved against this one.
+        let scope = format!(
+            "{}|{content_type}|{sort}|{order}|{include_initialized}",
+            input.folder_id
+        );
+        let offset = match input.marker.as_deref() {
+            None => 0,
+            Some(marker) => match crate::state::decode_marker(marker, &scope) {
+                Some(offset) => offset,
+                None => {
+                    return Err(DescribeFolderContentsErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some(
+                                "The pagination marker or limit fields are not valid.".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // `Limit`'s 1..999 range is already enforced by the boundary validator; clamping
+        // again here bounds the per-item work below whatever reaches this handler.
+        let limit = input
+            .limit
+            .map_or(crate::state::DEFAULT_PAGE_LIMIT, |limit| {
+                usize::try_from(limit).unwrap_or(crate::state::DEFAULT_PAGE_LIMIT)
+            })
+            .clamp(1, crate::state::MAX_PAGE_LIMIT);
+
+        // Under the guard: resolve the folder, order its children, and copy out the
+        // minimum this response needs. The parent -> children relation is built ONCE
+        // (`child_index`), so a page of F folders costs one pass over the store rather
+        // than F of them, and no hashing happens while the store is locked — the page's
+        // signatures are computed after the guard is released, below.
+        let (mut folder_drafts, documents, total) = {
+            // A reporting operation: read-only access to the store.
+            let state = state.lock();
+            if !state.folders.contains_key(&input.folder_id) {
+                return Err(DescribeFolderContentsErrorModeled::EntityNotExistsException(
+                    EntityNotExistsException {
+                        message: Some("The resource does not exist.".to_string()),
+                        entity_ids: Some(vec![input.folder_id.clone()]),
+                    },
+                )
+                .into());
+            }
+
+            let index = state.child_index();
+            let mut children: Vec<crate::state::ChildRef<'_>> = index
+                .children(&input.folder_id)
+                .iter()
+                .copied()
+                .filter(|child| {
+                    content_type == crate::state::FOLDER_CONTENT_ALL
+                        || content_type == child.content_type()
+                })
+                // "By default, Amazon WorkDocs returns the first 100 active document and
+                // folder metadata items": a document whose latest version is still
+                // INITIALIZED is listed only when the request includes it. `Include`
+                // widens the DOCUMENT-STATUS rule only — a resource that is not in an
+                // ACTIVE `ResourceStateType` stays out of the listing either way.
+                .filter(|child| is_listable(*child, include_initialized))
+                .collect();
+            sort_children(&mut children, &sort, &order);
+
+            let total = children.len();
+            let page_start = offset.min(total);
+            let page_end = page_start.saturating_add(limit).min(total);
+
+            let mut folder_drafts: Vec<(FolderMetadata, Vec<String>)> = Vec::new();
+            let mut documents: Vec<DocumentMetadata> = Vec::new();
+            for child in &children[page_start..page_end] {
+                match child {
+                    crate::state::ChildRef::Folder(folder) => folder_drafts.push((
+                        crate::state::folder_metadata(folder, None),
+                        index.child_ids(&folder.id),
+                    )),
+                    crate::state::ChildRef::Document(document) => documents.push(document.metadata()),
+                }
+            }
+            (folder_drafts, documents, total)
+        };
+
+        // The guard is released. Yielding here gives the runtime a point at which a
+        // cancelled or timed-out request stops before the remaining per-item work.
+        ::tokio::task::yield_now().await;
+
+        // "The unique identifier created from the subfolders and documents of the
+        // folder": each listed folder's signature, hashed from the child ids copied out
+        // above. The total work is bounded by the store's size, not by page x store.
+        let folders: Vec<FolderMetadata> = folder_drafts
+            .iter_mut()
+            .map(|(metadata, child_ids)| {
+                metadata.signature = Some(crate::state::folder_signature(child_ids));
+                metadata.clone()
+            })
+            .collect();
+
+        let page_end = offset.min(total).saturating_add(folders.len() + documents.len());
+        Ok(DescribeFolderContentsOutput {
+            folders: Some(folders),
+            documents: Some(documents),
+            // "The marker to use when requesting the next set of results. If there are
+            // no additional results, the string is empty."
+            marker: (page_end < total).then(|| crate::state::encode_marker(page_end, &scope)),
+        })
+    }
+}
+
+/// Whether `child` belongs in this listing.
+///
+/// A resource must be in an ACTIVE `ResourceStateType` whatever the request asks for.
+/// On top of that, a document's latest version must have been committed to `ACTIVE`,
+/// unless `include_initialized` (the request's `Include=INITIALIZED`) widens that one
+/// rule to an upload that has not been committed yet.
+fn is_listable(child: crate::state::ChildRef<'_>, include_initialized: bool) -> bool {
+    match child {
+        crate::state::ChildRef::Folder(folder) => {
+            folder.resource_state == crate::state::RESOURCE_STATE_ACTIVE
+        }
+        crate::state::ChildRef::Document(document) => {
+            document.resource_state == crate::state::RESOURCE_STATE_ACTIVE
+                && document.latest_version().is_some_and(|version| {
+                    version.status == crate::state::DOCUMENT_STATUS_ACTIVE
+                        || (include_initialized
+                            && version.status == crate::state::DOCUMENT_STATUS_INITIALIZED)
+                })
+        }
+    }
+}
+
+/// Order `children` by the `ResourceSortType` criteria and the `OrderType` direction.
+///
+/// The id breaks a tie in either criteria, so one folder's contents list in the same
+/// order on every call rather than in `HashMap` iteration order.
+fn sort_children(children: &mut [crate::state::ChildRef<'_>], sort: &str, order: &str) {
+    if sort == crate::state::SORT_NAME {
+        children.sort_by(|left, right| {
+            left.name()
+                .cmp(&right.name())
+                .then_with(|| left.id().cmp(right.id()))
+        });
+    } else {
+        children.sort_by(|left, right| {
+            left.modified()
+                .cmp(&right.modified())
+                .then_with(|| left.id().cmp(right.id()))
+        });
+    }
+    if order == crate::state::ORDER_DESCENDING {
+        children.reverse();
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgentRuntime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgentRuntime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgentRuntime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an agent runtime and PERSISTS it in [`crate::state`]: version `1`, the
+//! configuration the caller supplied, and the `CREATING` -> `READY` transition the
+//! clock owes it. Every later read of the runtime comes from that record.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +191,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgentRuntime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgentRuntimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgentRuntime"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAgentRuntimeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the agent runtime store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // result that token first produced, rather than minting a second runtime.
+        let replayed = store.replayed_result(Self::NAME, input.client_token.as_deref());
+        if let Some((id, version)) = replayed {
+            if let Some(record) = store.agent_runtimes.get(&id) {
+                if let Some(stored) = record.versions.get(&version) {
+                    return Ok(CreateAgentRuntimeOutput {
+                        agent_runtime_arn: record.agent_runtime_arn.clone(),
+                        workload_identity_details: record.workload_identity_details.clone(),
+                        agent_runtime_id: record.agent_runtime_id.clone(),
+                        agent_runtime_version: stored.version_string(),
+                        created_at: crate::state::timestamp(record.created_at),
+                        status: stored.status_at(now).to_string(),
+                    });
+                }
+            }
+        }
+
+        // One runtime per name, so a repeated name is a conflict, not a second
+        // runtime that later reads cannot tell apart.
+        if let Some(existing) = store.runtime_names.get(&input.agent_runtime_name) {
+            return Err(CreateAgentRuntimeErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "an agent runtime named {} already exists (agentRuntimeId {existing})",
+                    input.agent_runtime_name
+                )),
+            })
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.agent_runtimes.len() >= crate::state::MAX_AGENT_RUNTIMES {
+            return Err(CreateAgentRuntimeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} agent runtimes",
+                        crate::state::MAX_AGENT_RUNTIMES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let agent_runtime_id = store.mint_runtime_id(&input.agent_runtime_name, now);
+        let agent_runtime_arn = crate::state::runtime_arn(&region, &agent_runtime_id);
+        let version = crate::state::AgentRuntimeVersionRecord {
+            version: 1,
+            // A new runtime is created, not ready: the transition to READY is
+            // owed by the clock, not by this call.
+            transient_status: crate::state::STATUS_CREATING.to_string(),
+            settled_status: crate::state::STATUS_READY.to_string(),
+            settles_at: now + crate::state::RUNTIME_SETTLE_DELAY,
+            last_updated_at: now,
+            role_arn: input.role_arn,
+            description: input.description,
+            agent_runtime_artifact: input.agent_runtime_artifact,
+            network_configuration: input.network_configuration,
+            protocol_configuration: input.protocol_configuration,
+            authorizer_configuration: input.authorizer_configuration,
+            request_header_configuration: input.request_header_configuration,
+            // CreateAgentRuntime models no `metadataConfiguration` member; only
+            // UpdateAgentRuntime can set one.
+            metadata_configuration: None,
+            lifecycle_configuration: crate::state::effective_lifecycle_configuration(
+                input.lifecycle_configuration,
+            ),
+            environment_variables: crate::state::sorted_map(input.environment_variables),
+            filesystem_configurations: input.filesystem_configurations.unwrap_or_default(),
+            capacity_provider_configuration: input.capacity_provider_configuration,
+            platform_version: input.platform_version,
+            failure_reason: None,
+        };
+        let output = CreateAgentRuntimeOutput {
+            agent_runtime_arn: agent_runtime_arn.clone(),
+            workload_identity_details: Some(WorkloadIdentityDetails {
+                workload_identity_arn: crate::state::workload_identity_arn(
+                    &region,
+                    &agent_runtime_id,
+                ),
+            }),
+            agent_runtime_id: agent_runtime_id.clone(),
+            agent_runtime_version: version.version_string(),
+            created_at: crate::state::timestamp(now),
+            status: version.status_at(now).to_string(),
+        };
+        let record = crate::state::AgentRuntimeRecord {
+            agent_runtime_id: agent_runtime_id.clone(),
+            agent_runtime_arn,
+            agent_runtime_name: input.agent_runtime_name.clone(),
+            created_at: now,
+            latest_version: version.version,
+            highest_version_published: version.version,
+            versions: [(version.version, version)].into_iter().collect(),
+            tags: crate::state::sorted_map(input.tags),
+            workload_identity_details: output.workload_identity_details.clone(),
+        };
+
+        store
+            .runtime_names
+            .insert(input.agent_runtime_name, agent_runtime_id.clone());
+        store.remember_client_token(Self::NAME, input.client_token, &agent_runtime_id, 1);
+        store.agent_runtimes.insert(agent_runtime_id, record);
+
+        Ok(output)
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccessPoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccessPoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccessPoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the access points stored for the account the request names, in one
+//! stable scan order, filtered by `Bucket` when the caller supplies one and cut
+//! at `MaxResults` with a `NextToken` that resumes the scan.
+//! A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +127,19 @@ impl From<ListAccessPointsErrorModeled> for ListAccessPointsError {
     }
 }
 
+/// `MaxResults`'s modelled maximum (`ListAccessPointsRequest$MaxResults`,
+/// range 0..1000), which is also the page size a caller who names none gets.
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// Refuse a `MaxResults` outside the modelled range. The model carries no
+/// client-input error for this operation, so the refusal is the framework's
+/// 400 `ValidationException`.
+fn out_of_range_page_size() -> ListAccessPointsError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "MaxResults must be between 0 and {MAX_PAGE_SIZE}"
+    ))
+}
+
 /// The `ListAccessPoints` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +176,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccessPoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccessPointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccessPoints"))
+        let _ = ctx;
+        // Filtering by data source selects access points attached to an FSx
+        // volume or an Outpost, neither of which this emulator creates, so a
+        // request that filters by one is answered 501 rather than silently
+        // ignoring the filter and listing everything.
+        if input.data_source_id.is_some() || input.data_source_type.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListAccessPoints filtered by DataSourceId / DataSourceType",
+            ));
+        }
+
+        // `MaxResults` is modelled `@range(min: 0, max: 1000)` with a default of
+        // 0, and 0 is "the caller named no page size": the page is then the
+        // whole result set, up to the member's own 1000 maximum.
+        let page_size = match usize::try_from(input.max_results) {
+            // A page size outside the modelled range cannot arrive here — the
+            // boundary validator refuses it before this handler runs — but if
+            // one ever does it is refused on both sides rather than silently
+            // widened or clamped to the maximum.
+            Err(_) => return Err(out_of_range_page_size()),
+            Ok(0) => MAX_PAGE_SIZE,
+            Ok(requested) if requested > MAX_PAGE_SIZE => return Err(out_of_range_page_size()),
+            Ok(requested) => requested,
+        };
+
+        // The token is the opaque form of the last name the previous page
+        // returned; the scan resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(name) => Some(name),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a continuation token this service issued",
+                    ))
+                }
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+        let store = state.lock();
+
+        // Scan this account's slice of the keyspace in key order, starting just
+        // after the name the token named. `Excluded` on the empty name — which no
+        // access point can have, names being at least 3 characters — is how an
+        // un-tokened scan starts at the account's first access point.
+        let start = (input.account_id.clone(), resume_after.unwrap_or_default());
+        let mut matching = store
+            .access_points
+            .range((
+                ::std::ops::Bound::Excluded(start),
+                ::std::ops::Bound::Unbounded,
+            ))
+            .take_while(|((account_id, _), _)| account_id == &input.account_id)
+            .filter(|(_, record)| match input.bucket.as_deref() {
+                Some(bucket) => record.bucket == bucket,
+                None => true,
+            })
+            .map(|(_, record)| record);
+
+        let page: Vec<&crate::state::AccessPointRecord> =
+            matching.by_ref().take(page_size).collect();
+        // A token is returned only when the scan stopped short of the end, which
+        // is exactly when another matching record follows this page.
+        let next_token = matching
+            .next()
+            .and(page.last())
+            .map(|last| crate::state::encode_page_token(&last.name));
+
+        Ok(ListAccessPointsOutput {
+            access_point_list: Some(page.iter().map(|record| record.summary()).collect()),
+            next_token,
+        })
     }
 }

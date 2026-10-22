@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Digests the owner ARN into the stable IAM-shaped `userId` of an environment
+# member, and the clock plus the mint counter into a fresh `environmentId`.
+sha2 = { workspace = true }
+# Hex-encodes the opaque `ListEnvironments` `nextToken`, and the digests above.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

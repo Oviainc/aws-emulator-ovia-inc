@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBenefitApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBenefitApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a benefit application in [`crate::state`] for the benefit the request names,
+//! storing every member the request supplied, and reports the id, ARN and revision it
+//! minted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBenefitApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@idempotent`: the `ClientToken` of a create that succeeded is remembered with the
+//! application it created, so a retry of the same request answers with that first call's
+//! id, ARN and revision instead of creating a second application.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +175,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBenefitApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBenefitApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBenefitApplication"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateBenefitApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every string pattern and length on this input, and the length of every list it
+        // carries, is a modelled constraint the centralized walk has already enforced.
+        // `BenefitApplicationDetails` is an unconstrained `Document`, so its one bound
+        // lives here.
+        if let Some(why) = crate::state::details_rejection(input.benefit_application_details.as_ref())
+        {
+            return Err(CreateBenefitApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: why.clone(),
+                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+                    field_list: Some(crate::state::validation_field(
+                        "BenefitApplicationDetails",
+                        &why,
+                        crate::state::VALIDATION_CODE_INVALID_VALUE,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let principal = crate::state::caller_principal(ctx);
+        let now = crate::state::now_millis();
+
+        let mut store = state.lock();
+
+        // Everything this create reads from the catalog is resolved here, inside one
+        // borrow that ends before the mint and the insert below take a mutable one.
+        let (benefit_id, programs) = {
+            let Some(catalog) = store.catalogs.get(&input.catalog) else {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!("catalog {} does not exist", input.catalog),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // A retry of a create that already succeeded: answer with what that call
+            // minted, and create nothing. The stored `created_revision` is what the first
+            // call reported, so the retry sees the same response even if the application
+            // has been updated since.
+            if let Some(existing) = catalog
+                .client_tokens
+                .get(&input.client_token)
+                .and_then(|id| catalog.applications.get(id))
+            {
+                return Ok(CreateBenefitApplicationOutput {
+                    id: Some(existing.id.clone()),
+                    arn: Some(existing.arn.clone()),
+                    revision: Some(existing.created_revision_text()),
+                });
+            }
+
+            // The application requests ONE benefit of this catalog, named either by its
+            // bare `ben-...` id or by its ARN; anything the catalog does not hold is a
+            // 404.
+            let Some(benefit_id) =
+                catalog.resolve_benefit_id(&input.catalog, &input.benefit_identifier)
+            else {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "benefit {} does not exist in catalog {}",
+                                input.benefit_identifier, input.catalog
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // The store is finite: a create that would take this catalog past its cap is
+            // refused rather than growing it, the way the service refuses one past its
+            // quota.
+            if catalog.applications.len() >= crate::state::MAX_APPLICATIONS_PER_CATALOG {
+                return Err(CreateBenefitApplicationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "catalog {} already holds the maximum of {} benefit applications",
+                            input.catalog,
+                            crate::state::MAX_APPLICATIONS_PER_CATALOG
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // The programs an application belongs to are the programs of the benefit it
+            // requests: no input member carries them.
+            let programs = catalog
+                .benefits
+                .get(&benefit_id)
+                .map(|benefit| benefit.programs.clone())
+                .unwrap_or_default();
+            (benefit_id, programs)
+        };
+
+        let id = store.mint_application_id(now);
+        let arn = crate::state::application_arn(&region, &input.catalog, &id);
+        let application = crate::state::BenefitApplication {
+            id: id.clone(),
+            arn: arn.clone(),
+            catalog: input.catalog.clone(),
+            benefit_id,
+            name: input.name,
+            description: input.description,
+            fulfillment_types: input.fulfillment_types.unwrap_or_default(),
+            benefit_application_details: input.benefit_application_details,
+            programs,
+            status: crate::state::STATUS_PENDING_SUBMISSION.to_string(),
+            stage: None,
+            status_reason: None,
+            status_reason_codes: Vec::new(),
+            created_at_millis: now,
+            updated_at_millis: now,
+            revision: 1,
+            created_revision: 1,
+            associated_resources: input.associated_resources.unwrap_or_default(),
+            partner_contacts: input.partner_contacts.unwrap_or_default(),
+            file_details: input
+                .file_details
+                .unwrap_or_default()
+                .iter()
+                .map(|file| crate::state::file_detail(file, &principal, now))
+                .collect(),
+            tags: crate::state::tag_map(input.tags.as_ref()),
+        };
+        let revision = application.created_revision_text();
+        store.insert_application(input.client_token, application);
+
+        Ok(CreateBenefitApplicationOutput {
+            id: Some(id),
+            arn: Some(arn),
+            revision: Some(revision),
+        })
     }
 }

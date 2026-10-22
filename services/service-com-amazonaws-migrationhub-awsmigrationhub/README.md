@@ -102,6 +102,18 @@ async fn handle(
 State lives in the SINGLE shared engine, keyed by type. Reach it through
 `crate::state::service_state`, which `src/state.rs` generates.
 
+### Store bounds
+
+Every store a caller can grow is capped in `src/state.rs`, so a long-running
+emulator cannot be driven out of memory. The caps are CHOSEN emulator bounds (AWS
+publishes no matching quota) and are set far above any realistic migration run:
+
+| Constant | Bound | What happens at the bound |
+|---|---|---|
+| `MAX_PROGRESS_UPDATE_STREAMS` | 1 000 streams per account | `CreateProgressUpdateStream` refuses a NEW name with HTTP 500 `ServiceUnavailableException`; a name already stored is still accepted (creation is idempotent). |
+| `MAX_TASKS_PER_STREAM` | 10 000 tasks per stream | `ImportMigrationTask` refuses a NEW task name the same way; one already registered is still accepted. |
+| `MAX_UPDATES_PER_TASK` | 1 000 history entries per task | `NotifyMigrationTaskState` keeps succeeding and `MigrationTaskRecord::record_update` evicts the OLDEST entries, so the recent history stays exact. |
+
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
