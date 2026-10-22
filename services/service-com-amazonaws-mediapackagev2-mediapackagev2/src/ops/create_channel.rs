@@ -3,8 +3,10 @@
 //! @op CreateChannel
 //! IMPLEMENTED. Creates a channel under an existing channel group and persists it in
 //! [`crate::state`], including the pair of ingest endpoints derived from the parent
-//! group's egress domain. An unknown parent is a `ResourceNotFoundException`; a channel
-//! name already used in that group is a `ConflictException`.
+//! group's egress domain and the input-switch / output-header configuration blocks the
+//! service materialises for every channel. An unknown parent is a
+//! `ResourceNotFoundException`; a channel name already used in that group is a
+//! `ConflictException`.
 //!
 //! Two rules the model states but cannot express as a member constraint are enforced
 //! here, before anything is stored:
@@ -345,8 +347,8 @@ fn channel_output(channel: &crate::state::Channel) -> CreateChannelOutput {
         input_type: channel.input_type.clone(),
         e_tag: Some(channel.etag.clone()),
         tags: Some(channel.tags.clone()),
-        input_switch_configuration: channel.input_switch_configuration.clone(),
-        output_header_configuration: channel.output_header_configuration.clone(),
+        input_switch_configuration: Some(channel.input_switch_configuration.clone()),
+        output_header_configuration: Some(channel.output_header_configuration.clone()),
         output_locking_mode: channel.output_locking_mode.clone(),
     }
 }
@@ -499,11 +501,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // channel's name, computed once and stored: a later read returns these bytes.
         let ingest_endpoints =
             crate::state::ingest_endpoints(&group.egress_domain, &group.name, &name);
+        // The switching and CMSD-header blocks are applied by the service, not merely
+        // echoed: a channel created without them still has a switching state, so they
+        // are materialized here and stored.
+        let input_switch_configuration = crate::state::materialized_input_switch_configuration(
+            input.input_switch_configuration,
+        );
+        let output_header_configuration = crate::state::materialized_output_header_configuration(
+            input.output_header_configuration,
+        );
         let etag = crate::state::etag(&[
             arn.clone(),
             input.description.clone().unwrap_or_default(),
             input.input_type.clone().unwrap_or_default(),
             input.output_locking_mode.clone().unwrap_or_default(),
+            // The applied switching state is part of the channel's content, so a channel
+            // that differs only in it has a different ETag. Each member is rendered
+            // explicitly — `mqcs`/`publish` as 0 or 1, an absent preferred input as the
+            // empty string — rather than through a derived `Debug`.
+            format!(
+                "{}/{}/{}",
+                u8::from(
+                    input_switch_configuration
+                        .mqcs_input_switching
+                        .unwrap_or_default()
+                ),
+                input_switch_configuration
+                    .preferred_input
+                    .map(|preferred| preferred.to_string())
+                    .unwrap_or_default(),
+                u8::from(
+                    output_header_configuration
+                        .publish_mqcs
+                        .unwrap_or_default()
+                ),
+            ),
             crate::state::tag_fingerprint(&tags),
         ]);
 
@@ -514,8 +546,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             input_type: input.input_type,
             ingest_endpoints,
-            input_switch_configuration: input.input_switch_configuration,
-            output_header_configuration: input.output_header_configuration,
+            input_switch_configuration,
+            output_header_configuration,
             multiview_configuration: input.multiview_configuration,
             output_locking_mode: input.output_locking_mode,
             created_at,

@@ -247,8 +247,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input_type: channel.input_type.clone(),
             e_tag: Some(channel.etag.clone()),
             tags: Some(channel.tags.clone()),
-            input_switch_configuration: channel.input_switch_configuration.clone(),
-            output_header_configuration: channel.output_header_configuration.clone(),
+            input_switch_configuration: Some(channel.input_switch_configuration.clone()),
+            output_header_configuration: Some(channel.output_header_configuration.clone()),
             output_locking_mode: channel.output_locking_mode.clone(),
         })
     }

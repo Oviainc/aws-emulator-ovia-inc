@@ -11,6 +11,13 @@
 //!
 //! The maps are [`BTreeMap`]s: `ListOriginEndpoints` pages in name order, and an
 //! ordered map makes that order a property of the store rather than of each read.
+//!
+//! The same holds for the members the SERVICE applies rather than the caller: a channel's
+//! switching and CMSD-header blocks, an origin endpoint's segment settings, startover
+//! window and URI/stream-name modes, and every manifest configuration's window, URI path
+//! type and child-manifest URL encoding are materialised ONCE, at create time, from the
+//! submitted value or the service's default, and stored — so the create response, a later
+//! read and the list projection all report the same concrete value.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -63,6 +70,64 @@ pub const MAX_CHANNELS_PER_GROUP: usize = 100;
 /// further down: `origin_endpoints` grows per `CreateOriginEndpoint` and shrinks only on
 /// an explicit delete.
 pub const MAX_ORIGIN_ENDPOINTS_PER_CHANNEL: usize = 100;
+
+/// The startover window MediaPackage applies to an origin endpoint created without one.
+///
+/// The model declares no `@default` and documents none, so this is RECORDED behaviour:
+/// the service reports a fifteen-minute startover window on an endpoint whose create
+/// request named none, and reports the window the request named when it named one. The
+/// value is inside the member's modelled `@range 0..1209600`.
+pub const DEFAULT_STARTOVER_WINDOW_SECONDS: i32 = 900;
+
+/// The segment duration MediaPackage applies when a create request sends no
+/// `SegmentDurationSeconds` — six seconds, within the member's modelled `@range 1..30`
+/// and the value the recorded service returns for an endpoint created without a segment
+/// configuration.
+pub const DEFAULT_SEGMENT_DURATION_SECONDS: i32 = 6;
+
+/// The segment base name MediaPackage applies when a create request sends no
+/// `SegmentName` — the value the recorded service returns, and one the member's
+/// `^[a-zA-Z0-9_-]+$` pattern and `@length 1..256` admit.
+pub const DEFAULT_SEGMENT_NAME: &str = "segment";
+
+/// The manifest window MediaPackage applies when a manifest configuration sends no
+/// `ManifestWindowSeconds` — sixty seconds, the value the recorded service returns, and
+/// at or above the smallest window the create shapes accept (`@range` min 30).
+pub const DEFAULT_MANIFEST_WINDOW_SECONDS: i32 = 60;
+
+/// The URI path type MediaPackage applies when a manifest configuration sends no
+/// `UriPathType`. The model states the default on every create manifest shape that
+/// carries the member: "If you don't specify a value, the default is `LEAF`."
+pub const DEFAULT_URI_PATH_TYPE: &str = "LEAF";
+
+/// The URI separator MediaPackage applies to an origin endpoint created without one —
+/// the value the recorded service reports for such an endpoint, from the modelled
+/// `UriSeparator` enum (`UNDERSCORE` | `HYPHEN`).
+pub const DEFAULT_URI_SEPARATOR: &str = "UNDERSCORE";
+
+/// The stream-name output mode MediaPackage applies to an origin endpoint created
+/// without one — the value the recorded service reports, from the modelled
+/// `StreamNameOutputMode` enum (`INDEX` | `PASSTHROUGH_NAME`).
+pub const DEFAULT_STREAM_NAME_OUTPUT_MODE: &str = "INDEX";
+
+/// Whether MediaPackage bundles the audio tracks of an endpoint created without a
+/// segment configuration into a rendition group — recorded behaviour, like
+/// [`DEFAULT_TS_INCLUDE_DVB_SUBTITLES`] and [`DEFAULT_INCLUDE_IFRAME_ONLY_STREAMS`]: the
+/// model declares no `@default` for any of the three.
+pub const DEFAULT_TS_USE_AUDIO_RENDITION_GROUP: bool = true;
+
+/// Whether MediaPackage passes DVB subtitles through for an endpoint created without a
+/// segment configuration — recorded behaviour.
+pub const DEFAULT_TS_INCLUDE_DVB_SUBTITLES: bool = true;
+
+/// Whether the stream set of an endpoint created without a segment configuration carries
+/// the extra I-frame-only stream — recorded behaviour: the service reports it off.
+pub const DEFAULT_INCLUDE_IFRAME_ONLY_STREAMS: bool = false;
+
+/// Whether MediaPackage URL-encodes the child-manifest query string of a manifest
+/// configuration that does not ask for it — recorded behaviour: the service reports the
+/// encoding off.
+pub const DEFAULT_URL_ENCODE_CHILD_MANIFEST: bool = false;
 
 /// The most manifest configurations one origin endpoint stores, counted across the HLS,
 /// low-latency HLS, DASH and MSS families together.
@@ -120,8 +185,12 @@ pub struct Channel {
     pub description: Option<String>,
     pub input_type: Option<String>,
     pub ingest_endpoints: Vec<IngestEndpoint>,
-    pub input_switch_configuration: Option<InputSwitchConfiguration>,
-    pub output_header_configuration: Option<OutputHeaderConfiguration>,
+    /// Materialised at create time rather than only when the caller sends one: the
+    /// service reports a channel's switching state on every projection of it.
+    pub input_switch_configuration: InputSwitchConfiguration,
+    /// Materialised at create time, for the same reason as
+    /// [`Channel::input_switch_configuration`].
+    pub output_header_configuration: OutputHeaderConfiguration,
     pub multiview_configuration: Option<MultiviewConfiguration>,
     pub output_locking_mode: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
@@ -156,14 +225,20 @@ pub struct OriginEndpoint {
     pub container_type: String,
     pub segment: Segment,
     pub description: Option<String>,
-    pub startover_window_seconds: Option<i32>,
+    /// Materialised at create time: every endpoint has a startover window, whether or
+    /// not the create request named one.
+    pub startover_window_seconds: i32,
     pub hls_manifests: Vec<GetHlsManifestConfiguration>,
     pub low_latency_hls_manifests: Vec<GetLowLatencyHlsManifestConfiguration>,
     pub dash_manifests: Vec<GetDashManifestConfiguration>,
     pub mss_manifests: Vec<GetMssManifestConfiguration>,
     pub force_endpoint_error_configuration: Option<ForceEndpointErrorConfiguration>,
-    pub uri_separator: Option<String>,
-    pub stream_name_output_mode: Option<String>,
+    /// Materialised at create time: the service reports the separator it applied on
+    /// every projection of the endpoint, the list projection included.
+    pub uri_separator: String,
+    /// Materialised at create time, for the same reason as
+    /// [`OriginEndpoint::uri_separator`].
+    pub stream_name_output_mode: String,
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
     pub reset_at: Option<::aws_smithy_types::DateTime>,
@@ -189,6 +264,91 @@ pub struct OriginEndpoint {
 pub struct EndpointPolicy {
     pub policy: String,
     pub cdn_auth_configuration: Option<CdnAuthConfiguration>,
+}
+
+/// The input-switch configuration a channel is stored with.
+///
+/// MediaPackage materialises the block on the server side, so a channel created without
+/// one still has a switching state to report: the submitted block if there is one, with
+/// `MQCSInputSwitching` filled in from the model's documented default ("Default is
+/// false") when the caller left it out. `PreferredInput` has no documented default and
+/// the service reports none, so an omitted one stays omitted.
+pub fn materialized_input_switch_configuration(
+    submitted: Option<InputSwitchConfiguration>,
+) -> InputSwitchConfiguration {
+    let mut configuration = submitted.unwrap_or_default();
+    configuration.mqcs_input_switching = Some(configuration.mqcs_input_switching.unwrap_or(false));
+    configuration
+}
+
+/// The output-header configuration a channel is stored with — the same materialisation
+/// as [`materialized_input_switch_configuration`], one member wide: CMSD header
+/// publication is off unless the caller turned it on.
+pub fn materialized_output_header_configuration(
+    submitted: Option<OutputHeaderConfiguration>,
+) -> OutputHeaderConfiguration {
+    let mut configuration = submitted.unwrap_or_default();
+    configuration.publish_mqcs = Some(configuration.publish_mqcs.unwrap_or(false));
+    configuration
+}
+
+/// The segment configuration an origin endpoint is stored with.
+///
+/// `Segment` is required on every origin-endpoint response and optional on the request,
+/// so the service applies its own segmentation settings to whatever the caller omitted
+/// and reports the result: the duration and the base name from
+/// [`DEFAULT_SEGMENT_DURATION_SECONDS`] and [`DEFAULT_SEGMENT_NAME`], the TS passthrough
+/// toggles on and the extra I-frame-only stream off — the state the recorded service
+/// reports for an endpoint created without a segment configuration. `Scte`, `Encryption`
+/// and `OutputTimestampMode` are reported only when they were configured, so they pass
+/// through untouched.
+pub fn materialized_segment(submitted: Option<Segment>) -> Segment {
+    let mut segment = submitted.unwrap_or_default();
+    segment.segment_duration_seconds = Some(
+        segment
+            .segment_duration_seconds
+            .unwrap_or(DEFAULT_SEGMENT_DURATION_SECONDS),
+    );
+    segment.segment_name = Some(
+        segment
+            .segment_name
+            .unwrap_or_else(|| DEFAULT_SEGMENT_NAME.to_string()),
+    );
+    segment.ts_use_audio_rendition_group = Some(
+        segment
+            .ts_use_audio_rendition_group
+            .unwrap_or(DEFAULT_TS_USE_AUDIO_RENDITION_GROUP),
+    );
+    segment.include_iframe_only_streams = Some(
+        segment
+            .include_iframe_only_streams
+            .unwrap_or(DEFAULT_INCLUDE_IFRAME_ONLY_STREAMS),
+    );
+    segment.ts_include_dvb_subtitles = Some(
+        segment
+            .ts_include_dvb_subtitles
+            .unwrap_or(DEFAULT_TS_INCLUDE_DVB_SUBTITLES),
+    );
+    segment
+}
+
+/// The startover window an origin endpoint is stored with: the one the request named, or
+/// the service's own ([`DEFAULT_STARTOVER_WINDOW_SECONDS`]). Shared by the create and the
+/// update so one write cannot leave the endpoint reporting a window the other would not.
+pub fn materialized_startover_window_seconds(submitted: Option<i32>) -> i32 {
+    submitted.unwrap_or(DEFAULT_STARTOVER_WINDOW_SECONDS)
+}
+
+/// The URI separator an origin endpoint is stored with — the submitted one, else
+/// [`DEFAULT_URI_SEPARATOR`].
+pub fn materialized_uri_separator(submitted: Option<String>) -> String {
+    submitted.unwrap_or_else(|| DEFAULT_URI_SEPARATOR.to_string())
+}
+
+/// The stream-name output mode an origin endpoint is stored with — the submitted one,
+/// else [`DEFAULT_STREAM_NAME_OUTPUT_MODE`].
+pub fn materialized_stream_name_output_mode(submitted: Option<String>) -> String {
+    submitted.unwrap_or_else(|| DEFAULT_STREAM_NAME_OUTPUT_MODE.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -345,7 +505,9 @@ impl ManifestLocation<'_> {
 }
 
 /// The stored form of a submitted HLS manifest: everything the caller asked for, plus
-/// the URL the service computes for it.
+/// the URL the service computes for it and the manifest settings the service applies to
+/// what the caller left out ([`DEFAULT_MANIFEST_WINDOW_SECONDS`],
+/// [`DEFAULT_URI_PATH_TYPE`], and child-manifest URL encoding off).
 pub fn stored_hls_manifest(
     submitted: CreateHlsManifestConfiguration,
     at: ManifestLocation<'_>,
@@ -354,18 +516,31 @@ pub fn stored_hls_manifest(
         url: at.url(&submitted.manifest_name, ManifestKind::Hls),
         manifest_name: submitted.manifest_name,
         child_manifest_name: submitted.child_manifest_name,
-        manifest_window_seconds: submitted.manifest_window_seconds,
+        manifest_window_seconds: Some(
+            submitted
+                .manifest_window_seconds
+                .unwrap_or(DEFAULT_MANIFEST_WINDOW_SECONDS),
+        ),
         program_date_time_interval_seconds: submitted.program_date_time_interval_seconds,
         scte_hls: submitted.scte_hls,
         filter_configuration: submitted.filter_configuration,
         start_tag: submitted.start_tag,
-        url_encode_child_manifest: submitted.url_encode_child_manifest,
-        uri_path_type: submitted.uri_path_type,
+        url_encode_child_manifest: Some(
+            submitted
+                .url_encode_child_manifest
+                .unwrap_or(DEFAULT_URL_ENCODE_CHILD_MANIFEST),
+        ),
+        uri_path_type: Some(
+            submitted
+                .uri_path_type
+                .unwrap_or_else(|| DEFAULT_URI_PATH_TYPE.to_string()),
+        ),
     }
 }
 
 /// The stored form of a submitted low-latency HLS manifest. Low-latency HLS publishes
-/// the same `.m3u8` playlist as plain HLS, so it shares the URL rule.
+/// the same `.m3u8` playlist as plain HLS, so it shares the URL rule and the same
+/// manifest-setting defaults.
 pub fn stored_low_latency_hls_manifest(
     submitted: CreateLowLatencyHlsManifestConfiguration,
     at: ManifestLocation<'_>,
@@ -374,17 +549,31 @@ pub fn stored_low_latency_hls_manifest(
         url: at.url(&submitted.manifest_name, ManifestKind::Hls),
         manifest_name: submitted.manifest_name,
         child_manifest_name: submitted.child_manifest_name,
-        manifest_window_seconds: submitted.manifest_window_seconds,
+        manifest_window_seconds: Some(
+            submitted
+                .manifest_window_seconds
+                .unwrap_or(DEFAULT_MANIFEST_WINDOW_SECONDS),
+        ),
         program_date_time_interval_seconds: submitted.program_date_time_interval_seconds,
         scte_hls: submitted.scte_hls,
         filter_configuration: submitted.filter_configuration,
         start_tag: submitted.start_tag,
-        url_encode_child_manifest: submitted.url_encode_child_manifest,
-        uri_path_type: submitted.uri_path_type,
+        url_encode_child_manifest: Some(
+            submitted
+                .url_encode_child_manifest
+                .unwrap_or(DEFAULT_URL_ENCODE_CHILD_MANIFEST),
+        ),
+        uri_path_type: Some(
+            submitted
+                .uri_path_type
+                .unwrap_or_else(|| DEFAULT_URI_PATH_TYPE.to_string()),
+        ),
     }
 }
 
-/// The stored form of a submitted DASH manifest.
+/// The stored form of a submitted DASH manifest. The window and the URI path type are
+/// the same server-applied settings the HLS families carry; everything else is reported
+/// only when it was configured.
 pub fn stored_dash_manifest(
     submitted: CreateDashManifestConfiguration,
     at: ManifestLocation<'_>,
@@ -392,7 +581,11 @@ pub fn stored_dash_manifest(
     GetDashManifestConfiguration {
         url: at.url(&submitted.manifest_name, ManifestKind::Dash),
         manifest_name: submitted.manifest_name,
-        manifest_window_seconds: submitted.manifest_window_seconds,
+        manifest_window_seconds: Some(
+            submitted
+                .manifest_window_seconds
+                .unwrap_or(DEFAULT_MANIFEST_WINDOW_SECONDS),
+        ),
         filter_configuration: submitted.filter_configuration,
         min_update_period_seconds: submitted.min_update_period_seconds,
         min_buffer_time_seconds: submitted.min_buffer_time_seconds,
@@ -409,12 +602,17 @@ pub fn stored_dash_manifest(
         compactness: submitted.compactness,
         audio_timeline_pattern: submitted.audio_timeline_pattern,
         subtitle_configuration: submitted.subtitle_configuration,
-        uri_path_type: submitted.uri_path_type,
+        uri_path_type: Some(
+            submitted
+                .uri_path_type
+                .unwrap_or_else(|| DEFAULT_URI_PATH_TYPE.to_string()),
+        ),
         availability_start_time_configuration: submitted.availability_start_time_configuration,
     }
 }
 
-/// The stored form of a submitted Microsoft Smooth Streaming manifest.
+/// The stored form of a submitted Microsoft Smooth Streaming manifest. MSS models no
+/// URI path type, so the window is the only server-applied setting it carries.
 pub fn stored_mss_manifest(
     submitted: CreateMssManifestConfiguration,
     at: ManifestLocation<'_>,
@@ -423,7 +621,11 @@ pub fn stored_mss_manifest(
         url: at.url(&submitted.manifest_name, ManifestKind::Mss),
         manifest_name: submitted.manifest_name,
         filter_configuration: submitted.filter_configuration,
-        manifest_window_seconds: submitted.manifest_window_seconds,
+        manifest_window_seconds: Some(
+            submitted
+                .manifest_window_seconds
+                .unwrap_or(DEFAULT_MANIFEST_WINDOW_SECONDS),
+        ),
         manifest_layout: submitted.manifest_layout,
     }
 }
@@ -778,7 +980,7 @@ pub fn origin_endpoint_etag(endpoint: &OriginEndpoint) -> String {
         endpoint.arn.clone(),
         endpoint.container_type.clone(),
         endpoint.description.clone().unwrap_or_default(),
-        endpoint.startover_window_seconds.unwrap_or_default().to_string(),
+        endpoint.startover_window_seconds.to_string(),
         format!("{:?}", endpoint.segment),
         manifest_names(
             endpoint
@@ -809,8 +1011,8 @@ pub fn origin_endpoint_etag(endpoint: &OriginEndpoint) -> String {
                 .collect(),
         ),
         format!("{:?}", endpoint.force_endpoint_error_configuration),
-        endpoint.uri_separator.clone().unwrap_or_default(),
-        endpoint.stream_name_output_mode.clone().unwrap_or_default(),
+        endpoint.uri_separator.clone(),
+        endpoint.stream_name_output_mode.clone(),
         tag_fingerprint(&endpoint.tags),
     ])
 }
@@ -955,6 +1157,35 @@ mod tests {
             etag(&["a".to_string(), "bc".to_string()]),
             etag(&["ab".to_string(), "c".to_string()]),
             "field boundaries must be part of the digest"
+        );
+    }
+
+    #[test]
+    fn materialization_fills_only_what_the_caller_left_out() {
+        let submitted = Segment {
+            segment_duration_seconds: Some(12),
+            ts_include_dvb_subtitles: Some(false),
+            ..Segment::default()
+        };
+        let materialized = materialized_segment(Some(submitted));
+        assert_eq!(
+            materialized.segment_duration_seconds,
+            Some(12),
+            "a submitted duration must survive materialization"
+        );
+        assert_eq!(
+            materialized.ts_include_dvb_subtitles,
+            Some(false),
+            "a submitted toggle must survive materialization, even when it is off"
+        );
+        assert_eq!(
+            materialized.segment_name.as_deref(),
+            Some(DEFAULT_SEGMENT_NAME),
+            "an omitted segment name must come out as the service's default"
+        );
+        assert!(
+            materialized.scte.is_none() && materialized.output_timestamp_mode.is_none(),
+            "materialization must not invent members the service reports only when configured"
         );
     }
 

@@ -25,5 +25,7 @@ mod channel_reset;
 mod control_plane_validation;
 #[path = "all/origin_endpoint_policy.rs"]
 mod origin_endpoint_policy;
+#[path = "all/server_materialised_members.rs"]
+mod server_materialised_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
