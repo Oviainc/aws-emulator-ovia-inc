@@ -25,6 +25,44 @@ pub const ARN_NAMESPACE: &str = "codeguru-profiler";
 /// doc for that member: "If not specified, Default is used."
 pub const DEFAULT_COMPUTE_PLATFORM: &str = "Default";
 
+/// The aggregation periods this service offers, as (the modelled `AggregationPeriod`
+/// value, the period's length in WHOLE SECONDS): the three values the model's
+/// `AggregationPeriod` enum declares (PT5M, PT1H, P1D), with the lengths the
+/// `GetProfile` doc states — "Aggregated profiles are available with aggregation
+/// periods of 5 minutes, 1 hour, and 1 day, aligned to UTC."
+pub const AGGREGATION_PERIODS: &[(&str, i64)] = &[
+    ("PT5M", 5 * 60),
+    ("PT1H", 60 * 60),
+    ("P1D", 24 * 60 * 60),
+];
+
+/// The length in seconds of a modelled `AggregationPeriod` value, or `None` when the
+/// string is not one of [`AGGREGATION_PERIODS`], which covers every value the
+/// generated `AGGREGATION_PERIOD_VALUES` lists.
+pub fn aggregation_period_seconds(period: &str) -> Option<i64> {
+    AGGREGATION_PERIODS
+        .iter()
+        .find(|(name, _)| *name == period)
+        .map(|(_, seconds)| *seconds)
+}
+
+/// The start of the `period_seconds`-long aggregation window, aligned to the UTC
+/// epoch, that contains the instant `at`. Alignment to UTC is what the `GetProfile`
+/// doc states for every aggregation period, and the epoch is a whole number of
+/// 5-minute, 1-hour and 1-day periods past UTC midnight, so flooring against it aligns
+/// each of the three the same way.
+///
+/// Whole seconds, like [`instant_key`], rather than `f64` epoch seconds, whose
+/// granularity at current instants is coarser than a microsecond; `div_euclid` floors
+/// towards the past on both sides of the epoch. A period that is not positive names no
+/// window, so the instant is its own window start.
+pub fn aggregation_window_start(at: DateTime, period_seconds: i64) -> DateTime {
+    if period_seconds <= 0 {
+        return at;
+    }
+    DateTime::from_secs(at.secs().div_euclid(period_seconds) * period_seconds)
+}
+
 /// How many posted profiles one group retains. An emulator-chosen bound, not an AWS
 /// duration: the real service expires profiles over time (the `GetProfile` doc:
 /// "Because aggregated profiles expire over time GetProfile is not idempotent"), and
@@ -295,9 +333,13 @@ impl ProfilingGroup {
             updated_at: Some(self.updated_at),
             profiling_status: Some(ProfilingStatus {
                 latest_agent_profile_reported_at: self.latest_agent_profile_reported_at,
-                // Aggregating posted agent profiles into an aggregated profile is not
-                // implemented in this slice, so there is no aggregated-profile time to
-                // report. It stays absent rather than being invented.
+                // `latestAggregatedProfile` is ONE `AggregatedProfileTime`, i.e. one
+                // aggregation period, while the service aggregates a group's posted
+                // profiles at all three periods at once (see
+                // [`ProfilingGroup::aggregated_profile_starts`], which derives the
+                // aggregated profiles for the period a caller asks about). There is no
+                // stored fact saying which period to report here, so this stays absent
+                // rather than picking one arbitrarily.
                 latest_aggregated_profile: None,
                 latest_agent_orchestrated_at: self.latest_agent_orchestrated_at,
             }),
@@ -345,6 +387,25 @@ impl ProfilingGroup {
         }
         self.seen_profile_tokens.push_back(token.to_string());
         true
+    }
+
+    /// The start instants of the aggregated profiles this group holds for an
+    /// aggregation period `period_seconds` long, ASCENDING and distinct.
+    ///
+    /// The `GetProfile` doc fixes the rule: "Amazon CodeGuru Profiler collects posted
+    /// agent profiles for a profiling group into aggregated profiles", at periods
+    /// "aligned to UTC". So each posted profile belongs to the one aligned window that
+    /// contains its receipt time, and every window holding at least one posted profile
+    /// is exactly one available aggregated profile, reported by its window start.
+    pub fn aggregated_profile_starts(&self, period_seconds: i64) -> Vec<DateTime> {
+        let mut starts: Vec<i64> = self
+            .profiles
+            .iter()
+            .map(|profile| aggregation_window_start(profile.received_at, period_seconds).secs())
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        starts.into_iter().map(DateTime::from_secs).collect()
     }
 
     /// This group's resource-based policy, or `None` when it has none. A policy with
