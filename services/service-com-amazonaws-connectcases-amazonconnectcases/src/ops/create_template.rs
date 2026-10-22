@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a template under its domain in [`crate::state`].
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +172,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTemplateErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Pure input validation, done BEFORE the store lock is taken. The
+        // model's `requiredFields` cap is re-checked here as well as at the
+        // boundary, so the scans below are bounded by this code, and a list
+        // that names the same field twice is refused as on the case paths.
+        let required_fields = input.required_fields.unwrap_or_default();
+        if let Some(message) = crate::state::list_too_long(
+            "requiredFields",
+            required_fields.len(),
+            crate::state::MAX_REQUIRED_FIELDS,
+        ) {
+            return Err(
+                CreateTemplateErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        let duplicates =
+            crate::state::duplicate_ids(required_fields.iter().map(|f| f.field_id.as_str()));
+        if !duplicates.is_empty() {
+            return Err(
+                CreateTemplateErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "requiredFields names these field ids more than once: {}",
+                        crate::state::name_ids(&duplicates)
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(CreateTemplateErrorModeled::ResourceNotFoundException)?;
+        // Bound request-driven growth: a caller cannot fill the domain without end.
+        domain
+            .template_capacity()
+            .map_err(CreateTemplateErrorModeled::ServiceQuotaExceededException)?;
+
+        // A template name identifies the template within its domain.
+        if let Some(existing) = domain
+            .templates
+            .values()
+            .find(|t| !t.deleted && t.name == input.name)
+        {
+            return Err(
+                CreateTemplateErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "a template named {} already exists in domain {} (templateId {})",
+                        input.name, input.domain_id, existing.template_id
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // Every id the body references is resolved against the domain BEFORE
+        // anything is stored, so a template never records a reference that cannot
+        // be followed.
+        let unknown = domain.unknown_field_ids(required_fields.iter().map(|f| f.field_id.as_str()));
+        if !unknown.is_empty() {
+            return Err(
+                CreateTemplateErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "requiredFields names field ids that do not exist in domain {}: {}",
+                        input.domain_id,
+                        crate::state::name_ids(&unknown)
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // `rules` names case rules and `layoutConfiguration.defaultLayout` names a
+        // layout. Neither resource exists in this emulator yet — `CreateCaseRule`
+        // and `CreateLayout` are still scaffolded 501s — so a template cannot
+        // record a reference to one. The refusal says exactly that rather than
+        // claiming a lookup it did not perform; when those creates land it
+        // becomes a lookup against the domain's own rules and layouts.
+        let rule_ids: Vec<String> = input
+            .rules
+            .unwrap_or_default()
+            .iter()
+            .map(|rule| rule.case_rule_id.clone())
+            .collect();
+        if !rule_ids.is_empty() {
+            return Err(
+                CreateTemplateErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "rules names case rule ids, and this emulator supports no case rules \
+                         yet, so none can be referenced: {}",
+                        crate::state::name_ids(&rule_ids)
+                    ),
+                })
+                .into(),
+            );
+        }
+        if let Some(layout_id) = input
+            .layout_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.default_layout.as_deref())
+        {
+            return Err(
+                CreateTemplateErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "layoutConfiguration.defaultLayout names layout {layout_id}, and this \
+                         emulator supports no layouts yet, so none can be referenced"
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        let template_id = crate::state::new_id();
+        let template_arn = crate::state::template_arn(&region, &input.domain_id, &template_id);
+        let stored = domain
+            .templates
+            .entry(template_id.clone())
+            .or_insert_with(|| crate::state::Template {
+                template_id,
+                template_arn,
+                name: input.name,
+                description: input.description,
+                layout_configuration: input.layout_configuration,
+                required_fields,
+                tag_propagation_configurations: input
+                    .tag_propagation_configurations
+                    .unwrap_or_default(),
+                // `status` is optional, and a template that was not given one is
+                // usable, so it starts Active.
+                status: input
+                    .status
+                    .unwrap_or_else(|| crate::state::TEMPLATE_STATUS_ACTIVE.to_string()),
+                deleted: false,
+                tags: ::std::collections::HashMap::new(),
+                created_time: now,
+                last_modified_time: now,
+            });
+
+        Ok(CreateTemplateOutput {
+            template_id: stored.template_id.clone(),
+            template_arn: stored.template_arn.clone(),
+        })
     }
 }

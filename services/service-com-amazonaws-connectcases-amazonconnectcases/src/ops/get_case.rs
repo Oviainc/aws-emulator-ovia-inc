@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored case's field values from [`crate::state`].
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetCaseErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        // @readonly: it resolves the case and reports it, and writes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCase"))
+        // Bound the caller-chosen work BEFORE the store lock is taken: the
+        // response carries one entry per requested id, each cloning a stored
+        // value, so the id list is held to `MAX_CASE_FIELD_IDS`. A list that
+        // names the same id twice is ANSWERED twice rather than refused — the
+        // model declares no distinctness constraint, and the cap already bounds
+        // the response — unlike the write paths, where two values for one id is
+        // genuinely ambiguous.
+        if let Some(message) = crate::state::list_too_long(
+            "fields",
+            input.fields.len(),
+            crate::state::MAX_CASE_FIELD_IDS,
+        ) {
+            return Err(
+                GetCaseErrorModeled::ValidationException(ValidationException { message }).into(),
+            );
+        }
+        // Every requested field fits one page: the list is capped above and so
+        // is the response built from it, so this operation issues no
+        // `nextToken` — and a token it never issued cannot be continued from.
+        if let Some(token) = input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            return Err(GetCaseErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "nextToken {token} was not issued by GetCase, which returns every \
+                     requested field in one page"
+                ),
+            })
+            .into());
+        }
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(GetCaseErrorModeled::ResourceNotFoundException)?;
+        let case = domain
+            .case(&input.case_id)
+            .map_err(GetCaseErrorModeled::ResourceNotFoundException)?;
+
+        // The same reference rule the write paths apply, in the same order they
+        // apply it (the addressed resource first, then the body): an id the
+        // domain defines no field for cannot be answered, because `emptyValue`
+        // would make it indistinguishable from a field that exists and was
+        // never written. The model does not state this one — it is the
+        // emulator's reading of `FieldIdentifier`, chosen so a typo in a field
+        // id is reported rather than answered with a value the case does not
+        // have.
+        let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
+        if !unknown.is_empty() {
+            return Err(GetCaseErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "fields names field ids that do not exist in domain {}: {}",
+                    input.domain_id,
+                    crate::state::name_ids(&unknown)
+                ),
+            })
+            .into());
+        }
+
+        // Exactly the requested ids, in the order they were asked for: a field
+        // the domain defines but the case holds no value for reads back as the
+        // union's `emptyValue`.
+        let fields = input
+            .fields
+            .iter()
+            .map(|requested| FieldValue {
+                id: requested.id.clone(),
+                value: case
+                    .field_values
+                    .get(&requested.id)
+                    .cloned()
+                    .unwrap_or(FieldValueUnion::emptyValue(EmptyFieldValue {})),
+            })
+            .collect();
+
+        Ok(GetCaseOutput {
+            fields,
+            template_id: case.template_id.clone(),
+            next_token: None,
+            tags: crate::state::tags_output(&case.tags),
+        })
     }
 }

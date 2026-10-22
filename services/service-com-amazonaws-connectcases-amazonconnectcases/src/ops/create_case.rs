@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a case under its domain in [`crate::state`].
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -110,13 +103,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-connectcases-amazonconn
 // here — hence the `CreateCaseError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.connectcases#CreateCase")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.connectcases#CreateCase",
+    // The SERVICE models `ServiceQuotaExceededException` (CreateDomain, CreateField and
+    // CreateTemplate all list it) but CreateCase does not. The emulator needs it to refuse a
+    // create once its store is full, which is a quota refusal and nothing else: a 400
+    // ValidationException would tell a client its request was malformed, and a 429 would tell
+    // it to retry a call that can never succeed.
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateCaseErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -172,18 +174,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCase"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCaseErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Pure input validation, done BEFORE the store lock is taken so no
+        // caller-sized work happens while every other request is blocked. The
+        // list is held to `MAX_CASE_FIELD_IDS` here as well as at the boundary,
+        // so the scans below are bounded by this code, and they are linear.
+        if let Some(message) = crate::state::list_too_long(
+            "fields",
+            input.fields.len(),
+            crate::state::MAX_CASE_FIELD_IDS,
+        ) {
+            return Err(
+                CreateCaseErrorModeled::ValidationException(ValidationException { message }).into(),
+            );
+        }
+        let duplicates = crate::state::duplicate_ids(input.fields.iter().map(|f| f.id.as_str()));
+        if !duplicates.is_empty() {
+            return Err(CreateCaseErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "fields carries more than one value for field ids: {}",
+                    crate::state::name_ids(&duplicates)
+                ),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // `clientToken` is an @idempotencyToken on an @idempotent operation: a replay
+        // under a token that already minted a case resolves to THAT case instead of
+        // minting a second one. The token is remembered per domain, so the same
+        // token used against another domain is a different request.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(case) = store.idempotent_case(&input.domain_id, token) {
+                return Ok(CreateCaseOutput {
+                    case_id: case.case_id.clone(),
+                    case_arn: case.case_arn.clone(),
+                });
+            }
+        }
+
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(CreateCaseErrorModeled::ResourceNotFoundException)?;
+        let required_field_ids: Vec<String> = domain
+            .template(&input.template_id)
+            .map_err(CreateCaseErrorModeled::ResourceNotFoundException)?
+            .required_fields
+            .iter()
+            .map(|required| required.field_id.clone())
+            .collect();
+        // Bound request-driven growth: a caller cannot fill the domain without end.
+        domain
+            .case_capacity()
+            .map_err(CreateCaseErrorModeled::ServiceQuotaExceededException)?;
+
+        // Every field id the body writes against is resolved before anything is
+        // stored, so a case never holds a value for a field the domain lacks,
+        // and a value whose union variant is not a value of the field's own
+        // declared type is refused rather than stored under the wrong type.
+        let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
+        if !unknown.is_empty() {
+            return Err(CreateCaseErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "fields names field ids that do not exist in domain {}: {}",
+                    input.domain_id,
+                    crate::state::name_ids(&unknown)
+                ),
+            })
+            .into());
+        }
+        let mismatched =
+            domain.mismatched_field_values(input.fields.iter().map(|f| (f.id.as_str(), &f.value)));
+        if !mismatched.is_empty() {
+            return Err(CreateCaseErrorModeled::ValidationException(ValidationException {
+                message: format!("fields: {}", crate::state::name_ids(&mismatched)),
+            })
+            .into());
+        }
+
+        // The template's `requiredFields` is the "List of fields that must have
+        // a value provided to create a case"
+        // (`smithy_query(query="doc",shape="RequiredField")`), so a create that
+        // names no value for one of them is refused before anything is stored.
+        let missing = crate::state::ids_not_provided(
+            &required_field_ids,
+            input.fields.iter().map(|f| f.id.as_str()),
+        );
+        if !missing.is_empty() {
+            return Err(CreateCaseErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "fields provides no value for field ids template {} requires: {}",
+                    input.template_id,
+                    crate::state::name_ids(&missing)
+                ),
+            })
+            .into());
+        }
+
+        let case_id = crate::state::new_id();
+        let case_arn = crate::state::case_arn(&region, &input.domain_id, &case_id);
+        // The union variant each value arrived in is kept as given, so a later read
+        // hands back what was written rather than a re-encoding of it.
+        let field_values = input
+            .fields
+            .into_iter()
+            .map(|field| (field.id, field.value))
+            .collect();
+        let domain_id = input.domain_id;
+        let stored = domain
+            .cases
+            .entry(case_id.clone())
+            .or_insert_with(|| crate::state::Case {
+                case_id: case_id.clone(),
+                case_arn,
+                domain_id: domain_id.clone(),
+                template_id: input.template_id,
+                field_values,
+                tags: input.tags.unwrap_or_default(),
+                created_time: now,
+                last_modified_time: now,
+                performed_by: input.performed_by,
+            });
+        let output = CreateCaseOutput {
+            case_id: stored.case_id.clone(),
+            case_arn: stored.case_arn.clone(),
+        };
+
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_idempotent_case(&domain_id, token, &case_id);
+        }
+
+        Ok(output)
     }
 }

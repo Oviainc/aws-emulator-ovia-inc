@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetField
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetField`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetField::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored field definitions from [`crate::state`].
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +145,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetField` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetFieldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetFieldErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        // A read: it resolves each requested field and reports it, and writes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetField"))
+        // Bound the caller-chosen work BEFORE the store lock is taken: the
+        // response carries one entry per requested id, so the list is held to
+        // `MAX_BATCH_FIELD_IDS` here as well as at the boundary. A repeated id
+        // is answered once per occurrence rather than refused, as on `GetCase`:
+        // the model declares no distinctness constraint and the cap already
+        // bounds the response.
+        if let Some(message) = crate::state::list_too_long(
+            "fields",
+            input.fields.len(),
+            crate::state::MAX_BATCH_FIELD_IDS,
+        ) {
+            return Err(
+                BatchGetFieldErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(BatchGetFieldErrorModeled::ResourceNotFoundException)?;
+
+        // A batch read reports per-id failure in its own `errors` list rather than
+        // failing the whole call, so one unknown id does not hide the rest.
+        let mut fields: Vec<GetFieldResponse> = Vec::with_capacity(input.fields.len());
+        let mut errors: Vec<FieldError> = Vec::new();
+        for requested in &input.fields {
+            match domain
+                .fields
+                .get(&requested.id)
+                .filter(|field| !field.deleted)
+            {
+                Some(field) => fields.push(GetFieldResponse {
+                    field_id: field.field_id.clone(),
+                    name: field.name.clone(),
+                    field_arn: field.field_arn.clone(),
+                    description: field.description.clone(),
+                    r#type: field.field_type.clone(),
+                    namespace: field.namespace.clone(),
+                    tags: crate::state::tags_output(&field.tags),
+                    deleted: field.deleted,
+                    created_time: Some(crate::state::timestamp(field.created_time)),
+                    last_modified_time: Some(crate::state::timestamp(field.last_modified_time)),
+                    attributes: field.attributes.clone(),
+                }),
+                None => errors.push(FieldError {
+                    id: requested.id.clone(),
+                    error_code: "ResourceNotFoundException".to_string(),
+                    message: Some(format!(
+                        "Field {} was not found in domain {}",
+                        requested.id, input.domain_id
+                    )),
+                }),
+            }
+        }
+
+        Ok(BatchGetFieldOutput { fields, errors })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges field values into the stored case in [`crate::state`].
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCase"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCaseErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // Pure input validation, done BEFORE the store lock is taken so no
+        // caller-sized work happens while every other request is blocked. The
+        // list is held to `MAX_CASE_FIELD_IDS` here as well as at the boundary,
+        // so the scans below are bounded by this code, and they are linear.
+        if let Some(message) = crate::state::list_too_long(
+            "fields",
+            input.fields.len(),
+            crate::state::MAX_CASE_FIELD_IDS,
+        ) {
+            return Err(
+                UpdateCaseErrorModeled::ValidationException(ValidationException { message }).into(),
+            );
+        }
+        let duplicates = crate::state::duplicate_ids(input.fields.iter().map(|f| f.id.as_str()));
+        if !duplicates.is_empty() {
+            return Err(UpdateCaseErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "fields carries more than one value for field ids: {}",
+                    crate::state::name_ids(&duplicates)
+                ),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(UpdateCaseErrorModeled::ResourceNotFoundException)?;
+
+        // Resolve every reference the body carries, and check every value
+        // against its field's own declared type, before writing any of it, so a
+        // rejected update leaves the case exactly as it was.
+        let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
+        let mismatched =
+            domain.mismatched_field_values(input.fields.iter().map(|f| (f.id.as_str(), &f.value)));
+        let Some(case) = domain.cases.get_mut(&input.case_id) else {
+            return Err(UpdateCaseErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Case", &input.case_id),
+            )
+            .into());
+        };
+        if !unknown.is_empty() {
+            return Err(UpdateCaseErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "fields names field ids that do not exist in domain {}: {}",
+                    input.domain_id,
+                    crate::state::name_ids(&unknown)
+                ),
+            })
+            .into());
+        }
+        if !mismatched.is_empty() {
+            return Err(UpdateCaseErrorModeled::ValidationException(ValidationException {
+                message: format!("fields: {}", crate::state::name_ids(&mismatched)),
+            })
+            .into());
+        }
+
+        // A MERGE, not a replace: a supplied id overwrites the value stored for it
+        // and every other stored value is left alone.
+        for field in input.fields {
+            case.field_values.insert(field.id, field.value);
+        }
+        if let Some(performed_by) = input.performed_by {
+            case.performed_by = Some(performed_by);
+        }
+        case.last_modified_time = now;
+
+        Ok(UpdateCaseOutput {})
     }
 }

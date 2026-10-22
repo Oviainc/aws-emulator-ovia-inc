@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The digest and hex codec the opaque domain/field/template/case ids are minted
+# from: SHA-256 over this process's OS-seeded entropy, an atomic mint counter and
+# the mint instant, rendered in the textual UUID form the service's ids take
+# (see `state::new_id`). Same pair the sibling service crates mint ids with.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
