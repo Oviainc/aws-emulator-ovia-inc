@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableAutoScalingSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableAutoScalingSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the auto scaling settings `CreateTable` stored for the named
+//! table. This is the ONLY file to touch for `GetTableAutoScalingSettings`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableAutoScalingSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A table's auto scaling settings are a resource of their own — the scalable target this
+//! operation needs `application-autoscaling:DescribeScalableTargets` to read — so a table
+//! that was never given any has none to report, which is the modelled
+//! `ResourceNotFoundException`, not an empty success.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +170,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableAutoScalingSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableAutoScalingSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableAutoScalingSettings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableAutoScalingSettingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "Amazon Keyspaces could not reach its state store for this request."
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // Reporting, not mutating: `settle` only materialises the status changes the clock
+        // had already made due at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+            return Err(
+                GetTableAutoScalingSettingsErrorModeled::ResourceNotFoundException(
+                    crate::state::keyspace_not_found(&region, &input.keyspace_name),
+                )
+                .into(),
+            );
+        };
+        let Some(table) = keyspace.tables.get(&input.table_name) else {
+            return Err(
+                GetTableAutoScalingSettingsErrorModeled::ResourceNotFoundException(
+                    crate::state::table_not_found(
+                        &region,
+                        &input.keyspace_name,
+                        &input.table_name,
+                    ),
+                )
+                .into(),
+            );
+        };
+        // The settings this operation reads are the table's scalable target, which exists
+        // only for a table auto scaling was configured for: for any other table the
+        // operation "tried to access a ... resource that doesn't exist".
+        let Some(auto_scaling_specification) = table.auto_scaling_specification.clone() else {
+            return Err(
+                GetTableAutoScalingSettingsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Table {} has no auto scaling settings.",
+                            table.table_name
+                        )),
+                        resource_arn: Some(table.resource_arn.clone()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetTableAutoScalingSettingsOutput {
+            keyspace_name: table.keyspace_name.clone(),
+            table_name: table.table_name.clone(),
+            resource_arn: table.resource_arn.clone(),
+            auto_scaling_specification: Some(auto_scaling_specification),
+            // "Returns the settings for all Regions the table is replicated in" — a
+            // per-Region override is `replicaSpecifications` on `CreateTable`, which this
+            // slice refuses with a 501, so no stored table has one.
+            replica_specifications: None,
+        })
     }
 }

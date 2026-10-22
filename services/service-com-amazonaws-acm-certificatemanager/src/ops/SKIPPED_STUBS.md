@@ -18,4 +18,8 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: GetAccountConfiguration — unsupported shape construct: operation 'GetAccountConfiguration' has a Unit/absent input, which the generator does not emit yet
+Nothing is currently declined for this service: `GetAccountConfiguration` was
+declined for its Unit/absent input and has since been hand-authored in
+`src/ops/get_account_configuration.rs`, which puts it in the service's
+`operations(...)` allow-list (`build.rs` derives that list from each ops file's
+`//! @op <Name>` header).

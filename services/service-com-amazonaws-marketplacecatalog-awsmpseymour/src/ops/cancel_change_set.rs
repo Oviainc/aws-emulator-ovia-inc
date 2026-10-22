@@ -158,11 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
-            return Err(CancelChangeSetErrorModeled::ValidationException(
-                crate::state::wrong_catalog(&input.catalog),
-            )
-            .into());
+        // `Catalog` is judged here, not at the boundary (`skip_validation` on
+        // `CancelChangeSetInput`): a value that is not a catalog NAME is refused
+        // for its syntax, quoting the syntax the service publishes, and a
+        // well-formed name other than the fixed value every operation's
+        // `Catalog` documents names nothing this service has.
+        if let Err(fault) = crate::state::check_catalog(&input.catalog) {
+            return Err(CancelChangeSetErrorModeled::ValidationException(fault).into());
         }
 
         let now = ::std::time::SystemTime::now();

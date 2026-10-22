@@ -13,6 +13,9 @@
 //!   path space;
 //! * [`front_door`], the body-rejection layer an AWS REST service puts in front of its
 //!   application code, as a wrapper a service serves its operations behind;
+//! * [`validation`], which restores the value a constraint violation echoes to the one
+//!   the caller submitted, so a service wording its own `ValidationException` from the
+//!   framework's violations does not report a value nobody sent;
 //! * [`stable_hex_id`], the one deterministic mixing function a service derives a
 //!   wire-visible id with;
 //! * [`network`], the contract the account's EC2 network — which subnets a Region has —
@@ -84,6 +87,7 @@ pub mod arn;
 pub mod front_door;
 pub mod iot_job_executions;
 pub mod network;
+pub mod validation;
 
 use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};
 

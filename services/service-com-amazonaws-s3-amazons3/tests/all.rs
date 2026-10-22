@@ -17,6 +17,8 @@ mod bucket_lifecycle;
 mod bucket_policy_and_tagging;
 #[path = "all/bucket_tagging.rs"]
 mod bucket_tagging;
+#[path = "all/bucket_versioning.rs"]
+mod bucket_versioning;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
 #[path = "all/object_and_policy.rs"]

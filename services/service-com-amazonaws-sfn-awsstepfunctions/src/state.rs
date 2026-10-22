@@ -312,6 +312,14 @@ pub const MAX_EXECUTIONS: usize = 10_000;
 /// `TooManyTags`. The AWS-wide per-resource tag limit.
 pub const MAX_TAGS: usize = 50;
 
+/// The text the service's `TooManyTags` refusal carries.
+///
+/// A FIXED service string, NOT a message rebuilt from the request: the recorded
+/// Step Functions responses to a tag write past the limit carry exactly this text,
+/// whatever the request's tag count, so echoing the count or the limit into it
+/// would make the emulator's message vary where the service's does not.
+pub const TOO_MANY_TAGS_MESSAGE: &str = "Too many tags provided.";
+
 /// The most history events one execution keeps.
 ///
 /// This is the interpreter's own ceiling, not a separate guess: a transition emits
@@ -875,6 +883,20 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.state_machines.insert(machine.arn.clone(), machine);
     }
 
+    /// The tags recorded under a taggable ARN — an EMPTY list when none are.
+    ///
+    /// This is a read of the tag set, not a resolution of the resource: a tagging
+    /// read reports "an array of tags associated with the resource", and the array
+    /// of an ARN nothing is tagged under is empty, whether the resource carries no
+    /// tags or the store holds no resource under that ARN at all. The write path
+    /// ([`Self::merge_state_machine_tags`]) is where a resource has to exist.
+    pub fn tags_of(&self, arn: &str) -> Vec<Tag> {
+        self.state_machines
+            .get(arn)
+            .map(|machine| machine.tags.clone())
+            .unwrap_or_default()
+    }
+
     /// Merge `incoming` into the tags of the state machine `arn` names.
     ///
     /// A resource's tags are a MAP keyed by tag key: a key the resource already
@@ -933,6 +955,59 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .saturating_add(after)
             .saturating_sub(before);
         Ok(())
+    }
+
+    /// Remove the tags `keys` names from the state machine `arn` names.
+    ///
+    /// Keyed by tag key, like the merge: a key the resource does not carry is
+    /// nothing to remove, which is not a failure, and a key removed twice is
+    /// removed once. `false` when the store holds no state machine under `arn` —
+    /// the modelled `ResourceNotFound` of the write path.
+    ///
+    /// `keys` is caller-sized, so the WORK is bounded by what the resource holds
+    /// rather than by the request: the resource's at most [`MAX_TAGS`] keys are read
+    /// into a set, the request's list is walked ONCE against it, and only the keys
+    /// that actually match are kept — so the allocation is at most `MAX_TAGS`
+    /// entries however long the request's list is.
+    pub fn remove_state_machine_tags(&mut self, arn: &str, keys: &[String]) -> bool {
+        let Some(machine) = self.state_machines.get(arn) else {
+            return false;
+        };
+        let present: std::collections::HashSet<&str> = machine
+            .tags
+            .iter()
+            .filter_map(|tag| tag.key.as_deref())
+            .collect();
+        let removing: std::collections::HashSet<String> = keys
+            .iter()
+            .filter(|key| present.contains(key.as_str()))
+            .cloned()
+            .collect();
+        if removing.is_empty() {
+            // Nothing the resource carries was named, so there is nothing to write
+            // and the record's measurement cannot have moved.
+            return true;
+        }
+        let before = machine.retained_bytes;
+        let tags_before = tags_bytes(&machine.tags);
+
+        let Some(machine) = self.state_machines.get_mut(arn) else {
+            return false;
+        };
+        machine
+            .tags
+            .retain(|tag| tag.key.as_deref().is_none_or(|key| !removing.contains(key)));
+        // The record's measurement moves by what the write changed; a removal can
+        // only shrink it, so it can never take the store past [`MAX_STORE_BYTES`].
+        let after = before
+            .saturating_sub(tags_before)
+            .saturating_add(tags_bytes(&machine.tags));
+        machine.retained_bytes = after;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        true
     }
 
     /// Publish the CURRENT configuration of the state machine `arn` names as its
@@ -1444,7 +1519,7 @@ pub fn read_taggable_arn(arn: &str, endpoint_region: &str) -> Result<TaggableRes
 }
 
 /// What the modelled `ResourceNotFound` says about a taggable ARN the store holds no
-/// resource under, for the same reason.
+/// resource under, so every operation words that refusal the same way.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("could not find the resource {resource_arn}")
 }

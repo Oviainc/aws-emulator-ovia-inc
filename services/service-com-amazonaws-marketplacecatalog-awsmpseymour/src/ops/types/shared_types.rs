@@ -86,7 +86,16 @@ pub struct ContainerSecuritySummary {
     pub delivery_option_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#Entity")]
+// `skip_validation` names both members. `Type` is an entity type REFERENCE, which the
+// service accepts at a schema version (`DataProduct@1.0`) — the form every real caller
+// sends — where the modelled `EntityType` `@pattern` (`^[a-zA-Z]+$`) admits no `@`;
+// `Identifier` has two published forms wider than the modelled `^[\w\-@]+$`. Both are
+// judged by the handler (`crate::state::is_entity_type_reference` /
+// `is_entity_identifier`), which answers the modelled `ValidationException` and its 422.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#Entity",
+    skip_validation = ["Type", "Identifier"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct Entity {
     pub r#type: String,

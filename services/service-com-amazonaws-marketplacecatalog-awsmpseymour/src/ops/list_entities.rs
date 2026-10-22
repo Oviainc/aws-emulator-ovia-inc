@@ -173,9 +173,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+        // `Catalog` is judged here, not at the boundary (`skip_validation` on
+        // `ListEntitiesInput`): a value that is not a catalog NAME is refused
+        // for its syntax, and a well-formed name other than the fixed value
+        // every operation's `Catalog` documents names nothing this service has.
+        if let Err(fault) = crate::state::check_catalog(&input.catalog) {
+            return Err(ListEntitiesErrorModeled::ValidationException(fault).into());
+        }
+
+        // `EntityType` is checked against the types this catalog HAS, not only
+        // against the characters its `@pattern` admits: a letters-only value
+        // naming no type of this catalog names nothing to list, so it is refused
+        // before any listing is performed rather than answered as an empty page,
+        // which a caller cannot tell from a catalog that holds no such entity.
+        if !crate::state::is_entity_type(&input.entity_type) {
             return Err(ListEntitiesErrorModeled::ValidationException(
-                crate::state::wrong_catalog(&input.catalog),
+                crate::state::invalid_entity_type(&input.entity_type),
             )
             .into());
         }
@@ -264,6 +277,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .sort_order
             .unwrap_or_else(|| crate::state::DEFAULT_SORT_ORDER.to_string());
 
+        // A token this service never issued names no page, and neither does one
+        // outside the modelled `NextToken` syntax (`skip_validation` on
+        // `ListEntitiesInput`), so both are the one page-token fault.
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
@@ -271,10 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(offset) => offset,
                     None => {
                         return Err(ListEntitiesErrorModeled::ValidationException(
-                            crate::state::validation(
-                                "NextToken",
-                                format!("{token:?} is not a token returned by ListEntities"),
-                            ),
+                            crate::state::invalid_page_token(),
                         )
                         .into())
                     }
@@ -282,16 +295,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `MaxResults` is modelled `@range(min: 1, max: 50)`.
-        let requested = input
-            .max_results
-            .unwrap_or(crate::state::LIST_ENTITIES_PAGE_LIMIT);
-        debug_assert!(
-            (1..=crate::state::LIST_ENTITIES_PAGE_LIMIT).contains(&requested),
-            "MaxResults {requested} should have been refused at the boundary"
-        );
-        let page_size = usize::try_from(requested.clamp(1, crate::state::LIST_ENTITIES_PAGE_LIMIT))
-            .expect("a page size clamped into 1..=50 fits in usize");
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`. The range is
+        // CHECKED here rather than assumed: a page size outside it is refused
+        // with the modelled `ValidationException`, so no request can reach the
+        // paging arithmetic with a size the model does not allow — and an
+        // absent member serves the largest page the model allows.
+        let page_size = match input.max_results {
+            None => crate::state::LIST_ENTITIES_PAGE_LIMIT,
+            Some(requested)
+                if (1..=crate::state::LIST_ENTITIES_PAGE_LIMIT).contains(&requested) =>
+            {
+                requested
+            }
+            Some(requested) => {
+                return Err(ListEntitiesErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "MaxResults",
+                        format!(
+                            "ListEntities serves between 1 and {} entities a page, not {requested}",
+                            crate::state::LIST_ENTITIES_PAGE_LIMIT
+                        ),
+                    ),
+                )
+                .into())
+            }
+        };
+        let page_size = usize::try_from(page_size).expect("a page size in 1..=50 fits in usize");
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
