@@ -45,6 +45,45 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The first URI path segments another emulated service that SHARES S3's `s3` SigV4
+/// signing name owns, and which S3 must therefore not claim.
+///
+/// S3's own modeled path space cannot discriminate: every bucket/object operation binds
+/// `/{Bucket}` or `/{Bucket}/{Key+}`, a path LABEL that matches ANY first segment, which
+/// is why the generated `crate::ROUTE_PATH_SEGMENTS` is EMPTY ("no constraint") for this
+/// service. S3 Control
+/// (`services/service-com-amazonaws-s3control-awss3controlservicev20180820`) signs as
+/// `s3` too — `smithy_query(query="service_info")` on its model reports sigv4Name `s3`
+/// with endpointPrefix `s3-control` — and binds EVERY one of its operations under the
+/// single literal first segment below (`/v20180820/bucket/{Bucket}`, `/v20180820/jobs`,
+/// `/v20180820/accesspoint`, …). Excluding that one segment is what leaves exactly one
+/// claimant for every request signed for `s3`, instead of two and a
+/// `500 AmbiguousService` for both.
+///
+/// AWS itself separates the two by endpoint host, which an emulator cannot use: a client
+/// configured with one local endpoint URL sends the same `Host` for both services. The
+/// one request this costs is a bucket literally NAMED `v20180820`, which is the narrowest
+/// possible loss and strictly better than refusing every `s3` request.
+const PEER_PATH_SEGMENTS: &[&str] = &["v20180820"];
+
+/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
+/// first segment (`"/"`, `""`).
+fn first_path_segment(path: &str) -> Option<&str> {
+    let segment = path.trim_start_matches('/').split('/').next()?;
+    (!segment.is_empty()).then_some(segment)
+}
+
+/// Whether `parts` addresses the path space of a peer service listed in
+/// `peer_segments`. Matching is EXACT segment equality, deliberately never a prefix test:
+/// a bucket named `v20180820-logs` is S3's, not the peer's.
+fn addresses_peer_path(parts: &http::request::Parts, peer_segments: &[&str]) -> bool {
+    match first_path_segment(parts.uri.path()) {
+        Some(segment) => peer_segments.contains(&segment),
+        // The ROOT path (`GET /?x-id=ListBuckets`) is S3's own; no peer claims it.
+        None => false,
+    }
+}
+
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +113,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // This service signs as `s3` — a signing name it SHARES with S3 Control, whose
+        // own endpoint is `s3-control`. The router's routing key comes from the SigV4
+        // credential scope first, so both services resolve to `s3`, and matching on the
+        // signing name ALONE makes both claim every request — which the router answers
+        // `500 AmbiguousService` for, to BOTH services' traffic.
+        //
+        // S3 cannot narrow itself by its own path space (every operation is bound under
+        // the `{Bucket}` label, so its segment list is empty), so it claims every path
+        // under the shared signing name EXCEPT the peer's own (see `PEER_PATH_SEGMENTS`).
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                !addresses_peer_path(parts, PEER_PATH_SEGMENTS)
+            }
+            _ => false,
         }
     }
 

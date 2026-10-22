@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -233,18 +224,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBucket"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; the emulator then cannot create
+            // the bucket at all, and `CreateBucket` models no server-fault error to say
+            // so, so the scaffold's 501 carries that "this emulator cannot serve it".
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateBucket"));
+        };
+
+        // Where the bucket lives, from the request's own location constraint. Note this
+        // is NOT the Region the request was signed for: the constraint is what the model
+        // documents as deciding the bucket's Region, and an absent one means us-east-1.
+        let region = crate::state::bucket_region(
+            input
+                .create_bucket_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.location_constraint.as_deref()),
+        );
+
+        let mut store = state.lock();
+        match store.create_bucket(&input.bucket, &region) {
+            crate::state::BucketCreation::Created => Ok(CreateBucketOutput {
+                location: Some(location_of(
+                    &input.bucket,
+                    &region,
+                    input.bucket_namespace.as_deref(),
+                )),
+                // Directory buckets only, per the member's documentation; a general
+                // purpose bucket reports none.
+                bucket_arn: None,
+            }),
+            crate::state::BucketCreation::NameTaken => {
+                // Every caller of this emulator is the one emulated account
+                // (`engine::emulator_account_id()`), so a taken name is always a bucket
+                // the caller already owns — which is `BucketAlreadyOwnedByYou`, except in
+                // us-east-1: "For legacy compatibility, if you re-create an existing
+                // bucket that you already own in the North Virginia Region, Amazon S3
+                // returns 200 OK and resets the bucket access control lists (ACLs)"
+                // (`BucketAlreadyOwnedByYou`'s own documentation). The Region that
+                // decides it is the EXISTING bucket's, since that is the bucket being
+                // re-created.
+                let existing_region = store
+                    .bucket(&input.bucket)
+                    .map(|bucket| bucket.region.clone())
+                    .unwrap_or_default();
+                if existing_region != crate::state::DEFAULT_BUCKET_REGION {
+                    return Err(CreateBucketErrorModeled::BucketAlreadyOwnedByYou(
+                        BucketAlreadyOwnedByYou {},
+                    )
+                    .into());
+                }
+                Ok(CreateBucketOutput {
+                    location: Some(location_of(
+                        &input.bucket,
+                        &existing_region,
+                        input.bucket_namespace.as_deref(),
+                    )),
+                    bucket_arn: None,
+                })
+            }
+            // The account is at its bucket quota, so this create is refused instead of
+            // growing the store without limit. `CreateBucket` models no quota error (its
+            // only two are the name-in-use pair), and AWS's own `TooManyBuckets` code is
+            // not in the model and so cannot be rendered, so the refusal goes out through
+            // the framework's 400 `ValidationException` channel — a refusal, not a 501,
+            // and never a silent success.
+            crate::state::BucketCreation::QuotaReached => {
+                Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the account already holds the maximum of {} buckets; delete a bucket \
+                     before creating {}",
+                    crate::state::MAX_BUCKETS_PER_ACCOUNT, input.bucket
+                )))
+            }
+        }
+    }
+}
+
+/// The `BucketNamespace` value whose buckets live in the caller's account regional
+/// namespace rather than the shared global one (one of that enum's two values).
+const ACCOUNT_REGIONAL_NAMESPACE: &str = "account-regional";
+
+/// The `Location` a created bucket reports.
+///
+/// The rule is `CreateBucketOutput$Location`'s own documentation: "A forward slash
+/// followed by the name of the bucket for all account regional namespace buckets and all
+/// global general purpose buckets created in us-east-1. … For global general purpose
+/// buckets created in other Amazon Web Services Regions, the Location field is the global
+/// endpoint URL" — i.e. `http://<bucket>.s3.amazonaws.com/`.
+fn location_of(bucket: &str, region: &str, bucket_namespace: Option<&str>) -> String {
+    let account_regional = bucket_namespace == Some(ACCOUNT_REGIONAL_NAMESPACE);
+    if account_regional || region == crate::state::DEFAULT_BUCKET_REGION {
+        format!("/{bucket}")
+    } else {
+        format!("http://{bucket}.s3.amazonaws.com/")
     }
 }

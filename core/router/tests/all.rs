@@ -19,3 +19,5 @@ mod boot_serve;
 mod connect_signing_name_routing;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
+#[path = "all/shared_signing_name_routing.rs"]
+mod shared_signing_name_routing;
