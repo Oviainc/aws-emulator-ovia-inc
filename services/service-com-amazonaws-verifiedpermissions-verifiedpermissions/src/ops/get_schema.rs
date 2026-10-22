@@ -111,10 +111,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: nothing here writes.
         let _ = ctx;
         let store_not_found = || {
-            GetSchemaErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
-                &input.policy_store_id,
-                "POLICY_STORE",
-            ))
+            GetSchemaErrorModeled::ResourceNotFoundException(
+                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+            )
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

@@ -93,10 +93,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // comes from, and `crate::ops::resource_not_found` for the one builder
         // that fills it.
         let not_found = || {
-            GetPolicyStoreErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
-                &input.policy_store_id,
-                "POLICY_STORE",
-            ))
+            // The reference may name a store by id or an alias by
+            // `policy-store-alias/<name>`: the error reports the kind the
+            // reference named and that resource's own id, not the path.
+            GetPolicyStoreErrorModeled::ResourceNotFoundException(
+                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+            )
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts and deletes `Predicate`s in a stored `Rule`, consuming the caller's change
+//! token, so `GetRule` reports what this call applied. An inserted predicate points at
+//! a condition set this service stores, which is what makes that set a referenced item
+//! its own `Delete*` must refuse.
 //!
 //! ## Shape of an operation
 //!
@@ -172,6 +168,25 @@ impl From<UpdateRuleErrorModeled> for UpdateRuleError {
     }
 }
 
+/// The modelled `WAFNonexistentItemException`: the condition set an inserted predicate
+/// points at does not exist. "The operation failed because the referenced object doesn't
+/// exist."
+fn nonexistent_item() -> UpdateRuleError {
+    UpdateRuleErrorModeled::WAFNonexistentItemException(WAFNonexistentItemException {
+        message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `WAFLimitsExceededException`: the request, or the rule it would leave
+/// behind, is past a resource limit.
+fn limits_exceeded() -> UpdateRuleError {
+    UpdateRuleErrorModeled::WAFLimitsExceededException(WAFLimitsExceededException {
+        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -208,18 +223,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRule"))
+        let _ = ctx;
+        // The number of updates one request carries is the caller's choice, so it is
+        // bounded BEFORE the shared store's lock is taken: no request can make the
+        // service do an amount of work it picked, nor hold the lock for it.
+        if input.updates.len() > crate::state::MAX_RULE_UPDATES_PER_REQUEST {
+            return Err(limits_exceeded());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRuleErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The Rule is the CONTAINER the updates go into, and the model reserves
+        // `WAFNonexistentContainerException` for exactly this: "You tried to add a
+        // ByteMatchSet to or delete a ByteMatchSet from a Rule that doesn't exist."
+        let Some(stored) = state.rules.get(&input.rule_id) else {
+            return Err(UpdateRuleErrorModeled::WAFNonexistentContainerException(
+                WAFNonexistentContainerException {
+                    message: Some(crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request that is refused
+        // part-way through leaves the stored Rule (and the change token) exactly as they
+        // were.
+        let mut working = stored.clone();
+        for update in &input.updates {
+            let predicate = &update.predicate;
+            // `ChangeAction` and `PredicateType` are enum shapes, so a value outside
+            // their sets is refused before this handler runs.
+            let changed = if update.action == crate::state::CHANGE_ACTION_INSERT {
+                // An inserted predicate points at a condition set of its own `Type`:
+                // "A unique identifier for a predicate in a Rule, such as
+                // ByteMatchSetId or IPSetId. The ID is returned by the corresponding
+                // Create or List command." An id no such set carries is the modelled
+                // "referenced object doesn't exist".
+                if !state.condition_set_exists(&predicate.r#type, &predicate.data_id) {
+                    return Err(nonexistent_item());
+                }
+                // One Rule holds at most `MAX_RULE_PREDICATES` predicates, so the
+                // predicate state a caller can accumulate over many requests is
+                // bounded, not just the number of updates one request may carry.
+                if working.predicates.len() >= crate::state::MAX_RULE_PREDICATES {
+                    return Err(limits_exceeded());
+                }
+                working.insert_predicate(predicate)
+            } else {
+                working.remove_predicate(predicate)
+            };
+            // "The operation failed because there was nothing to do" covers both ways an
+            // update can leave the rule as it was: deleting a predicate the rule does
+            // not hold, and inserting one it already holds. "If you want to replace one
+            // ByteMatchSet or IPSet with another, you delete the existing one and add the
+            // new one."
+            if !changed {
+                return Err(UpdateRuleErrorModeled::WAFInvalidOperationException(
+                    WAFInvalidOperationException {
+                        message: Some(crate::state::MESSAGE_INVALID_OPERATION.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token.
+        if !state.consume_change_token(&input.change_token) {
+            return Err(UpdateRuleErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let rule_id = working.rule_id.clone();
+        state.rules.insert(rule_id, working);
+
+        Ok(UpdateRuleOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

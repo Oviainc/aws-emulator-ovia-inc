@@ -5,12 +5,10 @@
 //! request id name together.
 //! This is the ONLY file to touch for this operation.
 //!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `GetBillingAdjustmentRequest::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! This is a REPORT, and the only thing it writes is the status change the
+//! CLOCK had already made due: a submitted request is `PENDING` until its
+//! processing comes due, and a reader materialises that outcome rather than
+//! reporting a `PENDING` that is already stale.
 //!
 //! ## Reaching this service's state
 //!
@@ -168,9 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetBillingAdjustmentRequestErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),

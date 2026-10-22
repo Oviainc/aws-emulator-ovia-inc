@@ -8,8 +8,10 @@
 //! in all read the empty set), narrowed by every `filter` member the request
 //! sets, de-duped to one recommendation per resource unless
 //! `includeAllRecommendations` asks for them all, ordered by `orderBy`, and cut
-//! to the page `maxResults`/`nextToken` ask for. The money members are computed
-//! from each row's stored prices under the caller's effective
+//! to the page `maxResults`/`nextToken` ask for — `maxResults` being judged
+//! against the `@range` this operation's own member declares (0..1000), which is
+//! wider than the one on the `MaxResults` shape it targets. The money members
+//! are computed from each row's stored prices under the caller's effective
 //! `savingsEstimationMode` preference.
 //!
 //! `filter.accountIds` asks for other accounts' recommendations, which only the
@@ -165,8 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // This operation's own `@range` on `maxResults`, which the shared
-        // `MaxResults` shape does not bound (see `MAX_RESULTS_MAX`).
+        // The page size is judged against the `@range` THIS operation's own
+        // `maxResults` member declares (0..1000), not the narrower bound of the
+        // shape it targets: the member's traits are kept off the generated
+        // schema (`skip_validation`) so the boundary walk cannot apply the wrong
+        // one, and the refusal states the bound actually applied.
         if let Some(refused) =
             crate::service::out_of_range("maxResults", input.max_results, 0, MAX_RESULTS_MAX)
         {

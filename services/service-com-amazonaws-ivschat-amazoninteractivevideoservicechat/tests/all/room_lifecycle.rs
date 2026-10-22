@@ -23,9 +23,9 @@ use service_com_amazonaws_ivschat_amazoninteractivevideoservicechat::state::{
 use service_com_amazonaws_ivschat_amazoninteractivevideoservicechat::ComAmazonawsIvschatAmazoninteractivevideoservicechatState as ChatState;
 
 /// The account every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 /// The region the test signs for unless a case names another.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The capability values the model's `ChatTokenCapability` enum carries, as the service
 /// crate's generated catalog reports them.
@@ -33,13 +33,13 @@ const CAPABILITIES: &[&str] =
     service_com_amazonaws_ivschat_amazoninteractivevideoservicechat::ops::types::CHAT_TOKEN_CAPABILITY_VALUES;
 
 /// One emulator, one shared engine: exactly what the router hands every handler.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Pin authentication off so the suite does not depend on the process setting.
@@ -52,11 +52,11 @@ impl Emulator {
         Self { router, engine }
     }
 
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call_in(REGION, operation, body).await
     }
 
-    async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDTESTIVSCHAT/20260101/{region}/ivschat/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=deadbeef"
@@ -92,21 +92,21 @@ impl Emulator {
     }
 }
 
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
         .to_string()
 }
 
-fn str_field(body: &Value, member: &str) -> String {
+pub(crate) fn str_field(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("member {member} missing from {body}"))
         .to_string()
 }
 
-fn seconds(body: &Value, member: &str) -> i64 {
+pub(crate) fn seconds(body: &Value, member: &str) -> i64 {
     let raw = body
         .get(member)
         .unwrap_or_else(|| panic!("member {member} missing from {body}"));
@@ -125,7 +125,7 @@ fn seconds(body: &Value, member: &str) -> i64 {
         .secs()
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)

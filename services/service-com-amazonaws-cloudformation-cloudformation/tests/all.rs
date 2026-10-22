@@ -17,5 +17,7 @@ mod error_envelope;
 mod stack_lifecycle;
 #[path = "all/stack_outputs.rs"]
 mod stack_outputs;
+#[path = "all/stack_reported_members.rs"]
+mod stack_reported_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

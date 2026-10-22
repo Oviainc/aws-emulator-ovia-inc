@@ -14,7 +14,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness is shared with every other suite in this crate; this suite
 // adds only its own alias-specific helpers below.
-use super::harness::{call, error_code, ok, store_with_validation_off as store};
+use super::harness::{call, error_code, ok, store_with_validation_off as store, SIGNING_REGION};
 
 /// The prefix every alias name carries, from
 /// `CreatePolicyStoreAliasInput$aliasName`'s model documentation: "The alias name
@@ -34,12 +34,13 @@ fn router() -> Arc<MultiServiceRouter> {
 }
 
 /// The ARN an alias of `alias_name` must carry: the canonical emulator account
-/// (`000000000000`), no region segment — as `CreatePolicyStore`'s policy-store
-/// ARNs also carry none — and the alias name as the resource, which already
-/// states its own resource type through its prefix. Satisfies `ResourceArn`'s
-/// `^arn:[^:]*:[^:]*:[^:]*:[^:]*:.*$`.
-fn expected_alias_arn(alias_name: &str) -> String {
-    format!("arn:aws:verifiedpermissions::000000000000:{alias_name}")
+/// (`000000000000`), the region the request was SIGNED for — Verified Permissions
+/// is regional and an alias name is unique in the account and Region, so
+/// `ResourceArn`'s third colon-separated field names it — and the alias name as
+/// the resource, which already states its own resource type through its prefix.
+/// Satisfies `ResourceArn`'s `^arn:[^:]*:[^:]*:[^:]*:[^:]*:.*$`.
+fn expected_alias_arn(region: &str, alias_name: &str) -> String {
+    format!("arn:aws:verifiedpermissions:{region}:000000000000:{alias_name}")
 }
 
 /// Create an alias and return the parsed response, requiring success.
@@ -113,21 +114,21 @@ async fn alias_round_trips_every_name_the_model_admits() {
         );
         assert_eq!(
             created["aliasArn"].as_str().unwrap_or_default(),
-            expected_alias_arn(&alias_name),
+            expected_alias_arn(SIGNING_REGION, &alias_name),
             "case {case:?}: unexpected aliasArn, got {created}"
         );
         // `createdAt` targets `TimestampFormat`, which carries
         // `@timestampFormat("date-time")`, so the wire form is an RFC 3339 string
         // (`tests/all/date_time_wire_format.rs` pins that for every such member).
-        let created_at = created["createdAt"].as_str().unwrap_or_default().to_string();
         assert!(
             ::aws_smithy_types::DateTime::from_str(
-                &created_at,
+                created["createdAt"].as_str().unwrap_or_default(),
                 ::aws_smithy_types::date_time::Format::DateTime,
             )
             .is_ok(),
             "case {case:?}: createdAt must be a date-time string, got {created}"
         );
+        let created_at = created["createdAt"].as_str().unwrap_or_default().to_string();
 
         // The reader reports exactly what was persisted, plus the state.
         let read = ok(
@@ -147,7 +148,7 @@ async fn alias_round_trips_every_name_the_model_admits() {
             (
                 alias_name.as_str(),
                 store_id.as_str(),
-                expected_alias_arn(&alias_name).as_str(),
+                expected_alias_arn(SIGNING_REGION, &alias_name).as_str(),
                 created_at.as_str(),
                 "Active",
             ),

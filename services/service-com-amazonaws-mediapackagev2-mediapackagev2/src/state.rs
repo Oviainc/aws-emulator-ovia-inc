@@ -210,9 +210,16 @@ pub enum IngestOutcome {
 
 /// The one sentence for a conditional update whose `x-amzn-update-if-match` entity tag is
 /// not the committed one — the loser of a concurrent update.
-pub const CONFLICTING_OPERATION_MESSAGE: &str = "MediaPackage can't process your request \
-    because another operation changed this resource. Read the resource again to get its \
-    current entity tag and then try again";
+///
+/// This is the text the service itself answers with: fixed per rejection class, naming no
+/// resource and carrying nothing from the request, so the sentence is part of the contract
+/// rather than a per-run value (the recorded behavioral corpus asserts it for the channel
+/// path, and every operation of this class answers with the same one). Note the
+/// typographic apostrophes.
+pub const CONFLICTING_OPERATION_MESSAGE: &str = "You\u{2019}ve specified an entity tag with \
+    your request that does not match the resource\u{2019}s current entity tag. This can \
+    occur if the resource has been updated by another request between the time you \
+    retrieved the ETag and when you made your update request";
 
 /// `HarvestJobStatus` values, from the model's `HarvestJobStatus` enum
 /// (`HARVEST_JOB_STATUS_VALUES` in `ops::types`).

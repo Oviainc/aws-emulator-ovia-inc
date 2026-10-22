@@ -3,8 +3,11 @@
 //! @op DeleteXssMatchSet
 //!
 //! Permanently removes a stored `XssMatchSet`, consuming the caller's change token, so
-//! `GetXssMatchSet` and `ListXssMatchSets` stop reporting it. An XssMatchSet that still
-//! holds filters is refused.
+//! `GetXssMatchSet` and `ListXssMatchSets` stop reporting it. "You can't delete an
+//! XssMatchSet if it's still used in any Rules or if it still contains any XssMatchTuple
+//! objects", so a set a `Rule`'s predicate points at answers
+//! `WAFReferencedItemException` and one that still holds filters answers
+//! `WAFNonEmptyEntityException`.
 //!
 //! ## Shape of an operation
 //!
@@ -183,8 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            // "You can't delete an XssMatchSet if it's still used in any Rules or if it
-            // still contains any XssMatchTuple objects."
+            // "You can't delete an XssMatchSet if it's still used in any Rules …" — a
+            // Rule uses it while one of its predicates points at this id, which is what
+            // `UpdateRule` writes.
+            Some(_) if state.is_referenced_by_a_rule(&input.xss_match_set_id) => {
+                return Err(DeleteXssMatchSetErrorModeled::WAFReferencedItemException(
+                    WAFReferencedItemException {
+                        message: Some(crate::state::MESSAGE_REFERENCED_ITEM.to_string()),
+                    },
+                )
+                .into())
+            }
+            // "… or if it still contains any XssMatchTuple objects."
             Some(entry) if !entry.tuples.is_empty() => {
                 return Err(DeleteXssMatchSetErrorModeled::WAFNonEmptyEntityException(
                     WAFNonEmptyEntityException {

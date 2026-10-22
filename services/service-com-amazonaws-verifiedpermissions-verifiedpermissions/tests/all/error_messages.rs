@@ -229,12 +229,16 @@ async fn every_not_found_path_answers_the_same_constant_message() {
             resource_type: "POLICY_STORE",
         },
         NotFound {
+            // The reference named an ALIAS, so the missing resource is the
+            // alias, reported by its own name without the `policy-store-alias/`
+            // resource path — `resourceId` is "The unique ID of the resource
+            // referenced in the failed request".
             case: "GetPolicyStore, alias reference pending deletion",
             operation: "GetPolicyStore",
             request: json!({ "policyStoreId": pending_alias }),
             reference: pending_alias.clone(),
-            resource_id: pending_alias.clone(),
-            resource_type: "POLICY_STORE",
+            resource_id: "pending-deletion".to_string(),
+            resource_type: "POLICY_STORE_ALIAS",
         },
         NotFound {
             case: "GetPolicyStore, the id of a store that was deleted",
@@ -261,11 +265,16 @@ async fn every_not_found_path_answers_the_same_constant_message() {
             resource_type: "POLICY",
         },
         NotFound {
+            // A `name/<policyName>` reference names a POLICY, and its id is the
+            // bare policy name — the resource path is not an id a caller can
+            // feed back into the API.
             case: "GetPolicy, live store and unknown name/ reference",
             operation: "GetPolicy",
             request: json!({ "policyStoreId": live_store, "policyId": unknown_policy_name }),
             reference: unknown_policy_name.clone(),
-            resource_id: unknown_policy_name.clone(),
+            resource_id: unknown_policy_name
+                .trim_start_matches("name/")
+                .to_string(),
             resource_type: "POLICY",
         },
         NotFound {
@@ -383,6 +392,7 @@ async fn every_not_found_path_answers_the_same_constant_message() {
             resource_type: "POLICY_STORE",
         },
         NotFound {
+            // As above: an alias reference reports the alias, by its bare name.
             case: "UpdatePolicyStore, alias reference pending deletion",
             operation: "UpdatePolicyStore",
             request: json!({
@@ -390,8 +400,8 @@ async fn every_not_found_path_answers_the_same_constant_message() {
                 "validationSettings": { "mode": "OFF" },
             }),
             reference: pending_alias.clone(),
-            resource_id: pending_alias.clone(),
-            resource_type: "POLICY_STORE",
+            resource_id: "pending-deletion".to_string(),
+            resource_type: "POLICY_STORE_ALIAS",
         },
         NotFound {
             case: "BatchIsAuthorized, unknown store",
@@ -442,11 +452,13 @@ async fn every_not_found_path_answers_the_same_constant_message() {
             resource_type: "POLICY_STORE",
         },
         NotFound {
+            // An `aliasName` always names an alias, and its id is that name
+            // without the documented `policy-store-alias/` resource path.
             case: "GetPolicyStoreAlias, unknown alias name",
             operation: "GetPolicyStoreAlias",
             request: json!({ "aliasName": unknown_alias }),
             reference: unknown_alias.clone(),
-            resource_id: unknown_alias.clone(),
+            resource_id: "no-such-alias".to_string(),
             resource_type: "POLICY_STORE_ALIAS",
         },
         NotFound {

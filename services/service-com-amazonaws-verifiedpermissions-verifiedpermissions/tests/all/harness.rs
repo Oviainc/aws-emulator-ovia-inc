@@ -13,6 +13,12 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The region every request this harness sends is SIGNED for. The emulator reads
+/// it out of the SigV4 credential scope, and a minted regional ARN names it, so
+/// the header below and a suite's ARN expectation share this one constant rather
+/// than repeating a literal that could drift.
+pub const SIGNING_REGION: &str = "us-east-1";
+
 /// A router serving only this service, over a fresh shared engine.
 pub fn router() -> MultiServiceRouter {
     router_with_engine().0
@@ -42,8 +48,11 @@ pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) ->
         .header("x-amz-target", format!("VerifiedPermissions.{operation}"))
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us-east-1/verifiedpermissions/aws4_request, \
-             SignedHeaders=host;x-amz-target, Signature=0",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIAEXAMPLE/20260101/{SIGNING_REGION}/verifiedpermissions/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0"
+            ),
         )
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("a test request body always serializes"),
@@ -96,6 +105,16 @@ pub fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+/// A Cognito user pool ARN in the one account this emulator presents
+/// (`engine::emulator_account_id`), for `region` and `pool`. The ONE pool-ARN
+/// helper this test crate has, so every suite shapes a pool ARN the same way.
+pub fn user_pool_arn(region: &str, pool: &str) -> String {
+    format!(
+        "arn:aws:cognito-idp:{region}:{}:userpool/{pool}",
+        engine::emulator_account_id()
+    )
 }
 
 /// The `message` an awsJson1_0 fault carries. The modelled member is `message`;

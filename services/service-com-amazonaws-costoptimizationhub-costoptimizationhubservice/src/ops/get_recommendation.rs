@@ -216,12 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(row) = row else {
+            // The resource this 404 is about is identified by `resourceId` —
+            // "the identifier of the resource that was not found" — which the
+            // shape requires and which carries the requested id. No prose is
+            // substituted for it: the recorded answer to a well-formed id the
+            // account holds no recommendation for carries an empty `message`,
+            // so a client reads the machine-readable member rather than text.
             return Err(GetRecommendationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no recommendation with the ID {} exists",
-                        input.recommendation_id
-                    ),
+                    message: String::new(),
                     resource_id: input.recommendation_id,
                 },
             )

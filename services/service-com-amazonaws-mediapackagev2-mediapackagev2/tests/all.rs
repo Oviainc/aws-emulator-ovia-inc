@@ -41,6 +41,8 @@ mod rejection_rule_and_negative_paths;
 mod server_materialised_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_channel.rs"]
+mod update_channel;
 #[path = "all/update_origin_endpoint.rs"]
 mod update_origin_endpoint;
 #[path = "all/update_roundtrip.rs"]

@@ -98,14 +98,9 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// A Cognito user pool ARN in the one account this emulator presents
-/// (`engine::emulator_account_id`), for `region` and `pool`.
-fn user_pool_arn(region: &str, pool: &str) -> String {
-    format!(
-        "arn:aws:cognito-idp:{region}:{}:userpool/{pool}",
-        engine::emulator_account_id()
-    )
-}
+/// The ONE pool-ARN helper this test crate has lives in the shared harness; this
+/// suite reaches it rather than shaping a second copy.
+use super::harness::user_pool_arn;
 
 /// `IdentitySourceId`'s published shape: `IS` + 22 base62 characters, inside the
 /// modelled `^[a-zA-Z0-9-]*$`.
@@ -584,7 +579,10 @@ async fn an_unknown_policy_store_or_identity_source_is_not_found() {
                     }
                 },
             }),
-            "POLICY_STORE",
+            // The reference named an ALIAS, so the alias is the resource reported
+            // missing — `ResourceNotFoundException$resourceType` is "the resource
+            // type of the resource referenced in the failed request".
+            "POLICY_STORE_ALIAS",
         ),
         (
             "get-from-an-unknown-store",

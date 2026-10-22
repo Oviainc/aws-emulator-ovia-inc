@@ -141,10 +141,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let not_found = || {
-            ListPoliciesErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
-                &input.policy_store_id,
-                "POLICY_STORE",
-            ))
+            ListPoliciesErrorModeled::ResourceNotFoundException(
+                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+            )
         };
 
         // A cursor this service did not mint is a bad request, not an empty page:

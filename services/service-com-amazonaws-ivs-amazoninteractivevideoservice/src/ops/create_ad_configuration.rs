@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAdConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAdConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAdConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an ad configuration, materialises the defaults the model documents for the
+//! members the caller omitted, and persists it under its own ARN in
+//! `crate::state::ComAmazonawsIvsAmazoninteractivevideoserviceState::ad_configurations`,
+//! which is where `GetAdConfiguration` reads it back from.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAdConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAdConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAdConfiguration"))
+        // `mediaTailorPlaybackConfigurations` (required, 1..3 items), `name` (the
+        // `AdConfigurationName` pattern and length) and `postRollConfiguration`'s
+        // `durationSeconds` (1..300) are modelled constraints, so the framework's
+        // constraint walk has already refused anything outside them with a 400
+        // `ValidationException` before this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAdConfigurationErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // One more entry per call, for the life of the process: past the cap the
+        // service answers the quota error it models rather than growing without
+        // bound. See `crate::state::MAX_AD_CONFIGURATIONS`.
+        if store.ad_configurations.len() >= crate::state::MAX_AD_CONFIGURATIONS {
+            return Err(
+                CreateAdConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        exception_message: Some(format!(
+                            "the number of ad configurations would exceed the limit of {}",
+                            crate::state::MAX_AD_CONFIGURATIONS
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        let id = store.mint_hex("ad-configuration", 6);
+        let arn = crate::state::ad_configuration_arn(&region, &id);
+        let ad_configuration = AdConfiguration {
+            arn: arn.clone(),
+            // From the model doc on `AdConfiguration$name`: "Ad configuration name.
+            // Defaults to ""."
+            name: Some(input.name.unwrap_or_default()),
+            media_tailor_playback_configurations: input.media_tailor_playback_configurations,
+            post_roll_configuration: Some(
+                input
+                    .post_roll_configuration
+                    .unwrap_or_else(default_post_roll_configuration),
+            ),
+            tags: Some(input.tags.unwrap_or_default()),
+        };
+        store.ad_configurations.insert(arn, ad_configuration.clone());
+
+        Ok(CreateAdConfigurationOutput { ad_configuration })
     }
 }
+
+/// The post-roll configuration an ad configuration created without one carries.
+///
+/// The model's own doc for `CreateAdConfigurationRequest$postRollConfiguration`
+/// (`smithy_query(query="doc", shape="CreateAdConfigurationRequest",
+/// member="postRollConfiguration")`) reads: "Configuration for the post-roll ad
+/// break to use for this ad configuration. Default: disabled (`enabled` set to
+/// false, `durationSeconds` set to 15)." Both the flag and the 15-second duration
+/// are that documented default, not a span chosen here.
+fn default_post_roll_configuration() -> PostRollConfiguration {
+    PostRollConfiguration {
+        duration_seconds: 15,
+        enabled: false,
+    }
+}
+

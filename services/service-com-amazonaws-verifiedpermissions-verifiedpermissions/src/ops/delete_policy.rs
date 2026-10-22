@@ -119,16 +119,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let store_not_found = || {
-            DeletePolicyErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
-                &input.policy_store_id,
-                "POLICY_STORE",
-            ))
+            DeletePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+            )
         };
         let policy_not_found = || {
-            DeletePolicyErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
-                &input.policy_id,
-                "POLICY",
-            ))
+            DeletePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::policy_reference(&input.policy_id).not_found(),
+            )
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

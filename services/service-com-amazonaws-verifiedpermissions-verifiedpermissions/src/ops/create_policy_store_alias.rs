@@ -231,7 +231,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let alias = crate::state::PolicyStoreAlias {
             alias_name: input.alias_name.clone(),
-            arn: crate::state::alias_arn(&input.alias_name),
+            // The alias ARN names the region the request was signed for: an
+            // alias name is unique in the account and Region, so the ARN that
+            // identifies it has to say which Region.
+            arn: crate::state::alias_arn(
+                &crate::state::request_region(ctx.parts()),
+                &input.alias_name,
+            ),
             policy_store_id: input.policy_store_id.clone(),
             created_at: crate::state::now(),
             state: crate::state::ALIAS_STATE_ACTIVE.to_string(),

@@ -342,6 +342,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A table's schema is the store's third caller-driven growth dimension, and
+        // `allColumns` is modelled with no maximum, so it is capped the same way — here,
+        // and in `UpdateTable`, which is the only operation that can grow it afterwards.
+        if input.schema_definition.all_columns.len() > crate::state::MAX_COLUMNS_PER_TABLE {
+            return Err(CreateTableErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of columns in table '{}.{}' would exceed the limit of {}",
+                        input.keyspace_name,
+                        input.table_name,
+                        crate::state::MAX_COLUMNS_PER_TABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
         let resource_arn =
             crate::state::table_arn(&region, &input.keyspace_name, &input.table_name);
         let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
@@ -360,6 +377,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status_due_at: Some(settles_at),
                 schema_definition: input.schema_definition,
                 capacity_specification,
+                // Only an `UpdateTable` that moves the table to PAY_PER_REQUEST sets
+                // this; a table created in a mode was never updated into it.
+                last_update_to_pay_per_request: None,
                 encryption_specification,
                 point_in_time_recovery,
                 ttl: input.ttl,

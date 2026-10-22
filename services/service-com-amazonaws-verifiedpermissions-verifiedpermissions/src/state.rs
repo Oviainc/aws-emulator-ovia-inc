@@ -505,12 +505,38 @@ pub fn resolve_user_pool_arn(
 
 /// The region the request was signed for, or [`DEFAULT_REGION`] when it carries
 /// no SigV4 credential scope. A Cognito user pool is reachable only from the
-/// region it lives in, so the region is read off the request rather than fixed.
+/// region it lives in, and an alias ARN names the region the alias was created
+/// in, so the region is read off the request rather than fixed.
+///
+/// The scope's region is honoured only when it has an AWS region's SHAPE
+/// ([`is_region_shaped`]): it is interpolated into an ARN, so an arbitrary
+/// header value must not be able to shape one. The scope itself is parsed by
+/// `emulator_server::sigv4_credential_scope`, the framework's single source of
+/// truth for it.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
-        .filter(|region| !region.is_empty())
+        .filter(|region| is_region_shaped(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// True when `value` has an AWS region code's shape:
+/// `<partition>-<area>[-<area>]-<number>` (`us-east-1`, `ap-southeast-3`,
+/// `us-gov-west-1`) — at least TWO lowercase alphabetic segments joined by `-`,
+/// plus a trailing all-digit segment.
+fn is_region_shaped(value: &str) -> bool {
+    let mut segments = value.split('-').rev();
+    let Some(number) = segments.next() else {
+        return false;
+    };
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let words: Vec<&str> = segments.collect();
+    words.len() >= 2
+        && words
+            .iter()
+            .all(|word| !word.is_empty() && word.bytes().all(|b| b.is_ascii_lowercase()))
 }
 
 /// The ARN partition this emulator presents, read out of an ARN it builds
@@ -839,6 +865,114 @@ pub fn resource_id_from_arn(resource_arn: &str) -> String {
         .to_string()
 }
 
+/// `ResourceType$POLICY_STORE`, from the model's `ResourceType` enum.
+pub const RESOURCE_TYPE_POLICY_STORE: &str = "POLICY_STORE";
+
+/// `ResourceType$POLICY_STORE_ALIAS`, from the model's `ResourceType` enum.
+pub const RESOURCE_TYPE_POLICY_STORE_ALIAS: &str = "POLICY_STORE_ALIAS";
+
+/// `ResourceType$POLICY`, from the model's `ResourceType` enum.
+pub const RESOURCE_TYPE_POLICY: &str = "POLICY";
+
+/// `ResourceType$SCHEMA`, from the model's `ResourceType` enum.
+pub const RESOURCE_TYPE_SCHEMA: &str = "SCHEMA";
+
+/// `ResourceType$IDENTITY_SOURCE`, from the model's `ResourceType` enum.
+pub const RESOURCE_TYPE_IDENTITY_SOURCE: &str = "IDENTITY_SOURCE";
+
+/// The resource-path prefix a `policyId` member carries when it names a policy by
+/// name instead of by id, which `resolve_policy_id` already accepts.
+pub const POLICY_NAME_PREFIX: &str = "name/";
+
+/// What a caller-supplied identifier reference NAMES: the kind of resource, and
+/// that resource's own id.
+///
+/// Several identifier members of this API accept either a bare id or a
+/// `<resource-path>/<name>` form documented as interchangeable with it — a
+/// `policyStoreId` takes `policy-store-alias/<name>`, a `policyId` takes
+/// `name/<policyName>`. `ResourceNotFoundException` models `resourceId` as "the
+/// unique ID of the resource referenced in the failed request" and `resourceType`
+/// as "the resource type of the resource referenced in the failed request", so
+/// when such a reference does not resolve the error names the KIND the path named
+/// and the BARE name — never the path, which is not an id a caller can feed back
+/// into the API, and never the kind the member usually carries.
+#[derive(Debug, Clone)]
+pub struct ReferencedResource {
+    /// A `ResourceType` enum value: the kind of resource the reference named.
+    pub resource_type: String,
+    /// The named resource's own id, with any resource-path prefix removed.
+    pub resource_id: String,
+}
+
+impl ReferencedResource {
+    /// The modelled `ResourceNotFoundException` for this reference not resolving.
+    ///
+    /// The message comes from [`crate::ops::resource_not_found`], the one place
+    /// this service builds the shape, so every not-found path answers the same
+    /// sentence; what this type contributes is the identity of the resource the
+    /// reference NAMED, which is what the exception's required `resourceId` and
+    /// `resourceType` members model.
+    pub fn not_found(self) -> crate::ops::types::ResourceNotFoundException {
+        crate::ops::resource_not_found(&self.resource_id, &self.resource_type)
+    }
+}
+
+/// Split `reference` on one documented resource path: a reference carrying
+/// `prefix` names a `prefixed_type` by its bare name, anything else names a
+/// `bare_type` by its id.
+fn split_reference(
+    reference: &str,
+    prefix: &str,
+    prefixed_type: &str,
+    bare_type: &str,
+) -> ReferencedResource {
+    match reference.strip_prefix(prefix) {
+        Some(name) => ReferencedResource {
+            resource_type: prefixed_type.to_string(),
+            resource_id: name.to_string(),
+        },
+        None => ReferencedResource {
+            resource_type: bare_type.to_string(),
+            resource_id: reference.to_string(),
+        },
+    }
+}
+
+/// What a `policyStoreId` request member names: a policy store by id, or — when
+/// it carries [`ALIAS_PREFIX`], the form [`ComAmazonawsVerifiedpermissionsVerifiedpermissionsState::resolve_store_id`]
+/// resolves — a policy store alias by name.
+pub fn policy_store_reference(reference: &str) -> ReferencedResource {
+    split_reference(
+        reference,
+        ALIAS_PREFIX,
+        RESOURCE_TYPE_POLICY_STORE_ALIAS,
+        RESOURCE_TYPE_POLICY_STORE,
+    )
+}
+
+/// What a `policyId` request member names: a policy by id, or — when it carries
+/// [`POLICY_NAME_PREFIX`], the form [`PolicyStore::resolve_policy_id`] resolves —
+/// a policy by name. Either way the resource is a policy.
+pub fn policy_reference(reference: &str) -> ReferencedResource {
+    split_reference(
+        reference,
+        POLICY_NAME_PREFIX,
+        RESOURCE_TYPE_POLICY,
+        RESOURCE_TYPE_POLICY,
+    )
+}
+
+/// What an `aliasName` request member names: always a policy store alias, whose
+/// own id is the name without its documented [`ALIAS_PREFIX`] resource path.
+pub fn alias_reference(alias_name: &str) -> ReferencedResource {
+    split_reference(
+        alias_name,
+        ALIAS_PREFIX,
+        RESOURCE_TYPE_POLICY_STORE_ALIAS,
+        RESOURCE_TYPE_POLICY_STORE_ALIAS,
+    )
+}
+
 /// Encode a pagination cursor: the key the next page starts at, hex-encoded so
 /// the token is opaque to the caller and matches `NextToken`'s
 /// `^[A-Za-z0-9-_=+/\.]*$`.
@@ -853,13 +987,36 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// The ARN of a policy store alias. The alias name already carries its
-/// [`ALIAS_PREFIX`], which is the resource segment's type, so the ARN is that
-/// name under this account — and, like the policy-store ARN
-/// `CreatePolicyStore` mints, it carries no region segment.
-pub fn alias_arn(alias_name: &str) -> String {
-    ::engine::emulator_arn("verifiedpermissions", "", alias_name)
+/// The ARN of a policy store alias, in `region`.
+///
+/// The alias name already carries its [`ALIAS_PREFIX`], which is the resource
+/// segment's type, so the resource part is that name verbatim — the same string
+/// `aliases` is keyed on, so the ARN and the state key cannot disagree.
+/// `CreatePolicyStoreAlias` refuses a name without the prefix before anything
+/// reaches here, which the assertion states rather than silently repairing.
+///
+/// Verified Permissions is a REGIONAL service and an alias name "is unique in
+/// the account and Region", so the alias ARN's third colon-separated field — the
+/// region, per `ResourceArn`'s `^arn:[^:]*:[^:]*:[^:]*:[^:]*:.*$` — is the region
+/// the request was signed for ([`request_region`]). A present-but-empty region
+/// segment shifts nothing on the wire but makes the ARN match no ARN pattern or
+/// resource-based policy written for the real service.
+///
+/// The policy-store ARN `CreatePolicyStore` mints is deliberately NOT built this
+/// way: AWS publishes policy-store ARNs without a region
+/// (`arn:aws:verifiedpermissions::<account>:policy-store/<id>`), which is also
+/// what the recorded responses carry, so that ARN keeps its empty region segment.
+pub fn alias_arn(region: &str, alias_name: &str) -> String {
+    debug_assert!(
+        alias_name.starts_with(ALIAS_PREFIX),
+        "an alias name reaching alias_arn carries {ALIAS_PREFIX}, got {alias_name}"
+    );
+    ::engine::emulator_arn(ARN_SERVICE, region, alias_name)
 }
+
+/// This service's ARN namespace, from the model's `aws.api#service` trait
+/// (`arnNamespace: verifiedpermissions`).
+pub const ARN_SERVICE: &str = "verifiedpermissions";
 
 /// A canonical, UNAMBIGUOUS rendering of the parameters one `clientToken` was
 /// first used with, for the [`IdempotencyRecord::parameters`] field: a later

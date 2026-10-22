@@ -15,3 +15,5 @@
 mod invoice_unit_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire_envelope_and_error_detail.rs"]
+mod wire_envelope_and_error_detail;

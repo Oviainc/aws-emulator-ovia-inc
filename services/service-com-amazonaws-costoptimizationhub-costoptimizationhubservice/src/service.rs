@@ -62,9 +62,19 @@
 //! the model cannot express (an unknown `nextToken`, an `orderBy` dimension that
 //! names no member) fills the same two members through
 //! [`field_validation_exception`], the one place that envelope is built; a
-//! refusal no field accounts for \u2014 a rule about the CALLER rather than about a
-//! value the request carries \u2014 goes through [`other_validation_exception`],
+//! refusal no field accounts for — a rule about the CALLER rather than about a
+//! value the request carries — goes through [`other_validation_exception`],
 //! which is what the model's `Other` reason names.
+//!
+//! # A member's own value set or bound is the one its operation enforces
+//!
+//! What a member declares is not always what the generated schema carries: a
+//! `@range` written on the member overrides the one on the shape it targets, and
+//! the value set an enum member is judged against is the set the SERVICE accepts
+//! on the wire, which can be wider than the published enum. Such a member's
+//! traits are kept off the schema (`skip_validation`) and the operation checks
+//! it through [`out_of_range`] or [`not_in_enum`], so the refusal is worded
+//! exactly as the boundary walk would word it.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::SerdeError;
@@ -343,6 +353,39 @@ pub(crate) fn out_of_range(
     // is here only because `ViolationKind` is `#[non_exhaustive]`.
     let message = requirement(&kind)
         .unwrap_or_else(|| format!("Member must have value between {min} and {max}"));
+    Some(field_validation_exception(vec![ValidationExceptionDetail {
+        field_name: member.to_string(),
+        message,
+    }]))
+}
+
+/// This service's refusal of a string member whose value is outside the set the
+/// service ACCEPTS for it, or `None` when the value is one of them.
+///
+/// `accepted` is the set the service takes on the wire, which is not always the
+/// published enum's: `UpdateEnrollmentStatus.status` admits a terminal state the
+/// model's `EnrollmentStatus` does not list
+/// (`crate::state::ENROLLMENT_STATUS_WIRE_VALUES`). The accepted set is also the
+/// set the entry advertises, and the clause comes from the same [`requirement`]
+/// wording the constraint walk uses, so a handler-enforced value set reads like
+/// a walk-enforced one.
+pub(crate) fn not_in_enum(
+    member: &str,
+    value: &str,
+    accepted: &[&str],
+) -> Option<ValidationException> {
+    if accepted.contains(&value) {
+        return None;
+    }
+    let kind = ViolationKind::EnumValue(accepted.iter().map(|v| (*v).to_string()).collect());
+    // `requirement` words this kind; the fallback is unreachable, and is here
+    // only because `ViolationKind` is `#[non_exhaustive]`.
+    let message = requirement(&kind).unwrap_or_else(|| {
+        format!(
+            "Member must satisfy enum value set: [{}]",
+            accepted.join(", ")
+        )
+    });
     Some(field_validation_exception(vec![ValidationExceptionDetail {
         field_name: member.to_string(),
         message,

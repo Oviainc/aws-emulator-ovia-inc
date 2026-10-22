@@ -41,3 +41,5 @@ mod schema_lifecycle;
 mod state_roundtrip;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/wire_fidelity.rs"]
+mod wire_fidelity;
