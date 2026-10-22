@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the member associations of the calling (administrator) account's hub, one
+//! per `AccountDetails` entry, each starting in the documented `Created` status —
+//! "the administrator account added the member account, but has not yet invited the
+//! member account". `GetMembers` reads them back.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +136,16 @@ impl From<CreateMembersErrorModeled> for CreateMembersError {
     }
 }
 
+/// The modelled 400 for an input value outside a documented bound.
+fn invalid_input(message: String) -> CreateMembersError {
+    CreateMembersError::Modeled(CreateMembersErrorModeled::InvalidInputException(
+        InvalidInputException {
+            message: Some(message),
+            code: Some("InvalidInputException".to_string()),
+        },
+    ))
+}
+
 /// The `CreateMembers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -176,18 +182,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMembers"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMembersError::Modeled(CreateMembersErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let hub = crate::state::hub_key(ctx);
+        let administrator_id = hub.0.as_str();
+        let region = hub.1.as_str();
+
+        // "This action can only be used by an account that has Security Hub CSPM
+        // enabled. To enable Security Hub CSPM, you can use the EnableSecurityHub
+        // operation." — without the hub there is no administrator account for the
+        // members to be associated with.
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(CreateMembersErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(administrator_id, region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A malformed account id is an invalid input parameter, not a per-account
+        // result: the whole request is refused and nothing is persisted, so a caller
+        // never has to work out which half of its batch landed.
+        if let Some(bad) = input
+            .account_details
+            .iter()
+            .find(|detail| !crate::state::is_account_id(&detail.account_id))
+        {
+            return Err(invalid_input(format!(
+                "AccountDetails.AccountId must be {} digits, got '{}'",
+                crate::state::ACCOUNT_ID_LEN, bad.account_id
+            )));
+        }
+
+        // The same, for the size of what a single entry asks this store to keep: the
+        // model bounds how MANY accounts one call carries but says nothing about the
+        // length of an `Email`, so the handler bounds it.
+        if let Some(bad) = input.account_details.iter().find(|detail| {
+            detail
+                .email
+                .as_ref()
+                .is_some_and(|email| email.chars().count() > crate::state::MAX_MEMBER_EMAIL_LEN)
+        }) {
+            return Err(invalid_input(format!(
+                "AccountDetails.Email must be at most {} characters for account {}",
+                crate::state::MAX_MEMBER_EMAIL_LEN, bad.account_id
+            )));
+        }
+
+        // A hub holds at most [`crate::state::MAX_MEMBERS_PER_HUB`] member
+        // associations, so the number of records a caller can make this store hold is
+        // bounded however many calls it makes; past it the create is the modelled
+        // `LimitExceededException`. Only the accounts this call would ADD count: a
+        // call that re-creates associations the hub already holds stays inside it.
+        let held = store
+            .members
+            .keys()
+            .filter(|key| key.account_id == administrator_id && key.region == region)
+            .count();
+        let mut added: Vec<&str> = Vec::new();
+        for detail in &input.account_details {
+            let account_id = detail.account_id.as_str();
+            if account_id == administrator_id || added.contains(&account_id) {
+                continue;
+            }
+            if !store
+                .members
+                .contains_key(&crate::state::member_key(&hub, account_id))
+            {
+                added.push(account_id);
+            }
+        }
+        if held + added.len() > crate::state::MAX_MEMBERS_PER_HUB {
+            return Err(CreateMembersErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Account {administrator_id} may hold at most {} member accounts in Region \
+                         {region} and already holds {held}",
+                        crate::state::MAX_MEMBERS_PER_HUB
+                    )),
+                    code: Some("LimitExceededException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One instant for the whole call: every association it touches was written
+        // together.
+        let written_at = crate::state::now_date_time();
+        let mut unprocessed_accounts: Vec<Result2> = Vec::new();
+
+        for detail in &input.account_details {
+            // The administrator account is the other end of the association, so it
+            // cannot also be a member of itself. It is reported per account rather
+            // than failing the accounts in the same call that CAN be associated.
+            if detail.account_id == administrator_id {
+                unprocessed_accounts.push(Result2 {
+                    account_id: Some(detail.account_id.clone()),
+                    processing_result: Some(format!(
+                        "The request is rejected because the account {administrator_id} is the \
+                         administrator account and cannot be its own member account"
+                    )),
+                });
+                continue;
+            }
+
+            // One lookup per account: the association is created, or updated in
+            // place, through its own entry.
+            match store
+                .members
+                .entry(crate::state::member_key(&hub, &detail.account_id))
+            {
+                ::std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    let association = occupied.get_mut();
+                    // The details an entry leaves out keep the value already stored:
+                    // an association's email survives a call that does not restate it.
+                    if detail.email.is_some() {
+                        association.email = detail.email.clone();
+                    }
+                    // An association that is still in force keeps its own status:
+                    // re-adding an account must not pull an `Invited` or `Enabled`
+                    // member back to `Created`, which is what makes a repeated call
+                    // idempotent. A dissolved one is re-created — "CreateMembers is
+                    // only used in the following cases: … The account was
+                    // disassociated or deleted in Security Hub CSPM" — so it starts
+                    // again in `Created` with no invitation sent.
+                    if crate::state::member_status_is_dissolved(&association.member_status) {
+                        association.member_status =
+                            crate::state::MEMBER_STATUS_CREATED.to_string();
+                        association.invited_at = None;
+                    }
+                    association.updated_at = written_at;
+                }
+                ::std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(crate::state::MemberAssociation {
+                        email: detail.email.clone(),
+                        member_status: crate::state::MEMBER_STATUS_CREATED.to_string(),
+                        invited_at: None,
+                        updated_at: written_at,
+                    });
+                }
+            }
+        }
+
+        Ok(CreateMembersOutput {
+            unprocessed_accounts: Some(unprocessed_accounts),
+        })
     }
 }

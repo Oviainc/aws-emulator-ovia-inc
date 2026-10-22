@@ -30,6 +30,33 @@ pub struct FindingKey {
     pub finding_id: String,
 }
 
+/// A member association's identity: the administrator hub it belongs to (the
+/// account/Region pair that made the `CreateMembers` call), plus the member account
+/// id — the identity every member operation addresses an association by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MemberKey {
+    /// The administrator account the association belongs to.
+    pub account_id: String,
+    pub region: String,
+    /// The member account id.
+    pub member_account_id: String,
+}
+
+/// The member association `CreateMembers` creates and `GetMembers` reports.
+#[derive(Debug, Clone)]
+pub struct MemberAssociation {
+    /// The email `AccountDetails$Email` carried, when the administrator supplied one.
+    pub email: Option<String>,
+    /// One of the documented `Member$MemberStatus` values.
+    pub member_status: String,
+    /// Set only once an invitation has been sent; `Member$InvitedAt` is "a timestamp
+    /// for the date and time when the invitation was sent to the member account", so
+    /// an association that was only created carries none.
+    pub invited_at: Option<::aws_smithy_types::DateTime>,
+    /// `Member$UpdatedAt`: when the member account was last updated.
+    pub updated_at: ::aws_smithy_types::DateTime,
+}
+
 /// The `Hub` resource `EnableSecurityHub` creates and `DescribeHub` reports.
 #[derive(Debug, Clone)]
 pub struct Hub {
@@ -203,6 +230,8 @@ pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
     pub hubs: HashMap<HubKey, Hub>,
     /// Imported findings, keyed by hub + `AwsSecurityFindingIdentifier`.
     pub findings: HashMap<FindingKey, StoredFinding>,
+    /// Member associations, keyed by administrator account/Region + member account id.
+    pub members: HashMap<MemberKey, MemberAssociation>,
     /// Custom action targets, keyed by hub + the creator-chosen `Id`.
     pub action_targets: HashMap<ActionTargetKey, ActionTargetRecord>,
     /// The enabled standards, keyed by hub + standard ARN.
@@ -258,6 +287,28 @@ pub const MAX_ACTION_TARGETS_PER_HUB: usize = 100;
 /// `ops/batch_import_findings.rs`): one record's size must not grow with whatever a
 /// caller sends.
 pub const MAX_ACTION_TARGET_DESCRIPTION_LEN: usize = 1024;
+
+/// How many member associations one hub (`(account, Region)`) may hold. The AWS
+/// Security Hub quotas table publishes 1,000 member accounts per administrator
+/// account, and `CreateMembers` models `LimitExceededException` for a create "beyond
+/// the current Amazon Web Services account … limits"; the bound is also what keeps
+/// this store from growing with the number of calls a caller makes.
+pub const MAX_MEMBERS_PER_HUB: usize = 1_000;
+
+/// The longest `Email` this store keeps for a member association. The model
+/// documents no bound for `AccountDetails$Email`, so the cap is the longest address
+/// SMTP itself allows (RFC 5321 §4.5.3.1.3 bounds a forward path at 256 octets
+/// including the angle brackets, so 254 characters of address): one record's size
+/// must not grow with whatever a caller sends.
+pub const MAX_MEMBER_EMAIL_LEN: usize = 254;
+
+/// How many accounts one member operation may address in a single call: the bound
+/// the model already puts on `CreateMembers`' own batch (`AccountDetailsList`, "len
+/// 1..50"), applied to every member operation's account list so neither the work one
+/// call does under the state lock nor the response it produces grows with what a
+/// caller sends. `GetMembers`' `AccountIdList` carries no `length` trait, so its
+/// handler enforces this.
+pub const MAX_MEMBER_BATCH: usize = 50;
 
 /// A `NextToken` resuming a list at `offset`, carrying `prefix` so a token minted for
 /// another list — or a value a caller invented — is rejected rather than read as an
@@ -530,6 +581,59 @@ pub fn hub_key(ctx: &smithy_server_runtime::OperationContext<'_>) -> HubKey {
     (request_account_id(), request_region(ctx))
 }
 
+/// The key of a member association of the administrator hub `hub` — the single
+/// definition of how every member operation addresses an association.
+pub fn member_key(hub: &HubKey, member_account_id: &str) -> MemberKey {
+    MemberKey {
+        account_id: hub.0.clone(),
+        region: hub.1.clone(),
+        member_account_id: member_account_id.to_string(),
+    }
+}
+
+/// An Amazon Web Services account id is exactly 12 decimal digits (the
+/// `AwsSecurityFinding$AwsAccountId` length constraint: "Length Constraints: 12").
+/// The `AccountId` shape itself carries no `length`/`pattern` trait, so the
+/// framework's boundary validation cannot refuse a malformed id and each member
+/// operation checks it.
+pub const ACCOUNT_ID_LEN: usize = 12;
+
+/// Whether `candidate` is a well-formed Amazon Web Services account id.
+pub fn is_account_id(candidate: &str) -> bool {
+    candidate.len() == ACCOUNT_ID_LEN && candidate.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+// The documented `Member$MemberStatus` values (`smithy_query(query="shape",
+// shape="Member")`, member `MemberStatus`).
+
+/// "`Created` - Indicates that the administrator account added the member account,
+/// but has not yet invited the member account."
+pub const MEMBER_STATUS_CREATED: &str = "Created";
+/// "`Invited` - Indicates that the administrator account invited the member account.
+/// The member account has not yet responded to the invitation."
+pub const MEMBER_STATUS_INVITED: &str = "Invited";
+/// "`Enabled` - Indicates that the member account is currently active."
+pub const MEMBER_STATUS_ENABLED: &str = "Enabled";
+/// "`Removed` - Indicates that the administrator account disassociated the member
+/// account."
+pub const MEMBER_STATUS_REMOVED: &str = "Removed";
+/// "`Resigned` - Indicates that the member account disassociated themselves from the
+/// administrator account."
+pub const MEMBER_STATUS_RESIGNED: &str = "Resigned";
+/// "`Deleted` - Indicates that the administrator account deleted the member account."
+pub const MEMBER_STATUS_DELETED: &str = "Deleted";
+
+/// Whether a member status means the association is no longer in force, so
+/// `CreateMembers` re-creates it rather than leaving it alone: "`CreateMembers` is
+/// only used in the following cases: … The account was disassociated or deleted in
+/// Security Hub CSPM" (`smithy_query(query="operation", operation="CreateMembers")`).
+pub fn member_status_is_dissolved(status: &str) -> bool {
+    matches!(
+        status,
+        MEMBER_STATUS_REMOVED | MEMBER_STATUS_RESIGNED | MEMBER_STATUS_DELETED
+    )
+}
+
 /// The resource prefix a custom action target's ARN carries:
 /// `arn:aws:securityhub:<region>:<account>:action/custom/<Id>` — the form the
 /// model's own `ActionTargetArn` examples carry (every one of them matches
@@ -553,18 +657,23 @@ pub fn hub_arn(key: &HubKey) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, &key.1, HUB_RESOURCE)
 }
 
+/// The current instant as a modelled `Timestamp` — the type every `date-time`
+/// member of this service (`Member$UpdatedAt`, `Member$InvitedAt`, …) carries.
+pub fn now_date_time() -> ::aws_smithy_types::DateTime {
+    let since_epoch = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+        since_epoch.subsec_nanos(),
+    )
+}
+
 /// The current instant in the ISO-8601 (RFC-3339) form every Security Hub
 /// timestamp member uses.
 pub fn now_iso8601() -> String {
-    let now = ::std::time::SystemTime::now();
-    let since_epoch = now
-        .duration_since(::std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let dt = ::aws_smithy_types::DateTime::from_secs_and_nanos(
-        i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
-        since_epoch.subsec_nanos(),
-    );
-    dt.fmt(::aws_smithy_types::date_time::Format::DateTime)
+    now_date_time()
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|_| String::new())
 }
 
