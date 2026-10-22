@@ -387,6 +387,28 @@ pub struct ManagedPolicy {
     pub versions: BTreeMap<String, PolicyVersion>,
 }
 
+/// One instance profile the account holds.
+///
+/// The modelled [`InstanceProfile`] is kept exactly as every reader reports it, beside
+/// the BINDING `AddRoleToInstanceProfile` writes: the [`name_key`]s of the roles the
+/// profile holds. A bound role is NOT copied in here — it stays in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::roles`], the one record of what
+/// a role is, so a read of the profile reports that role as it stands now rather than a
+/// snapshot taken when it was bound (see
+/// [`instance_profile_report`](ComAmazonawsIamAwsidentitymanagementv20100508State::instance_profile_report)).
+#[derive(Debug, Clone)]
+pub struct InstanceProfileRecord {
+    /// The profile as `CreateInstanceProfile` returned it and `GetInstanceProfile`
+    /// reports it. Its `roles` member is not the binding and is never read: the report
+    /// builder fills it from [`role_keys`](Self::role_keys).
+    pub profile: InstanceProfile,
+    /// The [`name_key`]s of the roles bound to this profile, in the order they were
+    /// bound. At most [`MAX_ROLES_PER_INSTANCE_PROFILE`] of them, because "an instance
+    /// profile can contain only one role, and this quota cannot be increased"
+    /// (`AddRoleToInstanceProfile`).
+    pub role_keys: Vec<String>,
+}
+
 /// One access key an IAM user holds, keyed in [`ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`]
 /// by the access key id.
 ///
@@ -473,11 +495,12 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// unique within the account and "are not distinguished by case", while
     /// `InstanceProfile::instance_profile_name` keeps the case the creator chose.
     ///
-    /// The modelled [`InstanceProfile`] is stored exactly as every reader reports it,
-    /// including its `Roles` — "The role associated with the instance profile"
+    /// The stored value is an [`InstanceProfileRecord`]: the modelled profile beside the
+    /// names of the roles bound to it — "The role associated with the instance profile"
     /// (`InstanceProfile$Roles`) — so `AddRoleToInstanceProfile` has one place to bind a
-    /// role and `GetInstanceProfile` one place to read it from.
-    pub instance_profiles: BTreeMap<String, InstanceProfile>,
+    /// role and `GetInstanceProfile` one place to read the binding from, while the role
+    /// itself stays in [`Self::roles`].
+    pub instance_profiles: BTreeMap<String, InstanceProfileRecord>,
     /// The managed policies attached to each role: [`name_key`] of the role name
     /// -> the attached policies' ARNs. A `BTreeSet` because a policy is attached
     /// to a role at most once (a repeat attach is the same attachment) and
@@ -615,6 +638,42 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// size quota ([`MAX_ROLE_INLINE_POLICY_CHARACTERS`]) is taken against.
     pub fn role_inline_policy_characters(&self, role_key: &str, replacing: &str) -> usize {
         inline_policy_characters(&self.role_inline_policies, role_key, replacing)
+    }
+
+    /// The instance profile keyed by `profile_key` as a reader must report it: the
+    /// profile's own members, with `Roles` resolved from [`Self::roles`].
+    ///
+    /// `InstanceProfile$Roles` reports the ROLE, not a name, so the report has to carry
+    /// the role as the account holds it at the moment of the read: the binding
+    /// `AddRoleToInstanceProfile` wrote names the role, and a later change to that role
+    /// (a tag, a description, a permissions boundary) is part of what the next read of
+    /// the profile reports. A binding whose role the account no longer holds reports no
+    /// role rather than a resurrected copy of it.
+    pub fn instance_profile_report(&self, profile_key: &str) -> Option<InstanceProfile> {
+        let held = self.instance_profiles.get(profile_key)?;
+        Some(InstanceProfile {
+            roles: held
+                .role_keys
+                .iter()
+                .filter_map(|role_key| self.roles.get(role_key).cloned())
+                .collect(),
+            ..held.profile.clone()
+        })
+    }
+
+    /// The names of the instance profiles the role keyed by `role_key` is bound to, in
+    /// the profiles' stable key order.
+    ///
+    /// This is what tells a delete that an instance profile still depends on the role:
+    /// "before you delete a role, remove the following attached items: inline policies,
+    /// attached managed policies, instance profile" (`DeleteRole`). The names are the
+    /// ones the profiles were created with, so a refusal can say which they are.
+    pub fn instance_profiles_holding_role(&self, role_key: &str) -> Vec<String> {
+        self.instance_profiles
+            .values()
+            .filter(|record| record.role_keys.iter().any(|held| held == role_key))
+            .map(|record| record.profile.instance_profile_name.clone())
+            .collect()
     }
 }
 

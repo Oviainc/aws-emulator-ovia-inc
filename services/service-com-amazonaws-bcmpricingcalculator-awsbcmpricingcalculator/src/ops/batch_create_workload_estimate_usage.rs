@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateWorkloadEstimateUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateWorkloadEstimateUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints one usage line per request entry under the workload estimate
+//! `workloadEstimateId` names, stores it there, and reports each one with the `id` it
+//! was assigned and the `quantity` read off the entry's `amount`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateWorkloadEstimateUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adding usage changes what the estimate's cost is computed over, so the estimate
+//! re-enters the non-terminal `UPDATING` status and the CLOCK owes it the terminal one
+//! with the recomputed cost (`crate::state::WorkloadEstimate::begin_cost_recompute`).
+//!
+//! A `workloadEstimateId` no live estimate carries is `ResourceNotFoundException` (HTTP
+//! 404) for the whole request — there is no parent to store anything under. A failure
+//! that belongs to ONE entry is reported in `errors` against that entry's `key`, which
+//! the model requires to be unique within a request for exactly that reason, while the
+//! other entries are still created.
+//!
+//! The operation is `@idempotent` and `clientToken` is an `@idempotencyToken`, so a
+//! replayed token answers with the usage lines the first call created instead of
+//! minting a second set. A token carrying a request the first call did not make
+//! (another estimate, other entries) is `ConflictException` (HTTP 409) rather than a
+//! replay of someone else's answer.
+//!
+//! A line's `location`, `cost`, `currency`, `status` and its quantity's `unit` all come
+//! from the AWS price list, which this emulator does not carry, so they stay unset
+//! rather than carrying a value nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +133,60 @@ impl From<BatchCreateWorkloadEstimateUsageErrorModeled> for BatchCreateWorkloadE
     }
 }
 
+/// The `WorkloadEstimateCostStatus` a cost that is current carries (smithy_query:
+/// `shape="WorkloadEstimateCostStatus"`, values `VALID | INVALID | STALE`).
+const COST_STATUS_VALID: &str = "VALID";
+
+/// Push the digest parts of one batch entry.
+///
+/// Written member by member rather than from a derived `Debug`, so the digest is a
+/// contract this file owns: ADD A LINE HERE when the model gives
+/// `BatchCreateWorkloadEstimateUsageEntry` another member, or two requests differing
+/// only in that member will share one fingerprint. `request_fingerprint`
+/// length-prefixes every part, so parts cannot run together; the `historicalUsage` half
+/// is `crate::state`'s, so every batch operation of this service fingerprints that
+/// shape the same way.
+fn push_entry_digest(parts: &mut Vec<String>, entry: &BatchCreateWorkloadEstimateUsageEntry) {
+    parts.push(entry.key.clone());
+    parts.push(entry.service_code.clone());
+    parts.push(entry.usage_type.clone());
+    parts.push(entry.operation.clone());
+    parts.push(entry.usage_account_id.clone());
+    parts.push(entry.group.clone().unwrap_or_default());
+    parts.push(entry.amount.to_string());
+    if let Some(historical) = &entry.historical_usage {
+        crate::state::push_historical_usage_digest(parts, historical);
+    }
+}
+
+/// This operation's item for one stored usage line.
+fn item_for(line: &crate::state::WorkloadEstimateUsage) -> BatchCreateWorkloadEstimateUsageItem {
+    BatchCreateWorkloadEstimateUsageItem {
+        id: Some(line.id.clone()),
+        key: line.key.clone(),
+        service_code: line.service_code.clone(),
+        usage_type: line.usage_type.clone(),
+        operation: line.operation.clone(),
+        location: line.location.clone(),
+        group: line.group.clone(),
+        usage_account_id: Some(line.usage_account_id.clone()),
+        quantity: Some(line.quantity()),
+        cost: line.cost,
+        // `currency` says which currency a reported `cost` is in, so it is reported
+        // exactly when a cost is — and then it is the one `CurrencyCode` the model
+        // declares.
+        currency: line
+            .cost
+            .map(|_| crate::state::COST_CURRENCY.to_string()),
+        // `status` (a `WorkloadEstimateCostStatus`) says whether the cost reported for
+        // this line is current, and the cost of a line created just now is. With no
+        // cost reported there is nothing for it to qualify, so it stays unset rather
+        // than asserting a cost state nothing established.
+        status: line.cost.map(|_| COST_STATUS_VALID.to_string()),
+        historical_usage: line.historical_usage.clone(),
+    }
+}
+
 /// The `BatchCreateWorkloadEstimateUsage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,20 +221,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateWorkloadEstimateUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateWorkloadEstimateUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchCreateWorkloadEstimateUsageErrorModeled::DataUnavailableException(
+                    DataUnavailableException {
+                        message: "the workload estimate store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        let now_millis = crate::state::now_millis();
+        // Materialise what the clock has already made due, so this call does not store
+        // anything under an estimate that is already past its `expiresAt`, and does not
+        // start a recomputation from a status the clock has moved on from.
+        state.settle(now_millis);
+
+        // The per-entry failures this request earns, computed from the request alone:
+        // an entry whose `key` repeats an earlier entry's cannot be answered against
+        // that key. Computed BEFORE the replay branch so a replayed token reproduces
+        // the first call's `errors`, not an empty list.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateWorkloadEstimateUsage"))
+        // INFERRED, not modelled: the model declares no `@uniqueItems`-style constraint
+        // on an entry's `key`; the requirement is read off
+        // `BatchCreateWorkloadEstimateUsageEntry$key`'s documentation ("A unique
+        // identifier for this entry in the batch operation [...] useful to identify
+        // errors associated with any usage entry"), which only holds if one key names
+        // one entry of a request. It is scoped to the request, as that documentation
+        // scopes it: a key may be reused by a later call.
+        let mut keys_seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        let mut accepted: Vec<&BatchCreateWorkloadEstimateUsageEntry> =
+            Vec::with_capacity(input.usage.len());
+        let mut errors = Vec::new();
+        for entry in &input.usage {
+            if keys_seen.insert(entry.key.as_str()) {
+                accepted.push(entry);
+            } else {
+                errors.push(BatchCreateWorkloadEstimateUsageError2 {
+                    key: Some(entry.key.clone()),
+                    // CHOSEN from the values `BatchCreateWorkloadEstimateUsageCode`
+                    // declares (`BAD_REQUEST` | `CONFLICT` | `INTERNAL_SERVER_ERROR` |
+                    // `NOT_FOUND`): the model does not say which one a duplicate key
+                    // earns, and a clash between two entries of one request is a
+                    // conflict rather than any of the other three.
+                    error_code: Some("CONFLICT".to_string()),
+                    error_message: Some(format!(
+                        "key {} appears more than once in this request; each entry's key must be unique",
+                        entry.key
+                    )),
+                });
+            }
+        }
+
+        // A replayed `@idempotencyToken` answers with the usage lines the first call
+        // created, with their original ids — and, because the answer is only replayed
+        // when the request DIGEST also matches, the `errors` recomputed above are the
+        // ones that first call reported. The same token carrying a different request
+        // (another estimate, other entries) is not a retry, so it is refused as a
+        // conflict rather than answered with another request's lines.
+        let mut digest_parts: Vec<String> = vec![input.workload_estimate_id.clone()];
+        for entry in &input.usage {
+            push_entry_digest(&mut digest_parts, entry);
+        }
+        let fingerprint = crate::state::request_fingerprint(&digest_parts);
+
+        match state.replay(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Replayed(ids) => {
+                // The record resolves unless pruning has removed the lines it named,
+                // which `prune_idempotency` only does once they are gone (with their
+                // estimate, or one by one through a delete); falling through then
+                // creates what the caller asked for, exactly as `CreateWorkloadEstimate`
+                // does, rather than answering a batch with the few rows that survived.
+                if let Some(estimate) = state.workload_estimate(&input.workload_estimate_id) {
+                    let items: Vec<_> = ids
+                        .iter()
+                        .filter_map(|id| estimate.usage_line(id))
+                        .map(item_for)
+                        .collect();
+                    if items.len() == ids.len() {
+                        return Ok(BatchCreateWorkloadEstimateUsageOutput {
+                            items: Some(items),
+                            errors: Some(errors),
+                        });
+                    }
+                }
+            }
+            crate::state::Replay::Mismatch(created) => {
+                return Err(
+                    BatchCreateWorkloadEstimateUsageErrorModeled::ConflictException(
+                        ConflictException {
+                            message: "this clientToken was already used for a different \
+                                      BatchCreateWorkloadEstimateUsage request"
+                                .to_string(),
+                            // The resource the token already created, so the caller can
+                            // resolve the conflict against it.
+                            resource_id: created
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| input.workload_estimate_id.clone()),
+                            resource_type: crate::state::WORKLOAD_ESTIMATE_USAGE_RESOURCE_TYPE
+                                .to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        let Some(estimate) = state.workload_estimate(&input.workload_estimate_id) else {
+            return Err(
+                BatchCreateWorkloadEstimateUsageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No workload estimate found with identifier {}",
+                            input.workload_estimate_id
+                        ),
+                        resource_id: input.workload_estimate_id.clone(),
+                        resource_type: crate::state::WORKLOAD_ESTIMATE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let stored = estimate.usage.len();
+        if stored + accepted.len() > crate::state::MAX_USAGE_PER_WORKLOAD_ESTIMATE {
+            return Err(
+                BatchCreateWorkloadEstimateUsageErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "a workload estimate holds at most {} usage lines; this estimate holds {stored}",
+                            crate::state::MAX_USAGE_PER_WORKLOAD_ESTIMATE,
+                        ),
+                        resource_id: input.workload_estimate_id.clone(),
+                        resource_type: crate::state::WORKLOAD_ESTIMATE_USAGE_RESOURCE_TYPE
+                            .to_string(),
+                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every id this request assigns is minted BEFORE the estimate is borrowed
+        // mutably, in one pass over the store, so no two rows of one batch (and no row
+        // and an existing resource) can share an id.
+        let created_ids = state.mint_resource_ids(accepted.len());
+
+        let mut items = Vec::with_capacity(accepted.len());
+        // Resolved again because minting needed the store immutably; the estimate was
+        // found above and this guard holds the only lock on the store, so it is still
+        // there — and if it somehow were not, the caller is told so rather than
+        // panicked at.
+        let Some(estimate) = state.workload_estimate_mut(&input.workload_estimate_id) else {
+            return Err(
+                BatchCreateWorkloadEstimateUsageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No workload estimate found with identifier {}",
+                            input.workload_estimate_id
+                        ),
+                        resource_id: input.workload_estimate_id.clone(),
+                        resource_type: crate::state::WORKLOAD_ESTIMATE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        for (entry, id) in accepted.iter().zip(&created_ids) {
+            let line = crate::state::WorkloadEstimateUsage {
+                id: id.clone(),
+                key: Some(entry.key.clone()),
+                service_code: entry.service_code.clone(),
+                usage_type: entry.usage_type.clone(),
+                operation: entry.operation.clone(),
+                usage_account_id: entry.usage_account_id.clone(),
+                // Resolving a usage type's pricing location needs the price list,
+                // which this emulator does not carry.
+                location: None,
+                group: entry.group.clone(),
+                amount: entry.amount,
+                // And so does pricing it.
+                cost: None,
+                historical_usage: entry.historical_usage.clone(),
+            };
+
+            items.push(item_for(&line));
+            estimate.usage.push(line);
+        }
+
+        // The estimate's cost is computed over the usage it holds, which this call just
+        // changed, so the service owes it a recomputation: the estimate re-enters the
+        // non-terminal status and the clock lands the new cost with the terminal one.
+        estimate.begin_cost_recompute(now_millis);
+
+        state.record_idempotent(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            created_ids,
+        );
+
+        Ok(BatchCreateWorkloadEstimateUsageOutput {
+            items: Some(items),
+            errors: Some(errors),
+        })
     }
 }

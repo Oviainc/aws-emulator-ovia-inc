@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let role_key = crate::state::name_key(&input.role_name);
-        let Some(role) = store.roles.get(&role_key).cloned() else {
+        let Some(role_path) = store.roles.get(&role_key).map(|role| role.path.clone()) else {
             return Err(AddRoleToInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!("Role {} cannot be found.", input.role_name)),
@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service that depends on the service-linked role can modify or delete the
         // role on your behalf." (`UnmodifiableEntityException` doc.) Putting one in an
         // instance profile is such a modification.
-        if let Some(principal) = crate::state::service_linked_role_principal(&role.path) {
+        if let Some(principal) = crate::state::service_linked_role_principal(&role_path) {
             return Err(
                 AddRoleToInstanceProfileErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
@@ -248,11 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A repeated add of the role the profile already carries attempted "to create
         // a resource that already exists" (`EntityAlreadyExistsException` doc) rather
         // than a second association.
-        if profile
-            .roles
-            .iter()
-            .any(|held| crate::state::name_key(&held.role_name) == role_key)
-        {
+        if profile.role_keys.contains(&role_key) {
             return Err(
                 AddRoleToInstanceProfileErrorModeled::EntityAlreadyExistsException(
                     EntityAlreadyExistsException {
@@ -269,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An instance profile can contain only one role, and this quota cannot be
         // increased. You can remove the existing role and then add a different role to
         // an instance profile." (`AddRoleToInstanceProfile` doc.)
-        if profile.roles.len() >= crate::state::MAX_ROLES_PER_INSTANCE_PROFILE {
+        if profile.role_keys.len() >= crate::state::MAX_ROLES_PER_INSTANCE_PROFILE {
             return Err(AddRoleToInstanceProfileErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -281,9 +277,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The role is stored on the profile record itself, so the single store is
-        // still the one place the association lives.
-        profile.roles.push(role);
+        // The binding is the role's key on the profile record, so the single store is
+        // still the one place the association lives — and the ROLE is still stored once,
+        // in the role map, which is what a later read of this profile reports it from.
+        profile.role_keys.push(role_key);
         Ok(AddRoleToInstanceProfileOutput)
     }
 }

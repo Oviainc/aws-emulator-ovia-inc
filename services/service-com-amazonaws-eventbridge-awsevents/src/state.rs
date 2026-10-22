@@ -20,7 +20,7 @@
 //! are ordered so enumeration is deterministic, which is what lets the list
 //! operations resume from an opaque page token.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
@@ -810,6 +810,209 @@ pub fn is_arn(value: &str) -> bool {
         return false;
     };
     !partition.is_empty() && !service.is_empty() && !resource.is_empty()
+}
+
+/// Why a `PutTargets` request's `Targets` list names no single state to reach,
+/// or `None` when it does.
+///
+/// `Id` is the key a target is STORED under — "The ID of the target within the
+/// specified rule. Use this ID to reference the target when updating the rule"
+/// (`Target$Id`), and `PutTargets` "adds the specified targets to the specified
+/// rule, or updates the targets if they are already associated with the rule" —
+/// so two entries of ONE request carrying the same `Id` ask for two different
+/// targets at one key, and no stored target set satisfies the request. The
+/// whole request is refused, before any of its entries is applied, rather than
+/// one of the two silently winning.
+///
+/// The message is built from the request: it names the parameter and the `Id`
+/// that repeated, the way this service's other request-derived refusals do.
+pub fn duplicate_target_id_violation<'ids>(
+    ids: impl IntoIterator<Item = &'ids str>,
+) -> Option<String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Some(format!(
+                "Parameter targets is not valid. Reason: More than one target with Id \
+                 '{id}' is provided."
+            ));
+        }
+    }
+    None
+}
+
+/// Why one target of a `PutTargets` request cannot be installed as given, or
+/// `None` when it can.
+///
+/// Every ARN-valued member of a `Target` has to hold an ARN: `Arn` is "The
+/// Amazon Resource Name (ARN) of the target", `RoleArn` "the ARN of the IAM
+/// role to be used for this target", and `DeadLetterConfig$Arn` the ARN of the
+/// queue dead-letter events go to. None of the three is modelled with a
+/// pattern — they are plain 1..1600 strings — so the boundary validator passes
+/// any text, and a value that is not an ARN names no resource the rule could
+/// ever invoke. The request is refused WHOLE, before any of its targets is
+/// stored: a rule carrying a target that points nowhere would report back an
+/// invocation target AWS never accepted.
+///
+/// The message is built from the request, naming the value that was rejected
+/// and the form that was expected.
+pub fn target_arn_violation(target: &Target) -> Option<String> {
+    [
+        Some(target.arn.as_str()),
+        target.role_arn.as_deref(),
+        target
+            .dead_letter_config
+            .as_ref()
+            .and_then(|config| config.arn.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !is_arn(value))
+    .map(|value| {
+        format!("Parameter {value} is not valid. Reason: Provided Arn is not in correct format.")
+    })
+}
+
+/// Why one published event entry names no event, or `None` when it names one.
+///
+/// "Detail, DetailType, and Source are required for EventBridge to successfully
+/// send an event to an event bus. If you include event entries in a request
+/// that do not include each of those properties, EventBridge fails that entry.
+/// If you submit a request in which none of the entries have each of these
+/// properties, EventBridge fails the entire request"
+/// (`PutEventsRequestEntry$Detail`). None of the three is modelled `@required`,
+/// so nothing refuses an entry without them before a handler runs. They are
+/// checked in the order the entry documents them, so a refusal names the first
+/// property the entry does not provide.
+///
+/// `Detail` counts as provided when the entry CARRIES it, which is what the
+/// documentation asks of a request ("do not include each of those properties");
+/// whether its text is a JSON object is a separate check, with its own
+/// per-entry error code. `Source` and `DetailType` identify the event, so text
+/// that is only whitespace names nothing and is treated as absent.
+pub fn missing_entry_member(
+    source: Option<&str>,
+    detail_type: Option<&str>,
+    detail: Option<&str>,
+) -> Option<&'static str> {
+    let names_something = |text: Option<&str>| text.is_some_and(|text| !text.trim().is_empty());
+    [
+        ("Detail", detail.is_some()),
+        ("DetailType", names_something(detail_type)),
+        ("Source", names_something(source)),
+    ]
+    .into_iter()
+    .find_map(|(member, provided)| (!provided).then_some(member))
+}
+
+/// What a refusal states for an entry member the entry does not provide.
+pub fn required_member_violation(member: &str) -> String {
+    format!("Parameter {member} is not valid. Reason: {member} is a required argument.")
+}
+
+/// Largest `DetailType` one published event entry may carry, in characters.
+///
+/// "Free-form string, with a maximum of 128 characters, used to decide what
+/// fields to expect in the event detail" (`PutEventsRequestEntry$DetailType`).
+/// The member's target shape is a plain `String` carrying no `@length`, so the
+/// boundary validator passes a longer value and the documented limit has to be
+/// enforced per entry — see [`entry_limit_violation`].
+pub const MAX_DETAIL_TYPE_CHARS: usize = 128;
+
+/// Why one published event entry is outside a limit AWS DOCUMENTS for an entry
+/// member, or `None` when it is within every one of them.
+///
+/// These are the limits the entry's own documentation states while the model
+/// expresses none of them, so nothing refuses them before a handler runs. An
+/// entry violating one is not published: it is reported as a FAILED entry (the
+/// per-entry `InvalidArgument`, "A specified parameter is not valid"), not as a
+/// refusal of the whole request, because `PutEvents` reports one outcome per
+/// entry.
+///
+/// Today that is `DetailType`'s [`MAX_DETAIL_TYPE_CHARS`]; `Source` and
+/// `Detail` state no maximum of their own, and the size of the entry as a whole
+/// is [`MAX_ENTRY_SIZE_BYTES`], checked separately by
+/// [`put_events_entry_size`].
+pub fn entry_limit_violation(detail_type: Option<&str>) -> Option<String> {
+    let detail_type = detail_type?;
+    (detail_type.chars().count() > MAX_DETAIL_TYPE_CHARS).then(|| {
+        format!(
+            "Parameter DetailType is not valid. Reason: DetailType can't have more than \
+             {MAX_DETAIL_TYPE_CHARS} characters."
+        )
+    })
+}
+
+/// One clause of a `ValidationException` message: the value that was rejected,
+/// the member path it sat at, and the requirement it failed.
+///
+/// `value` is `None` for a member that was ABSENT, reported as the null it was
+/// rather than as a rendering of something the caller sent.
+///
+/// This and the three helpers below are the wording of a constraint refusal,
+/// which `crate::service`'s `override_refusal` renders and a handler enforcing
+/// an unmodelled constraint itself can reach, so a refusal found at the
+/// boundary and one found in a handler read identically.
+///
+/// NOTE: the subject half, the requirement half and [`unanchored`] are the same
+/// for every service and belong in `services/common/src/validation.rs` — whose
+/// module docs record that migration as a change of its own. They are inlined
+/// here, as they are in the ~24 other service crates that state them
+/// (`grep -rln 'fn unanchored' services/*/src`), and are to be MOVED there
+/// rather than copied again.
+pub fn constraint_clause(member_path: &str, value: Option<&str>, requirement: &str) -> String {
+    let subject = match value {
+        Some(shown) => format!("Value '{shown}'"),
+        None => "Value null".to_string(),
+    };
+    format!("{subject} at '{member_path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The requirement clause for a `@pattern` violation: the expression the value
+/// had to satisfy, rendered WITHOUT the anchors the model spells it with (see
+/// [`unanchored`]).
+pub fn pattern_requirement(pattern: &str) -> String {
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        unanchored(pattern)
+    )
+}
+
+/// The `ValidationException` message over one or more clauses: how many
+/// constraints were violated, then the clauses themselves.
+pub fn validation_envelope(clauses: &[String]) -> String {
+    match clauses {
+        [only] => format!("1 validation error detected: {only}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with: the
+/// requirement reported is the expression a value must satisfy, not the
+/// anchoring the model uses to make the match total.
+///
+/// Only the expression's OUTER anchors go: an anchor inside the expression (one
+/// per branch of an alternation, say) is part of its own structure, and
+/// dropping it would change which strings the reported expression describes. A
+/// `$` escaped by a backslash is a literal dollar sign rather than the end
+/// anchor, so it stays.
+pub fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
 }
 
 /// The identifier an event bus's customer managed key is reported back under:
