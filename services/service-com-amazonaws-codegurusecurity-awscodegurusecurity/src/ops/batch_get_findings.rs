@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves finding identifiers against the SAME store `GetFindings` pages, and reports
+//! one `failedFindings` entry per identifier it cannot resolve rather than failing the
+//! whole call.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetFindings"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetFindingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        let mut findings = Vec::new();
+        let mut failed_findings = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for identifier in &input.finding_identifiers {
+            let key = (identifier.scan_name.clone(), identifier.finding_id.clone());
+
+            // One identifier resolves to at most one finding, so a repeat inside the
+            // batch cannot be answered twice: the repeat is reported, the first
+            // occurrence is resolved normally.
+            if !seen.insert(key) {
+                failed_findings.push(BatchGetFindingsError2 {
+                    scan_name: identifier.scan_name.clone(),
+                    finding_id: identifier.finding_id.clone(),
+                    error_code: crate::state::ERROR_CODE_DUPLICATE_IDENTIFIER.to_string(),
+                    message: "this scanName and findingId appear more than once in \
+                              findingIdentifiers"
+                        .to_string(),
+                });
+                continue;
+            }
+
+            if !store.scans.contains_key(&identifier.scan_name) {
+                failed_findings.push(BatchGetFindingsError2 {
+                    scan_name: identifier.scan_name.clone(),
+                    finding_id: identifier.finding_id.clone(),
+                    error_code: crate::state::ERROR_CODE_INVALID_SCAN_NAME.to_string(),
+                    message: format!("no scan named {}", identifier.scan_name),
+                });
+                continue;
+            }
+
+            match store.finding(&identifier.scan_name, &identifier.finding_id) {
+                Some(finding) => findings.push(finding.clone()),
+                None => failed_findings.push(BatchGetFindingsError2 {
+                    scan_name: identifier.scan_name.clone(),
+                    finding_id: identifier.finding_id.clone(),
+                    error_code: crate::state::ERROR_CODE_ITEM_DOES_NOT_EXIST.to_string(),
+                    message: format!(
+                        "scan {scan_name} has no finding {finding_id}",
+                        scan_name = identifier.scan_name,
+                        finding_id = identifier.finding_id,
+                    ),
+                }),
+            }
+        }
+
+        Ok(BatchGetFindingsOutput {
+            findings,
+            failed_findings,
+        })
     }
 }

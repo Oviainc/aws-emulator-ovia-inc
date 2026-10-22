@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the findings of one scan out of the SAME store `BatchGetFindings` reads.
+//! Reporting only, apart from materialising the run-state transitions the clock already
+//! owes (`state::settle_due_runs`).
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +141,10 @@ impl<Eng> GetFindings<Eng> {
     }
 }
 
+/// The page size `GetFindings` uses when the request names no `maxResults`, and the cap
+/// it never exceeds: the modelled `GetFindingsRequest$maxResults` range is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1000;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for GetFindings<Eng>
 {
@@ -163,18 +162,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFindingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The token is the finding id the previous page stopped BEFORE; the ids are
+        // walked in one stable order, so the next page resumes exactly there. It travels
+        // hex-encoded, so the token always satisfies the modelled `NextToken` pattern
+        // whatever characters a stored `findingId` contains. Decoded up front: a request
+        // this service could not have issued is refused whatever state the scan is in.
+        let resume_at = match &input.next_token {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(GetFindingsErrorModeled::ValidationException(
+                        ValidationException {
+                            error_code: "ValidationException".to_string(),
+                            message: "nextToken is not a token this service issued".to_string(),
+                            reason: "fieldValidationFailed".to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message:
+                                    "pass back the nextToken from the previous page unchanged"
+                                        .to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        let mut store = state.lock();
+        store.settle_due_runs(crate::state::now_millis());
+
+        let Some(scan) = store.scans.get(&input.scan_name) else {
+            return Err(GetFindingsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: "ResourceNotFoundException".to_string(),
+                    message: format!("no scan named {}", input.scan_name),
+                    resource_id: input.scan_name.clone(),
+                    resource_type: "scan".to_string(),
+                },
+            )
+            .into());
+        };
+        let latest_run = scan.latest_run().map(|run| (run.run_id.clone(), run.scan_state.clone()));
+
+        // A run that has not finished has produced no findings yet, so asking for them
+        // conflicts with the scan's current state — the one state conflict this
+        // reporting operation can have, and the reason it models `ConflictException`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFindings"))
+        // Keyed on the LATEST run deliberately: `GetFindings` takes no `runId`, so it
+        // reports the findings of the scan as the scan stands now, and while the scan's
+        // current revision is running that set is not yet known — an earlier revision's
+        // findings are not the answer to the question asked.
+        if let Some((run_id, scan_state)) = &latest_run {
+            if scan_state == crate::state::SCAN_STATE_IN_PROGRESS {
+                return Err(GetFindingsErrorModeled::ConflictException(ConflictException {
+                    error_code: "ConflictException".to_string(),
+                    message: format!(
+                        "scan {scan_name} is still running revision {run_id}; its findings are \
+                         not available until the run finishes",
+                        scan_name = input.scan_name,
+                    ),
+                    resource_id: input.scan_name.clone(),
+                    resource_type: "scan".to_string(),
+                })
+                .into());
+            }
+        }
+
+        // "Pass either Open, Closed, or All" (`GetFindingsRequest$status`). The model
+        // declares no default, so a request that names none filters nothing.
+        let status = input
+            .status
+            .clone()
+            .unwrap_or_else(|| crate::state::STATUS_ALL.to_string());
+        let matching: Vec<(String, Finding)> = store
+            .findings_of(&input.scan_name)
+            .into_iter()
+            .filter(|(_, finding)| {
+                status == crate::state::STATUS_ALL
+                    || finding.status.as_deref() == Some(status.as_str())
+            })
+            .collect();
+
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(MAX_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // The ids are walked in one stable order, so a page resumes exactly where the
+        // previous one stopped.
+        let mut findings = Vec::new();
+        let mut next_token = None;
+        for (finding_id, finding) in matching {
+            if resume_at
+                .as_ref()
+                .is_some_and(|cursor| &finding_id < cursor)
+            {
+                continue;
+            }
+            if findings.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(&finding_id));
+                break;
+            }
+            findings.push(finding);
+        }
+
+        Ok(GetFindingsOutput {
+            findings: Some(findings),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the scan store `CreateScan` writes. Reporting only, apart from materialising
+//! the run-state transitions the clock already owes (`state::settle_due_runs`).
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +130,11 @@ impl<Eng> ListScans<Eng> {
     }
 }
 
+/// The page size `ListScans` uses when the request names no `maxResults`, and the cap
+/// it never exceeds: the modelled `ListScansRequest$maxResults` range is 1..100, so a
+/// page never carries more than 100 summaries.
+const MAX_PAGE_SIZE: i32 = 100;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListScans<Eng>
 {
@@ -153,18 +152,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScans"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListScansErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_runs(crate::state::now_millis());
+
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(MAX_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // The token is the scan name the previous page stopped BEFORE, so the next page
+        // resumes exactly there: no entry is repeated and none is skipped. It travels
+        // hex-encoded, so the token always satisfies the modelled `NextToken` pattern.
+        let resume_at = match &input.next_token {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListScansErrorModeled::ValidationException(ValidationException {
+                        error_code: "ValidationException".to_string(),
+                        message: "nextToken is not a token this service issued".to_string(),
+                        reason: "fieldValidationFailed".to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "nextToken".to_string(),
+                            message: "pass back the nextToken from the previous page unchanged"
+                                .to_string(),
+                        }]),
+                    })
+                    .into());
+                }
+            },
+            None => None,
+        };
+        let page = match &resume_at {
+            Some(cursor) => store.scans.range(cursor.clone()..),
+            None => store.scans.range::<String, _>(..),
+        };
+
+        let mut summaries = Vec::new();
+        let mut next_token = None;
+        for (scan_name, scan) in page {
+            // Resolved before the page boundary is tested, so an entry this loop skips
+            // can never become the cursor the next page resumes at.
+            let Some(run) = scan.latest_run() else {
+                continue;
+            };
+            if summaries.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(scan_name));
+                break;
+            }
+            summaries.push(ScanSummary {
+                scan_state: run.scan_state.clone(),
+                created_at: crate::state::to_timestamp(scan.created_at_millis),
+                updated_at: scan
+                    .updated_at_for(&run.scan_type)
+                    .map(crate::state::to_timestamp),
+                scan_name: scan.scan_name.clone(),
+                run_id: run.run_id.clone(),
+                scan_name_arn: Some(scan.scan_name_arn.clone()),
+            });
+        }
+
+        Ok(ListScansOutput {
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }

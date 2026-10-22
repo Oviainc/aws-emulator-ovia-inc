@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetScan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetScan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetScan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one scan run back out of the store `CreateScan` writes. Reporting only, but it
+//! first materialises the run-state transition the clock already owes
+//! (`state::settle_due_runs`), which is a change that was due at the same instant
+//! whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetScan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetScanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetScan"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetScanErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_runs(crate::state::now_millis());
+
+        let Some(scan) = store.scans.get(&input.scan_name) else {
+            return Err(GetScanErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: "ResourceNotFoundException".to_string(),
+                    message: format!("no scan named {}", input.scan_name),
+                    resource_id: input.scan_name.clone(),
+                    resource_type: "scan".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `runId` names one run of the scan; absent, the latest run answers.
+        let Some(run) = scan.run(input.run_id.as_deref()) else {
+            return Err(GetScanErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: "ResourceNotFoundException".to_string(),
+                    message: match &input.run_id {
+                        Some(run_id) => {
+                            format!("scan {} has no run {run_id}", input.scan_name)
+                        }
+                        None => format!("scan {} has no runs", input.scan_name),
+                    },
+                    resource_id: input.run_id.clone().unwrap_or_else(|| input.scan_name.clone()),
+                    resource_type: "scanRun".to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetScanOutput {
+            scan_name: scan.scan_name.clone(),
+            run_id: run.run_id.clone(),
+            scan_state: run.scan_state.clone(),
+            // "The time the scan was created" (`GetScanResponse$createdAt`) — the scan's
+            // own creation, not this run's.
+            created_at: crate::state::to_timestamp(scan.created_at_millis),
+            analysis_type: run.analysis_type.clone(),
+            // `updatedAt` is the SCAN's ("The time when the scan was last updated",
+            // `GetScanResponse$updatedAt`), so it is read off the scan record even when
+            // an older `runId` selected the rest of this answer; only its availability
+            // is gated on that run's scan type.
+            updated_at: scan
+                .updated_at_for(&run.scan_type)
+                .map(crate::state::to_timestamp),
+            number_of_revisions: Some(scan.number_of_revisions()),
+            scan_name_arn: Some(scan.scan_name_arn.clone()),
+            error_message: run.error_message.clone(),
+        })
     }
 }
