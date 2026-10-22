@@ -254,7 +254,9 @@ fn branch_projection_cases() -> Vec<BranchProjectionCase> {
                 "framework": null,
                 // Determined by the service: always present.
                 "enablePerformanceMode": false,
-                "backend": {},
+                // Every modelled member reaches the wire, nested ones included: an
+                // unset `Backend$stackArn` is an explicit null, not a missing key.
+                "backend": { "stackArn": null },
             }),
         },
         BranchProjectionCase {
@@ -272,7 +274,7 @@ fn branch_projection_cases() -> Vec<BranchProjectionCase> {
                 "activeJobId": null,
                 "customDomains": null,
                 "enablePerformanceMode": false,
-                "backend": {},
+                "backend": { "stackArn": null },
             }),
         },
         BranchProjectionCase {
@@ -387,7 +389,9 @@ async fn every_branch_returning_operation_projects_the_same_record() {
 struct TagCase {
     case: &'static str,
     tags: Option<Value>,
-    echoed: Option<Value>,
+    /// The WIRE value of `tags` on the write response: `null` when the request set
+    /// none, since every modelled member reaches the wire.
+    echoed: Value,
     reported: Value,
 }
 
@@ -399,19 +403,19 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             case: "no tags at all",
             tags: None,
-            echoed: None,
+            echoed: Value::Null,
             reported: json!({}),
         },
         TagCase {
             case: "one tag",
             tags: Some(json!({ "team": "web" })),
-            echoed: Some(json!({ "team": "web" })),
+            echoed: json!({ "team": "web" }),
             reported: json!({ "team": "web" }),
         },
         TagCase {
             case: "three tags",
             tags: Some(json!({ "team": "web", "env": "test", "owner": "nobody" })),
-            echoed: Some(json!({ "team": "web", "env": "test", "owner": "nobody" })),
+            echoed: json!({ "team": "web", "env": "test", "owner": "nobody" }),
             reported: json!({ "team": "web", "env": "test", "owner": "nobody" }),
         },
     ]
@@ -440,7 +444,7 @@ async fn a_read_reports_the_tag_map_and_a_write_echoes_what_the_request_set() {
         let app_id = string_member(&app, "appId");
         assert_eq!(
             app.get("tags"),
-            case.echoed.as_ref(),
+            Some(&case.echoed),
             "case {label:?}: CreateApp must echo the tags the request set, got {:?}",
             app.get("tags")
         );
@@ -479,7 +483,7 @@ async fn a_read_reports_the_tag_map_and_a_write_echoes_what_the_request_set() {
         let branch_name = string_member(&branch, "branchName");
         assert_eq!(
             branch.get("tags"),
-            case.echoed.as_ref(),
+            Some(&case.echoed),
             "case {label:?}: CreateBranch must echo the tags the request set, got {:?}",
             branch.get("tags")
         );
