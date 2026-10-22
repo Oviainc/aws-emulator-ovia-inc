@@ -265,9 +265,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // object, which is what the interpreter receives.
         let execution_input = input.input.clone().unwrap_or_else(|| "{}".to_string());
         if let Err(error) = serde_json::from_str::<serde_json::Value>(&execution_input) {
+            // The refusal names WHAT was invalid and quotes the diagnostic for it,
+            // through the same constructor an invalid definition is reported with,
+            // rather than answering the parser's own string bare.
             return Err(StartExecutionErrorModeled::InvalidExecutionInput(
                 InvalidExecutionInput {
-                    message: Some(format!("input is not valid JSON: {error}")),
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
+                        &error.to_string(),
+                    )),
                 },
             )
             .into());

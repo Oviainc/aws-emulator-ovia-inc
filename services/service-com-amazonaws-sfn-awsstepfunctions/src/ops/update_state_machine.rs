@@ -292,9 +292,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM role, and the two configuration structures whose members must agree
         // with each other.
         if let Some(definition) = input.definition.as_deref() {
-            if let Err(why) = crate::state::asl::validate(definition) {
+            if let Err(diagnostic) = crate::state::asl::validate(definition) {
                 return Err(UpdateStateMachineErrorModeled::InvalidDefinition(
-                    InvalidDefinition { message: Some(why) },
+                    InvalidDefinition {
+                        // The same construction `CreateStateMachine` reports a
+                        // definition diagnostic through: the thing that is invalid,
+                        // then the diagnostic quoted.
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::INVALID_STATE_MACHINE_DEFINITION,
+                            &diagnostic,
+                        )),
+                    },
                 )
                 .into());
             }
@@ -356,21 +364,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if let Err(rejection) = store.apply_state_machine_update(&input.state_machine_arn, update) {
             return Err(match rejection {
+                // Both conditions are worded by the service's ONE constructor,
+                // from the ARN the request named, so this operation reads the same
+                // sentence every other operation raising the same shape reads.
                 crate::state::StateMachineUpdateRejection::NotFound => {
                     UpdateStateMachineErrorModeled::StateMachineDoesNotExist(
                         StateMachineDoesNotExist {
-                            message: Some(format!(
-                                "State Machine Does Not Exist: '{}'",
-                                input.state_machine_arn
+                            message: Some(crate::state::resource_error_message(
+                                crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                                &input.state_machine_arn,
                             )),
                         },
                     )
                 }
                 crate::state::StateMachineUpdateRejection::Deleting => {
                     UpdateStateMachineErrorModeled::StateMachineDeleting(StateMachineDeleting {
-                        message: Some(format!(
-                            "State Machine Deleting: '{}'",
-                            input.state_machine_arn
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DELETING,
+                            &input.state_machine_arn,
                         )),
                     })
                 }
