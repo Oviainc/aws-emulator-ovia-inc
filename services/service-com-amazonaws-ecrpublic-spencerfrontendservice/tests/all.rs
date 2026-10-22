@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/client_error_message_templates.rs"]
 mod client_error_message_templates;
+#[path = "all/layer_part_uploads.rs"]
+mod layer_part_uploads;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
 #[path = "all/registry_catalog_data.rs"]

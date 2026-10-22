@@ -11,7 +11,7 @@
 //! rather than one recorded request.
 //!
 //! The harness (`emulator`, `ok`, `error`, `string_at`, `base64`, `from_base64` and
-//! the independent `git_blob_id` object-name oracle) is the one in
+//! the independent `git_blob_id` object-name oracle) is the shared one in
 //! [`crate::repository_lifecycle`].
 
 use std::collections::BTreeMap;
@@ -19,9 +19,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::repository_lifecycle::{
-    base64, emulator, error, from_base64, git_blob_id, ok, string_at,
-};
+use crate::repository_lifecycle::{base64, emulator, error, from_base64, git_blob_id, ok, string_at};
 
 /// One row of the content table: a file written into the repository, and the bytes
 /// `GetBlob` must answer with for the object name that write reported.

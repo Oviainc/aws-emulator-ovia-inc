@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/blob_content.rs"]
 mod blob_content;
+#[path = "all/comment_lifecycle.rs"]
+mod comment_lifecycle;
 #[path = "all/commit_reads.rs"]
 mod commit_reads;
 #[path = "all/compared_commit_comments.rs"]
@@ -29,3 +31,5 @@ mod repository_lifecycle;
 mod repository_rename;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire.rs"]
+mod wire;

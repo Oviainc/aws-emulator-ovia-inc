@@ -15,106 +15,14 @@
 //! from the returned fields, so the id is checked against the rule rather than
 //! against itself.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use sha2::Digest;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region the test's requests are signed for.
-const REGION: &str = "us-west-2";
-
-/// Build the emulator the way the router does: one shared engine, this service
-/// mounted on it, request authentication off so the test signs nothing.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_codecommit_codecommit_20150413::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// Send one awsJson1_1 request: `POST /` with `X-Amz-Target:
-/// CodeCommit_20150413.<Operation>` (the crate's OPERATIONS.md "Wire protocol").
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("https://codecommit.us-west-2.amazonaws.com/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("CodeCommit_20150413.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTKEY/20260101/{REGION}/codecommit/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload: Value = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|error| {
-            panic!(
-                "operation {operation}: response body is not JSON ({error}): {:?}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, payload)
-}
-
-/// A successful call's payload, with the status asserted.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
-    let (status, payload) = call(router, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "operation {operation}: expected 200, got {status} with {payload}"
-    );
-    payload
-}
-
-/// The modeled error code of a failed call, with the status asserted. awsJson
-/// carries it in `__type`, optionally namespace-qualified.
-async fn error(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: &Value,
-    expected_status: u16,
-) -> String {
-    let (status, payload) = call(router, operation, body).await;
-    assert_eq!(
-        status, expected_status,
-        "operation {operation}: expected HTTP {expected_status}, got {status} with {payload}"
-    );
-    payload
-        .get("__type")
-        .and_then(Value::as_str)
-        .map(|shape| shape.rsplit('#').next().unwrap_or(shape).to_string())
-        .unwrap_or_else(|| panic!("operation {operation}: no __type in {payload}"))
-}
-
-fn string_at(payload: &Value, pointer: &str) -> String {
-    payload
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("expected a string at {pointer} in {payload}"))
-        .to_string()
-}
-
-fn base64(content: &[u8]) -> String {
-    aws_smithy_types::base64::encode(content)
-}
-
-fn is_object_id(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
+// The wire harness — building the emulator, signing a call, reading an answer,
+// and the small value helpers — is the shared one in
+// `crate::repository_lifecycle`, so no two suites can disagree about what
+// calling the service means.
+use crate::repository_lifecycle::{base64, emulator, error, is_object_id, ok, string_at};
 
 /// A git identity line: `"<name> <<email>> <date>"`, with an absent name or email
 /// written as empty, which is what git records for an unnamed author.

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutCommentReaction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutCommentReaction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutCommentReaction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: records this caller's emoji reaction to a comment in
+//! `crate::state` — one reaction per caller per comment — or removes it when the
+//! request asks for none.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutCommentReaction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutCommentReactionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutCommentReaction"))
+        // "You can only add or update a reaction for yourself": the reaction is
+        // stored against the principal this request authenticates as.
+        let caller_arn = crate::state::caller_identity_arn(ctx.parts());
+
+        let comment_id = match crate::state::normalize_comment_id(&input.comment_id) {
+            Ok(comment_id) => comment_id.to_string(),
+            Err(crate::state::CommentIdProblem::Missing) => {
+                return Err(PutCommentReactionErrorModeled::CommentIdRequiredException(
+                    CommentIdRequiredException {
+                        message: Some(
+                            "The comment ID is missing or null. A comment ID is required."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::CommentIdProblem::Invalid) => {
+                return Err(PutCommentReactionErrorModeled::InvalidCommentIdException(
+                    InvalidCommentIdException {
+                        message: Some(format!(
+                            "the comment ID {} is not in a valid format",
+                            input.comment_id
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // A blank value, or the documented `none`, removes this caller's reaction;
+        // anything else has to name a reaction the service's table holds, or "the
+        // value of the reaction is not valid".
+        let reaction = if crate::state::is_reaction_removal(&input.reaction_value) {
+            None
+        } else {
+            Some(
+                crate::state::canonical_reaction(&input.reaction_value).ok_or_else(|| {
+                    PutCommentReactionErrorModeled::InvalidReactionValueException(
+                        InvalidReactionValueException {
+                            message: Some(format!(
+                                "the reaction value {} is not valid",
+                                input.reaction_value
+                            )),
+                        },
+                    )
+                })?,
+            )
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let comment = store.comment_mut(&comment_id).ok_or_else(|| {
+            PutCommentReactionErrorModeled::CommentDoesNotExistException(
+                CommentDoesNotExistException {
+                    message: Some(format!("no comment exists with the ID {comment_id}")),
+                },
+            )
+        })?;
+        // A deleted comment can no longer be reacted to.
+        if comment.deleted {
+            return Err(PutCommentReactionErrorModeled::CommentDeletedException(
+                CommentDeletedException {
+                    message: Some(format!(
+                        "the comment {comment_id} has already been deleted"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        match reaction {
+            // "Reactions are limited to one reaction per user for each individual
+            // comment ID", so a caller's second reaction REPLACES its first rather
+            // than adding one — and a principal that holds none yet is refused once
+            // the comment is at the bound on how many principals it holds, since
+            // that principal comes from the caller's own credential.
+            Some(reaction) => {
+                if !comment.reactions.contains_key(&caller_arn)
+                    && comment.reactions.len() >= crate::state::MAX_REACTIONS_PER_COMMENT
+                {
+                    return Err(PutCommentReactionErrorModeled::ReactionLimitExceededException(
+                        ReactionLimitExceededException {
+                            message: Some(format!(
+                                "the comment {comment_id} already holds reactions from {} users, which is the maximum",
+                                crate::state::MAX_REACTIONS_PER_COMMENT
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                comment.reactions.insert(caller_arn, reaction.to_string());
+            }
+            None => {
+                comment.reactions.remove(&caller_arn);
+            }
+        }
+
+        Ok(PutCommentReactionOutput)
     }
 }
