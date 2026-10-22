@@ -17,6 +17,8 @@ mod configure_logs;
 mod describe_packaging_configuration;
 #[path = "all/error_responses.rs"]
 mod error_responses;
+#[path = "all/packaging_configuration_deletion.rs"]
+mod packaging_configuration_deletion;
 #[path = "all/packaging_configuration_listing.rs"]
 mod packaging_configuration_listing;
 #[path = "all/packaging_group_update.rs"]
