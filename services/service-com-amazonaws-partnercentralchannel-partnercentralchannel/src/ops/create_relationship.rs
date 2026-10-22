@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRelationship
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRelationship`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRelationship::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the parent program management account out of
+//! [`crate::state`], mints an `rs-` id, builds the child ARN under the parent and
+//! answers from what it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRelationship` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRelationshipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRelationship"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRelationshipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service is not mounted on a state-bearing engine".into(),
+                },
+            )
+            .into());
+        };
+
+        // Enum-typed members are refused at the boundary, but a value outside the
+        // model's own set must never be stored, so each is checked against it.
+        for (member, value, values) in [
+            (
+                "associationType",
+                input.association_type.as_str(),
+                ASSOCIATION_TYPE_VALUES,
+            ),
+            ("sector", input.sector.as_str(), SECTOR_VALUES),
+        ] {
+            if !values.contains(&value) {
+                return Err(enum_refusal(member, value, values));
+            }
+        }
+        if let Some(model) = input.resale_account_model.as_deref() {
+            if !RESALE_ACCOUNT_MODEL_VALUES.contains(&model) {
+                return Err(enum_refusal(
+                    "resaleAccountModel",
+                    model,
+                    RESALE_ACCOUNT_MODEL_VALUES,
+                ));
+            }
+        }
+
+        // The identifier member accepts either a bare `pma-…` id or the full ARN.
+        let Some(parent_id) = crate::state::resolve_identifier(
+            &input.program_management_account_identifier,
+            crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
+        )
+        .map(str::to_string) else {
+            return Err(CreateRelationshipErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    "programManagementAccountIdentifier",
+                    format!(
+                        "Value '{}' at 'programManagementAccountIdentifier' failed to satisfy \
+                         constraint: Member must be a program management account id or ARN",
+                        input.program_management_account_identifier
+                    ),
+                ),
+            )
+            .into());
+        };
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let _ = ctx;
+        let mut guard = state.lock();
+        guard.advance_clock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            crate::state::TokenOutcome::Replay(record) => {
+                if let Some(relationship) = record
+                    .resource_id
+                    .as_deref()
+                    .and_then(|id| guard.relationships.get(id))
+                {
+                    return Ok(output_for(relationship));
+                }
+                return Err(CreateRelationshipErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: "The relationship created with this client token no longer \
+                                  exists."
+                            .into(),
+                        resource_id: record.resource_id,
+                        resource_type: Some(crate::state::RELATIONSHIP_RESOURCE_TYPE.into()),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenOutcome::ParameterMismatch
+            | crate::state::TokenOutcome::TokenInUse => {
+                return Err(CreateRelationshipErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "The specified clientToken has already been used with different \
+                                  parameters."
+                            .into(),
+                        resource_id: client_token.unwrap_or_default().to_string(),
+                        resource_type: "ClientToken".to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A relationship is a CHILD of a program management account, so the
+        // parent must exist in the requested catalog before one can be created.
+        let parent = guard
+            .program_management_accounts
+            .get(&parent_id)
+            .filter(|account| account.catalog == input.catalog);
+        let Some(parent) = parent else {
+            return Err(CreateRelationshipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Program management account {parent_id} was not found in catalog {}.",
+                        input.catalog
+                    ),
+                    resource_id: Some(parent_id.clone()),
+                    resource_type: Some(
+                        crate::state::PROGRAM_MANAGEMENT_ACCOUNT_RESOURCE_TYPE.into(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let parent_arn = parent.arn.clone();
+
+        // The store is in memory and this is the only operation that grows it, so
+        // the per-parent relationship count is capped.
+        if guard.relationships.count_for_parent(&parent_id)
+            >= crate::state::MAX_RELATIONSHIPS_PER_ACCOUNT
+        {
+            return Err(
+                CreateRelationshipErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the quota of {} relationships for program \
+                             management account {parent_id}.",
+                            crate::state::MAX_RELATIONSHIPS_PER_ACCOUNT
+                        ),
+                        resource_id: parent_id.clone(),
+                        resource_type: crate::state::RELATIONSHIP_RESOURCE_TYPE.to_string(),
+                        quota_code: crate::state::RELATIONSHIP_QUOTA_CODE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = guard.mint_id(crate::state::RELATIONSHIP_ID_PREFIX);
+        let arn = crate::state::relationship_arn(&parent_arn, &id);
+        let created_at = crate::state::now();
+        guard.relationships.insert(crate::state::Relationship {
+            id: id.clone(),
+            arn,
+            catalog: input.catalog,
+            program_management_account_id: parent_id,
+            association_type: input.association_type,
+            associated_account_id: input.associated_account_id,
+            display_name: input.display_name,
+            resale_account_model: input.resale_account_model,
+            sector: input.sector,
+            requested_support_plan: input.requested_support_plan,
+            revision: crate::state::INITIAL_REVISION,
+            created_at,
+            updated_at: created_at,
+            start_date: created_at,
+            tags: input.tags.unwrap_or_default(),
+        });
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(id.clone()),
+        );
+
+        // Answer from the store, not from the request struct.
+        let relationship = guard.relationships.get(&id).ok_or_else(|| {
+            CreateRelationshipError::from(CreateRelationshipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the relationship that was just stored could not be read back".into(),
+                },
+            ))
+        })?;
+        Ok(output_for(relationship))
     }
+}
+
+/// The response for a stored relationship. The ONE place this operation's output
+/// is built, so a fresh create and an idempotent replay answer from the same
+/// stored fields.
+fn output_for(relationship: &crate::state::Relationship) -> CreateRelationshipOutput {
+    CreateRelationshipOutput {
+        relationship_detail: Some(CreateRelationshipDetail {
+            arn: Some(relationship.arn.clone()),
+            id: Some(relationship.id.clone()),
+        }),
+    }
+}
+
+/// Refuse `member` because `value` is outside the model's own value set.
+fn enum_refusal(member: &str, value: &str, values: &[&str]) -> CreateRelationshipError {
+    CreateRelationshipErrorModeled::ValidationException(crate::state::validation_exception(
+        member,
+        format!(
+            "Value '{value}' at '{member}' failed to satisfy constraint: Member must satisfy \
+             enum value set: [{}]",
+            values.join(", ")
+        ),
+    ))
+    .into()
 }
