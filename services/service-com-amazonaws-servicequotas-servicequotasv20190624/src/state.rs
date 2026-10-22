@@ -892,6 +892,16 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     }
 }
 
+/// An `ExclusionList` as it arrives on the wire (service code -> quota codes), in the
+/// form [`AutoManagementConfig::exclusion_list`] stores: keyed in service-code order,
+/// with each service's codes kept exactly as the caller named them, and empty when the
+/// request named no exclusion list at all.
+pub fn stored_exclusion_list(
+    exclusion_list: Option<HashMap<String, Vec<String>>>,
+) -> BTreeMap<String, Vec<String>> {
+    exclusion_list.unwrap_or_default().into_iter().collect()
+}
+
 /// A wall-clock instant as the modelled `Timestamp` the wire carries.
 fn epoch_timestamp(time: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = time
