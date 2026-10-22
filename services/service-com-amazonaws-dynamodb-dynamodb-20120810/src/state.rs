@@ -367,6 +367,45 @@ impl NumberKey {
     fn significant_digits(&self) -> i64 {
         i64::try_from(self.digits.len()).unwrap_or(i64::MAX)
     }
+
+    /// This number's CANONICAL text — the one form every read of it reports.
+    ///
+    /// An `N` value travels as a string ("Numbers are sent across the network to
+    /// DynamoDB as strings, to maximize compatibility across languages and libraries.
+    /// However, DynamoDB treats them as number type attributes" — `AttributeValue$N`),
+    /// so what is stored is the NUMBER and what a read reports is that number rendered
+    /// once, not the lexeme a writer happened to send. The rendering is plain decimal
+    /// over the normalised digits — never an exponent, no sign on zero, and a leading
+    /// or trailing zero only where the decimal point needs one — so every spelling of
+    /// one value reads back identically.
+    pub fn canonical_text(&self) -> String {
+        if self.digits.is_empty() {
+            return "0".to_string();
+        }
+        let digits: String = self
+            .digits
+            .iter()
+            .map(|digit| char::from(b'0' + digit))
+            .collect();
+        // The value is 0.<digits> * 10^point, so `point` is where the decimal point
+        // falls among the digits: left of them all (a leading "0." and the zeros the
+        // exponent asks for), right of them all (trailing zeros), or between two.
+        let magnitude = match usize::try_from(self.point) {
+            Err(_) | Ok(0) => {
+                let zeros = usize::try_from(self.point.unsigned_abs()).unwrap_or(0);
+                format!("0.{}{digits}", "0".repeat(zeros))
+            }
+            Ok(at) if at >= self.digits.len() => {
+                format!("{digits}{}", "0".repeat(at - self.digits.len()))
+            }
+            Ok(at) => format!("{}.{}", &digits[..at], &digits[at..]),
+        };
+        if self.negative {
+            format!("-{magnitude}")
+        } else {
+            magnitude
+        }
+    }
 }
 
 impl Ord for NumberKey {
@@ -793,18 +832,10 @@ impl Table {
             ("B", AttributeValue::B(bytes)) => Ok(AttributeValueKey::B(bytes.clone())),
             ("N", AttributeValue::N(text)) => NumberKey::parse(text)
                 .map(AttributeValueKey::N)
-                .ok_or_else(|| {
-                    // A text longer than this emulator's own numeric-text limit is
-                    // refused here too, so the message names that limit as well as the
-                    // documented form.
-                    RequestError::Validation(format!(
-                        "The parameter cannot be converted to a numeric value: {text} \
-                         (a number must carry at most {MAX_SIGNIFICANT_DIGITS} significant \
-                         digits, an exponent within 10^{MIN_POINT}..10^{MAX_POINT}, and at \
-                         most {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's \
-                         input-size limit)"
-                    ))
-                }),
+                // A text longer than this emulator's own numeric-text limit is
+                // refused here too, so the message names that limit as well as the
+                // documented form.
+                .ok_or_else(|| not_a_number(text)),
             (_, actual) => Err(RequestError::Validation(format!(
                 "Type mismatch for key {attribute} expected: {declared} actual: {}",
                 attribute_value_type(actual)
@@ -1251,6 +1282,15 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
 
     /// Write one item into `name`, replacing whatever that key held.
     ///
+    /// Numbers are canonicalized HERE, the store's only item-write site, so what is
+    /// stored is the number each `N` denotes rather than the lexeme a writer sent, and
+    /// every read path reports that one form without normalising anything itself
+    /// ([`canonicalize_item`]). It runs before this method's own budget checks and
+    /// after the caller has resolved the table — every handler reaches this through
+    /// [`Self::active_table`]/[`Table::key_of_item`] first — so a write naming a table
+    /// that is absent or not `ACTIVE` is still answered with that refusal rather than
+    /// with a number's.
+    ///
     /// This is the store's only growth site, so it is also where the budgets are
     /// enforced: a write that would push the table past
     /// [`MAX_ITEMS_PER_TABLE`]/[`MAX_TABLE_SIZE_BYTES`], or the store past
@@ -1263,13 +1303,17 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         name: &str,
         now: SystemTime,
         key: ItemKey,
-        item: Item,
+        mut item: Item,
     ) -> Result<Option<Item>, RequestError> {
+        canonicalize_item(&mut item)?;
         let size = item_size(&item);
         let stored = self.stored_bytes();
         let table = self.active_table_mut(region, name, now)?;
-        let replaced_size = table.items.get(&key).map_or(0, item_size);
-        if replaced_size == 0 && table.items.len() >= MAX_ITEMS_PER_TABLE {
+        // Whether this write INSERTS is whether the key is held, not whether the item
+        // it holds sizes to zero — an item can legitimately size to nothing.
+        let replaced = table.items.get(&key);
+        let replaced_size = replaced.map_or(0, item_size);
+        if replaced.is_none() && table.items.len() >= MAX_ITEMS_PER_TABLE {
             return Err(RequestError::Validation(format!(
                 "Table {name} already holds this emulator's maximum of \
                  {MAX_ITEMS_PER_TABLE} items"
@@ -1576,6 +1620,121 @@ fn number_size(text: &str) -> i64 {
         Some(number) => number.significant_digits() / 2 + 1,
         None => byte_len(text.len()),
     }
+}
+
+/// The `ValidationException` refusal for a text that denotes no number this store can
+/// hold: not a number at all, or outside the documented precision and exponent range
+/// (or longer than this emulator's own numeric-text limit, which the message names
+/// alongside them).
+fn not_a_number(text: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "The parameter cannot be converted to a numeric value: {text} \
+         (a number must carry at most {MAX_SIGNIFICANT_DIGITS} significant \
+         digits, an exponent within 10^{MIN_POINT}..10^{MAX_POINT}, and at \
+         most {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's \
+         input-size limit)"
+    ))
+}
+
+/// One `N` value's canonical stored text, or the refusal for a text that is not a
+/// number: DynamoDB stores the number, so a write normalises the lexeme ONCE here and
+/// every later read reports that form ([`NumberKey::canonical_text`]).
+///
+/// Crate-visible: the write path reaches it through [`canonicalize_item`], and a
+/// handler that needs one value canonicalized (an `UpdateItem` attribute, say) is in
+/// this crate too, so nothing outside it needs this.
+pub(crate) fn canonical_number_text(text: &str) -> Result<String, RequestError> {
+    NumberKey::parse(text)
+        .map(|number| number.canonical_text())
+        .ok_or_else(|| not_a_number(text))
+}
+
+/// Canonicalize every number inside one attribute value, and refuse a set that holds
+/// one value twice.
+///
+/// The rule is about the number TYPE, not about where a number sits, so this reaches
+/// the `N` of a scalar, every member of an `NS`, and every number nested in an `L` or
+/// an `M` at any depth. Set distinctness is checked AFTER canonicalization, so two
+/// spellings of one number are the duplicate member DynamoDB refuses rather than two
+/// members of the stored set. The walk is ITERATIVE, over an explicit stack, for the
+/// reason [`attribute_value_size`]'s is: how deeply a value nests is the caller's
+/// choice, so recursing on it would make stack use a function of the request.
+pub(crate) fn canonicalize_attribute_value(
+    value: &mut AttributeValue,
+) -> Result<(), RequestError> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            AttributeValue::N(text) => *text = canonical_number_text(text)?,
+            AttributeValue::Ns(members) => {
+                for member in members.iter_mut() {
+                    *member = canonical_number_text(member)?;
+                }
+                require_distinct(members, "NS", String::clone)?;
+            }
+            AttributeValue::Ss(members) => require_distinct(members, "SS", String::clone)?,
+            AttributeValue::Bs(members) => require_distinct(members, "BS", |bytes| {
+                format!("a {}-byte value", bytes.len())
+            })?,
+            AttributeValue::L(members) => pending.extend(members.iter_mut()),
+            AttributeValue::M(entries) => pending.extend(entries.values_mut()),
+            AttributeValue::S(_)
+            | AttributeValue::B(_)
+            | AttributeValue::Bool(_)
+            | AttributeValue::Null(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a set whose members are not distinct: a set holds each of its values once,
+/// so a request naming one twice is a `ValidationException` rather than a stored
+/// duplicate. Members are compared as the values they are — numerically for `NS`,
+/// because its members are canonicalized first — and the check sorts BORROWED members,
+/// so it costs O(n log n) and copies nothing.
+fn require_distinct<T: Ord>(
+    members: &[T],
+    set_type: &str,
+    render: impl Fn(&T) -> String,
+) -> Result<(), RequestError> {
+    let mut sorted: Vec<&T> = members.iter().collect();
+    sorted.sort_unstable();
+    for pair in sorted.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(RequestError::Validation(format!(
+                "Input collection contains duplicates: the {set_type} member {} appears \
+                 more than once",
+                render(pair[0])
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize every number in one item, which is what a write does before the item
+/// lands. A refusal names the attribute it came from, so a caller can find it.
+///
+/// The attributes are walked in NAME order rather than in the hash map's own order,
+/// and the walk STOPS at the first refusal: two identical requests are therefore
+/// refused with identical messages, and a refused item is left with the attributes
+/// after the failing one untouched.
+pub fn canonicalize_item(item: &mut Item) -> Result<(), RequestError> {
+    let mut names: Vec<String> = item.keys().cloned().collect();
+    names.sort_unstable();
+    for name in names {
+        let Some(value) = item.get_mut(&name) else {
+            continue;
+        };
+        if let Err(error) = canonicalize_attribute_value(value) {
+            return Err(match error {
+                RequestError::Validation(message) => {
+                    RequestError::Validation(format!("Invalid attribute {name}: {message}"))
+                }
+                other => other,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The capacity units a write of `size` bytes consumes: one unit per 1 KB, and never

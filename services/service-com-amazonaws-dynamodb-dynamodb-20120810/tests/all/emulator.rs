@@ -62,3 +62,15 @@ pub async fn call_in(
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     call_in(router, REGION, operation, body).await
 }
+
+/// The wire error code of a refusal: the shape name the `__type` field carries, which
+/// is what an SDK client matches an error on.
+pub fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>")
+        .rsplit(['#', '/'])
+        .next()
+        .unwrap_or("<no __type>")
+        .to_string()
+}
