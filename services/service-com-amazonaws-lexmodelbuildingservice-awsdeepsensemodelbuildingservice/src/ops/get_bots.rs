@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the page is cut out of this service's stored bots, so it reports exactly
+//! the `$LATEST` versions that `PutBot` persisted and `DeleteBot` has not removed.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +80,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{bound_chars, BotRecord, LATEST_VERSION, MAX_STRING_CHARS};
+
+impl From<&BotRecord> for BotMetadata {
+    /// The `BotMetadata` entry for a stored bot revision: the six members the shape
+    /// declares, each read off the record.
+    fn from(record: &BotRecord) -> Self {
+        Self {
+            name: Some(record.name.clone()),
+            description: record.description.clone(),
+            status: Some(record.status.clone()),
+            last_updated_date: Some(record.last_updated_date),
+            created_date: Some(record.created_date),
+            version: Some(record.version.clone()),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +170,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBots"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `nextToken` is a plain string in the model, so its length is bounded here
+        // rather than by the boundary validator.
+        if let Some(token) = &input.next_token {
+            bound_chars("nextToken", token, MAX_STRING_CHARS).map_err(|message| {
+                GetBotsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        }
+
+        let mut store = state.lock();
+        // The one write a report may make: a build the CLOCK has already made due is
+        // finished here, so a listing cannot report a bot as still BUILDING after its
+        // build was owed.
+        store.materialise_due_builds(SystemTime::now());
+
+        // The response describes the `$LATEST` version of each selected bot, in name
+        // order, and `nextToken` carries the name the next page starts at.
+        let selected = store.bot_names_matching(input.name_contains.as_deref());
+        let page = crate::state::page_of(&selected, input.next_token.as_deref(), input.max_results);
+        let bots = page
+            .names
+            .iter()
+            .filter_map(|name| store.bots.get(name))
+            .filter_map(|entry| entry.versions.get(LATEST_VERSION))
+            .map(BotMetadata::from)
+            .collect();
+        Ok(GetBotsOutput {
+            bots: Some(bots),
+            next_token: page.next_token,
+        })
     }
 }
