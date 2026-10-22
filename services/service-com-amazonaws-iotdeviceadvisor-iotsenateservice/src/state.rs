@@ -14,6 +14,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use sha2::{Digest, Sha256};
+
 use crate::ops::types::{SuiteDefinitionConfiguration, SuiteRunConfiguration};
 
 /// The region an ARN or endpoint falls back to when the request carries no SigV4 scope.
@@ -699,29 +701,147 @@ pub fn arn(region: &str, resource: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, resource)
 }
 
-/// The Device Advisor endpoint for this account in `region`.
+/// The modelled `Endpoint` length bounds (`smithy_query(query="shape",shape="Endpoint")`
+/// gives `len 45..75`), so every host this module builds can be checked against them.
+pub const MIN_ENDPOINT_LENGTH: usize = 45;
+/// See [`MIN_ENDPOINT_LENGTH`].
+pub const MAX_ENDPOINT_LENGTH: usize = 75;
+
+/// Everything a Device Advisor host carries besides its label and its region.
+const ENDPOINT_FIXED_LENGTH: usize = ".deviceadvisor.iot.".len() + ".amazonaws.com".len();
+
+/// One Device Advisor host: a single label under this service's endpoint domain.
+///
+/// Both endpoints Device Advisor vends — the account-level one and a device-level one —
+/// have this shape, so the LABEL is the only thing that tells them apart.
+fn endpoint_host(label: &str, region: &str) -> String {
+    format!("{label}.deviceadvisor.iot.{region}.amazonaws.com")
+}
+
+/// The region a host whose label is `label_length` characters long can carry while staying
+/// inside [`MAX_ENDPOINT_LENGTH`]: the caller's region, or [`DEFAULT_REGION`] when the
+/// caller's would push the host past it.
+///
+/// Every region AWS publishes fits; a longer one falls back rather than producing an
+/// out-of-range `Endpoint` (the ARN still carries the caller's own region).
+fn host_region(label_length: usize, region: &str) -> &str {
+    if label_length + ENDPOINT_FIXED_LENGTH + region.len() > MAX_ENDPOINT_LENGTH {
+        DEFAULT_REGION
+    } else {
+        region
+    }
+}
+
+/// The ACCOUNT-LEVEL Device Advisor endpoint for this account in `region`.
 ///
 /// Device Advisor vends one account-scoped host of the form
 /// `<account>.deviceadvisor.iot.<region>.amazonaws.com`, which is what a suite run reports
 /// and what a device under test connects to. It is derived here rather than stored, so
-/// every operation that has to report it answers the same host for the same account and
-/// region — `GetEndpoint`, still a 501 stub in this slice, included once it is written.
-///
-/// `Endpoint` is `len 45..75`: every region AWS publishes keeps the host inside that, and
-/// a region long enough to break it falls back to [`DEFAULT_REGION`] here rather than
-/// emitting an out-of-range value (the ARN still carries the caller's own region).
+/// every operation that has to report it — `StartSuiteRun`, the suite-run reads, and
+/// `GetEndpoint` — answers the same host for the same account and region.
 pub fn endpoint_for_region(region: &str) -> String {
-    let host = |region: &str| {
-        format!(
-            "{}.deviceadvisor.iot.{region}.amazonaws.com",
-            ::emulator_server::emulator_account_id()
-        )
-    };
-    let endpoint = host(region);
-    if endpoint.len() > 75 {
-        return host(DEFAULT_REGION);
+    let label = ::emulator_server::emulator_account_id();
+    endpoint_host(label, host_region(label.len(), region))
+}
+
+/// The device a `GetEndpoint` request names, exactly as it names it.
+///
+/// Device Advisor lets a caller name the device under test by its thing, by its
+/// certificate, or by the role it assumes; a request that names NONE of them is asking for
+/// the account-level endpoint instead.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceIdentity<'a> {
+    pub thing_arn: Option<&'a str>,
+    pub certificate_arn: Option<&'a str>,
+    pub device_role_arn: Option<&'a str>,
+}
+
+impl DeviceIdentity<'_> {
+    /// True when the request named no device at all.
+    pub fn names_no_device(&self) -> bool {
+        self.thing_arn.is_none() && self.certificate_arn.is_none() && self.device_role_arn.is_none()
     }
-    endpoint
+}
+
+/// Length of the single DNS label that identifies ONE device in a device-level endpoint.
+///
+/// The exact length is this emulator's choice — what a caller depends on is that the label
+/// is one stable, lowercase-alphanumeric DNS label, and that the host stays inside the
+/// modelled `Endpoint` bounds for every region AWS publishes.
+pub const DEVICE_LABEL_LENGTH: usize = 14;
+
+/// The alphabet a device label's FIRST character is drawn from: a hostname label is read
+/// case-insensitively and AWS writes these prefixes in lowercase, and starting with a
+/// letter keeps the label in the preferred form of RFC 1035 §2.3.1.
+const DEVICE_LABEL_LEADING_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// The alphabet the rest of a device label is drawn from.
+const DEVICE_LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// The DEVICE-LEVEL Device Advisor endpoint for the device `device` names, in `region`.
+///
+/// Device Advisor vends an endpoint that is unique per device beside the account-level one
+/// (AWS IoT Core Device Advisor developer guide, "Device Advisor endpoints"), so the label
+/// is DERIVED — from the account, the region the host carries, and the ARNs the request
+/// names — rather than drawn at random: asking twice for one device answers the same host,
+/// and two devices get two hosts, with nothing stored per device. Truncating a digest to a
+/// single label makes a collision between two devices a probability rather than an
+/// impossibility; nothing treats the label as a unique key. The same derivation the
+/// `com-amazonaws-iot-awsiotservice` crate uses for an account's IoT endpoint prefix.
+///
+/// This service holds no device registry — only the devices a suite definition or a suite
+/// run points at — so two ARNs naming one real device (a thing and that thing's
+/// certificate) are two identities here, each with its own stable host, rather than one.
+pub fn endpoint_for_device(region: &str, device: &DeviceIdentity<'_>) -> String {
+    let region = host_region(DEVICE_LABEL_LENGTH, region);
+    let mut hasher = Sha256::new();
+    // Domain-separated, and every field length-prefixed, so no two different identities
+    // can feed the digest the same bytes.
+    hasher.update(b"iotdeviceadvisor/device-endpoint/");
+    for field in [
+        ::emulator_server::emulator_account_id(),
+        region,
+        device.thing_arn.unwrap_or(""),
+        device.certificate_arn.unwrap_or(""),
+        device.device_role_arn.unwrap_or(""),
+    ] {
+        hasher.update(field.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(field.as_bytes());
+        hasher.update(b";");
+    }
+    let digest = hasher.finalize();
+    let label: String = digest
+        .iter()
+        .take(DEVICE_LABEL_LENGTH)
+        .enumerate()
+        .map(|(position, byte)| {
+            let alphabet = if position == 0 {
+                DEVICE_LABEL_LEADING_ALPHABET
+            } else {
+                DEVICE_LABEL_ALPHABET
+            };
+            char::from(alphabet[usize::from(*byte) % alphabet.len()])
+        })
+        .collect();
+    endpoint_host(&label, region)
+}
+
+/// True when `value` is an Amazon Resource Name of `service`.
+///
+/// The form every AWS ARN has — `arn:<partition>:<service>:<region>:<account>:<resource>`
+/// with a non-empty partition, service and resource — with the service field equal to
+/// `service`. The region and account fields may be empty, as they are in a global
+/// service's ARN (an IAM role's, say).
+pub fn is_arn_of_service(value: &str, service: &str) -> bool {
+    let mut fields = value.splitn(6, ':');
+    fields.next() == Some("arn")
+        && fields.next().is_some_and(|partition| !partition.is_empty())
+        && fields.next() == Some(service)
+        // The region and the account, either of which a global service's ARN leaves empty.
+        && fields.next().is_some()
+        && fields.next().is_some()
+        && fields.next().is_some_and(|resource| !resource.is_empty())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

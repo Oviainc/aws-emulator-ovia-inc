@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Device Advisor host a device under test connects to: the ACCOUNT-LEVEL
+//! host for a request that names no device, and the DEVICE-LEVEL host for one that names
+//! a device by its thing, its certificate or the role it assumes. A pure read — the host
+//! is derived from the account, the request's signing region and the device named, by the
+//! single derivation in [`crate::state`] that `StartSuiteRun` already reports from, so
+//! nothing is written and the endpoint a run carries and the one this vends cannot
+//! disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +108,25 @@ impl From<GetEndpointErrorModeled> for GetEndpointError {
     }
 }
 
+/// `AuthenticationMethod$SignatureVersion4`: the device signs its connection with SigV4,
+/// using the role `deviceRoleArn` names. The wire tokens come from the model
+/// (`smithy_query(query="shape",shape="AuthenticationMethod")` -> `X509ClientCertificate`,
+/// `SignatureVersion4`), and a value outside the enum is refused before this handler runs.
+const SIGNATURE_VERSION_4: &str = "SignatureVersion4";
+
+/// `AuthenticationMethod$X509ClientCertificate`: the device presents the client
+/// certificate `certificateArn` names, attached to the thing `thingArn` names.
+const X509_CLIENT_CERTIFICATE: &str = "X509ClientCertificate";
+
+/// Refuse the request with this operation's own modelled client-input error (HTTP 400
+/// `ValidationException`), naming the member and what it must satisfy.
+fn validation(message: String) -> GetEndpointError {
+    GetEndpointErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `GetEndpoint` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +163,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEndpoint"))
+        // The endpoint this operation reports is DERIVED — from the account, the region
+        // the request is signed for and the device it names — the same way an ARN is, so
+        // there is no per-endpoint record to read and none to write. A request that
+        // cannot reach this service's store at all is still the modelled server failure
+        // rather than a host answered from nowhere.
+        if crate::state::service_state(&*self.engine).is_none() {
+            return Err(GetEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let device = crate::state::DeviceIdentity {
+            thing_arn: input.thing_arn.as_deref(),
+            certificate_arn: input.certificate_arn.as_deref(),
+            device_role_arn: input.device_role_arn.as_deref(),
+        };
+
+        // Every ARN the request carries has to BE one, and one of the service the member
+        // that carries it names: the thing and the certificate are IoT resources, and the
+        // device role is the IAM role the device assumes. The modelled length bounds are
+        // already enforced before this handler runs; the ARN form is not modelled, so it
+        // is refused here with the operation's own client-input error.
+        for (member, value, service) in [
+            ("thingArn", device.thing_arn, "iot"),
+            ("certificateArn", device.certificate_arn, "iot"),
+            ("deviceRoleArn", device.device_role_arn, "iam"),
+        ] {
+            if let Some(value) = value {
+                if !crate::state::is_arn_of_service(value, service) {
+                    return Err(validation(format!(
+                        "{member} must be an Amazon Resource Name of the form \
+                         arn:<partition>:{service}:<region>:<account>:<resource>, got {value:?}"
+                    )));
+                }
+            }
+        }
+
+        // A device-level endpoint is asked for by naming the device the way the
+        // authentication method identifies it: SigV4 by the role the device assumes, an
+        // X.509 client certificate by the thing or by the certificate itself. A request
+        // that names a method but no identity that method can use is contradictory, so it
+        // is refused rather than answered with some other device's host. A request that
+        // names no device at all asks for the account-level endpoint, whatever
+        // authentication method it carries.
+        if !device.names_no_device() {
+            match input.authentication_method.as_deref() {
+                Some(SIGNATURE_VERSION_4) if device.device_role_arn.is_none() => {
+                    return Err(validation(format!(
+                        "authenticationMethod {SIGNATURE_VERSION_4} identifies the device by \
+                         deviceRoleArn, which this request does not carry"
+                    )));
+                }
+                Some(X509_CLIENT_CERTIFICATE)
+                    if device.thing_arn.is_none() && device.certificate_arn.is_none() =>
+                {
+                    return Err(validation(format!(
+                        "authenticationMethod {X509_CLIENT_CERTIFICATE} identifies the device by \
+                         thingArn or certificateArn, neither of which this request carries"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        // The region the host names is the one the request was signed for, the same region
+        // this service scopes a minted ARN to.
+        let region = crate::state::request_region(ctx.parts());
+        let endpoint = if device.names_no_device() {
+            crate::state::endpoint_for_region(&region)
+        } else {
+            crate::state::endpoint_for_device(&region, &device)
+        };
+
+        Ok(GetEndpointOutput {
+            endpoint: Some(endpoint),
+        })
     }
 }
