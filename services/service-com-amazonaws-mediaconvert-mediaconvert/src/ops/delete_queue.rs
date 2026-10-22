@@ -161,14 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store owns the removal and the two refusals that go with it, so the
         // decision and the state it is read from cannot disagree.
         match state.delete_queue(&name) {
-            crate::state::DeleteQueueOutcome::Deleted => Ok(DeleteQueueOutput {}),
-            crate::state::DeleteQueueOutcome::NotFound => {
-                Err(DeleteQueueErrorModeled::NotFoundException(NotFoundException {
-                    // The refusal names the request member the lookup read, `Name`.
-                    message: Some(crate::state::not_found_message("name")),
-                })
-                .into())
-            }
+            // The delete is IDEMPOTENT on the name: a queue that was already gone leaves
+            // the store in exactly the state the request asked for, so the repeat is the
+            // same empty 202 the first delete answered rather than a failure a teardown
+            // path that runs twice would have to special-case. `GetQueue` on that name is
+            // unchanged — a READ of a queue that is not there is still the modelled 404.
+            crate::state::DeleteQueueOutcome::Deleted
+            | crate::state::DeleteQueueOutcome::AlreadyAbsent => Ok(DeleteQueueOutput {}),
             // "Permanently delete a queue you have created", and `Queue`'s `Type`:
             // "System queues are built in. You can't modify or delete system queues."
             // A built-in queue is not one the caller created, so the delete is refused —

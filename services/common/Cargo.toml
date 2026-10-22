@@ -14,7 +14,8 @@ http = { workspace = true }
 # off, the constraint walk it runs and the request/response types it serves.
 # `validation`: the same `Schema` / `ShapeSerializer` seam, used to re-walk a built
 # input, and the `Violation` / constraint-path vocabulary the framework's own
-# constraint walk reports in.
+# constraint walk reports in. `shared_path`: `percent_decode`, which it reads a
+# percent-encoded URI path label through.
 smithy-server-runtime = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

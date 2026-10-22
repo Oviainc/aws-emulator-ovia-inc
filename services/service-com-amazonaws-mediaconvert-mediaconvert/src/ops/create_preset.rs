@@ -181,29 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        // `Name`: "Each name must be unique within your account."
-        if state.presets.contains_key(&name) {
-            return Err(CreatePresetErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("Preset {name} already exists.")),
-            })
-            .into());
-        }
-        // Bounded growth: the store holds at most `MAX_PRESETS` presets, and a create
-        // past that is the quota refusal the model declares rather than more state.
-        if state.presets_at_capacity() {
-            return Err(CreatePresetErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "You have reached the maximum of {} presets.",
-                        crate::state::MAX_PRESETS
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // `Name`: "Each name must be unique within your account." A create under a name
+        // that is already in use does NOT conflict: see the match below.
         let record = crate::state::PresetRecord {
-            name: name.clone(),
+            name,
             category,
             description,
             settings: input.settings,
@@ -214,11 +195,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
 
-        let preset = record.view(&region);
-        state.presets.insert(name, record);
-
-        Ok(CreatePresetOutput {
-            preset: Some(preset),
-        })
+        // The store owns the existence probe, the idempotent return and the insert
+        // together, under the lock this handler holds, so two creates of one name can
+        // never both insert and the decision cannot disagree with the stored state.
+        match state.create_preset(record, &region) {
+            // A `Name` already in the store answers the SAME 201 with the preset that is
+            // there: the create is idempotent on `Name`, so a provisioning path that runs
+            // twice is handed the resource instead of a failure. Nothing was changed, so
+            // this is the preset the FIRST create persisted.
+            crate::state::CreateOutcome::Created(preset)
+            | crate::state::CreateOutcome::Existing(preset) => Ok(CreatePresetOutput {
+                preset: Some(preset),
+            }),
+            // A built-in preset holding the name is not a resource any `CreatePreset`
+            // produced, so there is no earlier create for this one to repeat: the name
+            // conflicts with the current state of the store.
+            crate::state::CreateOutcome::SystemResource => {
+                Err(CreatePresetErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::system_resource_name_message("name")),
+                })
+                .into())
+            }
+            // Bounded growth: the store holds at most `MAX_PRESETS` presets, and a create
+            // past that is the quota refusal the model declares rather than more state.
+            crate::state::CreateOutcome::AtCapacity => {
+                Err(CreatePresetErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "You have reached the maximum of {} presets.",
+                            crate::state::MAX_PRESETS
+                        )),
+                    },
+                )
+                .into())
+            }
+        }
     }
 }

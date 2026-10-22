@@ -343,10 +343,11 @@ async fn create_preset_persists_its_input_and_get_preset_reads_it_back() {
     }
 }
 
-/// `Name`: "Each name must be unique within your account." A second create under a name
-/// already in the store is the modelled conflict, and it leaves the stored preset alone.
+/// `Name` is the preset's identity: a second create under a name already in the store is
+/// IDEMPOTENT — the same 201 with the preset that is already there — and it leaves the
+/// stored preset alone whatever the repeat's body asks for.
 #[tokio::test]
-async fn a_preset_name_is_unique_within_the_account() {
+async fn re_creating_a_preset_returns_the_stored_preset() {
     let emulator = Emulator::new();
     let first = emulator
         .create_preset(json!({
@@ -361,8 +362,8 @@ async fn a_preset_name_is_unique_within_the_account() {
         first.status, first.body
     );
 
-    // Each row differs in what the second create asks for, so the refusal cannot depend
-    // on the body matching the first one.
+    // Each row differs in what the second create asks for, so what comes back cannot
+    // depend on the body matching the first one: the stored preset is returned either way.
     let collisions = [
         (
             "identical body",
@@ -392,21 +393,20 @@ async fn a_preset_name_is_unique_within_the_account() {
     for (label, request) in collisions {
         let reply = emulator.create_preset(request).await;
         assert_eq!(
-            reply.status, 409,
-            "case {label:?}: expected HTTP 409, got {} with body {}",
+            reply.status, 201,
+            "case {label:?}: expected HTTP 201, got {} with body {}",
             reply.status, reply.body
         );
         assert_eq!(
-            reply.error_type.as_deref(),
-            Some("ConflictException"),
-            "case {label:?}: expected ConflictException, got {:?} with body {}",
-            reply.error_type,
+            reply.at("/preset"),
+            first.at("/preset"),
+            "case {label:?}: the repeat must return the STORED preset, got {}",
             reply.body
         );
     }
 
     // The name is the resource's identity and is never normalised, so a name that only
-    // differs by surrounding whitespace is a DIFFERENT preset, not a collision, and it
+    // differs by surrounding whitespace is a DIFFERENT preset, not the same one, and it
     // is echoed back exactly as sent.
     for padded in ["unique ", " unique", "  unique  "] {
         let reply = emulator
@@ -432,7 +432,7 @@ async fn a_preset_name_is_unique_within_the_account() {
     assert_eq!(
         fetched.at("/preset"),
         first.at("/preset"),
-        "the refused creates must leave the stored preset untouched, got {}",
+        "the repeated creates must leave the stored preset untouched, got {}",
         fetched.body
     );
 }

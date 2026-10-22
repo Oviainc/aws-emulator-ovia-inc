@@ -78,6 +78,15 @@ pub const RESOURCE_TYPE: &str = "collection";
 /// refuses, from the model's own `VALIDATION_EXCEPTION_REASON_VALUES`.
 pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
+/// The `ErrorType` a batch read reports a refused request item as ("An API request
+/// validation exception"), from the model's own
+/// [`crate::ops::types::ERROR_TYPE_VALUES`].
+pub const ERROR_TYPE_VALIDATION_EXCEPTION: &str = "VALIDATION_EXCEPTION";
+/// The `ErrorType` a batch read reports an item it found nothing for as ("An API
+/// request retrieving an item that can't be found"); see
+/// [`ERROR_TYPE_VALIDATION_EXCEPTION`].
+pub const ERROR_TYPE_RESOURCE_NOT_FOUND_EXCEPTION: &str = "RESOURCE_NOT_FOUND_EXCEPTION";
+
 /// The largest page any listing returns, and the page size used when the caller names
 /// no `maxResults`.
 ///
@@ -558,6 +567,101 @@ impl ComAmazonawsManagedblockchainqueryTietonchainqueryserviceState {
     /// resolves.
     pub fn ledger(&self, network: &str) -> Option<&NetworkLedger> {
         self.networks.get(network)
+    }
+
+    /// The balance of one (token, owner) pair as of the instant the caller asked for,
+    /// projected onto the modelled `TokenBalance`.
+    ///
+    /// The ONE place a per-holding balance read is decided, so `GetTokenBalance` and
+    /// every item of a `BatchGetTokenBalance` answer the same question the same way —
+    /// the single read raises the [`BalanceFailure`] as the call's modelled error, while
+    /// the batch read reports it as one `BatchGetTokenBalanceErrorItem` and still
+    /// answers the rest of the request.
+    ///
+    /// Named apart from [`StoredHolding::token_balance`], the projection it finishes
+    /// with: this is the READ (resolve the key, pick the record in force, refuse what
+    /// cannot be answered), that one only renders a record on the wire.
+    pub fn read_token_balance(
+        &self,
+        token: &TokenIdentifier,
+        owner: &OwnerIdentifier,
+        at_instant: Option<&BlockchainInstant>,
+    ) -> Result<TokenBalance, BalanceFailure> {
+        // `TokenIdentifier` is "the container for the identifier for the token including
+        // the unique token ID and its blockchain network": a network on its own names no
+        // token, so one of `contractAddress`/`tokenId` has to be there. Both are
+        // modelled optional, so the validator cannot say this.
+        if token.contract_address.is_none() && token.token_id.is_none() {
+            return Err(BalanceFailure::Unidentified(field_validation_exception(
+                "tokenIdentifier",
+                "tokenIdentifier must specify one of contractAddress or tokenId",
+            )));
+        }
+
+        let key = HoldingKey {
+            contract_address: token.contract_address.clone(),
+            token_id: token.token_id.clone(),
+            owner_address: owner.address.clone(),
+        };
+        let at = instant_to_secs(at_instant);
+
+        let holding = self
+            .ledger(&token.network)
+            .and_then(|ledger| ledger.holdings.get(&key));
+        let record = holding.and_then(|holding| holding.balance_at(at));
+        let (holding, record) = match (holding, record) {
+            (Some(holding), Some(record)) => (holding, record),
+            _ => {
+                return Err(BalanceFailure::NotFound(not_found(key.resource_id())));
+            }
+        };
+
+        // `TokenBalance$atBlockchainInstant`: "the time for when the TokenBalance is
+        // requested or the current time if a time is not provided in the request".
+        let asked_at = at.unwrap_or_else(now_secs);
+        Ok(holding.token_balance(&token.network, &key, asked_at, record))
+    }
+}
+
+/// Why the ledger could not report a (token, owner) balance.
+///
+/// Carries the modelled exception the failure IS, so the single-item read answers with
+/// it directly and the batch read renders the same case as an error item: the
+/// `errorType` is the modelled `ErrorType` for that case, the `errorCode` the name of
+/// the exception's shape, and the `errorMessage` the exception's own message.
+#[derive(Debug)]
+pub enum BalanceFailure {
+    /// The `tokenIdentifier` names a network but no token.
+    Unidentified(ValidationException),
+    /// The ledger knows no balance for that (token, owner) at the requested instant.
+    NotFound(crate::ops::types::ResourceNotFoundException),
+}
+
+impl BalanceFailure {
+    /// The wire code of the modelled exception this failure is: the name of its shape,
+    /// which is the code that exception reports when it is raised as a call's error.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::Unidentified(_) => "ValidationException",
+            Self::NotFound(_) => "ResourceNotFoundException",
+        }
+    }
+
+    /// The modelled `ErrorType` of this failure.
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Unidentified(_) => ERROR_TYPE_VALIDATION_EXCEPTION,
+            Self::NotFound(_) => ERROR_TYPE_RESOURCE_NOT_FOUND_EXCEPTION,
+        }
+    }
+
+    /// The exception's own message, so a batch error item says exactly what the
+    /// single-item read's error would have said.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unidentified(error) => &error.message,
+            Self::NotFound(error) => &error.message,
+        }
     }
 }
 

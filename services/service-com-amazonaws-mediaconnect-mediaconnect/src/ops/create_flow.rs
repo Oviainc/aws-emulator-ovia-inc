@@ -98,7 +98,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{StoredFlow, StoredOutput, StoredSource};
+use crate::state::{StoredFlow, StoredMediaStream, StoredOutput, StoredSource};
 
 /// This service's ARN namespace and sigv4 signing name, from [`crate::state`] so the
 /// minting side and the ARN-recognising side name it once.
@@ -111,11 +111,6 @@ use crate::state::STATUS_ENABLED;
 /// `NetworkInterfaceType` (`ena | efa`) applied when a VPC interface request omits one;
 /// `ena` is the standard elastic network adapter.
 const NETWORK_INTERFACE_TYPE_ENA: &str = "ena";
-
-/// The first dynamic RTP payload type (RFC 3551 §6: 96-127 are dynamic). `MediaStream`'s
-/// `Fmt` member is "the format type number (sometimes referred to as RTP payload type) of
-/// the media stream. MediaConnect assigns this value to the media stream."
-const DYNAMIC_RTP_PAYLOAD_TYPE_BASE: i32 = 96;
 
 /// Refuse the request with the service's own client-input error, `BadRequestException`
 /// (HTTP 400): "thrown if the request contains a semantic error".
@@ -229,38 +224,6 @@ fn materialise_entitlement(
         ),
         data_transfer_subscriber_fee_percent: request.data_transfer_subscriber_fee_percent,
         subscribers: request.subscribers.clone(),
-    }
-}
-
-/// Materialise one `AddMediaStreamRequest` into the media stream the flow carries.
-fn materialise_media_stream(request: &AddMediaStreamRequest, index: usize) -> MediaStream {
-    MediaStream {
-        fmt: DYNAMIC_RTP_PAYLOAD_TYPE_BASE + i32::try_from(index).unwrap_or(0),
-        media_stream_id: request.media_stream_id,
-        media_stream_name: request.media_stream_name.clone(),
-        media_stream_type: request.media_stream_type.clone(),
-        clock_rate: request.clock_rate,
-        description: request.description.clone(),
-        video_format: request.video_format.clone(),
-        attributes: request
-            .attributes
-            .as_ref()
-            .map(|attributes| MediaStreamAttributes {
-                lang: attributes.lang.clone(),
-                fmtp: attributes
-                    .fmtp
-                    .as_ref()
-                    .map(|fmtp| Fmtp {
-                        channel_order: fmtp.channel_order.clone(),
-                        colorimetry: fmtp.colorimetry.clone(),
-                        exact_framerate: fmtp.exact_framerate.clone(),
-                        par: fmtp.par.clone(),
-                        range: fmtp.range.clone(),
-                        scan_mode: fmtp.scan_mode.clone(),
-                        tcs: fmtp.tcs.clone(),
-                    })
-                    .unwrap_or_default(),
-            }),
     }
 }
 
@@ -484,13 +447,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entitlements.push(materialise_entitlement(request, index, &region, suffix));
         }
 
-        let media_streams: Vec<MediaStream> = input
-            .media_streams
-            .iter()
-            .flatten()
-            .enumerate()
-            .map(|(index, request)| materialise_media_stream(request, index))
-            .collect();
+        // Every media stream carries the payload type the service assigns it, unique
+        // within the flow — the same materialisation AddFlowMediaStreams stores, refusing
+        // the same repeated names and ids.
+        let mut media_streams: Vec<StoredMediaStream> = Vec::new();
+        let mut media_stream_names: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        let mut media_stream_ids: ::std::collections::BTreeSet<i32> =
+            ::std::collections::BTreeSet::new();
+        for request in input.media_streams.iter().flatten() {
+            if let Some(rejection) = crate::state::media_stream_rejection(
+                request,
+                &media_stream_names,
+                &media_stream_ids,
+            ) {
+                return Err(bad_request(rejection));
+            }
+            media_stream_names.insert(request.media_stream_name.clone());
+            media_stream_ids.insert(request.media_stream_id);
+            let fmt = crate::state::next_media_stream_fmt(&media_streams);
+            media_streams.push(crate::state::materialise_media_stream(request, fmt));
+        }
 
         let mut vpc_interfaces = Vec::new();
         for request in input.vpc_interfaces.iter().flatten() {

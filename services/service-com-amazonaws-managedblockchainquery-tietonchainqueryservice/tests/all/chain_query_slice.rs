@@ -64,15 +64,12 @@ fn filtered_events_body(network: &str, address: &str) -> Value {
 
 /// The operations this slice deliberately leaves scaffolded, with a request that
 /// satisfies every modelled constraint so the answer can only be the scaffold's own.
+///
+/// `BatchGetTokenBalance` is no longer among them: it is implemented and covered by
+/// `tests/all/batch_token_balance.rs`. Neither is `GetAssetContract`, covered by
+/// `tests/all/asset_contracts.rs`.
 fn scaffolded_operations(network: &str, address: &str) -> Vec<(&'static str, Value)> {
     vec![
-        (
-            "/batch-get-token-balance",
-            json!({"getTokenBalanceInputs": [{
-                "tokenIdentifier": {"network": network, "tokenId": "eth"},
-                "ownerIdentifier": {"address": address},
-            }]}),
-        ),
         (
             "/list-asset-contracts",
             json!({"contractFilter": {
@@ -214,7 +211,7 @@ impl NetworkFixture {
     }
 
     /// The instant the ledger's balances open at: the earliest balance record it holds.
-    fn opened_at(&self) -> i64 {
+    pub(crate) fn opened_at(&self) -> i64 {
         self.holdings
             .iter()
             .filter_map(|(_, holding)| holding.history.first().map(|record| record.time))
@@ -251,7 +248,7 @@ fn hashes(items: &Value) -> Vec<String> {
 
 /// A `TokenIdentifier`/`TokenFilter` naming the token half of `key`. The two shapes
 /// declare the same three members (`network` required, `contractAddress`, `tokenId`).
-fn token_json(network: &str, key: &HoldingKey) -> Value {
+pub(crate) fn token_json(network: &str, key: &HoldingKey) -> Value {
     let mut value = json!({"network": network});
     if let Some(contract) = &key.contract_address {
         value["contractAddress"] = json!(contract);

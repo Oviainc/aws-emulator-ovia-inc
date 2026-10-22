@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetTokenBalance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetTokenBalance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers every item of the request independently out of the network ledgers
+//! (`crate::state::NetworkLedger`), by the SAME per-holding read `GetTokenBalance`
+//! performs (`state::...::read_token_balance`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetTokenBalance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A batch read answers the whole request with HTTP 200: an item the ledger holds a
+//! balance for goes to `tokenBalances`, and an item the single-item read would have
+//! refused goes to `errors` as a `BatchGetTokenBalanceErrorItem` carrying that
+//! failure's modelled `ErrorType`, the refused exception's code and its message. One
+//! item's failure therefore never costs the caller the balances of the others.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +156,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetTokenBalance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetTokenBalanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetTokenBalance"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetTokenBalanceErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+
+        // `GetTokenBalanceInputList` is `@length(min: 1, max: 10)`, so a present list is
+        // never empty by the time a handler runs — but the member itself is modelled
+        // optional, and a request that asks for no balance is answered by the two empty
+        // lists the output requires rather than by a refusal the model does not declare.
+        let requested = input.get_token_balance_inputs.unwrap_or_default();
+
+        let mut token_balances = Vec::with_capacity(requested.len());
+        let mut errors = Vec::new();
+
+        for item in &requested {
+            match state.read_token_balance(
+                &item.token_identifier,
+                &item.owner_identifier,
+                item.at_blockchain_instant.as_ref(),
+            ) {
+                // `BatchGetTokenBalanceOutputItem` declares exactly the members of the
+                // `TokenBalance` the single-item read returns.
+                Ok(balance) => token_balances.push(BatchGetTokenBalanceOutputItem {
+                    owner_identifier: balance.owner_identifier,
+                    token_identifier: balance.token_identifier,
+                    balance: balance.balance,
+                    at_blockchain_instant: balance.at_blockchain_instant,
+                    last_updated_time: balance.last_updated_time,
+                }),
+                // The error item identifies WHICH request item failed, so it echoes that
+                // item's own `tokenIdentifier`, `ownerIdentifier` and
+                // `atBlockchainInstant` — the last one only when the caller named it,
+                // since no balance was read for an instant to be reported as of.
+                Err(failure) => errors.push(BatchGetTokenBalanceErrorItem {
+                    token_identifier: Some(item.token_identifier.clone()),
+                    owner_identifier: Some(item.owner_identifier.clone()),
+                    at_blockchain_instant: item.at_blockchain_instant.clone(),
+                    error_code: failure.error_code().to_string(),
+                    error_message: failure.message().to_string(),
+                    error_type: failure.error_type().to_string(),
+                }),
+            }
+        }
+
+        Ok(BatchGetTokenBalanceOutput {
+            token_balances,
+            errors,
+        })
     }
 }
