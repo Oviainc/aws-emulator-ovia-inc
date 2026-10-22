@@ -74,13 +74,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `servicecatalog` — a signing name it SHARES with Service
+        // Catalog AppRegistry
+        // (`services/service-com-amazonaws-servicecatalogappregistry-aws242appregistry`,
+        // sigv4Name `servicecatalog`, endpointPrefix `servicecatalog-appregistry`,
+        // `restJson1`). The router's routing key comes from the SigV4 credential scope
+        // first, so both services resolve to `servicecatalog` and matching on the signing
+        // name ALONE makes both claim every request — which the router answers `500
+        // AmbiguousService` for, an error code AWS has no notion of, for this service's
+        // traffic as well as the peer's.
+        //
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing name.
+        // This model is `awsJson1_1`, an RPC protocol (`smithy_query(query="service_info")`:
+        // protocols `["awsJson1_1"]`) with no `smithy.api#http` binding anywhere, so all
+        // 90 operations post to `/` and name the target service out of band, in
+        // `X-Amz-Target: AWS242ServiceCatalogService.<OperationName>`; the generated
+        // `ROUTE_PATH_SEGMENTS` is EMPTY for exactly that model ("no constraint"), which
+        // is what made this service claim its peer's paths too. `claims_request` therefore
+        // claims a request only when the service that target NAMES is this one, leaving
+        // AppRegistry's `/applications/…`, `/attribute-groups/…`, `/configuration`,
+        // `/sync/…` and `/tags/…` space to it alone.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            Some(self.entry.identity().shape_id()),
+        )
     }
 
     fn override_operation(

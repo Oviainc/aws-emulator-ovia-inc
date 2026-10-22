@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDictionary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDictionary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDictionary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implements `UpdateDictionary`: the supplied members are WRITTEN BACK to the stored
+//! dictionary, so a later `GetDictionary` reports them.
 //!
 //! ## Shape of an operation
 //!
@@ -170,17 +163,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDictionary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDictionaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDictionary"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDictionaryErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Only the values the `DictionaryLanguage` enum lists are a dictionary
+        // language; the refusal itself lives in `crate::state`, shared with
+        // `CreateDictionary`.
+        if let Some(message) = input
+            .language
+            .as_deref()
+            .and_then(crate::state::invalid_language_message)
+        {
+            return Err(UpdateDictionaryErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
+        let now = std::time::Instant::now();
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        // The feeds that reference this dictionary, derived from the feed store, which
+        // is also what decides whether the updated dictionary reports REFERENCED.
+        let references = state.feeds_referencing(&input.id);
+
+        let Some(dictionary) = state.dictionaries.get_mut(&input.id) else {
+            return Err(UpdateDictionaryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A dictionary whose deletion has been accepted is on its way out; updating it
+        // would cancel a removal the clock already owes, so it is refused with the
+        // modelled ConflictException (HTTP 409), carrying that rule's invariant
+        // sentence rather than any value read out of state.
+        if dictionary.status == crate::state::DictionaryStatus::Deleting {
+            return Err(UpdateDictionaryErrorModeled::ConflictException(ConflictException {
+                message: crate::state::DICTIONARY_BEING_DELETED_MESSAGE.to_string(),
+            })
+            .into());
+        }
+
+        // PATCH: each member is optional and "if not specified, the <member> is not
+        // changed", so only what the request carried is written back — and it is
+        // written to the STORED record, which is what the response then reports and
+        // what a later GetDictionary returns.
+        if let Some(name) = input.name {
+            dictionary.name = name;
+        }
+        if let Some(language) = input.language {
+            dictionary.language = language;
+        }
+        if let Some(entries) = input.entries {
+            dictionary.entries = entries;
+        }
+
+        // HTTP 200: the update is applied when the call answers, so it moves the
+        // dictionary's lifecycle status nowhere — a dictionary still settling keeps
+        // CREATING, a settled one keeps AVAILABLE (or REFERENCED while a feed holds
+        // it).
+        Ok(UpdateDictionaryOutput {
+            arn: dictionary.arn.clone(),
+            id: dictionary.id.clone(),
+            name: dictionary.name.clone(),
+            language: dictionary.language.clone(),
+            status: dictionary.reported_status(&references).to_string(),
+            references: Some(references),
+            tags: Some(dictionary.tag_map()),
+        })
     }
 }

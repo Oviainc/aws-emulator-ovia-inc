@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIpGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIpGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIpGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -84,11 +74,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `DescribeIpGroupsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#DescribeIpGroups")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#DescribeIpGroups",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeIpGroupsErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InvalidParameterValuesException(InvalidParameterValuesException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +140,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIpGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIpGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIpGroups"))
+        let _ = ctx;
+
+        // The token names the last group the previous page reported, by the
+        // creation sequence that record carries; this page resumes strictly after
+        // it, so a group deleted between two pages shifts nothing.
+        let after_seq = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(token).ok_or_else(|| {
+                invalid_parameters("The NextToken value is not valid.".to_string())
+            })?,
+            None => 0,
+        };
+        // `MaxResults` is `range 1..25`, so request validation refuses anything
+        // outside that; a value that still does not convert is refused here rather
+        // than silently answered with a default-sized page.
+        let max_results = match input.max_results {
+            Some(max_results) => usize::try_from(max_results).map_err(|_| {
+                invalid_parameters(format!(
+                    "The MaxResults value {max_results} is not valid; MaxResults must be between 1 and 25."
+                ))
+            })?,
+            None => crate::state::DEFAULT_DESCRIBE_PAGE_SIZE,
+        };
+
+        // `GroupIds` is a caller-sized list the model constrains no length on,
+        // so it is indexed ONCE here: the filter below then costs one hash
+        // lookup per stored group rather than a scan of the request's list, and
+        // the walk under the lock is bounded by the stored-group cap alone.
+        let wanted: Option<::std::collections::HashSet<&str>> = input
+            .group_ids
+            .as_ref()
+            .map(|ids| ids.iter().map(String::as_str).collect());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeIpGroupsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        // Reporting only: nothing here writes, so a describe cannot change what a
+        // later caller sees.
+        let matched: Vec<&crate::state::IpGroupRecord> = state
+            .ordered_ip_groups()
+            .into_iter()
+            .filter(|record| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(record.group_id.as_str()))
+                    && record.seq > after_seq
+            })
+            .collect();
+
+        // Report a token only when a matching group is left beyond this page.
+        let mut remaining = matched.into_iter();
+        let page_records: Vec<&crate::state::IpGroupRecord> =
+            remaining.by_ref().take(max_results).collect();
+        let more_to_come = remaining.next().is_some();
+        let next_token = page_records
+            .last()
+            .filter(|_| more_to_come)
+            .map(|record| crate::state::encode_page_token(record.seq));
+        let page: Vec<WorkspacesIpGroup> = page_records
+            .iter()
+            .map(|record| record.to_ip_group())
+            .collect();
+
+        Ok(DescribeIpGroupsOutput {
+            result: Some(page),
+            next_token,
+        })
     }
+}
+
+/// A refusal of a request value this operation's own rules reject, as the modelled
+/// `InvalidParameterValuesException` ("One or more parameter values are not valid").
+fn invalid_parameters(message: String) -> DescribeIpGroupsError {
+    DescribeIpGroupsErrorModeled::InvalidParameterValuesException(InvalidParameterValuesException {
+        message: Some(message),
+    })
+    .into()
 }

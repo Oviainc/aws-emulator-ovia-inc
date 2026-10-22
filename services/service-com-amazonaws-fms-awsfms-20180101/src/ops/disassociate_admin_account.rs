@@ -1,15 +1,62 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateAdminAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateAdminAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateAdminAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Tears down the Firewall Manager default administrator association that
+//! `AssociateAdminAccount` persisted in
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::admin_account`].
+//!
+//! ### Who may call it
+//!
+//! The modelled documentation reproduced below is written in the second person
+//! about the administrator itself — "If you are the default administrator, all
+//! Firewall Manager administrators within the organization must first
+//! disassociate their accounts before you can disassociate your account" — so the
+//! caller of a successful disassociation IS the account that currently holds the
+//! association. A caller that does not hold it has nothing it is allowed to
+//! disassociate, which Firewall Manager answers with `AccessDeniedException`
+//! ([`crate::scaffolded::Scaffolded::access_denied`]): an authorization refusal,
+//! not a missing resource, and a shape this service's model does not declare at
+//! all. With NO association made, no caller holds it, so that is the same
+//! refusal — the one [`crate::state::require_administrator`], the gate every
+//! organisation-scoped operation of this service shares, states; this handler
+//! resolves the association mutably (it changes it) and states that refusal
+//! through [`crate::state::no_administrator_refusal`], the gate's own wording.
+//!
+//! Every request this emulator serves is signed by the single emulator account
+//! (`engine::emulator_account_id`), so "the caller holds the association" is read
+//! against that account id.
+//!
+//! The first-in-last-out rule in the same paragraph concerns the NON-default
+//! administrators `PutAdminAccount` creates. That operation is still a 501 and
+//! this service's state therefore holds no administrator other than the default
+//! one, so the rule has no case to refuse yet; it belongs to `PutAdminAccount`'s
+//! own gap issue.
+//!
+//! ### The disassociation is not instantaneous
+//!
+//! `AccountRoleStatus` (the enum `GetAdminAccount` reports, values in
+//! [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`]) carries the non-terminal
+//! `PENDING_DELETION` / `DELETING` beside the terminal `DELETED`, so the
+//! administrator role is being torn down for a while after this call rather than
+//! vanishing with it. This handler records the request by moving the association
+//! to `PENDING_DELETION` and storing the instant the tear-down completes
+//! ([`crate::state::DISASSOCIATION_SPAN`] from now); nothing sleeps for it.
+//! [`AdminAccountRecord::is_active_at`](crate::state::AdminAccountRecord::is_active_at)
+//! derives from that instant whether an administrator still holds the slot, and
+//! [`settle_admin_account_at`](crate::state::ComAmazonawsFmsAwsfms20180101State::settle_admin_account_at)
+//! persists the `DELETED` status that follows, for whichever operation looks
+//! next.
+//!
+//! The whole request decides from ONE reading of the clock (`SystemTime` is not
+//! monotonic), so this handler cannot see the association active and then gone
+//! between the check and the write; a caller whose association completes its
+//! tear-down first is simply a caller that holds none, and gets the shared
+//! refusal.
+//!
+//! Asking again while the tear-down is still pending is IDEMPOTENT: the caller
+//! still holds the association and the request is already recorded, so it answers
+//! 200 and leaves the due instant where it is rather than extending it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +208,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateAdminAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateAdminAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateAdminAccount"))
+        // `DisassociateAdminAccountRequest` has no members, so nothing in the request
+        // body selects what this call acts on: the association is organisation-wide
+        // and the whole decision is made from state. `ctx` carries the Region the
+        // request was signed for, which the shared refusal names.
+        let _ = &input;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateAdminAccountErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The account every request this emulator serves is signed by — so, the
+        // account asking to disassociate.
+        let caller = ::engine::emulator_account_id();
+        // The Region the request was signed for, which the shared refusal names.
+        let region = crate::state::request_region(ctx.parts());
+        // ONE reading of the clock for the whole request: this handler checks the
+        // association and then writes to it, and `SystemTime` is not monotonic, so
+        // a second reading could see it active and then gone.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The administrator gate every organisation-scoped operation goes through,
+        // resolved mutably because this one CHANGES the association: with none —
+        // including one already torn down, which the clock-derived predicate reads
+        // as gone — the caller is not an administrator at all, so it gets the same
+        // refusal `crate::state::require_administrator` states.
+        let Some(admin) = store.active_admin_account_mut_at(now) else {
+            return Err(crate::state::no_administrator_refusal(&region));
+        };
+        // An association exists, but a disassociation is the holder's own call: an
+        // account that is not the one holding it has nothing it may tear down.
+        if admin.account_id != caller {
+            return Err(crate::scaffolded::Scaffolded::access_denied(format!(
+                "account {caller} is not the Firewall Manager default administrator, \
+                 so it cannot disassociate the default administrator account"
+            )));
+        }
+
+        // Already asked for: keep the completion instant the first call set rather
+        // than pushing it out, so a retry cannot stretch the tear-down.
+        if !admin.removal_pending() {
+            admin.role_status = crate::state::ROLE_STATUS_PENDING_DELETION.to_string();
+            admin.removal_due = Some(now + crate::state::DISASSOCIATION_SPAN);
+        }
+        Ok(DisassociateAdminAccountOutput)
     }
 }

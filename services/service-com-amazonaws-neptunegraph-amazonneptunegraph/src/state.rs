@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::ops::types::VectorSearchConfiguration;
+use crate::ops::types::{ResourceNotFoundException, VectorSearchConfiguration};
 
 /// The ARN namespace (and SigV4 signing name) of this service, from the model's
 /// `aws.api#service` trait:
@@ -211,6 +211,101 @@ pub fn is_graph_id(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+// ---------------------------------------------------------------------------
+// How this service words a failure
+//
+// Both error messages below are built from the REQUEST — the identity it named, the
+// value it sent and the constraint that value broke — and each is written in exactly
+// one place, reached by every operation and by the framework-level refusal renderer in
+// `crate::service`, so no two call sites can drift into different wording for the same
+// failure.
+// ---------------------------------------------------------------------------
+
+/// The account every request this emulator serves is made by: the one canonical
+/// emulator account, which is also the account segment of every ARN this service mints
+/// (`::engine::emulator_arn`). Never a literal — the account contract has one source of
+/// truth.
+pub fn caller_account_id() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// The modelled `ResourceNotFoundException` for a `graphIdentifier` that names no
+/// stored graph.
+///
+/// The graph namespace is per-account, so "there is no such graph" is a statement about
+/// one account: the failure names the account the lookup was resolved in as well as the
+/// identifier the request asked for, which is what lets a caller tell a graph that was
+/// deleted apart from a call that reached the wrong account or partition. The modelled
+/// shape carries only `message`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the message is
+/// the only place either fact can go.
+pub fn graph_not_found(graph_identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "No graph found for customer [{}] with graph id [{graph_identifier}]",
+            caller_account_id()
+        ),
+    }
+}
+
+/// One clause of a `ValidationException` message: the value that was rejected, the
+/// member path it sat at, and the requirement it failed.
+///
+/// `value` is `None` for a member that was ABSENT, which is reported as the null it was
+/// — a fact of the request's shape rather than a rendering of something the caller sent.
+pub fn constraint_clause(member_path: &str, value: Option<&str>, requirement: &str) -> String {
+    let subject = match value {
+        Some(shown) => format!("Value '{shown}'"),
+        None => "Value null".to_string(),
+    };
+    format!("{subject} at '{member_path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The requirement clause for a `@pattern` violation: the expression the value had to
+/// satisfy, rendered WITHOUT the anchors the model spells it with (see [`unanchored`]).
+pub fn pattern_requirement(pattern: &str) -> String {
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        unanchored(pattern)
+    )
+}
+
+/// The `ValidationException` message over one or more clauses: how many constraints were
+/// violated, then the clauses themselves.
+pub fn validation_envelope(clauses: &[String]) -> String {
+    match clauses {
+        [only] => format!("1 validation error detected: {only}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with: the
+/// requirement reported is the expression a value must satisfy, not the anchoring the
+/// model uses to make the match total.
+///
+/// Only the expression's OUTER anchors go: an anchor inside the expression (one per
+/// branch of an alternation, say) is part of its own structure, and dropping it would
+/// change which strings the reported expression describes. A `$` escaped by a backslash
+/// is a literal dollar sign rather than the end anchor, so it stays.
+pub fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
 /// `36^10` — the number of distinct values ten `[a-z0-9]` characters can spell.
 const BASE36_POW10: u64 = 36u64.pow(10);
 
@@ -346,6 +441,105 @@ mod tests {
             assert_eq!(
                 actual, accepted,
                 "case {candidate:?}: expected accepted={accepted}, got {actual}"
+            );
+        }
+    }
+
+    /// Only the OUTER anchors of a `@pattern` are dropped, over a row per form an
+    /// expression can take: anchored at both ends, at one end, not at all, an escaped
+    /// trailing `$`, and anchors inside an alternation.
+    #[test]
+    fn unanchored_drops_only_the_outer_anchors() {
+        // (case, pattern, the expression the requirement must report)
+        let cases: &[(&str, &str, &str)] = &[
+            // The modelled `GraphIdentifier` / `GraphId` pattern.
+            ("anchored at both ends", "^g-[a-z0-9]{10}$", "g-[a-z0-9]{10}"),
+            // The modelled `SnapshotId` pattern.
+            ("another anchored pattern", "^gs-[a-z0-9]{10}$", "gs-[a-z0-9]{10}"),
+            ("anchored at the start only", "^g-[a-z0-9]+", "g-[a-z0-9]+"),
+            ("anchored at the end only", "[a-z0-9]+$", "[a-z0-9]+"),
+            ("no anchors at all", "[a-z0-9]+", "[a-z0-9]+"),
+            ("an escaped trailing dollar", "^cost\\$", "cost\\$"),
+            ("an escaped backslash before the anchor", "^path\\\\$", "path\\\\"),
+            ("anchors inside an alternation", "^(^a$|^b$)$", "(^a$|^b$)"),
+            ("empty", "", ""),
+        ];
+        for (case, pattern, expected) in cases {
+            let actual = unanchored(pattern);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The `ValidationException` envelope counts the clauses it carries, singular for
+    /// one and plural beyond.
+    #[test]
+    fn the_validation_envelope_counts_its_clauses() {
+        let clause = |index: usize| {
+            constraint_clause(
+                &format!("member{index}"),
+                Some("bad"),
+                &pattern_requirement("^[a-z]+$"),
+            )
+        };
+        for count in 1..=3 {
+            let clauses: Vec<String> = (0..count).map(clause).collect();
+            let actual = validation_envelope(&clauses);
+            let expected_prefix = if count == 1 {
+                "1 validation error detected: ".to_string()
+            } else {
+                format!("{count} validation errors detected: ")
+            };
+            assert!(
+                actual.starts_with(&expected_prefix),
+                "case {count} clauses: expected a message opening {expected_prefix:?}, \
+                 got {actual:?}"
+            );
+            assert_eq!(
+                actual.matches("failed to satisfy constraint").count(),
+                count,
+                "case {count} clauses: expected {count} clauses, got {actual:?}"
+            );
+        }
+    }
+
+    /// An absent member is reported as the null it was; a supplied one quotes its value.
+    #[test]
+    fn a_constraint_clause_states_the_value_it_rejected() {
+        // (case, the value the request carried, the subject the clause must open with)
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            ("a supplied value", Some("not-a-valid-id"), "Value 'not-a-valid-id' at 'graphIdentifier'"),
+            ("an empty value", Some(""), "Value '' at 'graphIdentifier'"),
+            ("an absent member", None, "Value null at 'graphIdentifier'"),
+        ];
+        for (case, value, expected_subject) in cases {
+            let actual = constraint_clause(
+                "graphIdentifier",
+                *value,
+                &pattern_requirement("^g-[a-z0-9]{10}$"),
+            );
+            assert!(
+                actual.starts_with(expected_subject),
+                "case {case:?}: expected a clause opening {expected_subject:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A missing graph is reported scoped to the account the lookup ran in, for every
+    /// well-formed identifier.
+    #[test]
+    fn graph_not_found_names_the_account_and_the_requested_id() {
+        for id in ["g-0000000000", "g-zzzzzzzzzz", "g-a1b2c3d4e5"] {
+            let actual = graph_not_found(id).message;
+            let expected = format!(
+                "No graph found for customer [{}] with graph id [{id}]",
+                caller_account_id()
+            );
+            assert_eq!(
+                actual, expected,
+                "case {id:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

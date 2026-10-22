@@ -393,24 +393,13 @@ async fn associate_is_refused_from_every_status_that_takes_no_association() {
     let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
 
     // One row per non-associable status the service produces (`FeedStatus`: CREATING,
-    // UPDATING, DELETING, ARCHIVED — AVAILABLE and ACTIVE are the associable ones,
-    // covered above).
-    for status_under_test in ["CREATING", "UPDATING", "DELETING", "ARCHIVED"] {
+    // DELETING, ARCHIVED — AVAILABLE and ACTIVE are the associable ones, covered
+    // above; UPDATING is never reported, because UpdateFeed answers 200 and so leaves
+    // the feed settled).
+    for status_under_test in ["CREATING", "DELETING", "ARCHIVED"] {
         let id = match status_under_test {
             // Read straight after the create, before the clock settles it.
             "CREATING" => create_feed(&router, "transient-feed", feed_outputs.clone()).await,
-            "UPDATING" => {
-                let id = available_feed(&router, "updating-feed", feed_outputs.clone()).await;
-                let (status, _) = call(
-                    &router,
-                    "PUT",
-                    &format!("/v1/feed/{id}"),
-                    Some(json!({"name": "updating-feed", "outputs": feed_outputs})),
-                )
-                .await;
-                assert_eq!(status, 200, "case {status_under_test:?}: UpdateFeed answers 200");
-                id
-            }
             "DELETING" => {
                 let id = available_feed(&router, "deleting-feed", feed_outputs.clone()).await;
                 let (status, _) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;

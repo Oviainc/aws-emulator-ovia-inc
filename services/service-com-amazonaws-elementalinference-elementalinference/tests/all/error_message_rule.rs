@@ -203,25 +203,11 @@ async fn associate_from_a_non_associable_status_answers_one_invariant_sentence()
     let mut seen: Vec<String> = Vec::new();
 
     // One row per non-associable status this service produces (`FeedStatus`: CREATING,
-    // UPDATING, DELETING, ARCHIVED; AVAILABLE and ACTIVE are the associable ones).
-    for status_under_test in ["CREATING", "UPDATING", "DELETING", "ARCHIVED"] {
+    // DELETING, ARCHIVED; AVAILABLE and ACTIVE are the associable ones, and UPDATING is
+    // never reported because UpdateFeed answers 200 and so leaves the feed settled).
+    for status_under_test in ["CREATING", "DELETING", "ARCHIVED"] {
         let id = match status_under_test {
             "CREATING" => create_feed(&router, "transient-feed", 1).await,
-            "UPDATING" => {
-                let id = available_feed(&router, "updating-feed", 1).await;
-                let (status, body) = call(
-                    &router,
-                    "PUT",
-                    &format!("/v1/feed/{id}"),
-                    Some(json!({"name": "updating-feed", "outputs": outputs("held", 1)})),
-                )
-                .await;
-                assert_eq!(
-                    status, 200,
-                    "case {status_under_test:?}: UpdateFeed answers 200, got {body}"
-                );
-                id
-            }
             "DELETING" => {
                 let id = available_feed(&router, "deleting-feed", 1).await;
                 let (status, body) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;

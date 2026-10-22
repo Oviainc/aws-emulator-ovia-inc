@@ -618,6 +618,27 @@ impl ComAmazonawsArtifactArtifactState {
         self.inquiries.len() < INQUIRY_CAPACITY
     }
 
+    /// The TAGGABLE resource one `resourceArn` names, or `None` when this account holds
+    /// no such resource.
+    ///
+    /// A compliance inquiry is the only resource of this service that can carry tags: it
+    /// is the only one a caller creates, and the only one whose modelled shapes have a
+    /// `tags` member at all (`CreateComplianceInquiryRequest$tags` — "Tags to associate
+    /// with the compliance inquiry resource" — and the `tags` of every inquiry
+    /// projection; no report, term or customer-agreement shape declares one). So a
+    /// `resourceArn` naming anything else names nothing this store holds.
+    ///
+    /// The ARN is compared WHOLE against the one [`inquiry_arn`] built for the stored
+    /// record rather than parsed for an id, which is what makes the partition, the
+    /// service, the region and the account segments all have to be the ones this
+    /// emulator issued the resource under: an ARN of another account, another region or
+    /// another service names no resource here, whatever id it carries.
+    pub fn tagged_resource(&self, resource_arn: &str) -> Option<&ComplianceInquiry> {
+        self.inquiries
+            .values()
+            .find(|inquiry| inquiry.arn == resource_arn)
+    }
+
     /// Mint an unused `InquiryId`.
     ///
     /// The counter advances on every call and the loop skips an id the store already

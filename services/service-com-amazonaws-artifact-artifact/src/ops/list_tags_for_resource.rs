@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags persisted on the resource `resourceArn` names, read off the record
+//! in [`crate::state`] — so the tag set a caller lists can never disagree with the one
+//! the create that persisted it returned.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation (`@readonly`): it writes nothing at all, not even the
+//! clock-owed transition a compliance-inquiry read materialises, because a tag set is
+//! owed no change by the clock.
+//!
+//! The whole output IS the tag set, so a resource carrying no tags reports an EMPTY
+//! `tags` map rather than omitting the member: "List tags for a resource" answers with
+//! the collection it listed, and an absent member is a different answer for a client
+//! that reads `tags` without a default.
+//!
+//! A `resourceArn` this account holds no resource for — one that is not an ARN at all,
+//! or an ARN of another account, region or service — is refused the way the AWS front
+//! door refuses every target it cannot authorize: HTTP 401 `UnauthorizedException`
+//! ([`crate::scaffolded::Scaffolded::unauthorized`]), ahead of this service's own
+//! not-found, exactly as the report and inquiry read paths beside it do. The gateway
+//! cannot make that judgement for a `resourceArn` itself — the model gives
+//! `LongStringAttribute` no identifier syntax, see `crate::service` — so this handler
+//! makes it from state and answers the same refusal.
+//!
+//! The modelled `ResourceNotFoundException` (404) is therefore NOT reachable here, and
+//! that is deliberate rather than unimplemented: the front door's refusal precedes this
+//! service's not-found for every target it authorizes, so an ARN naming nothing, naming
+//! another account's resource, or naming a resource of this service that carries no
+//! tags (a report is service-owned and carries none) all answer the one 401 instead —
+//! which is also what stops a tag read being used to probe for a resource.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +163,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact compliance inquiry store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(resource) = store.tagged_resource(&input.resource_arn) else {
+            // Authorization of the targeted resource precedes the lookup as far as a
+            // caller can tell: an ARN this account holds no resource for names nothing
+            // this caller may read. The refusal is the same whether that ARN named
+            // nothing at all or named another account's resource, so a tag read cannot
+            // be used to probe for one.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        };
+
+        Ok(ListTagsForResourceOutput {
+            // Every entry read off the one stored record, so this answer and the
+            // resource's own projections cannot disagree. An untagged resource reports
+            // the empty map: this member IS the listing.
+            tags: Some(resource.tags_map()),
+        })
     }
 }
