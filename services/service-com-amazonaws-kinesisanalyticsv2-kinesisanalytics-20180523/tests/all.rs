@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/ops_name_bindings.rs"]
+mod ops_name_bindings;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
