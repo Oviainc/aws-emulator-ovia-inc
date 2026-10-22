@@ -9,7 +9,7 @@
 //! makes an opaque `nextToken` resolve to the same place on the next call.
 //!
 //! The modelled response shapes are NOT stored. `DomainDescription`,
-//! `DomainSummary`, `RepositoryDescription`, `RepositorySummary` and
+//! `DomainSummary`, `RepositoryDescription`, `RepositorySummary`, `PackageSummary` and
 //! `PackageGroupDescription` are all projections of the records below
 //! ([`Domain::description`] and friends), so a value that is derived —
 //! `repositoryCount`, a package group's `parent` and each origin restriction's
@@ -20,7 +20,8 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     DomainDescription, DomainSummary, PackageGroupDescription, PackageGroupOriginConfiguration,
-    PackageGroupOriginRestriction, PackageGroupReference, RepositoryDescription,
+    PackageGroupOriginRestriction, PackageGroupReference, PackageOriginConfiguration,
+    PackageOriginRestrictions, PackageSummary, RepositoryDescription,
     RepositoryExternalConnectionInfo, RepositorySummary, ResourcePolicy, Tag,
     UpstreamRepositoryInfo, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
 };
@@ -103,6 +104,17 @@ pub const MAX_REPOSITORIES_PER_DOMAIN: usize = 1_000;
 /// repository" quota). `UpstreamRepositoryList` carries NO modelled length, so the
 /// boundary validator cannot cap it and `CreateRepository` must.
 pub const MAX_UPSTREAMS_PER_REPOSITORY: usize = 10;
+
+/// Maximum packages one repository holds.
+///
+/// Unlike the three bounds above this one is NOT a published CodeArtifact quota — AWS
+/// publishes none for packages per repository — so it is a bound this emulator CHOOSES to
+/// keep its in-process store finite: a package record is freed only by an explicit delete,
+/// so without a ceiling a local caller could grow the shared state without limit. It is far
+/// above anything a fixture creates, and a caller that reaches it is refused (the operations
+/// that create a package model no quota error, so the refusal is their `ValidationException`
+/// naming this limit) rather than served a truncated store.
+pub const MAX_PACKAGES_PER_REPOSITORY: usize = 10_000;
 
 /// Maximum external connections one repository may hold. `AssociateExternalConnection`'s
 /// own documentation states the limit — "One external connection is allowed per
@@ -494,8 +506,8 @@ fn covers_strictly(pattern: &str, path: &[&str]) -> bool {
 
 /// A stored repository inside a domain.
 ///
-/// Later slices hang the package maps off this record for the package-version
-/// operations; the fields here are the ones the repository lifecycle itself needs.
+/// Later slices hang the package-VERSION maps off [`Package`]; the fields here are the
+/// ones the repository lifecycle and the package listing need.
 #[derive(Debug, Clone)]
 pub struct Repository {
     pub name: String,
@@ -511,6 +523,10 @@ pub struct Repository {
     pub created_time: SystemTime,
     pub tags: Vec<Tag>,
     pub policy: Option<ResourcePolicy>,
+    /// The packages held in this repository, keyed by [`package_key`]. Sorted for the
+    /// same reason as the maps above: `ListPackages` is `@paginated`, and a stable key
+    /// order is what makes its opaque `nextToken` resolve to the same place next call.
+    pub packages: BTreeMap<String, Package>,
 }
 
 impl Repository {
@@ -542,6 +558,63 @@ impl Repository {
             created_time: Some(self.created_time.into()),
         }
     }
+}
+
+/// A stored package inside a repository.
+///
+/// A package is identified by the triple (`format`, `namespace`, `name`) — the same triple
+/// every package-scoped operation addresses it with — and carries the origin restrictions
+/// that decide whether new versions may be published into, or ingested from an upstream
+/// into, this repository. A package can legitimately hold no versions at all:
+/// `PutPackageOriginConfiguration` is documented to create exactly that when called for a
+/// package the repository does not yet hold.
+#[derive(Debug, Clone)]
+pub struct Package {
+    pub format: String,
+    /// `None` for a format whose versions carry no namespace component (the model's
+    /// `PackageSummary$namespace` doc lists Python, NuGet, Ruby and Cargo).
+    pub namespace: Option<String>,
+    pub name: String,
+    pub origin_restrictions: PackageOriginRestrictions,
+}
+
+impl Package {
+    /// The modelled `PackageSummary` for this record — what the package `List*`
+    /// operations return.
+    pub fn summary(&self) -> PackageSummary {
+        PackageSummary {
+            format: Some(self.format.clone()),
+            namespace: self.namespace.clone(),
+            package: Some(self.name.clone()),
+            origin_configuration: Some(self.origin_configuration()),
+        }
+    }
+
+    /// The modelled `PackageOriginConfiguration` for this record.
+    pub fn origin_configuration(&self) -> PackageOriginConfiguration {
+        PackageOriginConfiguration {
+            restrictions: Some(self.origin_restrictions.clone()),
+        }
+    }
+}
+
+/// The key a package is stored under inside its repository: `<format>/<namespace>/<name>`,
+/// the same coordinate CodeArtifact addresses a package by.
+///
+/// Unambiguous because `PackageNamespace` and `PackageName` are both modelled `^[^#/\s]+$`
+/// — neither can contain the `/` separator — and a format is a closed enum of lowercase
+/// letters. A format without a namespace leaves that segment empty, so the triple
+/// (`format`, `None`, `name`) and (`format`, `Some("")`, `name`) cannot collide: the empty
+/// namespace is refused at the boundary by `@length(min: 1)`.
+pub fn package_key(format: &str, namespace: Option<&str>, name: &str) -> String {
+    format!("{format}/{}/{name}", namespace.unwrap_or_default())
+}
+
+/// The cursor scope of `ListPackages` for one repository. Scoped PER REPOSITORY, so a
+/// cursor minted while listing one repository's packages cannot resolve as a key in
+/// another repository's listing (or in a domain or repository listing).
+pub fn package_cursor_scope(domain: &str, repository: &str) -> String {
+    format!("packages/{domain}/{repository}")
 }
 
 // ---------------------------------------------------------------------------
