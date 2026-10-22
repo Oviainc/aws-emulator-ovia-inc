@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stores a new table in [`crate::state`] and reports it back as a
+//! `TableDescription` read from the stored table. A second `CreateTable` for a name
+//! that is already taken is refused with `ResourceInUseException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The table is reported `CREATING`, as the doc below states: the status becomes
+//! `ACTIVE` once [`crate::state::STATUS_TRANSITION`] has elapsed, so a caller that
+//! writes an item immediately still sees the transient status. Secondary indexes,
+//! streams, SSE, resource policies and the other members this slice does not store
+//! are refused with the scaffold's 501 and filed as their own gap issues.
+//!
+//! The scaffold channel in [`crate::scaffolded`] still carries this operation's
+//! refusals: `validation` for a bad request, and `not_implemented` for a member of
+//! `CreateTable` that no implementation stores yet.
 //!
 //! ## Shape of an operation
 //!
@@ -252,18 +256,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTable"))
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        // A member this slice does not store is refused as "not written yet" rather
+        // than accepted and silently dropped.
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "CreateTable with {member}"
+            )));
+        }
+
+        let key_schema = validated_key_schema(&input).map_err(lift)?;
+        let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        if store.tables.contains_key(&name) {
+            return Err(CreateTableErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!("Table already exists: {name}")),
+                },
+            )
+            .into());
+        }
+        // "There is a soft account quota of 2,500 tables" (the
+        // `LimitExceededException` doc): past it the modelled error is the answer,
+        // rather than letting the store grow without any limit at all.
+        if store.tables.len() >= crate::state::MAX_TABLES {
+            return Err(CreateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Subscriber limit exceeded: this account already holds the maximum of {} \
+                         tables",
+                        crate::state::MAX_TABLES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let table = crate::state::Table {
+            arn: crate::state::table_arn(&region, &name),
+            name: name.clone(),
+            key_schema,
+            attribute_definitions: input.attribute_definitions.clone().unwrap_or_default(),
+            billing_mode,
+            provisioned_throughput,
+            table_class: input.table_class.clone(),
+            deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_date_time: now,
+            active_at: now + crate::state::STATUS_TRANSITION,
+            removed_at: None,
+            items: ::std::collections::BTreeMap::new(),
+            stored_bytes: 0,
+        };
+        let description = table.describe(now);
+        store.tables.insert(name, table);
+
+        Ok(CreateTableOutput {
+            table_description: Some(description),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> CreateTableError {
+    CreateTableErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel. `CreateTable` looks no
+/// table up, so every refusal it can produce is a bad request.
+fn lift(error: crate::state::RequestError) -> CreateTableError {
+    crate::scaffolded::Scaffolded::validation(error.message())
+}
+
+/// The first input member present that this slice does not store, if any.
+fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
+    if input
+        .local_secondary_indexes
+        .as_ref()
+        .is_some_and(|indexes| !indexes.is_empty())
+    {
+        return Some("LocalSecondaryIndexes");
+    }
+    if input
+        .global_secondary_indexes
+        .as_ref()
+        .is_some_and(|indexes| !indexes.is_empty())
+    {
+        return Some("GlobalSecondaryIndexes");
+    }
+    if input
+        .vector_indexes
+        .as_ref()
+        .is_some_and(|indexes| !indexes.is_empty())
+    {
+        return Some("VectorIndexes");
+    }
+    // A specification that turns the feature OFF asks for what this emulator already
+    // does, so only an enabling one is refused.
+    if input
+        .stream_specification
+        .as_ref()
+        .is_some_and(|specification| specification.stream_enabled)
+    {
+        return Some("StreamSpecification");
+    }
+    if input
+        .sse_specification
+        .as_ref()
+        .is_some_and(|specification| specification.enabled.unwrap_or(false))
+    {
+        return Some("SSESpecification");
+    }
+    if input.resource_policy.is_some() {
+        return Some("ResourcePolicy");
+    }
+    if input.global_table_source_arn.is_some() {
+        return Some("GlobalTableSourceArn");
+    }
+    if input.global_table_settings_replication_mode.is_some() {
+        return Some("GlobalTableSettingsReplicationMode");
+    }
+    if input.on_demand_throughput.is_some() {
+        return Some("OnDemandThroughput");
+    }
+    if input.warm_throughput.is_some() {
+        return Some("WarmThroughput");
+    }
+    None
+}
+
+/// The table's key schema, refused unless it is one `HASH` attribute optionally
+/// followed by one `RANGE` attribute, each defined in `AttributeDefinitions` as a
+/// scalar type — "The attributes in KeySchema must also be defined in the
+/// AttributeDefinitions array" (`CreateTable$KeySchema`).
+fn validated_key_schema(
+    input: &CreateTableInput,
+) -> Result<Vec<KeySchemaElement>, crate::state::RequestError> {
+    let key_schema = input.key_schema.clone().unwrap_or_default();
+    if key_schema.is_empty() {
+        return Err(crate::state::RequestError::Validation(
+            "KeySchema is required and must declare a HASH key attribute".to_string(),
+        ));
+    }
+    let definitions = input.attribute_definitions.clone().unwrap_or_default();
+    let hash_keys = key_schema
+        .iter()
+        .filter(|element| element.key_type == "HASH")
+        .count();
+    let range_keys = key_schema
+        .iter()
+        .filter(|element| element.key_type == "RANGE")
+        .count();
+    if hash_keys != 1 || range_keys > 1 || key_schema.len() != hash_keys + range_keys {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid KeySchema: a table's primary key must be one HASH attribute and at most \
+             one RANGE attribute, got {} element(s)",
+            key_schema.len()
+        )));
+    }
+    if key_schema[0].key_type != "HASH" {
+        return Err(crate::state::RequestError::Validation(
+            "Invalid KeySchema: the HASH key attribute must come first".to_string(),
+        ));
+    }
+    for element in &key_schema {
+        let name = element.attribute_name.as_str();
+        let Some(definition) = definitions
+            .iter()
+            .find(|definition| definition.attribute_name == name)
+        else {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid KeySchema: no AttributeDefinition was provided for key attribute {name}"
+            )));
+        };
+        if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid AttributeDefinition: {name} must have AttributeType S, N or B, got {}",
+                definition.attribute_type
+            )));
+        }
+    }
+    for definition in &definitions {
+        if !key_schema
+            .iter()
+            .any(|element| element.attribute_name == definition.attribute_name)
+        {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Some AttributeDefinitions are not used in any KeySchema: {}",
+                definition.attribute_name
+            )));
+        }
+    }
+    Ok(key_schema)
+}
+
+/// The billing mode and the provisioned throughput to store: "If you set BillingMode
+/// as PROVISIONED, you must specify this property. If you set BillingMode as
+/// PAY_PER_REQUEST, you cannot specify this property"
+/// (`CreateTable$ProvisionedThroughput`). `BillingMode` defaults to `PROVISIONED`.
+fn validated_throughput(
+    input: &CreateTableInput,
+) -> Result<(String, Option<ProvisionedThroughput>), crate::state::RequestError> {
+    let billing_mode = input
+        .billing_mode
+        .clone()
+        .unwrap_or_else(|| "PROVISIONED".to_string());
+    match (billing_mode.as_str(), input.provisioned_throughput.clone()) {
+        ("PAY_PER_REQUEST", None) => Ok((billing_mode, None)),
+        ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(
+            "ProvisionedThroughput cannot be specified when BillingMode is PAY_PER_REQUEST"
+                .to_string(),
+        )),
+        ("PROVISIONED", Some(throughput)) => {
+            if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid ProvisionedThroughput: ReadCapacityUnits and WriteCapacityUnits \
+                     must be at least 1, got {} and {}",
+                    throughput.read_capacity_units, throughput.write_capacity_units
+                )));
+            }
+            Ok((billing_mode, Some(throughput)))
+        }
+        ("PROVISIONED", None) => Err(crate::state::RequestError::Validation(
+            "ProvisionedThroughput must be specified when BillingMode is PROVISIONED".to_string(),
+        )),
+        (other, _) => Err(crate::state::RequestError::Validation(format!(
+            "Invalid BillingMode: {other} must be PROVISIONED or PAY_PER_REQUEST"
+        ))),
     }
 }

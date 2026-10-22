@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the item into the stored table, keyed by the primary key
+//! extracted from it, so a put over an existing key REPLACES that item. `Item` must
+//! carry every key attribute the table's `KeySchema` declares, with the type its
+//! `AttributeDefinitions` declare. `ReturnValues=ALL_OLD` reports the replaced item.
+//! An unknown — or not yet `ACTIVE` — table is `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Conditional writes (`ConditionExpression`, the legacy `Expected`) are refused with
+//! the scaffold's 501 and filed as their own gap issue.
+//!
+//! Sizes a request can choose are bounded before the write lands: the item's own size
+//! (the documented 400 KB limit), its nesting (the documented 32 levels) and the
+//! emulator's own budgets for what one table and the whole store may hold
+//! ([`crate::state::MAX_TABLE_SIZE_BYTES`] and friends, enforced by
+//! [`crate::state::ComAmazonawsDynamodbDynamodb20120810State::put_item`]).
 //!
 //! ## Shape of an operation
 //!
@@ -277,18 +282,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutItem"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        if input.condition_expression.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutItem with ConditionExpression",
+            ));
+        }
+        if input.expected.as_ref().is_some_and(|map| !map.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutItem with Expected",
+            ));
+        }
+        // The other two condition-path members are refused the same way rather than
+        // accepted and dropped, so this handler is no more permissive than the real
+        // service on a path it does not serve.
+        if input.conditional_operator.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutItem with ConditionalOperator",
+            ));
+        }
+        if input.return_values_on_condition_check_failure.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutItem with ReturnValuesOnConditionCheckFailure",
+            ));
+        }
+        // "Use ReturnValues if you want to get the item attributes as they appeared
+        // before they were updated": PutItem accepts only NONE and ALL_OLD
+        // (`PutItem$ReturnValues`).
+        let return_old = match input.return_values.as_deref() {
+            None | Some("NONE") => false,
+            Some("ALL_OLD") => true,
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ReturnValues can only be ALL_OLD or NONE for PutItem, got {other}"
+                )))
+            }
+        };
+
+        // Nesting is refused before the item is sized or stored: "DynamoDB supports
+        // nested attributes up to 32 levels deep".
+        for (attribute, value) in &input.item {
+            if crate::state::attribute_depth_exceeds(value, crate::state::MAX_ATTRIBUTE_DEPTH) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Attribute {attribute} nests deeper than the maximum of {} levels",
+                    crate::state::MAX_ATTRIBUTE_DEPTH
+                )));
+            }
+        }
+
+        let size = crate::state::item_size(&input.item);
+        if size > crate::state::MAX_ITEM_SIZE_BYTES {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Item size has exceeded the maximum allowed size of {} bytes: {size} bytes",
+                crate::state::MAX_ITEM_SIZE_BYTES
+            )));
+        }
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let key = {
+            let table = store.active_table(&name, now).map_err(lift)?;
+            table.key_of_item(&input.item).map_err(lift)?
+        };
+        // The store enforces its own budgets here: the only growth site this
+        // operation has is the item it inserts.
+        let replaced = store
+            .put_item(&name, now, key, input.item.clone())
+            .map_err(lift)?;
+
+        Ok(PutItemOutput {
+            attributes: if return_old { replaced } else { None },
+            consumed_capacity: crate::state::consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                &name,
+                crate::state::write_capacity_units(size),
+            ),
+            // ItemCollectionMetrics is reported only for a table that has a local
+            // secondary index, which this slice does not create.
+            item_collection_metrics: None,
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> PutItemError {
+    PutItemErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> PutItemError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            PutItemErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

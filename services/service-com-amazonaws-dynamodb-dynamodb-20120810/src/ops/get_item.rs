@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: looks the item up by the primary key extracted from `Key` and
+//! reports exactly the `AttributeValue` map [`crate::ops::put_item`] stored. A key
+//! with no item is a 200 with `Item` absent, not an error; an unknown — or not yet
+//! `ACTIVE` — table is `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projections (`ProjectionExpression`, the legacy `AttributesToGet`) are refused
+//! with the scaffold's 501 and filed as their own gap issue. `ConsistentRead` needs
+//! no handling beyond its effect on `ConsumedCapacity`: this store has one copy of
+//! each item, so every read of it is strongly consistent.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +207,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetItem"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        if input.projection_expression.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetItem with ProjectionExpression",
+            ));
+        }
+        if input
+            .attributes_to_get
+            .as_ref()
+            .is_some_and(|names| !names.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetItem with AttributesToGet",
+            ));
+        }
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store.active_table(&name, now).map_err(lift)?;
+        let key = table.key_of_key_map(&input.key).map_err(lift)?;
+        let item = table.items.get(&key).cloned();
+
+        let size = item.as_ref().map_or(0, crate::state::item_size);
+        Ok(GetItemOutput {
+            item,
+            consumed_capacity: crate::state::consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                &name,
+                crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false)),
+            ),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> GetItemError {
+    GetItemErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> GetItemError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            GetItemErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }
