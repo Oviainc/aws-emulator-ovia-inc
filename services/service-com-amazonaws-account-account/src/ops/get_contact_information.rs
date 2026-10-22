@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContactInformation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContactInformation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContactInformation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the primary contact information the store holds for the resolved
+//! account, with the verification status of that contact's phone number. A
+//! REPORTING operation (`@readonly`): it never writes the store.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContactInformation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContactInformationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContactInformation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetContactInformationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        // A REPORTING operation: the store is read, never written, so no record is
+        // created here and a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(account) = store.account(&account_id) else {
+            // Same reasoning as `GetAccountInformation`: naming another account
+            // requires the caller to be an identity in the organization's
+            // management account, with the named account a member of the same
+            // organization — which an account this emulator holds no record of
+            // is not.
+            return Err(GetContactInformationErrorModeled::AccessDeniedException(
+                crate::state::account_not_accessible(&account_id),
+            )
+            .into());
+        };
+
+        let Some(contact_information) = account.contact_information.clone() else {
+            // The account exists but no `PutContactInformation` has stored its
+            // primary contact: the resource this call names can't be found.
+            return Err(GetContactInformationErrorModeled::ResourceNotFoundException(
+                crate::state::contact_information_not_set(&account_id),
+            )
+            .into());
+        };
+
+        Ok(GetContactInformationOutput {
+            contact_information: Some(contact_information),
+            // The status of the phone number IN that contact information; see
+            // `state::UNVERIFIED_PHONE_NUMBER` for why a number this emulator
+            // stores is unverified.
+            verification_status: Some(crate::state::UNVERIFIED_PHONE_NUMBER.to_string()),
+        })
     }
 }
