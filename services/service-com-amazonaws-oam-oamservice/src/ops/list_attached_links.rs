@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAttachedLinks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAttachedLinks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAttachedLinks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +107,76 @@ impl From<ListAttachedLinksErrorModeled> for ListAttachedLinksError {
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `MaxResults` range (1..1000), which the
+/// centralized walk already refuses values outside of — but this handler does not
+/// depend on that: the size is clamped to this constant here, so the page it
+/// allocates is decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// The longest `NextToken` this operation will look at.
+///
+/// The member carries no modelled length, and the tokens this operation issues are
+/// a hex-encoded pair of UUIDs (146 characters), so this bound accepts every real
+/// token while keeping a caller from handing over an arbitrarily long one to decode.
+const MAX_PAGE_TOKEN_LEN: usize = 512;
+
+/// A page token naming the sink being enumerated and the link the NEXT page starts
+/// at.
+///
+/// `NextToken` is modelled opaque, so the pair is hex-encoded rather than handed
+/// back in the clear — which makes the token opaque to a caller, not secret: hex is
+/// trivially reversible and the token carries nothing beyond two ids this caller can
+/// already see. The sink id is part of it so a token can only resume the enumeration
+/// it was issued for; neither id can contain the separator, since both are UUIDs.
+fn encode_page_token(sink_id: &str, link_id: &str) -> String {
+    hex::encode(format!("{sink_id}:{link_id}"))
+}
+
+/// The link id a page token names, or the modelled 400 refusal when the token is
+/// not one this operation issued for `sink_id`.
+///
+/// The token is a position to resume THIS sink's sorted enumeration at, not a handle
+/// on a live record: a token whose link has since been deleted still resumes
+/// correctly (the enumeration continues from where that id sat). What it may not do
+/// is resume a different sink's enumeration, so the sink the token was issued for
+/// must be the sink being enumerated now.
+fn decode_page_token(token: &str, sink_id: &str) -> Result<String, ListAttachedLinksError> {
+    let refused = || {
+        ListAttachedLinksErrorModeled::InvalidParameterException(InvalidParameterException {
+            message: Some(
+                "NextToken is not a pagination token this ListAttachedLinks call can resume"
+                    .to_string(),
+            ),
+            ..Default::default()
+        })
+        .into()
+    };
+    // `NextToken` carries no modelled length, so the token is bounded HERE, before
+    // anything is decoded from it: the tokens this operation issues are two UUIDs and
+    // a separator, so this bound is far above any real one.
+    if token.len() > MAX_PAGE_TOKEN_LEN {
+        return Err(refused());
+    }
+    let decoded = hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(refused)?;
+    let (token_sink_id, link_id) = decoded.split_once(':').ok_or_else(refused)?;
+    if token_sink_id != sink_id
+        || link_id.is_empty()
+        || link_id.len() > 64
+        || !link_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(refused());
+    }
+    Ok(link_id.to_string())
+}
+
 /// The `ListAttachedLinks` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,18 +213,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAttachedLinks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAttachedLinksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAttachedLinks"))
+        // `SinkIdentifier`'s presence and pattern and `MaxResults`' 1..1000 range are
+        // modelled constraints, already refused by the centralized walk before this
+        // body runs. This operation is `@readonly`: it enumerates stored links and
+        // writes nothing.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAttachedLinksErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the link store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+        let store = state.lock();
+        let (sink_arn, sink_id) = store
+            .sink(&region, &input.sink_identifier)
+            .map(|sink| (sink.arn.clone(), sink.id.clone()))
+            .ok_or_else(|| {
+                ListAttachedLinksErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no sink matching '{}' exists in this account and Region",
+                            input.sink_identifier
+                        )),
+                        ..Default::default()
+                    },
+                )
+            })?;
+        // Decoded against the resolved sink, so a token can only resume the
+        // enumeration it was issued for.
+        let start = input
+            .next_token
+            .as_deref()
+            .map(|token| decode_page_token(token, &sink_id))
+            .transpose()?;
+
+        // Only the links whose stored `SinkArn` is this sink's, in the index's sorted
+        // order so a page token can name the id the next page starts at.
+        let empty = ::std::collections::BTreeSet::new();
+        let attached = store.link_ids_for_sink(&sink_arn).unwrap_or(&empty);
+        let remaining = match &start {
+            Some(id) => attached.range(id.clone()..),
+            None => attached.range::<String, _>(..),
+        };
+
+        // Reserve no more than this sink can actually yield.
+        let mut items = Vec::with_capacity(page_size.min(attached.len()));
+        let mut next_token = None;
+        for id in remaining {
+            // The first link that does not fit becomes the next page's start, and
+            // only then is a `NextToken` emitted — the last page carries none.
+            if items.len() == page_size {
+                next_token = Some(encode_page_token(&sink_id, id));
+                break;
+            }
+            // The index and the store are kept in step by `insert_link`/
+            // `remove_link`, so an indexed id with no record is a bug rather than a
+            // state a request can reach; it is asserted in a debug build and
+            // skipped in release rather than reported as a link.
+            let Some(link) = store.links.get(id) else {
+                debug_assert!(
+                    false,
+                    "links_by_sink named a link id the store does not hold"
+                );
+                continue;
+            };
+            items.push(ListAttachedLinksItem {
+                label: Some(link.label.clone()),
+                link_arn: Some(link.arn.clone()),
+                resource_types: Some(link.resource_types.clone()),
+            });
+        }
+
+        // `Items` is `@required`, so a sink with no links reports an empty list
+        // rather than omitting the member.
+        Ok(ListAttachedLinksOutput { items, next_token })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSink"))
+        // `Name`'s presence and its `^[a-zA-Z0-9_\.\-]{1,255}$` pattern, and `Tags`'
+        // 0..50 length, are modelled constraints, so the centralized walk has already
+        // refused anything outside them before this body runs — as this service's
+        // `MissingRequiredParameterException` / `InvalidParameterException`, which
+        // `crate::service` words it as.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the sink store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let created_at = crate::state::now_epoch_seconds();
+
+        let mut store = state.lock();
+
+        // "Each account can contain one sink per Region" (this operation's own
+        // documentation), so a second create in a region that already holds a sink is
+        // refused rather than quietly creating another one: with the name already in
+        // use that is the inconsistent-state refusal, and with any other name it is
+        // the quota refusal.
+        if let Some(existing) = store.sink_in_region(&region) {
+            if existing.name == input.name {
+                return Err(CreateSinkErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "a sink named '{}' already exists in this account and Region",
+                        input.name
+                    )),
+                    ..Default::default()
+                })
+                .into());
+            }
+            return Err(CreateSinkErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(
+                        "this account already contains a sink in this Region, and each account \
+                         can contain one sink per Region"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it.
+        if store.sinks.len() >= crate::state::MAX_SINKS {
+            return Err(CreateSinkErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} sinks",
+                        crate::state::MAX_SINKS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let id = store.fresh_sink_id().ok_or_else(|| {
+            CreateSinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("no sink id could be allocated".to_string()),
+                ..Default::default()
+            })
+        })?;
+        store.insert_sink(crate::state::Sink {
+            arn: crate::state::sink_arn(&region, &id),
+            id: id.clone(),
+            name: input.name,
+            region,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            policy: None,
+            created_at,
+        });
+
+        // Reported from the STORED record rather than from the values above, so what
+        // this create answers is exactly what a later `GetSink` reads back.
+        let sink = store.sinks.get(&id).ok_or_else(|| {
+            CreateSinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the sink could not be read back after creation".to_string()),
+                ..Default::default()
+            })
+        })?;
+        Ok(CreateSinkOutput {
+            arn: Some(sink.arn.clone()),
+            id: Some(sink.id.clone()),
+            name: Some(sink.name.clone()),
+            // The caller just supplied these tags, so they are reported without an
+            // `IncludeTags` to ask for them.
+            tags: sink.tags_output(true),
+        })
     }
 }

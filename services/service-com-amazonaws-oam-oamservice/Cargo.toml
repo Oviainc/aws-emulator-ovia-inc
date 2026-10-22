@@ -21,13 +21,19 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes/decodes the opaque `NextToken` ListAttachedLinks hands out, and renders a
+# minted resource id as hexadecimal.
+hex = { workspace = true }
+# Derives the opaque resource `Id` this service hands out (see `state::mint_id`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `hex` and `sha2` are regular dependencies above (the ListAttachedLinks page token
+# and the resource-id mint), which the test targets can use too, so neither is
+# repeated here.
 
 [lints]
 workspace = true

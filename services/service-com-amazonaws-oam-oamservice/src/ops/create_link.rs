@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLink"))
+        // `LabelTemplate` (presence, 1..64), `ResourceTypes` (presence, 1..50 unique
+        // `ResourceType` values), `SinkIdentifier` (presence, pattern) and `Tags`
+        // (0..50) are all modelled constraints, so the centralized walk has already
+        // refused anything outside them before this body runs — as this service's
+        // `MissingRequiredParameterException` / `InvalidParameterException`, which
+        // `crate::service` words it as. The resource-type catalog is checked again
+        // here so this handler never stores a type the model does not declare,
+        // whatever refused it first.
+        if let Some(unmodelled) = crate::state::unmodelled_resource_type(&input.resource_types) {
+            // The offending value is caller-controlled text, so only its first
+            // characters are echoed back.
+            let shown: String = unmodelled.chars().take(64).collect();
+            return Err(CreateLinkErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "ResourceTypes contains '{shown}', which is not one of [{}]",
+                        crate::ops::types::RESOURCE_TYPE_VALUES.join(", ")
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the link store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let parts = ctx.parts();
+        let region = crate::state::request_region(parts);
+        let source_account = crate::state::caller_source_account(parts);
+        let created_at = crate::state::now_epoch_seconds();
+
+        let mut store = state.lock();
+
+        // The sink must already exist: a link is an attachment to a STORED sink, so
+        // `SinkIdentifier` is resolved against the store rather than copied into the
+        // response. The refusal is `InvalidParameterException` (400) and not a 404:
+        // this operation declares no `ResourceNotFoundException`
+        // (`smithy_query(query="operation",operation="CreateLink")` lists Conflict,
+        // InternalServiceFault, InvalidParameter, MissingRequiredParameter and
+        // ServiceQuotaExceeded), and a `SinkIdentifier` naming no sink is exactly "a
+        // parameter is specified incorrectly".
+        let (sink_arn, sink_id) = store
+            .sink(&region, &input.sink_identifier)
+            .map(|sink| (sink.arn.clone(), sink.id.clone()))
+            .ok_or_else(|| {
+                CreateLinkErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(format!(
+                        "SinkIdentifier '{}' names no sink in this account and Region",
+                        input.sink_identifier
+                    )),
+                    ..Default::default()
+                })
+            })?;
+
+        // One link per source account per sink: a source account that is already
+        // attached to this sink cannot attach twice.
+        if let Some(existing) = store.link_from_source_to_sink(&source_account, &sink_arn) {
+            return Err(CreateLinkErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "this source account is already linked to this sink by link {}",
+                    existing.arn
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // "Each source account can be linked to as many as five monitoring accounts"
+        // (this operation's own documentation).
+        if store.links_from_source(&source_account) >= crate::state::MAX_LINKS_PER_SOURCE_ACCOUNT {
+            return Err(CreateLinkErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this source account already holds the maximum of {} links",
+                        crate::state::MAX_LINKS_PER_SOURCE_ACCOUNT
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it.
+        if store.links.len() >= crate::state::MAX_LINKS {
+            return Err(CreateLinkErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} links",
+                        crate::state::MAX_LINKS
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let id = store.fresh_link_id().ok_or_else(|| {
+            CreateLinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("no link id could be allocated".to_string()),
+                ..Default::default()
+            })
+        })?;
+        store.insert_link(crate::state::Link {
+            arn: crate::state::link_arn(&region, &id),
+            id: id.clone(),
+            // `Label` is the template with its variables resolved; `LabelTemplate`
+            // keeps the text the caller sent.
+            label: crate::state::resolve_label(&input.label_template),
+            label_template: input.label_template,
+            resource_types: input.resource_types,
+            sink_arn,
+            sink_id,
+            region,
+            source_account,
+            link_configuration: input.link_configuration,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at,
+        });
+
+        // Reported from the STORED record rather than from the values above, so what
+        // this create answers is exactly what a later `GetLink` reads back.
+        let link = store.links.get(&id).ok_or_else(|| {
+            CreateLinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the link could not be read back after creation".to_string()),
+                ..Default::default()
+            })
+        })?;
+        Ok(CreateLinkOutput {
+            arn: Some(link.arn.clone()),
+            id: Some(link.id.clone()),
+            label: Some(link.label.clone()),
+            label_template: Some(link.label_template.clone()),
+            resource_types: Some(link.resource_types.clone()),
+            sink_arn: Some(link.sink_arn.clone()),
+            // The caller just supplied these tags, so they are reported without an
+            // `IncludeTags` to ask for them.
+            tags: link.tags_output(true),
+            link_configuration: link.link_configuration.clone(),
+        })
     }
 }

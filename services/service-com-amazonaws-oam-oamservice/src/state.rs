@@ -1,11 +1,546 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-oam-oamservice service.
+//!
+//! OAM (CloudWatch Observability Access Manager) has two resources, and every
+//! operation in this slice answers from the one stored copy of them:
+//!
+//! * a **sink** — the attachment point a monitoring account owns. `CreateSink`'s
+//!   own documentation says "Each account can contain one sink per Region", so a
+//!   sink is stored with the region it was created in and at most one sink exists
+//!   per region.
+//! * a **link** — one source account's attachment to a sink. `CreateLink`'s
+//!   documentation says each sink can carry as many as 100,000 source accounts and
+//!   each source account can link to as many as five monitoring accounts.
+//!
+//! Both are keyed by the random id that is the last segment of their ARN, with two
+//! secondary indexes: `sink_name_index` so a sink resolves by name as well as by id
+//! or ARN, and `links_by_sink` so `ListAttachedLinks` enumerates one sink's links in
+//! a stable (sorted) order and `DeleteSink` can see that links are still attached.
+//!
+//! Every resource carries the region it was created in and is only ever resolved
+//! within the region the request was signed for: an ARN names its region, and a
+//! regional endpoint only ever sees its own region's resources.
+//!
+//! A few stored members are not reported by any operation in this slice — a sink's
+//! `policy` and `created_at`, a link's `sink_id` and `created_at`. They are written
+//! where the resource is created so the slices that read them (`Put`/`GetSinkPolicy`,
+//! the tagging and the `List` operations, all still 501 stubs) read the same record
+//! rather than a second copy of it.
 
-/// Per-service state for com-amazonaws-oam-oamservice. A handler reaches it through [`service_state`].
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::ops::types::LinkConfiguration;
+
+/// The ARN service namespace for this service (`arnNamespace`/sigv4 name `oam`).
+pub const ARN_SERVICE: &str = "oam";
+
+/// The region used when a request carries no SigV4 credential scope to read one
+/// from; the emulator's documented default region.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The resource portion a sink ARN carries before its id.
+pub const SINK_ARN_RESOURCE_PREFIX: &str = "sink/";
+
+/// The resource portion a link ARN carries before its id.
+pub const LINK_ARN_RESOURCE_PREFIX: &str = "link/";
+
+/// The variables `LabelTemplate` may carry, LONGEST FIRST.
+///
+/// From the `LabelTemplate` member's own documentation
+/// (`smithy_query(query="doc",shape="CreateLinkInput",member="LabelTemplate")`):
+/// `$AccountName`, `$AccountEmail` and `$AccountEmailNoDomain`. The order matters —
+/// `$AccountEmail` is a prefix of `$AccountEmailNoDomain`, so substituting the short
+/// one first would leave `NoDomain` behind.
+pub const LABEL_TEMPLATE_VARIABLES: &[&str] =
+    &["$AccountEmailNoDomain", "$AccountEmail", "$AccountName"];
+
+/// The most links one source account may hold.
+///
+/// From `CreateLink`'s own documentation: "Each source account can be linked to as
+/// many as five monitoring accounts."
+pub const MAX_LINKS_PER_SOURCE_ACCOUNT: usize = 5;
+
+/// The most sinks this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: AWS's quota is one sink per Region
+/// (enforced in `CreateSink`), and the number of regions a caller can sign for is
+/// caller-controlled, so this cap is what keeps the store finite. A create that
+/// would exceed it is refused with the modelled `ServiceQuotaExceededException`.
+pub const MAX_SINKS: usize = 100;
+
+/// The most links this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: AWS documents 100,000 source accounts
+/// per sink, which this emulator does not have the memory to hold, so this tighter
+/// cap is what keeps the store finite. A create that would exceed it is refused with
+/// the modelled `ServiceQuotaExceededException`.
+pub const MAX_LINKS: usize = 10_000;
+
+/// One stored sink: every member `GetSink` and `CreateSink` report, plus the
+/// resource policy `Put/GetSinkPolicy` will attach to it and the tags the tagging
+/// operations read off its ARN.
+#[derive(Debug, Clone, Default)]
+pub struct Sink {
+    /// The random id AWS allocates: the ARN's last segment and this record's key.
+    pub id: String,
+    pub name: String,
+    pub arn: String,
+    /// The region this sink was created in — the ARN's region field.
+    pub region: String,
+    pub tags: BTreeMap<String, String>,
+    /// The sink policy, present only once a `PutSinkPolicy` has stored one.
+    pub policy: Option<String>,
+    /// When this sink was created, in whole seconds since the Unix epoch.
+    pub created_at: i64,
+}
+
+/// One stored link: every member `GetLink`, `CreateLink` and `ListAttachedLinks`
+/// report, plus the back-reference to the sink it is attached to.
+#[derive(Debug, Clone, Default)]
+pub struct Link {
+    /// The random id AWS allocates: the ARN's last segment and this record's key.
+    pub id: String,
+    pub arn: String,
+    /// `LabelTemplate` with its variables resolved — what the service reports as
+    /// `Label`.
+    pub label: String,
+    /// The template exactly as the caller sent it.
+    pub label_template: String,
+    pub resource_types: Vec<String>,
+    pub sink_arn: String,
+    pub sink_id: String,
+    /// The region this link was created in — the ARN's region field.
+    pub region: String,
+    /// Which source account this link attaches to the sink. See
+    /// [`caller_source_account`].
+    pub source_account: String,
+    pub link_configuration: Option<LinkConfiguration>,
+    pub tags: BTreeMap<String, String>,
+    /// When this link was created, in whole seconds since the Unix epoch.
+    pub created_at: i64,
+}
+
+/// The tag map a response carries, as the wire shape wants it.
+///
+/// `include` is false for an operation whose caller did not ask for tags
+/// (`IncludeTags` absent or false). An empty map is omitted rather than reported as
+/// `{}`: a resource carrying no tags has none to report, and `Tags` is an optional
+/// output member precisely so it can be left out.
+fn tags_output(tags: &BTreeMap<String, String>, include: bool) -> Option<HashMap<String, String>> {
+    (include && !tags.is_empty()).then(|| {
+        tags.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    })
+}
+
+impl Sink {
+    /// This sink's `Tags`, reported only when the caller asked for them.
+    pub fn tags_output(&self, include: bool) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags, include)
+    }
+}
+
+impl Link {
+    /// This link's `Tags`, reported only when the caller asked for them.
+    pub fn tags_output(&self, include: bool) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags, include)
+    }
+}
+
+/// Per-service state for com-amazonaws-oam-oamservice. A handler reaches it through
+/// [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsOamOamserviceState {
-    // TODO: add service-specific state fields
+    /// Every sink, keyed by its id. A `BTreeMap` so an enumeration walks a stable,
+    /// total order.
+    pub sinks: BTreeMap<String, Sink>,
+    /// Every link, keyed by its id, for the same reason.
+    pub links: BTreeMap<String, Link>,
+    /// (region, sink name) -> sink id, so an `Identifier` resolves by name and
+    /// `CreateSink` can see that the name is already in use.
+    pub sink_name_index: HashMap<(String, String), String>,
+    /// Sink ARN -> the ids of the links attached to it, sorted, giving
+    /// `ListAttachedLinks` a deterministic enumeration order (so a page token can
+    /// name the id the next page starts at) and `DeleteSink` its "still has links"
+    /// check.
+    pub links_by_sink: BTreeMap<String, BTreeSet<String>>,
+    /// How many resource ids this store has minted. Every mint consumes one step of
+    /// it, so two resources can never be handed the same id; see
+    /// [`ComAmazonawsOamOamserviceState::fresh_id`].
+    pub minted_ids: u64,
+}
+
+impl ComAmazonawsOamOamserviceState {
+    /// The sink in `region`, if that region holds one.
+    ///
+    /// At most one ever does: `CreateSink` refuses a second one, the way AWS does
+    /// ("Each account can contain one sink per Region").
+    pub fn sink_in_region(&self, region: &str) -> Option<&Sink> {
+        self.sinks.values().find(|sink| sink.region == region)
+    }
+
+    /// The id of the sink `identifier` names in `region`, accepting any of the forms
+    /// the modelled `ResourceIdentifier` pattern admits: the full ARN, the bare id,
+    /// or the sink's name.
+    ///
+    /// An ARN must match the stored ARN in EVERY field, so an ARN naming another
+    /// partition, account or region resolves to nothing rather than to the sink that
+    /// happens to share its id segment. Every form is resolved within `region`: a
+    /// regional endpoint sees only its own region's sinks.
+    pub fn resolve_sink_id(&self, region: &str, identifier: &str) -> Option<String> {
+        if let Some(id) = id_from_arn(identifier, SINK_ARN_RESOURCE_PREFIX) {
+            return self
+                .sinks
+                .get(id)
+                .filter(|sink| sink.arn == identifier && sink.region == region)
+                .map(|sink| sink.id.clone());
+        }
+        if let Some(id) = self
+            .sink_name_index
+            .get(&(region.to_string(), identifier.to_string()))
+        {
+            return Some(id.clone());
+        }
+        self.sinks
+            .get(identifier)
+            .filter(|sink| sink.region == region)
+            .map(|sink| sink.id.clone())
+    }
+
+    /// The sink `identifier` names in `region`, for a reporting operation.
+    pub fn sink(&self, region: &str, identifier: &str) -> Option<&Sink> {
+        let id = self.resolve_sink_id(region, identifier)?;
+        self.sinks.get(&id)
+    }
+
+    /// Store a newly created sink and index it by name.
+    pub fn insert_sink(&mut self, sink: Sink) {
+        self.sink_name_index
+            .insert((sink.region.clone(), sink.name.clone()), sink.id.clone());
+        self.sinks.insert(sink.id.clone(), sink);
+    }
+
+    /// Remove the sink `id` keys, with its name index entry and its (by then empty)
+    /// entry in [`Self::links_by_sink`]. `None` when no sink is stored under `id`.
+    ///
+    /// Takes the id rather than an identifier so a caller that has already resolved
+    /// one — `DeleteSink`, which must read the sink's ARN to check for attached links
+    /// first — removes the very record it looked at. Refusing a sink that still has
+    /// links is the caller's job: this removes what it is told to and would leave the
+    /// links behind with no sink.
+    pub fn remove_sink_by_id(&mut self, id: &str) -> Option<Sink> {
+        let sink = self.sinks.remove(id)?;
+        self.sink_name_index
+            .remove(&(sink.region.clone(), sink.name.clone()));
+        self.links_by_sink.remove(&sink.arn);
+        Some(sink)
+    }
+
+    /// The id of the link `identifier` names in `region`: its full ARN or its bare
+    /// id. A link has no name, so there is no third form. Both forms are resolved
+    /// within `region`, as a sink's are.
+    pub fn resolve_link_id(&self, region: &str, identifier: &str) -> Option<String> {
+        if let Some(id) = id_from_arn(identifier, LINK_ARN_RESOURCE_PREFIX) {
+            return self
+                .links
+                .get(id)
+                .filter(|link| link.arn == identifier && link.region == region)
+                .map(|link| link.id.clone());
+        }
+        self.links
+            .get(identifier)
+            .filter(|link| link.region == region)
+            .map(|link| link.id.clone())
+    }
+
+    /// The link `identifier` names in `region`, for a reporting operation.
+    pub fn link(&self, region: &str, identifier: &str) -> Option<&Link> {
+        let id = self.resolve_link_id(region, identifier)?;
+        self.links.get(&id)
+    }
+
+    /// Store a newly created link and attach it to its sink's index.
+    pub fn insert_link(&mut self, link: Link) {
+        self.links_by_sink
+            .entry(link.sink_arn.clone())
+            .or_default()
+            .insert(link.id.clone());
+        self.links.insert(link.id.clone(), link);
+    }
+
+    /// Remove the link `identifier` names in `region`, detaching it from its sink.
+    /// `None` when nothing matched.
+    pub fn remove_link(&mut self, region: &str, identifier: &str) -> Option<Link> {
+        let id = self.resolve_link_id(region, identifier)?;
+        let link = self.links.remove(&id)?;
+        if let Some(attached) = self.links_by_sink.get_mut(&link.sink_arn) {
+            attached.remove(&link.id);
+            if attached.is_empty() {
+                self.links_by_sink.remove(&link.sink_arn);
+            }
+        }
+        Some(link)
+    }
+
+    /// The ids of the links attached to the sink `sink_arn` names, in sorted order.
+    pub fn link_ids_for_sink(&self, sink_arn: &str) -> Option<&BTreeSet<String>> {
+        self.links_by_sink.get(sink_arn)
+    }
+
+    /// The link `source_account` already has to the sink `sink_arn` names, if any —
+    /// the one `CreateLink` refuses to duplicate.
+    pub fn link_from_source_to_sink(&self, source_account: &str, sink_arn: &str) -> Option<&Link> {
+        self.link_ids_for_sink(sink_arn)?
+            .iter()
+            .filter_map(|id| self.links.get(id))
+            .find(|link| link.source_account == source_account)
+    }
+
+    /// How many links `source_account` holds, across every sink.
+    pub fn links_from_source(&self, source_account: &str) -> usize {
+        self.links
+            .values()
+            .filter(|link| link.source_account == source_account)
+            .count()
+    }
+
+    /// A fresh id no stored sink is using, or `None` when one could not be found.
+    ///
+    /// Takes `&mut self` because minting an id CONSUMES one step of
+    /// [`Self::minted_ids`]: two creates can never be handed the same id, even within
+    /// one clock tick.
+    pub fn fresh_sink_id(&mut self) -> Option<String> {
+        self.fresh_id(|store, candidate| store.sinks.contains_key(candidate))
+    }
+
+    /// A fresh id no stored link is using, or `None` when one could not be found.
+    pub fn fresh_link_id(&mut self) -> Option<String> {
+        self.fresh_id(|store, candidate| store.links.contains_key(candidate))
+    }
+
+    /// A fresh resource id that `taken` does not already claim.
+    ///
+    /// AWS calls this "the random ID string that Amazon Web Services generated as
+    /// part of the sink ARN", so the id is opaque and carries the UUID shape the
+    /// service hands out. [`mint_id`] derives it from this process's salt and this
+    /// counter — never from the request, so nothing a caller sends can choose or
+    /// predict a resource's id. The counter makes every id distinct by construction;
+    /// the store is asked anyway, with a bounded number of attempts so this can never
+    /// spin. `None` rather than an unchecked id when every attempt collided: the
+    /// caller answers a modelled server error instead of overwriting a stored record.
+    fn fresh_id(&mut self, taken: impl Fn(&Self, &str) -> bool) -> Option<String> {
+        for _ in 0..16 {
+            self.minted_ids = self.minted_ids.wrapping_add(1);
+            let candidate = mint_id(self.minted_ids);
+            if !taken(self, &candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+/// The 128 bits an id is built from: SHA-256 over this process's salt and the store's
+/// mint counter, truncated to 16 bytes.
+///
+/// The salt is what makes an id unguessable from outside — a caller cannot see how
+/// many ids a store has minted, and could not compute the next one if it could — and
+/// the counter is what makes it unique. Neither is request-derived, so an id never
+/// echoes client input. SHA-256 comes from the `sha2` crate rather than being
+/// hand-rolled.
+fn mint_id_bytes(ordinal: u64) -> [u8; 16] {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(process_salt());
+    digest.update(ordinal.to_be_bytes());
+    let full = digest.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&full[..16]);
+    bytes
+}
+
+/// A fresh opaque resource id, in the 8-4-4-4-12 hexadecimal form this service's ids
+/// carry, with the version and variant bits a version-4 UUID sets.
+fn mint_id(ordinal: u64) -> String {
+    let mut bytes = mint_id_bytes(ordinal);
+    // RFC 4122 places the version in the high nibble of byte 6 and the variant in the
+    // top two bits of byte 8; setting them is what makes this a well-formed UUID
+    // rather than 32 loose hex digits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// This process's id salt: 16 bytes taken ONCE, from the operating system's entropy
+/// by way of [`std::collections::hash_map::RandomState`], whose keys the standard
+/// library seeds from the OS. Two `RandomState`s hash one input to two different
+/// values, so two passes give two independent halves.
+///
+/// Taken once and reused, which is what lets the mint counter alone guarantee that
+/// two ids from one process differ.
+fn process_salt() -> [u8; 16] {
+    use std::hash::{BuildHasher, Hasher};
+    static SALT: ::std::sync::OnceLock<[u8; 16]> = ::std::sync::OnceLock::new();
+    *SALT.get_or_init(|| {
+        let mut salt = [0u8; 16];
+        for (half, chunk) in salt.chunks_mut(8).enumerate() {
+            let mut hasher = ::std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u64(half as u64);
+            chunk.copy_from_slice(&hasher.finish().to_be_bytes());
+        }
+        salt
+    })
+}
+
+/// The id segment of one of this service's ARNs, or `None` when `identifier` is not
+/// an ARN of this service's `prefix` resource.
+fn id_from_arn<'a>(identifier: &'a str, prefix: &str) -> Option<&'a str> {
+    if !identifier.starts_with("arn:") {
+        return None;
+    }
+    let mut fields = identifier.splitn(6, ':');
+    let (_arn, _partition, service, _region, _account, resource) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if service != ARN_SERVICE {
+        return None;
+    }
+    let id = resource.strip_prefix(prefix)?;
+    (!id.is_empty()).then_some(id)
+}
+
+/// The ARN of the sink `id` in `region`.
+pub fn sink_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{SINK_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the link `id` in `region`.
+pub fn link_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{LINK_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// `LabelTemplate` with its variables resolved — the `Label` the service reports.
+///
+/// Every variable resolves to the account id. That is what the member's own
+/// documentation says the service does where the account's name and email address
+/// are not available to it ("the `$AccountName`, `$AccountEmail`, and
+/// `$AccountEmailNoDomain` variables all resolve as *account-id* instead of the
+/// specified variable"), and this emulator has one canonical account
+/// ([`engine::EMULATOR_ACCOUNT_ID`]) with no Organizations name or email address
+/// behind it. Text around a variable is kept, so a custom label is reported
+/// unchanged.
+pub fn resolve_label(label_template: &str) -> String {
+    let account = ::engine::emulator_account_id();
+    LABEL_TEMPLATE_VARIABLES
+        .iter()
+        .fold(label_template.to_string(), |label, variable| {
+            label.replace(variable, account)
+        })
+}
+
+/// The first entry of `resource_types` the model's `ResourceType` enum does not
+/// declare, or `None` when every one of them is a modelled value.
+///
+/// The catalog is the generated [`crate::ops::types::RESOURCE_TYPE_VALUES`], which
+/// carries exactly the values
+/// `smithy_query(query="shape",shape="ResourceType")` reports.
+pub fn unmodelled_resource_type(resource_types: &[String]) -> Option<&str> {
+    resource_types
+        .iter()
+        .map(String::as_str)
+        .find(|supplied| !crate::ops::types::RESOURCE_TYPE_VALUES.contains(supplied))
+}
+
+/// The region this request was signed for, from its SigV4 credential scope; the
+/// emulator's default region when it carries none.
+///
+/// The scope is caller-controlled text and the value lands inside an ARN, so
+/// anything that is not shaped like a region is refused here and the default is used
+/// instead: a generated ARN can never carry text an ARN's region field could not
+/// hold.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region.len() <= 64
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// What a stored [`Link::source_account`] starts with.
+///
+/// It marks the value as an opaque per-caller identity derived from the request's
+/// credential — NOT an AWS account number, which in this emulator is the one
+/// canonical [`engine::EMULATOR_ACCOUNT_ID`] every ARN carries.
+pub const SOURCE_IDENTITY_PREFIX: &str = "akid:";
+
+/// Which source account this request speaks for.
+///
+/// A link belongs to the source account that created it: AWS reads that account
+/// from the request's credentials, and so does this. Every ARN a generated emulator
+/// emits carries the one canonical account id
+/// ([`engine::EMULATOR_ACCOUNT_ID`]), so the account a request speaks for cannot be
+/// a distinct account NUMBER here; it is the request's own SigV4 access key id. Two
+/// requests signed with the same credential are the same source account — which is
+/// what makes `CreateLink`'s modelled `ConflictException` (one link per source
+/// account per sink) and its five-links-per-source-account quota observable.
+///
+/// The id is caller-controlled text, so it is hex-encoded rather than filtered:
+/// encoding is INJECTIVE, so two credentials that differ at all stay two source
+/// accounts (dropping punctuation would collapse `AKID-1` and `AKID1` into one and
+/// refuse the second one's link), and the stored value is bounded and holds nothing
+/// but hex. The encoding is of the leading bytes, so a pathologically long header
+/// cannot grow the store.
+///
+/// The value is prefixed with [`SOURCE_IDENTITY_PREFIX`] so it can never be read as
+/// an AWS account NUMBER: it is an opaque identity for "which caller", and nothing
+/// but equality is ever asked of it. It is deliberately reported by no operation.
+pub fn caller_source_account(parts: &::http::request::Parts) -> String {
+    let raw = ::engine::extract_akid(&parts.headers);
+    let bounded: String = raw.chars().take(128).collect();
+    if bounded.is_empty() {
+        return format!("{SOURCE_IDENTITY_PREFIX}unsigned");
+    }
+    format!("{SOURCE_IDENTITY_PREFIX}{}", hex::encode(bounded))
+}
+
+/// Now, in whole seconds since the Unix epoch.
+///
+/// Saturating rather than truncating: the conversion is fallible in principle (the
+/// clock reports a `u64`), and a clock far past the `i64` range must not wrap into a
+/// negative creation time.
+pub fn now_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
