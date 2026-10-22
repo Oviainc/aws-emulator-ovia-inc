@@ -74,13 +74,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `sagemaker` — a signing name it SHARES with every other
+        // SageMaker-family service, while serving its own endpoint
+        // (`featurestore-runtime.sagemaker`). The router resolves the routing key from
+        // the SigV4 credential scope first, so every one of them sees the key
+        // `sagemaker`: claiming on the signing name ALONE claims the siblings' traffic
+        // too, and the router — which refuses rather than guesses — answers
+        // `500 AmbiguousService` for ALL of it.
+        //
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing
+        // name. This model is `restJson1`: its surface is the URI path space its
+        // operations bind (`/FeatureGroup/…`, `/BatchGetRecord`, `/BatchWriteRecord`),
+        // which is what `claims_request` matches against the generated
+        // `ROUTE_PATH_SEGMENTS` when a service declares no RPC protocol.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            None,
+        )
     }
 
     fn override_operation(
