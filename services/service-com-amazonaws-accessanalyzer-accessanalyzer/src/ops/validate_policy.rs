@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Runs IAM Access Analyzer's policy checks over the `policyDocument` the request
+//! carries and answers one finding per check that hits.
+//!
+//! The document is PARSED — JSON validity decided by `serde_json`, which is strict,
+//! and the tree itself by `jsonc-parser`, which keeps the source range of every value
+//! and object property — so every finding's `locations` carry the real JSON path
+//! (`key`/`index` elements) and the real line/column/offset span of the element the
+//! check is about. Nothing is echoed back and no finding is produced for a check that
+//! did not run.
+//!
+//! This operation is `@readonly` and owns no resource: the model documents it as
+//! "Requests the validation of a policy and returns a list of findings", so its answer
+//! is a pure function of the request and it reads and writes NO service state. The
+//! engine stays bound on `self` so the operation keeps the same constructor seam as
+//! every other one.
+//!
+//! ## What these checks cover, and what they do not
+//!
+//! The checks implemented here are the ones that read the policy's own grammar: the
+//! document's JSON, the elements each statement may hold, the shape of an action, a
+//! resource ARN and a principal, and the security warnings for a grant that reaches
+//! further than its author is likely to have meant (see the issue codes below). What
+//! they deliberately do NOT cover, so that silence here is not read as a pass:
+//!
+//! * the catalogs. No check validates an action, a condition operator or a condition
+//!   key against the set of services, operators and keys AWS publishes, so a typo in
+//!   a known-shaped name (`StringEqualss`, `aws:Principalrn`, `s3:GetObjekt`) is not
+//!   reported. Those catalogs are not in this service's model and are not invented
+//!   here.
+//! * the resource-type-specific suite. `validatePolicyResourceType` selects no checks:
+//!   it is only validated against `policyType` (the combination the model documents),
+//!   so the per-resource-type checks (`AWS::S3::Bucket` and the rest) do not run.
+//! * `Resource` is required of an identity-style statement only. A resource-policy
+//!   statement that names none is not reported, because which resource policies need
+//!   one is a per-service rule this slice does not model.
+//!
+//! Each gap is a check that does not run, never a finding reported for one that did.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +129,1595 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use jsonc_parser::common::Ranged;
+
+/// The policy document's AST as the span-preserving parser hands it back. Aliased
+/// rather than imported so the names cannot collide with a modelled shape out of
+/// `super::types`.
+type JsonValue<'a> = jsonc_parser::ast::Value<'a>;
+type JsonObject<'a> = jsonc_parser::ast::Object<'a>;
+type JsonProp<'a> = jsonc_parser::ast::ObjectProp<'a>;
+/// A byte range in the policy document, as the parser reports it.
+type JsonRange = jsonc_parser::common::Range;
+
+/// Strict JSON, not JSONC: an IAM policy document is plain JSON, so a comment, a
+/// trailing comma or an unquoted property name is a syntax error the way the real
+/// service reports one, not something to accept quietly.
+const STRICT_JSON: jsonc_parser::ParseOptions = jsonc_parser::ParseOptions {
+    allow_comments: false,
+    allow_loose_object_property_names: false,
+    allow_trailing_commas: false,
+};
+
+// ---------------------------------------------------------------------------
+// The finding types, from the model's own `ValidatePolicyFindingType` values
+// (`VALIDATE_POLICY_FINDING_TYPE_VALUES` in `super::types`).
+// ---------------------------------------------------------------------------
+
+/// "Errors report when a part of the policy is not functional."
+const FINDING_TYPE_ERROR: &str = "ERROR";
+/// "Security warnings report when the policy allows access that we consider overly
+/// permissive."
+const FINDING_TYPE_SECURITY_WARNING: &str = "SECURITY_WARNING";
+/// A suggestion reports an improvement that does not change what the policy allows.
+const FINDING_TYPE_SUGGESTION: &str = "SUGGESTION";
+
+// ---------------------------------------------------------------------------
+// The issue codes, named after the checks in IAM Access Analyzer's policy check
+// reference (`access-analyzer-reference-policy-checks`). Each one is reported by the
+// check of the same name below; nothing here is reported unless its check hits.
+// ---------------------------------------------------------------------------
+
+/// The document is not valid JSON at all.
+const JSON_SYNTAX_ERROR: &str = "JSON_SYNTAX_ERROR";
+/// A policy element holds a JSON type the grammar does not allow there.
+const DATA_TYPE_MISMATCH: &str = "DATA_TYPE_MISMATCH";
+/// A key the policy grammar does not define appears as an element.
+const INVALID_POLICY_ELEMENT: &str = "INVALID_POLICY_ELEMENT";
+/// `Version` carries a value IAM does not define.
+const INVALID_VERSION: &str = "INVALID_VERSION";
+/// The policy has no `Statement`.
+const MISSING_STATEMENT: &str = "MISSING_STATEMENT";
+/// A statement has no `Effect`.
+const MISSING_EFFECT: &str = "MISSING_EFFECT";
+/// `Effect` is neither `Allow` nor `Deny`.
+const INVALID_EFFECT: &str = "INVALID_EFFECT";
+/// A statement names neither `Action` nor `NotAction`.
+const MISSING_ACTION: &str = "MISSING_ACTION";
+/// An action is not of the form `service:action` (or the full wildcard).
+const INVALID_ACTION: &str = "INVALID_ACTION";
+/// A statement that needs a `Resource` (or `NotResource`) has neither.
+const MISSING_RESOURCE: &str = "MISSING_RESOURCE";
+/// A resource is neither the full wildcard nor an ARN.
+const INVALID_ARN: &str = "INVALID_ARN";
+/// A statement that needs a `Principal` (or `NotPrincipal`) has neither.
+const MISSING_PRINCIPAL: &str = "MISSING_PRINCIPAL";
+/// Two elements that cannot hold together appear in one statement (`Action` with
+/// `NotAction`, `Resource` with `NotResource`, `Principal` with `NotPrincipal`), or an
+/// element appears in a policy type that does not define it.
+const UNSUPPORTED_ELEMENT_COMBINATION: &str = "UNSUPPORTED_ELEMENT_COMBINATION";
+/// Two statements carry the same `Sid`.
+const UNIQUE_SIDS_REQUIRED: &str = "UNIQUE_SIDS_REQUIRED";
+/// A `Null` condition operator is paired with the `IfExists` suffix, which cancel out.
+const NULL_WITH_IF_EXISTS: &str = "NULL_WITH_IF_EXISTS";
+/// `Allow` paired with `NotPrincipal` grants to every principal the list does not name.
+const ALLOW_WITH_NOT_PRINCIPAL: &str = "ALLOW_WITH_NOT_PRINCIPAL";
+/// `iam:PassRole` allowed on the full resource wildcard.
+const PASS_ROLE_WITH_STAR_IN_RESOURCE: &str = "PASS_ROLE_WITH_STAR_IN_RESOURCE";
+/// `iam:CreateServiceLinkedRole` allowed on the full resource wildcard.
+const CREATE_SLR_WITH_STAR_IN_RESOURCE: &str = "CREATE_SLR_WITH_STAR_IN_RESOURCE";
+/// A resource policy or a role trust policy allows every principal.
+///
+/// Named for what the check reports, in the same shape as the reference's other
+/// security-warning codes: a grant to the `"*"` principal with no `Condition` is
+/// public access, which is what makes it overly permissive. The finding type is the
+/// model's `SECURITY_WARNING` either way.
+const ALLOW_WITH_WILDCARD_PRINCIPAL: &str = "ALLOW_WITH_WILDCARD_PRINCIPAL";
+/// The policy does not state a `Version`, so it is read as the oldest grammar.
+const MISSING_VERSION: &str = "MISSING_VERSION";
+/// An `Action`/`Resource`/`Principal` list is present but empty, so the statement
+/// grants nothing.
+///
+/// One code covers an element and its negation (`Action` and `NotAction` are both
+/// reported under `EMPTY_ARRAY_ACTION`, `Resource` and `NotResource` under
+/// `EMPTY_ARRAY_RESOURCE`, `Principal` and `NotPrincipal` under the `*_PRINCIPAL`
+/// codes), because the check is the same one and the finding's `details` name the
+/// element that was empty.
+const EMPTY_ARRAY_ACTION: &str = "EMPTY_ARRAY_ACTION";
+const EMPTY_ARRAY_RESOURCE: &str = "EMPTY_ARRAY_RESOURCE";
+const EMPTY_ARRAY_PRINCIPAL: &str = "EMPTY_ARRAY_PRINCIPAL";
+/// A `Principal`/`Condition` object is present but empty.
+const EMPTY_OBJECT_PRINCIPAL: &str = "EMPTY_OBJECT_PRINCIPAL";
+const EMPTY_OBJECT_CONDITION: &str = "EMPTY_OBJECT_CONDITION";
+/// `Sid` is the empty string.
+const EMPTY_SID_VALUE: &str = "EMPTY_SID_VALUE";
+
+/// The documentation page every finding links to: IAM Access Analyzer's policy check
+/// reference, which is where each issue code above is described.
+const POLICY_CHECK_REFERENCE: &str =
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-reference-policy-checks.html";
+
+// ---------------------------------------------------------------------------
+// The policy grammar the checks are written against: IAM's JSON policy elements.
+// ---------------------------------------------------------------------------
+
+/// The elements IAM's policy grammar defines at the top level of a policy document.
+const TOP_LEVEL_ELEMENTS: &[&str] = &["Version", "Id", "Statement"];
+
+/// The elements IAM's policy grammar defines inside one statement.
+const STATEMENT_ELEMENTS: &[&str] = &[
+    "Sid",
+    "Effect",
+    "Principal",
+    "NotPrincipal",
+    "Action",
+    "NotAction",
+    "Resource",
+    "NotResource",
+    "Condition",
+];
+
+/// The `Version` values IAM defines.
+const POLICY_VERSIONS: &[&str] = &["2012-10-17", "2008-10-17"];
+
+/// The `Effect` values IAM defines.
+const EFFECTS: &[&str] = &["Allow", "Deny"];
+
+/// The `Effect` that grants, as opposed to `Deny`; the security checks only look at
+/// statements that grant.
+const EFFECT_ALLOW: &str = "Allow";
+
+// The `policyType` values, from the model's own `PolicyType` enum
+// (`POLICY_TYPE_VALUES` in `super::types`).
+const POLICY_TYPE_IDENTITY: &str = "IDENTITY_POLICY";
+const POLICY_TYPE_RESOURCE: &str = "RESOURCE_POLICY";
+const POLICY_TYPE_SERVICE_CONTROL: &str = "SERVICE_CONTROL_POLICY";
+const POLICY_TYPE_RESOURCE_CONTROL: &str = "RESOURCE_CONTROL_POLICY";
+
+/// The actions whose grant on the full resource wildcard is a security warning, with
+/// the issue code each one is reported under. Both checks come from the policy check
+/// reference's security warnings: allowing them on `"*"` reaches every role in the
+/// account, including roles more privileged than the caller.
+const STAR_RESOURCE_SENSITIVE_ACTIONS: &[(&str, &str)] = &[
+    ("iam:PassRole", PASS_ROLE_WITH_STAR_IN_RESOURCE),
+    (
+        "iam:CreateServiceLinkedRole",
+        CREATE_SLR_WITH_STAR_IN_RESOURCE,
+    ),
+];
+
+/// The condition keys that narrow WHO a statement reaches: the AWS global condition
+/// context keys describing the principal making the request, or the account, service
+/// or network the call comes through (from the IAM reference for global condition
+/// context keys). A `Condition` testing one of these answers the wildcard-principal
+/// warning; a condition on anything else does not, because it leaves the set of
+/// principals the statement grants to exactly as wide as it was.
+const PRINCIPAL_RESTRICTING_CONDITION_KEYS: &[&str] = &[
+    "aws:PrincipalArn",
+    "aws:PrincipalAccount",
+    "aws:PrincipalOrgID",
+    "aws:PrincipalOrgPaths",
+    "aws:PrincipalTag",
+    "aws:PrincipalType",
+    "aws:PrincipalIsAWSService",
+    "aws:PrincipalServiceName",
+    "aws:PrincipalServiceNamesList",
+    "aws:userid",
+    "aws:username",
+    "aws:SourceAccount",
+    "aws:SourceArn",
+    "aws:SourceOrgID",
+    "aws:SourceOrgPaths",
+    "aws:SourceOwner",
+    "aws:SourceIp",
+    "aws:SourceVpc",
+    "aws:SourceVpce",
+    "aws:VpcSourceIp",
+];
+
+/// How many findings one call will report.
+///
+/// `policyDocument` carries no length constraint in the model, and a document can hold
+/// arbitrarily many statements, each able to hit several checks — so this is the
+/// emulator's own ceiling on how much one request can amplify into, not a fidelity
+/// claim. A document with more findings than this is REFUSED, the way the other
+/// ceilings refuse: a truncated report with no token to resume from would be
+/// indistinguishable from a complete one.
+pub const MAX_FINDINGS: usize = 1_000;
+
+/// The largest policy document this emulator will check.
+///
+/// `policyDocument` carries no length constraint in the model, so nothing upstream
+/// bounds how much work one call can ask for beyond the server's own request-body
+/// limit, which is orders of magnitude larger. AWS's own published policy size quotas
+/// are far smaller than this ceiling — 6,144 characters for a managed identity policy,
+/// 5,120 for a service control policy, 20 KB for most resource policies — so no real
+/// policy meets it, while the cost of the checks over an admitted document stays
+/// bounded and proportional to the request. A document past it is REFUSED (with the
+/// operation's modelled `ValidationException`) rather than half-checked: a short
+/// finding list for a document nothing finished reading would be a wrong answer.
+pub const MAX_POLICY_DOCUMENT_BYTES: usize = 1 << 20;
+
+/// How many statements one document may hold for the checks to run over it.
+///
+/// Every per-statement structure is bounded by this: the statements checked, the `Sid`
+/// values tracked, and the locations one finding can carry. Generous next to the size
+/// quotas cited above (a 20 KB resource policy cannot hold a tenth of this many
+/// statements), and like the size ceiling a document past it is refused rather than
+/// half-checked.
+pub const MAX_STATEMENTS: usize = 1_000;
+
+/// How long the checks may run over one document before the call is refused.
+///
+/// A second bound beside the two above, so a document that is small and well within
+/// the statement count but still expensive to check cannot occupy a thread
+/// indefinitely. The checks run on the blocking pool (see the handler, which also
+/// holds the caller to the same budget), and the deadline is tested at the top of
+/// every loop that walks the document — once per statement, per statement element,
+/// per list entry and per condition operator — so the budget is observed wherever the
+/// work grows, without a sleep.
+const CHECK_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a CALLER waits for the checks before the call is refused.
+///
+/// Slacker than [`CHECK_TIME_BUDGET`] on purpose: the checks hold themselves to that
+/// budget, and this is the backstop around the blocking-pool task, so a request is
+/// never left waiting even if a future check forgets to test the deadline.
+const CALLER_TIME_BUDGET: Duration = CHECK_TIME_BUDGET.saturating_mul(2);
+
+/// Why the checks stopped early, so the handler can refuse the call instead of
+/// answering with the findings of a document it did not finish reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckAborted {
+    /// The document holds more statements than [`MAX_STATEMENTS`].
+    TooManyStatements,
+    /// The document has more findings than [`MAX_FINDINGS`].
+    TooManyFindings,
+    /// The checks did not finish inside [`CHECK_TIME_BUDGET`].
+    OutOfTime,
+}
+
+impl CheckAborted {
+    /// What the refusal tells the caller about its own request.
+    fn message(self) -> String {
+        match self {
+            Self::TooManyStatements => format!(
+                "policyDocument holds more than the {MAX_STATEMENTS} statements this emulator will validate in one call"
+            ),
+            Self::TooManyFindings => format!(
+                "policyDocument has more than the {MAX_FINDINGS} findings this emulator will report in one call"
+            ),
+            Self::OutOfTime => format!(
+                "policyDocument could not be validated within {} seconds",
+                CHECK_TIME_BUDGET.as_secs()
+            ),
+        }
+    }
+}
+
+/// One check that hit, before it is rendered as the modelled `ValidatePolicyFinding`.
+#[derive(Debug)]
+struct Check {
+    /// One of the model's `ValidatePolicyFindingType` values.
+    finding_type: &'static str,
+    /// The issue code of the check that produced it.
+    issue_code: &'static str,
+    /// What is wrong and what to do about it.
+    details: String,
+    /// Where in the document the finding is, in document order.
+    locations: Vec<Location>,
+}
+
+impl Check {
+    /// Project the check onto the modelled finding.
+    ///
+    /// `learnMoreLink` is derived from the check itself: the policy check reference
+    /// gives every check an anchor built from its finding type and issue code,
+    /// lowercased with `_` written as `-`.
+    fn finding(self) -> ValidatePolicyFinding {
+        let anchor = format!(
+            "access-analyzer-reference-policy-checks-{}-{}",
+            self.finding_type.to_ascii_lowercase().replace('_', "-"),
+            self.issue_code.to_ascii_lowercase().replace('_', "-")
+        );
+        ValidatePolicyFinding {
+            finding_details: self.details,
+            finding_type: self.finding_type.to_string(),
+            issue_code: self.issue_code.to_string(),
+            learn_more_link: format!("{POLICY_CHECK_REFERENCE}#{anchor}"),
+            locations: self.locations,
+        }
+    }
+}
+
+/// The policy document, with the index that turns a parser byte offset into the
+/// modelled `Position`: line from 1, column from 0, offset from 0 (see
+/// `smithy_query(query="shape", shape="Position")`).
+///
+/// Columns and offsets are counted in characters, so a document holding non-ASCII text
+/// reports positions a caller can index the document with. Both tables are built ONCE,
+/// in one pass, so resolving a position is a binary search plus two index reads — a
+/// finding never costs a scan of the document, however many findings there are.
+struct Document<'a> {
+    text: &'a str,
+    /// The (byte offset, character offset) of the start of each line, in order.
+    lines: Vec<(usize, usize)>,
+    /// How many characters precede each BYTE of the document. `None` when every byte
+    /// is its own character (an all-ASCII document), where the byte offset IS the
+    /// character offset and no table is needed.
+    character_offsets: Option<Vec<u32>>,
+}
+
+impl<'a> Document<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut lines = vec![(0usize, 0usize)];
+        let mut character_offsets = if text.is_ascii() {
+            None
+        } else {
+            Some(Vec::with_capacity(text.len() + 1))
+        };
+        let mut characters = 0usize;
+        for (byte, character) in text.char_indices() {
+            if let Some(offsets) = character_offsets.as_mut() {
+                // Every byte of this character is preceded by the same characters, so
+                // an offset landing inside it resolves to the character it starts.
+                let preceding = u32::try_from(characters).unwrap_or(u32::MAX);
+                offsets.extend(std::iter::repeat_n(preceding, character.len_utf8()));
+            }
+            characters += 1;
+            if character == '\n' {
+                lines.push((byte + character.len_utf8(), characters));
+            }
+        }
+        if let Some(offsets) = character_offsets.as_mut() {
+            offsets.push(u32::try_from(characters).unwrap_or(u32::MAX));
+        }
+        Self {
+            text,
+            lines,
+            character_offsets,
+        }
+    }
+
+    /// How many characters precede `byte`.
+    fn character_offset(&self, byte: usize) -> usize {
+        match &self.character_offsets {
+            None => byte.min(self.text.len()),
+            Some(offsets) => offsets
+                .get(byte)
+                .or_else(|| offsets.last())
+                .map_or(0, |offset| *offset as usize),
+        }
+    }
+
+    /// The position of a byte offset in the document.
+    fn position(&self, byte: usize) -> Position {
+        let byte = byte.min(self.text.len());
+        // The last line that starts at or before `byte`; the table always holds line 1,
+        // so the index can never underflow.
+        let index = self.lines.partition_point(|(start, _)| *start <= byte) - 1;
+        let (_, line_characters) = self.lines[index];
+        let offset = self.character_offset(byte);
+        Position {
+            line: as_i32(index + 1),
+            column: as_i32(offset.saturating_sub(line_characters)),
+            offset: as_i32(offset),
+        }
+    }
+
+    /// The span a parser byte range covers: start inclusive, end exclusive, as the
+    /// model documents `Span`.
+    fn span(&self, range: JsonRange) -> Span {
+        Span {
+            start: self.position(range.start),
+            end: self.position(range.end),
+        }
+    }
+
+    /// A location: the JSON path that reaches an element, and the span it covers.
+    fn location(&self, path: Vec<PathElement>, range: JsonRange) -> Location {
+        Location {
+            path,
+            span: self.span(range),
+        }
+    }
+}
+
+/// A count as the modelled `Integer` members carry it. Saturating rather than
+/// wrapping: a position past `i32::MAX` characters cannot be reported faithfully, and
+/// reporting the largest position is closer than reporting a negative one.
+fn as_i32(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+/// `path` with one more element appended — paths are built downwards, so a parent's
+/// path is never mutated.
+fn child(path: &[PathElement], element: PathElement) -> Vec<PathElement> {
+    let mut extended = path.to_vec();
+    extended.push(element);
+    extended
+}
+
+/// The path element for an object key.
+fn key(name: &str) -> PathElement {
+    PathElement::Key(name.to_string())
+}
+
+/// The path element for an array index.
+fn index(position: usize) -> PathElement {
+    PathElement::Index(as_i32(position))
+}
+
+/// The statement element named `name`, whatever case the document spells it in: IAM
+/// resolves a policy element name without regard to case, so `"effect"` is the
+/// `Effect` element rather than an unknown one.
+///
+/// The LAST occurrence wins when a document repeats a key, which is the value a JSON
+/// reader keeps (`serde_json`, which decides this document's validity, keeps the last
+/// one too), so the checks judge the value the policy actually takes.
+fn element<'p, 'a>(object: &'p JsonObject<'a>, name: &str) -> Option<&'p JsonProp<'a>> {
+    object
+        .properties
+        .iter()
+        .rfind(|property| property.name.as_str().eq_ignore_ascii_case(name))
+}
+
+/// Whether `name` is one of the elements the grammar defines.
+fn is_known_element(elements: &[&str], name: &str) -> bool {
+    elements
+        .iter()
+        .any(|element| element.eq_ignore_ascii_case(name))
+}
+
+/// The JSON type of a value, as a `DATA_TYPE_MISMATCH` finding names it.
+fn json_type(value: &JsonValue<'_>) -> &'static str {
+    match value {
+        JsonValue::StringLit(_) => "a string",
+        JsonValue::NumberLit(_) => "a number",
+        JsonValue::BooleanLit(_) => "a boolean",
+        JsonValue::Object(_) => "an object",
+        JsonValue::Array(_) => "an array",
+        JsonValue::NullKeyword(_) => "null",
+    }
+}
+
+/// The value as a string, when it is one.
+fn as_string<'p, 'a>(value: &'p JsonValue<'a>) -> Option<&'p str> {
+    match value {
+        JsonValue::StringLit(literal) => Some(literal.value.as_ref()),
+        _ => None,
+    }
+}
+
+/// One string drawn out of an element that holds either a single string or an array of
+/// them, with the path and span of the string itself.
+#[derive(Debug)]
+struct Entry {
+    value: String,
+    path: Vec<PathElement>,
+    range: JsonRange,
+}
+
+/// Whether `action` is a well-formed IAM action: the full wildcard, or
+/// `<service-prefix>:<action>` where the action part may carry `*` and `?` wildcards.
+fn is_well_formed_action(action: &str) -> bool {
+    if action == "*" {
+        return true;
+    }
+    let Some((service, name)) = action.split_once(':') else {
+        return false;
+    };
+    !service.is_empty()
+        && service
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '*' | '?' | '-' | '_'))
+}
+
+/// Whether `resource` is a well-formed resource: the full wildcard, or an ARN.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>` — six
+/// colon-separated segments, the resource segment itself free to hold further colons.
+/// The partition, the service and the resource segment are required; the region and
+/// the account may be empty (`arn:aws:s3:::bucket/*` names a bucket in every region),
+/// and the account is either the 12-digit id, a wildcard, or `aws` for an
+/// AWS-owned resource (`arn:aws:iam::aws:policy/ReadOnlyAccess`). Any segment may
+/// carry the `*`/`?` wildcards IAM allows, and a wildcard may stand in for a digit of
+/// the account id, which keeps its 12-character length either way.
+fn is_well_formed_resource(resource: &str) -> bool {
+    if resource == "*" {
+        return true;
+    }
+    let mut segments = resource.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(region), Some(account), Some(tail)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let wildcards_only = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|character| matches!(character, '*' | '?'))
+    };
+    let account_id = |segment: &str| {
+        segment.len() == 12
+            && segment
+                .chars()
+                .all(|character| character.is_ascii_digit() || matches!(character, '*' | '?'))
+    };
+    !partition.is_empty()
+        && !service.is_empty()
+        && !tail.is_empty()
+        // The region is a region name or a wildcard, never arbitrary text with a space.
+        && region
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '*' | '?'))
+        && (account.is_empty()
+            || account == "aws"
+            || wildcards_only(account)
+            || account_id(account))
+}
+
+/// The condition operators that narrow the set of values a key may take: an equality
+/// or a pattern match, from IAM's condition-operator reference.
+///
+/// A negated operator (`StringNotEquals`, `ArnNotLike`, …) and `Null` are deliberately
+/// absent: neither names who is allowed. So is every `IfExists` form, which is skipped
+/// for a request that does not carry the key at all.
+const POSITIVE_CONDITION_OPERATORS: &[&str] = &[
+    "StringEquals",
+    "StringEqualsIgnoreCase",
+    "StringLike",
+    "ArnEquals",
+    "ArnLike",
+    "IpAddress",
+    "NumericEquals",
+    "DateEquals",
+    "Bool",
+];
+
+/// The set qualifiers a condition operator may carry as a prefix, from IAM's
+/// condition-operator reference. Only these two are stripped when an operator name is
+/// recognised: any other `prefix:` is not a qualifier IAM defines, so the operator is
+/// not one either.
+const CONDITION_SET_QUALIFIERS: &[&str] = &["ForAllValues:", "ForAnyValue:"];
+
+/// A condition operator with its set qualifier removed, so the operator itself can be
+/// recognised whichever spelling the document uses.
+fn condition_operator(operator: &str) -> &str {
+    for qualifier in CONDITION_SET_QUALIFIERS {
+        if let Some(rest) = operator
+            .get(..qualifier.len())
+            .filter(|head| head.eq_ignore_ascii_case(qualifier))
+            .and_then(|_| operator.get(qualifier.len()..))
+        {
+            return rest;
+        }
+    }
+    operator
+}
+
+/// Whether a condition operator narrows the values its keys may take.
+fn is_positive_condition_operator(operator: &str) -> bool {
+    let operator = condition_operator(operator);
+    POSITIVE_CONDITION_OPERATORS
+        .iter()
+        .any(|known| operator.eq_ignore_ascii_case(known))
+}
+
+/// Whether a condition's value narrows what the key may be: at least one value that
+/// is not the bare wildcard. A value list that is empty, or that holds only `"*"`,
+/// matches every caller and so restricts nothing.
+fn narrows_the_value(value: &JsonValue<'_>) -> bool {
+    match value {
+        JsonValue::Array(values) => values.elements.iter().any(narrows_the_value),
+        JsonValue::StringLit(literal) => {
+            let value = literal.value.trim();
+            !value.is_empty() && !value.chars().all(|character| matches!(character, '*' | '?'))
+        }
+        // A non-string value (a boolean for `Bool`, a number for a numeric operator)
+        // names one value, so it narrows.
+        JsonValue::NumberLit(_) | JsonValue::BooleanLit(_) => true,
+        JsonValue::Object(_) | JsonValue::NullKeyword(_) => false,
+    }
+}
+
+/// Whether an IAM action pattern — which may carry `*` (any run of characters) and `?`
+/// (one character) — matches `action`. IAM matches an action without regard to case,
+/// so `"IAM:passrole"` names the same action as `"iam:PassRole"`.
+///
+/// The matcher is the crate's own, shared with the access checks: it is
+/// allocation-free and charged to a step budget, so a long pattern out of the request
+/// cannot outrun it. Kept behind this name so the call sites read as what they mean.
+fn action_matches(pattern: &str, action: &str) -> bool {
+    crate::ops::check_no_new_access::policy::wildcard_match(pattern, action, false)
+}
+
+/// Whether a principal value names every principal: the `"*"` wildcard, or the
+/// equivalent IAM ARN naming the root of every account.
+///
+/// Matched structurally rather than against a literal, so the form holds in every
+/// partition (`arn:aws-cn:iam::*:root`) and for a wildcard in place of the resource
+/// (`arn:aws:iam::*:*`), which name just as many principals.
+fn is_wildcard_principal(value: &str) -> bool {
+    if value == "*" {
+        return true;
+    }
+    let mut segments = value.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(""), Some("*"), Some(resource)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    !partition.is_empty() && (resource == "root" || resource == "*")
+}
+
+/// The byte offset a `serde_json` error position names: its line is counted from 1 and
+/// its column is the 1-based character position on that line.
+fn offset_of(document: &str, line: usize, column: usize) -> usize {
+    let mut offset = 0usize;
+    for (number, text) in document.split_inclusive('\n').enumerate() {
+        if number + 1 == line {
+            return offset
+                + text
+                    .char_indices()
+                    .nth(column.saturating_sub(1))
+                    .map_or(text.len(), |(byte, _)| byte);
+        }
+        offset += text.len();
+    }
+    document.len()
+}
+
+/// Runs every check over `document` and reports what hit, in document order.
+///
+/// `policy_type` selects the checks that depend on where the policy is attached: an
+/// identity policy must name a resource and must not name a principal, a resource
+/// policy is the other way round.
+///
+/// Answers `Err` when the document is past a bound the checks hold themselves to
+/// ([`MAX_STATEMENTS`], [`CHECK_TIME_BUDGET`]), so the caller refuses the call rather
+/// than answering with the findings of a document the checks did not finish.
+fn policy_findings(
+    document: &str,
+    policy_type: &str,
+) -> Result<Vec<ValidatePolicyFinding>, CheckAborted> {
+    let doc = Document::new(document);
+    let mut linter = Linter {
+        doc: &doc,
+        policy_type,
+        checks: Vec::new(),
+        sids: BTreeMap::new(),
+        statements: 0,
+        deadline: Instant::now() + CHECK_TIME_BUDGET,
+        aborted: None,
+    };
+
+    // Two parsers, each for what it is authoritative about. `jsonc-parser` is the one
+    // that keeps source ranges, but its grammar stays a superset of JSON even with
+    // every extension switched off — it accepts a single-quoted string, say — so JSON
+    // VALIDITY is decided by `serde_json`, which is strict, and the AST is used only
+    // for the positions the findings report. Both passes are linear in a document the
+    // handler has already bounded by `MAX_POLICY_DOCUMENT_BYTES`.
+    if let Err(error) = serde_json::from_str::<serde_json::Value>(document) {
+        // `serde_json` reports the line and column it gave up at; the span covers the
+        // character there, which is where the document stops being JSON.
+        let start = offset_of(document, error.line(), error.column());
+        let end = document[start..]
+            .chars()
+            .next()
+            .map_or(start, |character| start + character.len_utf8());
+        linter.flag(
+            FINDING_TYPE_ERROR,
+            JSON_SYNTAX_ERROR,
+            format!(
+                "The policy document is not valid JSON: {error}. Fix the JSON syntax so that the policy can be parsed."
+            ),
+            vec![doc.location(Vec::new(), JsonRange { start, end })],
+        );
+        return Ok(linter.report());
+    }
+
+    match jsonc_parser::parse_to_ast(document, &jsonc_parser::CollectOptions::default(), &STRICT_JSON)
+    {
+        Err(error) => {
+            // The parser reports where it gave up; that range IS the finding's span.
+            let range = error.range();
+            linter.flag(
+                FINDING_TYPE_ERROR,
+                JSON_SYNTAX_ERROR,
+                format!(
+                    "The policy document is not valid JSON: {error}. Fix the JSON syntax so that the policy can be parsed."
+                ),
+                vec![doc.location(Vec::new(), range)],
+            );
+        }
+        Ok(parsed) => match parsed.value {
+            None => linter.flag(
+                FINDING_TYPE_ERROR,
+                JSON_SYNTAX_ERROR,
+                "The policy document is empty. Provide a JSON policy document.".to_string(),
+                vec![doc.location(
+                    Vec::new(),
+                    JsonRange {
+                        start: 0,
+                        end: document.len(),
+                    },
+                )],
+            ),
+            Some(root) => linter.lint_policy(&root),
+        },
+    }
+
+    match linter.aborted {
+        Some(reason) => Err(reason),
+        None => Ok(linter.report()),
+    }
+}
+
+/// The policy checks, and what they have found so far.
+struct Linter<'d> {
+    doc: &'d Document<'d>,
+    /// The request's `policyType`, which decides which checks apply.
+    policy_type: &'d str,
+    checks: Vec<Check>,
+    /// Where each `Sid` was seen, keyed by the value, so a repeated one is reported
+    /// once the whole document has been walked. Keyed rather than scanned: a document
+    /// whose statements all carry a different `Sid` would otherwise cost a comparison
+    /// per pair. Holds at most [`MAX_STATEMENTS`] keys, since every entry comes from a
+    /// statement the checks admitted.
+    sids: BTreeMap<String, Vec<Location>>,
+    /// How many statements have been checked, against [`MAX_STATEMENTS`].
+    statements: usize,
+    /// When the checks run out of [`CHECK_TIME_BUDGET`].
+    deadline: Instant,
+    /// Set once a bound is hit; the findings gathered so far are then discarded in
+    /// favour of a refusal.
+    aborted: Option<CheckAborted>,
+}
+
+impl Linter<'_> {
+    /// The findings, in the order the checks produced them.
+    ///
+    /// No ceiling is applied here: a report that reached [`MAX_FINDINGS`] is refused by
+    /// [`Linter::flag`] instead, so the refusal is the one place that bound is
+    /// expressed and what this answers is always the whole report.
+    fn report(self) -> Vec<ValidatePolicyFinding> {
+        self.checks.into_iter().map(Check::finding).collect()
+    }
+
+    /// Whether one more statement may be checked, against the statement ceiling and
+    /// the time budget.
+    fn admit_statement(&mut self) -> bool {
+        if !self.keep_going() {
+            return false;
+        }
+        if self.statements >= MAX_STATEMENTS {
+            self.aborted = Some(CheckAborted::TooManyStatements);
+            return false;
+        }
+        self.statements += 1;
+        true
+    }
+
+    /// Whether the checks may keep walking the document: false once a bound has been
+    /// hit, and the place the time budget is observed. Tested at the top of every loop
+    /// that walks the document, so no loop can run past the budget and no further
+    /// location or message is built for a report that is already being refused.
+    fn keep_going(&mut self) -> bool {
+        if self.aborted.is_some() {
+            return false;
+        }
+        if Instant::now() >= self.deadline {
+            self.aborted = Some(CheckAborted::OutOfTime);
+            return false;
+        }
+        true
+    }
+
+    /// Record a check that hit.
+    ///
+    /// A document with more findings than the ceiling is refused rather than reported
+    /// in part, so this is also where that bound is observed.
+    fn flag(
+        &mut self,
+        finding_type: &'static str,
+        issue_code: &'static str,
+        details: String,
+        locations: Vec<Location>,
+    ) {
+        if self.checks.len() >= MAX_FINDINGS {
+            self.aborted = Some(CheckAborted::TooManyFindings);
+            return;
+        }
+        self.checks.push(Check {
+            finding_type,
+            issue_code,
+            details,
+            locations,
+        });
+    }
+
+    /// Whether the policy is attached to a principal (so it must name resources) as
+    /// opposed to a resource (so it must name principals).
+    fn is_identity_style(&self) -> bool {
+        self.policy_type == POLICY_TYPE_IDENTITY
+            || self.policy_type == POLICY_TYPE_SERVICE_CONTROL
+    }
+
+    /// Whether the policy is attached to a resource, so a statement needs a principal.
+    fn is_resource_style(&self) -> bool {
+        self.policy_type == POLICY_TYPE_RESOURCE || self.policy_type == POLICY_TYPE_RESOURCE_CONTROL
+    }
+
+    /// The whole-document checks, then every statement.
+    fn lint_policy(&mut self, root: &JsonValue<'_>) {
+        let doc = self.doc;
+        let JsonValue::Object(policy) = root else {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                DATA_TYPE_MISMATCH,
+                format!(
+                    "A policy document must be a JSON object, but this one is {}.",
+                    json_type(root)
+                ),
+                vec![doc.location(Vec::new(), root.range())],
+            );
+            return;
+        };
+
+        for property in &policy.properties {
+            if !self.keep_going() {
+                return;
+            }
+            if !is_known_element(TOP_LEVEL_ELEMENTS, property.name.as_str()) {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    INVALID_POLICY_ELEMENT,
+                    format!(
+                        "{} is not a policy element. A policy document holds only {}.",
+                        property.name.as_str(),
+                        TOP_LEVEL_ELEMENTS.join(", ")
+                    ),
+                    vec![doc.location(vec![key(property.name.as_str())], property.range())],
+                );
+            }
+        }
+
+        self.lint_version(policy);
+        self.lint_statements(policy);
+        self.lint_duplicate_sids();
+    }
+
+    /// `Version`: absent, or present with a value IAM defines.
+    fn lint_version(&mut self, policy: &JsonObject<'_>) {
+        let doc = self.doc;
+        let Some(property) = element(policy, "Version") else {
+            self.flag(
+                FINDING_TYPE_SUGGESTION,
+                MISSING_VERSION,
+                format!(
+                    "The policy document does not state a Version, so it is read with the oldest policy grammar. Add \"Version\": \"{}\" to use policy variables and all current policy features.",
+                    POLICY_VERSIONS[0]
+                ),
+                vec![doc.location(Vec::new(), policy.range())],
+            );
+            return;
+        };
+        let path = vec![key("Version")];
+        match as_string(&property.value) {
+            Some(version) if POLICY_VERSIONS.contains(&version) => {}
+            Some(version) => self.flag(
+                FINDING_TYPE_ERROR,
+                INVALID_VERSION,
+                format!(
+                    "{version} is not a policy version. The supported versions are {}.",
+                    POLICY_VERSIONS.join(", ")
+                ),
+                vec![doc.location(path, property.value.range())],
+            ),
+            None => self.flag(
+                FINDING_TYPE_ERROR,
+                DATA_TYPE_MISMATCH,
+                format!(
+                    "Version must be a string, but it is {}.",
+                    json_type(&property.value)
+                ),
+                vec![doc.location(path, property.value.range())],
+            ),
+        }
+    }
+
+    /// `Statement`: one statement object, or an array of them.
+    fn lint_statements(&mut self, policy: &JsonObject<'_>) {
+        let doc = self.doc;
+        let Some(property) = element(policy, "Statement") else {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                MISSING_STATEMENT,
+                "The policy document has no Statement element, so it grants and denies nothing. Add a Statement.".to_string(),
+                vec![doc.location(Vec::new(), policy.range())],
+            );
+            return;
+        };
+        let path = vec![key("Statement")];
+        match &property.value {
+            JsonValue::Object(statement) => {
+                if !self.admit_statement() {
+                    return;
+                }
+                self.lint_statement(statement, &path);
+            }
+            JsonValue::Array(statements) => {
+                if statements.elements.is_empty() {
+                    self.flag(
+                        FINDING_TYPE_ERROR,
+                        MISSING_STATEMENT,
+                        "The Statement element is an empty array, so the policy grants and denies nothing. Add a statement to it.".to_string(),
+                        vec![doc.location(path.clone(), property.value.range())],
+                    );
+                }
+                for (position, value) in statements.elements.iter().enumerate() {
+                    // Each statement is admitted against the statement ceiling and the
+                    // time budget before any work is done on it, so the cost of the
+                    // checks over one document is bounded whatever the document holds.
+                    if !self.admit_statement() {
+                        return;
+                    }
+                    let path = child(&path, index(position));
+                    match value {
+                        JsonValue::Object(statement) => self.lint_statement(statement, &path),
+                        other => self.flag(
+                            FINDING_TYPE_ERROR,
+                            DATA_TYPE_MISMATCH,
+                            format!("A statement must be a JSON object, but this one is {}.", json_type(other)),
+                            vec![doc.location(path, other.range())],
+                        ),
+                    }
+                }
+            }
+            other => self.flag(
+                FINDING_TYPE_ERROR,
+                DATA_TYPE_MISMATCH,
+                format!(
+                    "Statement must be a statement object or an array of them, but it is {}.",
+                    json_type(other)
+                ),
+                vec![doc.location(path, other.range())],
+            ),
+        }
+    }
+
+    /// Every check that applies to one statement.
+    fn lint_statement(&mut self, statement: &JsonObject<'_>, path: &[PathElement]) {
+        let doc = self.doc;
+
+        for property in &statement.properties {
+            if !self.keep_going() {
+                return;
+            }
+            if !is_known_element(STATEMENT_ELEMENTS, property.name.as_str()) {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    INVALID_POLICY_ELEMENT,
+                    format!(
+                        "{} is not a statement element. A statement holds only {}.",
+                        property.name.as_str(),
+                        STATEMENT_ELEMENTS.join(", ")
+                    ),
+                    vec![doc.location(child(path, key(property.name.as_str())), property.range())],
+                );
+            }
+        }
+
+        self.lint_sid(statement, path);
+        let effect = self.lint_effect(statement, path);
+        let actions = self.lint_actions(statement, path);
+        let resources = self.lint_resources(statement, path);
+        let principals = self.lint_principals(statement, path);
+        self.lint_condition(statement, path);
+        self.lint_security(statement, path, effect.as_deref(), &actions, &resources, &principals);
+    }
+
+    /// `Sid`: a non-empty string, remembered so a repeat can be reported.
+    fn lint_sid(&mut self, statement: &JsonObject<'_>, path: &[PathElement]) {
+        let doc = self.doc;
+        let Some(property) = element(statement, "Sid") else {
+            return;
+        };
+        let location = doc.location(child(path, key("Sid")), property.value.range());
+        match as_string(&property.value) {
+            Some("") => self.flag(
+                FINDING_TYPE_SUGGESTION,
+                EMPTY_SID_VALUE,
+                "Sid is the empty string, which identifies nothing. Give the statement an identifier or remove the element.".to_string(),
+                vec![location],
+            ),
+            Some(sid) => {
+                // Keyed by the value, so the duplicate check costs one lookup per
+                // statement rather than a scan of everything seen so far. Bounded with
+                // the statements: every entry comes from an admitted statement.
+                self.sids.entry(sid.to_string()).or_default().push(location);
+            }
+            None => self.flag(
+                FINDING_TYPE_ERROR,
+                DATA_TYPE_MISMATCH,
+                format!("Sid must be a string, but it is {}.", json_type(&property.value)),
+                vec![location],
+            ),
+        }
+    }
+
+    /// `Effect`: required, and exactly one of the two values IAM defines. Answers the
+    /// effect the statement carries, read without regard to case, for the security
+    /// checks.
+    fn lint_effect(&mut self, statement: &JsonObject<'_>, path: &[PathElement]) -> Option<String> {
+        let doc = self.doc;
+        let Some(property) = element(statement, "Effect") else {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                MISSING_EFFECT,
+                "The statement has no Effect element. Add \"Effect\": \"Allow\" or \"Effect\": \"Deny\".".to_string(),
+                vec![doc.location(path.to_vec(), statement.range())],
+            );
+            return None;
+        };
+        let location = doc.location(child(path, key("Effect")), property.value.range());
+        match as_string(&property.value) {
+            Some(effect) if EFFECTS.contains(&effect) => Some(effect.to_string()),
+            Some(effect) => {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    INVALID_EFFECT,
+                    format!(
+                        "{effect} is not an effect. Effect must be exactly {}.",
+                        EFFECTS.join(" or ")
+                    ),
+                    vec![location],
+                );
+                // The value is still read for the security checks when it names an
+                // effect in another case: the statement's intent is not in doubt.
+                EFFECTS
+                    .iter()
+                    .find(|known| known.eq_ignore_ascii_case(effect))
+                    .map(|known| (*known).to_string())
+            }
+            None => {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    DATA_TYPE_MISMATCH,
+                    format!(
+                        "Effect must be a string, but it is {}.",
+                        json_type(&property.value)
+                    ),
+                    vec![location],
+                );
+                None
+            }
+        }
+    }
+
+    /// `Action`/`NotAction`: exactly one of them, holding well-formed actions.
+    fn lint_actions(&mut self, statement: &JsonObject<'_>, path: &[PathElement]) -> Vec<Entry> {
+        let doc = self.doc;
+        let action = element(statement, "Action");
+        let not_action = element(statement, "NotAction");
+        if action.is_none() && not_action.is_none() {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                MISSING_ACTION,
+                "The statement names no Action and no NotAction, so it applies to no action at all. Add one of them.".to_string(),
+                vec![doc.location(path.to_vec(), statement.range())],
+            );
+        }
+        if action.is_some() && not_action.is_some() {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                UNSUPPORTED_ELEMENT_COMBINATION,
+                "A statement holds Action or NotAction, never both. Remove one of them.".to_string(),
+                vec![doc.location(path.to_vec(), statement.range())],
+            );
+        }
+
+        let mut entries = Vec::new();
+        for (name, empty_code) in [
+            ("Action", Some(EMPTY_ARRAY_ACTION)),
+            ("NotAction", Some(EMPTY_ARRAY_ACTION)),
+        ] {
+            let Some(property) = element(statement, name) else {
+                continue;
+            };
+            let found = self.string_entries(property, path, name, empty_code);
+            for entry in &found {
+                if !self.keep_going() {
+                    break;
+                }
+                if !is_well_formed_action(&entry.value) {
+                    self.flag(
+                        FINDING_TYPE_ERROR,
+                        INVALID_ACTION,
+                        format!(
+                            "{} is not an action. An action is service:action, such as s3:GetObject, or the wildcard *.",
+                            entry.value
+                        ),
+                        vec![doc.location(entry.path.clone(), entry.range)],
+                    );
+                }
+            }
+            if name == "Action" {
+                entries = found;
+            }
+        }
+        entries
+    }
+
+    /// `Resource`/`NotResource`: required where the policy is attached to a principal,
+    /// at most one of the two, holding ARNs or the wildcard.
+    fn lint_resources(&mut self, statement: &JsonObject<'_>, path: &[PathElement]) -> Vec<Entry> {
+        let doc = self.doc;
+        let resource = element(statement, "Resource");
+        let not_resource = element(statement, "NotResource");
+        if resource.is_none() && not_resource.is_none() && self.is_identity_style() {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                MISSING_RESOURCE,
+                format!(
+                    "A statement in a {} names the resources it applies to, and this one names neither Resource nor NotResource. Add one of them.",
+                    self.policy_type
+                ),
+                vec![doc.location(path.to_vec(), statement.range())],
+            );
+        }
+        if resource.is_some() && not_resource.is_some() {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                UNSUPPORTED_ELEMENT_COMBINATION,
+                "A statement holds Resource or NotResource, never both. Remove one of them."
+                    .to_string(),
+                vec![doc.location(path.to_vec(), statement.range())],
+            );
+        }
+
+        let mut entries = Vec::new();
+        for (name, empty_code) in [
+            ("Resource", Some(EMPTY_ARRAY_RESOURCE)),
+            ("NotResource", Some(EMPTY_ARRAY_RESOURCE)),
+        ] {
+            let Some(property) = element(statement, name) else {
+                continue;
+            };
+            let found = self.string_entries(property, path, name, empty_code);
+            for entry in &found {
+                if !self.keep_going() {
+                    break;
+                }
+                if !is_well_formed_resource(&entry.value) {
+                    self.flag(
+                        FINDING_TYPE_ERROR,
+                        INVALID_ARN,
+                        format!(
+                            "{} is not a resource. A resource is an ARN, such as arn:aws:s3:::bucket/*, or the wildcard *.",
+                            entry.value
+                        ),
+                        vec![doc.location(entry.path.clone(), entry.range)],
+                    );
+                }
+            }
+            if name == "Resource" {
+                entries = found;
+            }
+        }
+        entries
+    }
+
+    /// `Principal`/`NotPrincipal`: required where the policy is attached to a resource,
+    /// refused where it is attached to a principal, at most one of the two.
+    fn lint_principals(&mut self, statement: &JsonObject<'_>, path: &[PathElement]) -> Vec<Entry> {
+        let doc = self.doc;
+        let principal = element(statement, "Principal");
+        let not_principal = element(statement, "NotPrincipal");
+
+        if principal.is_none() && not_principal.is_none() && self.is_resource_style() {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                MISSING_PRINCIPAL,
+                format!(
+                    "A statement in a {} names the principals it applies to, and this one names neither Principal nor NotPrincipal. Add one of them.",
+                    self.policy_type
+                ),
+                vec![doc.location(path.to_vec(), statement.range())],
+            );
+        }
+        if principal.is_some() && not_principal.is_some() {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                UNSUPPORTED_ELEMENT_COMBINATION,
+                "A statement holds Principal or NotPrincipal, never both. Remove one of them."
+                    .to_string(),
+                vec![doc.location(path.to_vec(), statement.range())],
+            );
+        }
+        if self.is_identity_style() {
+            for name in ["Principal", "NotPrincipal"] {
+                if let Some(property) = element(statement, name) {
+                    self.flag(
+                        FINDING_TYPE_ERROR,
+                        UNSUPPORTED_ELEMENT_COMBINATION,
+                        format!(
+                            "{name} is not supported in a {}: the policy is attached to the principal it applies to. Remove the element.",
+                            self.policy_type
+                        ),
+                        vec![doc.location(child(path, key(name)), property.range())],
+                    );
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        for name in ["Principal", "NotPrincipal"] {
+            let Some(property) = element(statement, name) else {
+                continue;
+            };
+            let found = self.principal_entries(property, path, name);
+            if name == "Principal" {
+                entries = found;
+            }
+        }
+        entries
+    }
+
+    /// The principal values one `Principal`/`NotPrincipal` element names, in either
+    /// form IAM accepts: the bare `"*"` string, or an object keyed by principal type.
+    fn principal_entries(
+        &mut self,
+        property: &JsonProp<'_>,
+        path: &[PathElement],
+        name: &str,
+    ) -> Vec<Entry> {
+        let doc = self.doc;
+        let path = child(path, key(name));
+        match &property.value {
+            JsonValue::StringLit(_) => self.values_of(&property.value, &path, name, None),
+            JsonValue::Object(principals) => {
+                if principals.properties.is_empty() {
+                    self.flag(
+                        FINDING_TYPE_SUGGESTION,
+                        EMPTY_OBJECT_PRINCIPAL,
+                        format!("{name} is an empty object, which names no principal. Name a principal or remove the element."),
+                        vec![doc.location(path.clone(), property.value.range())],
+                    );
+                }
+                let mut entries = Vec::new();
+                for principal_type in &principals.properties {
+                    if !self.keep_going() {
+                        break;
+                    }
+                    let typed = child(&path, key(principal_type.name.as_str()));
+                    entries.extend(self.values_of(
+                        &principal_type.value,
+                        &typed,
+                        name,
+                        Some(EMPTY_ARRAY_PRINCIPAL),
+                    ));
+                }
+                entries
+            }
+            other => {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    DATA_TYPE_MISMATCH,
+                    format!(
+                        "{name} must be a string or an object keyed by principal type, but it is {}.",
+                        json_type(other)
+                    ),
+                    vec![doc.location(path, other.range())],
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// `Condition`: an object of operator to condition keys, with the one pairing that
+    /// cancels itself out reported.
+    fn lint_condition(&mut self, statement: &JsonObject<'_>, path: &[PathElement]) {
+        let doc = self.doc;
+        let Some(property) = element(statement, "Condition") else {
+            return;
+        };
+        let path = child(path, key("Condition"));
+        let JsonValue::Object(condition) = &property.value else {
+            self.flag(
+                FINDING_TYPE_ERROR,
+                DATA_TYPE_MISMATCH,
+                format!(
+                    "Condition must be an object keyed by condition operator, but it is {}.",
+                    json_type(&property.value)
+                ),
+                vec![doc.location(path, property.value.range())],
+            );
+            return;
+        };
+        if condition.properties.is_empty() {
+            self.flag(
+                FINDING_TYPE_SUGGESTION,
+                EMPTY_OBJECT_CONDITION,
+                "Condition is an empty object, which restricts nothing. Add a condition or remove the element.".to_string(),
+                vec![doc.location(path.clone(), property.value.range())],
+            );
+            return;
+        }
+        for operator in &condition.properties {
+            if !self.keep_going() {
+                return;
+            }
+            let operator_name = operator.name.as_str();
+            let operator_path = child(&path, key(operator_name));
+            // `Null` asks whether a key is absent, and `IfExists` asks to skip the
+            // test when it is: together they test nothing.
+            if condition_operator(operator_name).eq_ignore_ascii_case("NullIfExists") {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    NULL_WITH_IF_EXISTS,
+                    "The Null condition operator cannot be used with the IfExists suffix: Null already tests whether the key is present.".to_string(),
+                    vec![doc.location(operator_path.clone(), operator.range())],
+                );
+            }
+            if !matches!(&operator.value, JsonValue::Object(_)) {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    DATA_TYPE_MISMATCH,
+                    format!(
+                        "The {operator_name} condition must be an object keyed by condition key, but it is {}.",
+                        json_type(&operator.value)
+                    ),
+                    vec![doc.location(operator_path, operator.value.range())],
+                );
+            }
+        }
+    }
+
+    /// The security checks: what a statement that GRANTS reaches.
+    fn lint_security(
+        &mut self,
+        statement: &JsonObject<'_>,
+        path: &[PathElement],
+        effect: Option<&str>,
+        actions: &[Entry],
+        resources: &[Entry],
+        principals: &[Entry],
+    ) {
+        let doc = self.doc;
+        if effect != Some(EFFECT_ALLOW) {
+            // Only a grant can be overly permissive.
+            return;
+        }
+
+        if self.is_identity_style() {
+            if let Some(star) = resources
+                .iter()
+                .find(|resource| resource.value.trim() == "*")
+            {
+                for (sensitive, issue_code) in STAR_RESOURCE_SENSITIVE_ACTIONS {
+                    let Some(action) = actions
+                        .iter()
+                        .find(|action| action_matches(&action.value, sensitive))
+                    else {
+                        continue;
+                    };
+                    self.flag(
+                        FINDING_TYPE_SECURITY_WARNING,
+                        issue_code,
+                        format!(
+                            "Using {sensitive} with a wildcard (*) resource is overly permissive, because the statement reaches every role in the account. Name the role ARNs the statement needs."
+                        ),
+                        vec![
+                            doc.location(action.path.clone(), action.range),
+                            doc.location(star.path.clone(), star.range),
+                        ],
+                    );
+                }
+            }
+        }
+
+        if self.is_resource_style() {
+            // A resource policy granting to NotPrincipal grants to every principal the
+            // list does not name, which is almost never what the author meant.
+            if let Some(property) = element(statement, "NotPrincipal") {
+                self.flag(
+                    FINDING_TYPE_SECURITY_WARNING,
+                    ALLOW_WITH_NOT_PRINCIPAL,
+                    "Using NotPrincipal with Allow grants access to every principal the element does not name. Use Principal to name who is allowed."
+                        .to_string(),
+                    vec![doc.location(child(path, key("NotPrincipal")), property.range())],
+                );
+            }
+
+            let wildcards: Vec<&Entry> = principals
+                .iter()
+                .filter(|principal| is_wildcard_principal(principal.value.trim()))
+                .collect();
+            // A condition only answers the warning when it narrows WHO the grant
+            // reaches; a condition on something else (an encryption header, say)
+            // leaves the wildcard principal as wide as it was.
+            if !wildcards.is_empty() && !self.restricts_the_principal(statement) {
+                let locations = wildcards
+                    .iter()
+                    .map(|principal| doc.location(principal.path.clone(), principal.range))
+                    .collect();
+                self.flag(
+                    FINDING_TYPE_SECURITY_WARNING,
+                    ALLOW_WITH_WILDCARD_PRINCIPAL,
+                    "Granting to a wildcard (*) principal allows public access to the resource. Name the principals that need access, or restrict the statement with a condition on who is calling."
+                        .to_string(),
+                    locations,
+                );
+            }
+        }
+    }
+
+    /// Whether the statement's `Condition` narrows WHO the grant reaches: a POSITIVE
+    /// test (an equality or pattern match, not a negation and not `Null`) on one of
+    /// the global condition keys that identify the caller or the calling resource.
+    ///
+    /// Anything else leaves a wildcard principal as wide as it was: `Null` asks only
+    /// whether the key is present, a negated operator excludes one principal rather
+    /// than naming who is allowed, and an `IfExists` form is skipped entirely for a
+    /// caller that does not carry the key.
+    fn restricts_the_principal(&self, statement: &JsonObject<'_>) -> bool {
+        let Some(property) = element(statement, "Condition") else {
+            return false;
+        };
+        let JsonValue::Object(condition) = &property.value else {
+            return false;
+        };
+        condition.properties.iter().any(|operator| {
+            if !is_positive_condition_operator(operator.name.as_str()) {
+                return false;
+            }
+            let JsonValue::Object(keys) = &operator.value else {
+                return false;
+            };
+            keys.properties.iter().any(|entry| {
+                let name = entry.name.as_str();
+                let names_the_caller = PRINCIPAL_RESTRICTING_CONDITION_KEYS.iter().any(|known| {
+                    name.eq_ignore_ascii_case(known)
+                        // A tag key names the tag after a slash: `aws:PrincipalTag/team`.
+                        || name
+                            .get(..known.len())
+                            .is_some_and(|head| head.eq_ignore_ascii_case(known))
+                            && name.as_bytes().get(known.len()) == Some(&b'/')
+                });
+                // The VALUE has to narrow something too: a test against the bare
+                // wildcard (or against nothing at all) matches every caller, so it
+                // leaves the grant exactly as public as it was.
+                names_the_caller && narrows_the_value(&entry.value)
+            })
+        })
+    }
+
+    /// Report a `Sid` carried by more than one statement, once per repeated value,
+    /// with every place it appears.
+    fn lint_duplicate_sids(&mut self) {
+        // The map is already keyed by the value, so this is one pass over the distinct
+        // ids rather than a comparison per pair of statements.
+        for (sid, locations) in std::mem::take(&mut self.sids) {
+            if !self.keep_going() {
+                return;
+            }
+            if locations.len() > 1 {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    UNIQUE_SIDS_REQUIRED,
+                    format!(
+                        "The statement id {sid} is used by {} statements. Every Sid in a policy must be unique.",
+                        locations.len()
+                    ),
+                    locations,
+                );
+            }
+        }
+    }
+
+    /// The strings one element holds, whether it holds a single string or an array of
+    /// them, each with the path and span of the string itself. A non-string where a
+    /// string belongs is reported, and so is an empty array when `empty_code` names
+    /// the check for it.
+    fn string_entries(
+        &mut self,
+        property: &JsonProp<'_>,
+        path: &[PathElement],
+        name: &str,
+        empty_code: Option<&'static str>,
+    ) -> Vec<Entry> {
+        let element_path = child(path, key(name));
+        self.values_of(&property.value, &element_path, name, empty_code)
+    }
+
+    /// The strings a value holds: itself when it is a string, its elements when it is
+    /// an array of them.
+    fn values_of(
+        &mut self,
+        value: &JsonValue<'_>,
+        path: &[PathElement],
+        name: &str,
+        empty_code: Option<&'static str>,
+    ) -> Vec<Entry> {
+        let doc = self.doc;
+        match value {
+            JsonValue::StringLit(literal) => vec![Entry {
+                value: literal.value.to_string(),
+                path: path.to_vec(),
+                range: value.range(),
+            }],
+            JsonValue::Array(values) => {
+                if values.elements.is_empty() {
+                    if let Some(issue_code) = empty_code {
+                        self.flag(
+                            FINDING_TYPE_SUGGESTION,
+                            issue_code,
+                            format!("{name} is an empty array, so the statement names nothing there. Add a value or remove the element."),
+                            vec![doc.location(path.to_vec(), value.range())],
+                        );
+                    }
+                }
+                let mut entries = Vec::new();
+                for (position, item) in values.elements.iter().enumerate() {
+                    if !self.keep_going() {
+                        break;
+                    }
+                    let item_path = child(path, index(position));
+                    match item {
+                        JsonValue::StringLit(literal) => entries.push(Entry {
+                            value: literal.value.to_string(),
+                            path: item_path,
+                            range: item.range(),
+                        }),
+                        other => self.flag(
+                            FINDING_TYPE_ERROR,
+                            DATA_TYPE_MISMATCH,
+                            format!(
+                                "Every value in {name} must be a string, but this one is {}.",
+                                json_type(other)
+                            ),
+                            vec![doc.location(item_path, other.range())],
+                        ),
+                    }
+                }
+                entries
+            }
+            other => {
+                self.flag(
+                    FINDING_TYPE_ERROR,
+                    DATA_TYPE_MISMATCH,
+                    format!(
+                        "{name} must be a string or an array of strings, but it is {}.",
+                        json_type(other)
+                    ),
+                    vec![doc.location(path.to_vec(), other.range())],
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -133,6 +1751,26 @@ impl From<ValidatePolicyErrorModeled> for ValidatePolicyError {
     fn from(modeled: ValidatePolicyErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse a `policyDocument` the checks will not run over, with the operation's own
+/// modelled `ValidationException` naming the member.
+///
+/// The bounds that lead here ([`MAX_POLICY_DOCUMENT_BYTES`], [`MAX_STATEMENTS`],
+/// [`CHECK_TIME_BUDGET`]) are the emulator's own ceilings rather than a modelled
+/// constraint, so the message says which one the request met and the `fieldList` names
+/// the member to change — the caller can act on it, which a truncated finding list or
+/// a server error would not let it do.
+fn document_refused(message: String) -> ValidatePolicyError {
+    ValidatePolicyErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "policyDocument".to_string(),
+            message,
+        }]),
+    })
+    .into()
 }
 
 /// The `ValidatePolicy` operation.
@@ -171,18 +1809,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // This operation is `@readonly` and owns no resource: the findings are computed
+        // from the request's own policy document, so no service state is read or
+        // written. The engine stays bound so the constructor seam is unchanged.
+        let _ = (ctx, &self.engine);
+
+        // One record per invocation, so an operator driving the emulator can see which
+        // calls were served and which were refused by a ceiling of the emulator's own.
+        // The policy document itself is NOT recorded — only its size.
+        ::tracing::debug!(
+            operation = ValidatePolicy::<Eng>::NAME,
+            policy_type = %input.policy_type,
+            document_bytes = input.policy_document.len(),
+            "validating a policy document"
+        );
+
+        // The model documents `validatePolicyResourceType` as "Specify a value for the
+        // policy validation resource type only if the policy type is RESOURCE_POLICY" —
+        // a combination no modeled constraint can express, so it is refused here with
+        // the operation's own `ValidationException` rather than silently ignored.
+        if let Some(resource_type) = input.validate_policy_resource_type.as_deref() {
+            if input.policy_type != POLICY_TYPE_RESOURCE {
+                let message = format!(
+                    "validatePolicyResourceType {resource_type} is supported only when policyType is {POLICY_TYPE_RESOURCE}, but policyType was {}",
+                    input.policy_type
+                );
+                return Err(ValidatePolicyErrorModeled::ValidationException(ValidationException {
+                    message: message.clone(),
+                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "validatePolicyResourceType".to_string(),
+                        message,
+                    }]),
+                })
+                .into());
+            }
+        }
+
+        // The checks' cost is bounded by the document they run over, so a document
+        // larger than this emulator will check is REFUSED rather than half-checked:
+        // `policyDocument` carries no length constraint in the model, and the findings
+        // of a document nothing finished reading would be a wrong answer.
+        if input.policy_document.len() > MAX_POLICY_DOCUMENT_BYTES {
+            let message = format!(
+                "policyDocument is {} bytes, more than the {MAX_POLICY_DOCUMENT_BYTES} bytes this emulator will validate in one call",
+                input.policy_document.len()
+            );
+            ::tracing::debug!(reason = %message, "refusing to validate the policy document");
+            return Err(document_refused(message));
+        }
+
+        // `locale` localizes the finding text. The checks report in English whatever
+        // locale is asked for: a translation table would be invented text, and the
+        // finding's `issueCode` — which is what a client matches on — is the same in
+        // every locale.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidatePolicy"))
+        // The checks are synchronous CPU work over caller-supplied text, so they run on
+        // the blocking pool rather than on the async worker that is serving other
+        // requests. The task holds itself to `CHECK_TIME_BUDGET`, and the caller is held
+        // to it here as well, so a request is never left waiting on the pool even if a
+        // future check forgets to test the deadline.
+        let document = input.policy_document.clone();
+        let policy_type = input.policy_type.clone();
+        let checked = ::tokio::time::timeout(
+            CALLER_TIME_BUDGET,
+            ::tokio::task::spawn_blocking(move || policy_findings(&document, &policy_type)),
+        )
+        .await
+        .map_err(|_| document_refused(CheckAborted::OutOfTime.message()))?;
+        let findings = checked
+            .map_err(|error| {
+                // The checks panicked or were cancelled: nothing was computed, so the
+                // only honest answer is the operation's own server error.
+                ValidatePolicyErrorModeled::InternalServerException(InternalServerException {
+                    message: format!("the policy checks did not complete: {error}"),
+                    retry_after_seconds: None,
+                })
+            })?
+            .map_err(|aborted| {
+                let message = aborted.message();
+                ::tracing::debug!(reason = %message, "refusing to validate the policy document");
+                document_refused(message)
+            })?;
+        ::tracing::debug!(
+            findings = findings.len(),
+            "the policy checks reported their findings"
+        );
+
+        // `findings` is the paginated member (`smithy_query(query="operation",
+        // operation="ValidatePolicy")`: inputToken `nextToken`, pageSize `maxResults`),
+        // so one page is handed out at a time, keyed by the finding's position in the
+        // report. The key is zero-padded because the shared pager resumes from the
+        // first key that sorts at or after the token's.
+        let keyed = findings
+            .into_iter()
+            .enumerate()
+            .map(|(position, finding)| (format!("{position:06}"), finding))
+            .collect();
+        let page = crate::state::page(keyed, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ValidatePolicyErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ValidatePolicyOutput {
+            findings: page.items,
+            next_token: page.next_token,
+        })
     }
 }
