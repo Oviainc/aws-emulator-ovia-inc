@@ -124,6 +124,186 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// records are the ones kept.
 pub const MAX_RETAINED_TERMINATED_ENVIRONMENTS: usize = 200;
 
+/// One solution stack this service offers: the platform BRANCH it is a version
+/// within, that version, and the source-bundle file types it permits.
+///
+/// A solution stack is a concrete platform version inside a published platform
+/// branch, so a stack is identified by the branch it belongs to rather than by
+/// a second spelling of the runtime: that is what keeps this catalog and the
+/// branch catalog [`MANAGED_PLATFORM_BRANCHES`] (what `ListPlatformBranches`
+/// reports) from disagreeing about which runtimes the service offers.
+#[derive(Debug, Clone, Copy)]
+pub struct SolutionStack {
+    /// The `BranchName` of the [`MANAGED_PLATFORM_BRANCHES`] entry this stack is
+    /// a version within, e.g. `Python 3.13 running on 64bit Amazon Linux 2023`.
+    pub branch_name: &'static str,
+    /// The platform version: the `v<major>.<minor>.<patch>` component of the
+    /// reported `SolutionStackName`.
+    pub platform_version: &'static str,
+    pub permitted_file_types: &'static [&'static str],
+}
+
+impl SolutionStack {
+    /// The `SolutionStackName` this stack is reported under.
+    ///
+    /// AWS publishes a branch as `<runtime> running on <os>` and a solution
+    /// stack within it as `<os> v<version> running <runtime>` — the Python 3.13
+    /// branch's current version is `64bit Amazon Linux 2023 v4.6.0 running
+    /// Python 3.13` — so the name is DERIVED from the branch rather than
+    /// written out a second time and left to drift from it.
+    pub fn name(&self) -> String {
+        match self.branch_name.split_once(" running on ") {
+            Some((runtime, os)) => format!("{os} v{} running {runtime}", self.platform_version),
+            // A branch name not in the published form is reported as it stands
+            // rather than rewritten into a shape it does not have.
+            None => self.branch_name.to_string(),
+        }
+    }
+}
+
+/// The solution stacks this emulator offers, which is what
+/// `ListAvailableSolutionStacks` reports: the current version of every platform
+/// branch in [`MANAGED_PLATFORM_BRANCHES`] that has not retired, because a
+/// retired branch has no version an account can still deploy on.
+///
+/// This is the SERVICE's own platform catalog, not anything a caller creates,
+/// so it is a table here rather than a map in
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState`]. Each entry
+/// names its branch, so the two catalogs agree by construction; the version
+/// components are this emulator's own, because AWS re-publishes a platform
+/// version with every platform release and no emulator can track those.
+/// `PermittedFileTypes` is "the permitted file types allowed for a solution
+/// stack": the archive that runtime deploys from — a Tomcat platform deploys a
+/// `war`, a Java SE (Corretto) platform a `jar`, and every platform accepts a
+/// `zip` source bundle.
+///
+/// ORDER IS CONTRACTUAL: the operation reports the stacks "with the public
+/// version first and then in reverse chronological order", and the handler
+/// reports this table as it stands, so the table is written newest branch first
+/// within each platform, in [`MANAGED_PLATFORM_BRANCHES`]' own order.
+pub const SOLUTION_STACKS: &[SolutionStack] = &[
+    // .NET on Linux.
+    SolutionStack {
+        branch_name: ".NET 9 running on 64bit Amazon Linux 2023",
+        platform_version: "3.4.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: ".NET 8 running on 64bit Amazon Linux 2023",
+        platform_version: "3.3.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: ".NET Core running on 64bit Amazon Linux 2",
+        platform_version: "2.8.0",
+        permitted_file_types: &["zip"],
+    },
+    // .NET on Windows Server.
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server 2019",
+        platform_version: "2.16.0",
+        permitted_file_types: &["zip"],
+    },
+    // Docker.
+    SolutionStack {
+        branch_name: "Docker running on 64bit Amazon Linux 2023",
+        platform_version: "4.2.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: "Docker running on 64bit Amazon Linux 2",
+        platform_version: "3.9.0",
+        permitted_file_types: &["zip"],
+    },
+    // Go.
+    SolutionStack {
+        branch_name: "Go 1 running on 64bit Amazon Linux 2023",
+        platform_version: "3.5.0",
+        permitted_file_types: &["zip"],
+    },
+    // Java SE (Corretto): a Java SE platform deploys a `jar`.
+    SolutionStack {
+        branch_name: "Corretto 21 running on 64bit Amazon Linux 2023",
+        platform_version: "4.4.0",
+        permitted_file_types: &["jar", "zip"],
+    },
+    SolutionStack {
+        branch_name: "Corretto 17 running on 64bit Amazon Linux 2023",
+        platform_version: "4.3.0",
+        permitted_file_types: &["jar", "zip"],
+    },
+    SolutionStack {
+        branch_name: "Corretto 11 running on 64bit Amazon Linux 2",
+        platform_version: "3.7.0",
+        permitted_file_types: &["jar", "zip"],
+    },
+    // Node.js.
+    SolutionStack {
+        branch_name: "Node.js 22 running on 64bit Amazon Linux 2023",
+        platform_version: "6.6.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: "Node.js 20 running on 64bit Amazon Linux 2023",
+        platform_version: "6.5.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: "Node.js 18 running on 64bit Amazon Linux 2023",
+        platform_version: "6.4.0",
+        permitted_file_types: &["zip"],
+    },
+    // PHP.
+    SolutionStack {
+        branch_name: "PHP 8.4 running on 64bit Amazon Linux 2023",
+        platform_version: "4.5.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: "PHP 8.3 running on 64bit Amazon Linux 2023",
+        platform_version: "4.4.0",
+        permitted_file_types: &["zip"],
+    },
+    // Python.
+    SolutionStack {
+        branch_name: "Python 3.13 running on 64bit Amazon Linux 2023",
+        platform_version: "4.6.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: "Python 3.11 running on 64bit Amazon Linux 2023",
+        platform_version: "4.5.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: "Python 3.9 running on 64bit Amazon Linux 2023",
+        platform_version: "4.4.0",
+        permitted_file_types: &["zip"],
+    },
+    // Ruby.
+    SolutionStack {
+        branch_name: "Ruby 3.4 running on 64bit Amazon Linux 2023",
+        platform_version: "3.5.0",
+        permitted_file_types: &["zip"],
+    },
+    SolutionStack {
+        branch_name: "Ruby 3.2 running on 64bit Amazon Linux 2023",
+        platform_version: "3.4.0",
+        permitted_file_types: &["zip"],
+    },
+    // Tomcat: a Tomcat platform deploys a `war`.
+    SolutionStack {
+        branch_name: "Tomcat 10.1 with Corretto 21 running on 64bit Amazon Linux 2023",
+        platform_version: "5.4.0",
+        permitted_file_types: &["war", "zip"],
+    },
+    SolutionStack {
+        branch_name: "Tomcat 9 with Corretto 11 running on 64bit Amazon Linux 2023",
+        platform_version: "5.3.0",
+        permitted_file_types: &["war", "zip"],
+    },
+];
+
 /// The server clock, as the modelled timestamp type.
 pub fn now() -> ::aws_smithy_types::DateTime {
     let since_epoch = ::std::time::SystemTime::now()

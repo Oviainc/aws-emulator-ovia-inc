@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateEnvironmentOperationsRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateEnvironmentOperationsRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateEnvironmentOperationsRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears the operations role stored on one environment, so every later read of
+//! that environment reports none: "After this call is made, Elastic Beanstalk uses
+//! the caller's permissions for permissions to downstream services during
+//! subsequent calls acting on this environment."
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateEnvironmentOperationsRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateEnvironmentOperationsRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateEnvironmentOperationsRole"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateEnvironmentOperationsRoleError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // A termination the clock has already completed frees that environment's
+        // name, so settle those before resolving the name.
+        store.materialize_due_transitions();
+
+        // The name names a LIVE environment: a terminated one no longer holds its
+        // name (CreateEnvironment lets the name be taken again), so a name that
+        // resolves to nothing is refused the way every other environment
+        // operation refuses one — with the shared refusal message, so none of
+        // them can disagree about the wording.
+        let environment_id = store
+            .resolve_environment_id(None, Some(input.environment_name.as_str()))
+            .filter(|id| {
+                store
+                    .environments
+                    .get(id)
+                    .is_some_and(|environment| !environment.is_terminated())
+            })
+            .ok_or_else(|| {
+                DisassociateEnvironmentOperationsRoleError::invalid_parameter_value(
+                    crate::state::missing_environment_message(
+                        None,
+                        Some(input.environment_name.as_str()),
+                    ),
+                )
+            })?;
+
+        let environment = store
+            .environments
+            .get_mut(&environment_id)
+            .expect("resolved above");
+        // Disassociating is the removal of the stored role, and removing a role
+        // that is not there changes nothing — so a repeat call succeeds and
+        // leaves `DateUpdated` ("the last modified date for this environment")
+        // alone.
+        if environment.operations_role.take().is_some() {
+            environment.date_updated = crate::state::now();
+        }
+
+        Ok(DisassociateEnvironmentOperationsRoleOutput)
     }
 }
