@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
@@ -303,10 +303,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let key = {
-            let table = store.active_table(&name, now).map_err(lift)?;
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
             table.key_of_key_map(&input.key).map_err(lift)?
         };
-        let removed = store.delete_item(&name, now, &key).map_err(lift)?;
+        let removed = store
+            .delete_item(&region, &name, now, &key)
+            .map_err(lift)?;
 
         let size = removed.as_ref().map_or(0, crate::state::item_size);
         Ok(DeleteItemOutput {

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves the stored table's provisioned throughput, its billing mode,
+//! its global secondary indexes (create, delete and throughput update), its table
+//! class and its deletion protection, and reports the table back as a
+//! `TableDescription` read from the stored table.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `UpdateTable` is asynchronous — "while it's executing, the table status changes
+//! from ACTIVE to UPDATING" (the doc below) — so the table is reported `UPDATING` and
+//! the clock owes it the move back to `ACTIVE` [`crate::state::STATUS_TRANSITION`]
+//! later; a second `UpdateTable` inside that span is refused with
+//! `ResourceInUseException`, while item operations keep being served. The NEW
+//! throughput is in effect from the moment the call returns, which is what
+//! `DescribeTable` and the capacity accounting report.
+//!
+//! Members this slice does not store (streams, SSE, replicas, witnesses, on-demand and
+//! warm throughput, multi-region consistency and vector indexes) are refused with the
+//! scaffold's 501 and are their own gap issues.
 //!
 //! ## Shape of an operation
 //!
@@ -253,18 +260,540 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTable"))
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let region = crate::state::request_region(ctx.parts());
+
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "UpdateTable with {member}"
+            )));
+        }
+        let index_updates = validated_index_updates(&input).map_err(lift)?;
+        // Every other caller-sized list is clamped here too, BEFORE the store lock is
+        // taken, so no loop whose length the request chooses runs inside the critical
+        // section.
+        let declared_definitions = clamped_definitions(&input).map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        // The table has to exist and be settled before anything is changed, so a
+        // refused update leaves the stored table exactly as it was.
+        match store.table(&region, &name).map_err(lift)?.status(now) {
+            crate::state::TableStatus::Active => {}
+            crate::state::TableStatus::Creating => {
+                return Err(UpdateTableErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "Attempt to change a resource which is still in use: Table is being \
+                             created: {name}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            crate::state::TableStatus::Updating => {
+                // "While it's UPDATING, you can't issue another UpdateTable request"
+                // (the doc above); `ResourceInUseException` is the modelled answer for
+                // "you tried to update a resource that was already being updated".
+                return Err(UpdateTableErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "Attempt to change a resource which is still in use: Table is being \
+                             updated: {name}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            crate::state::TableStatus::Deleting => {
+                return Err(UpdateTableErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Requested resource not found: Table: {name} not found"
+                        )),
+                    },
+                )
+                .into())
+            }
+        }
+
+        // What the update resolves to is computed against the STORED table, so a
+        // request that only names an index update leaves the table's own mode and
+        // throughput alone.
+        let table = store.table_mut(&region, &name).map_err(lift)?;
+        let billing_mode = input
+            .billing_mode
+            .clone()
+            .unwrap_or_else(|| table.billing_mode.clone());
+        if !matches!(billing_mode.as_str(), "PROVISIONED" | "PAY_PER_REQUEST") {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid BillingMode: {billing_mode} must be PROVISIONED or PAY_PER_REQUEST"
+            )));
+        }
+        let table_throughput = resolve_table_throughput(table, &billing_mode, &input)
+            .map_err(lift)?;
+        let declared = merged_definitions(table, &declared_definitions);
+        let indexes = resolve_indexes(table, &billing_mode, &declared, &index_updates, now)
+            .map_err(lift)?;
+        // Only the attribute definitions some key schema still uses are kept, so a
+        // repeated UpdateTable cannot grow the stored list, and a definition the
+        // request declares for no key at all is refused the way CreateTable refuses it.
+        let definitions =
+            retained_definitions(declared, table, &indexes, &declared_definitions).map_err(lift)?;
+
+        // Nothing above wrote to the table, so from here on the update applies whole.
+        if let (Some(before), Some(after)) = (
+            table.provisioned_throughput.clone(),
+            table_throughput.clone(),
+        ) {
+            table.throughput_history.record(now, &before, &after);
+        }
+        table.billing_mode = billing_mode;
+        table.provisioned_throughput = table_throughput;
+        table.attribute_definitions = definitions;
+        table.global_secondary_indexes = indexes;
+        if let Some(table_class) = input.table_class.clone() {
+            table.table_class = Some(table_class);
+        }
+        if let Some(protection) = input.deletion_protection_enabled {
+            table.deletion_protection_enabled = protection;
+        }
+        table.updated_at = Some(now + crate::state::STATUS_TRANSITION);
+
+        Ok(UpdateTableOutput {
+            table_description: Some(table.describe(now)),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> UpdateTableError {
+    UpdateTableErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> UpdateTableError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            UpdateTableErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The first input member present that this slice does not store, if any.
+fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
+    // A specification that turns a feature OFF asks for what this emulator already
+    // does, so only an enabling one is refused.
+    if input
+        .stream_specification
+        .as_ref()
+        .is_some_and(|specification| specification.stream_enabled)
+    {
+        return Some("StreamSpecification");
+    }
+    if input
+        .sse_specification
+        .as_ref()
+        .is_some_and(|specification| specification.enabled.unwrap_or(false))
+    {
+        return Some("SSESpecification");
+    }
+    if input
+        .replica_updates
+        .as_ref()
+        .is_some_and(|updates| !updates.is_empty())
+    {
+        return Some("ReplicaUpdates");
+    }
+    if input
+        .global_table_witness_updates
+        .as_ref()
+        .is_some_and(|updates| !updates.is_empty())
+    {
+        return Some("GlobalTableWitnessUpdates");
+    }
+    if input
+        .vector_index_updates
+        .as_ref()
+        .is_some_and(|updates| !updates.is_empty())
+    {
+        return Some("VectorIndexUpdates");
+    }
+    if input.on_demand_throughput.is_some() {
+        return Some("OnDemandThroughput");
+    }
+    if input.warm_throughput.is_some() {
+        return Some("WarmThroughput");
+    }
+    if input.multi_region_consistency.is_some() {
+        return Some("MultiRegionConsistency");
+    }
+    if input.global_table_settings_replication_mode.is_some() {
+        return Some("GlobalTableSettingsReplicationMode");
+    }
+    if input.disassociation_protection_enabled.is_some() {
+        return Some("DisassociationProtectionEnabled");
+    }
+    // An index's throughput is stored as a PROVISIONED one only, so an on-demand or
+    // warm throughput asked for per index is "not written yet" rather than accepted and
+    // dropped. Checked here so it answers the scaffold's 501, like the table-level
+    // members above, instead of a bad-request refusal.
+    for update in input.global_secondary_index_updates.iter().flatten() {
+        let on_demand = update
+            .create
+            .as_ref()
+            .is_some_and(|create| create.on_demand_throughput.is_some())
+            || update
+                .update
+                .as_ref()
+                .is_some_and(|change| change.on_demand_throughput.is_some());
+        if on_demand {
+            return Some("GlobalSecondaryIndexUpdates carrying OnDemandThroughput");
+        }
+        let warm = update
+            .create
+            .as_ref()
+            .is_some_and(|create| create.warm_throughput.is_some())
+            || update
+                .update
+                .as_ref()
+                .is_some_and(|change| change.warm_throughput.is_some());
+        if warm {
+            return Some("GlobalSecondaryIndexUpdates carrying WarmThroughput");
+        }
+    }
+    None
+}
+
+/// The index actions one request asks for, each named at most once, with at most one
+/// create and at most one delete: "You can create or delete only one global secondary
+/// index per UpdateTable operation" (`UpdateTable$GlobalSecondaryIndexUpdates`).
+///
+/// The caller-chosen list is CLAMPED before anything walks it: a table carries at most
+/// [`crate::state::MAX_GLOBAL_SECONDARY_INDEXES`] indexes, so a longer list names an
+/// index twice or an index that cannot exist and is already invalid. Duplicate
+/// detection then costs one hash per entry rather than a scan, and the one-create /
+/// one-delete rule short-circuits on the second of either.
+fn validated_index_updates(
+    input: &UpdateTableInput,
+) -> Result<Vec<GlobalSecondaryIndexUpdate>, crate::state::RequestError> {
+    let updates = input
+        .global_secondary_index_updates
+        .clone()
+        .unwrap_or_default();
+    if updates.len() > crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid GlobalSecondaryIndexUpdates: a table carries at most {} global secondary \
+             indexes, so a request cannot name {} of them",
+            crate::state::MAX_GLOBAL_SECONDARY_INDEXES,
+            updates.len()
+        )));
+    }
+    let mut named: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+    let mut creates = 0usize;
+    let mut deletes = 0usize;
+    for update in &updates {
+        let actions = usize::from(update.create.is_some())
+            + usize::from(update.update.is_some())
+            + usize::from(update.delete.is_some());
+        if actions != 1 {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid GlobalSecondaryIndexUpdates: each entry must request exactly one of \
+                 Create, Update or Delete, got {actions}"
+            )));
+        }
+        let index_name = match (&update.create, &update.update, &update.delete) {
+            (Some(create), _, _) => {
+                creates += 1;
+                create.index_name.as_str()
+            }
+            (_, Some(update), _) => update.index_name.as_str(),
+            (_, _, Some(delete)) => {
+                deletes += 1;
+                delete.index_name.as_str()
+            }
+            _ => unreachable!("exactly one action is present"),
+        };
+        if creates > 1 || deletes > 1 {
+            return Err(crate::state::RequestError::Validation(
+                "Invalid GlobalSecondaryIndexUpdates: you can create or delete only one global \
+                 secondary index per UpdateTable operation"
+                    .to_string(),
+            ));
+        }
+        if !named.insert(index_name) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid GlobalSecondaryIndexUpdates: index {index_name} is named more than once"
+            )));
+        }
+    }
+    Ok(updates)
+}
+
+/// The table's provisioned throughput after the update: "When switching from
+/// pay-per-request to provisioned capacity, initial provisioned capacity values must be
+/// set" (`UpdateTable$BillingMode`), and a `PAY_PER_REQUEST` table carries none.
+fn resolve_table_throughput(
+    table: &crate::state::Table,
+    billing_mode: &str,
+    input: &UpdateTableInput,
+) -> Result<Option<ProvisionedThroughput>, crate::state::RequestError> {
+    if billing_mode == "PAY_PER_REQUEST" {
+        if input.provisioned_throughput.is_some() {
+            return Err(crate::state::RequestError::Validation(
+                "ProvisionedThroughput cannot be specified when BillingMode is PAY_PER_REQUEST"
+                    .to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    match input
+        .provisioned_throughput
+        .clone()
+        .or_else(|| table.provisioned_throughput.clone())
+    {
+        Some(throughput) => {
+            if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid ProvisionedThroughput: ReadCapacityUnits and WriteCapacityUnits \
+                     must be at least 1, got {} and {}",
+                    throughput.read_capacity_units, throughput.write_capacity_units
+                )));
+            }
+            Ok(Some(throughput))
+        }
+        None => Err(crate::state::RequestError::Validation(
+            "ProvisionedThroughput must be specified when BillingMode is PROVISIONED".to_string(),
+        )),
+    }
+}
+
+/// The attribute definitions this request declares, refused when the list is longer
+/// than any table could keep.
+///
+/// A table's definitions can never outnumber the key attributes of its own key schema
+/// plus those of its indexes (see [`crate::state::MAX_ATTRIBUTE_DEFINITIONS`]), so a
+/// longer list is already invalid — and clamping it HERE, before the store lock is
+/// taken, is what bounds the merge below: both the stored list and the declared one
+/// would otherwise be request-sized.
+fn clamped_definitions(
+    input: &UpdateTableInput,
+) -> Result<Vec<AttributeDefinition>, crate::state::RequestError> {
+    let declared = input.attribute_definitions.clone().unwrap_or_default();
+    if declared.len() > crate::state::MAX_ATTRIBUTE_DEFINITIONS {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid AttributeDefinitions: a table may declare at most {} attribute \
+             definitions, got {}",
+            crate::state::MAX_ATTRIBUTE_DEFINITIONS,
+            declared.len()
+        )));
+    }
+    Ok(declared)
+}
+
+/// The table's attribute definitions after the update: the stored ones plus the ones
+/// this request declares — "If you are adding a new global secondary index to the
+/// table, AttributeDefinitions must include the key element(s) of the new index"
+/// (`UpdateTable$AttributeDefinitions`). The list [`retained_definitions`] keeps is a
+/// subset of this one.
+///
+/// The merge is done through a map of name -> position, so it costs one hash per
+/// declared definition rather than a scan of the accumulated list per declared
+/// definition.
+fn merged_definitions(
+    table: &crate::state::Table,
+    declared: &[AttributeDefinition],
+) -> Vec<AttributeDefinition> {
+    let mut definitions = table.attribute_definitions.clone();
+    let mut positions: ::std::collections::HashMap<String, usize> = definitions
+        .iter()
+        .enumerate()
+        .map(|(position, definition)| (definition.attribute_name.clone(), position))
+        .collect();
+    for declared in declared {
+        match positions.get(&declared.attribute_name) {
+            Some(position) => {
+                definitions[*position].attribute_type = declared.attribute_type.clone();
+            }
+            None => {
+                positions.insert(declared.attribute_name.clone(), definitions.len());
+                definitions.push(declared.clone());
+            }
+        }
+    }
+    definitions
+}
+
+/// The definitions the updated table keeps: exactly those a key schema still uses —
+/// the table's own, or one of the indexes it carries after the update.
+///
+/// This is what bounds the stored list: it can never hold more entries than those key
+/// schemas name, however many `UpdateTable` calls declare definitions. A definition the
+/// REQUEST declared that no key schema uses is refused rather than dropped silently,
+/// which is the same rule `CreateTable` applies ("Some AttributeDefinitions are not
+/// used in any KeySchema"); a definition that was stored and whose index this same
+/// request deleted is simply dropped, since removing an index removes its keys.
+///
+/// The key attributes are collected ONCE into a set, so the check costs one hash per
+/// definition rather than a walk over every key schema.
+fn retained_definitions(
+    declared: Vec<AttributeDefinition>,
+    table: &crate::state::Table,
+    indexes: &[crate::state::GlobalSecondaryIndex],
+    requested: &[AttributeDefinition],
+) -> Result<Vec<AttributeDefinition>, crate::state::RequestError> {
+    let used: ::std::collections::HashSet<&str> = table
+        .key_schema
+        .iter()
+        .chain(indexes.iter().flat_map(|index| index.key_schema.iter()))
+        .map(|element| element.attribute_name.as_str())
+        .collect();
+    for definition in requested {
+        if !used.contains(definition.attribute_name.as_str()) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Some AttributeDefinitions are not used in any KeySchema: {}",
+                definition.attribute_name
+            )));
+        }
+    }
+    Ok(declared
+        .into_iter()
+        .filter(|definition| used.contains(definition.attribute_name.as_str()))
+        .collect())
+}
+
+/// The table's global secondary indexes after the update.
+///
+/// A `Create` adds one (reported `CREATING` until the clock makes it `ACTIVE`), a
+/// `Delete` removes one, and an `Update` moves one's provisioned throughput and leaves
+/// it `UPDATING` for the same span. A switch of the table's billing mode carries its
+/// indexes with it, because an index's capacity mode is the table's.
+fn resolve_indexes(
+    table: &crate::state::Table,
+    billing_mode: &str,
+    definitions: &[AttributeDefinition],
+    updates: &[GlobalSecondaryIndexUpdate],
+    now: ::std::time::SystemTime,
+) -> Result<Vec<crate::state::GlobalSecondaryIndex>, crate::state::RequestError> {
+    let mut indexes = table.global_secondary_indexes.clone();
+    // An index of a PAY_PER_REQUEST table has no provisioned throughput, and one of a
+    // PROVISIONED table must have some; a mode switch resolves each stored index the
+    // same way the table's own throughput was resolved.
+    if billing_mode == "PAY_PER_REQUEST" {
+        for index in &mut indexes {
+            index.provisioned_throughput = None;
+        }
+    }
+    for update in updates {
+        if let Some(create) = &update.create {
+            if indexes.iter().any(|index| index.name == create.index_name) {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid GlobalSecondaryIndexUpdates: index {} already exists on table {}",
+                    create.index_name, table.name
+                )));
+            }
+            if indexes.len() >= crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid GlobalSecondaryIndexUpdates: table {} already carries the maximum \
+                     of {} global secondary indexes",
+                    table.name,
+                    crate::state::MAX_GLOBAL_SECONDARY_INDEXES
+                )));
+            }
+            super::create_table::validated_index_key_schema(
+                &create.index_name,
+                &create.key_schema,
+                definitions,
+            )?;
+            super::create_table::validated_projection(&create.index_name, &create.projection)?;
+            let throughput = super::create_table::validated_index_throughput(
+                &create.index_name,
+                billing_mode,
+                create.provisioned_throughput.clone(),
+            )?;
+            indexes.push(crate::state::GlobalSecondaryIndex {
+                arn: crate::state::index_arn(&table.region, &table.name, &create.index_name),
+                name: create.index_name.clone(),
+                key_schema: create.key_schema.clone(),
+                projection: create.projection.clone(),
+                provisioned_throughput: throughput,
+                transient_status: crate::state::IndexStatus::Creating,
+                active_at: now + crate::state::STATUS_TRANSITION,
+                throughput_history: crate::state::ThroughputHistory::default(),
+            });
+        }
+        if let Some(delete) = &update.delete {
+            let before = indexes.len();
+            indexes.retain(|index| index.name != delete.index_name);
+            if indexes.len() == before {
+                return Err(crate::state::RequestError::NotFound(format!(
+                    "Requested resource not found: Index not found for table {}: {}",
+                    table.name, delete.index_name
+                )));
+            }
+        }
+        if let Some(change) = &update.update {
+            let Some(index) = indexes
+                .iter_mut()
+                .find(|index| index.name == change.index_name)
+            else {
+                return Err(crate::state::RequestError::NotFound(format!(
+                    "Requested resource not found: Index not found for table {}: {}",
+                    table.name, change.index_name
+                )));
+            };
+            if change.on_demand_throughput.is_some() || change.warm_throughput.is_some() {
+                // Refused up front by `unsupported_member`, which answers the
+                // scaffold's 501 for it; reaching here would mean that check was
+                // bypassed, so it is an internal inconsistency rather than a bad
+                // request.
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid GlobalSecondaryIndexUpdates: index {} can only be updated through \
+                     ProvisionedThroughput in this emulator",
+                    change.index_name
+                )));
+            }
+            let throughput = super::create_table::validated_index_throughput(
+                &change.index_name,
+                billing_mode,
+                change
+                    .provisioned_throughput
+                    .clone()
+                    .or_else(|| index.provisioned_throughput.clone()),
+            )?;
+            if let (Some(before), Some(after)) = (&index.provisioned_throughput, &throughput) {
+                index.throughput_history.record(now, before, after);
+            }
+            index.provisioned_throughput = throughput;
+            index.transient_status = crate::state::IndexStatus::Updating;
+            index.active_at = now + crate::state::STATUS_TRANSITION;
+        }
+    }
+    // "When switching from pay-per-request to provisioned capacity, initial provisioned
+    // capacity values must be set" (`UpdateTable$BillingMode`) — and an index's capacity
+    // mode is the table's, so every index needs one too. Refusing names the index rather
+    // than leaving it reporting a capacity of zero, which a PROVISIONED index never has.
+    if billing_mode == "PROVISIONED" {
+        for index in &indexes {
+            if index.provisioned_throughput.is_none() {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "ProvisionedThroughput must be specified for index {} when BillingMode is \
+                     PROVISIONED",
+                    index.name
+                )));
+            }
+        }
+    }
+    Ok(indexes)
 }
