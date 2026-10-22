@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecordingConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecordingConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecordingConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read over the persisted recording configurations, in one stable order
+//! (ARN), cut into pages of at most `maxResults`. The `nextToken` it issues names
+//! the last ARN of the page, so the following page is everything ordered strictly
+//! after it. It first materialises the `CREATING` → `ACTIVE` transition the clock
+//! has already made due, which is a move the create owed whether or not anybody
+//! listed.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +148,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecordingConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecordingConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecordingConfigurations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRecordingConfigurationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    exception_message: Some("the IVS store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(
+                    crate::state::RECORDING_CONFIGURATION_PAGE,
+                    token,
+                )
+                .ok_or_else(|| {
+                    ListRecordingConfigurationsErrorModeled::ValidationException(
+                        ValidationException {
+                            exception_message: Some(
+                                "nextToken is not a pagination token this service issued"
+                                    .to_string(),
+                            ),
+                            ..Default::default()
+                        },
+                    )
+                })?,
+            ),
+            None => None,
+        };
+        // `MaxRecordingConfigurationResults` is modelled `range(1..100)`, so the
+        // framework has already refused anything outside it; an absent value means
+        // the whole page, which the operation documents as "your service quota or
+        // 100, whichever is smaller".
+        let page_size =
+            crate::state::page_size(input.max_results, MAX_RECORDING_CONFIGURATION_RESULTS);
+
+        let mut store = state.lock();
+        store.settle_recording_configurations();
+        let (window, next_token) = crate::state::page(
+            crate::state::RECORDING_CONFIGURATION_PAGE,
+            store.recording_configurations.iter(),
+            after.as_deref(),
+            page_size,
+        );
+
+        Ok(ListRecordingConfigurationsOutput {
+            recording_configurations: window
+                .into_iter()
+                .map(|record| summary(&record.configuration))
+                .collect(),
+            next_token,
+        })
+    }
+}
+
+/// The `maxResults` ceiling the model declares for this operation
+/// (`MaxRecordingConfigurationResults`, `range(min: 1, max: 100)`), and so also the
+/// page size an absent `maxResults` means.
+const MAX_RECORDING_CONFIGURATION_RESULTS: i32 = 100;
+
+/// The `RecordingConfigurationSummary` projection of a persisted recording
+/// configuration: every member `RecordingConfigurationSummary` declares, read off
+/// the stored record.
+fn summary(configuration: &RecordingConfiguration) -> RecordingConfigurationSummary {
+    RecordingConfigurationSummary {
+        arn: configuration.arn.clone(),
+        name: configuration.name.clone(),
+        destination_configuration: configuration.destination_configuration.clone(),
+        state: configuration.state.clone(),
+        tags: configuration.tags.clone(),
     }
 }

@@ -19,6 +19,8 @@ mod batch_get_channel;
 mod channel_lifecycle;
 #[path = "all/recording_configuration_lifecycle.rs"]
 mod recording_configuration_lifecycle;
+#[path = "all/recording_configuration_list.rs"]
+mod recording_configuration_list;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]

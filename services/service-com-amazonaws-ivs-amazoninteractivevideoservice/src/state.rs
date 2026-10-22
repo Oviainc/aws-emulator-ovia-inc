@@ -352,6 +352,10 @@ pub const CHANNEL_PAGE: &str = "channel";
 /// The stamp a `ListStreamKeys` page token carries. See [`CHANNEL_PAGE`].
 pub const STREAM_KEY_PAGE: &str = "stream-key";
 
+/// The stamp a `ListRecordingConfigurations` page token carries. See
+/// [`CHANNEL_PAGE`].
+pub const RECORDING_CONFIGURATION_PAGE: &str = "recording-configuration";
+
 /// The prefix of every ARN this service mints, and so of every page boundary a
 /// token may legitimately name.
 const ARN_PREFIX: &str = "arn:aws:ivs:";
@@ -381,18 +385,36 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<String> {
     key.starts_with(ARN_PREFIX).then(|| key.to_string())
 }
 
+/// The page size a list serves for the `maxResults` the caller sent, bounded by the
+/// `maximum` that list's own modelled `max*Results` shape declares.
+///
+/// Shared by every list operation, so the three cannot drift apart: an absent
+/// `maxResults` means the whole page, and a value the modelled range would refuse —
+/// which the framework has already rejected before any handler runs — can never
+/// reach [`page`] as a zero or an unbounded size.
+pub fn page_size(requested: Option<i32>, maximum: i32) -> usize {
+    let maximum = usize::try_from(maximum).unwrap_or(1).max(1);
+    usize::try_from(requested.unwrap_or(i32::MAX))
+        .unwrap_or(maximum)
+        .clamp(1, maximum)
+}
+
 /// Cut one page out of an ordered, already-filtered `(key, item)` sequence, and
 /// issue the token that resumes after it.
 ///
 /// Shared by every list operation so they cannot drift apart: one more than the page
 /// is read, so a token is issued only when a further page really exists, and the
-/// token names the last key this page returned.
+/// token names the last key this page returned. A page holds at least one item —
+/// every modelled `max*Results` has a minimum of 1, and a zero-sized page would
+/// answer an empty list with no token, which reads as "nothing left" while items
+/// remain.
 pub fn page<'a, T>(
     kind: &str,
     ordered: impl Iterator<Item = (&'a String, &'a T)>,
     after: Option<&str>,
     page_size: usize,
 ) -> (Vec<&'a T>, Option<String>) {
+    let page_size = page_size.max(1);
     let mut window: Vec<(&'a String, &'a T)> = ordered
         .filter(|(key, _)| after.is_none_or(|boundary| key.as_str() > boundary))
         .take(page_size.saturating_add(1))

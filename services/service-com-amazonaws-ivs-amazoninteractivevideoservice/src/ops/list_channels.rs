@@ -189,9 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `MaxChannelResults` is modelled `range(1..100)`, so the framework has
         // already refused anything outside it; an absent value means the whole page.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_CHANNEL_RESULTS))
-            .unwrap_or(MAX_CHANNEL_RESULTS as usize)
-            .clamp(1, MAX_CHANNEL_RESULTS as usize);
+        let page_size = crate::state::page_size(input.max_results, MAX_CHANNEL_RESULTS);
 
         let store = state.lock();
         let (window, next_token) = crate::state::page(

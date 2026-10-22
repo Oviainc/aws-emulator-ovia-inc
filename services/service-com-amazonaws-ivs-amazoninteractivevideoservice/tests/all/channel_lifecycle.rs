@@ -130,7 +130,7 @@ fn flag(value: &Value, key: &str) -> bool {
 /// Lowercase-hex of `text`, for forging a candidate `nextToken` by hand: the token
 /// codec is hex, so this is how a caller would construct a value that decodes
 /// cleanly and still is not a boundary this service issued.
-fn hex_of(text: &str) -> String {
+pub(crate) fn hex_of(text: &str) -> String {
     text.bytes()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()

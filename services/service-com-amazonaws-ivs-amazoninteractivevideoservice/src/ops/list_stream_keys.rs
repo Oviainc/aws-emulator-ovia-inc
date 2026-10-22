@@ -174,9 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `MaxStreamKeyResults` is modelled `range(1..50)`, so the framework has
         // already refused anything outside it; an absent value means the whole page.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_STREAM_KEY_RESULTS))
-            .unwrap_or(MAX_STREAM_KEY_RESULTS as usize)
-            .clamp(1, MAX_STREAM_KEY_RESULTS as usize);
+        let page_size = crate::state::page_size(input.max_results, MAX_STREAM_KEY_RESULTS);
 
         let store = state.lock();
         if !store.channels.contains_key(&input.channel_arn) {
