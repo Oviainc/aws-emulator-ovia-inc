@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfigureLogs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfigureLogs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replaces the addressed PackagingGroup's egress-access-log
+//! subscription with the one the request carries, persists it, and answers the
+//! group's full current representation read back from state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfigureLogs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It is a PUT on the group's `configure_logs` sub-resource, so the member it owns is
+//! REPLACED rather than merged: a request carrying no `EgressAccessLogs` leaves the
+//! group with no log subscription. Every other member of the group — `Arn`,
+//! `CreatedAt`, `DomainName`, `Authorization`, its tags — is untouched, and the
+//! response reports them from the stored record, so this call and a following
+//! `DescribePackagingGroup` agree. An `Id` no group is stored under is answered with
+//! the modelled `NotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +155,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfigureLogs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfigureLogsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfigureLogs"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ConfigureLogsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // The group this request ADDRESSES (`Id` is an `@httpLabel`), so one this
+        // service holds none of is a 404 rather than a parameter violation.
+        let Some(stored) = state.packaging_groups.get_mut(&input.id) else {
+            return Err(ConfigureLogsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::scaffolded::not_found_message(
+                    "PackagingGroup",
+                    &input.id,
+                )),
+            })
+            .into());
+        };
+
+        // A PUT on the sub-resource REPLACES the member it owns, exactly as supplied:
+        // a request carrying no `EgressAccessLogs` leaves the group unsubscribed.
+        // Nothing else about the stored group is rewritten.
+        stored.egress_access_logs = input.egress_access_logs;
+
+        // Answer from what is now stored, not from the request, so this response and
+        // the next `DescribePackagingGroup` cannot disagree. Only the members the
+        // response carries are copied out of the record, which also ends the mutable
+        // borrow before the tag store is read — the record itself is not cloned, and
+        // there is no second lookup that could fail.
+        let arn = stored.arn.clone();
+        let authorization = stored.authorization.clone();
+        let created_at = stored.created_at.clone();
+        let domain_name = stored.domain_name.clone();
+        let egress_access_logs = stored.egress_access_logs.clone();
+        let id = stored.id.clone();
+        Ok(ConfigureLogsOutput {
+            authorization,
+            created_at: Some(created_at),
+            domain_name: Some(domain_name),
+            egress_access_logs,
+            id: Some(id),
+            // Tags live only in the ARN-keyed tag store, the one copy every
+            // operation reads.
+            tags: Some(state.tags_of(&arn)),
+            arn: Some(arn),
+        })
     }
 }
