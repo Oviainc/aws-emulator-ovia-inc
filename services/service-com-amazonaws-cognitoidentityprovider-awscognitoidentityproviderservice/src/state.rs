@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType, DeviceConfigurationType,
-    EmailConfigurationType, IssuerConfigurationType, KeyConfigurationType, LambdaConfigType,
-    MFAOptionType, NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
+    EmailConfigurationType, GroupType, IssuerConfigurationType, KeyConfigurationType,
+    LambdaConfigType, MFAOptionType, NumberAttributeConstraintsType, PasswordPolicyType,
+    RefreshTokenRotationType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
     TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserPoolAddOnsType,
     UserPoolClientType, UserPoolPolicyType, UserPoolType, UserType, UsernameConfigurationType,
@@ -102,6 +103,9 @@ pub const MAX_CLIENTS_PER_POOL: usize = 1_000;
 
 /// The most users one user pool holds.
 pub const MAX_USERS_PER_POOL: usize = 10_000;
+
+/// The most groups one user pool holds.
+pub const MAX_GROUPS_PER_POOL: usize = 1_000;
 
 /// The most unexpired challenge sessions this emulator holds; the oldest are
 /// evicted past it.
@@ -338,6 +342,10 @@ pub struct UserPool {
     /// Users keyed by [`UserPool::user_key`], so a pool configured
     /// case-insensitive treats `Alice` and `alice` as one user.
     pub users: HashMap<String, User>,
+    /// This pool's groups keyed by `GroupName`, ordered so a read of several is
+    /// stable. `GroupNameType` carries no case-insensitivity trait, so a name is
+    /// matched exactly as it was created.
+    pub groups: BTreeMap<String, Group>,
 }
 
 impl UserPool {
@@ -759,6 +767,36 @@ impl User {
     }
 }
 
+/// One stored group of a user pool: what `CreateGroup` stored and every later
+/// read of that group renders.
+#[derive(Debug, Clone)]
+pub struct Group {
+    pub group_name: String,
+    pub user_pool_id: String,
+    pub description: Option<String>,
+    pub role_arn: Option<String>,
+    pub precedence: Option<i32>,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+}
+
+impl Group {
+    /// The modelled view of this group, rendered from what is stored. An
+    /// optional member the creating request left out stays absent rather than
+    /// being invented.
+    pub fn to_group_type(&self) -> GroupType {
+        GroupType {
+            group_name: Some(self.group_name.clone()),
+            user_pool_id: Some(self.user_pool_id.clone()),
+            description: self.description.clone(),
+            role_arn: self.role_arn.clone(),
+            precedence: self.precedence,
+            creation_date: Some(to_date_time(self.creation_date)),
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+        }
+    }
+}
+
 /// A challenge session: what a `RespondToAuthChallenge` for this session resumes.
 #[derive(Debug, Clone)]
 pub struct AuthSession {
@@ -1061,6 +1099,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         tags: HashMap::new(),
         clients: HashMap::new(),
         users: HashMap::new(),
+        groups: BTreeMap::new(),
     }
 }
 

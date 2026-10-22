@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a group in a stored user pool and returns the STORED group, so a later
+//! `GetGroup` renders the same resource. A name the pool already holds is refused
+//! with `GroupExistsException`; an unknown `UserPoolId` with
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -182,20 +177,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // "A name for the group. This name must be unique in your user pool."
+        // (`CreateGroup.GroupName`) — a second group under a stored name is
+        // refused, and the stored group is left exactly as it was.
+        if pool.groups.contains_key(&input.group_name) {
+            return Err(group_exists(&input.group_name));
+        }
+
+        // This emulator holds a pool's groups in memory, so the store is bounded.
+        if pool.groups.len() >= crate::state::MAX_GROUPS_PER_POOL {
+            return Err(limit_exceeded(format!(
+                "User pool {} holds at most {} groups.",
+                input.user_pool_id,
+                crate::state::MAX_GROUPS_PER_POOL
+            )));
+        }
+
+        let group = crate::state::Group {
+            group_name: input.group_name.clone(),
+            user_pool_id: pool.id.clone(),
+            description: input.description.clone(),
+            role_arn: input.role_arn.clone(),
+            precedence: input.precedence,
+            creation_date: now,
+            last_modified_date: now,
+        };
+        pool.groups.insert(input.group_name.clone(), group);
+
+        // Rendered from the STORED group, so the response is what a later read sees.
+        let stored = pool
+            .groups
+            .get(&input.group_name)
+            .ok_or_else(internal_error)?
+            .to_group_type();
+        Ok(CreateGroupOutput {
+            group: Some(stored),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateGroupError {
+    CreateGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `GroupExistsException` for a name the pool already holds.
+fn group_exists(group_name: &str) -> CreateGroupError {
+    CreateGroupErrorModeled::GroupExistsException(GroupExistsException {
+        message: Some(format!("A group named {group_name} already exists.")),
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a store at its bound.
+fn limit_exceeded(message: String) -> CreateGroupError {
+    CreateGroupErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateGroupError {
+    CreateGroupErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

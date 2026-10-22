@@ -15,6 +15,8 @@
 mod admin_user_pool_lifecycle;
 #[path = "all/clock_dependent_state.rs"]
 mod clock_dependent_state;
+#[path = "all/group_lifecycle.rs"]
+mod group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/token_signing.rs"]
