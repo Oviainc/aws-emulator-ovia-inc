@@ -8,8 +8,9 @@
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one request:
 //!
-//! 1. `PutBucketPolicy` stores the policy document verbatim, so `GetBucketPolicy`
-//!    returns the same bytes; `PutBucketTagging` REPLACES the tag set, so
+//! 1. `PutBucketPolicy` stores the policy document verbatim and answers `204 No Content`
+//!    with an empty body, so `GetBucketPolicy` returns the same bytes;
+//!    `PutBucketTagging` REPLACES the tag set, so
 //!    `GetBucketTagging` reports exactly the last submitted one and nothing of the one
 //!    before it.
 //! 2. A `Policy` that is not a policy document is `MalformedPolicy` (400) — judged
@@ -161,9 +162,14 @@ async fn a_bucket_policy_round_trips_and_a_malformed_one_is_refused() {
     for (label, document) in accepted {
         let answer = send(&router, "PUT", &format!("/{bucket}?policy"), document).await;
         assert_eq!(
-            answer.status, 200,
-            "case {label:?}: PutBucketPolicy must accept it, got {} with body {}",
+            answer.status, 204,
+            "case {label:?}: PutBucketPolicy must accept it with 204, got {} with body {}",
             answer.status, answer.body
+        );
+        assert!(
+            answer.body.is_empty(),
+            "case {label:?}: a 204 carries no body, got {:?}",
+            answer.body
         );
         let read = send(&router, "GET", &format!("/{bucket}?policy"), "").await;
         assert_eq!(
@@ -236,22 +242,9 @@ async fn a_bucket_policy_past_the_published_size_limit_is_refused() {
     // One row at the published ceiling and one past it. The ceiling is
     // `state::MAX_BUCKET_POLICY_BYTES` (20 KB), S3's published bucket-policy limit; the
     // document is padded in a `Sid` so it stays a valid policy document at both sizes.
-    let document = |bytes: usize| {
-        let skeleton = serde_json::json!({
-            "Statement": [{"Sid": "", "Effect": "Allow", "Principal": "*", "Action": "s3:*"}],
-        })
-        .to_string();
-        let padding = bytes.saturating_sub(skeleton.len());
-        serde_json::json!({
-            "Statement": [{
-                "Sid": "s".repeat(padding),
-                "Effect": "Allow",
-                "Principal": "*",
-                "Action": "s3:*",
-            }],
-        })
-        .to_string()
-    };
+    // The builder is the shared one, so this suite and the policy-status suite cannot
+    // drift on what "exactly at the ceiling" means.
+    let document = super::bucket_lifecycle::policy_of_size;
 
     let at_limit = document(20 * 1024);
     assert_eq!(
@@ -261,8 +254,8 @@ async fn a_bucket_policy_past_the_published_size_limit_is_refused() {
     );
     let answer = send(&router, "PUT", &format!("/{bucket}?policy"), &at_limit).await;
     assert_eq!(
-        answer.status, 200,
-        "case \"a policy exactly at the 20 KB limit\": expected HTTP 200, got {} with body {}",
+        answer.status, 204,
+        "case \"a policy exactly at the 20 KB limit\": expected HTTP 204, got {} with body {}",
         answer.status, answer.body
     );
 

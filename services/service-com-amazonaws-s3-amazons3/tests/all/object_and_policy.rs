@@ -18,7 +18,9 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{create_bucket, router, send, send_bytes, Answer};
+use super::bucket_lifecycle::{
+    create_bucket, get_bucket_policy, put_bucket_policy, router, send_bytes, Answer,
+};
 
 /// `PUT /<bucket>/<key>` — `PutObject`, with the object's bytes as the body.
 async fn put_object(
@@ -34,16 +36,6 @@ async fn put_object(
 /// `GET /<bucket>/<key>` — `GetObject`.
 async fn get_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> Answer {
     send_bytes(router, "GET", &format!("/{bucket}/{key}"), &[], b"").await
-}
-
-/// `PUT /<bucket>?policy` — `PutBucketPolicy`, with the document as the body.
-async fn put_bucket_policy(router: &MultiServiceRouter, bucket: &str, policy: &str) -> Answer {
-    send(router, "PUT", &format!("/{bucket}?policy"), &[], policy).await
-}
-
-/// `GET /<bucket>?policy` — `GetBucketPolicy`.
-async fn get_bucket_policy(router: &MultiServiceRouter, bucket: &str) -> Answer {
-    send(router, "GET", &format!("/{bucket}?policy"), &[], "").await
 }
 
 #[tokio::test]
@@ -69,8 +61,8 @@ async fn a_bucket_policy_and_objects_coexist_on_one_bucket_without_touching_each
                   \"Resource\": \"arn:aws:s3:::staging-bucket/*\"\n\t\t}\n\t]\n}";
     let put_policy = put_bucket_policy(&router, bucket, policy).await;
     assert_eq!(
-        put_policy.status, 200,
-        "the policy must be attached, got {} with body {:?}",
+        put_policy.status, 204,
+        "the policy must be attached with 204 No Content, got {} with body {:?}",
         put_policy.status,
         String::from_utf8_lossy(&put_policy.body)
     );
@@ -128,8 +120,8 @@ async fn a_bucket_policy_and_objects_coexist_on_one_bucket_without_touching_each
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::staging-bucket/*"}]}"#;
     let replaced = put_bucket_policy(&router, bucket, replacement).await;
     assert_eq!(
-        replaced.status, 200,
-        "the replacing policy must be accepted, got {} with body {:?}",
+        replaced.status, 204,
+        "the replacing policy must be accepted with 204 No Content, got {} with body {:?}",
         replaced.status,
         String::from_utf8_lossy(&replaced.body)
     );

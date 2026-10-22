@@ -9,6 +9,24 @@
 //! bucket's policy as it was. Neither code is in the model — this operation declares no
 //! errors at all — but they are the codes S3 sends, and a client branches on the code.
 //!
+//! A SUCCESS answers `204 No Content` with an empty body. The operation's output shape is
+//! `smithy.api#Unit` — no members, so nothing to carry — and S3's own API Reference sample
+//! response for `PutBucketPolicy` is `HTTP/1.1 204 NoContent`, which recorded traffic
+//! confirms. The model's declared `@http(code: 200)` understates it (the sibling
+//! `DeleteBucketPolicy` over the same `/{Bucket}?policy` subresource declares 204), so
+//! `SUCCESS_STATUS` below pins 204: a client, proxy or test that reads 204 as this call's
+//! success signal, or that parses a body because the status promised one, must see the
+//! same thing here as against AWS. The status is a property of the operation, never of the
+//! bucket, the document's content or whether the put creates or replaces a policy.
+//!
+//! NOT IMPLEMENTED HERE, so that a reader does not take the 204 for validation that did
+//! not happen: `ExpectedBucketOwner`, `ContentMD5`, `ChecksumAlgorithm` and
+//! `ConfirmRemoveSelfBucketAccess` are accepted and IGNORED. Real S3 answers 403 on an
+//! owner mismatch, 400 on a body digest or checksum-header mismatch, and treats the
+//! confirmation flag as a self-lockout acknowledgement; none of those branches exists
+//! yet, so this emulator is more permissive than AWS on exactly those four members. Each
+//! is its own gap, not part of the status this file fixes.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
 //!
@@ -135,8 +153,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 pub struct PutBucketPolicyOutput;
 
 impl PutBucketPolicyOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // `with_http` carries this operation's response status. Remove it and the status
+    // falls back to the protocol default, so a 204 operation answers 200.
+    //
+    // 204, not the model's declared 200: see the module docs — a successful bucket-policy
+    // put carries no body and S3 reports it `204 No Content`.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -145,9 +166,19 @@ impl PutBucketPolicyOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/{Bucket}?policy",
-        Some(200u16),
+        Some(PUT_BUCKET_POLICY_SUCCESS_STATUS),
     ));
 }
+
+/// The HTTP status a successful `PutBucketPolicy` answers: `204 No Content`.
+///
+/// A successful bucket-policy put has nothing to return — the modelled output shape is
+/// `smithy.api#Unit` — and S3 reports it with 204 and an empty body (its API Reference
+/// sample response is `HTTP/1.1 204 NoContent`, and recorded traffic agrees), where the
+/// model's `@http(code:)` says 200. Named once here so the operation's `SUCCESS_STATUS`
+/// (which is what the serializer reads) and the output schema's `@http` code cannot drift
+/// apart.
+pub const PUT_BUCKET_POLICY_SUCCESS_STATUS: u16 = 204;
 
 pub static PUT_BUCKET_POLICY_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &PutBucketPolicyOutput::SCHEMA;
 
@@ -209,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutBucketPolicy";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_BUCKET_POLICY_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_BUCKET_POLICY_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = PUT_BUCKET_POLICY_SUCCESS_STATUS;
 
     async fn handle(
         &self,

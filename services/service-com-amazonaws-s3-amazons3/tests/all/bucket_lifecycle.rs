@@ -166,6 +166,49 @@ pub(crate) async fn head_bucket(router: &MultiServiceRouter, bucket: &str) -> An
     send(router, "HEAD", &format!("/{bucket}"), &[], "").await
 }
 
+/// `PUT /<bucket>?policy` — `PutBucketPolicy`, with the document as the body.
+///
+/// `pub(crate)` for the same reason as the helpers above: both the policy-status suite
+/// and the object-and-policy suite drive the bucket policy subresource, and one helper
+/// keeps them from drifting apart.
+pub(crate) async fn put_bucket_policy(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    policy: &str,
+) -> Answer {
+    send(router, "PUT", &format!("/{bucket}?policy"), &[], policy).await
+}
+
+/// `GET /<bucket>?policy` — `GetBucketPolicy`.
+pub(crate) async fn get_bucket_policy(router: &MultiServiceRouter, bucket: &str) -> Answer {
+    send(router, "GET", &format!("/{bucket}?policy"), &[], "").await
+}
+
+/// A valid policy document padded with a `Sid` so that it is exactly `bytes` long — what a
+/// size-limit row needs, since the limit is on the document's BYTES.
+///
+/// `pub(crate)` so the two suites that drive the bucket policy subresource cannot drift on
+/// what "exactly at the ceiling" means. The padded document keeps the skeleton's member
+/// ORDER (`Sid` first), so measuring the skeleton and then padding by the difference lands
+/// on exactly `bytes`; each call site asserts the resulting length, which is what would
+/// catch a change in `serde_json`'s key ordering.
+pub(crate) fn policy_of_size(bytes: usize) -> String {
+    let skeleton = serde_json::json!({
+        "Statement": [{"Sid": "", "Effect": "Allow", "Principal": "*", "Action": "s3:*"}],
+    })
+    .to_string();
+    let padding = bytes.saturating_sub(skeleton.len());
+    serde_json::json!({
+        "Statement": [{
+            "Sid": "s".repeat(padding),
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:*",
+        }],
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn creating_a_bucket_reports_its_location_and_region_and_reads_back() {
     let router = router();

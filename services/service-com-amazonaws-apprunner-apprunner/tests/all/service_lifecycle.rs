@@ -659,6 +659,15 @@ async fn update_merges_into_the_stored_record() {
             "case {case:?}: an update is asynchronous: {body:?}"
         );
 
+        // Hold the update in flight before reading the record back. The pending
+        // transition is materialised by `settle_due` on the next REQUEST, so on a
+        // loaded machine the describe below can fall past the 500 ms due instant,
+        // materialise the update and leave nothing for `make_due_now` at the foot
+        // of this loop to move — which is a race in the test, not in the emulator.
+        // Pinning the due instant far out first makes the read deterministic; the
+        // merged members this row asserts do not depend on the transition.
+        hold_in_flight(&engine, &service_arn);
+
         let (_, described) =
             call(&router, "DescribeService", json!({ "ServiceArn": service_arn })).await;
         let read = service_of(&described);
