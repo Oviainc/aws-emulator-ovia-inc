@@ -46,10 +46,10 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 /// `TagMap`'s modelled maximum entry count (`smithy_query(query="shape",
-/// shape="TagMap")`: `@length(min: 0, max: 200)`). A request carrying more tags
-/// than this is a bad request BODY, not a member-level constraint failure — see
-/// [`refused_for`].
-const TAG_MAP_MAX_ENTRIES: i64 = 200;
+/// shape="TagMap")`: `@length(min: 0, max: 200)`), read from the one place this
+/// crate spells that bound. A request carrying more tags than this is a bad
+/// request BODY, not a member-level constraint failure — see [`refused_for`].
+const TAG_MAP_MAX_ENTRIES: i64 = crate::state::MAX_TAGS_PER_RESOURCE as i64;
 
 /// The member every `TagMap` in this service is bound to (`tags` on
 /// `CreateCluster`, `CreateStream` and `TagResource`:
