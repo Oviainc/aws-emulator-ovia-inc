@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a function, or just one published version of it, from [`crate::state`], so
+//! a later `GetFunction` answers 404 and `ListFunctions` no longer reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFunctionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                DeleteFunctionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                DeleteFunctionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(message),
+                })
+            }
+        })?;
+        let name = record.config.name.clone();
+        let qualified = input.qualifier.is_some()
+            || crate::state::parse_function_reference(&input.function_name)
+                .is_some_and(|reference| reference.qualifier.is_some());
+
+        if qualified {
+            // "To delete a specific function version, use the Qualifier parameter" — and
+            // the unpublished version is not one: it exists for as long as the function
+            // does, so only deleting the function itself removes it.
+            if version == crate::state::VERSION_LATEST {
+                return Err(DeleteFunctionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "{} version cannot be deleted without deleting the function",
+                            crate::state::VERSION_LATEST
+                        )),
+                    },
+                )
+                .into());
+            }
+            let Ok(number) = version.parse::<u64>() else {
+                return Err(DeleteFunctionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The Qualifier '{version}' is not a function version: only a \
+                             published version number can be deleted on its own"
+                        )),
+                    },
+                )
+                .into());
+            };
+            record.versions.remove(&number);
+        } else {
+            // "Otherwise, all versions and aliases are deleted" — the whole record goes.
+            store.functions.remove(&name);
+        }
+
+        // `StatusCode` is this operation's `@httpResponseCode`, and a successful delete
+        // carries no body.
+        Ok(DeleteFunctionOutput {
+            status_code: DELETED_STATUS,
+        })
     }
 }
+
+/// The HTTP status a successful `DeleteFunction` answers with: 204 No Content, bound
+/// through the output's `StatusCode` `@httpResponseCode` member.
+const DELETED_STATUS: i32 = 204;

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the request's key-value pairs to the monitor or probe its `resourceArn`
+//! names, overwriting the value of a key the resource already carries and
+//! leaving every other stored key alone. The tags live in the resource's own
+//! record ([`crate::state`]), so what this write stores is what `GetMonitor`
+//! reports afterwards — for the monitor itself and for each probe it lists — and
+//! an ARN no stored resource answers to is
+//! refused with the modelled 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +109,24 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// The modelled 404 for an ARN no stored monitor or probe carries. The wording
+/// matches `UntagResource`'s: the two operations resolve their `resourceArn` the
+/// same way, so they refuse an unresolvable one the same way.
+fn not_found(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("no monitor or probe with ARN {resource_arn} exists")),
+    })
+    .into()
+}
+
+/// This service's `ValidationException` (HTTP 400), carrying `message`.
+fn validation(message: String) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,20 +161,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `resourceArn`'s length bound and `^arn:.*$` pattern, and every tag
+        // key's and value's own length bounds, are refused by the framework
+        // BEFORE this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let target = store
+            .resolve_tagged_resource(&input.resource_arn)
+            .ok_or_else(|| not_found(&input.resource_arn))?;
+        let tags = store.tags_mut(&target).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(format!(
+                    "the tags of {} are not reachable",
+                    input.resource_arn
+                )),
+            })
+        })?;
+
+        // The merged set is what the resource will carry, so it is the set the
+        // modelled `TagMap` bound applies to — checked before anything is
+        // written, so a refused call stores none of the pairs it carried.
+        let merged_len = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if merged_len > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(validation(format!(
+                "a monitor or probe keeps at most {} tags in this emulator; tagging {} with these keys would give it {}",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                input.resource_arn,
+                merged_len
+            )));
+        }
+
+        // Add or overwrite the named keys, in place: a key the request does not
+        // name keeps the value it had, which is what makes two tag writes of
+        // different keys converge on the union of both.
+        let mut changed = false;
+        for (key, value) in input.tags {
+            changed |= tags.get(&key).is_none_or(|stored| *stored != value);
+            tags.insert(key, value);
+        }
+        // A write that assigned every key the value it already had modified
+        // nothing, so it does not move `modifiedAt` — the same rule
+        // `UntagResource` applies to a removal that removed nothing.
+        if changed {
+            store.mark_modified(&target, now);
+        }
+
+        Ok(TagResourceOutput::default())
     }
 }

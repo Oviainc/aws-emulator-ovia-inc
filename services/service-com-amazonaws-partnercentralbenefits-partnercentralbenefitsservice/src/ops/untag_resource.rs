@@ -157,14 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
         let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
-        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
-            return Err(UntagResourceErrorModeled::AccessDeniedException(denied).into());
-        }
+        // The partner-entitlement gate (`crate::state::entitlement_refusal`) is NOT
+        // applied on the tagging path: the recorded tagging calls are answered by the
+        // resource lookup rather than by the gate — see the citation in
+        // `crate::ops::tag_resource`. So this operation is still simply unwritten, and a
+        // caller gets the 501 below whether its account holds a partner benefit or not.
         // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.

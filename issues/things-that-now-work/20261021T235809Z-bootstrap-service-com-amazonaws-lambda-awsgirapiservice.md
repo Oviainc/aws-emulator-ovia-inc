@@ -9,6 +9,29 @@ _Operation: service-com-amazonaws-lambda-awsgirapiservice | Class: missing_
 
 > _Note: this issue was identified against the code base at commit `b135c4508c1fb26e9a8e4477f81bd51ec13345b2`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+The five-operation first slice below is implemented and state-backed: `CreateFunction`,
+`GetFunction`, `ListFunctions`, `Invoke` and `DeleteFunction` all compute their answers
+from `crate::state`, covered by `tests/all/function_lifecycle.rs`. Two things differ from
+the plan above, deliberately:
+
+- **`State` is `Pending` at creation, not `Active`.** The model's own `CreateFunction`,
+  `StateReasonCode` and `LastUpdateStatus` documentation describes the provisioning window
+  ("During this time, you can't invoke or modify the function"), so creation reports
+  `Pending`/`Creating` and the clock makes the move to `Active` due shortly after.
+- **`Invoke` does not run the deployment package.** `DryRun` is served in full (no function
+  code runs for it on AWS either), but `RequestResponse` and `Event` answer HTTP 501: this
+  emulator has no in-process runtime for a Lambda zip archive or container image, and a
+  payload, `FunctionError` or log tail invented for a run that never happened would be
+  indistinguishable from a real one. Everything around the run — name/version resolution,
+  the lifecycle-state refusal, the documented payload limits and the JSON check — is real.
+
+Still open as their own gap issues: the other 83 operations (aliases, layers, versions
+beyond `Publish` at creation, event source mappings, URL configs, concurrency, permissions,
+code signing, tagging, `InvokeAsync`, `InvokeWithResponseStream`, ...), and with them the
+`MasterRegion` filter, which can never match while nothing creates a Lambda@Edge replica.
+
 ## Description
 
 Every one of the 88 operations in this crate is an unmodified scaffold: each `src/ops/*.rs` carries the `//! SCAFFOLDED, NOT IMPLEMENTED:` header and returns `Err(crate::scaffolded::Scaffolded::not_implemented(..))`, i.e. HTTP 501 `NotImplemented`, and `src/state.rs` holds no function data. No client workflow works at all.
