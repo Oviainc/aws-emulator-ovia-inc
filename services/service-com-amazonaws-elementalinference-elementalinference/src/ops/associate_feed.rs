@@ -365,12 +365,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "New outputs will be appended" — and an output that entered the feed this way
         // reports `fromAssociation: true` (`GetOutput$fromAssociation`).
         feed.outputs
-            .extend(input.outputs.into_iter().map(|output| crate::state::Output {
-                name: output.name,
-                output_config: output.output_config,
-                status: output.status,
-                description: output.description,
-                from_association: true,
+            .extend(input.outputs.into_iter().map(|output| {
+                crate::state::Output::new(
+                    output.name,
+                    output.output_config,
+                    output.status,
+                    output.description,
+                    true,
+                )
             }));
         feed.association = Some(FeedAssociation {
             associated_resource_name: input.associated_resource_name,

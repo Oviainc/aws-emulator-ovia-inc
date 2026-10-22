@@ -163,18 +163,13 @@ async fn create_dictionary_persists_a_dictionary_get_dictionary_reports_member_f
             "case {label:?}: nothing references a just-created dictionary, got {:?}",
             created["references"]
         );
-        match submitted.get("tags") {
-            Some(tags) => assert_eq!(
-                &created["tags"], tags,
-                "case {label:?}: the response carries the requested tags, got {:?}",
-                created["tags"]
-            ),
-            None => assert!(
-                created["tags"].is_null(),
-                "case {label:?}: a dictionary created without tags reports none, got {:?}",
-                created["tags"]
-            ),
-        }
+        assert_eq!(
+            &created["tags"],
+            submitted.get("tags").unwrap_or(&json!({})),
+            "case {label:?}: the response carries the requested tag set, empty when the \
+             request carried none, got {:?}",
+            created["tags"]
+        );
 
         // The round trip: everything but the status comes back from storage
         // unchanged.

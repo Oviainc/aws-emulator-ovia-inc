@@ -242,15 +242,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         feed.outputs = input
             .outputs
             .into_iter()
-            .map(|output| crate::state::Output {
-                name: output.name,
-                output_config: output.output_config,
-                status: output.status,
-                description: output.description,
-                // `fromAssociation` is carried by the caller (it is an UpdateOutput
-                // member); an output the caller does not mark came from this call,
-                // not from AssociateFeed.
-                from_association: output.from_association.unwrap_or(false),
+            .map(|output| {
+                crate::state::Output::new(
+                    output.name,
+                    output.output_config,
+                    output.status,
+                    output.description,
+                    // `fromAssociation` is carried by the caller (it is an
+                    // UpdateOutput member); an output the caller does not mark came
+                    // from this call, not from AssociateFeed.
+                    output.from_association.unwrap_or(false),
+                )
             })
             .collect();
         feed.access_role_arn = input.access_role_arn;
@@ -267,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_role_arn: feed.access_role_arn.clone(),
             status: feed.status.as_wire().to_string(),
             association: feed.association.clone(),
-            tags: feed.tag_map(),
+            tags: Some(feed.tag_map()),
         };
         state.note_due(due);
         Ok(output)

@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             language: dictionary.language.clone(),
             status: dictionary.status.as_wire().to_string(),
             references: Some(dictionary.feed_references()),
-            tags: dictionary.tag_map(),
+            tags: Some(dictionary.tag_map()),
         })
     }
 }

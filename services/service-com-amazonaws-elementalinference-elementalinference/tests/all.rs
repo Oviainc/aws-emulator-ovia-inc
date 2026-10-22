@@ -27,5 +27,7 @@ mod fixture_catalog;
 mod fixture_search;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/response_members.rs"]
+mod response_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

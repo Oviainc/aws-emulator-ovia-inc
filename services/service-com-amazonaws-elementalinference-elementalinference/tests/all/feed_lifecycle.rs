@@ -179,10 +179,13 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
             .unwrap_or_default();
         assert!(
             !endpoints.is_empty()
-                && endpoints
-                    .iter()
-                    .all(|e| e.as_str().is_some_and(|e| e.contains(&id))),
-            "case {label:?}: dataEndpoints is a non-empty list naming the feed, got {:?}",
+                && endpoints.iter().all(|e| e
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("https://")
+                        && e.ends_with(&format!(
+                            ".{SIGNING_NAME}-data.{REGION}.api.aws/"
+                        )))),
+            "case {label:?}: dataEndpoints is a non-empty list of data-plane URLs, got {:?}",
             created["dataEndpoints"]
         );
         assert_eq!(
@@ -199,8 +202,9 @@ async fn create_feed_persists_a_feed_that_get_feed_reports_member_for_member() {
         );
         assert_eq!(
             created.get("tags"),
-            case.body.get("tags"),
-            "case {label:?}: tags are echoed only when supplied, got {:?}",
+            Some(case.body.get("tags").unwrap_or(&json!({}))),
+            "case {label:?}: the tag set is reported, empty when the request carried \
+             none, got {:?}",
             created.get("tags")
         );
         assert_eq!(

@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    Competitor, FeedAssociation, FeedSummary, FixtureSummary, GetOutput, OutputConfig,
+    AspectRatio, Competitor, FeedAssociation, FeedSummary, FixtureSummary, GetOutput, OutputConfig,
 };
 
 /// This service's SigV4 signing name and ARN namespace (`OPERATIONS.md`, "Wire
@@ -244,12 +244,14 @@ pub struct Dictionary {
 }
 
 impl Dictionary {
-    /// The tags of this dictionary as a `TagMap`, absent when it carries none.
-    pub fn tag_map(&self) -> Option<std::collections::HashMap<String, String>> {
-        if self.tags.is_empty() {
-            return None;
-        }
-        Some(self.tags.clone().into_iter().collect())
+    /// The tags of this dictionary as the `TagMap` every dictionary response carries.
+    ///
+    /// A dictionary that carries no tags reports an EMPTY map, not an absent member:
+    /// the tag set is a property every dictionary HAS, so a client reading it gets an
+    /// empty collection rather than null, and the member does not start existing the
+    /// moment the first tag is added.
+    pub fn tag_map(&self) -> std::collections::HashMap<String, String> {
+        self.tags.clone().into_iter().collect()
     }
 
     /// The `FeedReferences` list every dictionary response carries: the feeds that
@@ -273,6 +275,29 @@ pub struct Output {
 }
 
 impl Output {
+    /// One output of a feed as it is STORED, from the output a create or update
+    /// request carried.
+    ///
+    /// The config is stored with the service's own defaults already materialised
+    /// ([`output_config_with_defaults`]), so every later read of the feed reports the
+    /// configuration the service actually applied rather than only the members the
+    /// request happened to carry.
+    pub fn new(
+        name: String,
+        output_config: OutputConfig,
+        status: String,
+        description: Option<String>,
+        from_association: bool,
+    ) -> Self {
+        Self {
+            name,
+            output_config: output_config_with_defaults(output_config),
+            status,
+            description,
+            from_association,
+        }
+    }
+
     /// The `GetOutput` projection of this output, as every feed response reports it.
     pub fn to_get_output(&self) -> GetOutput {
         GetOutput {
@@ -337,12 +362,12 @@ impl Feed {
             .map(|association| association.associated_resource_name.as_str())
     }
 
-    /// The tags of this feed as a `TagMap`, absent when the feed carries none.
-    pub fn tag_map(&self) -> Option<std::collections::HashMap<String, String>> {
-        if self.tags.is_empty() {
-            return None;
-        }
-        Some(self.tags.clone().into_iter().collect())
+    /// The tags of this feed as the `TagMap` every feed response carries.
+    ///
+    /// As with [`Dictionary::tag_map`], an untagged feed reports an EMPTY map rather
+    /// than an absent member.
+    pub fn tag_map(&self) -> std::collections::HashMap<String, String> {
+        self.tags.clone().into_iter().collect()
     }
 
     /// The `FeedSummary` projection `ListFeeds` reports.
@@ -365,14 +390,15 @@ pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// refuses past that with the modelled `ServiceQuotaExceededException`, so this
     /// map cannot grow without limit however many requests arrive.
     pub feeds: BTreeMap<String, Feed>,
-    /// Monotonic source for minted feed ids: unique and stable within a run.
+    /// Monotonic source for minted feed ids: one more per feed this emulator mints.
     pub next_feed_seq: u64,
     /// Every live dictionary, keyed by its `DictionaryId`. `BTreeMap` so
     /// `ListDictionaries` has one stable order to paginate over. BOUNDED at
     /// [`MAX_DICTIONARIES`] entries: `CreateDictionary` refuses past that with the
     /// modelled `ServiceQuotaExceededException`.
     pub dictionaries: BTreeMap<String, Dictionary>,
-    /// Monotonic source for minted dictionary ids: unique and stable within a run.
+    /// Monotonic source for minted dictionary ids: one more per dictionary this
+    /// emulator mints.
     pub next_dictionary_seq: u64,
     /// Every fixture the external sports data source holds, keyed by its `FixtureId`.
     /// `BTreeMap` so a search has ONE stable order to page over, which is what a
@@ -387,19 +413,37 @@ pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     /// [`Self::settle_due_transitions`] reads it first and returns without touching
     /// the store while nothing is owed, so the common request path is O(1).
     pub earliest_due: Option<Instant>,
+    /// The entropy that distinguishes THIS emulator's ids from another's, drawn once
+    /// on the first mint ([`Self::run_seed`]).
+    ///
+    /// An id identifies exactly one resource, so no two resources may ever carry the
+    /// same one. The per-resource sequence alone cannot promise that: it starts over
+    /// at the same value in a fresh store, so two stores would hand out the same
+    /// first id. Mixing this seed in is what makes a minted id unique across stores
+    /// as well as within one.
+    pub run_seed: Option<u64>,
 }
 
 impl ComAmazonawsElementalinferenceElementalinferenceState {
+    /// This store's id entropy, drawn on first use and then held for its life, so
+    /// every id it mints is unique across stores while an id, once minted, never
+    /// changes.
+    fn run_seed(&mut self) -> u64 {
+        *self.run_seed.get_or_insert_with(fresh_run_seed)
+    }
+
     /// Mint a fresh `FeedId`: 19 characters of `[a-z0-9]`, as the model requires.
     ///
-    /// Derived from the per-run sequence through a bit mixer, so ids are unique and
-    /// stable within a run without consecutive ones sharing a prefix. The loop is
-    /// the collision guard: a mixed value that happens to land on a live feed's id
-    /// takes the next sequence number instead.
+    /// Derived from this store's [`Self::run_seed`] plus the per-resource sequence
+    /// through a bit mixer, so no two feeds — of this store or of any other — share
+    /// an id, and consecutive ids share no prefix. The loop is the collision guard: a
+    /// mixed value that happens to land on a live feed's id takes the next sequence
+    /// number instead.
     pub fn mint_feed_id(&mut self) -> String {
+        let run_seed = self.run_seed();
         loop {
             self.next_feed_seq += 1;
-            let id = feed_id_from_seq(self.next_feed_seq);
+            let id = feed_id_from_seq(run_seed.wrapping_add(self.next_feed_seq));
             if !self.feeds.contains_key(&id) {
                 return id;
             }
@@ -409,14 +453,15 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
     /// Mint a fresh `DictionaryId`: up to [`DICTIONARY_ID_LEN`] characters of
     /// `[a-zA-Z0-9]`, as the model requires.
     ///
-    /// Same construction as [`Self::mint_feed_id`] — the per-run sequence through a
-    /// bit mixer, with the loop as the collision guard — over the wider alphabet the
-    /// `DictionaryId` pattern admits.
+    /// Same construction as [`Self::mint_feed_id`] — this store's seed plus the
+    /// per-resource sequence through a bit mixer, with the loop as the collision
+    /// guard — over the wider alphabet the `DictionaryId` pattern admits.
     pub fn mint_dictionary_id(&mut self) -> String {
+        let run_seed = self.run_seed();
         loop {
             self.next_dictionary_seq += 1;
             let id = id_from_seq(
-                self.next_dictionary_seq,
+                run_seed.wrapping_add(self.next_dictionary_seq),
                 DICTIONARY_ID_LEN,
                 DICTIONARY_ID_ALPHABET,
             );
@@ -576,17 +621,82 @@ pub fn dictionary_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(SERVICE_NAMESPACE, region, &format!("dictionary/{id}"))
 }
 
+/// The top-level domain every data endpoint of this service sits under.
+///
+/// The media data plane is reached on a DEDICATED per-region domain,
+/// `<signing-name>-data.<region>.api.aws`, not on the control-plane service domain
+/// the control API itself answers on: a client routes media by the endpoint's domain
+/// suffix, so that suffix is part of the contract even though the host label is not.
+/// This constant is its last two labels; the rest are built from the signing name and
+/// the request's region in [`feed_data_endpoints`].
+const DATA_ENDPOINT_TLD: &str = "api.aws";
+
+/// How many hex characters the opaque host label of a data endpoint carries.
+///
+/// The label itself is environment-specific — it is assigned by the data plane and is
+/// deliberately NOT the feed id, so a client cannot read a feed id out of an endpoint
+/// it was handed.
+const DATA_ENDPOINT_LABEL_LEN: usize = 10;
+
 /// The data endpoints of a feed in `region`.
 ///
-/// One endpoint per feed ("Typically, there is only one endpoint"), named after the
-/// feed so it is stable for the life of the feed and distinct per feed. The media
-/// data plane those endpoints serve (`PutMedia` / `GetMetadata`) is not part of this
-/// service's Smithy model, so no listener backs them — the field reports where the
-/// feed would be reached, which is all the control plane models.
+/// One endpoint per feed ("Typically, there is only one endpoint"), as a data-plane
+/// URL: `https://<opaque-label>.<signing-name>-data.<region>.api.aws/`, with the
+/// trailing slash a client concatenates a path onto. The label is derived from the
+/// feed id, so it is stable for the life of the feed and distinct per feed, while
+/// being opaque rather than the id itself. The media data plane those endpoints serve
+/// (`PutMedia` / `GetMetadata`) is not part of this service's Smithy model, so no
+/// listener backs them — the field reports where the feed would be reached, which is
+/// all the control plane models.
 pub fn feed_data_endpoints(region: &str, id: &str) -> Vec<String> {
+    let label = data_endpoint_label(id);
     vec![format!(
-        "https://{id}.data.{SERVICE_NAMESPACE}.{region}.amazonaws.com"
+        "https://{label}.{SERVICE_NAMESPACE}-data.{region}.{DATA_ENDPOINT_TLD}/"
     )]
+}
+
+/// The opaque host label a feed's data endpoint carries: [`DATA_ENDPOINT_LABEL_LEN`]
+/// hex characters derived from the feed id (FNV-1a, then mixed), so two feeds get two
+/// labels and one feed keeps its own for life without the label spelling the id.
+fn data_endpoint_label(id: &str) -> String {
+    let mut hash = fnv1a64(id.as_bytes());
+    let mut label = format!("{:016x}", splitmix64(&mut hash));
+    label.truncate(DATA_ENDPOINT_LABEL_LEN);
+    label
+}
+
+/// The aspect ratio a subtitling output is configured with when the request that
+/// created it carried none.
+///
+/// `SubtitlingConfig$aspectRatio` is optional ("Elemental Inference uses the aspect
+/// ratio to determine subtitle layout and line lengths") and the model declares no
+/// default, so this value is OBSERVED behaviour rather than documented: every created
+/// subtitling output comes back on the standard broadcast frame, 16:9. It is applied
+/// to every subtitling output alike, never keyed on a particular request; should the
+/// model ever declare the default, that declaration replaces this constant.
+pub const DEFAULT_SUBTITLING_ASPECT_RATIO: AspectRatio = AspectRatio {
+    width: 16,
+    height: 9,
+};
+
+/// An output config as the service STORES it: every optional member the service fills
+/// in for itself is materialised, so a read-modify-write round trip through
+/// `GetFeed` -> `UpdateFeed` (a full-replacement PUT) carries the service's own
+/// configuration back instead of dropping it.
+///
+/// Only members this service's model declares can be reported, so the defaults are
+/// exactly the modelled optional members the service resolves itself: a subtitling
+/// output's [`DEFAULT_SUBTITLING_ASPECT_RATIO`]. The cropping, clipping and
+/// contextual-metadata configs declare no member the service resolves
+/// (`smithy_query(query="shape",shape="CroppingConfig,ClippingConfig,ContextualMetadataConfig")`),
+/// so they are stored as the request carried them.
+pub fn output_config_with_defaults(mut config: OutputConfig) -> OutputConfig {
+    if let OutputConfig::Subtitling(subtitling) = &mut config {
+        subtitling
+            .aspect_ratio
+            .get_or_insert(DEFAULT_SUBTITLING_ASPECT_RATIO);
+    }
+    config
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no
@@ -595,6 +705,20 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Draw one store's id entropy.
+///
+/// Two sources that differ between two stores: the wall clock at the moment the
+/// first id is minted and this process's id. Mixed together, so the seed is spread
+/// over the whole 64-bit range rather than tracking the clock.
+fn fresh_run_seed() -> u64 {
+    let nanos = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_nanos() as u64)
+        .unwrap_or_default();
+    let mut seed = nanos ^ (u64::from(::std::process::id()) << 32);
+    splitmix64(&mut seed)
 }
 
 /// Mix `seq` into `FEED_ID_LEN` characters of [`FEED_ID_ALPHABET`].
@@ -637,9 +761,21 @@ fn id_from_seq(seq: u64, len: usize, alphabet: &[u8]) -> String {
     id
 }
 
-/// SplitMix64: a well-known 64-bit mixer, used here only to spread a counter over the
-/// whole 64-bit range. Deterministic, so an id this service mints from a given
-/// sequence number is identical on every call.
+/// FNV-1a over `bytes`: the one place this service hashes a byte string into a seed,
+/// so the data-endpoint label's derivation is stated once.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    // FNV-1a's 64-bit offset basis and prime.
+    let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+/// SplitMix64: a well-known 64-bit mixer, used here only to spread a counter or a
+/// hashed byte string over the whole 64-bit range. Deterministic, so everything
+/// derived from it (an id this service mints, a feed's endpoint label) is identical
+/// on every call with the same input.
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;

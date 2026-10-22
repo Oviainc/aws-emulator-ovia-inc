@@ -254,12 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outputs: input
                 .outputs
                 .into_iter()
-                .map(|output| crate::state::Output {
-                    name: output.name,
-                    output_config: output.output_config,
-                    status: output.status,
-                    description: output.description,
-                    from_association: false,
+                .map(|output| {
+                    crate::state::Output::new(
+                        output.name,
+                        output.output_config,
+                        output.status,
+                        output.description,
+                        false,
+                    )
                 })
                 .collect(),
             access_role_arn: input.access_role_arn,
@@ -282,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_role_arn: feed.access_role_arn.clone(),
             status: feed.status.as_wire().to_string(),
             association: feed.association.clone(),
-            tags: feed.tag_map(),
+            tags: Some(feed.tag_map()),
         };
         state.feeds.insert(feed.id.clone(), feed);
         state.note_due(due);

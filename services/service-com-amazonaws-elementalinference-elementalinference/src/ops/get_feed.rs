@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_role_arn: feed.access_role_arn.clone(),
             status: feed.status.as_wire().to_string(),
             association: feed.association.clone(),
-            tags: feed.tag_map(),
+            tags: Some(feed.tag_map()),
         })
     }
 }
