@@ -19,6 +19,8 @@ mod engine_versions;
 mod parameter_groups;
 #[path = "all/parameters.rs"]
 mod parameters;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/user_deletion.rs"]
