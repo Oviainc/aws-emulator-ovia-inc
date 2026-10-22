@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/db_instance_lifecycle.rs"]
 mod db_instance_lifecycle;
+#[path = "all/db_parameter_group.rs"]
+mod db_parameter_group;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
