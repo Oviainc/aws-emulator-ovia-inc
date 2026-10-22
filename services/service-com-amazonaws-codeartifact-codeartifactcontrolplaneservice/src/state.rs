@@ -19,9 +19,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    DomainDescription, DomainSummary, PackageGroupDescription, PackageGroupOriginConfiguration,
-    PackageGroupOriginRestriction, PackageGroupReference, PackageOriginConfiguration,
-    PackageOriginRestrictions, PackageSummary, RepositoryDescription,
+    AssetSummary, DomainDescription, DomainEntryPoint, DomainSummary, PackageGroupDescription,
+    PackageGroupOriginConfiguration, PackageGroupOriginRestriction, PackageGroupReference,
+    PackageOriginConfiguration, PackageOriginRestrictions, PackageSummary,
+    PackageVersionDescription, PackageVersionOrigin, RepositoryDescription,
     RepositoryExternalConnectionInfo, RepositorySummary, ResourcePolicy, Tag,
     UpstreamRepositoryInfo, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
 };
@@ -122,6 +123,71 @@ pub const MAX_PACKAGES_PER_REPOSITORY: usize = 10_000;
 /// `ServiceQuotaExceededException` (402).
 pub const MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY: usize = 1;
 
+/// Maximum bytes one published asset may carry.
+///
+/// NOT an AWS quota — CodeArtifact's published asset ceiling is measured in gigabytes,
+/// which this in-memory store could not hold — but the emulator's OWN bound: asset bytes
+/// live in the process until an explicit delete, so without a ceiling one local caller
+/// can grow the shared store until the process dies. An asset over it is refused with the
+/// `ServiceQuotaExceededException` (402) every publish path already models.
+///
+/// It bounds what is STORED, not the peak allocation of one request: the request body is
+/// already buffered by the time a handler sees it, so the only bound on THAT is the
+/// server's body cap.
+pub const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum assets one package version may hold (the emulator's own bound, for the same
+/// reason as [`MAX_ASSET_BYTES`]: an unfinished version accepts assets until it closes).
+pub const MAX_ASSETS_PER_PACKAGE_VERSION: usize = 100;
+
+/// Maximum versions one package may hold (the emulator's own bound).
+pub const MAX_PACKAGE_VERSIONS_PER_PACKAGE: usize = 1_000;
+
+/// Maximum total bytes of asset content this service retains, across every domain.
+///
+/// [`MAX_ASSET_BYTES`] bounds ONE asset; the record-count ceilings bound only their
+/// product, which is astronomically larger than the host's memory. This is the bound that
+/// actually holds the process: real CodeArtifact keeps assets in S3, this emulator keeps
+/// them in RAM, so the bytes it retains need a ceiling of their own. Peer services that
+/// retain caller bytes declare the same thing (S3's `MAX_OBJECT_BYTES_TOTAL`,
+/// mediastoredata's `MAX_STORED_BYTES`); this sits in the same band and is far above
+/// anything a fixture publishes. A publish that would cross it is refused with
+/// `ServiceQuotaExceededException` (402) BEFORE the asset is stored.
+///
+/// An `i64` rather than a `usize` because it is compared against the derived total of
+/// [`ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState::stored_asset_bytes`],
+/// which is an `i64` to match the modelled `assetSizeBytes`.
+pub const MAX_STORED_ASSET_BYTES: i64 = 256 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Package-version vocabulary
+//
+// Each constant below is one value of a modelled enum (`PackageFormat`,
+// `PackageVersionStatus`, `AllowPublish`/`AllowUpstream`, `PackageVersionOriginType`,
+// `HashAlgorithm`), named here so the handlers compare against one spelling.
+// ---------------------------------------------------------------------------
+
+/// The only `PackageFormat` `PublishPackageVersion` accepts: "Only generic packages can
+/// be published using this API" (the operation's own documentation).
+pub const PACKAGE_FORMAT_GENERIC: &str = "generic";
+
+/// `PackageVersionStatus` of a version whose assets are all uploaded.
+pub const PACKAGE_VERSION_STATUS_PUBLISHED: &str = "Published";
+
+/// `PackageVersionStatus` of a version that is still accepting assets, which is what the
+/// `unfinished` flag keeps a publish in.
+pub const PACKAGE_VERSION_STATUS_UNFINISHED: &str = "Unfinished";
+
+/// The `AllowPublish`/`AllowUpstream` value that permits the action.
+pub const ORIGIN_RESTRICTION_ALLOW: &str = "ALLOW";
+
+/// The `AllowPublish`/`AllowUpstream` value that refuses the action.
+pub const ORIGIN_RESTRICTION_BLOCK: &str = "BLOCK";
+
+/// `PackageVersionOriginType` of a version published straight into a repository (as
+/// opposed to one pulled in from an upstream or an external connection).
+pub const PACKAGE_VERSION_ORIGIN_INTERNAL: &str = "INTERNAL";
+
 /// Maximum package groups one domain holds, counting the root group every domain is
 /// created with.
 ///
@@ -188,6 +254,19 @@ impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
             .get_mut(name)
             .filter(|domain| owner.is_none_or(|owner| owner == domain.owner))
     }
+
+    /// The total asset bytes this service currently retains, across every domain — what
+    /// [`MAX_STORED_ASSET_BYTES`] bounds.
+    ///
+    /// Summed from the assets themselves rather than kept as a running counter, for the
+    /// same reason as every other derived value here: a counter is one more place that
+    /// can forget to move when a version or a repository is deleted. The sum costs the
+    /// NUMBER of stored assets (bounded by the record ceilings above), never their bytes.
+    pub fn stored_asset_bytes(&self) -> i64 {
+        self.domains.values().fold(0i64, |total, domain| {
+            total.saturating_add(domain.asset_size_bytes())
+        })
+    }
 }
 
 /// A stored CodeArtifact domain.
@@ -200,7 +279,6 @@ pub struct Domain {
     pub status: String,
     pub created_time: SystemTime,
     pub encryption_key: Option<String>,
-    pub asset_size_bytes: i64,
     pub s3_bucket_arn: String,
     pub tags: Vec<Tag>,
     pub policy: Option<ResourcePolicy>,
@@ -229,7 +307,7 @@ impl Domain {
             created_time: Some(self.created_time.into()),
             encryption_key: self.encryption_key.clone(),
             repository_count: self.repository_count(),
-            asset_size_bytes: self.asset_size_bytes,
+            asset_size_bytes: self.asset_size_bytes(),
             s3_bucket_arn: Some(self.s3_bucket_arn.clone()),
         }
     }
@@ -253,6 +331,18 @@ impl Domain {
     /// that overflowed it would otherwise report a negative number of repositories.
     fn repository_count(&self) -> i32 {
         i32::try_from(self.repositories.len()).unwrap_or(i32::MAX)
+    }
+
+    /// `assetSizeBytes`: the total size of every asset the domain's repositories hold.
+    ///
+    /// Derived, never stored, for the same reason as [`Domain::repository_count`]: a
+    /// publish or a delete changes it, and a stored copy would be the one place that
+    /// forgot to move. Saturating, so a total past `i64::MAX` reports the ceiling rather
+    /// than wrapping negative.
+    pub fn asset_size_bytes(&self) -> i64 {
+        self.repositories.values().fold(0i64, |total, repository| {
+            total.saturating_add(repository.asset_size_bytes())
+        })
     }
 
     /// The modelled `PackageGroupDescription` of the group this domain holds under
@@ -558,6 +648,32 @@ impl Repository {
             created_time: Some(self.created_time.into()),
         }
     }
+
+    /// Resolve a package the way every package-scoped operation addresses it: by the
+    /// `(format, namespace, package)` triple, never by name alone.
+    pub fn package(&self, format: &str, namespace: Option<&str>, package: &str) -> Option<&Package> {
+        self.packages.get(&package_key(format, namespace, package))
+    }
+
+    /// The total size of every asset this repository holds, summed from the assets
+    /// themselves (see [`Domain::asset_size_bytes`] on why it is derived).
+    pub fn asset_size_bytes(&self) -> i64 {
+        self.packages.values().fold(0i64, |total, package| {
+            total.saturating_add(package.asset_size_bytes())
+        })
+    }
+}
+
+/// The key a package is held under inside its repository.
+///
+/// A package's identity is the `(format, namespace, package)` triple — the same name in
+/// two formats, or under two namespaces, is two different packages — so the key carries
+/// all three. `/` is the separator because no component can contain one: `PackageFormat`
+/// is an enum of lowercase words, and both `PackageNamespace` and `PackageName` are
+/// modelled `^[^#/\s]+$`. A package with no namespace keys as `<format>//<package>`,
+/// which no namespaced package can collide with for that same reason.
+pub fn package_key(format: &str, namespace: Option<&str>, package: &str) -> String {
+    format!("{format}/{}/{package}", namespace.unwrap_or_default())
 }
 
 /// A stored package inside a repository.
@@ -565,9 +681,9 @@ impl Repository {
 /// A package is identified by the triple (`format`, `namespace`, `name`) — the same triple
 /// every package-scoped operation addresses it with — and carries the origin restrictions
 /// that decide whether new versions may be published into, or ingested from an upstream
-/// into, this repository. A package can legitimately hold no versions at all:
-/// `PutPackageOriginConfiguration` is documented to create exactly that when called for a
-/// package the repository does not yet hold.
+/// into, this repository, plus the versions published into it. A package can legitimately
+/// hold no versions at all: `PutPackageOriginConfiguration` is documented to create
+/// exactly that when called for a package the repository does not yet hold.
 #[derive(Debug, Clone)]
 pub struct Package {
     pub format: String,
@@ -575,10 +691,30 @@ pub struct Package {
     /// `PackageSummary$namespace` doc lists Python, NuGet, Ruby and Cargo).
     pub namespace: Option<String>,
     pub name: String,
+    /// `publish`/`upstream` origin control, as `PutPackageOriginConfiguration` sets it.
     pub origin_restrictions: PackageOriginRestrictions,
+    /// The package's versions, keyed by version string.
+    pub versions: BTreeMap<String, PackageVersion>,
 }
 
 impl Package {
+    /// A package created by a direct publish: CodeArtifact gives a package that was
+    /// published into a repository the default origin configuration, which allows both
+    /// further publishes and upstream fetches until an explicit
+    /// `PutPackageOriginConfiguration` narrows it.
+    pub fn new(format: &str, namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            format: format.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+            origin_restrictions: PackageOriginRestrictions {
+                publish: ORIGIN_RESTRICTION_ALLOW.to_string(),
+                upstream: ORIGIN_RESTRICTION_ALLOW.to_string(),
+            },
+            versions: BTreeMap::new(),
+        }
+    }
+
     /// The modelled `PackageSummary` for this record — what the package `List*`
     /// operations return.
     pub fn summary(&self) -> PackageSummary {
@@ -596,18 +732,210 @@ impl Package {
             restrictions: Some(self.origin_restrictions.clone()),
         }
     }
+
+    /// Whether origin control permits publishing a version into this package.
+    pub fn publish_allowed(&self) -> bool {
+        self.origin_restrictions.publish != ORIGIN_RESTRICTION_BLOCK
+    }
+
+    /// The total size of every asset this package's versions hold.
+    pub fn asset_size_bytes(&self) -> i64 {
+        self.versions.values().fold(0i64, |total, version| {
+            total.saturating_add(version.asset_size_bytes())
+        })
+    }
 }
 
-/// The key a package is stored under inside its repository: `<format>/<namespace>/<name>`,
-/// the same coordinate CodeArtifact addresses a package by.
+/// A stored package version: its status, when it was published, where it entered the
+/// domain, and the assets published into it.
+#[derive(Debug, Clone)]
+pub struct PackageVersion {
+    pub version: String,
+    /// One of `PackageVersionStatus`; a version is only ever stored in a status it can be
+    /// observed in, so `Deleted` never appears here (a deleted version is gone).
+    pub status: String,
+    pub published_time: SystemTime,
+    /// One of `PackageVersionOriginType`.
+    pub origin_type: String,
+    /// The repository the version entered the domain through, reported as the origin's
+    /// `domainEntryPoint`.
+    pub entry_point_repository: String,
+    /// The version's assets, keyed by asset name.
+    pub assets: BTreeMap<String, Asset>,
+}
+
+impl PackageVersion {
+    /// `versionRevision`: an opaque token that identifies this version's CONTENT.
+    ///
+    /// Derived from everything a revision has to move with — the version, its status and
+    /// each asset's name and content digest — so two reads of an unchanged version report
+    /// the same revision, adding an asset or closing an unfinished version reports a new
+    /// one, and a version restored to identical content reports the identical token.
+    /// Base64 of a SHA-256 digest, which is 44 characters: inside the modelled
+    /// `PackageVersionRevision` length (1..50) and `^\S+$` pattern.
+    ///
+    /// Costs the NUMBER of assets, not their bytes: each asset's digest was computed once
+    /// when the asset was accepted (see [`Asset::new`]), so no read ever hashes stored
+    /// content again.
+    pub fn revision(&self) -> String {
+        use base64::Engine as _;
+
+        let mut fields: Vec<&str> = vec![self.version.as_str(), self.status.as_str()];
+        for (name, asset) in &self.assets {
+            fields.push(name.as_str());
+            fields.push(asset.sha256_hex());
+        }
+        base64::engine::general_purpose::STANDARD.encode(identity_digest(&fields))
+    }
+
+    /// The modelled `PackageVersionDescription` for this record, inside `package`.
+    ///
+    /// `displayName`, `summary`, `homePage`, `sourceCodeRepository` and `licenses` are
+    /// read by CodeArtifact out of a package's own metadata file (a `pom.xml`, a
+    /// `package.json`): a generic package has none, so they have no source here and are
+    /// omitted rather than invented.
+    pub fn description(&self, package: &Package) -> PackageVersionDescription {
+        PackageVersionDescription {
+            format: Some(package.format.clone()),
+            namespace: package.namespace.clone(),
+            package_name: Some(package.name.clone()),
+            display_name: None,
+            version: Some(self.version.clone()),
+            summary: None,
+            home_page: None,
+            source_code_repository: None,
+            published_time: Some(self.published_time.into()),
+            licenses: None,
+            revision: Some(self.revision()),
+            status: Some(self.status.clone()),
+            origin: Some(PackageVersionOrigin {
+                domain_entry_point: Some(DomainEntryPoint {
+                    repository_name: Some(self.entry_point_repository.clone()),
+                    // Set only for a version pulled through an external connection.
+                    external_connection_name: None,
+                }),
+                origin_type: Some(self.origin_type.clone()),
+            }),
+        }
+    }
+
+    /// The total size of this version's assets.
+    pub fn asset_size_bytes(&self) -> i64 {
+        self.assets.values().fold(0i64, |total, asset| {
+            total.saturating_add(asset.size_bytes())
+        })
+    }
+}
+
+/// A stored asset: its name, the exact bytes that were published, and their hashes.
 ///
-/// Unambiguous because `PackageNamespace` and `PackageName` are both modelled `^[^#/\s]+$`
-/// — neither can contain the `/` separator — and a format is a closed enum of lowercase
-/// letters. A format without a namespace leaves that segment empty, so the triple
-/// (`format`, `None`, `name`) and (`format`, `Some("")`, `name`) cannot collide: the empty
-/// namespace is refused at the boundary by `@length(min: 1)`.
-pub fn package_key(format: &str, namespace: Option<&str>, name: &str) -> String {
-    format!("{format}/{}/{name}", namespace.unwrap_or_default())
+/// The bytes are kept verbatim — `GetPackageVersionAsset` has to answer with what
+/// `PublishPackageVersion` was given, byte for byte. Their hashes are computed ONCE, when
+/// the asset is accepted, and stored beside them:
+///
+/// * a hash can never disagree with the content it describes, because the fields are
+///   private and [`Asset::new`] is the only way to make one — an asset is replaced
+///   wholesale, never edited in place, so a stored digest cannot go stale; and
+/// * no request pays for the bytes already in the store. Hashing on every read would
+///   make a few-hundred-byte `DescribePackageVersion` cost a pass over every byte the
+///   version holds (its revision digests each asset), so the work one caller can ask for
+///   would be the PRODUCT of the asset ceiling and the asset size rather than the size of
+///   the request they sent.
+#[derive(Debug, Clone)]
+pub struct Asset {
+    name: String,
+    content: Vec<u8>,
+    /// Keyed by the model's `HashAlgorithm` wire values, computed from `content`.
+    hashes: HashMap<String, String>,
+}
+
+impl Asset {
+    /// Accept `content` as the asset named `name`, computing its hashes now — one pass
+    /// per algorithm over the bytes of THIS request, and never again for this asset.
+    pub fn new(name: &str, content: Vec<u8>) -> Self {
+        use md5::Digest as _;
+
+        // One entry per value of the model's `HashAlgorithm` enum, lowercase hex, so a
+        // client can look up the algorithm it verifies with.
+        let hashes = HashMap::from([
+            (
+                HASH_ALGORITHM_MD5.to_string(),
+                hex::encode(md5::Md5::digest(&content)),
+            ),
+            (
+                HASH_ALGORITHM_SHA1.to_string(),
+                hex::encode(sha1::Sha1::digest(&content)),
+            ),
+            (HASH_ALGORITHM_SHA256.to_string(), sha256_hex(&content)),
+            (
+                HASH_ALGORITHM_SHA512.to_string(),
+                hex::encode(sha2::Sha512::digest(&content)),
+            ),
+        ]);
+        Self {
+            name: name.to_string(),
+            content,
+            hashes,
+        }
+    }
+
+    /// The modelled `AssetSummary` for this record.
+    pub fn summary(&self) -> AssetSummary {
+        AssetSummary {
+            name: self.name.clone(),
+            size: Some(self.size_bytes()),
+            hashes: Some(self.hashes.clone()),
+        }
+    }
+
+    /// The asset's name.
+    ///
+    /// Read path for `GetPackageVersionAsset`, which is still a stub with its own issue:
+    /// this and [`Asset::content`] are how that operation will reach a stored asset
+    /// without the fields being public.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The asset's bytes, exactly as they were published.
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+
+    /// The asset's size, saturating at `i64::MAX` because the modelled member is an
+    /// `i64` while a length is a `usize`.
+    pub fn size_bytes(&self) -> i64 {
+        i64::try_from(self.content.len()).unwrap_or(i64::MAX)
+    }
+
+    /// The asset's stored SHA-256, lowercase hex — the digest a caller declares in
+    /// `assetSHA256`, the one two assets are compared by, and the one a version's
+    /// revision is derived from. Always present: [`Asset::new`] computes it.
+    pub fn sha256_hex(&self) -> &str {
+        self.hashes
+            .get(HASH_ALGORITHM_SHA256)
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+}
+
+/// The `HashAlgorithm` value the `assetSHA256` integrity check and the stored revision
+/// both read.
+const HASH_ALGORITHM_SHA256: &str = "SHA-256";
+
+/// The model's other three `HashAlgorithm` values, each named once so the keys of an
+/// asset's `hashes` map cannot drift from the enum.
+const HASH_ALGORITHM_MD5: &str = "MD5";
+const HASH_ALGORITHM_SHA1: &str = "SHA-1";
+const HASH_ALGORITHM_SHA512: &str = "SHA-512";
+
+/// The lowercase-hex SHA-256 of `content`, in the spelling the modelled `SHA256` shape
+/// accepts (`^[0-9a-f]+$`, exactly 64 characters). Private: a handler reads an asset's
+/// digest through [`Asset::sha256_hex`], which is the stored one.
+fn sha256_hex(content: &[u8]) -> String {
+    use sha2::Digest as _;
+
+    hex::encode(sha2::Sha256::digest(content))
 }
 
 /// The cursor scope of `ListPackages` for one repository. Scoped PER REPOSITORY, so a
