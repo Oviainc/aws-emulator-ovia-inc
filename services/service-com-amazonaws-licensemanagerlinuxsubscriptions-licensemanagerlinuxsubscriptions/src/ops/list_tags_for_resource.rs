@@ -7,7 +7,10 @@
 //!
 //! `resourceArn` is a `SubscriptionProviderArn`, so the resource it addresses is a
 //! registered subscription provider; an ARN naming none is refused with the
-//! `NotFoundException` the tag APIs answer ([`crate::scaffolded::NOT_FOUND_CODE`]).
+//! `NotFoundException` the tag APIs answer ([`crate::scaffolded::NOT_FOUND_CODE`]), and
+//! one that is not a parseable resource ARN at all never reaches here — the request
+//! boundary refuses it with the `BadRequestException` the tag APIs answer for that
+//! (`crate::service::validation`).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
