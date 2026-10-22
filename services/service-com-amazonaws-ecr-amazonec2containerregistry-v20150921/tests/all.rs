@@ -51,6 +51,8 @@ mod resource_tags;
 mod scanning_configuration;
 #[path = "all/signing_configuration.rs"]
 mod signing_configuration;
+#[path = "all/signing_configuration_delete.rs"]
+mod signing_configuration_delete;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wire.rs"]

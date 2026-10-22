@@ -23,17 +23,17 @@ const REGION: &str = "us-west-2";
 
 /// Long enough to cover the emulator's chosen `CREATING` -> `ACTIVE` /
 /// `DELETING` -> removed span (`crate::state::TRANSITION_DELAY`).
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(1_200);
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(1_200);
 
 /// One emulator: the firehose service mounted on a single shared engine, plus the engine
 /// itself so a test can read the record buffer no operation exposes yet.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -41,7 +41,7 @@ impl Emulator {
     }
 
     /// Call one operation; answer its HTTP status and JSON body.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -90,7 +90,7 @@ impl Emulator {
 
     /// Create a stream with the smallest valid S3 destination. It is `CREATING` on
     /// return; sleep [`PAST_THE_TRANSITION`] once when a test needs it `ACTIVE`.
-    async fn create_stream(&self, name: &str, stream_type: Option<&str>) {
+    pub(crate) async fn create_stream(&self, name: &str, stream_type: Option<&str>) {
         let mut body = json!({
             "DeliveryStreamName": name,
             "S3DestinationConfiguration": s3_configuration(),
@@ -127,12 +127,12 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/firehose-delivery";
 /// An S3 bucket ARN satisfying `BucketARN`'s modelled pattern.
 const BUCKET_ARN: &str = "arn:aws:s3:::demo-bucket";
 
-fn s3_configuration() -> Value {
+pub(crate) fn s3_configuration() -> Value {
     json!({ "RoleARN": ROLE_ARN, "BucketARN": BUCKET_ARN, "Prefix": "raw/" })
 }
 
 /// The wire error code of an error response: `__type` without its namespace prefix.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .map(|wire| wire.rsplit('#').next().unwrap_or(wire).to_string())

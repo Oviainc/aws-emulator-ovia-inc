@@ -105,6 +105,91 @@ pub const REGION_STATUS_ACTIVE: &str = "ACTIVE";
 /// Replication status of a spoke region the fan-out could not create the rule in.
 pub const REGION_STATUS_FAILED: &str = "FAILED";
 
+/// How long after a `StartTelemetryEvaluation` / `StopTelemetryEvaluation` the
+/// telemetry-config feature of one region reaches its terminal status.
+///
+/// A CHOSEN span, not an AWS-documented duration: the modelled `Status` enum carries
+/// the transient `STARTING` and `STOPPING` values either side of the terminal
+/// `RUNNING` and `STOPPED`, and this is how long this emulator reports the transient
+/// one for. Deliberately non-zero, so a caller that reads straight after the start
+/// still observes `STARTING` — which is what makes the feature's own poll loop
+/// observable.
+pub const EVALUATION_TRANSITION_DELAY_MS: i64 = 400;
+
+/// `Status` of a telemetry-config feature no `Start` has ever been called for.
+///
+/// This and the four constants below are values of the modelled `Status` enum, whose
+/// full value list is what `smithy_query(query="shape",shape="Status")` reports:
+/// `NOT_STARTED`, `STARTING`, `FAILED_START`, `RUNNING`, `STOPPING`, `FAILED_STOP`,
+/// `STOPPED`. The two `FAILED_*` values are the ones this emulator never reports:
+/// nothing here can fail to onboard or offboard a region, and `FailureReason`'s own
+/// documentation says that member "will only be populated if `Status` is
+/// `FAILED_START` or `FAILED_STOP`" — so it is never populated either.
+pub const STATUS_NOT_STARTED: &str = "NOT_STARTED";
+
+/// `Status` while the onboarding a `Start` began has not come due.
+pub const STATUS_STARTING: &str = "STARTING";
+
+/// `Status` of a region whose onboarding has come due.
+pub const STATUS_RUNNING: &str = "RUNNING";
+
+/// `Status` while the offboarding a `Stop` began has not come due.
+pub const STATUS_STOPPING: &str = "STOPPING";
+
+/// `Status` of a region whose offboarding has come due.
+pub const STATUS_STOPPED: &str = "STOPPED";
+
+/// `TelemetryEnrichmentStatus` of an enrichment feature that is enabled.
+///
+/// This and [`ENRICHMENT_STATUS_STOPPED`] are values of the modelled
+/// `TelemetryEnrichmentStatus` enum, whose values
+/// `smithy_query(query="shape",shape="TelemetryEnrichmentStatus")` reports as
+/// `Running`, `Stopped` and `Impaired`. `Impaired` is the value this emulator never
+/// reports: it describes a managed view this emulator cannot break, since nothing
+/// here can degrade the Resource Explorer view the feature reads.
+pub const ENRICHMENT_STATUS_RUNNING: &str = "Running";
+
+/// `TelemetryEnrichmentStatus` of an enrichment feature that is disabled.
+pub const ENRICHMENT_STATUS_STOPPED: &str = "Stopped";
+
+/// The ARN service namespace of the Resource Explorer managed view the telemetry
+/// enrichment feature reads, as the modelled `AwsResourceExplorerManagedViewArn`
+/// pattern (`^arn:aws([a-z0-9\-]+)?:resource-explorer-2:...`) fixes it.
+pub const ENRICHMENT_VIEW_ARN_SERVICE: &str = "resource-explorer-2";
+
+/// The resource portion of that managed view's ARN.
+///
+/// One managed view per account and region — the feature is a single per-account
+/// switch, and the ARN's own region and account fields are what tell two of them
+/// apart — so the resource portion is a constant name rather than a minted id. The
+/// NAME is this emulator's own choice: the model fixes the ARN's shape (the
+/// `AwsResourceExplorerManagedViewArn` pattern, which admits any `managed-view/<x>`)
+/// but publishes no name for the view AWS creates, so nothing here is a recorded
+/// value — only the partition, region and account come from the request, through
+/// `engine::emulator_arn`.
+pub const ENRICHMENT_VIEW_RESOURCE: &str = "managed-view/AWSManagedViewForResourceTagsForTelemetry";
+
+/// The most regions ONE telemetry-feature store will hold a record for.
+///
+/// Emulator resource guard, NOT an AWS quota: this service publishes no quota on
+/// enabling a feature. Every region-keyed feature store
+/// ([`ComAmazonawsObservabilityadminObservabilityadminState::telemetry_evaluations`],
+/// its organization twin and
+/// [`ComAmazonawsObservabilityadminObservabilityadminState::telemetry_enrichments`])
+/// is keyed by a region that can only come from [`request_region`], which admits
+/// nothing outside `emulator_telemetry::policy::KNOWN_REGIONS` — so the catalog's own
+/// size IS the bound, and this constant says so rather than repeating a number. It is
+/// the independent clamp as well: a `Start` or `Stop` that would take a store past it
+/// is refused BEFORE a single record is allocated, so the guard holds even if a future
+/// caller writes a key that did not come from `request_region`.
+///
+/// DEFENCE IN DEPTH, and deliberately so: because `request_region` already admits
+/// nothing outside the catalog, no request reaching the current handlers can take a
+/// store past this bound, so the refusal each write path answers with is unreachable
+/// from the wire today. It is the clamp that keeps it unreachable — a later key
+/// source, or a larger catalog, meets a bound rather than an unbounded map.
+pub const MAX_TELEMETRY_FEATURE_REGIONS: usize = ::emulator_telemetry::policy::KNOWN_REGIONS.len();
+
 /// The most organization centralization rules this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota: this service publishes no centralization
@@ -197,6 +282,111 @@ impl StoredTelemetryRule {
             telemetry_type: Some(self.rule.telemetry_type.clone()),
             telemetry_source_types: self.rule.telemetry_source_types.clone(),
         }
+    }
+}
+
+/// Which way the last `Start`/`Stop` moved a telemetry-config feature, and so which
+/// pair of the modelled `Status` values that region reports either side of the
+/// instant that call comes due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationTransition {
+    /// A `Start`: [`STATUS_STARTING`] until due, [`STATUS_RUNNING`] after.
+    Onboarding,
+    /// A `Stop`: [`STATUS_STOPPING`] until due, [`STATUS_STOPPED`] after.
+    Offboarding,
+}
+
+impl EvaluationTransition {
+    /// The `Status` this transition reports at `now_ms`, given the instant it comes
+    /// due. The transient value before, the terminal one from then on — no write is
+    /// needed to get from one to the other, so a status read never mutates.
+    pub fn status_at(self, due_ms: i64, now_ms: i64) -> &'static str {
+        match (self, now_ms < due_ms) {
+            (Self::Onboarding, true) => STATUS_STARTING,
+            (Self::Onboarding, false) => STATUS_RUNNING,
+            (Self::Offboarding, true) => STATUS_STOPPING,
+            (Self::Offboarding, false) => STATUS_STOPPED,
+        }
+    }
+}
+
+/// The telemetry-config (telemetry evaluation) feature of ONE region of the caller's
+/// account, as the last `Start`/`Stop` left it.
+///
+/// A record exists only for a region some call named; a region with no record has
+/// never been onboarded and reports [`STATUS_NOT_STARTED`]. The configuration's
+/// multi-region shape is carried on every record of that configuration, so a read
+/// signed for any of its regions reports the same `HomeRegion` and the same
+/// `RegionStatuses` list and differs only in its own `Status`.
+#[derive(Debug, Clone)]
+pub struct TelemetryEvaluation {
+    /// The transition the last `Start`/`Stop` for this region began.
+    pub transition: EvaluationTransition,
+    /// The epoch-millisecond instant that transition comes due, which is when this
+    /// region starts reporting the terminal status of [`Self::transition`].
+    pub due_ms: i64,
+    /// The region the `Start` that configured this feature was signed for — "the
+    /// single management point for all multi-region operations on this account", in
+    /// `HomeRegion`'s own words.
+    pub home_region: String,
+    /// The spoke regions that `Start`'s multi-region scope named, empty when it
+    /// named none. `HomeRegion` and `RegionStatuses` are each "only present when
+    /// multi-region telemetry evaluation is active", which is exactly this list
+    /// being non-empty.
+    pub spoke_regions: Vec<String>,
+}
+
+impl TelemetryEvaluation {
+    /// The `Status` this region reports at `now_ms`.
+    pub fn status_at(&self, now_ms: i64) -> &'static str {
+        self.transition.status_at(self.due_ms, now_ms)
+    }
+
+    /// Whether this feature was configured with a multi-region scope, which is what
+    /// decides whether `HomeRegion` and `RegionStatuses` are reported at all.
+    pub fn is_multi_region(&self) -> bool {
+        !self.spoke_regions.is_empty()
+    }
+}
+
+/// The resource tags for telemetry (telemetry enrichment) feature of one region of
+/// the caller's account.
+///
+/// A record exists only once a `Start` or a `Stop` has named the region; before
+/// that the feature "has never been started" and the status read answers the
+/// modelled 404. The modelled `TelemetryEnrichmentStatus` carries no transient
+/// value — only `Running`, `Stopped` and `Impaired` — so this feature has no
+/// in-flight state and no due instant: a `Start` leaves it running and a `Stop`
+/// leaves it stopped, both at once.
+#[derive(Debug, Clone)]
+pub struct TelemetryEnrichment {
+    /// Whether the feature is enabled: [`ENRICHMENT_STATUS_RUNNING`] when it is,
+    /// [`ENRICHMENT_STATUS_STOPPED`] when it is not.
+    pub running: bool,
+    /// The Resource Explorer managed view this feature reads, minted by the first
+    /// `Start` in the region and kept across a `Stop`, so a feature stopped and
+    /// started again reads the same view. `None` until a `Start` mints it, which is
+    /// the state a `Stop` of a never-started feature leaves behind.
+    pub managed_view_arn: Option<String>,
+}
+
+impl TelemetryEnrichment {
+    /// The `TelemetryEnrichmentStatus` this feature reports.
+    pub fn status(&self) -> &'static str {
+        if self.running {
+            ENRICHMENT_STATUS_RUNNING
+        } else {
+            ENRICHMENT_STATUS_STOPPED
+        }
+    }
+
+    /// The managed view ARN to report, which
+    /// `GetTelemetryEnrichmentStatusOutput$AwsResourceExplorerManagedViewArn`'s own
+    /// documentation qualifies with "if the feature is enabled" — so a stopped
+    /// feature reports none even though the view it would read again is still
+    /// recorded.
+    pub fn reported_view_arn(&self) -> Option<String> {
+        self.running.then(|| self.managed_view_arn.clone()).flatten()
     }
 }
 
@@ -319,6 +509,17 @@ pub struct ComAmazonawsObservabilityadminObservabilityadminState {
     /// Rule ARN -> store key, so a `RuleIdentifier` resolves as an ARN as well as
     /// as a bare name.
     pub arn_index: BTreeMap<String, RuleKey>,
+    /// The account's telemetry-config feature, keyed by region: the region a
+    /// `StartTelemetryEvaluation` was signed for, plus every spoke region its
+    /// multi-region scope named.
+    pub telemetry_evaluations: BTreeMap<String, TelemetryEvaluation>,
+    /// The organization's telemetry-config feature, keyed by region exactly as
+    /// [`Self::telemetry_evaluations`] is. A separate map because the two features
+    /// are onboarded by separate operations and reported by separate reads: the
+    /// account's own evaluation is not the organization's.
+    pub organization_telemetry_evaluations: BTreeMap<String, TelemetryEvaluation>,
+    /// The account's resource tags for telemetry feature, keyed by region.
+    pub telemetry_enrichments: BTreeMap<String, TelemetryEnrichment>,
     /// Every organization centralization rule, keyed by `(CreatedRegion, RuleName)`.
     /// Ordering by region then name is what gives
     /// `ListCentralizationRulesForOrganization` a stable, name-ordered page sequence
@@ -594,6 +795,242 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
         self.remove(key)
     }
 
+    /// The telemetry-config feature records of `scope`.
+    fn evaluations(&self, scope: EvaluationScope) -> &BTreeMap<String, TelemetryEvaluation> {
+        match scope {
+            EvaluationScope::Account => &self.telemetry_evaluations,
+            EvaluationScope::Organization => &self.organization_telemetry_evaluations,
+        }
+    }
+
+    /// The telemetry-config feature records of `scope`, to write.
+    fn evaluations_mut(
+        &mut self,
+        scope: EvaluationScope,
+    ) -> &mut BTreeMap<String, TelemetryEvaluation> {
+        match scope {
+            EvaluationScope::Account => &mut self.telemetry_evaluations,
+            EvaluationScope::Organization => &mut self.organization_telemetry_evaluations,
+        }
+    }
+
+    /// The `scope` telemetry-config feature of `region`, or `None` when no `Start`
+    /// or `Stop` has ever named that region.
+    pub fn telemetry_evaluation(
+        &self,
+        scope: EvaluationScope,
+        region: &str,
+    ) -> Option<&TelemetryEvaluation> {
+        self.evaluations(scope).get(region)
+    }
+
+    /// Record the onboarding a `Start` signed for `home_region` began: that region
+    /// and every spoke region its multi-region scope named are onboarded together,
+    /// reaching [`STATUS_RUNNING`] [`EVALUATION_TRANSITION_DELAY_MS`] later.
+    ///
+    /// Repeating the same `Start` is the same onboarding: a region already onboarding
+    /// under this very configuration keeps the instant the first call came due, so a
+    /// caller cannot push a running feature back into `STARTING` by asking for what
+    /// it already has.
+    ///
+    /// Answers `false`, having written NOTHING, when the regions this call would add
+    /// would take the store past [`MAX_TELEMETRY_FEATURE_REGIONS`]: the count is
+    /// checked before the first insert, and the spoke list is re-clamped to
+    /// [`MAX_REPLICATION_TARGETS`] here as well as in [`multi_region_targets`], so one
+    /// request can never store more than that many records however it reached this
+    /// method.
+    #[must_use]
+    pub fn start_telemetry_evaluation(
+        &mut self,
+        scope: EvaluationScope,
+        home_region: &str,
+        spoke_regions: Vec<String>,
+        now_ms: i64,
+    ) -> bool {
+        let due = now_ms.saturating_add(EVALUATION_TRANSITION_DELAY_MS);
+        let spoke_regions: Vec<String> = spoke_regions
+            .into_iter()
+            .take(MAX_REPLICATION_TARGETS)
+            .collect();
+        let regions: Vec<String> = ::std::iter::once(home_region.to_string())
+            .chain(spoke_regions.iter().cloned())
+            .collect();
+        let feature = self.evaluations_mut(scope);
+        if would_exceed_feature_store(feature, &regions) {
+            return false;
+        }
+        for region in regions {
+            let due_ms = feature
+                .get(&region)
+                .filter(|current| {
+                    current.transition == EvaluationTransition::Onboarding
+                        && current.home_region == home_region
+                        && current.spoke_regions == spoke_regions
+                })
+                .map_or(due, |current| current.due_ms);
+            feature.insert(
+                region,
+                TelemetryEvaluation {
+                    transition: EvaluationTransition::Onboarding,
+                    due_ms,
+                    home_region: home_region.to_string(),
+                    spoke_regions: spoke_regions.clone(),
+                },
+            );
+        }
+        true
+    }
+
+    /// Record the offboarding a `Stop` signed for `region` began, reaching
+    /// [`STATUS_STOPPED`] [`EVALUATION_TRANSITION_DELAY_MS`] later.
+    ///
+    /// A `Stop` signed for the home region of a multi-region configuration offboards
+    /// its spoke regions with it, since that region is where the whole configuration
+    /// is managed; a `Stop` signed for a spoke region offboards that region alone.
+    /// Repeating the `Stop` is the same offboarding and keeps its due instant, and a
+    /// `Stop` of a region no `Start` ever named still records the offboarding — the
+    /// caller asked for the feature to be off, which is what the status read then
+    /// reports.
+    ///
+    /// Answers `false`, having written NOTHING, when that would take the store past
+    /// [`MAX_TELEMETRY_FEATURE_REGIONS`].
+    #[must_use]
+    pub fn stop_telemetry_evaluation(
+        &mut self,
+        scope: EvaluationScope,
+        region: &str,
+        now_ms: i64,
+    ) -> bool {
+        let due = now_ms.saturating_add(EVALUATION_TRANSITION_DELAY_MS);
+        let feature = self.evaluations_mut(scope);
+        let mut regions = vec![region.to_string()];
+        if let Some(record) = feature.get(region) {
+            if record.home_region == region {
+                regions.extend(record.spoke_regions.iter().take(MAX_REPLICATION_TARGETS).cloned());
+            }
+        }
+        if would_exceed_feature_store(feature, &regions) {
+            return false;
+        }
+        for target in regions {
+            let current = feature.get(&target);
+            let offboarding = TelemetryEvaluation {
+                transition: EvaluationTransition::Offboarding,
+                due_ms: current
+                    .filter(|record| record.transition == EvaluationTransition::Offboarding)
+                    .map_or(due, |record| record.due_ms),
+                home_region: current
+                    .map_or_else(|| target.clone(), |record| record.home_region.clone()),
+                spoke_regions: current
+                    .map_or_else(Vec::new, |record| record.spoke_regions.clone()),
+            };
+            feature.insert(target, offboarding);
+        }
+        true
+    }
+
+    /// The per-spoke-region statuses of the configuration `record` belongs to, or
+    /// `None` when the member does not apply: `RegionStatuses` "is only present when
+    /// multi-region telemetry evaluation is active", and a configuration with no
+    /// spoke region is not.
+    pub fn evaluation_region_statuses(
+        &self,
+        scope: EvaluationScope,
+        record: &TelemetryEvaluation,
+        now_ms: i64,
+    ) -> Option<Vec<RegionStatus>> {
+        if !record.is_multi_region() {
+            return None;
+        }
+        let feature = self.evaluations(scope);
+        Some(
+            record
+                .spoke_regions
+                .iter()
+                .map(|region| RegionStatus {
+                    region: Some(region.clone()),
+                    status: Some(
+                        feature
+                            .get(region)
+                            .map_or(STATUS_NOT_STARTED, |spoke| spoke.status_at(now_ms))
+                            .to_string(),
+                    ),
+                    // Never populated: nothing here can fail to onboard a region, and
+                    // the member is "only populated when `Status` indicates a failure".
+                    failure_reason: None,
+                    // "This field is only present for telemetry rule region statuses".
+                    rule_arn: None,
+                })
+                .collect(),
+        )
+    }
+
+    /// The resource tags for telemetry feature of `region`, or `None` when it has
+    /// never been started or stopped there.
+    pub fn telemetry_enrichment(&self, region: &str) -> Option<&TelemetryEnrichment> {
+        self.telemetry_enrichments.get(region)
+    }
+
+    /// Enable the resource tags for telemetry feature in `region` and answer the
+    /// record that leaves behind.
+    ///
+    /// The managed view is minted by the first `Start` in the region and kept from
+    /// then on, so a feature started, stopped and started again reads the one view
+    /// its first start created.
+    ///
+    /// Answers `None`, having written NOTHING, when a record for a region this store
+    /// does not hold yet would take it past [`MAX_TELEMETRY_FEATURE_REGIONS`].
+    #[must_use]
+    pub fn start_telemetry_enrichment(&mut self, region: &str) -> Option<TelemetryEnrichment> {
+        let view_arn = enrichment_view_arn(region);
+        let record = self.enrichment_entry(region, true)?;
+        record.running = true;
+        record.managed_view_arn.get_or_insert(view_arn);
+        Some(record.clone())
+    }
+
+    /// Disable the resource tags for telemetry feature in `region` and answer the
+    /// record that leaves behind.
+    ///
+    /// Idempotent: the feature has one off state, so stopping an already-stopped
+    /// feature — or one that was never started — leaves it stopped and changes
+    /// nothing else.
+    ///
+    /// Answers `None`, having written NOTHING, when a record for a region this store
+    /// does not hold yet would take it past [`MAX_TELEMETRY_FEATURE_REGIONS`].
+    #[must_use]
+    pub fn stop_telemetry_enrichment(&mut self, region: &str) -> Option<TelemetryEnrichment> {
+        let record = self.enrichment_entry(region, false)?;
+        record.running = false;
+        Some(record.clone())
+    }
+
+    /// The enrichment record of `region`, inserting one in the `running` state given
+    /// when the store holds none yet — unless that insert would take the store past
+    /// [`MAX_TELEMETRY_FEATURE_REGIONS`], which answers `None` and writes nothing.
+    ///
+    /// The one place either enrichment write path can grow the store, so the bound is
+    /// stated once.
+    fn enrichment_entry(
+        &mut self,
+        region: &str,
+        running: bool,
+    ) -> Option<&mut TelemetryEnrichment> {
+        if !self.telemetry_enrichments.contains_key(region)
+            && self.telemetry_enrichments.len() >= MAX_TELEMETRY_FEATURE_REGIONS
+        {
+            return None;
+        }
+        Some(
+            self.telemetry_enrichments
+                .entry(region.to_string())
+                .or_insert_with(|| TelemetryEnrichment {
+                    running,
+                    managed_view_arn: None,
+                }),
+        )
+    }
+
     /// The key of the centralization rule `identifier` names for a caller signed for
     /// `region`, accepting both forms `RuleIdentifier` allows: the bare rule name, or
     /// the full rule ARN.
@@ -676,6 +1113,39 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
     }
 }
 
+/// Whether storing a record for each of `regions` would take `feature` past
+/// [`MAX_TELEMETRY_FEATURE_REGIONS`].
+///
+/// Only a region the store does not hold yet grows it, so re-recording a region
+/// never trips the guard. Asked BEFORE the first insert, so a refusal costs nothing
+/// and never leaves a half-written configuration behind.
+fn would_exceed_feature_store(
+    feature: &BTreeMap<String, TelemetryEvaluation>,
+    regions: &[String],
+) -> bool {
+    let additions = regions
+        .iter()
+        .filter(|region| !feature.contains_key(*region))
+        .count();
+    feature.len().saturating_add(additions) > MAX_TELEMETRY_FEATURE_REGIONS
+}
+
+/// Which telemetry-config feature a `Start`, `Stop` or status read is about: the
+/// caller's own account, or its organization.
+///
+/// The two are onboarded by separate operations (`StartTelemetryEvaluation` versus
+/// `StartTelemetryEvaluationForOrganization`) and reported by separate reads, so they
+/// are separate records; everything else about them — the `Status` values, the
+/// transient span, the multi-region scope — is the same, which is why one set of
+/// methods takes this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationScope {
+    /// The caller's own account (`StartTelemetryEvaluation` and friends).
+    Account,
+    /// The caller's organization (`StartTelemetryEvaluationForOrganization`).
+    Organization,
+}
+
 /// Whether `rule` asks to be replicated beyond its home region.
 ///
 /// `Regions` and `AllRegions` are the two forms of multi-region scope the model
@@ -702,13 +1172,35 @@ pub fn has_multi_region_scope(rule: &TelemetryRule) -> bool {
 /// [`replication_rejection`] refuses such a list outright, and this clamp holds even
 /// if a caller of this function has not run that check.
 pub fn replication_targets(rule: &TelemetryRule, home_region: &str) -> Vec<String> {
+    multi_region_targets(
+        rule.all_regions == Some(true),
+        rule.regions.as_deref().unwrap_or_default(),
+        home_region,
+    )
+}
+
+/// The spoke regions a multi-region scope names, from `home_region`.
+///
+/// The scope is the `AllRegions` / `Regions` pair — the one every multi-region member
+/// of this service carries, on a telemetry rule and on a `Start` of the
+/// telemetry-config feature alike. `Regions` names the spoke regions outright;
+/// `AllRegions` means "all Amazon Web Services Regions where Amazon CloudWatch
+/// Observability Admin is available in the current partition", which this emulator
+/// reads as every region of the home region's partition. The home region is never a
+/// spoke of its own scope, and the result is de-duplicated and ordered so two calls
+/// with the same scope reach the same regions.
+///
+/// The set is CLAMPED to [`MAX_REPLICATION_TARGETS`] and to the regions of the home
+/// region's partition, so the number of regions a request can reach is decided here,
+/// by the server, and not by the length of the list it sent:
+/// [`multi_region_rejection`] refuses such a list outright, and this clamp holds even
+/// if a caller of this function has not run that check.
+pub fn multi_region_targets(all_regions: bool, named: &[String], home_region: &str) -> Vec<String> {
     let partition = partition_regions(home_region);
-    let listed: BTreeSet<String> = if rule.all_regions == Some(true) {
+    let listed: BTreeSet<String> = if all_regions {
         partition
     } else {
-        rule.regions
-            .as_deref()
-            .unwrap_or_default()
+        named
             .iter()
             .filter(|region| partition.contains(*region))
             .cloned()
@@ -925,17 +1417,44 @@ fn destination_rejection(rule: &TelemetryRule) -> Option<String> {
 /// the modelled `ResourceArn` pattern admits only `[a-z0-9-]+` in — and this
 /// emulator mints ARNs in the `aws` partition only.
 fn replication_rejection(rule: &TelemetryRule, home_region: &str) -> Option<String> {
-    let named = rule.regions.as_deref().unwrap_or_default();
-    if rule.all_regions == Some(true) && !named.is_empty() {
-        return Some(
-            "Rule.Regions and Rule.AllRegions are mutually exclusive; supply one of them"
-                .to_string(),
-        );
+    multi_region_rejection(
+        "Rule.",
+        rule.all_regions == Some(true),
+        rule.regions.as_deref().unwrap_or_default(),
+        home_region,
+    )
+}
+
+/// Why a multi-region scope is unacceptable, or `None` when it is fine.
+///
+/// The scope is the `AllRegions` / `Regions` pair, whose members this service names
+/// under different prefixes — `Rule.Regions` on a telemetry rule, plain `Regions` on
+/// a `Start` of the telemetry-config feature — which is what `member_prefix` carries.
+/// The two forms are, in each member's own words, "mutually exclusive"; a named list
+/// may be no longer than [`MAX_REPLICATION_TARGETS`]; and each region it names must
+/// be a region of the home region's own partition. The partition catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may
+/// carry"), split by [`partition_of`]: a region outside it is refused rather than
+/// stored, because the number of regions the list names is the number of records the
+/// request stores, and because a stored region lands in an ARN field the modelled
+/// `ResourceArn` pattern admits only `[a-z0-9-]+` in — and this emulator mints ARNs
+/// in the `aws` partition only.
+pub fn multi_region_rejection(
+    member_prefix: &str,
+    all_regions: bool,
+    named: &[String],
+    home_region: &str,
+) -> Option<String> {
+    if all_regions && !named.is_empty() {
+        return Some(format!(
+            "{member_prefix}Regions and {member_prefix}AllRegions are mutually exclusive; \
+             supply one of them"
+        ));
     }
     if named.len() > MAX_REPLICATION_TARGETS {
         return Some(format!(
-            "Rule.Regions names {} regions, more than the {MAX_REPLICATION_TARGETS} this \
-             service replicates a rule into",
+            "{member_prefix}Regions names {} regions, more than the {MAX_REPLICATION_TARGETS} \
+             this service propagates to",
             named.len()
         ));
     }
@@ -946,11 +1465,17 @@ fn replication_rejection(rule: &TelemetryRule, home_region: &str) -> Option<Stri
         .find(|(_, region)| !partition.contains(*region))
         .map(|(index, region)| {
             format!(
-                "Rule.Regions[{index}] must be an Amazon Web Services Region of the \
+                "{member_prefix}Regions[{index}] must be an Amazon Web Services Region of the \
                  {} partition, got '{region}'",
                 partition_of(home_region)
             )
         })
+}
+
+/// The ARN of the Resource Explorer managed view the resource tags for telemetry
+/// feature of `region` reads.
+pub fn enrichment_view_arn(region: &str) -> String {
+    ::engine::emulator_arn(ENRICHMENT_VIEW_ARN_SERVICE, region, ENRICHMENT_VIEW_RESOURCE)
 }
 
 /// The ARN of the telemetry rule `name` in `region`.
@@ -1129,21 +1654,30 @@ fn destination_metrics_rejection(
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the
-/// emulator's default region when it carries none.
+/// emulator's default region when it carries none the service recognises.
 ///
-/// The scope is caller-controlled text and the value lands inside an ARN whose
-/// modelled pattern allows only `[a-z0-9-]+` in that field, so anything else is
-/// refused here and the default is used instead: a generated ARN can never carry
-/// text the model does not admit.
+/// The scope is caller-controlled text, and it is BOTH a store key and a field of
+/// every ARN this service mints, so only a region of
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may
+/// carry", the same catalog [`partition_regions`] projects) is taken and anything
+/// else falls back to [`DEFAULT_REGION`]. That is what bounds the key space of every
+/// region-keyed store in this module — a caller cannot invent a region to grow one
+/// with — and it also keeps a generated ARN from ever carrying text the modelled
+/// `ResourceArn` pattern does not admit.
+///
+/// Every store this module keys by region shares that fold, the rule stores
+/// included: a request whose scope names a region AWS does not have is served in
+/// [`DEFAULT_REGION`], so its rules and its features live where a request carrying no
+/// scope at all would put them. The fold is the same for reads and writes, so such a
+/// request still sees exactly what it wrote; what it does NOT get is a private
+/// namespace per invented region code.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .filter(|region| {
-            !region.is_empty()
-                && region.len() <= 64
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            ::emulator_telemetry::policy::KNOWN_REGIONS
+                .binary_search(&region.as_str())
+                .is_ok()
         })
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }

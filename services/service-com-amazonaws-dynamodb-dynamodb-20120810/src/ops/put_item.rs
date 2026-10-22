@@ -282,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
@@ -345,13 +345,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let key = {
-            let table = store.active_table(&name, now).map_err(lift)?;
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
             table.key_of_item(&input.item).map_err(lift)?
         };
         // The store enforces its own budgets here: the only growth site this
         // operation has is the item it inserts.
         let replaced = store
-            .put_item(&name, now, key, input.item.clone())
+            .put_item(&region, &name, now, key, input.item.clone())
             .map_err(lift)?;
 
         Ok(PutItemOutput {

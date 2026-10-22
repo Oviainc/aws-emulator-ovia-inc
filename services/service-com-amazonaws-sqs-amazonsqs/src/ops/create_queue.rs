@@ -4,8 +4,8 @@
 //!
 //! Allocates a queue in [`crate::state::ComAmazonawsSqsAmazonsqsState::queues`] and
 //! answers with the url a client addresses it by. Every later reference to that queue
-//! — `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes` — resolves the SAME
-//! record, so what this call writes is what they report.
+//! — `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes`, `SendMessage` — resolves
+//! the SAME record, so what this call writes is what they report.
 //!
 //! Three rules from the operation's own documentation drive the body:
 //!
@@ -130,7 +130,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -311,6 +310,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: state::queue_arn(&region, &input.queue_name),
             attributes,
             tags: tags.into_iter().collect(),
+            messages: ::std::collections::VecDeque::new(),
+            handles: ::std::collections::HashMap::new(),
             created_at: now,
             // Nothing has changed the queue yet, so it was last modified when it was
             // created.
