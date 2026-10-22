@@ -20,5 +20,8 @@ mod state_roundtrip;
 #[path = "all/telemetry_feature_status.rs"]
 mod telemetry_feature_status;
 
+#[path = "all/telemetry_pipelines.rs"]
+mod telemetry_pipelines;
+
 #[path = "all/telemetry_rules.rs"]
 mod telemetry_rules;
