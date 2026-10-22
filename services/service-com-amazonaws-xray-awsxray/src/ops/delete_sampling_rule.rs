@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSamplingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSamplingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSamplingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one STORED sampling rule, selected by `RuleName` or `RuleARN` —
+//! "either name or ARN, but not both" — and answers the record it removed, the
+//! one `CreateSamplingRule` stored. After it, no listing carries that rule and
+//! no selector resolves it, so deleting it again is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +137,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSamplingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSamplingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSamplingRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteSamplingRuleErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray sampling-rule store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // One lock, so the lookup and the removal cannot interleave with
+        // another call for the same rule: of N concurrent deletes exactly one
+        // answers the removed record and the rest see no such rule. An ARN
+        // selects the rule it names under THIS request's region.
+        let rule_name = store
+            .resolve_sampling_rule_name(
+                input.rule_name.as_deref(),
+                input.rule_arn.as_deref(),
+                &region,
+            )
+            .map_err(|error| {
+                invalid(error.message(input.rule_name.as_deref(), input.rule_arn.as_deref()))
+            })?;
+
+        let Some(removed) = store.remove_sampling_rule(&rule_name) else {
+            return Err(invalid(format!(
+                "no sampling rule named `{rule_name}` is stored"
+            )));
+        };
+
+        Ok(DeleteSamplingRuleOutput {
+            sampling_rule_record: Some(removed.to_record()),
+        })
     }
+}
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn invalid(message: impl Into<String>) -> DeleteSamplingRuleError {
+    DeleteSamplingRuleErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

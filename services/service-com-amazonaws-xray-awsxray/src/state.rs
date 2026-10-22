@@ -9,7 +9,10 @@
 //! that stored them. Groups are a keyed map plus an ARN index, so `GetGroup`
 //! resolves a group by either selector; the account-level `Default` group is
 //! DERIVED rather than stored ([`default_group`]), because it exists in every
-//! region without being created and cannot be created or deleted. Indexing
+//! region without being created and cannot be created or deleted. Sampling
+//! rules are a map keyed by `RuleName`, holding what `CreateSamplingRule`
+//! stored; `GetSamplingRules` lists that map and `DeleteSamplingRule` removes
+//! from it, by either selector. Indexing
 //! rules are a fixed, seeded keyed map: the account's `Default` rule exists
 //! before the first call, and `UpdateIndexingRule` rewrites its configuration in
 //! place for `GetIndexingRules` to report.
@@ -895,6 +898,40 @@ pub struct InsightsConfigurationRecord {
     pub insights_enabled: Option<bool>,
     /// Whether insight notifications are enabled for the group.
     pub notifications_enabled: Option<bool>,
+}
+
+/// Why a `(RuleName, RuleARN)` pair names no stored sampling rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingRuleLookupError {
+    /// Neither selector was supplied.
+    NoSelector,
+    /// Both selectors were supplied: `SamplingRule$RuleName` and
+    /// `SamplingRule$RuleARN` are documented as "either name or ARN, but not
+    /// both".
+    BothSelectors,
+    /// A selector was supplied but no rule matches it.
+    NotFound,
+}
+
+impl SamplingRuleLookupError {
+    /// What to tell the caller. Lives here, beside
+    /// [`ComAmazonawsXrayAwsxrayState::resolve_sampling_rule_name`], so every
+    /// operation that selects a rule words one refusal the same way. The text
+    /// names the selector the request carried, and never renders an internal
+    /// Rust type.
+    pub fn message(self, rule_name: Option<&str>, rule_arn: Option<&str>) -> String {
+        match self {
+            Self::NoSelector => "either RuleName or RuleARN must be specified".to_string(),
+            Self::BothSelectors => {
+                "specify a sampling rule by either RuleName or RuleARN, but not both".to_string()
+            }
+            Self::NotFound => match (rule_name, rule_arn) {
+                (Some(name), _) => format!("no sampling rule named `{name}` is stored"),
+                (_, Some(arn)) => format!("no sampling rule has the ARN `{arn}`"),
+                (None, None) => "no sampling rule matches the request".to_string(),
+            },
+        }
+    }
 }
 
 /// What identifies one group in the store: the region it lives in and its
@@ -1854,26 +1891,28 @@ impl ComAmazonawsXrayAwsxrayState {
     /// The tags held by the resource `resource_arn` names, or `None` when it
     /// names no resource this store holds.
     ///
-    /// X-Ray tags attach to a group or a sampling rule; a group's ARN is the
-    /// only one that resolves here, so a sampling rule's tags — which
-    /// `CreateSamplingRule` validates and stores on the rule — are NOT reachable
-    /// through the tagging operations yet, and this lookup is the single place
-    /// their branch goes when they are.
+    /// X-Ray tags attach to a group or a sampling rule, so both branches are
+    /// here: a group resolves through the ARN index (or, for the reserved
+    /// [`DEFAULT_GROUP_NAME`] group, through the ARN it is read with), and a
+    /// sampling rule through the name its ARN embeds
+    /// ([`sampling_rule_name_in_arn`]), so the tags `CreateSamplingRule`
+    /// validated and stored on a rule are the ones its ARN reports.
     ///
     /// No region argument: a group ARN carries the region it was minted in and a
     /// suffix unique to the group, so it names at most one record in the whole
     /// store — the ARN IS the key, and resolving one cannot reach a resource in
     /// another region by accident.
     ///
-    /// The reserved [`DEFAULT_GROUP_NAME`] group resolves here too, by the ARN it
-    /// is read with, so every tagging operation accepts exactly the ARNs the
-    /// group operations do. Until something tags it there is no record to read
-    /// from, and the group carries no tags, so the answer is the empty map.
+    /// Until something tags the reserved group there is no record to read from,
+    /// and the group carries no tags, so the answer is the empty map.
     pub fn tags_for_resource(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
         /// The tags a resource that holds none reports. `static`, so the read
         /// path borrows it rather than materialising a record.
         static NO_TAGS: BTreeMap<String, String> = BTreeMap::new();
 
+        if let Some(rule_name) = sampling_rule_name_in_arn(resource_arn) {
+            return Some(&self.sampling_rules.get(rule_name)?.tags);
+        }
         if let Some(key) = self.group_arn_to_name.get(resource_arn) {
             return Some(&self.groups.get(key)?.tags);
         }
@@ -1889,6 +1928,10 @@ impl ComAmazonawsXrayAwsxrayState {
         &mut self,
         resource_arn: &str,
     ) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(rule_name) = sampling_rule_name_in_arn(resource_arn) {
+            let rule_name = rule_name.to_string();
+            return Some(&mut self.sampling_rules.get_mut(&rule_name)?.tags);
+        }
         if let Some(key) = self.group_arn_to_name.get(resource_arn).cloned() {
             return Some(&mut self.groups.get_mut(&key)?.tags);
         }
@@ -1941,6 +1984,31 @@ impl ComAmazonawsXrayAwsxrayState {
         }
         current.clone()
     }
+}
+
+/// The `RuleName` a sampling rule ARN embeds, when `value` is one this service
+/// could have minted ([`sampling_rule_arn`]).
+///
+/// A tagging operation takes an ARN rather than a name, and the ARN is derived
+/// from the region and the name, so reading the name back out of it is how a
+/// sampling rule is resolved from one. The partition, service, account and
+/// resource prefix all have to match.
+///
+/// The REGION the ARN names is not checked here, and that is deliberate: a
+/// tagging operation has no other selector, so the ARN is the caller's whole
+/// statement of which resource it means, and this one store serves every
+/// regional endpoint. An operation that can also select by name
+/// ([`ComAmazonawsXrayAwsxrayState::resolve_sampling_rule_name`], used by
+/// `DeleteSamplingRule`) holds an ARN selector to the region of the endpoint it
+/// was called on instead, which is the stricter reading of a request that names
+/// a region explicitly.
+pub fn sampling_rule_name_in_arn(value: &str) -> Option<&str> {
+    let [_, partition, service, _region, account, resource] = arn_fields(value)?;
+    if partition != "aws" || service != ARN_NAMESPACE || account != ::emulator_server::emulator_account_id() {
+        return None;
+    }
+    let name = resource.strip_prefix("sampling-rule/")?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
 /// What `CreateGroup` supplies; the ARN is minted by [`ComAmazonawsXrayAwsxrayState::insert_group`].
@@ -2662,8 +2730,10 @@ pub struct StoredSamplingRule {
     pub created_at: f64,
     /// When the rule was last modified, in seconds of epoch time.
     pub modified_at: f64,
-    /// The tags the rule was created with, in submission order.
-    pub tags: Vec<(String, String)>,
+    /// The tags the rule carries, keyed by tag key — what `TagResource` and
+    /// `ListTagsForResource` reach through
+    /// [`tags_for_resource`](ComAmazonawsXrayAwsxrayState::tags_for_resource).
+    pub tags: BTreeMap<String, String>,
 }
 
 impl StoredSamplingRule {
@@ -2756,7 +2826,7 @@ impl ComAmazonawsXrayAwsxrayState {
         &mut self,
         region: &str,
         mut rule: SamplingRule,
-        tags: Vec<(String, String)>,
+        tags: BTreeMap<String, String>,
         now: f64,
     ) -> Result<&StoredSamplingRule, SamplingRuleRejection> {
         let name = sampling_rule_name(&rule)?.to_string();
@@ -2782,6 +2852,52 @@ impl ComAmazonawsXrayAwsxrayState {
             },
         );
         Ok(&self.sampling_rules[&name])
+    }
+
+    /// The stored `RuleName` a `(RuleName, RuleARN)` pair selects, for a request
+    /// addressed to `region`.
+    ///
+    /// `RuleName` and `RuleARN` are documented as "either name or ARN, but not
+    /// both", so supplying neither or both is a refusal rather than a lookup. An
+    /// ARN selects the rule whose ARN under THIS request's region it equals — an
+    /// ARN naming another region names another region's rule — and it is matched
+    /// by walking the stored rules, bounded by [`MAX_SAMPLING_RULES`], rather
+    /// than through a second index, so there is only ever one copy of a rule.
+    pub fn resolve_sampling_rule_name(
+        &self,
+        rule_name: Option<&str>,
+        rule_arn: Option<&str>,
+        region: &str,
+    ) -> Result<String, SamplingRuleLookupError> {
+        match (rule_name, rule_arn) {
+            (None, None) => return Err(SamplingRuleLookupError::NoSelector),
+            (Some(_), Some(_)) => return Err(SamplingRuleLookupError::BothSelectors),
+            _ => {}
+        }
+        if let Some(name) = rule_name {
+            if self.sampling_rules.contains_key(name) {
+                return Ok(name.to_string());
+            }
+        }
+        if let Some(arn) = rule_arn {
+            if let Some(name) = self
+                .sampling_rules
+                .keys()
+                .find(|name| sampling_rule_arn(region, name) == arn)
+            {
+                return Ok(name.clone());
+            }
+        }
+        Err(SamplingRuleLookupError::NotFound)
+    }
+
+    /// Remove one sampling rule, answering the record that was removed.
+    ///
+    /// "Deletes a sampling rule" is the whole of the operation: the rule is gone
+    /// from the store, so no later listing carries it and no later selector
+    /// resolves it.
+    pub fn remove_sampling_rule(&mut self, rule_name: &str) -> Option<StoredSamplingRule> {
+        self.sampling_rules.remove(rule_name)
     }
 }
 

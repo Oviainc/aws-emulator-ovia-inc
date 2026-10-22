@@ -192,19 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Deduplicated by tag key, so a key the request repeats ends at its last
         // value rather than being stored twice — which is also what the cap
-        // counts.
-        let deduplicated: ::std::collections::BTreeMap<String, String> = submitted
+        // counts, and is the shape the rule's tags are stored in, so a later
+        // `TagResource` reads and writes exactly the same set.
+        let tags: ::std::collections::BTreeMap<String, String> = submitted
             .into_iter()
             .map(|tag| (tag.key, tag.value))
             .collect();
-        if deduplicated.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(invalid(format!(
                 "{} tags were supplied, past the maximum of {} per resource",
-                deduplicated.len(),
+                tags.len(),
                 crate::state::MAX_TAGS_PER_RESOURCE
             )));
         }
-        let tags: Vec<(String, String)> = deduplicated.into_iter().collect();
 
         // One lock, so the name check and the insert cannot interleave with
         // another call for the same name.
