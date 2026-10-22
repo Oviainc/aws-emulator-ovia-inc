@@ -7,7 +7,7 @@
 //! (PutObject / GetObject / ListObjectsV2 / DeleteObject / DeleteBucket) computes
 //! every response from the objects stored inside it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use md5::{Digest, Md5};
@@ -355,6 +355,342 @@ pub struct BucketVersioning {
     pub mfa_delete: Option<String>,
 }
 
+/// Every value the `Event` enum publishes: the bucket events a notification configuration
+/// may ask to be notified about, and so the only values one may name.
+///
+/// Re-exported from the model-generated value list for the shape rather than restated, so
+/// there is ONE source of truth and a regenerated model cannot leave this behind.
+pub use crate::ops::types::EVENT_VALUES;
+
+/// Every value the `FilterRuleName` enum publishes: a key-name filter rule filters on the
+/// prefix or on the suffix of an object key and on nothing else. Re-exported from the
+/// model-generated value list, like [`EVENT_VALUES`].
+pub use crate::ops::types::FILTER_RULE_NAME_VALUES;
+
+/// How many destination configurations one bucket's notification configuration may carry.
+///
+/// `PutBucketNotificationConfiguration`'s own documentation points at the published quota
+/// for this ("For more information about the number of event notification configurations
+/// that you can create per bucket, see Amazon S3 service quotas"), which is 100 event
+/// notification configurations per bucket; nothing in the model bounds the three lists
+/// (`TopicConfigurationList` and its siblings carry no `@length`), so this is also what
+/// bounds the records one bucket can park in this process's memory. A put past it is
+/// refused rather than recorded, the way a create past [`MAX_BUCKETS_PER_ACCOUNT`] is.
+pub const MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET: usize = 100;
+
+/// Which destination a notification configuration publishes to, which is what decides the
+/// member its ARN arrives on and the service that ARN has to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDestination {
+    /// An Amazon SNS topic (`TopicConfiguration`).
+    Topic,
+    /// An Amazon SQS queue (`QueueConfiguration`).
+    Queue,
+    /// A Lambda function (`LambdaFunctionConfiguration`).
+    LambdaFunction,
+}
+
+impl NotificationDestination {
+    /// The member the destination ARN arrives on, as the wire spells it — the `xmlName`
+    /// each required ARN member carries (`Topic`, `Queue` and `CloudFunction`
+    /// respectively, from `smithy_query(query="shape",shape="TopicConfiguration")` and its
+    /// siblings). Used to name the offending member in a refusal.
+    pub fn arn_member(self) -> &'static str {
+        match self {
+            Self::Topic => "Topic",
+            Self::Queue => "Queue",
+            Self::LambdaFunction => "CloudFunction",
+        }
+    }
+
+    /// The service field the destination's ARN names: an SNS topic ARN for a
+    /// `TopicConfiguration`, an SQS queue ARN for a `QueueConfiguration` and a Lambda
+    /// function ARN for a `LambdaFunctionConfiguration` — the three destinations
+    /// `PutBucketNotificationConfiguration`'s documentation describes.
+    pub fn arn_service(self) -> &'static str {
+        match self {
+            Self::Topic => "sns",
+            Self::Queue => "sqs",
+            Self::LambdaFunction => "lambda",
+        }
+    }
+}
+
+/// One object key name filtering rule of a configuration's `Filter`.
+///
+/// Both members are optional in the model (`smithy_query(query="shape",shape="FilterRule")`),
+/// so each is kept exactly as the request carried it rather than defaulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationFilterRule {
+    /// A `FilterRuleName` value — one of [`FILTER_RULE_NAME_VALUES`] — or `None` when the
+    /// rule named none.
+    pub name: Option<String>,
+    /// "The value that the filter searches for in object key names" (`FilterRule$Value`),
+    /// or `None` when the rule named none.
+    pub value: Option<String>,
+}
+
+/// One destination configuration a bucket's notification configuration carries: a topic,
+/// a queue or a Lambda function, with the events it is notified about.
+///
+/// The three lists have identical members (an optional `Id`, a required destination ARN, a
+/// required `Events` list and an optional `Filter`), so one record serves all three and
+/// the destination kind travels beside it as a [`NotificationDestination`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NotificationTarget {
+    /// The configuration's id. `None` only before the store has seen it: "An optional
+    /// unique identifier for configurations in a notification configuration. If you don't
+    /// provide one, Amazon S3 will assign an ID" (`NotificationId`), so
+    /// [`ComAmazonawsS3Amazons3State::put_notification_configuration`] mints one for every
+    /// record that arrives without, and every STORED record carries `Some`.
+    pub id: Option<String>,
+    /// The destination's ARN, verbatim.
+    pub arn: String,
+    /// The bucket events this destination is notified about, in the order the request
+    /// carried them. Each is one of [`EVENT_VALUES`].
+    pub events: Vec<String>,
+    /// The key-name filter rules of the configuration's `Filter`, or `None` when it
+    /// carries no `Filter` (and so matches every key).
+    pub filter_rules: Option<Vec<NotificationFilterRule>>,
+}
+
+/// The whole notification configuration a bucket carries.
+///
+/// A bucket is created with the EMPTY value of this: "By default, your bucket has no event
+/// notifications configured. That is, the notification configuration will be an empty
+/// NotificationConfiguration" (`PutBucketNotificationConfiguration`'s documentation),
+/// which is why this is a plain field rather than an `Option` — "no notifications" and "an
+/// empty NotificationConfiguration" are the same state, and a put carrying an empty
+/// container is how notifications are turned back off.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BucketNotificationConfiguration {
+    /// The SNS topic configurations, in the order the request carried them.
+    pub topic_configurations: Vec<NotificationTarget>,
+    /// The SQS queue configurations, in the order the request carried them.
+    pub queue_configurations: Vec<NotificationTarget>,
+    /// The Lambda function configurations, in the order the request carried them.
+    pub lambda_function_configurations: Vec<NotificationTarget>,
+    /// Whether the configuration carries an `EventBridgeConfiguration`, which "enables
+    /// delivery of events to Amazon EventBridge"
+    /// (`NotificationConfiguration$EventBridgeConfiguration`). The shape has no members,
+    /// so its PRESENCE is the whole state and a `bool` records it exactly.
+    pub event_bridge_enabled: bool,
+}
+
+impl BucketNotificationConfiguration {
+    /// Every destination configuration, with its destination kind, in list order:
+    /// topics, then queues, then Lambda functions.
+    pub fn targets(&self) -> impl Iterator<Item = (NotificationDestination, &NotificationTarget)> {
+        self.topic_configurations
+            .iter()
+            .map(|target| (NotificationDestination::Topic, target))
+            .chain(
+                self.queue_configurations
+                    .iter()
+                    .map(|target| (NotificationDestination::Queue, target)),
+            )
+            .chain(
+                self.lambda_function_configurations
+                    .iter()
+                    .map(|target| (NotificationDestination::LambdaFunction, target)),
+            )
+    }
+
+    /// The same records, for writing — what lets the store mint an id into each record
+    /// that arrived without one.
+    fn targets_mut(&mut self) -> impl Iterator<Item = &mut NotificationTarget> {
+        self.topic_configurations
+            .iter_mut()
+            .chain(self.queue_configurations.iter_mut())
+            .chain(self.lambda_function_configurations.iter_mut())
+    }
+
+    /// How many destination configurations the container carries, across all three lists —
+    /// what [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] bounds.
+    pub fn configuration_count(&self) -> usize {
+        self.topic_configurations.len()
+            + self.queue_configurations.len()
+            + self.lambda_function_configurations.len()
+    }
+
+    /// Whether the bucket has no event notifications configured at all — the state a
+    /// bucket is created in, and the one an empty `NotificationConfiguration` puts it back
+    /// into.
+    pub fn is_empty(&self) -> bool {
+        self.configuration_count() == 0 && !self.event_bridge_enabled
+    }
+}
+
+/// Why a `NotificationConfiguration` cannot be applied to a bucket.
+///
+/// Every one of these is a request S3 refuses with `InvalidArgument` (HTTP 400) rather
+/// than recording, so a refused put leaves the bucket's current configuration exactly as
+/// it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationConfigurationRejection {
+    /// An event outside [`EVENT_VALUES`].
+    UnsupportedEvent {
+        /// The member the configuration arrived on, for the message.
+        member: &'static str,
+        /// The value that is not a published event.
+        event: String,
+    },
+    /// A configuration naming no event at all: `Events` is a REQUIRED member of each
+    /// configuration shape, so a configuration with an empty list asks for nothing to be
+    /// published and cannot be applied.
+    NoEvents {
+        /// The member the configuration arrived on.
+        member: &'static str,
+    },
+    /// A filter rule whose `Name` is not one of [`FILTER_RULE_NAME_VALUES`].
+    InvalidFilterRuleName {
+        /// The rule's `Name`, or the empty string when it named none.
+        name: String,
+    },
+    /// Two configurations carrying the same `Id`: "An optional UNIQUE identifier for
+    /// configurations in a notification configuration" (`NotificationId`).
+    DuplicateConfigurationId {
+        /// The id that is used twice.
+        id: String,
+    },
+    /// A destination ARN that is not an ARN of the service that destination lives in.
+    InvalidDestinationArn {
+        /// The member the ARN arrived on (`Topic`, `Queue` or `CloudFunction`).
+        member: &'static str,
+        /// The service field such an ARN has to name.
+        service: &'static str,
+        /// The value that is not such an ARN.
+        arn: String,
+    },
+    /// More configurations than [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`].
+    TooManyConfigurations {
+        /// How many the request carried.
+        count: usize,
+    },
+}
+
+impl std::fmt::Display for NotificationConfigurationRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedEvent { member, event } => write!(
+                f,
+                "The event {event} is not supported for notifications (member {member})"
+            ),
+            Self::NoEvents { member } => write!(
+                f,
+                "A {member} configuration must specify at least one event"
+            ),
+            Self::InvalidFilterRuleName { name } => write!(
+                f,
+                "filter rule name must be either prefix or suffix, got {name}"
+            ),
+            Self::DuplicateConfigurationId { id } => {
+                write!(f, "Configuration ID {id} is not unique")
+            }
+            Self::InvalidDestinationArn {
+                member,
+                service,
+                arn,
+            } => write!(
+                f,
+                "The {member} ARN {arn} is not a valid {service} ARN"
+            ),
+            Self::TooManyConfigurations { count } => write!(
+                f,
+                "A notification configuration may carry at most \
+                 {MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET} configurations, got {count}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotificationConfigurationRejection {}
+
+/// Whether `arn` is an ARN of `service`.
+///
+/// The ARN grammar AWS publishes: `arn:<partition>:<service>:<region>:<account-id>:<resource>`,
+/// so the first field is the literal `arn`, the third IS the service, and the partition,
+/// Region, account and resource fields are non-empty. A Lambda function ARN carries extra
+/// `:`-separated fields in its resource part, which is why only the first six are examined.
+fn is_arn_of_service(arn: &str, service: &str) -> bool {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && fields[2] == service
+        && !fields[3].is_empty()
+        && !fields[4].is_empty()
+        && !fields[5].is_empty()
+}
+
+/// Whether `configuration` is one S3 applies to a bucket, and what is wrong with it when
+/// it is not.
+///
+/// Checked BEFORE anything is written, because "the PUT notification is an atomic
+/// operation … If the message fails, the entire PUT action will fail, and Amazon S3 will
+/// not add the configuration to your bucket" (`PutBucketNotificationConfiguration`'s own
+/// documentation).
+///
+/// Three of the rules here are ALSO modelled constraints, and the boundary validator
+/// refuses those before any handler runs (`Event` and `FilterRuleName` are enums and
+/// `Events` is required, so a request breaking one never reaches the store). They are
+/// still checked here because this function, not the wire, is what guards the STORE: a
+/// configuration no reader could report back is never recorded, whoever writes it.
+pub fn validate_notification_configuration(
+    configuration: &BucketNotificationConfiguration,
+) -> Result<(), NotificationConfigurationRejection> {
+    let count = configuration.configuration_count();
+    if count > MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET {
+        return Err(NotificationConfigurationRejection::TooManyConfigurations { count });
+    }
+
+    let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+    for (destination, target) in configuration.targets() {
+        let member = destination.arn_member();
+
+        if !is_arn_of_service(&target.arn, destination.arn_service()) {
+            return Err(NotificationConfigurationRejection::InvalidDestinationArn {
+                member,
+                service: destination.arn_service(),
+                arn: target.arn.clone(),
+            });
+        }
+
+        if target.events.is_empty() {
+            return Err(NotificationConfigurationRejection::NoEvents { member });
+        }
+        for event in &target.events {
+            if !EVENT_VALUES.contains(&event.as_str()) {
+                return Err(NotificationConfigurationRejection::UnsupportedEvent {
+                    member,
+                    event: event.clone(),
+                });
+            }
+        }
+
+        for rule in target.filter_rules.iter().flatten() {
+            let name = rule.name.as_deref().unwrap_or_default();
+            if !FILTER_RULE_NAME_VALUES.contains(&name) {
+                return Err(NotificationConfigurationRejection::InvalidFilterRuleName {
+                    name: name.to_string(),
+                });
+            }
+        }
+
+        if let Some(id) = target.id.as_deref() {
+            if !seen_ids.insert(id) {
+                return Err(
+                    NotificationConfigurationRejection::DuplicateConfigurationId {
+                        id: id.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// One rule of a bucket's default server-side-encryption configuration: one
 /// `ServerSideEncryptionRule` of the `ServerSideEncryptionConfiguration` a
 /// `PutBucketEncryption` carried.
@@ -452,6 +788,19 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the pair of accessors below is the only way in or out.
     ownership_controls: Option<Vec<String>>,
+    /// The bucket's event notification configuration, as
+    /// `PutBucketNotificationConfiguration` last set it.
+    ///
+    /// NOT an `Option`, unlike `ownership_controls`: a bucket is created with the EMPTY
+    /// configuration ("By default, your bucket has no event notifications configured. That
+    /// is, the notification configuration will be an empty NotificationConfiguration"), and
+    /// a put carrying an empty container is how notifications are turned off again — the
+    /// same state, so there is nothing for a `None` to mean.
+    ///
+    /// Private, like `tags`: the accessor pair below and
+    /// [`ComAmazonawsS3Amazons3State::put_notification_configuration`] (which mints the
+    /// ids) are the only way in or out.
+    notification: BucketNotificationConfiguration,
     /// The bucket's own default server-side-encryption configuration: one entry per
     /// `ServerSideEncryptionRule` the last `PutBucketEncryption` carried, in that order,
     /// or `None` while no configuration of the bucket's own is associated with it.
@@ -530,6 +879,16 @@ impl Bucket {
     /// request names becomes the bucket's controls in full.
     pub fn set_ownership_controls(&mut self, rules: Vec<String>) {
         self.ownership_controls = Some(rules);
+    }
+
+    /// The bucket's event notification configuration — empty when the bucket has no event
+    /// notifications configured, which is the state it is created in.
+    ///
+    /// Every destination configuration it holds carries an `Id`, minted by
+    /// [`ComAmazonawsS3Amazons3State::put_notification_configuration`] when the request
+    /// named none.
+    pub fn notification_configuration(&self) -> &BucketNotificationConfiguration {
+        &self.notification
     }
 
     /// The bucket's own default server-side-encryption rules, in the order they were
@@ -756,6 +1115,11 @@ pub struct ComAmazonawsS3Amazons3State {
     /// Services Regions within a partition" (`CreateBucket`'s documentation). Sorted,
     /// because S3 lists buckets in name order.
     buckets: BTreeMap<String, Bucket>,
+    /// How many notification configuration ids this store has minted.
+    ///
+    /// Only ever increases, so [`Self::mint_notification_configuration_id`] cannot hand
+    /// out the same id twice however many configurations are put.
+    minted_notification_configuration_ids: u64,
 }
 
 impl ComAmazonawsS3Amazons3State {
@@ -834,6 +1198,64 @@ impl ComAmazonawsS3Amazons3State {
         self.buckets
             .get_mut(bucket)
             .map(|held| held.put_object(key, object))
+    }
+
+    /// Record `configuration` as the whole notification configuration of the bucket named
+    /// `bucket`, reporting `None` when this emulator holds no such bucket (so a put
+    /// refuses a name that is not a bucket instead of creating one).
+    ///
+    /// A REPLACEMENT, not a merge: "This action replaces the existing notification
+    /// configuration with the configuration you include in the request body"
+    /// (`PutBucketNotificationConfiguration`'s own documentation), so what the bucket
+    /// carries afterwards is exactly what this request carried — an empty container
+    /// included, which turns notifications off.
+    ///
+    /// Every record that arrives without an `Id` is given one here, because "if you don't
+    /// provide one, Amazon S3 will assign an ID" (`NotificationId`). A minted id is
+    /// recorded with the configuration, so every later read reports the same one, and it
+    /// never collides with an id the request named itself.
+    pub fn put_notification_configuration(
+        &mut self,
+        bucket: &str,
+        mut configuration: BucketNotificationConfiguration,
+    ) -> Option<()> {
+        if !self.buckets.contains_key(bucket) {
+            return None;
+        }
+
+        let mut taken: BTreeSet<String> = configuration
+            .targets()
+            .filter_map(|(_, target)| target.id.clone())
+            .collect();
+        for target in configuration.targets_mut() {
+            if target.id.is_none() {
+                let id = self.mint_notification_configuration_id(&taken);
+                taken.insert(id.clone());
+                target.id = Some(id);
+            }
+        }
+
+        self.buckets.get_mut(bucket)?.notification = configuration;
+        Some(())
+    }
+
+    /// An opaque configuration id no configuration in this store carries.
+    ///
+    /// S3's own assigned ids are opaque strings, so this is the MD5 digest of the counter
+    /// above rendered as hex — the digest helper this module already uses for an object's
+    /// ETag. Uniqueness comes from the counter, not from the digest, and an id a request
+    /// named itself (`taken`) is stepped over rather than reused.
+    fn mint_notification_configuration_id(&mut self, taken: &BTreeSet<String>) -> String {
+        loop {
+            self.minted_notification_configuration_ids += 1;
+            let mut digest = Md5::new();
+            digest.update(b"s3-notification-configuration-id:");
+            digest.update(self.minted_notification_configuration_ids.to_be_bytes());
+            let id = hex::encode(digest.finalize());
+            if !taken.contains(&id) {
+                return id;
+            }
+        }
     }
 
     /// Replace the tag set of the object at `key` in the bucket named `bucket`, reporting
@@ -1021,6 +1443,18 @@ pub const KMS_SSE_ALGORITHMS: [&str; 2] = ["aws:kms", "aws:kms:dsse"];
 /// error codes).
 pub const INVALID_ARGUMENT_CODE: &str = "InvalidArgument";
 
+/// The HTTP status [`INVALID_ARGUMENT_CODE`] is rendered with: 400, from the same list.
+pub const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+/// The code S3 answers a request it could not carry out at all: "InternalError - We
+/// encountered an internal error. Please try again" (same list) — what a handler answers
+/// when the shared store is unreachable, since every other code would be a false statement
+/// about the bucket.
+pub const INTERNAL_ERROR_CODE: &str = "InternalError";
+
+/// The HTTP status [`INTERNAL_ERROR_CODE`] is rendered with: 500, from the same list.
+pub const INTERNAL_ERROR_STATUS: u16 = 500;
+
 /// How many default-encryption rules this emulator records for one bucket.
 ///
 /// NOT a fidelity claim, for the same reason as [`MAX_OWNERSHIP_CONTROLS_RULES`]:
@@ -1138,6 +1572,215 @@ mod tests {
             metadata: BTreeMap::new(),
             tags: Vec::new(),
         }
+    }
+
+    /// A notification configuration carrying exactly `targets` as its queue
+    /// configurations, so a validation row names only what it is about.
+    fn queue_configuration(targets: Vec<NotificationTarget>) -> BucketNotificationConfiguration {
+        BucketNotificationConfiguration {
+            queue_configurations: targets,
+            ..BucketNotificationConfiguration::default()
+        }
+    }
+
+    /// One queue configuration publishing `events` to the emulator's account.
+    fn queue_target(id: Option<&str>, events: &[&str]) -> NotificationTarget {
+        NotificationTarget {
+            id: id.map(str::to_string),
+            arn: "arn:aws:sqs:us-east-1:123456789012:object-events".to_string(),
+            events: events.iter().map(|event| (*event).to_string()).collect(),
+            filter_rules: None,
+        }
+    }
+
+    #[test]
+    fn a_notification_configuration_is_validated_against_the_published_sets() {
+        // (case, the configuration, what must be wrong with it — `None` for one that is
+        // applied as given). The rows cover every rule the store enforces, the three the
+        // boundary validator also refuses included, since this function is what guards the
+        // store whoever writes to it.
+        let rows: Vec<(&str, BucketNotificationConfiguration, Option<&str>)> = vec![
+            (
+                "a published event with no id",
+                queue_configuration(vec![queue_target(None, &["s3:ObjectCreated:*"])]),
+                None,
+            ),
+            (
+                "the last published event of the catalog",
+                queue_configuration(vec![queue_target(
+                    Some("last"),
+                    &[EVENT_VALUES[EVENT_VALUES.len() - 1]],
+                )]),
+                None,
+            ),
+            (
+                "an event outside the published catalog",
+                queue_configuration(vec![queue_target(None, &["s3:ObjectCreated:Rename"])]),
+                Some("not supported"),
+            ),
+            (
+                "a configuration naming no event",
+                queue_configuration(vec![queue_target(None, &[])]),
+                Some("at least one event"),
+            ),
+            (
+                "a filter rule name outside the published set",
+                queue_configuration(vec![NotificationTarget {
+                    filter_rules: Some(vec![NotificationFilterRule {
+                        name: Some("Prefix".to_string()),
+                        value: Some("logs/".to_string()),
+                    }]),
+                    ..queue_target(None, &["s3:ObjectCreated:Put"])
+                }]),
+                Some("prefix or suffix"),
+            ),
+            (
+                "both published filter rule names",
+                queue_configuration(vec![NotificationTarget {
+                    filter_rules: Some(
+                        FILTER_RULE_NAME_VALUES
+                            .iter()
+                            .map(|name| NotificationFilterRule {
+                                name: Some((*name).to_string()),
+                                value: Some("logs/".to_string()),
+                            })
+                            .collect(),
+                    ),
+                    ..queue_target(None, &["s3:ObjectCreated:Put"])
+                }]),
+                None,
+            ),
+            (
+                "the same id twice",
+                queue_configuration(vec![
+                    queue_target(Some("twice"), &["s3:ObjectCreated:Put"]),
+                    queue_target(Some("twice"), &["s3:ObjectCreated:Post"]),
+                ]),
+                Some("not unique"),
+            ),
+            (
+                "an SQS ARN where a topic ARN belongs",
+                BucketNotificationConfiguration {
+                    topic_configurations: vec![queue_target(None, &["s3:ObjectCreated:Put"])],
+                    ..BucketNotificationConfiguration::default()
+                },
+                Some("not a valid sns ARN"),
+            ),
+            (
+                "exactly as many configurations as a bucket may carry",
+                queue_configuration(
+                    (0..MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
+                        .map(|_| queue_target(None, &["s3:ObjectCreated:Put"]))
+                        .collect(),
+                ),
+                None,
+            ),
+            (
+                "one configuration past the bound",
+                queue_configuration(
+                    (0..=MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
+                        .map(|_| queue_target(None, &["s3:ObjectCreated:Put"]))
+                        .collect(),
+                ),
+                Some("at most"),
+            ),
+        ];
+
+        for (case, configuration, rejected_for) in rows {
+            let outcome = validate_notification_configuration(&configuration);
+            match rejected_for {
+                None => assert!(
+                    outcome.is_ok(),
+                    "case {case:?}: expected the configuration to be applied as given, got \
+                     {outcome:?}"
+                ),
+                Some(expected) => {
+                    let rejection = outcome
+                        .expect_err(&format!("case {case:?}: the configuration must be refused"));
+                    assert!(
+                        rejection.to_string().contains(expected),
+                        "case {case:?}: expected a refusal mentioning {expected:?}, got \
+                         {rejection}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_configuration_carries_an_id_the_request_named_or_one_the_store_minted() {
+        let mut store = ComAmazonawsS3Amazons3State::default();
+        assert_eq!(
+            store.create_bucket("notified", DEFAULT_BUCKET_REGION),
+            BucketCreation::Created
+        );
+
+        // A bucket is created with no event notifications configured at all.
+        assert!(
+            store
+                .bucket("notified")
+                .expect("the bucket exists")
+                .notification_configuration()
+                .is_empty(),
+            "a fresh bucket carries the empty notification configuration"
+        );
+
+        assert_eq!(
+            store.put_notification_configuration(
+                "notified",
+                queue_configuration(vec![
+                    queue_target(Some("named"), &["s3:ObjectCreated:Put"]),
+                    queue_target(None, &["s3:ObjectCreated:Post"]),
+                    queue_target(None, &["s3:ObjectCreated:Copy"]),
+                ]),
+            ),
+            Some(()),
+            "a bucket this store holds takes a notification configuration"
+        );
+
+        let ids: Vec<String> = store
+            .bucket("notified")
+            .expect("the bucket exists")
+            .notification_configuration()
+            .targets()
+            .map(|(_, target)| {
+                target
+                    .id
+                    .clone()
+                    .expect("every stored configuration carries an id")
+            })
+            .collect();
+        assert_eq!(
+            ids[0], "named",
+            "an id the request named is kept verbatim, got {:?}",
+            ids[0]
+        );
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "every configuration carries a distinct id, got {ids:?}"
+        );
+        assert!(
+            ids[1..].iter().all(|id| !id.is_empty()),
+            "a minted id is not empty, got {ids:?}"
+        );
+
+        // A put naming no bucket this store holds records nothing.
+        assert_eq!(
+            store.put_notification_configuration(
+                "not-a-bucket",
+                queue_configuration(vec![queue_target(None, &["s3:ObjectCreated:Put"])]),
+            ),
+            None,
+            "a put refuses a name that is not a bucket instead of creating one"
+        );
+        assert!(
+            store.bucket("not-a-bucket").is_none(),
+            "nothing was created by the refused put"
+        );
     }
 
     #[test]

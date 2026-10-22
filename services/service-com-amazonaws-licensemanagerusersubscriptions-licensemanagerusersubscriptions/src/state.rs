@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, ProductUserSummary,
-    Settings,
+    Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, LicenseServerEndpoint,
+    LicenseServerSettings, ProductUserSummary, ServerEndpoint, Settings,
 };
 
 /// The status a registration carries while its VPC endpoints are being provisioned.
@@ -27,6 +27,12 @@ pub const STATUS_DEREGISTERING: &str = "DEREGISTERING";
 pub const STATUS_SUBSCRIBED: &str = "SUBSCRIBED";
 /// The status returned by `StopProductSubscription` for the subscription it ended.
 pub const STATUS_UNSUBSCRIBED: &str = "UNSUBSCRIBED";
+/// The `LicenseServerEndpointProvisioningStatus` an endpoint carries while its network
+/// endpoint is being provisioned.
+pub const PROVISIONING_STATUS_PROVISIONING: &str = "PROVISIONING";
+/// The `LicenseServerEndpointProvisioningStatus` an endpoint carries once provisioning
+/// completed.
+pub const PROVISIONING_STATUS_PROVISIONED: &str = "PROVISIONED";
 
 /// How long after `RegisterIdentityProvider` the registration becomes `REGISTERED`.
 ///
@@ -36,6 +42,15 @@ pub const STATUS_UNSUBSCRIBED: &str = "UNSUBSCRIBED";
 /// observes that transient status, and any later read materialises the transition the
 /// clock already owed.
 const REGISTRATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `CreateLicenseServerEndpoint` the endpoint becomes `PROVISIONED`.
+///
+/// A chosen span (AWS documents no duration for it), kept inside the emulator's
+/// 250-750 ms window for a clock-owed transition: the endpoint is created in the
+/// non-terminal `PROVISIONING` status, so a caller that lists it straight away still
+/// observes that transient status, and a later read materialises the transition the
+/// clock already owed.
+const ENDPOINT_PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 
 /// Why an operation could not be served from state.
 ///
@@ -128,6 +143,33 @@ pub struct ProductUserRecord {
     pub license_expiration_date: Option<String>,
 }
 
+/// A license server endpoint, as `CreateLicenseServerEndpoint` stored it.
+#[derive(Debug, Clone)]
+pub struct LicenseServerEndpointRecord {
+    /// The minted `LicenseServerEndpointArn`; the key of `license_server_endpoints`.
+    pub arn: String,
+    /// The minted `LicenseServerEndpointId`.
+    pub id: String,
+    /// The registration this endpoint was created for.
+    pub identity_provider_arn: String,
+    /// The `ServerType` the endpoint serves (the model's only value is `RDS_SAL`).
+    pub server_type: String,
+    /// The license-server settings exactly as created, so nothing the caller supplied is
+    /// lost between operations.
+    pub settings: LicenseServerSettings,
+    /// The network address of the endpoint, reported only once it is `PROVISIONED`:
+    /// there is no address to reach while it is still being provisioned.
+    pub endpoint: String,
+    /// `PROVISIONING` until [`ENDPOINT_PROVISIONING_SPAN`] has elapsed, then `PROVISIONED`.
+    pub provisioning_status: String,
+    /// Set only when the service has something to report; never fabricated.
+    pub status_message: Option<String>,
+    /// When the endpoint was created.
+    pub created_at: SystemTime,
+    /// When the `PROVISIONING` -> `PROVISIONED` transition falls due.
+    pub provisioned_due_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState {
@@ -144,6 +186,13 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     pub product_user_order: Vec<String>,
     /// `(IdentityProviderArn, product, username) -> ProductUserArn`.
     pub product_user_index: HashMap<(String, String, String), String>,
+    /// License server endpoints by `LicenseServerEndpointArn`.
+    pub license_server_endpoints: HashMap<String, LicenseServerEndpointRecord>,
+    /// Endpoint ARNs in creation order, so a list is stable and pageable.
+    pub license_server_endpoint_order: Vec<String>,
+    /// `(IdentityProviderArn, ServerType) -> LicenseServerEndpointArn`, so a repeat
+    /// create resolves the endpoint already in state instead of minting a second one.
+    pub license_server_endpoint_index: HashMap<(String, String), String>,
     /// Instances providing user-based subscriptions, by EC2 instance id.
     pub instances: HashMap<String, InstanceRecord>,
     /// Instance ids in the order the instances entered the store, so a list is stable
@@ -177,6 +226,13 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                 record.status = STATUS_REGISTERED.to_string();
             }
         }
+        for record in self.license_server_endpoints.values_mut() {
+            if record.provisioning_status == PROVISIONING_STATUS_PROVISIONING
+                && now >= record.provisioned_due_at
+            {
+                record.provisioning_status = PROVISIONING_STATUS_PROVISIONED.to_string();
+            }
+        }
     }
 
     /// The registrations in registration order.
@@ -184,6 +240,14 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         self.identity_provider_order
             .iter()
             .filter_map(|arn| self.identity_providers.get(arn).cloned())
+            .collect()
+    }
+
+    /// The license server endpoints in creation order.
+    pub fn license_server_endpoints_in_order(&self) -> Vec<LicenseServerEndpointRecord> {
+        self.license_server_endpoint_order
+            .iter()
+            .filter_map(|arn| self.license_server_endpoints.get(arn).cloned())
             .collect()
     }
 
@@ -484,6 +548,41 @@ pub fn registration_due_at(created_at: SystemTime) -> SystemTime {
     created_at + REGISTRATION_SPAN
 }
 
+/// The instant a license server endpoint created at `created_at` becomes `PROVISIONED`.
+pub fn endpoint_provisioned_due_at(created_at: SystemTime) -> SystemTime {
+    created_at + ENDPOINT_PROVISIONING_SPAN
+}
+
+/// The network address of the license server endpoint `id`, in the regional form this
+/// emulator mints for a service-owned endpoint: `<id>.<signing name>.<region>.amazonaws.com`.
+pub fn endpoint_address(signing_name: &str, region: &str, id: &str) -> String {
+    format!("{id}.{signing_name}.{region}.amazonaws.com")
+}
+
+/// The `LicenseServerEndpoint` the model describes, built entirely from the stored
+/// record.
+///
+/// `ServerEndpoint` is reported only once the endpoint is `PROVISIONED` — there is no
+/// address to connect to while it is still being provisioned. `LicenseServers` is left
+/// absent rather than invented: this emulator provisions no license-server hosts, so
+/// there are none to report. `StatusMessage` is only what the record carries.
+pub fn license_server_endpoint(record: &LicenseServerEndpointRecord) -> LicenseServerEndpoint {
+    let provisioned = record.provisioning_status == PROVISIONING_STATUS_PROVISIONED;
+    LicenseServerEndpoint {
+        identity_provider_arn: Some(record.identity_provider_arn.clone()),
+        server_type: Some(record.server_type.clone()),
+        server_endpoint: provisioned.then(|| ServerEndpoint {
+            endpoint: Some(record.endpoint.clone()),
+        }),
+        status_message: record.status_message.clone(),
+        license_server_endpoint_id: Some(record.id.clone()),
+        license_server_endpoint_arn: Some(record.arn.clone()),
+        license_server_endpoint_provisioning_status: Some(record.provisioning_status.clone()),
+        license_servers: None,
+        creation_time: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+    }
+}
+
 /// One page of `items`, plus the token that reaches the next one.
 ///
 /// `MaxResults` is the page size; a `NextToken` is this service's opaque cursor, minted
@@ -576,7 +675,8 @@ pub fn filter_signature(filters: &[Filter]) -> String {
 ///
 /// `Filter.Attribute` names one of the attributes the calling operation's model
 /// documents as filterable (`Product`/`DirectoryId` for `ListIdentityProviders`,
-/// `Status`/`Username`/`Domain` for `ListProductSubscriptions`): the caller passes those
+/// `Status`/`Username`/`Domain` for `ListProductSubscriptions`, `IdentityProviderArn`
+/// for `ListLicenseServerEndpoints`): the caller passes those
 /// as `(name, value)` pairs, matched EXACTLY as the documentation spells them, so a typo
 /// is refused rather than silently honoured. `Filter.Operation` is the kind of search —
 /// the model documents it only as "the type of search (For example, eq, geq, leq)", so

@@ -238,11 +238,14 @@ fn schema_cases() -> Vec<SchemaCase> {
             tags: BTreeMap::new(),
         },
         SchemaCase {
-            case: "content-at-the-modelled-lower-length-bound",
-            name: "one-byte-schema".to_string(),
+            case: "content-at-the-smallest-document-there-is",
+            name: "two-byte-schema".to_string(),
             schema_type: "OpenApi3",
-            // The smallest `Content` the model admits: len 1.
-            content: "x".to_string(),
+            // The smallest `Content` that is a schema document: `{}`. The modelled
+            // lower bound is `len 1`, but a one-byte body cannot be a JSON object, so
+            // that bound is exercised by the refusal table in
+            // `malformed_content_and_policy_deletion.rs` instead.
+            content: "{}".to_string(),
             description: None,
             tags: BTreeMap::new(),
         },
@@ -528,7 +531,7 @@ async fn naming_an_absent_resource_is_a_404() {
         .call(
             "POST",
             &schema_uri("present", "present-schema"),
-            Some(json!({"Content": "x", "Type": "OpenApi3"})),
+            Some(json!({"Content": "{}", "Type": "OpenApi3"})),
         )
         .await;
 
@@ -544,7 +547,7 @@ async fn naming_an_absent_resource_is_a_404() {
             "absent registry / CreateSchema",
             "POST",
             schema_uri("ghost", "any"),
-            Some(json!({"Content": "x", "Type": "OpenApi3"})),
+            Some(json!({"Content": "{}", "Type": "OpenApi3"})),
         ),
         ("absent schema / DescribeSchema", "GET", schema_uri("present", "ghost"), None),
         ("absent schema / DeleteSchema", "DELETE", schema_uri("present", "ghost"), None),
@@ -602,7 +605,7 @@ async fn a_delete_removes_the_resource_from_every_read() {
             .call(
                 "POST",
                 &schema_uri(registry, name),
-                Some(json!({"Content": "x", "Type": "OpenApi3"})),
+                Some(json!({"Content": "{}", "Type": "OpenApi3"})),
             )
             .await;
         assert_eq!(created.status, 201, "case {name:?}: {:?}", created.body);
@@ -721,7 +724,7 @@ async fn following_next_token_walks_each_listing_exactly_once() {
                 .call(
                     "POST",
                     &schema_uri("holder", name),
-                    Some(json!({"Content": "x", "Type": "OpenApi3"})),
+                    Some(json!({"Content": "{}", "Type": "OpenApi3"})),
                 )
                 .await;
             assert_eq!(created.status, 201, "case {name:?}: {:?}", created.body);
@@ -824,7 +827,7 @@ async fn a_name_prefix_selects_exactly_the_names_that_start_with_it() {
             .call(
                 "POST",
                 &schema_uri(name, name),
-                Some(json!({"Content": "x", "Type": "OpenApi3"})),
+                Some(json!({"Content": "{}", "Type": "OpenApi3"})),
             )
             .await;
         assert_eq!(created.status, 201, "case {name:?}: {:?}", created.body);
@@ -866,7 +869,7 @@ async fn a_name_prefix_selects_exactly_the_names_that_start_with_it() {
             .call(
                 "POST",
                 &schema_uri("many", name),
-                Some(json!({"Content": "x", "Type": "OpenApi3"})),
+                Some(json!({"Content": "{}", "Type": "OpenApi3"})),
             )
             .await;
     }
@@ -1004,7 +1007,7 @@ async fn a_page_is_capped_server_side_however_large_the_limit() {
             .call(
                 "POST",
                 &schema_uri("holder", name),
-                Some(json!({"Content": "x", "Type": "OpenApi3"})),
+                Some(json!({"Content": "{}", "Type": "OpenApi3"})),
             )
             .await;
         assert_eq!(created.status, 201, "case {name:?}: {:?}", created.body);
@@ -1111,7 +1114,7 @@ async fn a_create_past_the_store_cap_is_refused() {
             .call(
                 "POST",
                 &schema_uri("full", &format!("schema-{i:06}")),
-                Some(json!({"Content": "x", "Type": "OpenApi3"})),
+                Some(json!({"Content": "{}", "Type": "OpenApi3"})),
             )
             .await;
         assert_eq!(
@@ -1124,7 +1127,7 @@ async fn a_create_past_the_store_cap_is_refused() {
         .call(
             "POST",
             &schema_uri("full", "one-too-many"),
-            Some(json!({"Content": "x", "Type": "OpenApi3"})),
+            Some(json!({"Content": "{}", "Type": "OpenApi3"})),
         )
         .await;
     assert_eq!(
@@ -1147,7 +1150,7 @@ async fn a_create_past_the_store_cap_is_refused() {
         .call(
             "POST",
             &schema_uri("roomy", "first"),
-            Some(json!({"Content": "x", "Type": "OpenApi3"})),
+            Some(json!({"Content": "{}", "Type": "OpenApi3"})),
         )
         .await;
     assert_eq!(
@@ -1166,8 +1169,20 @@ async fn a_create_past_the_content_budget_is_refused() {
 
     // `Content` is modelled `len 1..100000`; each row below stores the largest
     // payload the model admits, so the budget is reached in the fewest requests.
+    // Every payload is a JSON object document, which is what a create will store at
+    // all — `{"x":"…"}` frames the padding in 8 bytes.
     const PAYLOAD: usize = 100_000;
-    let content = "x".repeat(PAYLOAD);
+    /// A schema document of exactly `size` bytes (`size` must leave room for the
+    /// 8-byte frame).
+    fn document_of(size: usize) -> String {
+        format!(r#"{{"x":"{}"}}"#, "x".repeat(size - 8))
+    }
+    let content = document_of(PAYLOAD);
+    assert_eq!(
+        content.len(),
+        PAYLOAD,
+        "the payload is exactly the modelled maximum"
+    );
 
     let emulator = Emulator::new();
     let mut stored = 0usize;
@@ -1222,12 +1237,15 @@ async fn a_create_past_the_content_budget_is_refused() {
     // A payload that still fits is accepted after the refusal, so the budget bounds
     // the total rather than latching the store closed.
     let headroom = MAX_STORED_CONTENT_BYTES - refused_at;
-    assert!(headroom >= 1, "there is room for at least one byte");
+    assert!(
+        headroom >= 8,
+        "there is room for at least one document: {headroom} bytes"
+    );
     let answer = emulator
         .call(
             "POST",
             &schema_uri("bulk-000", "fits-in-the-headroom"),
-            Some(json!({"Content": "y".repeat(headroom), "Type": "OpenApi3"})),
+            Some(json!({"Content": document_of(headroom), "Type": "OpenApi3"})),
         )
         .await;
     assert_eq!(
@@ -1249,7 +1267,7 @@ async fn a_next_token_does_not_resume_a_differently_selected_listing() {
             .call(
                 "POST",
                 &schema_uri("aa", name),
-                Some(json!({"Content": "x", "Type": "OpenApi3"})),
+                Some(json!({"Content": "{}", "Type": "OpenApi3"})),
             )
             .await;
         assert_eq!(created.status, 201, "case {name:?}: {:?}", created.body);

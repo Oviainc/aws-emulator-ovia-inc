@@ -1042,20 +1042,25 @@ pub fn json_type_name(value: &::serde_json::Value) -> &'static str {
 /// well-formed. Content is stored verbatim and handed back verbatim by
 /// `DescribeSchema` and `ExportSchema`, and partial documents are legitimate input to
 /// those, so the refusal is scoped to content that is not a schema document at all.
-/// `CreateSchema` does not route through here: changing which inputs a create accepts
-/// is its own change, not this one.
+///
+/// `CreateSchema` and `UpdateSchema` both route through here: the requirement is a
+/// property of the request, so it cannot differ between the two.
 ///
 /// `schema_type` is named in the message only — the requirement is the same for both
 /// of [`crate::ops::types::TYPE_VALUES`], and a third type cannot reach a handler
 /// because the modelled enum is refused at the boundary before one runs.
 ///
-/// The message names the member, the type it was declared as and what the parser
-/// objected to, the way a validation error does; it echoes no content back.
+/// The message names the member and what was wrong with it, the way a validation
+/// error does; it echoes no content back. The refusal carries
+/// [`CODE_MALFORMED_REQUEST`] (see [`bad_request`]): the body is not the document it
+/// was declared to be.
 pub fn validate_content(content: &str, schema_type: &str) -> Result<(), BadRequestException> {
     let document: ::serde_json::Value = ::serde_json::from_str(content).map_err(|error| {
-        bad_request(format!(
-            "Content is not a valid {schema_type} document: it is not JSON ({error})."
-        ))
+        // AWS's own template for a body it cannot read as JSON, built from the
+        // request: the member, then what the parser objected to and where. The words
+        // of the objection are whichever parser read the body — the rule is that the
+        // refusal names the member and the failure, not any one parser's phrasing.
+        bad_request(format!("Content is not valid JSON: {error}"))
     })?;
     if document.is_object() {
         return Ok(());
@@ -1388,9 +1393,8 @@ mod tests {
                     refusal.code
                 );
                 assert!(
-                    refusal.message.contains("Content")
-                        && refusal.message.contains(schema_type),
-                    "case {case:?}: the message must name the member and the declared type, got {:?}",
+                    refusal.message.contains("Content"),
+                    "case {case:?}: the message must name the member it is about, got {:?}",
                     refusal.message
                 );
             }

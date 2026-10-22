@@ -36,21 +36,36 @@ const ACTION_ON_FAILURE: [&str; 4] = [
 
 static NULL: Value = Value::Null;
 
+/// The access key id the harness's requests PRESENT by default, so a suite that reads
+/// this service's audit stream can attribute a call to it. Request authentication is off
+/// in these tests; this is the identity a request carries, not a verified one.
+pub(crate) const PRESENTED_AKID: &str = "AKIDEMRTESTHARNESS";
+
+/// The request target every harness call names, as an audit record reports it.
+pub(crate) const REQUEST_TARGET: &str = "POST /";
+
 /// One emulator: a router carrying only this service, over one shared engine.
 ///
 /// `pub(crate)` so every suite in this test target drives the emulator through the
 /// same wire harness rather than growing its own copy.
 pub(crate) struct Emr {
     router: MultiServiceRouter,
+    akid: &'static str,
 }
 
 impl Emr {
     pub(crate) fn new() -> Self {
+        Self::with_akid(PRESENTED_AKID)
+    }
+
+    /// An emulator whose requests present `akid` as their SigV4 access key id, for a
+    /// suite that has to tell its own calls apart from another's.
+    pub(crate) fn with_akid(akid: &'static str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(engine));
-        Self { router }
+        Self { router, akid }
     }
 
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
@@ -60,6 +75,14 @@ impl Emr {
             .header("host", "elasticmapreduce.us-east-1.amazonaws.com")
             .header("content-type", "application/x-amz-json-1.1")
             .header("x-amz-target", format!("ElasticMapReduce.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={}/20261022/us-east-1/\
+                     elasticmapreduce/aws4_request, SignedHeaders=host, Signature=00",
+                    self.akid
+                ),
+            )
             .body(bytes::Bytes::from(
                 serde_json::to_vec(&body).expect("the request body serializes"),
             ))
@@ -112,7 +135,7 @@ pub(crate) fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     cursor
 }
 
-fn epoch_secs(at: SystemTime) -> f64 {
+pub(crate) fn epoch_secs(at: SystemTime) -> f64 {
     at.duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_secs_f64()

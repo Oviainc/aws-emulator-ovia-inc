@@ -114,7 +114,7 @@ pub(crate) async fn error(
 /// hashed and truncated to the 20 bytes an object name is wide — computed here
 /// independently of the service, so `blobId` is checked against the rule rather
 /// than against itself.
-fn git_blob_id(content: &[u8]) -> String {
+pub(crate) fn git_blob_id(content: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(format!("blob {}\0", content.len()).as_bytes());
     hasher.update(content);
@@ -138,11 +138,11 @@ pub(crate) fn is_uuid(value: &str) -> bool {
             .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn base64(content: &[u8]) -> String {
+pub(crate) fn base64(content: &[u8]) -> String {
     aws_smithy_types::base64::encode(content)
 }
 
-fn from_base64(encoded: &str) -> Vec<u8> {
+pub(crate) fn from_base64(encoded: &str) -> Vec<u8> {
     aws_smithy_types::base64::decode(encoded).expect("the service returns base64 blobs")
 }
 

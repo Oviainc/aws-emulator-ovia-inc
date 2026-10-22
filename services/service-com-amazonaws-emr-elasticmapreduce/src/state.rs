@@ -131,6 +131,26 @@ pub const MAX_STEP_CONCURRENCY_LEVEL: i32 = 256;
 /// Width of the uppercase base-36 body of a minted `j-`/`s-` id.
 const ID_BODY_WIDTH: usize = 13;
 
+/// The largest `CreateSecurityConfiguration$SecurityConfiguration` document this
+/// emulator accepts, in bytes.
+///
+/// CHOSEN, not documented: the model leaves that member an unconstrained `String`, but
+/// an unbounded document would be parsed and then retained for the life of the process.
+/// 256 KiB is two orders of magnitude above the longest bounded string EMR models
+/// (`XmlString`, 10280 bytes) and far above any real security configuration, so a
+/// faithful request is never refused by it. A document past it is refused BEFORE it is
+/// parsed.
+pub const MAX_SECURITY_CONFIGURATION_BYTES: usize = 256 * 1024;
+
+/// How many security configurations this emulator stores for the account.
+///
+/// CHOSEN, not documented: EMR publishes a service quota on security configurations per
+/// account and region but the model carries no value for it, so this stands in for it —
+/// high enough that no faithful client reaches it, and a bound rather than unlimited
+/// growth. Reaching it is refused with the operation's modeled client error, the way a
+/// quota is.
+pub const MAX_SECURITY_CONFIGURATIONS: usize = 1_000;
+
 /// Per-service state for com-amazonaws-emr-elasticmapreduce. A handler reaches it through [`service_state`].
 ///
 /// `clusters` is keyed by cluster id, and a minted id is the zero-padded base-36
@@ -143,6 +163,12 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// One counter for every step of every cluster, so a step id is unique
     /// service-wide rather than only within its own cluster.
     pub next_step_seq: u64,
+    /// Security configurations keyed by NAME: a security configuration "is stored in
+    /// the service and can be specified when a cluster is created"
+    /// (`CreateSecurityConfiguration` doc, Smithy model) by that name alone, so the
+    /// name is its identity. Keying the map by it is what makes the name unique and
+    /// what gives every listing a deterministic, name-ordered sequence.
+    pub security_configurations: BTreeMap<String, SecurityConfigurationRecord>,
 }
 
 impl ComAmazonawsEmrElasticmapreduceState {
@@ -933,6 +959,20 @@ impl ClusterRecord {
     }
 }
 
+/// One persisted security configuration, named by a `CreateSecurityConfiguration`
+/// request.
+///
+/// The document is held VERBATIM: `DescribeSecurityConfiguration` "provides the details
+/// of a security configuration by returning the configuration JSON" (its Smithy doc),
+/// so what a reader gets back is the exact string that was stored, never a
+/// re-serialisation of a parse of it.
+#[derive(Debug, Clone)]
+pub struct SecurityConfigurationRecord {
+    pub name: String,
+    pub security_configuration: String,
+    pub creation_date_time: SystemTime,
+}
+
 /// One persisted step, built from a submitted `StepConfig`.
 #[derive(Debug, Clone)]
 pub struct StepRecord {
@@ -1162,6 +1202,97 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// and empty — EMR omits what was never supplied.
 fn optional_list<T: Clone>(items: &[T]) -> Option<Vec<T>> {
     (!items.is_empty()).then(|| items.to_vec())
+}
+
+/// The tracing target every audit record below is emitted on, so a host can route or
+/// filter the audit stream on its own. Keep it equal to the `target:` literal in
+/// [`audit`] — a `tracing` target must be a literal, so the two cannot share one name.
+pub const AUDIT_TARGET: &str = "emulator::audit";
+
+/// Emit the structured access record one state-changing call owes.
+///
+/// A security configuration is created and deleted by name, and the effect on the store
+/// is otherwise invisible after the fact, so each branch that returns from such a call
+/// records it: the operation, the identity the request PRESENTED (its SigV4 access key
+/// id, an identifier and not a secret), the request target it named, and the outcome.
+/// The subscriber supplies the timestamp.
+///
+/// There is no network peer in the record because a Smithy handler is not given one:
+/// `OperationContext::parts()` carries the request's method, URI, headers and
+/// extensions, and nothing in this framework puts a peer address in them.
+///
+/// Deliberately metadata only: no configuration document is logged, so a caller's own
+/// data never reaches the log. Every interpolated value is request-derived, so
+/// [`audit_field`] bounds it and strips the control characters that would otherwise let
+/// one request forge a second record.
+pub fn audit(
+    operation: &str,
+    resource: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: AuditOutcome,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation,
+        resource = %audit_field(resource),
+        access_key_id = %audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target = %audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        outcome = outcome.as_str(),
+        "elasticmapreduce api call"
+    );
+}
+
+/// Longest request-derived value one audit field carries.
+///
+/// A configuration name, an access key id and a request path are all caller-controlled,
+/// so an unbounded echo would let one request emit an arbitrarily long log line.
+const MAX_AUDIT_FIELD: usize = 128;
+
+/// A request-derived value as it may appear in an audit record: control characters
+/// (above all CR and LF, which would forge a second record) replaced, and the whole
+/// thing bounded by [`MAX_AUDIT_FIELD`] on a character boundary.
+fn audit_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .take(MAX_AUDIT_FIELD)
+        .collect()
+}
+
+/// What a state-changing call answered, as the one closed set [`audit`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// A security configuration was created and stored.
+    SecurityConfigurationCreated,
+    /// A stored security configuration was deleted.
+    SecurityConfigurationDeleted,
+    /// The request was refused as invalid (400).
+    ValidationRefused,
+    /// The name is already taken (400 `InvalidRequestException`).
+    Conflict,
+    /// A quota — the service's or this emulator's own ceiling — was met.
+    QuotaExceeded,
+    /// The named resource does not exist.
+    NotFound,
+    /// The service's own store was unreachable (500).
+    StoreUnavailable,
+}
+
+impl AuditOutcome {
+    /// The stable token this outcome is logged as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SecurityConfigurationCreated => "security-configuration-created",
+            Self::SecurityConfigurationDeleted => "security-configuration-deleted",
+            Self::ValidationRefused => "validation-refused",
+            Self::Conflict => "conflict",
+            Self::QuotaExceeded => "quota-exceeded",
+            Self::NotFound => "not-found",
+            Self::StoreUnavailable => "store-unavailable",
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

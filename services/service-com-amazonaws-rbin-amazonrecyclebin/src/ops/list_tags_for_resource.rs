@@ -2,8 +2,10 @@
 
 //! @op ListTagsForResource
 //!
-//! Lists the tags assigned to a retention rule. Implemented: it reports the rule's own
-//! tags out of the store, and changes nothing.
+//! Lists the tags assigned to a retention rule. IMPLEMENTED: it reports the tags
+//! PERSISTED on the retention rule the `ResourceArn` addresses (HTTP 200), or answers
+//! `ResourceNotFoundException` (HTTP 404) when no stored rule carries that ARN. A pure
+//! read: it changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -139,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
@@ -149,9 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
 
         let store = state.lock();
+        // The ARN addresses the rule; a well-formed ARN naming no stored rule is a
+        // missing resource, not a malformed request (the modelled `RuleArn` pattern is
+        // already enforced before this handler runs).
         let Some(rule) = store.rule_by_arn(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -164,6 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The tag list is reported even when empty: `Tags` is a modelled list, so an
+        // untagged rule answers `[]` rather than omitting the member.
         Ok(ListTagsForResourceOutput {
             tags: Some(rule.tags.clone()),
         })

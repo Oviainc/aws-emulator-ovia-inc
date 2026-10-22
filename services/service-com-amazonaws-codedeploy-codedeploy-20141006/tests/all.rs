@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/codedeploy_lifecycle.rs"]
 mod codedeploy_lifecycle;
+#[path = "all/on_premises_instances.rs"]
+mod on_premises_instances;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]

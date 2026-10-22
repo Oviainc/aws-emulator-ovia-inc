@@ -23,3 +23,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/subscription_providers.rs"]
 mod subscription_providers;
+#[path = "all/tag_removal.rs"]
+mod tag_removal;

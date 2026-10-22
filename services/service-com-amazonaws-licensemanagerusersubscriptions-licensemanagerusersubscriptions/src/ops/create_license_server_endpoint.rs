@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLicenseServerEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLicenseServerEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLicenseServerEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the RDS SAL license server endpoint for a registered identity provider and
+//! persists it, so `ListLicenseServerEndpoints` reports what this call created. It is
+//! the writer the list reads; implemented here because a list with no writer can never
+//! report anything (see the `ListLicenseServerEndpoints` scaffold issue).
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLicenseServerEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLicenseServerEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLicenseServerEndpoint"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLicenseServerEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service state is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let now = std::time::SystemTime::now();
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let signing_name = ctx.identity().signing_name().to_string();
+        let server_type = input.license_server_settings.server_type.clone();
+
+        let mut state = state.lock();
+        state.materialise_due(now);
+
+        // The endpoint is created FOR a registration: an `IdentityProviderArn` that names
+        // none is an invalid parameter rather than a missing resource, so it is refused
+        // with this operation's `ValidationException` before anything is minted.
+        if !state
+            .identity_providers
+            .contains_key(&input.identity_provider_arn)
+        {
+            return Err(validation("Identity provider is not valid"));
+        }
+
+        // `@idempotent`: a repeat create for the same (identity provider, server type)
+        // answers with the endpoint already in state instead of minting a second one.
+        // The endpoint's tags are therefore whatever the create that MINTED the record
+        // supplied; a repeat request's `Tags` map does not re-tag it, because the repeat
+        // creates nothing (use `TagResource` to change an existing endpoint's tags).
+        let key = (input.identity_provider_arn.clone(), server_type.clone());
+        if let Some(existing) = state.license_server_endpoint_index.get(&key) {
+            return Ok(CreateLicenseServerEndpointOutput {
+                identity_provider_arn: Some(input.identity_provider_arn.clone()),
+                license_server_endpoint_arn: Some(existing.clone()),
+            });
+        }
+
+        let id = state.mint_id("lse");
+        let arn =
+            crate::state::resource_arn(&signing_name, &region, "license-server-endpoint", &id);
+        let record = crate::state::LicenseServerEndpointRecord {
+            arn: arn.clone(),
+            endpoint: crate::state::endpoint_address(&signing_name, &region, &id),
+            id,
+            identity_provider_arn: input.identity_provider_arn.clone(),
+            server_type,
+            settings: input.license_server_settings.clone(),
+            provisioning_status: crate::state::PROVISIONING_STATUS_PROVISIONING.to_string(),
+            status_message: None,
+            created_at: now,
+            provisioned_due_at: crate::state::endpoint_provisioned_due_at(now),
+        };
+
+        if let Some(tags) = input.tags.clone() {
+            state.tags.insert(arn.clone(), tags);
+        }
+        state
+            .license_server_endpoints
+            .insert(arn.clone(), record.clone());
+        state.license_server_endpoint_order.push(arn.clone());
+        state
+            .license_server_endpoint_index
+            .insert(key, arn.clone());
+
+        Ok(CreateLicenseServerEndpointOutput {
+            identity_provider_arn: Some(record.identity_provider_arn),
+            license_server_endpoint_arn: Some(arn),
+        })
     }
+}
+
+/// This operation's modelled `ValidationException` (HTTP 400).
+fn validation(message: &str) -> CreateLicenseServerEndpointError {
+    CreateLicenseServerEndpointErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
