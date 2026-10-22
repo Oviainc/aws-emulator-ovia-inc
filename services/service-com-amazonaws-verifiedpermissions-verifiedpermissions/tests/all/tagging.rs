@@ -13,15 +13,15 @@
 //!
 //! Every assertion goes over the wire through the same `MultiServiceRouter` the
 //! emulator binary serves, over ONE shared engine, reusing the harness in
-//! `policy_store_authorization.rs` — so a tag is only visible to a later request
-//! if it really reached state.
+//! `harness.rs` — so a tag is only visible to a later request if it really
+//! reached state.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::policy_store_authorization::{call, error_code, ok, router};
+use crate::harness::{call, error_code, ok, router};
 
 /// `MAX_TAGS_PER_RESOURCE` in `src/state.rs`, which the model states twice: in
 /// `TagResource`'s documentation ("You can associate as many as 50 tags with a

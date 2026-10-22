@@ -13,7 +13,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_verifiedpermissions_verifiedpermissions::state::cedar::MAX_SCHEMA_BYTES;
 
-use crate::policy_store_authorization::{call, error_code, ok, router, store_with_mode};
+use crate::harness::{call, error_code, ok, router, store_with_mode};
 
 /// The namespaces a response reports, sorted, so the comparison does not depend
 /// on the order the parse walked them in. An absent list reads as empty.
@@ -37,7 +37,7 @@ fn namespaces(value: &Value) -> Vec<String> {
 /// in Cedar schema JSON"): an object keyed by namespace, each namespace holding
 /// `entityTypes` and `actions`, and an action's `appliesTo` naming its
 /// `principalTypes`, `resourceTypes` and `context` record type.
-fn photo_app_schema() -> String {
+pub(crate) fn photo_app_schema() -> String {
     serde_json::to_string(&json!({
         "PhotoApp": {
             "entityTypes": {

@@ -14,6 +14,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The wire harness is shared with every other suite in this crate; this suite
+// adds only its own alias-specific helpers below.
+use super::harness::{call, error_code, ok, store_with_validation_off as store};
+
 /// The prefix every alias name carries, from
 /// `CreatePolicyStoreAliasInput$aliasName`'s model documentation: "The alias name
 /// must always be prefixed with `policy-store-alias/`."
@@ -25,73 +29,10 @@ const ALIAS_MAX_LEN: usize = 150;
 /// `MAX_POLICY_STORE_ALIASES` in `src/state.rs`.
 const MAX_POLICY_STORE_ALIASES: usize = 100;
 
-/// A router serving only this service, over a fresh shared engine.
+/// The shared harness router, behind an `Arc` so the concurrency cases below can
+/// hand one router to several tasks.
 fn router() -> Arc<MultiServiceRouter> {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_verifiedpermissions_verifiedpermissions::EmulatedService::new(engine),
-    );
-    Arc::new(router)
-}
-
-/// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("VerifiedPermissions.{operation}"))
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us-east-1/verifiedpermissions/aws4_request, \
-             SignedHeaders=host;x-amz-target, Signature=0",
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("a test request body always serializes"),
-        ))
-        .expect("a valid test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// Call one operation, requiring success, and return the parsed body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
-    let (status, parsed) = call(router, operation, body).await;
-    assert_eq!(status, 200, "{operation} failed: {parsed}");
-    parsed
-}
-
-/// Create a store with validation mode `OFF` and return its `policyStoreId`.
-async fn store(router: &MultiServiceRouter) -> String {
-    let created = ok(
-        router,
-        "CreatePolicyStore",
-        &json!({ "validationSettings": { "mode": "OFF" } }),
-    )
-    .await;
-    created["policyStoreId"]
-        .as_str()
-        .expect("policyStoreId is required on the CreatePolicyStore response")
-        .to_string()
-}
-
-/// The error code an awsJson1_0 fault carries in `__type`, without its namespace.
-fn error_code(body: &Value) -> String {
-    body["__type"]
-        .as_str()
-        .unwrap_or_default()
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    Arc::new(super::harness::router())
 }
 
 /// The ARN an alias of `alias_name` must carry: the canonical emulator account

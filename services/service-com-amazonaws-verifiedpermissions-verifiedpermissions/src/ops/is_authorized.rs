@@ -161,20 +161,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Cedar evaluates a request against a complete triple, so each of the
         // three must be present. Refused as a bad request rather than answered
         // with a deny, which would read as "evaluated and denied".
-        let principal = scope_entity(input.principal.as_ref(), "principal")?;
-        let resource = scope_entity(input.resource.as_ref(), "resource")?;
-        let action = input
-            .action
-            .as_ref()
-            .map(|a| crate::state::ScopeEntity {
-                entity_type: a.action_type.clone(),
-                entity_id: a.action_id.clone(),
-            })
-            .ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation(
-                    "action is required to evaluate an authorization request",
-                )
-            })?;
+        let required = |member: &str| {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "{member} is required to evaluate an authorization request"
+            ))
+        };
+        let principal = crate::state::cedar::request_entity(input.principal.as_ref())
+            .ok_or_else(|| required("principal"))?;
+        let resource = crate::state::cedar::request_entity(input.resource.as_ref())
+            .ok_or_else(|| required("resource"))?;
+        let action = crate::state::cedar::request_action(input.action.as_ref())
+            .ok_or_else(|| required("action"))?;
 
         let context = crate::state::cedar::context_to_cedar_json(input.context.as_ref())
             .map_err(crate::scaffolded::Scaffolded::validation)?;
@@ -222,22 +219,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
         })
     }
-}
-
-/// An `EntityIdentifier` request member as a state scope entity, refusing an
-/// absent one by naming the member.
-fn scope_entity(
-    identifier: Option<&EntityIdentifier>,
-    member: &str,
-) -> Result<crate::state::ScopeEntity, IsAuthorizedError> {
-    identifier
-        .map(|e| crate::state::ScopeEntity {
-            entity_type: e.entity_type.clone(),
-            entity_id: e.entity_id.clone(),
-        })
-        .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(format!(
-                "{member} is required to evaluate an authorization request"
-            ))
-        })
 }

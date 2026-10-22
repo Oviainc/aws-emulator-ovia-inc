@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::policy_store_authorization::{call, error_code, ok, router, store_with_mode};
+use super::harness::{call, error_code, ok, router, store_with_mode};
 
 /// One policy the fixture stores, and what a batch answer about it must say.
 struct Stored {
