@@ -24,7 +24,7 @@ use crate::harness::{
 
 /// Every `Type` the model's `Type` enum accepts, from
 /// `smithy_query(query="operation", operation="CreateAnalyzer")`'s `type` member.
-const ANALYZER_TYPES: &[&str] = &[
+pub(crate) const ANALYZER_TYPES: &[&str] = &[
     "ACCOUNT",
     "ACCOUNT_INTERNAL_ACCESS",
     "ACCOUNT_UNUSED_ACCESS",

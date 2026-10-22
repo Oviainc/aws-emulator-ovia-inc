@@ -15,3 +15,5 @@
 mod free_tier;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire_contract.rs"]
+mod wire_contract;
