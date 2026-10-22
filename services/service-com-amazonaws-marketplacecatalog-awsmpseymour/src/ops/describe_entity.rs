@@ -166,11 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
-            return Err(DescribeEntityErrorModeled::ValidationException(
-                crate::state::wrong_catalog(&input.catalog),
-            )
-            .into());
+        // `Catalog` is judged here, not at the boundary (`skip_validation` on
+        // `DescribeEntityInput`): a value that is not a catalog NAME is refused
+        // for its syntax, and a well-formed name other than the fixed value
+        // every operation's `Catalog` documents names nothing this service has.
+        if let Err(fault) = crate::state::check_catalog(&input.catalog) {
+            return Err(DescribeEntityErrorModeled::ValidationException(fault).into());
         }
 
         // `DescribeEntityRequest$EntityId` targets the wider `ResourceId`

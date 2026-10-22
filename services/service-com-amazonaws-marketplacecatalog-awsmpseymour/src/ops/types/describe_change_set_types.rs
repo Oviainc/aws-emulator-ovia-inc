@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacecatalog-awsmpseymour.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#DescribeChangeSetRequest")]
+// `skip_validation` names `Catalog` for the reason given on `CancelChangeSetInput`: the
+// catalog syntax this service publishes is not the modelled `@pattern`, so the HANDLER
+// judges the member.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#DescribeChangeSetRequest",
+    skip_validation = ["Catalog"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeChangeSetInput {
     pub catalog: String,

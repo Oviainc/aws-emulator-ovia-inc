@@ -172,13 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Every operation's `Catalog` member documents "Fixed value:
-        // AWSMarketplace", so any other catalog names nothing this service has.
-        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
-            return Err(ListAssessmentsErrorModeled::ValidationException(
-                crate::state::wrong_catalog(&input.catalog),
-            )
-            .into());
+        // `Catalog` is judged here, not at the boundary (`skip_validation` on
+        // `ListAssessmentsInput`): a value that is not a catalog NAME is refused
+        // for its syntax, and a well-formed name other than the fixed value
+        // every operation's `Catalog` documents names nothing this service has.
+        if let Err(fault) = crate::state::check_catalog(&input.catalog) {
+            return Err(ListAssessmentsErrorModeled::ValidationException(fault).into());
         }
 
         // "Filters the list of assessments to those performed against a specific
@@ -187,7 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an empty filter structure selects everything rather than being refused.
 
         // The token is the offset the next page resumes at; one this service
-        // never issued names no page.
+        // never issued names no page, and neither does one outside the modelled
+        // `NextToken` syntax (`skip_validation` on `ListAssessmentsInput`), so
+        // both are the one page-token fault.
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
@@ -195,10 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(offset) => offset,
                     None => {
                         return Err(ListAssessmentsErrorModeled::ValidationException(
-                            crate::state::validation(
-                                "NextToken",
-                                format!("{token:?} is not a token returned by ListAssessments"),
-                            ),
+                            crate::state::invalid_page_token(),
                         )
                         .into())
                     }
@@ -207,19 +205,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `MaxResults` is modelled `@range(min: 1, max: 100)` with `@default(20)`,
-        // so the boundary has already applied the default and refused anything
-        // outside the range.
-        debug_assert!(
-            (1..=crate::state::LIST_ASSESSMENTS_PAGE_LIMIT).contains(&input.max_results),
-            "MaxResults {} should have been refused at the boundary",
-            input.max_results
-        );
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .clamp(1, crate::state::LIST_ASSESSMENTS_PAGE_LIMIT),
-        )
-        .expect("a page size clamped into 1..=100 fits in usize");
+        // so the boundary has applied the default. The range is CHECKED here
+        // rather than assumed: a page size outside it is refused with the
+        // modelled `ValidationException`, so no request can reach the paging
+        // arithmetic with a size the model does not allow.
+        if !(1..=crate::state::LIST_ASSESSMENTS_PAGE_LIMIT).contains(&input.max_results) {
+            return Err(ListAssessmentsErrorModeled::ValidationException(
+                crate::state::validation(
+                    "MaxResults",
+                    format!(
+                        "ListAssessments serves between 1 and {} assessments a page, not {}",
+                        crate::state::LIST_ASSESSMENTS_PAGE_LIMIT,
+                        input.max_results
+                    ),
+                ),
+            )
+            .into());
+        }
+        let page_size =
+            usize::try_from(input.max_results).expect("a page size in 1..=100 fits in usize");
 
         let store = state.lock();
         let mut matched: Vec<&crate::state::AssessmentRecord> = store

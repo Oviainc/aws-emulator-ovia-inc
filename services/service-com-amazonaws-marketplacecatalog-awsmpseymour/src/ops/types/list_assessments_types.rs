@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacecatalog-awsmpseymour.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#ListAssessmentsRequest")]
+// `skip_validation` names `Catalog` (see `CancelChangeSetInput`) and `NextToken`: a page
+// token is OPAQUE, so one outside the modelled `@pattern` and one that is well formed but
+// names no page are the SAME fault, which only the handler that issues the tokens can
+// tell — it answers both with `crate::state::invalid_page_token`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#ListAssessmentsRequest",
+    skip_validation = ["Catalog", "NextToken"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListAssessmentsInput {
     pub catalog: String,
