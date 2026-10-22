@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCostCategoryDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCostCategoryDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCostCategoryDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +138,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCostCategoryDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCostCategoryDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCostCategoryDefinition"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there is nothing to read and the operation genuinely
+            // cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // "You have the option to use EffectiveOn to return a cost category that's
+        // active on a specific date. If there's no EffectiveOn specified, you see a Cost
+        // Category that's effective on the current date."
+        let at = crate::state::effective_on_or_now(input.effective_on.as_deref()).map_err(
+            |why| crate::scaffolded::Scaffolded::validation(format!("EffectiveOn {why}")),
+        )?;
+
+        let store = state.lock();
+        let found = store
+            .cost_categories
+            .get(&input.cost_category_arn)
+            .filter(|def| def.effective_on(at))
+            .map(crate::state::CostCategoryDefinition::to_cost_category);
+        drop(store);
+
+        match found {
+            Some(cost_category) => Ok(DescribeCostCategoryDefinitionOutput {
+                cost_category: Some(cost_category),
+            }),
+            // A never-created ARN and one whose definition was not in effect at `at` —
+            // because it had not started yet, or because it has since been deleted — are
+            // the same answer: the request names no cost category the service can show.
+            None => Err(DescribeCostCategoryDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No cost category found for {}",
+                        input.cost_category_arn
+                    )),
+                    resource_name: Some(input.cost_category_arn),
+                },
+            )
+            .into()),
+        }
     }
 }

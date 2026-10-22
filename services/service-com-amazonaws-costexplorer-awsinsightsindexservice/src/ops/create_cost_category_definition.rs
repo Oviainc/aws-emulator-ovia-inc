@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCostCategoryDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCostCategoryDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCostCategoryDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +157,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCostCategoryDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCostCategoryDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCostCategoryDefinition"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so the definition cannot be persisted and the operation
+            // genuinely cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // `EffectiveStart` defaults to the first day of the current month, and when the
+        // caller does supply one it must be a billing start date inside the documented
+        // twelve-month window. The model declares no client-input error for this
+        // operation, so a value its pattern admits but its documentation forbids is
+        // refused through the 400 `ValidationException` channel.
+        let effective_start = match input.effective_start.as_deref() {
+            None => crate::state::current_month_start(),
+            Some(requested) => {
+                crate::state::validate_effective_start(requested)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?;
+                requested.to_string()
+            }
+        };
+
+        let now = crate::state::Timestamp::now();
+        let mut store = state.lock();
+
+        // Admission first, so a refused Create leaves the store exactly as it was.
+        if store.name_taken(&input.name, now) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Name '{}' is already used by a cost category; CostCategoryName must be unique",
+                input.name
+            )));
+        }
+        // The account's cost category quota. A tombstoned definition is not in effect and
+        // so does not occupy a slot — a delete frees one.
+        if store.live_count(now) >= crate::state::MAX_LIVE_COST_CATEGORIES {
+            return Err(
+                CreateCostCategoryDefinitionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} cost categories for this account",
+                            crate::state::MAX_LIVE_COST_CATEGORIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // This operation is one of the two that change the registry, so it is where its
+        // retention runs: ended definitions the policy no longer keeps are released on the
+        // path that adds an entry.
+        store.release_ended_definitions(now);
+
+        let arn = ::engine::emulator_arn(
+            "ce",
+            "",
+            &format!("costcategory/{}", store.next_definition_id()),
+        );
+        store.cost_categories.insert(
+            arn.clone(),
+            crate::state::CostCategoryDefinition {
+                arn: arn.clone(),
+                name: input.name,
+                rule_version: input.rule_version,
+                rules: input.rules,
+                split_charge_rules: input.split_charge_rules,
+                default_value: input.default_value,
+                resource_tags: input.resource_tags.unwrap_or_default(),
+                effective_start: effective_start.clone(),
+                effective_end: None,
+                applied_at: ::std::time::Instant::now() + crate::state::PROCESSING_SPAN,
+            },
+        );
+        drop(store);
+
+        Ok(CreateCostCategoryDefinitionOutput {
+            cost_category_arn: Some(arn),
+            effective_start: Some(effective_start),
+        })
     }
 }
