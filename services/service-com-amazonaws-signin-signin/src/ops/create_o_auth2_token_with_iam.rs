@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOAuth2TokenWithIAM
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOAuth2TokenWithIAM`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOAuth2TokenWithIAM::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOAuth2TokenWithIAM` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOAuth2TokenWithIAMErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOAuth2TokenWithIAM"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateOAuth2TokenWithIAMErrorModeled::InternalServerException(
+                    InternalServerException {
+                        error: crate::state::SERVER_ERROR_CODE.to_string(),
+                        message: "the signin OAuth 2.0 token store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `grantType` is modelled `^client_credentials$` and `resource` is
+        // `@required` with `@length(min: 1, max: 2048)`, so the boundary
+        // validator has already refused every request this operation could
+        // refuse on its input alone: the exchange is the client-credentials
+        // grant, scoped to the resource named.
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // Reclaim what the clock has already made due before testing the
+        // store's bound, so the bound is only ever reached by that many tokens
+        // that are all still live.
+        store.purge_expired_tokens(now);
+        if !store.has_room_for_token() {
+            return Err(CreateOAuth2TokenWithIAMErrorModeled::TooManyRequestsError(
+                crate::state::token_quota_exceeded(),
+            )
+            .into());
+        }
+
+        let minted = store.issue_token(
+            crate::state::NewToken {
+                token_type: crate::state::TOKEN_TYPE_ACCESS,
+                resource: input.resource,
+                // The IAM flow authenticates an IAM principal with SigV4; no
+                // OAuth 2.0 client takes part, so the token carries no client
+                // identifier to report as the `clientId` claim.
+                client_id: None,
+                region,
+                expires_in: crate::state::ACCESS_TOKEN_EXPIRES_IN,
+                // This token heads its own chain: the client-credentials grant
+                // issues no refresh token, so nothing can revoke it as part of
+                // another chain.
+                chain: None,
+                session_arn: None,
+            },
+            now,
+        );
+
+        Ok(CreateOAuth2TokenWithIAMOutput {
+            access_token: minted.token,
+            token_type: crate::state::BEARER_TOKEN_TYPE.to_string(),
+            // Reported off the stored record, so what this call promises is the
+            // lifetime `IntrospectOAuth2TokenWithIAM` computes `exp` from.
+            expires_in: i32::try_from(minted.expires_in).unwrap_or(i32::MAX),
+        })
     }
 }

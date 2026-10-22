@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives the `AIDA`-prefixed AWS unique id of a token's subject principal from
+# that principal's ARN (`state::unique_id`), the same derivation the emulator's
+# STS service mints one with. Already in this workspace's dependency set, so the
+# service adds no new locked crate.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IntrospectOAuth2TokenWithIAM
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IntrospectOAuth2TokenWithIAM`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`IntrospectOAuth2TokenWithIAM::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +181,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IntrospectOAuth2TokenWithIAM` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IntrospectOAuth2TokenWithIAMErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IntrospectOAuth2TokenWithIAM"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                IntrospectOAuth2TokenWithIAMErrorModeled::InternalServerException(
+                    InternalServerException {
+                        error: crate::state::SERVER_ERROR_CODE.to_string(),
+                        message: "the signin OAuth 2.0 token store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The account the caller speaks for; a token of any other account is
+        // inactive to it. This emulator answers for one account, so this is the
+        // account every token it issued belongs to.
+        let caller_account = ::engine::emulator_account_id();
+
+        // `tokenTypeHint` is advisory: the server "uses this hint to optimize
+        // lookup, but still falls back to the other token type on miss", so a
+        // lookup by the presented value — which is keyed by neither kind —
+        // already answers for both, and the hint changes nothing this operation
+        // reports.
+        let _ = input.token_type_hint;
+
+        // A read: the claims are computed from the stored record and nothing is
+        // written, so introspecting a token leaves every later caller's answer
+        // unchanged. An expired record stays resident until the next mint
+        // reclaims it, and reads as inactive either way.
+        let store = state.lock();
+        let claims = store
+            .token(&input.token)
+            .filter(|token| token.is_active(now, caller_account))
+            .map_or_else(crate::state::inactive_token, |token| token.to_claims());
+        Ok(claims)
     }
 }
