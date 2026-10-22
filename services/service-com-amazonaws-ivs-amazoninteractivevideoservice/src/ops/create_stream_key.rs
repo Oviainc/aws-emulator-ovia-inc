@@ -158,41 +158,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateStreamKeyErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(CreateStreamKeyErrorModeled::InternalServerException)
         })?;
 
         let mut store = state.lock();
         if !store.channels.contains_key(&input.channel_arn) {
-            return Err(CreateStreamKeyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    exception_message: Some(format!(
-                        "channel {} does not exist",
-                        input.channel_arn
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::resource_not_found(
+                CreateStreamKeyErrorModeled::ResourceNotFoundException,
+                &input.channel_arn,
+            ));
         }
-        // Keys accumulate on a channel for the life of the process, so their count
-        // per channel is capped; past the cap the service answers the quota error it
-        // models rather than accepting another entry.
+        // A channel is created WITH its one stream key and the quota is one key per
+        // channel, so a second key on the same channel is refused with the quota error
+        // the model declares here — and deleting the existing key frees the slot, which
+        // is what makes delete-then-create the way a client rotates a key.
         if crate::state::stream_key_count(&store, &input.channel_arn)
             >= crate::state::MAX_STREAM_KEYS_PER_CHANNEL
         {
-            return Err(CreateStreamKeyErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    exception_message: Some(format!(
-                        "the number of stream keys for this channel would exceed the limit of {}",
-                        crate::state::MAX_STREAM_KEYS_PER_CHANNEL
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::quota_exceeded(
+                CreateStreamKeyErrorModeled::ServiceQuotaExceededException,
+                crate::state::STREAM_KEY_QUOTA_RESOURCE,
+                crate::state::MAX_STREAM_KEYS_PER_CHANNEL,
+            ));
         }
         // The key belongs to the channel, so it is minted in the channel's region
         // rather than in whatever region this request happened to be signed for.

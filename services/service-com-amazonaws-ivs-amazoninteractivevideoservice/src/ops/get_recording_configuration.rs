@@ -151,11 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before `handle` runs.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetRecordingConfigurationErrorModeled::InternalServerException(
-                InternalServerException {
-                    exception_message: Some("the IVS store is unavailable".to_string()),
-                    ..Default::default()
-                },
+            crate::state::store_unavailable(
+                GetRecordingConfigurationErrorModeled::InternalServerException,
             )
         })?;
 
@@ -166,11 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.arn)
             .map(|record| record.configuration.clone())
             .ok_or_else(|| {
-                GetRecordingConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        exception_message: Some(format!("Resource: {} not found", input.arn)),
-                        ..Default::default()
-                    },
+                crate::state::resource_not_found(
+                    GetRecordingConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
                 )
             })?;
 

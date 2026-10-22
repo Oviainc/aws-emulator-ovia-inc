@@ -175,11 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateRecordingConfigurationErrorModeled::InternalServerException(
-                InternalServerException {
-                    exception_message: Some("the IVS store is unavailable".to_string()),
-                    ..Default::default()
-                },
+            crate::state::store_unavailable(
+                CreateRecordingConfigurationErrorModeled::InternalServerException,
             )
         })?;
         let region = crate::state::request_region(ctx.parts());
@@ -188,11 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // let it through: CUSTOM rendition selection has to name the renditions.
         if let Some(rendition) = input.rendition_configuration.as_ref() {
             crate::state::check_rendition_configuration(rendition).map_err(|message| {
-                CreateRecordingConfigurationErrorModeled::ValidationException(
-                    ValidationException {
-                        exception_message: Some(message),
-                        ..Default::default()
-                    },
+                crate::state::validation(
+                    CreateRecordingConfigurationErrorModeled::ValidationException,
+                    message,
                 )
             })?;
         }
@@ -210,18 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // process, so the growth is capped; past the cap the service answers the
         // quota error it models rather than accepting another entry.
         if store.recording_configurations.len() >= crate::state::MAX_RECORDING_CONFIGURATIONS {
-            return Err(
-                CreateRecordingConfigurationErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        exception_message: Some(format!(
-                            "the number of recording configurations would exceed the limit of {}",
-                            crate::state::MAX_RECORDING_CONFIGURATIONS
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::state::quota_exceeded(
+                CreateRecordingConfigurationErrorModeled::ServiceQuotaExceededException,
+                crate::state::RECORDING_CONFIGURATION_QUOTA_RESOURCE,
+                crate::state::MAX_RECORDING_CONFIGURATIONS,
+            ));
         }
         let id = store.mint_hex("recording-configuration", 6);
         let arn = crate::state::recording_configuration_arn(&region, &id);

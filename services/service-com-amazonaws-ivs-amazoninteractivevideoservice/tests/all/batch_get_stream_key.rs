@@ -44,9 +44,10 @@ enum Slot {
     Missing(usize),
 }
 
-/// The state every row reads: four persisted stream keys spread over two channels
-/// (one of them tagged), plus two well-formed `StreamKeyArn`s that name no
-/// persisted key — one never minted, one whose key existed and was deleted.
+/// The state every row reads: four persisted stream keys, one per channel (a channel's
+/// stream-key quota is one key), one of them tagged and two of them minted by
+/// `CreateStreamKey` into the slot a delete freed, plus two well-formed `StreamKeyArn`s
+/// that name no persisted key — one never minted, one whose key existed and was deleted.
 struct Fixture {
     ivs: Ivs,
     keys: Vec<Value>,
@@ -57,21 +58,35 @@ impl Fixture {
     async fn build() -> Self {
         let ivs = Ivs::new();
 
+        // The key `CreateChannel` mints with its channel.
         let first = ivs.ok("CreateChannel", json!({ "name": "first" })).await;
-        let first_arn = text(&first["channel"], "arn");
         let mut keys = vec![first["streamKey"].clone()];
-        keys.push(
-            ivs.ok("CreateStreamKey", json!({ "channelArn": first_arn })).await["streamKey"]
-                .clone(),
-        );
-        keys.push(
-            ivs.ok(
-                "CreateStreamKey",
-                json!({ "channelArn": first_arn, "tags": { "team": "live" } }),
-            )
-            .await["streamKey"]
-                .clone(),
-        );
+
+        // Two keys `CreateStreamKey` mints, one tagged: a channel is created WITH its
+        // one key, so each of these needs its channel's quota slot freed first — the
+        // delete-then-create a client rotates a key with.
+        for tags in [json!({}), json!({ "team": "live" })] {
+            let owner = ivs.ok("CreateChannel", json!({ "name": "rotated" })).await;
+            let owner_arn = text(&owner["channel"], "arn");
+            let freed = ivs
+                .call(
+                    "DeleteStreamKey",
+                    &json!({ "arn": text(&owner["streamKey"], "arn") }),
+                )
+                .await;
+            assert!(
+                freed.status < 300,
+                "case fixture: DeleteStreamKey must free the channel's quota slot, got {} {}",
+                freed.status,
+                freed.body
+            );
+            let mut request = json!({ "channelArn": owner_arn });
+            if tags.as_object().is_some_and(|tags| !tags.is_empty()) {
+                request["tags"] = tags;
+            }
+            keys.push(ivs.ok("CreateStreamKey", request).await["streamKey"].clone());
+        }
+
         let second = ivs.ok("CreateChannel", json!({ "name": "second" })).await;
         keys.push(second["streamKey"].clone());
 
@@ -282,8 +297,8 @@ async fn batch_get_stream_key_changes_nothing() {
          then {second}"
     );
 
-    // Every key the first channel owns is still exactly the three the creates made:
-    // the one CreateChannel minted plus the two CreateStreamKey added.
+    // Every key the first channel owns is still exactly the one `CreateChannel` minted
+    // with it: a channel's quota is one key, and a read adds none.
     let owner = text(&fixture.keys[0], "channelArn");
     let listed = fixture
         .ivs
@@ -291,7 +306,7 @@ async fn batch_get_stream_key_changes_nothing() {
         .await;
     assert_eq!(
         listed["streamKeys"].as_array().map(Vec::len),
-        Some(3),
+        Some(1),
         "case after reads: a read must not add or remove a stream key, got {listed}"
     );
 }

@@ -190,18 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UpdateChannelErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(UpdateChannelErrorModeled::InternalServerException)
         })?;
 
         let mut store = state.lock();
         let mut channel = store.channels.get(&input.arn).cloned().ok_or_else(|| {
-            UpdateChannelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                exception_message: Some(format!("channel {} does not exist", input.arn)),
-                ..Default::default()
-            })
+            crate::state::resource_not_found(
+                UpdateChannelErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            )
         })?;
 
         // Every optional member: present replaces, absent keeps.
@@ -239,10 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel.multitrack_input_configuration.as_ref(),
         )
         .map_err(|message| {
-            UpdateChannelErrorModeled::ValidationException(ValidationException {
-                exception_message: Some(message),
-                ..Default::default()
-            })
+            crate::state::validation(UpdateChannelErrorModeled::ValidationException, message)
         })?;
 
         store.channels.insert(input.arn, channel.clone());

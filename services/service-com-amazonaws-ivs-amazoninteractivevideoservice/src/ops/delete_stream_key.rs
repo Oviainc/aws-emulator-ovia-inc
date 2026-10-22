@@ -9,6 +9,10 @@
 //! Deleting a key that is not persisted is the modelled 404, so a repeated delete of
 //! one ARN succeeds exactly once.
 //!
+//! It is also what frees the channel's one-key quota
+//! (`crate::state::MAX_STREAM_KEYS_PER_CHANNEL`) for a later `CreateStreamKey` — the
+//! delete-then-create a client rotates a key with.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -103,6 +107,9 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteStreamKeyOutput {
 // here — hence the `DeleteStreamKeyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+// `extra_errors`: `InternalServerException` is a shape this SERVICE models that this
+// operation's model does not list; the handler needs it for the one failure that is the
+// emulator's own rather than the request's — its store being unreachable.
 #[smithy_macros::operation_error(
     "com.amazonaws.ivs#DeleteStreamKey",
     extra_errors = ["InternalServerException"]
@@ -172,10 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refuses with a 400 `ValidationException` before `handle` runs.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteStreamKeyErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(DeleteStreamKeyErrorModeled::InternalServerException)
         })?;
 
         // The removal IS this operation, so a key the store does not hold cannot be
@@ -183,13 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the same ARN takes exactly that path.
         let mut store = state.lock();
         if store.stream_keys.remove(&input.arn).is_none() {
-            return Err(DeleteStreamKeyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    exception_message: Some(format!("stream key {} does not exist", input.arn)),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::resource_not_found(
+                DeleteStreamKeyErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            ));
         }
 
         Ok(DeleteStreamKeyOutput)

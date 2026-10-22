@@ -73,30 +73,24 @@ async fn listed_keys(ivs: &Ivs, channel_arn: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Rule 1, over a table whose rows differ in how many keys the channel holds, which
-/// key of that channel is deleted (the one `CreateChannel` minted, the first added,
-/// the last added), and whether that key carries tags.
+/// Rule 1, over a table whose rows differ in WHICH create minted the key the delete
+/// removes — the one `CreateChannel` minted, or one `CreateStreamKey` minted into the
+/// slot a delete had freed, with and without tags. A channel's stream-key quota is one
+/// key (`crate::state::MAX_STREAM_KEYS_PER_CHANNEL`), so the rows cannot differ in how
+/// many keys one channel holds; what they do vary is the key's provenance and its tags.
 #[tokio::test]
 async fn deleting_a_stream_key_removes_exactly_that_key() {
     let tagged = json!({ "tags": { "env": "prod", "team": "video" } });
-    let cases: Vec<(&str, Vec<Value>, usize)> = vec![
-        ("the only key, the one CreateChannel minted", vec![], 0),
-        ("the minted key, one added key surviving", vec![json!({})], 0),
-        ("the added key, the minted one surviving", vec![json!({})], 1),
+    let cases: Vec<(&str, Option<Value>)> = vec![
+        ("the key CreateChannel minted", None),
         (
-            "the first added of three",
-            vec![json!({}), tagged.clone(), json!({})],
-            1,
+            "a key CreateStreamKey minted into a freed slot",
+            Some(json!({})),
         ),
-        (
-            "the last added of three",
-            vec![json!({}), tagged.clone(), json!({})],
-            3,
-        ),
-        ("a key carrying tags", vec![tagged.clone()], 1),
+        ("a key carrying tags", Some(tagged.clone())),
     ];
 
-    for (case, extras, victim_index) in cases {
+    for (case, replacement) in cases {
         let ivs = Ivs::new();
         let created = ivs.create(json!({ "name": "owner" })).await;
         let owner = text(&created["channel"], "arn");
@@ -106,38 +100,31 @@ async fn deleting_a_stream_key_removes_exactly_that_key() {
         let bystander = text(&bystander_created["channel"], "arn");
         let bystander_key = bystander_created["streamKey"].clone();
 
-        // The channel's keys, in creation order: the one CreateChannel minted first.
-        let mut keys = vec![created["streamKey"].clone()];
-        for extra in &extras {
-            let mut request = extra.clone();
-            request["channelArn"] = json!(owner);
-            keys.push(ivs.ok("CreateStreamKey", request).await["streamKey"].clone());
+        // The key this row deletes: the channel's own, or the one that replaced it.
+        let mut victim = created["streamKey"].clone();
+        if let Some(request) = replacement {
+            delete_key(&ivs, &text(&victim, "arn"), case).await;
+            let mut body = request.clone();
+            body["channelArn"] = json!(owner);
+            victim = ivs.ok("CreateStreamKey", body).await["streamKey"].clone();
         }
-
-        // The key each ARN names before the delete, so what changed afterwards is
-        // attributable to the delete alone.
-        for key in &keys {
-            let arn = text(key, "arn");
-            let fetched = ivs.ok("GetStreamKey", json!({ "arn": arn })).await;
-            assert_eq!(
-                fetched["streamKey"], *key,
-                "case {case:?}: GetStreamKey must answer the persisted key for {arn:?}, \
-                 got {fetched}"
-            );
-            assert_eq!(
-                text(key, "channelArn"),
-                owner,
-                "case {case:?}: every key of this channel must name it, got {key}"
-            );
-        }
-
-        let victim = keys[victim_index].clone();
         let victim_arn = text(&victim, "arn");
-        let survivors: BTreeSet<String> = keys
-            .iter()
-            .map(|key| text(key, "arn"))
-            .filter(|arn| *arn != victim_arn)
-            .collect();
+
+        // What the ARN names before the delete, so what changed afterwards is
+        // attributable to the delete alone.
+        let fetched = ivs
+            .ok("GetStreamKey", json!({ "arn": victim_arn.clone() }))
+            .await;
+        assert_eq!(
+            fetched["streamKey"], victim,
+            "case {case:?}: GetStreamKey must answer the persisted key for \
+             {victim_arn:?}, got {fetched}"
+        );
+        assert_eq!(
+            text(&victim, "channelArn"),
+            owner,
+            "case {case:?}: the key must name the channel it belongs to, got {victim}"
+        );
 
         delete_key(&ivs, &victim_arn, case).await;
 
@@ -148,23 +135,12 @@ async fn deleting_a_stream_key_removes_exactly_that_key() {
         }
         assert_eq!(
             listed_keys(&ivs, &owner).await,
-            survivors,
-            "case {case:?}: ListStreamKeys must answer exactly the keys that survived \
-             the delete of {victim_arn:?}"
+            BTreeSet::new(),
+            "case {case:?}: the channel held exactly the key the delete removed, so it \
+             now holds none"
         );
 
-        // Rule 1: nothing else moved — every surviving key still reads back whole.
-        for key in keys.iter().filter(|key| text(key, "arn") != victim_arn) {
-            let arn = text(key, "arn");
-            let fetched = ivs.ok("GetStreamKey", json!({ "arn": arn })).await;
-            assert_eq!(
-                fetched["streamKey"], *key,
-                "case {case:?}: deleting {victim_arn:?} must leave {arn:?} untouched, \
-                 got {fetched}"
-            );
-        }
-
-        // ... and neither did the other channel's key.
+        // ... and the other channel's key did not move.
         let bystander_arn = text(&bystander_key, "arn");
         let fetched = ivs
             .ok("GetStreamKey", json!({ "arn": bystander_arn }))
