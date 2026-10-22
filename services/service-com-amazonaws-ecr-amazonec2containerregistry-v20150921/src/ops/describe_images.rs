@@ -162,44 +162,6 @@ fn fault_error(fault: crate::state::Fault) -> DescribeImagesErrorModeled {
     }
 }
 
-/// The digest an `imageIds` entry names, or the failure that entry resolves to.
-///
-/// An entry carries a digest, a tag, or both; it names an image only when the store
-/// holds one that answers to every part of it.
-fn resolve(repo: &crate::state::Repo, id: &ImageIdentifier) -> Result<String, crate::state::Fault> {
-    match (id.image_digest.as_deref(), id.image_tag.as_deref()) {
-        (Some(digest), tag) => {
-            let stored = repo.images.get(digest).ok_or_else(|| {
-                crate::state::Fault::ImageNotFound(format!(
-                    "The image with digest '{digest}' does not exist within the repository \
-                     with name '{}'",
-                    repo.name
-                ))
-            })?;
-            if let Some(tag) = tag {
-                if !stored.tags.contains(tag) {
-                    return Err(crate::state::Fault::ImageNotFound(format!(
-                        "The image with digest '{digest}' and tag '{tag}' does not exist \
-                         within the repository with name '{}'",
-                        repo.name
-                    )));
-                }
-            }
-            Ok(stored.digest.clone())
-        }
-        (None, Some(tag)) => repo.digest_of_tag(tag).cloned().ok_or_else(|| {
-            crate::state::Fault::ImageNotFound(format!(
-                "The image with tag '{tag}' does not exist within the repository with \
-                 name '{}'",
-                repo.name
-            ))
-        }),
-        (None, None) => Err(crate::state::Fault::InvalidParameter(
-            "an imageIds entry must carry an imageDigest, an imageTag, or both".to_string(),
-        )),
-    }
-}
-
 /// The `DescribeImages` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -264,11 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(fault_error)?;
 
         // Each requested identifier must name a stored image; the whole call is refused
-        // when one does not.
+        // when one does not. The resolution lives on `Repo`, so every operation that
+        // takes an `imageId` refuses the same identifier the same way.
         let requested = input.image_ids.unwrap_or_default();
         let mut wanted = ::std::collections::BTreeSet::new();
         for id in &requested {
-            wanted.insert(resolve(repo, id).map_err(fault_error)?);
+            wanted.insert(repo.resolve_image(id).map_err(fault_error)?.digest.clone());
         }
 
         let candidates: Vec<(String, ImageDetail)> = if status_matches {

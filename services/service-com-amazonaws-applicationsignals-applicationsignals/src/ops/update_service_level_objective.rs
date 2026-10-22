@@ -164,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // Same documented exclusion as on create: "You can't specify both
         // RequestBasedSliConfig and SliConfig in the same operation."
         if input.sli_config.is_some() && input.request_based_sli_config.is_some() {
@@ -183,11 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let region = crate::state::region_of(ctx.parts());
         let mut store = state.lock();
         let Some(slo) = store.resolve_mut(&input.id) else {
             return Err(
                 UpdateServiceLevelObjectiveErrorModeled::ResourceNotFoundException(
-                    crate::state::slo_not_found(&input.id),
+                    crate::state::slo_not_found(&region, &input.id),
                 )
                 .into(),
             );

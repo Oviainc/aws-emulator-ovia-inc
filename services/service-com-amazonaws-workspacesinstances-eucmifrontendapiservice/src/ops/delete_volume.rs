@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteVolumeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // "Deletes a specified volume": the record goes, so a second delete of the same
+        // id is not-found, and the volume quota — which is derived by counting
+        // `state.volumes` (`has_volume_capacity`), not a separate counter — regains the
+        // capacity this record held. An id that satisfies the modelled `VolumeId` shape
+        // but names no stored volume is `ResourceNotFoundException`, never a success;
+        // it goes through `crate::state::volume_not_found_error` so this path answers
+        // the same (status, code) pair as every other not-found in this service.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVolume"))
+        // The modelled `ConflictException` covers the real service's refusal to delete a
+        // volume that is in use; nothing can put a volume in use while `AssociateVolume`
+        // is still a scaffold (its own stub issue), so no attachment state exists to
+        // check here and the refusal is deliberately not invented.
+        let Some(removed) = state.volumes.remove(&input.volume_id) else {
+            return Err(crate::state::volume_not_found_error(
+                &input.volume_id,
+                DeleteVolumeErrorModeled::ResourceNotFoundException,
+            ));
+        };
+
+        // Retire the creating `ClientToken` with the record: the token identifies that
+        // create call, and replaying it must not hand back an id that no longer exists.
+        if let Some(token) = removed.client_token {
+            state.volume_client_tokens.remove(&token);
+        }
+
+        Ok(DeleteVolumeOutput {})
     }
 }

@@ -208,22 +208,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let endpoint = store
-            .channel_groups
-            .get(&input.channel_group_name)
-            .and_then(|group| group.channels.get(&input.channel_name))
-            .and_then(|channel| channel.origin_endpoints.get(&input.origin_endpoint_name));
-        let Some(endpoint) = endpoint else {
+        // The miss is reported against the resource that is actually absent: a request
+        // naming a channel group or channel that does not exist is a miss on THAT
+        // resource, not on the endpoint underneath it.
+        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
             return Err(GetOriginEndpointErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Origin endpoint {} not found on channel {} in channel group {}",
-                        input.origin_endpoint_name,
-                        input.channel_name,
-                        input.channel_group_name
-                    )),
-                    resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
-                },
+                crate::state::ResourceKind::ChannelGroup.not_found(),
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get(&input.channel_name) else {
+            return Err(GetOriginEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::Channel.not_found(),
+            )
+            .into());
+        };
+        let Some(endpoint) = channel.origin_endpoints.get(&input.origin_endpoint_name) else {
+            return Err(GetOriginEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::OriginEndpoint.not_found(),
             )
             .into());
         };

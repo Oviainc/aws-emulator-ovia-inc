@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BadRequestException, ConflictException, InternalServerErrorException, NotFoundException,
+    PreconditionFailedException,
 };
 
 /// Per-service state for com-amazonaws-schemas-schemas. A handler reaches it through [`service_state`].
@@ -24,6 +25,26 @@ use crate::ops::types::{
 pub struct ComAmazonawsSchemasSchemasState {
     /// Registries by `RegistryName`.
     pub registries: BTreeMap<String, Registry>,
+    /// Source of resource-policy revision ids, so every revision this process mints
+    /// is distinct. See [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`].
+    pub next_policy_revision_seq: u64,
+}
+
+impl ComAmazonawsSchemasSchemasState {
+    /// Mint the next resource-policy revision id.
+    ///
+    /// A revision id identifies ONE revision of a policy: it must differ from the
+    /// revision it replaces (otherwise a stale-revision precondition could not be
+    /// detected) and must stay put until the next write. It is drawn from a
+    /// store-wide counter rather than at random, so a process's ids are
+    /// deterministic and no two policies can ever share one, and rendered in the
+    /// 8-4-4-4-12 shape AWS opaque ids use (version nibble 4, variant nibble 8, as
+    /// RFC 4122 lays them out) so a client sees the form it expects.
+    pub fn mint_policy_revision_id(&mut self) -> String {
+        self.next_policy_revision_seq = self.next_policy_revision_seq.saturating_add(1);
+        let seq = self.next_policy_revision_seq;
+        format!("{:08x}-0000-4000-8000-{seq:012x}", seq & 0xffff_ffff)
+    }
 }
 
 /// A schema registry, as `CreateRegistry` persisted it.
@@ -36,6 +57,21 @@ pub struct Registry {
     pub tags: BTreeMap<String, String>,
     /// Schemas by `SchemaName`.
     pub schemas: BTreeMap<String, Schema>,
+    /// The resource-based policy attached to this registry, as `PutResourcePolicy`
+    /// last wrote it; `None` for a registry no policy is attached to. It lives on
+    /// the registry because the policy is a property OF the registry: deleting the
+    /// registry takes its policy with it.
+    pub policy: Option<ResourcePolicy>,
+}
+
+/// A registry's resource-based policy and the revision it is at.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicy {
+    /// The policy document, stored exactly as the caller sent it.
+    pub document: String,
+    /// The revision this policy is at, minted by
+    /// [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`] on every write.
+    pub revision_id: String,
 }
 
 /// A schema and all of its versions.
@@ -412,6 +448,16 @@ pub const MAX_SCHEMAS_PER_REGISTRY: usize = 500;
 /// beside this budget.
 pub const MAX_STORED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// The largest `Policy` document `PutResourcePolicy` will store for one registry.
+///
+/// `Policy` is modelled as a plain `__string`, so the model bounds it nowhere, and a
+/// policy is retained for the life of the process like every other resource here —
+/// the same reason [`MAX_REGISTRIES`] exists. One policy per registry, each at most
+/// this many bytes, bounds what policies can make this store retain. The number is
+/// the emulator's own bound rather than a published AWS quota, and is far larger than
+/// any real policy document.
+pub const MAX_POLICY_BYTES: usize = 64 * 1024;
+
 /// See [`MAX_REGISTRIES`]. The ceiling on how many code bindings one schema holds.
 ///
 /// A binding is keyed by schema version and language. The language is one of the
@@ -506,6 +552,14 @@ pub fn bad_request(message: impl Into<String>) -> BadRequestException {
 }
 
 /// See [`not_found`] for the `Code` member.
+pub fn precondition_failed(message: impl Into<String>) -> PreconditionFailedException {
+    PreconditionFailedException {
+        code: "PreconditionFailedException".to_string(),
+        message: message.into(),
+    }
+}
+
+/// See [`not_found`] for the `Code` member.
 ///
 /// Raised only where a handler cannot reach its own store, which is a server fault.
 pub fn internal_error() -> InternalServerErrorException {
@@ -518,6 +572,54 @@ pub fn internal_error() -> InternalServerErrorException {
 /// Message for a registry no caller has created.
 pub fn registry_not_found(registry: &str) -> NotFoundException {
     not_found(format!("Registry {registry} does not exist."))
+}
+
+/// Message for a registry that holds no resource-based policy.
+pub fn policy_not_found(registry: &str) -> NotFoundException {
+    not_found(format!(
+        "Registry {registry} does not have a resource-based policy."
+    ))
+}
+
+/// Refuse a request that carries no `RegistryName`.
+///
+/// A resource policy is a property of ONE registry, so a request that does not name
+/// a registry names no resource to read or write. Names the member, as a validation
+/// error does.
+pub fn registry_name_required() -> BadRequestException {
+    bad_request(
+        "RegistryName is required: a resource-based policy belongs to one registry, \
+         so the request must name the registry it applies to.",
+    )
+}
+
+/// Refuse a write whose `RevisionId` precondition is not the revision the stored
+/// policy is at. Echoes the revision the CALLER sent, never the stored one: the
+/// caller already holds what it sent, and a refusal is not a read of the resource.
+pub fn stale_policy_revision(requested: &str) -> PreconditionFailedException {
+    precondition_failed(format!(
+        "RevisionId {requested} is not the current revision of this resource-based \
+         policy; read the policy again and retry with the revision it reports."
+    ))
+}
+
+/// Refuse a `Policy` larger than the store will retain for one registry. Names the
+/// cap, so the caller knows a retry cannot help.
+pub fn policy_too_large(sent: usize) -> BadRequestException {
+    bad_request(format!(
+        "Policy must be at most {MAX_POLICY_BYTES} bytes; the document sent is {sent} bytes."
+    ))
+}
+
+/// Refuse a `Policy` that is not a JSON object.
+///
+/// `Policy` is modelled `@mediaType("application/json")` and a resource-based policy
+/// document is a JSON object, so a value that is not one cannot be stored as a
+/// policy. Names the member and what it must carry.
+pub fn policy_not_json(detail: &str) -> BadRequestException {
+    bad_request(format!(
+        "Policy must be a JSON object holding a resource-based policy document: {detail}."
+    ))
 }
 
 /// Message for a schema the named registry does not hold.
@@ -788,6 +890,7 @@ mod tests {
                 description: None,
                 tags: BTreeMap::new(),
                 schemas: BTreeMap::new(),
+                policy: None,
             };
             for (index, content) in contents.iter().enumerate() {
                 let name = format!("s{index}");

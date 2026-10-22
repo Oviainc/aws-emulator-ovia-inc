@@ -132,7 +132,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteServiceLevelObjectiveErrorModeled::ThrottlingException(
                 ThrottlingException {
@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.remove(&input.id).is_none() {
             return Err(
                 DeleteServiceLevelObjectiveErrorModeled::ResourceNotFoundException(
-                    crate::state::slo_not_found(&input.id),
+                    crate::state::slo_not_found(&region, &input.id),
                 )
                 .into(),
             );

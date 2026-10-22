@@ -237,11 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx.parts());
         let mut store = state.lock();
 
-        if store.slos.contains_key(input.name.as_str()) {
+        // The conflicting resource is identified by ITS OWN ARN, read off the stored record
+        // rather than minted from this request: the record's ARN is what a client resolves
+        // or adopts the existing SLO by.
+        if let Some(existing) = store.slos.get(input.name.as_str()) {
             return Err(CreateServiceLevelObjectiveErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!("Service level objective {} already exists", input.name),
-                },
+                crate::state::slo_already_exists(&existing.arn),
             )
             .into());
         }

@@ -85,30 +85,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The sentence MediaPackage answers with when a channel group cannot be resolved —
-/// fixed per resource type, echoing none of the caller's identifiers.
-const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
-    we can't find your channel group. Verify your channel group name or add a channel \
-    group and then try again";
+/// Why a policy document was refused — the requirement the rejected member failed,
+/// which `crate::state::validation_failed` states in the service's own envelope.
+const INVALID_POLICY_REQUIREMENT: &str = "The policy you provided isn't a valid policy \
+    document. Provide a JSON policy document with a Statement and then try again";
 
-/// The same fixed sentence at channel scope.
-const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-    can't find your channel. Verify your channel name or add a channel and then try \
+/// Why a policy was refused on a multiview channel — the requirement the rejected member
+/// failed. A multiview channel composites the channels it lists as sources and is reached
+/// through their access, so it takes no resource policy of its own: the case the model's
+/// `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type names.
+const MULTIVIEW_POLICY_NOT_ALLOWED_REQUIREMENT: &str = "You can't attach a policy to a \
+    multiview channel. Attach the policy to the source channels instead and then try \
     again";
-
-/// Why a policy document was refused. Request-derived (it names the rejected member
-/// path and restates the rule), which is the form this service's validation text takes.
-const INVALID_POLICY_MESSAGE: &str = "Validation error encountered at request.policy: \
-    The policy you provided isn't a valid policy document. Provide a JSON policy \
-    document with a Statement and then try again";
-
-/// Why a policy was refused on a multiview channel. A multiview channel composites the
-/// channels it lists as sources and is reached through their access, so it takes no
-/// resource policy of its own — the case the model's `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED`
-/// validation type names. Fixed, like the sentences above: it echoes no identifier.
-const MULTIVIEW_POLICY_NOT_ALLOWED_MESSAGE: &str = "Validation error encountered at \
-    request.policy: You can't attach a policy to a multiview channel. Attach the policy \
-    to the source channels instead and then try again";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -199,10 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // leaves whatever policy the channel already had in place.
         if !crate::state::is_policy_document(&input.policy) {
             return Err(PutChannelPolicyErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(INVALID_POLICY_MESSAGE.to_string()),
-                    validation_exception_type: Some("INVALID_POLICY".to_string()),
-                },
+                crate::state::validation_failed(
+                    "policy",
+                    INVALID_POLICY_REQUIREMENT,
+                    "INVALID_POLICY",
+                ),
             )
             .into());
         }
@@ -210,19 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(PutChannelPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
-                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                },
+                crate::state::ResourceKind::ChannelGroup.not_found(),
             )
             .into());
         };
         let Some(channel) = group.channels.get_mut(&input.channel_name) else {
             return Err(PutChannelPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(CHANNEL_NOT_FOUND.to_string()),
-                    resource_type_not_found: Some("CHANNEL".to_string()),
-                },
+                crate::state::ResourceKind::Channel.not_found(),
             )
             .into());
         };
@@ -234,12 +217,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (its own doc says so), so it is what identifies such a channel.
         if channel.multiview_configuration.is_some() {
             return Err(PutChannelPolicyErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(MULTIVIEW_POLICY_NOT_ALLOWED_MESSAGE.to_string()),
-                    validation_exception_type: Some(
-                        "MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED".to_string(),
-                    ),
-                },
+                crate::state::validation_failed(
+                    "policy",
+                    MULTIVIEW_POLICY_NOT_ALLOWED_REQUIREMENT,
+                    "MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED",
+                ),
             )
             .into());
         }

@@ -89,27 +89,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The sentence MediaPackage answers with when a channel group cannot be resolved.
-///
-/// Fixed per resource type and per rejection class: the service's not-found text names
-/// the KIND of resource and echoes none of the caller's identifiers.
-const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
-    we can't find your channel group. Verify your channel group name or add a channel \
-    group and then try again";
-
-/// The same fixed sentence at channel scope.
-const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-    can't find your channel. Verify your channel name or add a channel and then try \
-    again";
-
-/// The not-found text for a channel that exists with no policy attached.
-///
-/// AWS publishes no wording for this case, so the text is an example; what the service
-/// requires is the 404 and the `ResourceNotFoundException` code. It follows the same
-/// rule as the two above: request-independent, naming only the kind of resource.
-const CHANNEL_POLICY_NOT_FOUND: &str = "MediaPackage can't process your request because \
-    we can't find a policy on your channel. Attach a channel policy and then try again";
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -196,19 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
             return Err(GetChannelPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
-                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                },
+                crate::state::ResourceKind::ChannelGroup.not_found(),
             )
             .into());
         };
         let Some(channel) = group.channels.get(&input.channel_name) else {
             return Err(GetChannelPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(CHANNEL_NOT_FOUND.to_string()),
-                    resource_type_not_found: Some("CHANNEL".to_string()),
-                },
+                crate::state::ResourceKind::Channel.not_found(),
             )
             .into());
         };
@@ -217,14 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the only answer the model leaves is the not-found one.
         let Some(policy) = channel.policy.clone() else {
             return Err(GetChannelPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(CHANNEL_POLICY_NOT_FOUND.to_string()),
-                    // `ResourceTypeNotFound` enumerates CHANNEL_GROUP | CHANNEL |
-                    // ORIGIN_ENDPOINT | HARVEST_JOB — no member names a policy, and the
-                    // channel itself is NOT missing, so the discriminator is left unset
-                    // rather than claiming a resource type that is present.
-                    resource_type_not_found: None,
-                },
+                crate::state::policy_not_found(),
             )
             .into());
         };

@@ -166,16 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeleteChannelGroupOutput {});
         };
         // Deleting a group that still has channels would orphan them (and everything
-        // beneath them), so the service refuses while any child is left.
+        // beneath them), so the service refuses while any child is left. The refusal
+        // names the child kind that has to go first, not how many of them there are.
         if !group.channels.is_empty() {
-            return Err(DeleteChannelGroupErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel group {} still has {} channel(s); delete them first",
-                    group.name,
-                    group.channels.len()
-                )),
-                conflict_exception_type: Some("RESOURCE_IN_USE".to_string()),
-            })
+            return Err(DeleteChannelGroupErrorModeled::ConflictException(
+                crate::state::children_attached(
+                    crate::state::ResourceKind::ChannelGroup,
+                    crate::state::ResourceKind::Channel,
+                ),
+            )
             .into());
         }
         store.channel_groups.remove(&input.channel_group_name);

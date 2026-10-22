@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageSigningStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageSigningStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageSigningStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The registry's stored signing configuration is deliberately NOT consulted here. It
+//! says which images a push WOULD sign; a status reports a signing job, and nothing in
+//! this emulator runs an AWS Signer job, so no job exists for any stored image however
+//! the configuration is set. `signingStatuses` is therefore the empty list ECR answers
+//! with for an image no signing rule signed — a status for a job that never ran would be
+//! an invented one. A later change that really records signing jobs is where the
+//! per-profile statuses belong.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +126,28 @@ impl From<DescribeImageSigningStatusErrorModeled> for DescribeImageSigningStatus
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> DescribeImageSigningStatusErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            DescribeImageSigningStatusErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        crate::state::Fault::ImageNotFound(_) => {
+            DescribeImageSigningStatusErrorModeled::ImageNotFoundException(
+                ImageNotFoundException { message },
+            )
+        }
+        // No other fault can arise from a read of one image: the tag faults belong to
+        // the operations that write repository metadata tags.
+        _ => DescribeImageSigningStatusErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
 /// The `DescribeImageSigningStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +184,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageSigningStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageSigningStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageSigningStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeImageSigningStatusErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        // The report is about one image of one repository, so both are resolved against
+        // the store before anything is projected: an unknown repository is refused with
+        // `RepositoryNotFoundException`, and an identifier no stored manifest answers to
+        // with `ImageNotFoundException`.
+        let store = state.lock();
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+        let image = repo.resolve_image(&input.image_id).map_err(fault_error)?;
+
+        // One status per signing profile that signed this image. ECR records a signing
+        // job per signing rule that matched the image when it was pushed, and reports one
+        // status per job; nothing in this emulator runs an AWS Signer signing job, so no
+        // job exists for any stored image and the list is empty — which is what ECR
+        // answers for an image no signing rule matched. The registry's signing
+        // configuration (`PutSigningConfiguration`) says which images WOULD be signed; it
+        // is not a signing job, and a status is never invented for one that never ran.
+        let signing_statuses: Vec<ImageSigningStatus> = Vec::new();
+
+        Ok(DescribeImageSigningStatusOutput {
+            repository_name: Some(repo.name.clone()),
+            registry_id: Some(repo.registry_id.clone()),
+            image_id: Some(image.identifier(input.image_id.image_tag.as_deref())),
+            signing_statuses: Some(signing_statuses),
+        })
     }
 }

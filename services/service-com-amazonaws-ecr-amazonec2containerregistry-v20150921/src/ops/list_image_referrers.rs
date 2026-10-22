@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImageReferrers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImageReferrers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImageReferrers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,6 +132,108 @@ impl From<ListImageReferrersErrorModeled> for ListImageReferrersError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> ListImageReferrersErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            ListImageReferrersErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // `ImageNotFound` cannot arise here: this operation models no image-not-found
+        // error, and a subject no artifact refers to is an empty list, not a refusal.
+        _ => ListImageReferrersErrorModeled::InvalidParameterException(InvalidParameterException {
+            message,
+        }),
+    }
+}
+
+/// "If this parameter is not used, then ListImageReferrers returns up to 20 results and a
+/// nextToken value, if applicable." (`maxResults`' own documentation) — so a request that
+/// asks for no page size gets a page of 20 rather than this service's general default.
+const DEFAULT_REFERRER_PAGE_SIZE: i32 = 20;
+
+/// The artifact status every stored manifest has, and the one a request that names no
+/// `artifactStatus` filter asks for: "If not specified, only artifacts with ACTIVE status
+/// are returned." (`ListImageReferrersFilter$artifactStatus`).
+const DEFAULT_ARTIFACT_STATUS_FILTER: &str = "ACTIVE";
+
+/// The `ArtifactStatusFilter` value that matches an artifact of any status — the one
+/// value of that enum (`ARTIFACT_STATUS_FILTER_VALUES`) that `ArtifactStatus` itself does
+/// not carry.
+const ANY_ARTIFACT_STATUS_FILTER: &str = "ANY";
+
+/// The media type of an OCI image manifest, which is what a manifest that declares no
+/// `mediaType` of its own is: the OCI image-spec defines the property as reserved for
+/// `application/vnd.oci.image.manifest.v1+json` and only RECOMMENDS writing it, so a
+/// manifest without it is still reported with the media type it has.
+const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+/// The artifact `image` describes if it refers to `subject_digest`, or `None` when it
+/// refers to something else (or to nothing at all).
+///
+/// An artifact declares its subject in its own manifest: the OCI image-spec's `subject`
+/// property is "a descriptor of another manifest this manifest refers to", so the
+/// referrers of a digest are exactly the stored manifests whose `subject.digest` is that
+/// digest. Nothing is re-synthesised from the request — every member reported here is
+/// read out of the stored manifest or the stored record.
+fn referrer_of(image: &crate::state::ImageRecord, subject_digest: &str) -> Option<ImageReferrer> {
+    // A manifest that does not carry the subject digest in its bytes cannot declare it as
+    // its subject, so the parse — which a manifest is modelled to carry up to 4 MiB of —
+    // only runs for the stored manifests that could possibly match.
+    if !image.manifest.contains(subject_digest) {
+        return None;
+    }
+    let document = image.manifest_document()?;
+    let subject = document.get("subject")?.get("digest")?.as_str()?;
+    if subject != subject_digest {
+        return None;
+    }
+    // "artifactType: the IANA media type of this artifact... When the subject is
+    // present, this field SHOULD be present; if absent the config descriptor's
+    // mediaType is the artifact type." (OCI image-spec, image manifest).
+    let artifact_type = document
+        .get("artifactType")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            document
+                .get("config")
+                .and_then(|config| config.get("mediaType"))
+                .and_then(|value| value.as_str())
+        })
+        .map(ToString::to_string)
+        .or_else(|| image.artifact_media_type.clone());
+    let annotations: ::std::collections::HashMap<String, String> = document
+        .get("annotations")
+        .and_then(|value| value.as_object())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ImageReferrer {
+        digest: image.digest.clone(),
+        media_type: image
+            .manifest_media_type
+            .clone()
+            .unwrap_or_else(|| OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string()),
+        artifact_type,
+        size: image.size_in_bytes,
+        annotations: if annotations.is_empty() {
+            None
+        } else {
+            Some(annotations)
+        },
+        // Every manifest this registry stores is in standard storage, so every artifact
+        // it reports is ACTIVE; moving one to archive is `UpdateImageStorageClass`.
+        artifact_status: Some(crate::state::ACTIVE_IMAGE_STATUS.to_string()),
+    })
+}
+
 /// The `ListImageReferrers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -177,18 +270,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImageReferrers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImageReferrersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImageReferrers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListImageReferrersErrorModeled::ServerException(ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let filter = input.filter.unwrap_or_default();
+        // A value outside `ArtifactStatusFilter` was already refused at the boundary, so
+        // what arrives here is one of the modelled values.
+        let artifact_status = filter
+            .artifact_status
+            .unwrap_or_else(|| DEFAULT_ARTIFACT_STATUS_FILTER.to_string());
+        let status_matches = artifact_status == ANY_ARTIFACT_STATUS_FILTER
+            || artifact_status == crate::state::ACTIVE_IMAGE_STATUS;
+        let artifact_types = filter.artifact_types.unwrap_or_default();
+
+        let store = state.lock();
+        // The subject is addressed inside one repository, so the repository has to exist
+        // before anything can refer to anything: an unknown one is refused with
+        // `RepositoryNotFoundException`. A subject digest this repository does not hold is
+        // NOT a refusal — this operation models no image-not-found error, and nothing
+        // refers to an image that is not there, which is an empty list.
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+
+        let candidates: Vec<(String, ImageReferrer)> = if status_matches {
+            repo.images
+                .values()
+                .filter_map(|image| referrer_of(image, &input.subject_id.image_digest))
+                .filter(|referrer| {
+                    artifact_types.is_empty()
+                        || referrer
+                            .artifact_type
+                            .as_ref()
+                            .is_some_and(|artifact_type| artifact_types.contains(artifact_type))
+                })
+                .map(|referrer| (referrer.digest.clone(), referrer))
+                .collect()
+        } else {
+            // Nothing stored here is archived or activating, so no stored artifact
+            // matches a filter asking for one.
+            Vec::new()
+        };
+
+        let (referrers, next_token) = crate::state::paginate(
+            candidates,
+            input.next_token.as_ref(),
+            input.max_results.or(Some(DEFAULT_REFERRER_PAGE_SIZE)),
+        )
+        .map_err(fault_error)?;
+
+        Ok(ListImageReferrersOutput {
+            referrers: Some(referrers),
+            next_token,
+        })
     }
 }

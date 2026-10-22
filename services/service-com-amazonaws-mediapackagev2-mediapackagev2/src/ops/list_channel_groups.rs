@@ -190,12 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(ListChannelGroupsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(crate::state::invalid_pagination_token_message()),
-                            validation_exception_type: Some(
-                                "INVALID_PAGINATION_TOKEN".to_string(),
-                            ),
-                        },
+                        crate::state::validation_failed(
+                            "nextToken",
+                            crate::state::INVALID_PAGINATION_TOKEN_DETAIL,
+                            "INVALID_PAGINATION_TOKEN",
+                        ),
                     )
                     .into());
                 }
