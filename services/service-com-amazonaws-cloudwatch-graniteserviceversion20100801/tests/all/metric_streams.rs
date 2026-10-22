@@ -34,6 +34,46 @@ fn stamp(value: &Value, member: &str) -> Option<f64> {
     value.get(member).and_then(Value::as_f64)
 }
 
+/// A filter naming `namespace` and `count` generated metric names, for the rows that probe
+/// the published "up to 1000 total names" bound.
+fn filter_with_metric_names(namespace: &str, count: usize) -> Value {
+    let names: Vec<String> = (0..count).map(|index| format!("Metric{index}")).collect();
+    json!({"Namespace": namespace, "MetricNames": names})
+}
+
+/// A statistics configuration naming `count` metric pairs, for the rows that probe the
+/// published "as many as 100 pairs in the array" bound.
+fn configuration_with_include_metrics(count: usize) -> Value {
+    let metrics: Vec<Value> = (0..count)
+        .map(|index| json!({"Namespace": "MyApp", "MetricName": format!("Metric{index}")}))
+        .collect();
+    json!({"IncludeMetrics": metrics, "AdditionalStatistics": ["p99"]})
+}
+
+/// A statistics configuration asking for `count` percentile statistics on one metric, for
+/// the rows that probe the published "as many as 20 statistics" bound.
+fn configuration_with_statistics(count: usize) -> Value {
+    let statistics: Vec<String> = (0..count).map(|index| format!("p{}", index + 1)).collect();
+    json!({
+        "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": "Latency"}],
+        "AdditionalStatistics": statistics,
+    })
+}
+
+/// `count` statistics configurations, each on its own metric, for the rows that probe the
+/// published "up to 100 members" bound.
+fn statistics_configurations(count: usize) -> Value {
+    let configurations: Vec<Value> = (0..count)
+        .map(|index| {
+            json!({
+                "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": format!("Metric{index}")}],
+                "AdditionalStatistics": ["p99"],
+            })
+        })
+        .collect();
+    Value::Array(configurations)
+}
+
 #[tokio::test]
 async fn every_configuration_form_round_trips_through_get_metric_stream() {
     // Rows differ along the output format, which of the two mutually exclusive namespace
@@ -329,6 +369,131 @@ async fn an_additional_statistic_is_accepted_only_where_the_output_format_carrie
                     "case {case:?}: a refused PutMetricStream must persist nothing, got {get_body}"
                 );
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_configuration_is_accepted_at_each_documented_size_and_refused_past_it() {
+    // One row per published size bound, each tested AT the bound and one past it. The sizes
+    // come from the model's own documentation:
+    //   * "A metric stream's filters can include up to 1000 total names. This limit applies
+    //     to the sum of namespace names and metric names in the filters." (MetricStreamFilter)
+    //   * "There can be as many as 100 pairs in the array."
+    //     (MetricStreamStatisticsConfiguration$IncludeMetrics)
+    //   * "This list can include as many as 20 statistics."
+    //     (MetricStreamStatisticsConfiguration$AdditionalStatistics)
+    //   * "This array can have up to 100 members."
+    //     (PutMetricStreamInput$StatisticsConfigurations)
+    // A filter naming one namespace and 999 metric names is exactly 1000 names.
+    let cases: Vec<(&str, &str, Value, bool)> = vec![
+        (
+            "1000 names in an include filter",
+            "json",
+            json!({"IncludeFilters": [filter_with_metric_names("MyApp", 999)]}),
+            true,
+        ),
+        (
+            "1001 names in an include filter",
+            "json",
+            json!({"IncludeFilters": [filter_with_metric_names("MyApp", 1000)]}),
+            false,
+        ),
+        (
+            "1000 names spread over two exclude filters",
+            "json",
+            json!({"ExcludeFilters": [
+                filter_with_metric_names("MyApp", 499),
+                filter_with_metric_names("Other", 499),
+            ]}),
+            true,
+        ),
+        (
+            "1001 names spread over two exclude filters",
+            "json",
+            json!({"ExcludeFilters": [
+                filter_with_metric_names("MyApp", 500),
+                filter_with_metric_names("Other", 499),
+            ]}),
+            false,
+        ),
+        (
+            "100 include-metric pairs in one configuration",
+            "opentelemetry1.0",
+            json!({"StatisticsConfigurations": [configuration_with_include_metrics(100)]}),
+            true,
+        ),
+        (
+            "101 include-metric pairs in one configuration",
+            "opentelemetry1.0",
+            json!({"StatisticsConfigurations": [configuration_with_include_metrics(101)]}),
+            false,
+        ),
+        (
+            "20 additional statistics in one configuration",
+            "opentelemetry0.7",
+            json!({"StatisticsConfigurations": [configuration_with_statistics(20)]}),
+            true,
+        ),
+        (
+            "21 additional statistics in one configuration",
+            "opentelemetry0.7",
+            json!({"StatisticsConfigurations": [configuration_with_statistics(21)]}),
+            false,
+        ),
+        (
+            "100 statistics configurations",
+            "opentelemetry1.0",
+            json!({"StatisticsConfigurations": statistics_configurations(100)}),
+            true,
+        ),
+        (
+            "101 statistics configurations",
+            "opentelemetry1.0",
+            json!({"StatisticsConfigurations": statistics_configurations(101)}),
+            false,
+        ),
+    ];
+
+    for (case, format, extra, expected_ok) in cases {
+        let router = build_router();
+        let mut request = put_request("sized-stream", format);
+        for (member, value) in extra.as_object().expect("the row is an object") {
+            request[member.as_str()] = value.clone();
+        }
+
+        let (status, body) = call(&router, "PutMetricStream", &request).await;
+        if expected_ok {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a configuration at the documented bound must be accepted, got \
+                 {status} {body}"
+            );
+            let got = ok(&router, "GetMetricStream", &json!({"Name": "sized-stream"})).await;
+            // Only the members this row populated: a member the row does not set would
+            // compare `None` with `None` and assert nothing.
+            for member in extra.as_object().expect("the row is an object").keys() {
+                assert_eq!(
+                    got.get(member),
+                    request.get(member),
+                    "case {case:?}: {member} must round-trip, got {got}"
+                );
+            }
+        } else {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidParameterValueException"),
+                "case {case:?}: a configuration past the documented bound must be refused with \
+                 a 400 InvalidParameterValueException, got {status} {body}"
+            );
+            // A refused request persists nothing.
+            let (get_status, get_body) =
+                call(&router, "GetMetricStream", &json!({"Name": "sized-stream"})).await;
+            assert_eq!(
+                (get_status, error_code(&get_body).as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: a refused PutMetricStream must persist nothing, got {get_body}"
+            );
         }
     }
 }
