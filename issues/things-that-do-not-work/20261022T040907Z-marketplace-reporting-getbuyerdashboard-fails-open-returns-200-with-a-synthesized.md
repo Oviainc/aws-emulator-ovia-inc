@@ -1,0 +1,69 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: marketplace-reporting.agreement-dashboard-embed-success marketplace-reporting.concurrent-calls-yield-unique-embed-urls marketplace-reporting.dashboard-account-id-wrong-digit-count-rejected marketplace-reporting.dashboard-arn-pattern-mismatch-rejected marketplace-reporting.dashboard-arn-trailing-extra-segment-rejected marketplace-reporting.dashboard-disallowed-resource-path-rejected marketplace-reporting.dashboard-identifier-wrong-partition-rejected marketplace-reporting.embed-url-distinct-across-repeated-calls marketplace-reporting.embed-url-is-valid-https-endpoint marketplace-reporting.embedding-domain-disallowed-scheme-rejected marketplace-reporting.embedding-domain-missing-tld-rejected marketplace-reporting.embedding-domain-uppercase-scheme-rejected marketplace-reporting.embedding-domain-with-path-and-query-accepted marketplace-reporting.embedding-domains-echoed-in-order marketplace-reporting.localhost-embedding-domain-accepted marketplace-reporting.sequential-different-dashboards-do-not-leak-identifiers marketplace-reporting.wildcard-subdomain-embedding-domain-accepted
+Issue-Shape-Id: com.amazonaws.marketplacereporting#AWSMarketplaceReporting
+Issue-Key: marketplace-reporting.agreement-dashboard-embed-success|run#6|AssertionError|raise AssertionError(
+Issue-Key: marketplace-reporting.concurrent-calls-yield-unique-embed-urls|run#9|AssertionError|assert outcome == ("UnauthorizedException", "Unauthorized"), (
+Issue-Key: marketplace-reporting.dashboard-account-id-wrong-digit-count-rejected|_error_for#6|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.dashboard-arn-pattern-mismatch-rejected|_error_for#5|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.dashboard-arn-trailing-extra-segment-rejected|_error_for#5|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.dashboard-disallowed-resource-path-rejected|_error_for#6|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.dashboard-identifier-wrong-partition-rejected|_error_for#6|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.embed-url-distinct-across-repeated-calls|_call#6|AssertionError|raise AssertionError(f"expected UnauthorizedException, call succeeded: {resp}")
+Issue-Key: marketplace-reporting.embed-url-is-valid-https-endpoint|run#4|AssertionError|raise AssertionError(f"expected UnauthorizedException, call succeeded: {resp}")
+Issue-Key: marketplace-reporting.embedding-domain-disallowed-scheme-rejected|_error_for#4|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.embedding-domain-missing-tld-rejected|_error_for#4|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.embedding-domain-uppercase-scheme-rejected|_error_for#4|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.embedding-domain-with-path-and-query-accepted|run#5|AssertionError|raise AssertionError(f"expected UnauthorizedException, call succeeded: {resp}")
+Issue-Key: marketplace-reporting.embedding-domains-echoed-in-order|_error_for#5|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.localhost-embedding-domain-accepted|_error_for#4|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.sequential-different-dashboards-do-not-leak-identifiers|_error_for#7|AssertionError|raise AssertionError(f"expected GetBuyerDashboard({arn}) to fail, it succeeded: {resp}")
+Issue-Key: marketplace-reporting.wildcard-subdomain-embedding-domain-accepted|_error_for#4|AssertionError|raise AssertionError(f"expected GetBuyerDashboard to fail, it succeeded: {resp}")
+Issue-Commit: 6d3a954d57304c873e4e6a3ccc977c1ac1664bbd
+
+# GetBuyerDashboard fails open: returns 200 with a synthesized QuickSight embedUrl instead of UnauthorizedException (HTTP 401) for an unentitled caller
+
+> _Note: this issue was identified against the code base at commit `6d3a954d57304c873e4e6a3ccc977c1ac1664bbd`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetBuyerDashboard
+
+## Description
+All 17 replayed marketplace-reporting behavioral checks fail on the same single root cause, and every one of them fails on its FIRST (baseline/control) GetBuyerDashboard call, so only this one divergence was ever observed.
+
+Cause 1 of 1: GetBuyerDashboard has no entitlement/authorization gate and unconditionally answers 200 with a fabricated embed URL.
+
+AWS: AWS Marketplace Reporting's GetBuyerDashboard is gated on the caller holding the procurement-insights entitlement for the requested dashboard. A caller without that entitlement is rejected, and the rejection happens before the response body is produced, so no embedUrl is ever emitted on the failure path. Smithy (services/service-com-amazonaws-marketplacereporting-awsmarketplacereporting/smithy-model/com-amazonaws-marketplacereporting-awsmarketplacereporting.json): GetBuyerDashboard POST /getBuyerDashboard, success code 200, modeled errors AccessDeniedException (403), BadRequestException (400), InternalServerException (500), UnauthorizedException (401 — documented "You do not have permission to perform this action."). The recorded behavior for this suite's caller is UnauthorizedException with HTTP status 401 and error code "UnauthorizedException"; the recorded message is "Unauthorized" (the checks assert that exact text, so the fix should emit it, but the requirement being filed is the status + code). The recordings also show that this authorization decision precedes input-shape validation: identifiers that violate the modeled dashboardIdentifier pattern (^arn:aws:aws-marketplace::[0-9]{12}:AWSMarketplace/ReportingData/(Agreement_V1/Dashboard/AgreementSummary_V1|BillingEvent_V1/Dashboard/CostAnalysis_V1)$) and shape-valid-but-unusual embeddingDomains values both come back as the same UnauthorizedException, never BadRequestException and never a 200.
+
+Emulator: every GetBuyerDashboard call returns HTTP 200 with a JSON body containing a generated embedUrl of the form https://<region>.quicksight.aws.amazon.com/embed/<64-hex>/dashboards/AgreementSummary_V1 plus the echoed dashboardIdentifier and embeddingDomains. Nothing is rejected: the entitlement check is absent, so a valid-shaped ARN, a non-ARN string, an 11-digit account id, an extra trailing path segment, a disallowed resource path, a non-aws partition, and odd embeddingDomains values all alike produce a 200. Repeated and concurrent identical calls each mint a different embed URL rather than each failing identically. Observed per-call response: {'ResponseMetadata': {'HTTPStatusCode': 200, ...}, 'embedUrl': 'https://us-east-1.quicksight.aws.amazon.com/embed/<hex>/dashboards/AgreementSummary_V1', 'dashboardIdentifier': 'arn:aws:aws-marketplace::000000000000:AWSMarketplace/ReportingData/Agreement_V1/Dashboard/AgreementSummary_V1', 'embeddingDomains': ['https://example.com']}.
+
+Why: this is an authorization gate that fails OPEN. A client built against the emulator sees unconditional success and never exercises its UnauthorizedException/401 handling (retry-vs-abort classification, credential or entitlement remediation, the error surface shown to a buyer), then breaks the first time it runs against real AWS. Worse, the 200 path hands out a QuickSight embedding URL to a caller AWS would have refused, so any test asserting that an unauthorized request does not leak an embedUrl passes falsely — exactly the regression these checks exist to catch. It also makes shape-validation negative tests meaningless, because the emulator accepts identifiers the modeled pattern forbids.
+
+Fix: the GetBuyerDashboard handler in the marketplace-reporting service crate. Add the entitlement/authorization decision ahead of response construction, and have it return the modeled UnauthorizedException (HTTP 401, error code "UnauthorizedException", message "Unauthorized") with an error body only — no embedUrl, no echoed dashboardIdentifier or embeddingDomains. The decision must be deterministic (identical repeated and concurrent calls return the identical status and code) and must run BEFORE dashboardIdentifier/embeddingDomains shape validation, so a malformed identifier from an unentitled caller still yields UnauthorizedException rather than BadRequestException.
+
+Traces: all 17 failing marketplace-reporting checks, each failing on its control GetBuyerDashboard call — agreement-dashboard-embed-success, embed-url-is-valid-https-endpoint, embed-url-distinct-across-repeated-calls, concurrent-calls-yield-unique-embed-urls, sequential-different-dashboards-do-not-leak-identifiers, embedding-domains-echoed-in-order, embedding-domain-with-path-and-query-accepted, embedding-domain-disallowed-scheme-rejected, embedding-domain-missing-tld-rejected, embedding-domain-uppercase-scheme-rejected, localhost-embedding-domain-accepted, wildcard-subdomain-embedding-domain-accepted, dashboard-arn-pattern-mismatch-rejected, dashboard-arn-trailing-extra-segment-rejected, dashboard-account-id-wrong-digit-count-rejected, dashboard-disallowed-resource-path-rejected, dashboard-identifier-wrong-partition-rejected. Handler lives under services/service-com-amazonaws-marketplacereporting-awsmarketplacereporting/src/.
+
+## Evidence
+Expected (recorded AWS behavior, and the modeled error): botocore raises ClientError with Error.Code == "UnauthorizedException", Error.Message == "Unauthorized", ResponseMetadata.HTTPStatusCode == 401, and the error response contains no embedUrl and does not echo dashboardIdentifier/embeddingDomains. Smithy model binds UnauthorizedException to httpError 401 on GetBuyerDashboard.
+
+Actual (emulator): HTTP 200 and a success body, for every variant tried. E.g. marketplace-reporting.agreement-dashboard-embed-success:
+  AssertionError: expected an unentitled caller to be rejected with UnauthorizedException, call unexpectedly succeeded: {'ResponseMetadata': {'HTTPStatusCode': 200, 'HTTPHeaders': {'content-type': 'application/json', 'content-length': '337', ...}, 'RetryAttempts': 0}, 'embedUrl': 'https://us-east-1.quicksight.aws.amazon.com/embed/7001b04c9a61403e58e16b87773ab513403089e3eb6c584d4992866a87b149bb/dashboards/AgreementSummary_V1', 'dashboardIdentifier': 'arn:aws:aws-marketplace::000000000000:AWSMarketplace/ReportingData/Agreement_V1/Dashboard/AgreementSummary_V1', 'embeddingDomains': ['https://example.com']}
+
+marketplace-reporting.concurrent-calls-yield-unique-embed-urls shows the same fail-open under concurrency, with each concurrent call minting a DIFFERENT embed URL instead of all failing identically:
+  AssertionError: expected every concurrent call to independently fail with UnauthorizedException, got outcome='SUCCESS' ... results=[('SUCCESS', {... 'embedUrl': '.../embed/243d1212697b56f9af78e5766ebb5d3fd7977bb77255e302936587781f5f58d4/...'}), ('SUCCESS', {... 'embedUrl': '.../embed/9e6ecb02b174c947bc08113a0aff5447a3f3c1e5f57dae628466b505adddaa3d/...'}), ...]
+
+marketplace-reporting.dashboard-arn-pattern-mismatch-rejected, .dashboard-account-id-wrong-digit-count-rejected, .dashboard-arn-trailing-extra-segment-rejected, .dashboard-disallowed-resource-path-rejected and .dashboard-identifier-wrong-partition-rejected all abort at their control call with:
+  AssertionError: expected GetBuyerDashboard to fail, it succeeded: {'ResponseMetadata': {'HTTPStatusCode': 200, ...}, 'embedUrl': '...', ...}
+so the emulator never even reached the malformed-identifier comparison — the single observed divergence is the missing auth gate on the well-formed request.
+
+Note: the generated 64-hex embed URL path component, the host/region in the URL, the account id 000000000000, dates and content-length are environment-specific and are not requirements; the requirements are the 401 status, the "UnauthorizedException" code, and the absence of any success field in the error body.
+
+## Steps to Reproduce
+1. Build and boot the emulator from mainline and point a botocore client at it: client = boto3.client("marketplace-reporting", region_name="us-east-1", endpoint_url=<emulator>).
+2. Resolve the caller account with sts.get_caller_identity()["Account"].
+3. arn = f"arn:aws:aws-marketplace::{account}:AWSMarketplace/ReportingData/Agreement_V1/Dashboard/AgreementSummary_V1".
+4. Call client.get_buyer_dashboard(dashboardIdentifier=arn, embeddingDomains=["https://example.com"]).
+5. Observe HTTP 200 and a body carrying embedUrl / dashboardIdentifier / embeddingDomains. Expected: botocore ClientError with Error.Code "UnauthorizedException", Error.Message "Unauthorized", HTTPStatusCode 401, and no embedUrl anywhere in the response.
+6. Repeat the identical call twice sequentially, and once from several threads concurrently: every response is a 200 carrying a DIFFERENT embedUrl, where AWS returns the same UnauthorizedException/401 each time.
+7. Repeat step 4 with dashboardIdentifier="not-an-arn-at-all", with an 11-digit account id, with arn+"/extra", with a non-aws partition, and with a resource path outside the modeled allow-list: each is also accepted with a 200 instead of the same UnauthorizedException/401.
