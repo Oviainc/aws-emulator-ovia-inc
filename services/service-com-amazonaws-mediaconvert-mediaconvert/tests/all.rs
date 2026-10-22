@@ -37,6 +37,8 @@ mod preset_lifecycle;
 mod preset_update;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
+#[path = "all/queue_listing.rs"]
+mod queue_listing;
 #[path = "all/queue_update.rs"]
 mod queue_update;
 #[path = "all/resource_projection_defaults.rs"]
