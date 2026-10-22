@@ -49,6 +49,63 @@ pub const SORT_ORDER_DESCENDING: &str = "DESCENDING";
 /// `com.amazonaws.datazone#DomainVersion`: V1 | V2).
 pub const DEFAULT_DOMAIN_VERSION: &str = "V1";
 
+/// The `FormTypeStatus` a metadata form type gets when the request names none (model
+/// enum `com.amazonaws.datazone#FormTypeStatus`: ENABLED | DISABLED). A form type is
+/// usable as soon as it is created, so the default is the usable member.
+pub const FORM_TYPE_STATUS_ENABLED: &str = "ENABLED";
+
+/// `FormTypeName`'s modelled maximum length, 1..128 (smithy_query shape="FormTypeName").
+pub const FORM_TYPE_NAME_MAX_LEN: usize = 128;
+
+/// The `@pattern` the model declares on `FormTypeName`, the shape a form type's `name`
+/// and a form entry's reported `typeName` both target.
+///
+/// SOURCE: `smithy_query(query="shape", shape="FormTypeName")`. The negative lookahead
+/// is why it is checked here at all: the vendored boundary validator compiles a
+/// `@pattern` with the `regex` crate, which has no look-around, and treats a pattern it
+/// cannot compile as matching (`vendor/smithy-schema-server/src/constraints.rs`), so
+/// this pattern would otherwise reach the store unchecked.
+pub const FORM_TYPE_NAME_PATTERN: &str =
+    r"^(amazon.datazone.)?(?![0-9_])\w+$|^_\w*[a-zA-Z0-9]\w*$";
+
+/// [`FORM_TYPE_NAME_PATTERN`], checked directly rather than compiled.
+///
+/// The pattern needs look-around, which the `regex` crate does not offer, and a Smithy
+/// `@pattern` is an ECMA-262 expression, where `\w` is the ASCII class `[A-Za-z0-9_]`.
+/// So each alternative is read off the pattern and checked in turn:
+///
+/// * `^_\w*[a-zA-Z0-9]\w*$` — the NAME ITSELF starts with an underscore and some ASCII
+///   alphanumeric follows it. The `amazon.datazone.` prefix belongs to the other
+///   alternative only, so `amazon.datazone._0` is NOT a form type name.
+/// * `^(amazon.datazone.)?(?![0-9_])\w+$` — otherwise, every character is an ASCII word
+///   character once the optional literal prefix is taken off, and the first of them is
+///   a letter (the look-ahead rules out a digit, and an underscore there would have
+///   matched the first alternative).
+fn matches_form_type_name_pattern(name: &str) -> bool {
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    if let Some(rest) = name.strip_prefix('_') {
+        if rest.bytes().all(is_word) && rest.bytes().any(|byte| byte.is_ascii_alphanumeric()) {
+            return true;
+        }
+    }
+    let bare = name.strip_prefix("amazon.datazone.").unwrap_or(name);
+    bare.bytes().all(is_word)
+        && bare
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+}
+
+/// Whether `name` satisfies `FormTypeName`'s modelled length and pattern.
+///
+/// Shared by every handler that takes or reports a form type name — `CreateFormType`
+/// validates its `name` with it, and `CreateAssetType` decides with it whether a form
+/// entry's `typeIdentifier` is already a well-formed name — so the two cannot drift.
+pub fn is_form_type_name(name: &str) -> bool {
+    (1..=FORM_TYPE_NAME_MAX_LEN).contains(&name.chars().count())
+        && matches_form_type_name_pattern(name)
+}
+
 /// The `GlossaryStatus` members (model enum `com.amazonaws.datazone#GlossaryStatus`:
 /// DISABLED | ENABLED).
 pub const GLOSSARY_STATUS_ENABLED: &str = "ENABLED";
@@ -96,6 +153,11 @@ pub struct Domain {
     /// The projects stored in this domain, so they go with it when it is deleted.
     /// Bounded by [`MAX_PROJECTS_PER_DOMAIN`].
     pub projects: BTreeMap<String, Project>,
+    /// The metadata form types stored in this domain, keyed by their `FormTypeName`
+    /// — the same string `GetFormType`/`DeleteFormType` address them by
+    /// (`formTypeIdentifier`). Nested under the domain so they go with it when it is
+    /// deleted. Bounded by [`MAX_FORM_TYPES_PER_DOMAIN`].
+    pub form_types: BTreeMap<String, FormType>,
     /// The catalog assets stored in this domain, keyed by their `AssetId`, so they go
     /// with the domain when it is deleted. Bounded by [`MAX_ASSETS_PER_DOMAIN`].
     pub assets: BTreeMap<String, Asset>,
@@ -148,6 +210,68 @@ pub struct DomainUnit {
 pub enum DomainUnitOwner {
     User(String),
     Group(String),
+}
+
+/// One stored metadata form type: a name, the project that owns it, and every
+/// revision created under that name.
+///
+/// The model gives `CreateFormType` no companion `UpdateFormType` and makes
+/// `revision` a REQUIRED output of both `CreateFormType` and `GetFormType`
+/// (smithy_query operation="CreateFormType,GetFormType"), so re-creating a name is
+/// the only way a second revision can come about: each create under an existing name
+/// appends the next revision and leaves the earlier ones readable.
+#[derive(Debug, Clone)]
+pub struct FormType {
+    pub name: String,
+    pub domain_id: String,
+    /// The project named by `owningProjectIdentifier` on the create that minted
+    /// revision 1; a later create under this name must name the same project.
+    pub owning_project_id: String,
+    /// Every revision, keyed by its number so the greatest key is the latest.
+    /// Bounded by [`MAX_FORM_TYPE_REVISIONS`].
+    pub revisions: BTreeMap<u32, FormTypeRevision>,
+}
+
+impl FormType {
+    /// The greatest revision number stored, i.e. the one a `GetFormType` that names no
+    /// `revision` reports.
+    pub fn latest_revision(&self) -> Option<&FormTypeRevision> {
+        self.revisions.values().next_back()
+    }
+
+    /// The revision addressed by a `revision` string, which is the decimal number the
+    /// create that minted it returned. Addressing is exact: only the canonical decimal
+    /// resolves, so `"01"` and `"+1"` name no revision. `None` when this form type has
+    /// no such revision.
+    pub fn revision(&self, revision: &str) -> Option<&FormTypeRevision> {
+        let number = revision.parse::<u32>().ok()?;
+        if number.to_string() != revision {
+            return None;
+        }
+        self.revisions.get(&number)
+    }
+}
+
+/// One revision of a stored metadata form type.
+#[derive(Debug, Clone)]
+pub struct FormTypeRevision {
+    /// The revision number, rendered as the modelled `Revision` string: the first one
+    /// minted under a name renders as [`FIRST_REVISION`].
+    pub revision: u32,
+    /// The `smithy` member of the modelled `Model` union — the only member it has
+    /// (smithy_query shape="Model") — exactly as the create supplied it.
+    pub model_smithy: String,
+    pub status: String,
+    pub description: Option<String>,
+    pub created_at_ms: i64,
+    pub created_by: String,
+}
+
+impl FormTypeRevision {
+    /// This revision as the modelled `Revision` string.
+    pub fn revision_string(&self) -> String {
+        self.revision.to_string()
+    }
 }
 
 /// One stored DataZone business glossary.
@@ -578,6 +702,16 @@ pub const MAX_DOMAINS: usize = 100;
 /// The most projects this emulator stores in one domain, for the same reason and with
 /// the same refusal (`CreateProject` models `ServiceQuotaExceededException` too).
 pub const MAX_PROJECTS_PER_DOMAIN: usize = 500;
+
+/// The most metadata form types this emulator stores in one domain, for the same
+/// reason and with the same refusal (`CreateFormType` models
+/// `ServiceQuotaExceededException` too).
+pub const MAX_FORM_TYPES_PER_DOMAIN: usize = 500;
+
+/// The most revisions this emulator keeps for one metadata form type. Re-creating a
+/// name appends a revision, so this is the bound on that caller-driven growth; the
+/// refusal past it is `CreateFormType`'s `ServiceQuotaExceededException`.
+pub const MAX_FORM_TYPE_REVISIONS: usize = 100;
 
 /// The most domain units this emulator stores in one domain, for the same reason and
 /// with the same refusal (`CreateDomainUnit` models `ServiceQuotaExceededException`).

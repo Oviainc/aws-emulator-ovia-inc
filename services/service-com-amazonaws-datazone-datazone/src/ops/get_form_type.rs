@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFormType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFormType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFormType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a stored metadata form type from the domain that holds it: the revision the
+//! request names, or the latest one stored when it names none.
+//!
+//! `formTypeIdentifier` is the form type's NAME — the string `CreateFormType` was
+//! given — which is why its pattern admits the dots of a qualified name such as
+//! `amazon.datazone.…`. Reporting only: the sole write is the domain lifecycle the
+//! clock already owes.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +183,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFormType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFormTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFormType"))
+        let _ = ctx;
+        use crate::state::{date_time, now_ms};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetFormTypeErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        let form_type = store
+            .live_domain(&input.domain_identifier)
+            .ok_or_else(|| {
+                GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Domain {} was not found", input.domain_identifier),
+                })
+            })?
+            .form_types
+            .get(&input.form_type_identifier)
+            .ok_or_else(|| {
+                GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "Metadata form type {} was not found",
+                        input.form_type_identifier
+                    ),
+                })
+            })?;
+        // A request naming a `revision` addresses exactly that revision; one naming
+        // none reports the latest stored.
+        let revision = match input.revision.as_deref() {
+            Some(wanted) => form_type.revision(wanted).ok_or_else(|| {
+                GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "Metadata form type {} has no revision {wanted}",
+                        input.form_type_identifier
+                    ),
+                })
+            })?,
+            None => form_type.latest_revision().ok_or_else(|| {
+                GetFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "Metadata form type {} has no revisions",
+                        input.form_type_identifier
+                    ),
+                })
+            })?,
+        };
+
+        Ok(GetFormTypeOutput {
+            domain_id: form_type.domain_id.clone(),
+            name: form_type.name.clone(),
+            revision: revision.revision_string(),
+            model: Model::Smithy(revision.model_smithy.clone()),
+            owning_project_id: Some(form_type.owning_project_id.clone()),
+            // A form type created in this domain ORIGINATES here; the origin members
+            // differ from the owning ones only for one imported from another domain,
+            // which this emulator has no operation to produce.
+            origin_domain_id: Some(form_type.domain_id.clone()),
+            origin_project_id: Some(form_type.owning_project_id.clone()),
+            status: Some(revision.status.clone()),
+            created_at: Some(date_time(revision.created_at_ms)),
+            created_by: Some(revision.created_by.clone()),
+            description: revision.description.clone(),
+            // `imports` reports the OTHER form types this one's model pulls in. Nothing
+            // in this emulator composes a form type out of others, so there are none;
+            // the member's list is modelled min-1, so an empty list would be the one
+            // value that is wrong here.
+            imports: None,
+        })
     }
 }

@@ -352,38 +352,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// other namespace reports its unqualified last segment, which is the form type's own
 /// name.
 ///
-/// Whether a form type of that name EXISTS is not checked here: form types are not
-/// served yet (`CreateFormType` is still a scaffold stub with its own issue), and the
-/// built-in `amazon.datazone.*` types are not stored at all, so there is nothing to
-/// resolve an identifier against.
+/// Whether a form type of that name EXISTS is still not checked here: the built-in
+/// `amazon.datazone.*` types are not stored at all, and an asset type may name a form
+/// type in any namespace, so an identifier is resolved to a name rather than to a
+/// stored record. (`CreateFormType` does now persist custom form types under
+/// `Domain::form_types`, so resolving a `typeIdentifier` against them is possible —
+/// deliberately out of scope here, and the business of whichever issue makes an asset
+/// type's forms refer to stored ones.)
 fn form_type_name(identifier: &str) -> &str {
-    if is_form_type_name(identifier) {
+    if crate::state::is_form_type_name(identifier) {
         return identifier;
     }
     identifier.split('.').next_back().unwrap_or(identifier)
-}
-
-/// Whether `value` already satisfies the `FormTypeName` constraints quoted above, so it
-/// can be reported as a form type name unchanged.
-fn is_form_type_name(value: &str) -> bool {
-    if value.is_empty() || value.len() > 128 {
-        return false;
-    }
-    // The optional namespace prefix the pattern allows is part of the name.
-    let bare = value.strip_prefix("amazon.datazone.").unwrap_or(value);
-    if !bare
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return false;
-    }
-    match bare.bytes().next() {
-        // `(?![0-9_])\w+`: a name cannot start with a digit.
-        Some(byte) if byte.is_ascii_digit() => false,
-        // `_\w*[a-zA-Z0-9]\w*`: it may start with an underscore only when some
-        // alphanumeric character follows.
-        Some(b'_') => bare.bytes().any(|byte| byte.is_ascii_alphanumeric()),
-        Some(_) => true,
-        None => false,
-    }
 }

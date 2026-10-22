@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFormType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFormType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFormType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a metadata form type under a PERSISTED, available domain and stores it in that
+//! domain, so `GetFormType` answers from the stored record and the form type disappears
+//! with its domain.
+//!
+//! The model gives form types no `UpdateFormType` and makes `revision` a REQUIRED
+//! output of both `CreateFormType` and `GetFormType`, so re-creating an existing name
+//! is the only way a second revision can arise: a create under a name this domain
+//! already holds appends the NEXT revision (and must name the owning project that
+//! already holds the name), while a create under a fresh name mints revision `1`.
+//!
+//! `status` defaults to `ENABLED` — the usable member of `FormTypeStatus` — and
+//! `createdBy` is the CALLER's principal, not anything the request body carries.
+//!
+//! `name` is checked against `FormTypeName`'s modelled pattern by
+//! [`crate::state::is_form_type_name`] — the one predicate every handler that takes or
+//! reports a form type name shares — and `model`'s `smithy` member against its modelled
+//! length, rather than at the boundary: a negative lookahead and a constraint on a union
+//! member are the two the centralized request walk cannot enforce.
 //!
 //! ## Shape of an operation
 //!
@@ -171,6 +181,11 @@ impl<Eng> CreateFormType<Eng> {
     }
 }
 
+/// The modelled length range of the `Model` union's only member, `smithy`, 1..100000
+/// (smithy_query shape="Model"). Checked in this handler because it constrains a UNION
+/// member, which the centralized request walk does not validate either.
+const MODEL_SMITHY_LENGTH: std::ops::RangeInclusive<usize> = 1..=100_000;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateFormType<Eng>
 {
@@ -188,18 +203,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFormType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFormTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFormType"))
+        use crate::state::{
+            caller_principal, is_form_type_name, now_ms, FormType, FormTypeRevision,
+            DOMAIN_STATUS_AVAILABLE, FORM_TYPE_NAME_PATTERN, FORM_TYPE_STATUS_ENABLED,
+            PROJECT_STATUS_ACTIVE,
+        };
+
+        if !is_form_type_name(&input.name) {
+            return Err(CreateFormTypeErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "name {} does not satisfy the constraint: Member must satisfy regular \
+                     expression pattern: {FORM_TYPE_NAME_PATTERN}",
+                    input.name
+                ),
+            })
+            .into());
+        }
+        // `Model` is a union whose only member is `smithy` (smithy_query shape="Model"),
+        // so the stored model is that string, kept verbatim.
+        let Model::Smithy(model_smithy) = input.model;
+        // Smithy measures a string's length in Unicode code points.
+        let model_length = model_smithy.chars().count();
+        if !MODEL_SMITHY_LENGTH.contains(&model_length) {
+            return Err(CreateFormTypeErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "model.smithy has length {model_length}, which does not satisfy the \
+                     constraint: Member must have length between {} and {}, inclusive",
+                    MODEL_SMITHY_LENGTH.start(),
+                    MODEL_SMITHY_LENGTH.end()
+                ),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateFormTypeErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        let created_by = caller_principal(ctx);
+
+        let domain = store
+            .domains
+            .get(&input.domain_identifier)
+            // `CreateFormType` models no `ResourceNotFoundException`
+            // (smithy_query operation="CreateFormType"), so an identifier that names
+            // no stored domain is refused as an input the service cannot satisfy.
+            .ok_or_else(|| {
+                CreateFormTypeErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "domainIdentifier {} does not identify a domain",
+                        input.domain_identifier
+                    ),
+                })
+            })?;
+        // "The domain must exist and be in an ENABLED state": a domain still being
+        // created, or already being deleted, cannot take a form type.
+        if domain.status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateFormTypeErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {}, so it cannot accept a metadata form type",
+                    input.domain_identifier, domain.status
+                ),
+            })
+            .into());
+        }
+        // "The owning project must exist and be accessible", in this domain. Same
+        // reasoning as the domain above for the error a project the identifier does not
+        // resolve to is refused with.
+        let project = domain
+            .projects
+            .get(&input.owning_project_identifier)
+            .ok_or_else(|| {
+                CreateFormTypeErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "owningProjectIdentifier {} does not identify a project in domain {}",
+                        input.owning_project_identifier, input.domain_identifier
+                    ),
+                })
+            })?;
+        // A project that exists but is not ACTIVE is not accessible: the request
+        // conflicts with the project's current state, exactly as the sibling
+        // `create_asset_type` handler refuses the same prerequisite.
+        if project.project_status != PROJECT_STATUS_ACTIVE {
+            return Err(CreateFormTypeErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Project {} is {}, so it cannot own a metadata form type",
+                    input.owning_project_identifier, project.project_status
+                ),
+            })
+            .into());
+        }
+
+        // The name already in the domain decides whether this create mints the form
+        // type or appends a revision to it.
+        let existing = domain.form_types.get(&input.name);
+        if let Some(existing) = existing {
+            // "The name must be unique within the domain": the name is already taken,
+            // and only the project that owns it may add to it.
+            if existing.owning_project_id != input.owning_project_identifier {
+                return Err(CreateFormTypeErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "metadata form type {} in domain {} is owned by project {}",
+                        input.name, input.domain_identifier, existing.owning_project_id
+                    ),
+                })
+                .into());
+            }
+            if existing.revisions.len() >= crate::state::MAX_FORM_TYPE_REVISIONS {
+                return Err(CreateFormTypeErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator keeps at most {} revisions of one metadata form type",
+                            crate::state::MAX_FORM_TYPE_REVISIONS
+                        ),
+                    },
+                )
+                .into());
+            }
+        } else if domain.form_types.len() >= crate::state::MAX_FORM_TYPES_PER_DOMAIN {
+            // The store is bounded, so a create loop cannot grow the emulator's heap
+            // without limit; the refusal is the error the operation already models.
+            return Err(CreateFormTypeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {} metadata form types in one domain",
+                        crate::state::MAX_FORM_TYPES_PER_DOMAIN
+                    ),
+                },
+            )
+            .into());
+        }
+        // Revision numbers never go backwards, even once an earlier revision is gone:
+        // the next one is one past the greatest ever stored under this name.
+        let revision = existing
+            .and_then(|form_type| form_type.revisions.keys().next_back().copied())
+            .unwrap_or(0)
+            + 1;
+
+        let stored = FormTypeRevision {
+            revision,
+            model_smithy,
+            status: input
+                .status
+                .unwrap_or_else(|| FORM_TYPE_STATUS_ENABLED.to_string()),
+            description: input.description,
+            created_at_ms: now,
+            created_by,
+        };
+        let output = CreateFormTypeOutput {
+            domain_id: input.domain_identifier.clone(),
+            name: input.name.clone(),
+            revision: stored.revision_string(),
+            description: stored.description.clone(),
+            owning_project_id: Some(input.owning_project_identifier.clone()),
+            // A form type created in this domain ORIGINATES here: the origin members
+            // differ from the owning ones only for a form type imported from another
+            // domain, which this emulator has no operation to produce.
+            origin_domain_id: Some(input.domain_identifier.clone()),
+            origin_project_id: Some(input.owning_project_identifier.clone()),
+        };
+
+        // The domain lookup above ran under the lock this scope still holds, so the
+        // domain is there; store the revision under it, minting the form type when this
+        // is its first revision.
+        store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .expect("the domain was found above under this lock")
+            .form_types
+            .entry(input.name.clone())
+            .or_insert_with(|| FormType {
+                name: input.name,
+                domain_id: input.domain_identifier,
+                owning_project_id: input.owning_project_identifier,
+                revisions: std::collections::BTreeMap::new(),
+            })
+            .revisions
+            .insert(revision, stored);
+        Ok(output)
     }
 }
