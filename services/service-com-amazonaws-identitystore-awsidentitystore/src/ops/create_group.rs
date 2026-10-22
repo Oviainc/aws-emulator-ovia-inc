@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a group in the identity store the request names, minting its `GroupId`,
+//! `GroupArn` and first `Revision` and persisting the display name and description it
+//! was given, so a later `DescribeGroup` reports exactly what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -110,13 +105,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `CreateGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#CreateGroup")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#CreateGroup",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateGroupErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -168,20 +170,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGroupErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let mut state = state.lock();
+        // A create may bring an identity store into being (this API models no
+        // operation that creates one), but only while fewer than
+        // `MAX_IDENTITY_STORES` are held: `IdentityStoreId` is caller-chosen, so the
+        // vivification is capped rather than unbounded.
+        let store = state
+            .try_store_mut(&input.identity_store_id)
+            .ok_or_else(|| {
+                CreateGroupErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(format!(
+                        "{} identity stores",
+                        crate::state::MAX_IDENTITY_STORES
+                    )),
+                )
+            })?;
+
+        // The store holds a bounded number of groups. The operation models
+        // `ServiceQuotaExceededException` for "the request would cause the number of
+        // users or groups in the identity store to exceed the maximum allowed", so the
+        // bound is reached through that error rather than by exhausting memory.
+        if !store.has_group_capacity() {
+            return Err(CreateGroupErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(format!(
+                    "identity store {} already holds {} groups",
+                    store.identity_store_id,
+                    store.groups.len()
+                )),
+            )
+            .into());
+        }
+
+        // A `DisplayName` is a uniqueness claim within the identity store, so a second
+        // create naming one that is taken conflicts rather than storing a duplicate.
+        // The member is optional in the model, so a request without one claims nothing.
+        // The name itself is `@sensitive` and so stays out of the message.
+        if let Some(taken_by) = input
+            .display_name
+            .as_deref()
+            .and_then(|display_name| store.group_display_name_index.get(display_name))
+        {
+            return Err(CreateGroupErrorModeled::ConflictException(
+                crate::state::uniqueness_conflict(format!(
+                    "a group with this DisplayName already exists in identity store {} (GroupId {taken_by})",
+                    store.identity_store_id
+                )),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let group_id = store.mint_resource_id();
+        let group = crate::state::Group {
+            group_arn: crate::state::resource_arn(crate::state::ResourceKind::Group, &group_id),
+            group_id: group_id.clone(),
+            // A create is revision 1; an UpdateGroup bumps it from there.
+            revision: 1,
+            display_name: input.display_name,
+            description: input.description,
+            external_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            created_by: None,
+            updated_by: None,
+        };
+
+        let output = CreateGroupOutput {
+            identity_store_id: store.identity_store_id.clone(),
+            group_id: group.group_id.clone(),
+            group_arn: group.group_arn.clone(),
+            revision: group.revision(),
+        };
+        if let Some(display_name) = group.display_name.clone() {
+            store
+                .group_display_name_index
+                .insert(display_name, group_id.clone());
+        }
+        store.groups.insert(group_id, group);
+        Ok(output)
     }
 }
