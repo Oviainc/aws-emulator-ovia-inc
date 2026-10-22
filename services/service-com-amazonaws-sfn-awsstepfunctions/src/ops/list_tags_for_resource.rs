@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag list a Step Functions state machine or activity carries.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +95,15 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// The modelled failure for a taggable ARN the store holds no resource under.
+fn not_found(resource_arn: &str) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::ResourceNotFound(ResourceNotFound {
+        message: Some(crate::state::resource_not_found_message(resource_arn)),
+        resource_name: Some(resource_arn.to_string()),
+    })
+    .into()
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -138,18 +140,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The same ARN rule `TagResource` reads: `resourceArn` is "the ARN for the
+        // Step Functions state machine or activity", and anything else is the ARN
+        // this operation cannot read, which `InvalidArn` reports.
+        let Some(target) = crate::state::parse_taggable_arn(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::InvalidArn(InvalidArn {
+                message: Some(crate::state::untaggable_arn_message(&input.resource_arn)),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialising a deletion the clock already owes is the one write a report
+        // may make: it was due at the same instant whether or not anybody called.
+        store.settle(crate::state::now());
+
+        // No activity can be in the store — `CreateActivity` is still scaffolded — so
+        // an activity ARN names a resource that could not be found.
+        match target {
+            crate::state::TaggableResource::Activity(_) => Err(not_found(&input.resource_arn)),
+            crate::state::TaggableResource::StateMachine(_) => {
+                match store.state_machines.get(&input.resource_arn) {
+                    None => Err(not_found(&input.resource_arn)),
+                    // A resource with no tags has an EMPTY tag list, not an absent
+                    // one: the member is "an array of tags associated with the
+                    // resource", and the array of a resource nothing tagged is empty.
+                    Some(machine) => Ok(ListTagsForResourceOutput {
+                        tags: Some(machine.tags.clone()),
+                    }),
+                }
+            }
+        }
     }
 }

@@ -25,3 +25,5 @@ mod destination_update;
 mod refusal_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_encryption.rs"]
+mod stream_encryption;

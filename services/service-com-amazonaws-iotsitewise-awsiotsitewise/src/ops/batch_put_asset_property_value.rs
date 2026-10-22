@@ -94,6 +94,8 @@
 //!   the allowed number of messages per second, and so on. For more information, see Quotas
 //!   in the IoT SiteWise User Guide.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -205,6 +207,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The window every TQV's timestamp is judged against is anchored on ONE
+        // instant for the whole request, so two entries of the same batch cannot
+        // disagree about where "now" was.
+        let now = SystemTime::now();
+
+        // "This setting enables partial ingestion at entry-level. If set to true, we
+        // ingest all TQVs not resulting in an error. If set to false, an invalid TQV
+        // fails ingestion of the entire entry that contains it." Absent is the
+        // all-or-nothing form: the flag has to be asked for.
+        let partial = input.enable_partial_entry_processing.unwrap_or(false);
+
         let mut store = state.lock();
         let mut error_entries = Vec::new();
 
@@ -235,18 +248,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
-            // A property accepts only values of its own data type, and a `Variant`
-            // carries a value "of a single type only".
-            if let Some((code, message)) = entry
-                .property_values
-                .iter()
-                .find_map(|value| reject_value(&data_type, value))
-            {
-                error_entries.push(error_entry(entry, code, message));
-                continue;
+            // Per-TQV refusals. Each value of the entry must carry a variant of the
+            // property's own data type AND a timestamp inside the window IoT
+            // SiteWise accepts; a value that fails either is reported against the
+            // entry with its own `BatchPutAssetPropertyValueErrorCode`.
+            let mut refused: Vec<(&'static str, String, TimeInNanos)> = Vec::new();
+            let mut accepted: Vec<&AssetPropertyValue> = Vec::new();
+            for value in &entry.property_values {
+                match reject_value(&data_type, value)
+                    .or_else(|| reject_timestamp(now, &value.timestamp))
+                {
+                    Some((code, message)) => {
+                        refused.push((code, message, value.timestamp.clone()))
+                    }
+                    None => accepted.push(value),
+                }
             }
 
-            for value in &entry.property_values {
+            if !refused.is_empty() {
+                error_entries.push(BatchPutAssetPropertyErrorEntry {
+                    entry_id: entry.entry_id.clone(),
+                    errors: group_errors(&refused),
+                });
+                // Without partial entry processing "an invalid TQV fails ingestion
+                // of the entire entry that contains it", so the entry's good values
+                // are dropped along with the bad ones.
+                if !partial {
+                    continue;
+                }
+            }
+
+            for value in accepted {
                 store.record_property_value(&asset_id, &property_id, value.clone());
             }
         }
@@ -264,6 +296,85 @@ const MAX_ENTRIES: usize = 10;
 /// `PutAssetPropertyValueEntry$propertyValues`: "You can specify up to 10
 /// `propertyValues` array elements."
 const MAX_VALUES_PER_ENTRY: usize = 10;
+
+/// How far in the PAST a TQV's timestamp may fall, from the operation's own model
+/// doc: "With respect to Unix epoch time, IoT SiteWise accepts only TQVs that have
+/// a timestamp of no more than 7 days in the past and no more than 10 minutes in
+/// the future. IoT SiteWise rejects timestamps outside of the inclusive range of
+/// [-7 days, +10 minutes] and returns a TimestampOutOfRangeException error."
+const MAX_TIMESTAMP_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How far in the FUTURE a TQV's timestamp may fall; same doc sentence as
+/// [`MAX_TIMESTAMP_AGE`].
+const MAX_TIMESTAMP_LEAD: Duration = Duration::from_secs(10 * 60);
+
+/// The reason to refuse a TQV's timestamp, or `None` when it falls inside the
+/// accepted window.
+///
+/// The window is the INCLUSIVE `[now - 7 days, now + 10 minutes]` the model doc
+/// states, compared at nanosecond resolution because a `TimeInNanos` carries a
+/// nanosecond offset beside its whole seconds. The arithmetic is done in `i128`
+/// nanoseconds so the top of the modelled `timeInSeconds` range
+/// (9223372036854774) cannot overflow it.
+fn reject_timestamp(
+    now: SystemTime,
+    timestamp: &TimeInNanos,
+) -> Option<(&'static str, String)> {
+    let offset_in_nanos = timestamp.offset_in_nanos.unwrap_or(0);
+    // A `SystemTime` before the Unix epoch is not a request condition — it is a
+    // host clock set before 1970, which no realistic TQV timestamp could be judged
+    // against. Anchoring at the epoch is the deliberate degenerate answer: the
+    // window then sits at the epoch, so a present-day timestamp is reported out of
+    // range rather than silently stored.
+    let now_nanos = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0i128, |since_epoch| since_epoch.as_nanos() as i128);
+    let value_nanos = i128::from(timestamp.time_in_seconds) * 1_000_000_000
+        + i128::from(offset_in_nanos);
+    let oldest = now_nanos - MAX_TIMESTAMP_AGE.as_nanos() as i128;
+    let newest = now_nanos + MAX_TIMESTAMP_LEAD.as_nanos() as i128;
+    if value_nanos >= oldest && value_nanos <= newest {
+        return None;
+    }
+    Some((
+        "TimestampOutOfRangeException",
+        format!(
+            "The timestamp {}.{offset_in_nanos:09} is outside the inclusive range of \
+             [-{} days, +{} minutes] around the current time, so IoT SiteWise cannot \
+             store it.",
+            timestamp.time_in_seconds,
+            MAX_TIMESTAMP_AGE.as_secs() / (24 * 60 * 60),
+            MAX_TIMESTAMP_LEAD.as_secs() / 60,
+        ),
+    ))
+}
+
+/// The entry's `errors` list, one element per distinct error code among the
+/// refused values, carrying the timestamps of the values that hit that code —
+/// `BatchPutAssetPropertyError$timestamps` is "a list of timestamps for each
+/// error".
+///
+/// Codes keep the order they were first met in, so the list is a function of the
+/// request rather than of a hash iteration order. One message per code — the
+/// first value that hit it — stands for the whole group; `errorMessage` is a
+/// single required string, so it describes the code rather than every timestamp
+/// listed beside it.
+fn group_errors(
+    refused: &[(&'static str, String, TimeInNanos)],
+) -> Vec<BatchPutAssetPropertyError> {
+    let mut errors: Vec<BatchPutAssetPropertyError> = Vec::new();
+    for (code, message, timestamp) in refused {
+        match errors.iter_mut().find(|error| error.error_code == *code) {
+            Some(error) => error.timestamps.push(timestamp.clone()),
+            None => errors.push(BatchPutAssetPropertyError {
+                error_code: (*code).to_string(),
+                error_message: message.clone(),
+                timestamps: vec![timestamp.clone()],
+            }),
+        }
+    }
+    errors
+}
 
 /// Resolve one entry to `(assetId, propertyId, dataType)`, failing with the
 /// `BatchPutAssetPropertyValueErrorCode` the entry should report.

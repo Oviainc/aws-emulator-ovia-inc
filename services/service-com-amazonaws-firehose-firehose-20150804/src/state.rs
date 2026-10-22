@@ -110,6 +110,12 @@ pub const ENCRYPTION_DISABLING: &str = "DISABLING";
 /// DISABLED".
 pub const ENCRYPTION_DISABLED: &str = "DISABLED";
 
+/// The `DeliveryStreamEncryptionStatus` a disable that failed leaves behind: encryption is
+/// still in force, so a further `StopDeliveryStreamEncryption` has something to disable.
+/// Modelled (`DeliveryStreamEncryptionStatus`) but unreachable here, because nothing in
+/// this emulator fails an encryption change.
+pub const ENCRYPTION_DISABLING_FAILED: &str = "DISABLING_FAILED";
+
 /// The `DeliveryStreamEncryptionStatus` values that mean an SSE change is still in
 /// flight, so another encryption call on the same stream is refused.
 ///
@@ -143,7 +149,8 @@ impl StreamStatus {
 /// its due instant has passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingTransition {
-    /// `CREATING` -> `ACTIVE` (and `ENABLING` -> `ENABLED` for encryption enabled at create).
+    /// `CREATING` -> `ACTIVE` (and `ENABLING` -> `ENABLED` for encryption enabled at
+    /// create, which settles with the creation it rode along with).
     Activate,
     /// `DELETING` -> gone from the register.
     Remove,
@@ -234,7 +241,11 @@ impl DeliveryStream {
         format!("destinationId-{ordinal:012}")
     }
 
-    /// Whether server-side encryption is in force for this stream right now.
+    /// Whether server-side encryption is in force for the data this stream takes right
+    /// now, which is what `PutRecord`/`PutRecordBatch` report as `Encrypted`. Only a
+    /// settled `ENABLED` encrypts: "You can continue to read and write data to your
+    /// Firehose stream while the encryption status is ENABLING, but the data is not
+    /// encrypted."
     fn is_encrypted(&self) -> bool {
         self.encryption
             .as_ref()

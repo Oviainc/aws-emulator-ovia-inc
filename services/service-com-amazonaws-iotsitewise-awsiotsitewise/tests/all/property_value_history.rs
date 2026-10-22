@@ -30,11 +30,29 @@ const QUALITIES: [&str; 3] = ["GOOD", "BAD", "UNCERTAIN"];
 /// `maxResults` is 20000."
 const MAX_RESULTS: i64 = 20_000;
 
+/// The epoch this suite's tables measure their seconds from.
+///
+/// They name small seconds (100..9000) rather than calendar instants, and
+/// `BatchPutAssetPropertyValue` ingests only TQVs inside
+/// `[now - 7 days, now + 10 minutes]`, so the shared `super::support` anchoring
+/// maps this epoch into the accepted window at the wire boundary.
+const ROW_EPOCH: i64 = 0;
+
+/// A table second as the absolute `timeInSeconds` the wire carries.
+fn anchored(seconds: i64) -> i64 {
+    super::support::anchored(ROW_EPOCH, seconds)
+}
+
+/// The inverse of [`anchored`].
+fn relative(seconds: i64) -> i64 {
+    super::support::relative(ROW_EPOCH, seconds)
+}
+
 /// The RFC 3339 form a query-bound timestamp takes on the wire: `startDate` and
 /// `endDate` carry no `@timestampFormat`, so an `@httpQuery` timestamp uses
 /// Smithy's default `date-time` format.
 fn query_date(seconds: i64) -> String {
-    DateTime::from_secs(seconds)
+    DateTime::from_secs(anchored(seconds))
         .fmt(Format::DateTime)
         .expect("a formattable timestamp")
 }
@@ -78,7 +96,7 @@ async fn write_samples(
                     .map(|(seconds, quality)| {
                         let mut sample = json!({
                             "value": {"doubleValue": value_at(*seconds)},
-                            "timestamp": {"timeInSeconds": seconds, "offsetInNanos": 0},
+                            "timestamp": {"timeInSeconds": anchored(*seconds), "offsetInNanos": 0},
                         });
                         if let Some(quality) = quality {
                             sample["quality"] = json!(quality);
@@ -115,16 +133,19 @@ async fn history(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     call(router, "GET", &format!("/properties/history?{query}"), None).await
 }
 
-/// The `timeInSeconds` of every reported sample, in the order reported.
+/// The `timeInSeconds` of every reported sample, as this suite's relative seconds,
+/// in the order reported.
 fn reported_seconds(body: &Value) -> Vec<i64> {
     body["assetPropertyValueHistory"]
         .as_array()
         .unwrap_or_else(|| panic!("no assetPropertyValueHistory in {body}"))
         .iter()
         .map(|sample| {
-            sample["timestamp"]["timeInSeconds"]
-                .as_i64()
-                .unwrap_or_else(|| panic!("a sample with no timeInSeconds in {body}"))
+            relative(
+                sample["timestamp"]["timeInSeconds"]
+                    .as_i64()
+                    .unwrap_or_else(|| panic!("a sample with no timeInSeconds in {body}")),
+            )
         })
         .collect()
 }
@@ -135,9 +156,11 @@ fn assert_values_match(case: &str, body: &Value) {
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: no assetPropertyValueHistory in {body}"))
     {
-        let seconds = sample["timestamp"]["timeInSeconds"]
-            .as_i64()
-            .unwrap_or_else(|| panic!("case {case:?}: a sample with no timeInSeconds in {body}"));
+        let seconds = relative(
+            sample["timestamp"]["timeInSeconds"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("case {case:?}: a sample with no timeInSeconds in {body}")),
+        );
         assert_eq!(
             sample["value"]["doubleValue"].as_f64(),
             Some(value_at(seconds)),

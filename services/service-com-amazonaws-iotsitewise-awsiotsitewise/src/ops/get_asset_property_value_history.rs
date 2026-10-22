@@ -323,21 +323,19 @@ const MAX_RESULTS: i32 = 20_000;
 /// with ASCENDING the documented default.
 const ORDER_DESCENDING: &str = "DESCENDING";
 
-/// The `Quality` a sample stored without one counts as: IoT SiteWise records a
-/// reading whose write carried no `quality` as `GOOD`.
-const QUALITY_GOOD: &str = "GOOD";
-
 /// Whether `sample` survives the requested quality filter.
 ///
 /// `qualities` is "the quality by which to filter asset data": a request that names
 /// none asks for every sample, and one that names a quality keeps only the samples
-/// reporting it.
+/// reporting it. The quality a sample stored without one counts as comes from the
+/// shared [`crate::state::quality_of`], so this filter and the quality-aware write
+/// in `BatchPutAssetPropertyValue` cannot disagree about it.
 fn keeps_quality(qualities: Option<&[String]>, sample: &AssetPropertyValue) -> bool {
     match qualities {
         // A filter naming no quality — absent, or the empty list — asks for all of them.
         None | Some([]) => true,
         Some(wanted) => {
-            let quality = sample.quality.as_deref().unwrap_or(QUALITY_GOOD);
+            let quality = crate::state::quality_of(sample);
             wanted.iter().any(|candidate| candidate == quality)
         }
     }

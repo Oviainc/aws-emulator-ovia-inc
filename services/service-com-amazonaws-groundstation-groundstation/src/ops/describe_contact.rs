@@ -181,7 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle_due_contacts();
         let contact = guard.contacts.get(&input.contact_id).ok_or_else(|| {
             DescribeContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("No contact with id {} exists", input.contact_id)),
+                // This service's `DescribeContact` text is a fixed literal: it does not
+                // disclose the id that was asked for. `CancelContact` answers a
+                // DIFFERENT text for the same missing contact, so the two are not built
+                // from one template.
+                message: Some("Contact not found".to_string()),
             })
         })?;
 

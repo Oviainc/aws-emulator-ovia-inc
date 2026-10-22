@@ -19,11 +19,15 @@ mod asset_model_properties;
 mod asset_property_update;
 #[path = "all/batch_get_latest_values.rs"]
 mod batch_get_latest_values;
+#[path = "all/batch_put_timestamp_and_quality.rs"]
+mod batch_put_timestamp_and_quality;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support.rs"]
+mod support;
 #[path = "all/time_series.rs"]
 mod time_series;

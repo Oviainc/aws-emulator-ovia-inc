@@ -145,7 +145,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         let contact = guard.contacts.get_mut(&input.contact_id).ok_or_else(|| {
             CancelContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("No contact with id {} exists", input.contact_id)),
+                // This service's `CancelContact` text quotes the requested id and
+                // terminates the sentence — a different text from `DescribeContact`'s
+                // for the same missing contact.
+                message: Some(format!(
+                    "Contact with id '{}' does not exist.",
+                    input.contact_id
+                )),
             })
         })?;
 
