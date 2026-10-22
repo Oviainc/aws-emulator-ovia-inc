@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTelemetryRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTelemetryRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTelemetryRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the one stored telemetry rule `RuleIdentifier` names from
+//! [`crate::state`], together with its tags and every fan-out replica it owns, and
+//! answers an empty body. The next read of that identifier is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTelemetryRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTelemetryRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTelemetryRule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTelemetryRuleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry rule store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_millis();
+
+        let mut store = state.lock();
+        let Some(record) = store.rule(&region, &input.rule_identifier, now) else {
+            return Err(DeleteTelemetryRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no telemetry rule '{}' in {region}",
+                        input.rule_identifier
+                    )),
+                    resource_id: Some(input.rule_identifier),
+                    resource_type: Some("telemetry-rule".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `IsReplicated`'s own documentation: "Replicated rules cannot be directly
+        // updated or deleted in the spoke region. To modify a replicated rule, make
+        // changes in the home region." This operation models no `ConflictException`,
+        // so the refusal is its `ValidationException` — the client-input error it
+        // does model — naming the member and the region to call instead.
+        if record.is_replica {
+            let home_region = record.home_region.clone();
+            let rule_name = record.rule_name.clone();
+            return Err(DeleteTelemetryRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "RuleIdentifier names telemetry rule '{rule_name}', a replica in {region} \
+                         of the rule in {home_region}; delete it in its home region"
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let key = record.key();
+        store.remove_rule_tree(&key);
+
+        Ok(DeleteTelemetryRuleOutput)
     }
 }

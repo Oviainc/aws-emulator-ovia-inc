@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTelemetryRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTelemetryRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTelemetryRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a telemetry rule: stores the whole `Rule` body, its `Tags` and its creation
+//! and update timestamps in [`crate::state`] under the name the caller chose and the
+//! region the request was signed for, starts the fan-out its multi-region scope asks
+//! for, and answers the ARN built from that name, region and the emulator's account.
+//! A name already in use in that region is a `ConflictException`, never an overwrite.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTelemetryRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTelemetryRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTelemetryRule"))
+        // `RuleName`'s 1..100 length and `^[0-9A-Za-z-_.#/]+$` pattern, `Rule`'s
+        // presence and its required `TelemetryType` and the `Tags` map's 1..50
+        // length are modelled, so the centralized walk has already refused anything
+        // outside them with a 400 `ValidationException` before this body runs. What
+        // is left — the enum value sets, and the `Regions`/`AllRegions` exclusion and
+        // the MAXIMUM of the `Regions` list, which the model does not carry — is in
+        // `telemetry_rule_rejection`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTelemetryRuleErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry rule store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        if let Some(why) = crate::state::telemetry_rule_rejection(&input.rule, &region) {
+            return Err(CreateTelemetryRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(why),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let created_at = crate::state::now_epoch_millis();
+        // The fan-out set is computed, bounded and counted BEFORE anything is
+        // allocated: it is at most `MAX_REPLICATION_TARGETS` regions of the home
+        // region's partition, whatever the request listed.
+        let replication_targets = crate::state::replication_targets(&input.rule, &region);
+
+        let mut store = state.lock();
+
+        // A rule name identifies the rule within its region, so a second create
+        // cannot take a name already in use there — including one a fan-out replica
+        // occupies, which is a record this region holds whether or not the fan-out
+        // has come due.
+        if store.name_taken(&region, &input.rule_name) {
+            return Err(CreateTelemetryRuleErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a telemetry rule named '{}' already exists in {region}",
+                        input.rule_name
+                    )),
+                    resource_id: Some(input.rule_name.clone()),
+                    resource_type: Some("telemetry-rule".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store is finite, and the cap covers the fan-out replicas this create
+        // would add as well as the rule itself: a create that would take it past
+        // either bound is refused BEFORE a single record is allocated.
+        if store.home_rule_count() >= crate::state::MAX_TELEMETRY_RULES
+            || store.would_exceed_store(1 + replication_targets.len())
+        {
+            return Err(
+                CreateTelemetryRuleErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} telemetry rules, or \
+                             this rule's {} replicas would take the store past its {} records",
+                            crate::state::MAX_TELEMETRY_RULES,
+                            replication_targets.len(),
+                            crate::state::MAX_STORED_RULE_RECORDS
+                        )),
+                        resource_type: Some("telemetry-rule".to_string()),
+                        service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let rule_arn = crate::state::rule_arn(&region, &input.rule_name);
+        store.create_rule(
+            crate::state::StoredTelemetryRule {
+                rule_name: input.rule_name,
+                region: region.clone(),
+                rule_arn: rule_arn.clone(),
+                replication_targets,
+                rule: ::std::sync::Arc::new(input.rule),
+                created_timestamp_ms: created_at,
+                last_update_timestamp_ms: created_at,
+                home_region: region,
+                is_replica: false,
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+            },
+            created_at,
+        );
+
+        Ok(CreateTelemetryRuleOutput {
+            rule_arn: Some(rule_arn),
+        })
     }
 }
