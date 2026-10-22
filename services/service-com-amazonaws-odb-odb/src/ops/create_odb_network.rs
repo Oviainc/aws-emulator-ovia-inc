@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOdbNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOdbNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOdbNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an ODB network, persists the whole record in [`crate::state`] and answers from
+//! it. The operation is `@idempotent`: a repeat call carrying a `clientToken` already
+//! seen answers with the network that token minted rather than a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +195,245 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOdbNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOdbNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOdbNetwork"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // `displayName`'s `@pattern` is written with a negative lookahead, which the
+        // boundary validator's regex engine cannot compile — it passes such a pattern
+        // unchecked, so the constraint is enforced here.
+        if !crate::state::display_name_matches(&input.display_name) {
+            return Err(field_validation(
+                "displayName",
+                &format!(
+                    "Value '{}' does not satisfy the constraint: Member must satisfy regular \
+                     expression pattern: {}",
+                    input.display_name,
+                    crate::state::RESOURCE_DISPLAY_NAME_PATTERN
+                ),
+            ));
+        }
+
+        // "This operation requires that you specify a value for either availabilityZone
+        // or availabilityZoneId" — the model's own wording on both members. Neither is
+        // `@required` on its own, so the model cannot express the pair and the boundary
+        // validator cannot refuse a request that carries neither.
+        if input.availability_zone.is_none() && input.availability_zone_id.is_none() {
+            return Err(field_validation(
+                "availabilityZone",
+                "either availabilityZone or availabilityZoneId must be specified",
+            ));
+        }
+
+        // The access flags drive the `managedServices` view a read answers with, so an
+        // unmodelled value cannot be stored. The framework already refuses every
+        // modelled constraint before `handle` runs; this keeps the derivation total
+        // rather than assuming it did.
+        let s3_access = access_or_default("s3Access", input.s3_access.as_deref())?;
+        let zero_etl_access = access_or_default("zeroEtlAccess", input.zero_etl_access.as_deref())?;
+        let sts_access = access_or_default("stsAccess", input.sts_access.as_deref())?;
+        let kms_access = access_or_default("kmsAccess", input.kms_access.as_deref())?;
+
+        // The subnet constraints the model documents: each CIDR is an IPv4 block, must
+        // not intrude on a range OCI reserves, and the two must not overlap.
+        let client_subnet = subnet_cidr("clientSubnetCidr", &input.client_subnet_cidr)?;
+        let backup_subnet = match input.backup_subnet_cidr.as_deref() {
+            None => None,
+            Some(value) => Some(subnet_cidr("backupSubnetCidr", value)?),
+        };
+        if let Some(backup_subnet) = backup_subnet {
+            if crate::state::cidrs_overlap(client_subnet, backup_subnet) {
+                return Err(field_validation(
+                    "backupSubnetCidr",
+                    &format!(
+                        "CIDR range {} overlaps the client subnet CIDR range {}",
+                        input.backup_subnet_cidr.as_deref().unwrap_or_default(),
+                        input.client_subnet_cidr
+                    ),
+                ));
+            }
+        }
+
+        // A cross-Region restore source names an Amazon Web Services Region; an
+        // arbitrary caller string is refused rather than persisted, and the stored list
+        // is de-duplicated and capped so one request cannot grow a record past the
+        // bound `UpdateOdbNetwork` also enforces.
+        let restore_sources = restore_sources(
+            input.cross_region_s3_restore_sources_to_enable.as_deref(),
+        )?;
+
+        let mut guard = state.lock();
+
+        // `@idempotent` with an `@idempotencyToken`: the same token names the same
+        // network, so a retried create answers from the record the first call stored.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = guard.odb_network_for_token(token) {
+                return Ok(CreateOdbNetworkOutput {
+                    odb_network_id: existing.odb_network_id.clone(),
+                    display_name: Some(existing.display_name.clone()),
+                    status: Some(existing.status.clone()),
+                    status_reason: existing.status_reason.clone(),
+                });
+            }
+        }
+
+        // The account's ODB network quota: a create beyond it is refused, which is also
+        // what keeps the store finite — a record is released only by `DeleteOdbNetwork`.
+        if guard.odb_networks.len() >= crate::state::MAX_ODB_NETWORKS_PER_ACCOUNT {
+            return Err(CreateOdbNetworkErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The account already holds the maximum of {} ODB networks",
+                        crate::state::MAX_ODB_NETWORKS_PER_ACCOUNT
+                    ),
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::ODB_NETWORK_RESOURCE_TYPE.to_string(),
+                    quota_code: crate::state::ODB_NETWORKS_QUOTA_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(odb_network_id) = guard.mint_odb_network_id() else {
+            return Err(CreateOdbNetworkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "could not mint a unique ODB network id".to_string(),
+                    retry_after_seconds: Some(1),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let record = crate::state::OdbNetworkRecord {
+            odb_network_arn: crate::state::odb_network_arn(&region, &odb_network_id),
+            odb_network_id: odb_network_id.clone(),
+            display_name: input.display_name.clone(),
+            // A newly created ODB network is still being provisioned; the clock owes it
+            // `AVAILABLE` after `TRANSITION_SPAN`.
+            status: crate::state::STATUS_PROVISIONING.to_string(),
+            status_reason: None,
+            availability_zone: input.availability_zone.clone(),
+            availability_zone_id: input.availability_zone_id.clone(),
+            client_subnet_cidr: input.client_subnet_cidr.clone(),
+            backup_subnet_cidr: input.backup_subnet_cidr.clone(),
+            custom_domain_name: input.custom_domain_name.clone(),
+            default_dns_prefix: input.default_dns_prefix.clone(),
+            peered_cidrs: Vec::new(),
+            s3_access,
+            zero_etl_access,
+            sts_access,
+            kms_access,
+            s3_policy_document: input.s3_policy_document.clone(),
+            sts_policy_document: input.sts_policy_document.clone(),
+            kms_policy_document: input.kms_policy_document.clone(),
+            cross_region_s3_restore_sources: restore_sources,
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            created_at: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            settles_at: ::std::time::Instant::now() + crate::state::TRANSITION_SPAN,
+        };
+        let output = CreateOdbNetworkOutput {
+            odb_network_id,
+            display_name: Some(record.display_name.clone()),
+            status: Some(record.status.clone()),
+            status_reason: record.status_reason.clone(),
+        };
+        guard.insert_odb_network(record, input.client_token.as_deref());
+
+        Ok(output)
     }
+}
+
+/// The modelled server error for an engine that holds no state for this service.
+fn internal_error() -> CreateOdbNetworkError {
+    CreateOdbNetworkErrorModeled::InternalServerException(InternalServerException {
+        message: "the odb emulator is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// A modelled `ValidationException` (HTTP 400) naming the member that failed and the
+/// constraint it failed, the way the service's own boundary validator words one.
+fn field_validation(member: &str, message: &str) -> CreateOdbNetworkError {
+    CreateOdbNetworkErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {message}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// The `Access` value this member carries, defaulting to `DISABLED` when the request
+/// leaves the access configuration out.
+fn access_or_default(member: &str, value: Option<&str>) -> Result<String, CreateOdbNetworkError> {
+    match value {
+        None => Ok(crate::state::ACCESS_DISABLED.to_string()),
+        Some(value) if ACCESS_VALUES.contains(&value) => Ok(value.to_string()),
+        Some(value) => Err(field_validation(
+            member,
+            &format!(
+                "Value '{}' is not a member of Access: {}",
+                value,
+                ACCESS_VALUES.join(" | ")
+            ),
+        )),
+    }
+}
+
+/// The cross-Region restore sources to store: every entry an Amazon Web Services Region
+/// name, de-duplicated, and no more of them than one ODB network may hold.
+fn restore_sources(values: Option<&[String]>) -> Result<Vec<String>, CreateOdbNetworkError> {
+    const MEMBER: &str = "crossRegionS3RestoreSourcesToEnable";
+    let mut regions: Vec<String> = Vec::new();
+    for value in values.unwrap_or_default() {
+        if !crate::state::is_region_name(value) {
+            return Err(field_validation(
+                MEMBER,
+                &format!(
+                    "Value '{value}' is not an Amazon Web Services Region name (pattern: {})",
+                    crate::state::AWS_REGION_PATTERN
+                ),
+            ));
+        }
+        if regions.iter().any(|region| region == value) {
+            continue;
+        }
+        if regions.len() >= crate::state::MAX_CROSS_REGION_RESTORE_SOURCES_PER_ODB_NETWORK {
+            return Err(field_validation(
+                MEMBER,
+                &format!(
+                    "An ODB network holds at most {} cross-Region Amazon S3 restore sources",
+                    crate::state::MAX_CROSS_REGION_RESTORE_SOURCES_PER_ODB_NETWORK
+                ),
+            ));
+        }
+        regions.push(value.clone());
+    }
+    Ok(regions)
+}
+
+/// A client or backup subnet CIDR block, refused when it is not an IPv4 CIDR block or
+/// when it intrudes on a range OCI reserves (see [`crate::state::OCI_RESERVED_CIDRS`]).
+fn subnet_cidr(member: &str, value: &str) -> Result<::ipnet::Ipv4Net, CreateOdbNetworkError> {
+    let Some(cidr) = crate::state::parse_cidr(value) else {
+        return Err(field_validation(
+            member,
+            &format!("Value '{value}' is not an IPv4 CIDR range"),
+        ));
+    };
+    if let Some(reserved) = crate::state::reserved_cidr_conflict(cidr) {
+        return Err(field_validation(
+            member,
+            &format!("CIDR range {value} intrudes on {reserved}, which is reserved by OCI"),
+        ));
+    }
+    Ok(cidr)
 }
