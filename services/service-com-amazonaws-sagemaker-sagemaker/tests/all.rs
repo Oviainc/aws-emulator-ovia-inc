@@ -23,6 +23,8 @@ mod batch_transform_jobs;
 mod code_repositories;
 #[path = "all/endpoint_config_deletion.rs"]
 mod endpoint_config_deletion;
+#[path = "all/hub_contents_listing.rs"]
+mod hub_contents_listing;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
 #[path = "all/lineage_action_lifecycle.rs"]
