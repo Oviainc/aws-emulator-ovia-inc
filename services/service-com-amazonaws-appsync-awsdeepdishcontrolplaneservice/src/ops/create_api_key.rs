@@ -164,6 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(CreateApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
         let now = unix_seconds();
         // "From the creation time, the time after which the API key expires. [...] The
         // default value for this parameter is 7 days from creation time." An unset
@@ -197,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let Some(api) = guard.graphql_apis.get(&input.api_id) else {
                 return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!("No GraphQL API found with ID {}", input.api_id)),
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into());
             };
@@ -234,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
             return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("No GraphQL API found with ID {}", input.api_id)),
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };

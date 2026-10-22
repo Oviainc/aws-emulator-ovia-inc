@@ -26,7 +26,7 @@ const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 /// Create an asset model from `body` and return its id. Unlike the harness's
 /// `create_model`, this takes the whole request body: these suites need
 /// `assetModelHierarchies` and `assetModelExternalId`.
-async fn create_model(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn create_model(router: &MultiServiceRouter, body: Value) -> String {
     let (status, parsed) = call(router, "POST", "/asset-models", Some(body.clone())).await;
     assert_eq!(status, 202, "create model {body}: got {status} {parsed}");
     parsed["assetModelId"]
@@ -36,7 +36,7 @@ async fn create_model(router: &MultiServiceRouter, body: Value) -> String {
 }
 
 /// Create an asset from `body` and return its id.
-async fn create_asset(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn create_asset(router: &MultiServiceRouter, body: Value) -> String {
     let (status, parsed) = call(router, "POST", "/assets", Some(body.clone())).await;
     assert_eq!(status, 202, "create asset {body}: got {status} {parsed}");
     parsed["assetId"]
@@ -47,7 +47,7 @@ async fn create_asset(router: &MultiServiceRouter, body: Value) -> String {
 
 /// The minted id of the `name` hierarchy of the stored asset model `model_id`, read
 /// back through `DescribeAssetModel`.
-async fn hierarchy_id(router: &MultiServiceRouter, model_id: &str, name: &str) -> String {
+pub(crate) async fn hierarchy_id(router: &MultiServiceRouter, model_id: &str, name: &str) -> String {
     let (status, body) = call(router, "GET", &format!("/asset-models/{model_id}"), None).await;
     assert_eq!(status, 200, "describe model {model_id}: got {status} {body}");
     body["assetModelHierarchies"]
@@ -61,7 +61,7 @@ async fn hierarchy_id(router: &MultiServiceRouter, model_id: &str, name: &str) -
 }
 
 /// `POST /assets/{assetId}/associate`.
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     parent: &str,
     hierarchy: &str,

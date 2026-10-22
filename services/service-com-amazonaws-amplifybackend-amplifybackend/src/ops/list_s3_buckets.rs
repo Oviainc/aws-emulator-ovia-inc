@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListS3Buckets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListS3Buckets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListS3Buckets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers
+//!
+//! "The list of S3 buckets in your account" — so the buckets reported are the ones
+//! Amazon S3 holds, read from the S3 service's own store through the one shared engine
+//! ([`s3_buckets`] below). This service keeps no bucket registry of its own: a bucket
+//! created or deleted over the S3 API is reported, or stops being reported, with no
+//! propagation step.
+//!
+//! Each bucket is reported with its `Name` and its `CreationDate` — the instant S3
+//! recorded it, rendered the way this service renders every timestamp member
+//! ([`crate::state::format_time`]). The order is bucket-name order, the order S3 itself
+//! lists buckets in.
+//!
+//! This is a REPORTING operation: it writes nothing, so two calls with no intervening
+//! S3 call answer identically.
+//!
+//! `NextToken` is "Reserved for future use" on both the input and the output (the
+//! model's own documentation for both members), so the answer is the single page of
+//! every bucket the account holds and carries no `NextToken`; an input token is
+//! accepted and reserved members decide nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +85,42 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use ::std::time::SystemTime;
+
+/// The S3 buckets this account holds, as `(name, creation instant)` pairs in
+/// bucket-name order. The instant is absent only for a bucket S3 holds without one,
+/// which `create_bucket` never produces — the reader reports no `CreationDate` for such
+/// a bucket rather than inventing one.
+///
+/// `ListS3Buckets` reports "The list of S3 buckets in your account", so the buckets it
+/// reports are the ones Amazon S3 holds — not a registry of this service's own. They are
+/// read from the S3 service's OWN store through the one shared engine, so a bucket
+/// created or removed over the S3 API is reported here with no propagation step and
+/// without this service keeping a second copy of the map.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one),
+/// which the handler answers with `crate::state::store_unavailable` exactly as it does
+/// for this service's own store.
+///
+/// LOCK ORDER: this takes the S3 store's lock and holds no other while it does, and it
+/// hands back owned values rather than a guard — so it is called with NO store guard of
+/// this service held (`ListS3Buckets` holds none). Keeping the cross-service read
+/// one-directional and guard-free is what makes a lock cycle between the two stores
+/// unreachable. The vector it allocates is bounded by S3's own
+/// `MAX_BUCKETS_PER_ACCOUNT`.
+fn s3_buckets<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<Vec<(String, Option<SystemTime>)>> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let store = state.lock();
+    Some(
+        store
+            .buckets()
+            .map(|(name, bucket)| (name.to_string(), bucket.created_at()))
+            .collect(),
+    )
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +193,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListS3Buckets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListS3BucketsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListS3Buckets"))
+        // `NextToken` is reserved on both sides of this operation, so it selects
+        // nothing: whatever the caller sent, the answer is the one page of every bucket.
+        let _ = (&input.next_token, ctx);
+
+        let buckets = s3_buckets(&*self.engine).ok_or_else(|| {
+            ListS3BucketsError::from(ListS3BucketsErrorModeled::GatewayTimeoutException(
+                crate::state::store_unavailable(),
+            ))
+        })?;
+
+        Ok(ListS3BucketsOutput {
+            buckets: Some(
+                buckets
+                    .into_iter()
+                    .map(|(name, created_at)| S3BucketInfo {
+                        // Reported only for a bucket S3 recorded an instant for, which
+                        // is every bucket it holds; never invented for one it did not.
+                        creation_date: created_at.map(crate::state::format_time),
+                        name: Some(name),
+                    })
+                    .collect(),
+            ),
+            // Reserved for future use, and this answer is the whole account: there is no
+            // further page to name.
+            next_token: None,
+        })
     }
 }

@@ -4,7 +4,8 @@
 //!
 //! This holds the REST API resource tree the control plane persists — a `RestApi`, the
 //! `Resource`s under it (including the implicit root resource every API is created
-//! with) and the `Method`s put on those resources. Every handler in `src/ops/` computes
+//! with) and the `Method`s put on those resources — beside the account's `ApiKey`
+//! records. Every handler in `src/ops/` computes
 //! its response from these records; nothing is synthesised per request.
 //!
 //! A few leaf values are stored as the modelled shapes from [`crate::ops::types`]
@@ -21,6 +22,9 @@ use crate::ops::types::{EndpointConfiguration, GetIntegrationOutput, GetMethodRe
 pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// Every created `RestApi`, keyed by its API id.
     pub rest_apis: BTreeMap<String, RestApiEntry>,
+    /// Every created `ApiKey`, keyed by its API key id — the identifier `GetApiKey`
+    /// and `DeleteApiKey` take in their `apiKey` path label, NOT the key's value.
+    pub api_keys: BTreeMap<String, ApiKeyEntry>,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`]; see there for how an id is derived from it.
     pub id_seed: u64,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`]: the creation rank stamped on each
@@ -112,6 +116,32 @@ pub struct MethodEntry {
     pub integration: Option<GetIntegrationOutput>,
 }
 
+/// One stored `ApiKey`: the identifier the control plane assigns, the key value a
+/// client presents in `x-api-key`, and the record's own attributes.
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeyEntry {
+    pub id: String,
+    /// The key's secret value. Minted by the emulator's credential store (see
+    /// [`mint_api_key_value`]) or supplied by the caller through `CreateApiKey$value`,
+    /// and reported only where the model says so — `CreateApiKey`, and `GetApiKey`
+    /// when the request asks for it with `includeValue`.
+    pub value: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub customer_id: Option<String>,
+    pub enabled: bool,
+    pub created_date: Option<::aws_smithy_types::DateTime>,
+    pub last_updated_date: Option<::aws_smithy_types::DateTime>,
+    /// The stages this key is associated with, each rendered `<restApiId>/<stageName>`
+    /// as the modelled `ApiKey$stageKeys` list of strings reports them.
+    pub stage_keys: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    /// This key's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than id order.
+    pub sequence: u64,
+}
+
 /// The characters an API Gateway id is built from: lowercase alphanumerics.
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -154,6 +184,9 @@ pub const MAX_PAGE_LIMIT: i32 = 500;
 
 /// API Gateway's default quota "APIs per account per Region: 600".
 pub const MAX_REST_APIS: usize = 600;
+
+/// API Gateway's default quota "API keys per account per Region: 10,000".
+pub const MAX_API_KEYS: usize = 10_000;
 
 /// API Gateway's default quota "Resources per API: 300".
 pub const MAX_RESOURCES_PER_API: usize = 300;
@@ -301,6 +334,58 @@ pub const NO_SUCH_RESOURCE: &str = "Invalid Resource identifier specified";
 
 /// The `NotFoundException` message for an `httpMethod` with no method on the resource.
 pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
+
+/// The `NotFoundException` message for an `apiKey` that names no stored API key.
+pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
+
+/// The `target` every audit record this service emits carries, so a consumer can select
+/// the access trail without reading the rest of the emulator's traces.
+///
+/// A state-changing operation emits ONE record, at `INFO`, naming the operation, the
+/// caller's presented access key id, the resource it changed and the outcome. Metadata
+/// only — never a request body, a tag value or a secret, so an API key's `value` is
+/// never among the fields.
+pub const AUDIT_TARGET: &str = "emulator::audit";
+
+/// The identity a request presents, for an audit record: the access key id in its SigV4
+/// credential scope. `emulator_server::extract_akid` answers `"default"` when the
+/// request carries no scope. An access key id NAMES a caller and is not a secret — the
+/// signature and the secret key are never read here.
+pub fn request_caller(parts: &http::request::Parts) -> String {
+    ::emulator_server::extract_akid(&parts.headers)
+}
+
+/// The length of an API Gateway-minted API key value: 40 characters, as observed from
+/// AWS. A caller-supplied `CreateApiKey$value` is stored as given instead.
+const API_KEY_VALUE_LEN: usize = 40;
+
+/// A fresh API key value, for `CreateApiKey` when the request supplies none.
+///
+/// The value is a secret handed to a caller — a client presents it in `x-api-key` — but
+/// it is NOT a credential of this emulator and must never be accepted as one. Nothing in
+/// a service may construct a secret itself, so the value is cut from a secret minted by
+/// the one component that generates secrets, the emulator's credential store, which is
+/// then removed from that store again: the caller gets the secret, the emulator keeps no
+/// credential it would accept, and nothing accumulates per call. Only the alphanumeric
+/// characters of that secret are kept, because an API key value carries no others while
+/// the store's secret alphabet also holds `+` and `/`.
+///
+/// `None` when the store minted no secret, or one with fewer than
+/// [`API_KEY_VALUE_LEN`] usable characters, which leaves the operation to refuse rather
+/// than report a value it made up.
+pub fn mint_api_key_value(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let value: String = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(API_KEY_VALUE_LEN)
+        .collect();
+    // The key value is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    (value.chars().count() == API_KEY_VALUE_LEN).then_some(value)
+}
 
 /// What a handler answers when [`service_state`] cannot reach this service's store.
 ///

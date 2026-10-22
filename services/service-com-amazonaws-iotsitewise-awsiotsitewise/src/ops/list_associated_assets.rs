@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssociatedAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssociatedAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssociatedAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates the hierarchy associations held in
+//! `crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::asset_hierarchy_children`
+//! — the same map `AssociateAssets`/`DisassociateAssets` write and `ListAssets`'s
+//! `TOP_LEVEL` filter reads. It is a pure read: nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +165,264 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssociatedAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssociatedAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssociatedAssets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssociatedAssetsError::Modeled(
+                ListAssociatedAssetsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // `traversalDirection` defaults to CHILD, as this operation's own docs state.
+        // The member targets an enum, so a value outside the two the model declares is
+        // a request error rather than a silently-defaulted one. The shared validation
+        // layer already refuses an off-enum value before this handler runs; this arm is
+        // what keeps that refusal inside this operation's own modelled error set if the
+        // request ever reaches here.
+        let direction = match input
+            .traversal_direction
+            .as_deref()
+            .unwrap_or(DIRECTION_CHILD)
+        {
+            DIRECTION_CHILD => Direction::Child,
+            DIRECTION_PARENT => Direction::Parent,
+            other => {
+                return Err(ListAssociatedAssetsError::Modeled(
+                    ListAssociatedAssetsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: format!(
+                                "traversalDirection must be one of {DIRECTION_CHILD} or \
+                                 {DIRECTION_PARENT}, not {other}."
+                            ),
+                        },
+                    ),
+                ));
+            }
+        };
+
+        let store = state.lock();
+
+        // The label is either the raw UUID or the `externalId:<externalId>` alias
+        // form, for the asset and for the hierarchy alike.
+        let asset_id = store
+            .resolve_asset_id(&input.asset_id)
+            .ok_or_else(|| asset_not_found(&input.asset_id))?;
+
+        // A hierarchy is DEFINED on an asset model and MATERIALISED on every asset of
+        // that model, so a label is resolved where the walk needs it declared: on the
+        // queried asset itself going downwards, and on the assets that hold it as a
+        // child going upwards, because an upward hierarchy belongs to the parent and
+        // so is never one the queried asset declares. A label nothing on that side
+        // declares names no hierarchy of this traversal: a 404, not an empty page,
+        // which would report absence as success.
+        let hierarchy_id = match input.hierarchy_id.as_deref() {
+            Some(label) => {
+                let resolved = match direction {
+                    Direction::Child => store.assets.get(&asset_id).and_then(|asset| {
+                        resolve_hierarchy_label(
+                            asset
+                                .hierarchies
+                                .iter()
+                                .map(|owned| (owned.id.as_deref(), owned.external_id.as_deref())),
+                            label,
+                        )
+                    }),
+                    // Upwards the hierarchy belongs to the PARENT, so the label is
+                    // resolved against the hierarchies of the assets that actually
+                    // hold the queried asset as a child: a label only some unrelated
+                    // model declares names no hierarchy of this traversal, and is
+                    // refused exactly as it is downwards.
+                    Direction::Parent => resolve_hierarchy_label(
+                        store
+                            .asset_hierarchy_children
+                            .iter()
+                            .filter(|(_, children)| {
+                                children.iter().any(|child| child == &asset_id)
+                            })
+                            .filter_map(|((parent, _), _)| store.assets.get(parent))
+                            .flat_map(|parent| parent.hierarchies.iter())
+                            .map(|owned| (owned.id.as_deref(), owned.external_id.as_deref())),
+                        label,
+                    ),
+                };
+                Some(resolved.ok_or_else(|| hierarchy_not_found(label))?)
+            }
+            None => None,
+        };
+
+        // CHILD collects what is associated UNDER the queried asset; PARENT collects
+        // the assets the queried asset is associated under.
+        let mut related: Vec<&str> = match direction {
+            Direction::Child => store
+                .asset_hierarchy_children
+                .iter()
+                .filter(|((parent, hierarchy), _)| {
+                    parent == &asset_id
+                        && hierarchy_id
+                            .as_deref()
+                            .is_none_or(|wanted| hierarchy == wanted)
+                })
+                .flat_map(|(_, children)| children.iter().map(String::as_str))
+                .collect(),
+            Direction::Parent => store
+                .asset_hierarchy_children
+                .iter()
+                .filter(|((_, hierarchy), children)| {
+                    hierarchy_id
+                        .as_deref()
+                        .is_none_or(|wanted| hierarchy == wanted)
+                        && children.iter().any(|child| child == &asset_id)
+                })
+                .map(|((parent, _), _)| parent.as_str())
+                .collect(),
+        };
+        // One asset reachable through two hierarchies is still ONE associated asset.
+        related.sort_unstable();
+        related.dedup();
+
+        let mut matching: Vec<&crate::state::AssetRecord> = related
+            .into_iter()
+            .filter_map(|id| store.assets.get(id))
+            .collect();
+        // A stable order is what makes `nextToken` resumable: oldest first, ties broken
+        // by id so two assets created in the same instant still order deterministically.
+        matching.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first asset of
+        // the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`, exactly as `ListAssets` encodes its own. A token whose
+        // resume point is not in this enumeration is refused rather than answered with
+        // an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                matching
+                    .iter()
+                    .position(|asset| asset.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one this operation's docs publish.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(matching.len());
+
+        let next_token = matching
+            .get(end)
+            .map(|asset| ::hex::encode(asset.id.as_bytes()));
+        let asset_summaries = matching[start..end]
+            .iter()
+            .map(|asset| associated_summary(asset, now))
+            .collect();
+
+        Ok(ListAssociatedAssetsOutput {
+            asset_summaries,
+            next_token,
+        })
     }
+}
+
+/// The page size this operation's docs publish when the caller gives no `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// The `TraversalDirection` value that lists the queried asset's children.
+const DIRECTION_CHILD: &str = "CHILD";
+/// The `TraversalDirection` value that lists the queried asset's parent.
+const DIRECTION_PARENT: &str = "PARENT";
+
+/// Which way this call walks the association graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// The assets associated as children of the queried asset.
+    Child,
+    /// The asset the queried asset is associated under.
+    Parent,
+}
+
+/// This asset as an `AssociatedAssetsSummary`, as of `now`: the same projection
+/// [`crate::state::AssetRecord::summary`] makes for `ListAssets`, in the shape this
+/// operation models.
+fn associated_summary(
+    asset: &crate::state::AssetRecord,
+    now: ::std::time::SystemTime,
+) -> AssociatedAssetsSummary {
+    AssociatedAssetsSummary {
+        id: asset.id.clone(),
+        external_id: asset.external_id.clone(),
+        arn: asset.arn.clone(),
+        name: asset.name.clone(),
+        asset_model_id: asset.asset_model_id.clone(),
+        creation_date: crate::state::to_date_time(asset.creation_date),
+        last_update_date: crate::state::to_date_time(asset.last_update_date),
+        status: asset.status(now),
+        hierarchies: asset.hierarchies.clone(),
+        description: asset.description.clone(),
+    }
+}
+
+/// Resolve a hierarchy `CustomID` label — a raw id or `externalId:<externalId>` —
+/// against the `(id, externalId)` pairs of the hierarchies `declared` holds, to the
+/// hierarchy id an association is keyed by; `None` when none of them declares it.
+fn resolve_hierarchy_label<'a>(
+    declared: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
+    label: &str,
+) -> Option<String> {
+    let external = label.strip_prefix(crate::state::EXTERNAL_ID_PREFIX);
+    declared
+        .filter(|(id, hierarchy_external)| match external {
+            Some(wanted) => *hierarchy_external == Some(wanted),
+            None => *id == Some(label),
+        })
+        .find_map(|(id, _)| id.map(str::to_string))
+}
+
+/// HTTP 404 `ResourceNotFoundException` for an asset label that resolves to no
+/// stored asset. The message is built from the requested identifier, the rule AWS
+/// builds this rejection by.
+fn asset_not_found(label: &str) -> ListAssociatedAssetsError {
+    ListAssociatedAssetsError::Modeled(
+        ListAssociatedAssetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: format!("Asset with ID {label} not found"),
+        }),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a hierarchy label that nothing on this
+/// traversal's side declares — neither the queried asset going downwards, nor any
+/// asset holding it as a child going upwards. Built from the requested identifier.
+fn hierarchy_not_found(label: &str) -> ListAssociatedAssetsError {
+    ListAssociatedAssetsError::Modeled(
+        ListAssociatedAssetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: format!("A hierarchy with ID {label} doesn't exist"),
+        }),
+    )
+}
+
+/// Decode a `nextToken` back into the asset id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListAssociatedAssetsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListAssociatedAssetsError {
+    ListAssociatedAssetsError::Modeled(
+        ListAssociatedAssetsErrorModeled::InvalidRequestException(InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        }),
+    )
 }
