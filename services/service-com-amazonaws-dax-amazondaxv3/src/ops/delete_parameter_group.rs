@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored parameter group, so a later `DescribeParameterGroups` no longer
+//! reports it. Two refusals keep the store consistent, and neither writes anything: the
+//! default group DAX provides is not deletable (`InvalidParameterValueException`), and
+//! "You cannot delete a parameter group if it is associated with any DAX clusters"
+//! (`InvalidParameterGroupStateFault`). An unknown name answers
+//! `ParameterGroupNotFoundFault`.
+//!
+//! Before it reads the clusters it settles the cluster status moves the CLOCK has
+//! already made due (`crate::state::ComAmazonawsDaxAmazondaxv3State::settle_due`), so a
+//! cluster whose deletion came due no longer holds a parameter group back.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +149,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteParameterGroup"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The clock's due cluster transitions first: a cluster whose deletion was
+        // already owed holds nothing any more.
+        store.settle_due(now);
+
+        let Some(group) = store.parameter_groups.get(&input.parameter_group_name) else {
+            return Err(
+                DeleteParameterGroupErrorModeled::ParameterGroupNotFoundFault(
+                    ParameterGroupNotFoundFault {
+                        message: Some(crate::state::parameter_group_not_found_message()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A parameter group AWS provides is not the caller's to remove.
+        if group.default_group {
+            return Err(
+                DeleteParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "Default parameter group cannot be deleted.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "You cannot delete a parameter group if it is associated with any DAX
+        // clusters."
+        let in_use = store.clusters.values().any(|cluster| {
+            cluster.parameter_group_name.as_deref() == Some(input.parameter_group_name.as_str())
+        });
+        if in_use {
+            return Err(
+                DeleteParameterGroupErrorModeled::InvalidParameterGroupStateFault(
+                    InvalidParameterGroupStateFault {
+                        message: Some(format!(
+                            "Parameter group {} is associated with one or more DAX clusters",
+                            input.parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.parameter_groups.remove(&input.parameter_group_name);
+
+        Ok(DeleteParameterGroupOutput {
+            deletion_message: Some(format!(
+                "Parameter group {} has been deleted.",
+                input.parameter_group_name
+            )),
+        })
     }
 }

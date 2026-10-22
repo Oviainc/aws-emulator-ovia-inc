@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Cluster, Endpoint, Node, NotificationConfiguration, ParameterGroupStatus, SSEDescription,
-    SecurityGroupMembership, Subnet, SubnetGroup,
+    Cluster, Endpoint, Node, NotificationConfiguration, ParameterGroup, ParameterGroupStatus,
+    SSEDescription, SecurityGroupMembership, Subnet, SubnetGroup,
 };
 
 /// The region an ARN or an endpoint hostname carries when the request is unsigned and
@@ -103,6 +103,23 @@ pub const MAX_CLUSTERS: usize = 50;
 /// The number of subnet groups the store may hold; a create past it is refused with
 /// `SubnetGroupQuotaExceededFault`.
 pub const MAX_SUBNET_GROUPS: usize = 50;
+
+/// The number of parameter groups the store may hold, counting the default group DAX
+/// provides. Past it a create is refused with the modelled
+/// `ParameterGroupQuotaExceededFault` ("You have attempted to exceed the maximum number
+/// of parameter groups"), so no sequence of requests grows the store without limit. The
+/// emulator picks the bound, as it does for [`MAX_CLUSTERS`] and [`MAX_SUBNET_GROUPS`].
+pub const MAX_PARAMETER_GROUPS: usize = 50;
+
+/// The parameter group every DAX account already has: `DescribeParameterGroups` lists it
+/// before anything has been created, it is what a cluster created without an explicit
+/// `ParameterGroupName` runs with, and `DescribeDefaultParameters` describes its
+/// parameters. It is a RESERVED name — a create cannot take it and a delete cannot remove
+/// it.
+pub const DEFAULT_PARAMETER_GROUP: &str = "default.dax";
+
+/// The description the default parameter group carries.
+pub const DEFAULT_PARAMETER_GROUP_DESCRIPTION: &str = "Default parameter group.";
 
 /// The number of subnets one group may name, so one request cannot store an
 /// arbitrarily long identifier list that every page then re-renders. Past it the create
@@ -339,6 +356,35 @@ impl ClusterRecord {
     }
 }
 
+/// A stored DAX parameter group: everything the modelled `ParameterGroup` reports, plus
+/// whether DAX provides it (a default group, which cannot be deleted).
+#[derive(Debug, Clone)]
+pub struct ParameterGroupRecord {
+    pub name: String,
+    pub description: Option<String>,
+    /// True for a group AWS provides rather than one a caller created.
+    pub default_group: bool,
+}
+
+impl ParameterGroupRecord {
+    /// The default group DAX provides in every account.
+    pub fn default_group() -> Self {
+        Self {
+            name: DEFAULT_PARAMETER_GROUP.to_string(),
+            description: Some(DEFAULT_PARAMETER_GROUP_DESCRIPTION.to_string()),
+            default_group: true,
+        }
+    }
+
+    /// The modelled `ParameterGroup` for this record.
+    pub fn view(&self) -> ParameterGroup {
+        ParameterGroup {
+            parameter_group_name: Some(self.name.clone()),
+            description: self.description.clone(),
+        }
+    }
+}
+
 /// A stored DAX subnet group.
 #[derive(Debug, Clone)]
 pub struct SubnetGroupRecord {
@@ -387,15 +433,34 @@ impl SubnetGroupRecord {
 }
 
 /// Per-service state for com-amazonaws-dax-amazondaxv3. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsDaxAmazondaxv3State {
     /// Clusters by their (lower-cased) `ClusterName`. A `BTreeMap` so every describe
     /// pages in one stable order.
     pub clusters: BTreeMap<String, ClusterRecord>,
     /// Subnet groups by `SubnetGroupName`.
     pub subnet_groups: BTreeMap<String, SubnetGroupRecord>,
+    /// Parameter groups by `ParameterGroupName`, seeded with the default group DAX
+    /// provides (see [`DEFAULT_PARAMETER_GROUP`]). A `BTreeMap` so every describe pages
+    /// in one stable order.
+    pub parameter_groups: BTreeMap<String, ParameterGroupRecord>,
     /// Monotonic node counter, so a node id is unique and reproducible.
     pub next_node_seq: u64,
+}
+
+/// A fresh store is an account DAX has just become available in: no clusters and no
+/// subnet groups, and the one parameter group AWS provides itself. Seeding it HERE rather
+/// than from a handler is what keeps `DescribeParameterGroups` a pure read.
+impl Default for ComAmazonawsDaxAmazondaxv3State {
+    fn default() -> Self {
+        let default_group = ParameterGroupRecord::default_group();
+        Self {
+            clusters: BTreeMap::new(),
+            subnet_groups: BTreeMap::new(),
+            parameter_groups: BTreeMap::from([(default_group.name.clone(), default_group)]),
+            next_node_seq: 0,
+        }
+    }
 }
 
 impl ComAmazonawsDaxAmazondaxv3State {
@@ -540,6 +605,21 @@ pub fn cluster_name_violation(name: &str) -> Option<String> {
         return Some("ClusterName cannot contain two consecutive hyphens".to_string());
     }
     None
+}
+
+/// The message DAX answers when `MaxResults` falls outside the documented window. DAX
+/// words this rejection from a FIXED template that echoes nothing of the request, so it
+/// is built from the documented bounds alone rather than from the value received.
+pub fn max_results_out_of_range_message() -> String {
+    format!(
+        "Invalid value for max records. Must be between {MIN_MAX_RESULTS} and {MAX_MAX_RESULTS}"
+    )
+}
+
+/// The message `ParameterGroupNotFoundFault` carries. Like DAX's other not-found faults
+/// it is generic: the requested name is NOT echoed back.
+pub fn parameter_group_not_found_message() -> String {
+    "Parameter Group not found.".to_string()
 }
 
 /// The page of `names` to answer, and the token that continues it.
