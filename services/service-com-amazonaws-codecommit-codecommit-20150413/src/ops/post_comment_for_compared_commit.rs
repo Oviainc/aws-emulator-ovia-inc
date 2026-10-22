@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PostCommentForComparedCommit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PostCommentForComparedCommit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PostCommentForComparedCommit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores a comment on the comparison between two commits of a
+//! repository held in `crate::state`, so `GetCommentsForComparedCommit` reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -189,6 +182,50 @@ impl From<PostCommentForComparedCommitErrorModeled> for PostCommentForComparedCo
     }
 }
 
+/// A commit id named in the request: absent (empty) is `CommitIdRequiredException`,
+/// and anything that is not a git object name is `InvalidCommitIdException`.
+fn checked_commit_id(
+    member: &str,
+    commit_id: &str,
+) -> Result<(), PostCommentForComparedCommitError> {
+    if commit_id.is_empty() {
+        return Err(PostCommentForComparedCommitErrorModeled::CommitIdRequiredException(
+            CommitIdRequiredException {
+                message: Some(format!("a commit id is required (member: {member})")),
+            },
+        )
+        .into());
+    }
+    if !crate::state::is_object_id(commit_id) {
+        return Err(PostCommentForComparedCommitErrorModeled::InvalidCommitIdException(
+            InvalidCommitIdException {
+                message: Some(format!(
+                    "the commit id {commit_id} is not valid (member: {member})"
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The comment this call posted (or, on a repeated idempotency token, the comment
+/// the first call posted), with the comparison it was filed under.
+fn posted(
+    repository_name: &str,
+    record: &crate::state::CommentRecord,
+) -> PostCommentForComparedCommitOutput {
+    PostCommentForComparedCommitOutput {
+        repository_name: Some(repository_name.to_string()),
+        before_commit_id: record.comparison.before_commit_id.clone(),
+        after_commit_id: Some(record.comparison.after_commit_id.clone()),
+        before_blob_id: record.comparison.before_blob_id.clone(),
+        after_blob_id: record.comparison.after_blob_id.clone(),
+        location: record.location.clone(),
+        comment: Some(record.comment()),
+    }
+}
+
 /// The `PostCommentForComparedCommit` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -225,18 +262,336 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PostCommentForComparedCommit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PostCommentForComparedCommitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PostCommentForComparedCommit"))
+        // "The comment is empty. You must provide some content for a comment." The
+        // model puts no length bound on `Content`, so both bounds are checked here.
+        if input.content.is_empty() {
+            return Err(PostCommentForComparedCommitErrorModeled::CommentContentRequiredException(
+                CommentContentRequiredException {
+                    message: Some("the comment content is required".to_string()),
+                },
+            )
+            .into());
+        }
+        if input.content.chars().count() > crate::state::MAX_COMMENT_CHARACTERS {
+            return Err(
+                PostCommentForComparedCommitErrorModeled::CommentContentSizeLimitExceededException(
+                    CommentContentSizeLimitExceededException {
+                        message: Some(format!(
+                            "the comment is too large: comments are limited to {} characters",
+                            crate::state::MAX_COMMENT_CHARACTERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        checked_commit_id("afterCommitId", &input.after_commit_id)?;
+        // A blank `beforeCommitId` names no before commit, the same as leaving the
+        // optional member out: a comment on an initial commit has no before side.
+        let before_commit_id = input
+            .before_commit_id
+            .as_deref()
+            .filter(|commit_id| !commit_id.is_empty());
+        if let Some(before_commit_id) = before_commit_id {
+            checked_commit_id("beforeCommitId", before_commit_id)?;
+            if before_commit_id == input.after_commit_id {
+                return Err(
+                    PostCommentForComparedCommitErrorModeled::BeforeCommitIdAndAfterCommitIdAreSameException(
+                        BeforeCommitIdAndAfterCommitIdAreSameException {
+                            // The sentence the model states for this error shape
+                            // (`smithy_query(query="doc",shape="BeforeCommitIdAndAfterCommitIdAreSameException")`).
+                            message: Some(
+                                "The before commit ID and the after commit ID are the same, which is not valid. The before commit ID and the after commit ID must be different commit IDs."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The location, with its file path reduced to the form a git tree holds (as
+        // `GetFile` does), so the same file is the same location however it is
+        // spelled. A location naming nothing at all places the comment nowhere, so
+        // it is the same as leaving the optional member out.
+        let mut location = input.location.clone().filter(|location| {
+            crate::state::location_key(Some(location)) != (None, None, None)
+        });
+        if let Some(location) = location.as_mut() {
+            if location.file_path.is_none()
+                && (location.file_position.is_some() || location.relative_file_version.is_some())
+            {
+                return Err(
+                    PostCommentForComparedCommitErrorModeled::InvalidFileLocationException(
+                        InvalidFileLocationException {
+                            message: Some(
+                                "the location of the file is not valid: it names no file path"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if let Some(file_path) = location.file_path.as_deref() {
+                location.file_path = Some(match crate::state::normalize_path(file_path) {
+                    Ok(path) => path,
+                    Err(crate::state::PathProblem::Missing) => {
+                        return Err(PostCommentForComparedCommitErrorModeled::PathRequiredException(
+                            PathRequiredException {
+                                message: Some("a file path is required".to_string()),
+                            },
+                        )
+                        .into())
+                    }
+                    Err(crate::state::PathProblem::Invalid) => {
+                        return Err(PostCommentForComparedCommitErrorModeled::InvalidPathException(
+                            InvalidPathException {
+                                message: Some(format!("the path {file_path} is not valid")),
+                            },
+                        )
+                        .into())
+                    }
+                });
+            }
+            // `RelativeFileVersionEnum` is an enum, so a value outside it is already
+            // refused at the boundary; this keeps the handler's own invariant explicit.
+            if let Some(version) = location.relative_file_version.as_deref() {
+                if version != crate::state::RELATIVE_FILE_VERSION_BEFORE
+                    && version != crate::state::RELATIVE_FILE_VERSION_AFTER
+                {
+                    return Err(
+                        PostCommentForComparedCommitErrorModeled::InvalidRelativeFileVersionEnumException(
+                            InvalidRelativeFileVersionEnumException {
+                                message: Some(format!(
+                                    "the relative file version {version} is not valid: expected {} or {}",
+                                    crate::state::RELATIVE_FILE_VERSION_BEFORE,
+                                    crate::state::RELATIVE_FILE_VERSION_AFTER
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // A line number starts at 1, so a position below that names no line.
+            if location.file_position.is_some_and(|position| position < 1) {
+                return Err(
+                    PostCommentForComparedCommitErrorModeled::InvalidFilePositionException(
+                        InvalidFilePositionException {
+                            message: Some(
+                                "the position is not valid: a line number starts at 1".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A blank idempotency token names no earlier request, the same as leaving
+        // the optional member out.
+        let client_request_token = input
+            .client_request_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+
+        let now = std::time::SystemTime::now();
+        let author_arn = crate::state::caller_identity_arn(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                PostCommentForComparedCommitErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(format!(
+                            "the repository {} does not exist",
+                            input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // Both sides of the comparison have to be commits this repository holds: a
+        // comment is filed against stored commits, never against an id the
+        // repository never had.
+        for commit_id in [Some(input.after_commit_id.as_str()), before_commit_id]
+            .into_iter()
+            .flatten()
+        {
+            if !repository.commits.contains_key(commit_id) {
+                return Err(
+                    PostCommentForComparedCommitErrorModeled::CommitDoesNotExistException(
+                        CommitDoesNotExistException {
+                            message: Some(format!(
+                                "the commit {commit_id} does not exist in the repository {}",
+                                input.repository_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The blobs of the commented file in each side of the comparison, read out
+        // of the two commits' tree snapshots.
+        let file_path = location
+            .as_ref()
+            .and_then(|location| location.file_path.clone());
+        let (before_blob_id, after_blob_id) = match file_path.as_deref() {
+            None => (None, None),
+            Some(file_path) => {
+                let entry_in = |commit_id: &str| {
+                    repository
+                        .commits
+                        .get(commit_id)
+                        .and_then(|commit| commit.files.get(file_path))
+                        .cloned()
+                };
+                let before_entry = before_commit_id.and_then(entry_in);
+                let after_entry = entry_in(&input.after_commit_id);
+
+                // The version the comment is on: `relativeFileVersion`, which
+                // defaults to the after side of the comparison.
+                let version = location
+                    .as_ref()
+                    .and_then(|location| location.relative_file_version.clone())
+                    .unwrap_or_else(|| crate::state::RELATIVE_FILE_VERSION_AFTER.to_string());
+                let commented = if version == crate::state::RELATIVE_FILE_VERSION_BEFORE {
+                    if before_commit_id.is_none() {
+                        // There is no before side to comment on.
+                        return Err(
+                            PostCommentForComparedCommitErrorModeled::InvalidRelativeFileVersionEnumException(
+                                InvalidRelativeFileVersionEnumException {
+                                    message: Some(format!(
+                                        "the relative file version {} is not valid for a comparison with no before commit",
+                                        crate::state::RELATIVE_FILE_VERSION_BEFORE
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    before_entry.clone()
+                } else {
+                    after_entry.clone()
+                };
+                let commented = commented.ok_or_else(|| {
+                    PostCommentForComparedCommitErrorModeled::PathDoesNotExistException(
+                        PathDoesNotExistException {
+                            message: Some(format!(
+                                "the path {file_path} does not exist in the {version} version of the comparison"
+                            )),
+                        },
+                    )
+                })?;
+                // "Make sure that the line number exists in the version of the file
+                // you want to comment on": the commented blob's own line count is
+                // what bounds the position.
+                if let Some(position) = location
+                    .as_ref()
+                    .and_then(|location| location.file_position)
+                {
+                    let lines = repository
+                        .blobs
+                        .get(&commented.blob_id)
+                        .map_or(0, |content| crate::state::line_count(content));
+                    if position > lines {
+                        return Err(
+                            PostCommentForComparedCommitErrorModeled::InvalidFilePositionException(
+                                InvalidFilePositionException {
+                                    message: Some(format!(
+                                        "the position {position} is not valid: {file_path} has {lines} line(s) in the {version} version of the comparison"
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+                (
+                    before_entry.map(|entry| entry.blob_id),
+                    after_entry.map(|entry| entry.blob_id),
+                )
+            }
+        };
+
+        let comparison = crate::state::ComparedCommit {
+            before_commit_id: before_commit_id.map(str::to_string),
+            after_commit_id: input.after_commit_id.clone(),
+            before_blob_id,
+            after_blob_id,
+        };
+
+        // An idempotency token that was already used: the same request returns the
+        // comment it first posted, and a changed one is refused rather than posting
+        // a second comment under the same token.
+        if let Some(token) = client_request_token {
+            if let Some(existing) = repository
+                .comment_tokens
+                .get(token)
+                .and_then(|comment_id| repository.comments.get(comment_id))
+            {
+                let unchanged = existing.content == input.content
+                    && existing.comparison == comparison
+                    && crate::state::location_key(existing.location.as_ref())
+                        == crate::state::location_key(location.as_ref());
+                return if unchanged {
+                    Ok(posted(&input.repository_name, existing))
+                } else {
+                    Err(
+                        PostCommentForComparedCommitErrorModeled::IdempotencyParameterMismatchException(
+                            IdempotencyParameterMismatchException {
+                                message: Some(format!(
+                                    "the client request token {token} was used in a previous request with different parameters"
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                };
+            }
+        }
+
+        if repository.comments.len() >= crate::state::MAX_COMMENTS_PER_REPOSITORY {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds at most {} comments per repository",
+                crate::state::MAX_COMMENTS_PER_REPOSITORY
+            )));
+        }
+
+        let sequence = repository.next_comment_sequence;
+        repository.next_comment_sequence = sequence.saturating_add(1);
+        let record = crate::state::CommentRecord {
+            comment_id: crate::state::comment_id(&input.repository_name, sequence, now),
+            content: input.content.clone(),
+            in_reply_to: None,
+            creation_date: now,
+            last_modified_date: now,
+            author_arn,
+            deleted: false,
+            client_request_token: client_request_token.map(str::to_string),
+            comparison,
+            location,
+            sequence,
+        };
+        if let Some(token) = client_request_token {
+            repository
+                .comment_tokens
+                .insert(token.to_string(), record.comment_id.clone());
+        }
+        let response = posted(&input.repository_name, &record);
+        repository.comments.insert(record.comment_id.clone(), record);
+        Ok(response)
     }
 }

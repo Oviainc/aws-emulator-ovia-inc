@@ -15,6 +15,8 @@
 mod blob_content;
 #[path = "all/commit_reads.rs"]
 mod commit_reads;
+#[path = "all/compared_commit_comments.rs"]
+mod compared_commit_comments;
 #[path = "all/repository_lifecycle.rs"]
 mod repository_lifecycle;
 #[path = "all/repository_rename.rs"]
