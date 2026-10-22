@@ -152,6 +152,37 @@ pub struct ClusterRecord {
 }
 
 impl ClusterRecord {
+    /// The cluster's id: the resource tail of its ARN, which is the host label its
+    /// data-plane endpoints are published under.
+    pub fn cluster_id(&self) -> &str {
+        self.arn
+            .rsplit_once('/')
+            .map_or(self.arn.as_str(), |(_, id)| id)
+    }
+
+    /// Move the cluster onto `network_type`, re-deriving the Regional data-plane
+    /// endpoints that network type decides and making the deployment of those endpoints
+    /// due again — so a caller cannot write one half of the transition without the
+    /// other.
+    ///
+    /// A request naming the network the cluster is already on writes NOTHING: there is
+    /// no endpoint to re-derive and no deployment to redo. The endpoints are stored
+    /// rather than projected so that one function ([`cluster_endpoints`]) decides them
+    /// for a created and for an updated cluster alike.
+    ///
+    /// Answers whether the record changed, so a caller can tell a redeploy from a
+    /// no-op.
+    pub fn set_network_type(&mut self, network_type: String) -> bool {
+        if self.network_type == network_type {
+            return false;
+        }
+        let endpoints = cluster_endpoints(self.cluster_id(), &network_type);
+        self.endpoints = endpoints;
+        self.network_type = network_type;
+        self.deploy_due = deploy_due();
+        true
+    }
+
     /// This record as the modelled `Cluster` shape — the single projection create and
     /// describe both answer with.
     pub fn to_cluster(&self) -> Cluster {
@@ -534,6 +565,56 @@ fn splitmix64(state: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Changing a cluster's network type re-derives its endpoints and makes the
+    /// deployment due again; requesting the network it is already on writes nothing.
+    #[test]
+    fn setting_the_network_type_redeploys_only_when_it_changes() {
+        let arn = "arn:aws:route53-recovery-control::000000000000:cluster/abc";
+        // Rows: every ordered pair of the values `NetworkType` declares
+        // (`smithy_query(query="shape",shape="NetworkType")` -> DUALSTACK | IPV4).
+        for from in ["DUALSTACK", "IPV4"] {
+            for to in ["DUALSTACK", "IPV4"] {
+                let case = format!("{from} -> {to}");
+                let mut record = ClusterRecord {
+                    seq: 1,
+                    arn: arn.to_string(),
+                    name: "c".to_string(),
+                    owner: "000000000000".to_string(),
+                    network_type: from.to_string(),
+                    endpoints: cluster_endpoints("abc", from),
+                    tags: BTreeMap::new(),
+                    default_control_panel_arn: String::new(),
+                    deploy_due: Instant::now(),
+                };
+                let was_due = record.deploy_due;
+
+                let changed = record.set_network_type(to.to_string());
+
+                assert_eq!(
+                    changed,
+                    from != to,
+                    "case {case}: the record changes exactly when the network type does, \
+                     got {changed}"
+                );
+                assert_eq!(
+                    record.network_type, to,
+                    "case {case}: expected the requested network type, got {}",
+                    record.network_type
+                );
+                assert_eq!(
+                    record.endpoints,
+                    cluster_endpoints("abc", to),
+                    "case {case}: the endpoints must be the ones its network type decides"
+                );
+                assert_eq!(
+                    record.deploy_due > was_due,
+                    from != to,
+                    "case {case}: only a change re-deploys the cluster"
+                );
+            }
+        }
+    }
 
     /// A record the capacity tests can store without going through a handler.
     fn routing_control(arn: &str) -> RoutingControlRecord {

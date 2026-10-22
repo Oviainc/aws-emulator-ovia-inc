@@ -19,3 +19,5 @@ mod list_clusters;
 mod recovery_control_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_cluster.rs"]
+mod update_cluster;
