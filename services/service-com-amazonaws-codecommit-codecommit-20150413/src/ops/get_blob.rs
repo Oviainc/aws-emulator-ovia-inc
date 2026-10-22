@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBlob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBlob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBlob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: answers with the bytes the repository holds under the requested git
+//! object name, read out of `crate::state`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBlob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBlobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBlob"))
+        let _ = ctx;
+        // `blobId` is modelled required, so it is present here — but `ObjectId`
+        // carries no length bound, so an empty (or blank) value reaches the handler
+        // and names no object at all.
+        if input.blob_id.trim().is_empty() {
+            return Err(GetBlobErrorModeled::BlobIdRequiredException(
+                BlobIdRequiredException {
+                    message: Some("a blob ID is required".to_string()),
+                },
+            )
+            .into());
+        }
+        // A blob is addressed by a git object name: the 40 hexadecimal characters
+        // an object id is wide. Anything else names no object in any repository.
+        if !crate::state::is_object_id(&input.blob_id) {
+            return Err(GetBlobErrorModeled::InvalidBlobIdException(InvalidBlobIdException {
+                message: Some(format!("the blob ID {} is not valid", input.blob_id)),
+            })
+            .into());
+        }
+        // An object name is a hexadecimal number, so its case does not change which
+        // object it names; the store writes it lowercase.
+        let blob_id = input.blob_id.to_ascii_lowercase();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+        let repository = store
+            .repositories
+            .get(&input.repository_name)
+            .ok_or_else(|| {
+                GetBlobErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(format!(
+                            "the repository {} does not exist",
+                            input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // A blob belongs to the repository that holds it: an object name this
+        // repository has no object for does not exist here, whatever another
+        // repository holds under it.
+        let content = repository.blobs.get(&blob_id).ok_or_else(|| {
+            GetBlobErrorModeled::BlobIdDoesNotExistException(BlobIdDoesNotExistException {
+                message: Some(format!(
+                    "the blob ID {blob_id} does not exist in the repository {}",
+                    input.repository_name
+                )),
+            })
+        })?;
+
+        // `FileTooLargeException` is not reachable from here: every stored blob was
+        // written through a `fileContent` the model bounds at 6 MB, so no object this
+        // store holds exceeds the size a read would have to refuse.
+        Ok(GetBlobOutput {
+            content: content.clone(),
+        })
     }
 }
