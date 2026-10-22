@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTimeSeriesServiceStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTimeSeriesServiceStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTimeSeriesServiceStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Aggregates the stored segment documents into fixed-width periods across
+//! [`StartTime`, `EndTime`): every COMPLETED segment whose `start_time` falls in
+//! the window is one request, counted into the period that contains it, and the
+//! per-period counts, aggregate response time and response-time histogram are
+//! recomputed from those stored documents on every call — nothing is echoed from
+//! the request and nothing is persisted here.
+//!
+//! A request asking for behaviour this slice does not evaluate — an
+//! `EntitySelectorExpression`, a forecast (which the model documents as
+//! requiring one), a group carrying a filter expression — is REFUSED with
+//! `InvalidRequestException` naming what is unsupported, rather than answered
+//! with an aggregation that quietly ignored it, and the window itself goes
+//! through the crate's one check in [`crate::state::validate_window`].
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +93,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::epoch_seconds;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +164,317 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTimeSeriesServiceStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTimeSeriesServiceStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTimeSeriesServiceStatistics"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTimeSeriesServiceStatisticsErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Behaviour this slice does not evaluate is REFUSED, never answered with
+        // an aggregation that ignored it: a caller asking for the statistics of a
+        // selected entity, or of a group whose filter expression narrows them,
+        // would otherwise get the whole window's unfiltered aggregate under HTTP
+        // 200.
+        if input
+            .entity_selector_expression
+            .as_deref()
+            .is_some_and(|selector| !selector.trim().is_empty())
+        {
+            return Err(unsupported(
+                "EntitySelectorExpression is not evaluated by this emulator yet; omit it to aggregate every completed request in [StartTime, EndTime)",
+            ));
+        }
+        // `ForecastStatistics`: "Forecast enabled requests require the
+        // EntitySelectorExpression ID be provided" — and that expression is not
+        // evaluated here, so a forecast cannot be computed from state either.
+        if input.forecast_statistics == Some(true) {
+            return Err(unsupported(
+                "ForecastStatistics requires an EntitySelectorExpression ID, which this emulator does not evaluate yet; omit ForecastStatistics",
+            ));
+        }
+
+        // `Period` is "aggregation period in seconds", so a period of zero or
+        // fewer seconds describes no period at all. The model declares no
+        // default, so an omitted one falls back to [`DEFAULT_PERIOD_SECONDS`].
+        let period = match input.period {
+            None => DEFAULT_PERIOD_SECONDS,
+            Some(seconds) if seconds > 0 => i64::from(seconds),
+            Some(seconds) => {
+                return Err(unsupported(format!(
+                    "Period must be a positive number of seconds, not {seconds}"
+                )))
+            }
+        };
+
+        // A token this service issued names the epoch second the next page's
+        // first period starts at; anything else never came from here.
+        let resume = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(token.parse::<i64>().map_err(|_| {
+                unsupported(format!(
+                    "NextToken `{token}` was not issued by this service"
+                ))
+            })?),
+        };
+
+        let start = epoch_seconds(&input.start_time);
+        let end = epoch_seconds(&input.end_time);
+        // The crate's ONE window check, so every operation taking a required
+        // `[StartTime, EndTime]` refuses the same windows with the same wording:
+        // one running backwards, or a bound naming no time recorded traffic
+        // could carry.
+        if let Err(window) =
+            crate::state::validate_window(start, end, crate::state::now_epoch_seconds())
+        {
+            return Err(unsupported(window.message(start, end)));
+        }
+
+        let store = state.lock();
+
+        // A group selector narrows the aggregation to that group, so a selector
+        // naming no stored group is an invalid request rather than an empty
+        // aggregate; a group that carries a filter expression would narrow it
+        // further than this slice can.
+        if input.group_name.is_some() || input.group_arn.is_some() {
+            let group_name = store
+                .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
+                .map_err(|failure| {
+                    GetTimeSeriesServiceStatisticsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(failure.message(
+                                input.group_name.as_deref(),
+                                input.group_arn.as_deref(),
+                            )),
+                        },
+                    )
+                })?;
+            let filtered = store
+                .groups
+                .get(&group_name)
+                .and_then(|group| group.filter_expression.as_deref())
+                .is_some_and(|filter| !filter.trim().is_empty());
+            if filtered {
+                return Err(unsupported(format!(
+                    "group `{group_name}` carries a FilterExpression, which this emulator does not evaluate yet; pull statistics from a group without one"
+                )));
+            }
+        }
+
+        // Walked over the STORED segments, not over the window's periods, so the
+        // work is bounded by what was ingested however wide the window or small
+        // the period: a period with no completed request in it holds no entry.
+        let mut periods: std::collections::BTreeMap<i64, Aggregate> =
+            std::collections::BTreeMap::new();
+        for trace in store.traces.values() {
+            for segment in &trace.segments {
+                if segment.start_time < start || segment.start_time >= end {
+                    continue;
+                }
+                // "The total number of COMPLETED requests" — a segment still in
+                // progress has no response time yet, so it is not counted.
+                let Some(segment_end) = segment.end_time.filter(|_| !segment.in_progress) else {
+                    continue;
+                };
+                // Every comparison against a NaN is false, so a segment whose
+                // times are not finite passed both window bounds above; it is
+                // dropped here rather than counted into every window and left
+                // to poison a period's aggregate response time. A segment whose
+                // stored `end_time` precedes its `start_time` is dropped for the
+                // same reason: no request took a negative time, so it would only
+                // put a negative `TotalResponseTime` and a negative histogram
+                // value in the answer.
+                let response_time = segment_end - segment.start_time;
+                if !segment.start_time.is_finite() || !response_time.is_finite() || response_time < 0.0
+                {
+                    continue;
+                }
+                periods
+                    .entry(period_start(segment.start_time, period))
+                    .or_default()
+                    .record(segment, response_time);
+            }
+        }
+
+        let scan = periods.range((
+            resume.map_or(::std::ops::Bound::Unbounded, ::std::ops::Bound::Included),
+            ::std::ops::Bound::Unbounded,
+        ));
+        let mut time_series_service_statistics = Vec::new();
+        let mut next_token = None;
+        for (period_start, aggregate) in scan {
+            // A token only when the aggregation was truncated; it names the
+            // period the next page resumes at.
+            if time_series_service_statistics.len() >= TIME_SERIES_PAGE_SIZE {
+                next_token = Some(period_start.to_string());
+                break;
+            }
+            time_series_service_statistics.push(aggregate.to_statistics(*period_start));
+        }
+
+        Ok(GetTimeSeriesServiceStatisticsOutput {
+            time_series_service_statistics: Some(time_series_service_statistics),
+            // Nothing in this emulator aggregates across a change to a group's
+            // filter expression: a group whose expression narrows the selection
+            // is refused above, so no answer can mix two versions of one.
+            contains_old_group_versions: false,
+            next_token,
+        })
+    }
+}
+
+/// The aggregation period an omitted `Period` means, in seconds.
+///
+/// The model documents `Period` only as "Aggregation period in seconds" and
+/// publishes no default, so this one-minute period is this emulator's.
+pub const DEFAULT_PERIOD_SECONDS: i64 = 60;
+
+/// How many `TimeSeriesServiceStatistics` entries one page carries.
+///
+/// The model marks the operation paginated over `TimeSeriesServiceStatistics`
+/// but declares no page size, so this is the emulator's — the same page size
+/// `GetTraceSummaries` uses. A `NextToken` is emitted only when the aggregation
+/// exceeded it, and resuming from that token returns the remainder.
+pub const TIME_SERIES_PAGE_SIZE: usize = 5;
+
+/// Refuse a request asking for behaviour this slice does not implement, with the
+/// error this operation models for an invalid request.
+fn unsupported(message: impl Into<String>) -> GetTimeSeriesServiceStatisticsError {
+    GetTimeSeriesServiceStatisticsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The epoch second the `period`-wide aggregation period containing `seconds`
+/// starts at.
+///
+/// Periods are aligned to multiples of `period` since the epoch, not to the
+/// requested `StartTime`, so the same instant falls in the same period whatever
+/// window asks about it — two overlapping windows report one request under one
+/// `Timestamp`.
+///
+/// Total for any finite `seconds` and any accepted `period`: the float-to-int
+/// cast saturates rather than wrapping, and the alignment multiply is checked,
+/// so an absurd stored `start_time` lands in the first or last representable
+/// period instead of panicking or wrapping into another period's counts.
+fn period_start(seconds: f64, period: i64) -> i64 {
+    #[allow(clippy::cast_possible_truncation)]
+    let whole = seconds.floor() as i64;
+    whole
+        .div_euclid(period)
+        .checked_mul(period)
+        .unwrap_or(if whole < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// One aggregation period's counts, built up from the stored segments.
+///
+/// A completed segment is one request, classified by the status it recorded:
+/// `ErrorStatistics` counts the 4xx ones (429 as its `ThrottleCount`, every
+/// other 4xx as `OtherCount`) and `FaultStatistics` the 5xx ones, so `OkCount`
+/// — "the number of requests that completed with a 2xx Success status code" —
+/// takes every other completed request: a segment that recorded no status at
+/// all, or one outside those two series, has no other count to go to and is one
+/// more request its service completed without error or fault.
+#[derive(Debug, Default)]
+struct Aggregate {
+    /// Requests that completed with neither an error, a fault nor a throttle.
+    ///
+    /// The model's wording for `OkCount` is "completed with a 2xx Success
+    /// status code"; it is DELIBERATELY widened here to "completed without
+    /// error or fault", because a 3xx response and a segment that recorded no
+    /// status at all are both completed requests the other two counts exclude,
+    /// and `TotalCount` is "the total number of completed requests".
+    ok_count: i64,
+    /// Requests that recorded a 429 throttle.
+    throttle_count: i64,
+    /// Requests that recorded a 400-series error other than a throttle.
+    error_other_count: i64,
+    /// Requests that recorded a 500-series fault.
+    fault_count: i64,
+    /// The aggregate response time of the counted requests, in seconds.
+    total_response_time: f64,
+    /// Response time in whole milliseconds -> how many requests took it, which
+    /// is the `ResponseTimeHistogram`'s (value, prevalence) pairs.
+    histogram: std::collections::BTreeMap<i64, i32>,
+}
+
+impl Aggregate {
+    /// Count one completed segment, whose request took `response_time` seconds.
+    fn record(&mut self, segment: &crate::state::SegmentRecord, response_time: f64) {
+        // A 429 is both a throttle and a 400-series error, and `ErrorStatistics`
+        // splits it out, so the throttle arm comes before the other-error one.
+        if segment.is_fault() {
+            self.fault_count += 1;
+        } else if segment.is_throttle() {
+            self.throttle_count += 1;
+        } else if segment.is_error() {
+            self.error_other_count += 1;
+        } else {
+            self.ok_count += 1;
+        }
+        self.total_response_time += response_time;
+        #[allow(clippy::cast_possible_truncation)]
+        let millis = (response_time * 1_000.0).round() as i64;
+        let count = self.histogram.entry(millis).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// "The total number of completed requests."
+    fn total_count(&self) -> i64 {
+        self.ok_count + self.error_total_count() + self.fault_count
+    }
+
+    /// "The total number of requests that failed with a 4xx Client Error status
+    /// code" — throttles included.
+    fn error_total_count(&self) -> i64 {
+        self.throttle_count + self.error_other_count
+    }
+
+    /// This period as one `TimeSeriesServiceStatistics`.
+    ///
+    /// `EdgeSummaryStatistics` carries the counts because "if no selector
+    /// expression is specified, edge statistics are returned", and a selector
+    /// expression is refused by this slice: every counted request arrived at its
+    /// service over one inbound edge, so the aggregate is that of the edges the
+    /// window covers. `ServiceForecastStatistics` stays absent — a forecast
+    /// request is refused rather than answered with numbers nothing computed.
+    fn to_statistics(&self, period_start: i64) -> TimeSeriesServiceStatistics {
+        TimeSeriesServiceStatistics {
+            timestamp: Some(::aws_smithy_types::DateTime::from_secs(period_start)),
+            edge_summary_statistics: Some(EdgeStatistics {
+                ok_count: Some(self.ok_count),
+                error_statistics: Some(ErrorStatistics {
+                    throttle_count: Some(self.throttle_count),
+                    other_count: Some(self.error_other_count),
+                    total_count: Some(self.error_total_count()),
+                }),
+                fault_statistics: Some(FaultStatistics {
+                    // Nothing here categorises a 5xx further, so every counted
+                    // fault is an untracked one.
+                    other_count: Some(self.fault_count),
+                    total_count: Some(self.fault_count),
+                }),
+                total_count: Some(self.total_count()),
+                total_response_time: Some(self.total_response_time),
+            }),
+            service_summary_statistics: None,
+            service_forecast_statistics: None,
+            response_time_histogram: Some(
+                self.histogram
+                    .iter()
+                    .map(|(millis, count)| HistogramEntry {
+                        #[allow(clippy::cast_precision_loss)]
+                        value: *millis as f64 / 1_000.0,
+                        count: *count,
+                    })
+                    .collect(),
+            ),
+        }
     }
 }

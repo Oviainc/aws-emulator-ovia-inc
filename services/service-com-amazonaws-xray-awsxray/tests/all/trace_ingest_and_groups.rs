@@ -103,7 +103,7 @@ impl Xray {
         }
     }
 
-    async fn put_segments(&self, documents: &[String]) -> Answer {
+    pub(crate) async fn put_segments(&self, documents: &[String]) -> Answer {
         self.call("/TraceSegments", &json!({ "TraceSegmentDocuments": documents }))
             .await
     }
