@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMicrosoftAD
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMicrosoftAD`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMicrosoftAD::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an AWS Managed Microsoft AD directory: mints a `DirectoryId`, persists the
+//! record (its name, short name, description, edition, VPC settings, network type and
+//! tags) in [`crate::state`] and answers with the minted id. The administrator
+//! `Password` is `@sensitive` and no operation reports it back, so it is not stored.
+//!
+//! What makes the record a Managed Microsoft AD rather than the Simple AD
+//! `CreateDirectory` persists:
+//!
+//! * its `Type` is [`crate::state::TYPE_MICROSOFT_AD`] and it carries an `Edition`
+//!   ([`crate::state::DEFAULT_MICROSOFT_AD_EDITION`] when the request names none)
+//!   instead of a `Size`;
+//! * an absent `ShortName` defaults to the first label of the directory's DNS name, as
+//!   the member's own documentation describes;
+//! * it is created with [`crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS`] domain
+//!   controllers, the only directory type for which that member is reported.
+//!
+//! The directory is persisted in the modelled `Requested` stage with the move to
+//! `Active` owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller
+//! that describes it immediately still sees the transient stage.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +185,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMicrosoftAD` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMicrosoftADErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMicrosoftAD"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `Edition`'s own documentation: "Managed Microsoft AD is available in two
+        // editions: Standard and Enterprise." The member is modelled as the whole
+        // `DirectoryEdition` enum, so the boundary validator passes `Hybrid` (which
+        // belongs to a hybrid directory); the per-directory-type rule is enforced here,
+        // naming the member and the values it admits.
+        if let Some(edition) = input.edition.as_deref() {
+            if !crate::state::MICROSOFT_AD_EDITIONS.contains(&edition) {
+                return Err(invalid_parameter(format!(
+                    "Edition {edition} is not supported by a {} directory; supported values are {}",
+                    crate::state::TYPE_MICROSOFT_AD,
+                    crate::state::MICROSOFT_AD_EDITIONS.join(", ")
+                )));
+            }
+        }
+
+        // Nothing caller-sized reaches the store unchecked: the tag list is bounded
+        // before the store lock is taken at all. `CreateMicrosoftAD` models no
+        // `TagLimitExceededException`, so the bound is reported as the invalid
+        // parameter it is.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid_parameter(format!(
+                "Tags may carry at most {max} entries, got {got}",
+                max = crate::state::MAX_TAGS,
+                got = requested_tags.len()
+            )));
+        }
+        let tags: ::std::collections::BTreeMap<String, String> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let short_name = match input.short_name {
+            Some(requested) => Some(requested),
+            None => default_short_name(&input.name),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        if store.directories.len() >= crate::state::MAX_DIRECTORIES {
+            return Err(
+                CreateMicrosoftADErrorModeled::DirectoryLimitExceededException(
+                    DirectoryLimitExceededException {
+                        message: Some(format!(
+                            "Maximum number of directories in the region has been reached: {}",
+                            crate::state::MAX_DIRECTORIES
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let directory_id = store.mint_directory_id();
+        let seq = store.next_seq();
+        let record = crate::state::Directory {
+            directory_id: directory_id.clone(),
+            name: input.name,
+            short_name,
+            description: input.description,
+            // Only a Simple AD directory has a size; this one reports its edition.
+            size: None,
+            edition: Some(
+                input
+                    .edition
+                    .unwrap_or_else(|| crate::state::DEFAULT_MICROSOFT_AD_EDITION.to_string()),
+            ),
+            directory_type: crate::state::TYPE_MICROSOFT_AD.to_string(),
+            stage: crate::state::STAGE_REQUESTED.to_string(),
+            stage_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            launch_time: now,
+            stage_last_updated: now,
+            // No alias until `CreateAlias` assigns one; the directory id stands in for
+            // it until then.
+            alias: None,
+            vpc_settings: Some(DirectoryVpcSettingsDescription {
+                vpc_id: Some(input.vpc_settings.vpc_id),
+                subnet_ids: Some(input.vpc_settings.subnet_ids),
+                // The security group and availability zones are chosen by the VPC data
+                // plane this emulator does not have, so they stay absent rather than
+                // invented.
+                security_group_id: None,
+                availability_zones: None,
+            }),
+            // `NetworkType`'s own documentation: "The default value is IPv4 or IPv6
+            // based on the provided subnet capabilities" — a choice made by the VPC
+            // data plane this emulator does not have, so an unspecified network type
+            // stays absent rather than being invented. Every value of the modelled
+            // enum is admitted: unlike Simple AD, Managed Microsoft AD's documentation
+            // narrows none of them.
+            network_type: input.network_type,
+            // `EnableSso` (still scaffolded) is what turns this on.
+            sso_enabled: false,
+            desired_number_of_domain_controllers: Some(
+                crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS,
+            ),
+            tags,
+            // No event topic until `RegisterEventTopic` associates one.
+            event_topics: ::std::collections::BTreeMap::new(),
+            seq,
+        };
+        store.directories.insert(directory_id.clone(), record);
+
+        // Read the id back out of the store, so the response cannot name a directory
+        // the insert did not persist.
+        let stored = store
+            .directories
+            .get(&directory_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(CreateMicrosoftADOutput {
+            directory_id: Some(stored.directory_id.clone()),
+        })
     }
+}
+
+/// The `ShortName` a request that names none gets.
+///
+/// From `CreateMicrosoftADRequest$ShortName`'s own documentation: "If you don't specify
+/// a NetBIOS name, it will default to the first part of your directory DNS. For example,
+/// `CORP` for the directory DNS `corp.example.com`" — the first label of the DNS name,
+/// written as that example writes a NetBIOS name: upper case.
+///
+/// `None` only when that first label is empty, which the modelled `DirectoryName`
+/// pattern already forbids; the directory then simply carries no short name rather than
+/// an empty one, which the modelled `DirectoryShortName` pattern forbids in turn.
+fn default_short_name(name: &str) -> Option<String> {
+    // `.` and `\` are the label separators the modelled `DirectoryName` pattern allows,
+    // and both are characters `DirectoryShortName` forbids.
+    let first_label = name.split(['.', '\\']).next().unwrap_or_default();
+    if first_label.is_empty() {
+        return None;
+    }
+    Some(first_label.to_uppercase())
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> CreateMicrosoftADError {
+    CreateMicrosoftADErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        request_id: None,
+    })
+    .into()
 }
