@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves one tile of one tileset. The `Tileset` label selects a stored tileset
+//! record in [`crate::state`], which decides the tile's format, its
+//! `Content-Type`, the zoom range it has tiles for and the pricing bucket the
+//! request is charged to; the tile's bytes are derived from that record and the
+//! requested `Z`/`X`/`Y`. A label no record carries is a
+//! `ResourceNotFoundException`, and a coordinate outside the record's range is
+//! a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +91,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::assets::{self, FieldFault, TileCoord};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,18 +165,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTile"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator (one shared `InMemoryEngine`), and
+            // this operation models the server error for it.
+            return Err(GetTileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the maps asset catalog is not available on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let catalog = state.lock();
+        let Some(tileset) = catalog.tilesets.get(&input.tileset) else {
+            return Err(GetTileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no tileset named `{}`", input.tileset),
+                },
+            )
+            .into());
+        };
+
+        let z = parse_coordinate("Z", &input.z).map_err(refuse)?;
+        let x = parse_coordinate("X", &input.x).map_err(refuse)?;
+        let y = parse_coordinate("Y", &input.y).map_err(refuse)?;
+        if z < tileset.min_zoom || z > tileset.max_zoom {
+            return Err(refuse(FieldFault::new(
+                "Z",
+                "FieldValidationFailed",
+                format!(
+                    "tileset `{}` has tiles for zoom {}..={}",
+                    tileset.id, tileset.min_zoom, tileset.max_zoom
+                ),
+            )));
+        }
+        // A zoom level is a 2^z by 2^z grid of tiles, so a coordinate at or
+        // past that edge addresses no tile of this zoom.
+        let axis = TileCoord::axis_tiles(z);
+        for (name, value) in [("X", x), ("Y", y)] {
+            if u64::from(value) >= axis {
+                return Err(refuse(FieldFault::new(
+                    name,
+                    "FieldValidationFailed",
+                    format!("zoom {z} addresses tiles 0..{axis} on each axis"),
+                )));
+            }
+        }
+
+        let additional = input.additional_features.clone().unwrap_or_default();
+        for feature in &additional {
+            if assets::additional_feature_layer(feature).is_none() {
+                return Err(refuse(FieldFault::new(
+                    "AdditionalFeatures",
+                    "FieldValidationFailed",
+                    format!(
+                        "AdditionalFeatures must be drawn from {}, got `{feature}`",
+                        TILE_ADDITIONAL_FEATURE_VALUES.join(" | ")
+                    ),
+                )));
+            }
+        }
+
+        // Render outside the critical section: the catalog lock is this
+        // service's one shared lock, so it is held only to read the record.
+        let record = tileset.clone();
+        let pricing_bucket = catalog.pricing_bucket(record.pricing_bucket.as_ref());
+        drop(catalog);
+
+        let body = assets::tile_bytes(&record, TileCoord { z, x, y }, &additional);
+        Ok(GetTileOutput {
+            pricing_bucket,
+            content_type: Some(record.content_type.clone()),
+            cache_control: Some(record.cache_control.clone()),
+            e_tag: Some(assets::etag(&body)),
+            blob: Some(body),
+        })
     }
+}
+
+/// A tile coordinate: an unsigned decimal integer, which is the only thing a
+/// `{Z}`/`{X}`/`{Y}` path label can address.
+///
+/// The refusal names the member and the constraint but not the value: these
+/// three labels target `@sensitive` shapes, so their values do not belong in a
+/// message the client (or a log) keeps.
+fn parse_coordinate(name: &str, raw: &str) -> Result<u32, FieldFault> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(FieldFault::new(
+            name,
+            "CannotParse",
+            format!("{name} must be a non-negative integer"),
+        ));
+    }
+    raw.parse::<u32>().map_err(|_| {
+        FieldFault::new(
+            name,
+            "FieldValidationFailed",
+            format!("{name} is larger than any tile coordinate"),
+        )
+    })
+}
+
+/// Refuse the request with this operation's own modeled `ValidationException`,
+/// filling the reason and field list the model declares room for.
+fn refuse(fault: FieldFault) -> GetTileError {
+    GetTileErrorModeled::ValidationException(ValidationException {
+        message: fault.message.clone(),
+        reason: fault.reason.to_string(),
+        field_list: vec![ValidationExceptionField {
+            name: fault.name,
+            message: fault.message,
+        }],
+    })
+    .into()
 }

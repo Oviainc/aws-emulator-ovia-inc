@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGlyphs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGlyphs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGlyphs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves one glyph range of one font stack. `FontStack` selects a stored font
+//! record in [`crate::state`] (comma-separated stacks resolve to the first name
+//! the catalog has metrics for, the way a client's fallback list is meant to
+//! work); `FontUnicodeRange` names the 256-codepoint range, and the `.pbf`
+//! bytes are the SDF glyphs derived from that record over that range.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +72,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::assets;
+use crate::state::glyph_pbf::{MAX_CODEPOINT, MAX_RANGE_WIDTH};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +142,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGlyphs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGlyphsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGlyphs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. This operation
+            // models no server error, so an engine that carries no maps
+            // catalog is answered as an operation this emulator cannot serve.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetGlyphs"));
+        };
+
+        let (start, end) = parse_range(&input.font_unicode_range)?;
+
+        let font = {
+            let catalog = state.lock();
+            // A font stack is a fallback list (`Amazon Ember Bold,Noto Sans
+            // Bold`): the first name the catalog has metrics for is the one
+            // measured with, and a stack it knows none of is measured with the
+            // catalog's fallback metrics, because this operation models no
+            // error to refuse it with.
+            input
+                .font_stack
+                .split(',')
+                .map(str::trim)
+                .find_map(|name| catalog.fonts.get(name))
+                .unwrap_or(&catalog.fallback_font)
+                .clone()
+        };
+
+        let body = assets::glyph_range_bytes(&font, &input.font_stack, start, end);
+        Ok(GetGlyphsOutput {
+            e_tag: Some(assets::etag(&body)),
+            content_type: Some(font.content_type.clone()),
+            cache_control: Some(font.cache_control.clone()),
+            blob: Some(body),
+        })
     }
+}
+
+/// The codepoint range a `FontUnicodeRange` names.
+///
+/// The modeled pattern (`^[0-9]+-[0-9]+\.pbf$`) fixes the shape; what is
+/// checked here is the rule the member documents and the pattern cannot
+/// express: "This must be aligned to multiples of 256. Example: 0-255.pbf" — so
+/// a range starts on a multiple of 256 and is exactly 256 codepoints wide.
+fn parse_range(raw: &str) -> Result<(u32, u32), GetGlyphsError> {
+    let refuse = |message: String| crate::scaffolded::Scaffolded::validation(message);
+    let body = raw.strip_suffix(".pbf").ok_or_else(|| {
+        refuse(format!(
+            "FontUnicodeRange must name a .pbf range, got `{raw}`"
+        ))
+    })?;
+    let (start, end) = body.split_once('-').ok_or_else(|| {
+        refuse(format!(
+            "FontUnicodeRange must be <start>-<end>.pbf, got `{raw}`"
+        ))
+    })?;
+    let (Ok(start), Ok(end)) = (start.parse::<u32>(), end.parse::<u32>()) else {
+        return Err(refuse(format!(
+            "FontUnicodeRange bounds must fit a Unicode codepoint, got `{raw}`"
+        )));
+    };
+    // Bound the start before any arithmetic on it: a glyph range addresses the
+    // Basic Multilingual Plane, which is what a style's `{range}` template
+    // expands to.
+    if start > MAX_CODEPOINT {
+        return Err(refuse(format!(
+            "FontUnicodeRange must start within 0..={MAX_CODEPOINT}, got `{raw}`"
+        )));
+    }
+    let Some(expected_end) = start.checked_add(MAX_RANGE_WIDTH - 1) else {
+        return Err(refuse(format!(
+            "FontUnicodeRange is not a {MAX_RANGE_WIDTH}-codepoint range, got `{raw}`"
+        )));
+    };
+    if start % MAX_RANGE_WIDTH != 0 || end != expected_end {
+        return Err(refuse(format!(
+            "FontUnicodeRange must be aligned to multiples of {MAX_RANGE_WIDTH} \
+             (for example 0-{}.pbf), got `{raw}`",
+            MAX_RANGE_WIDTH - 1
+        )));
+    }
+    Ok((start, end))
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStyleDescriptor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStyleDescriptor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStyleDescriptor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves the style descriptor of one (`Style`, `ColorScheme`) pair: the stored
+//! style record in [`crate::state`] decides the document's palette, sources and
+//! font stack, and the request's feature knobs (political view, terrain,
+//! contour density, traffic, travel modes, buildings, POI density and
+//! categories) are projected onto it. The templates the document hands back are
+//! the routes this service's own `GetTile`, `GetSprites` and `GetGlyphs` serve.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +126,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::assets::{self, StyleOptions};
+use crate::state::{ColorSchemeKind, MapStyleKind};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -197,18 +196,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStyleDescriptor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStyleDescriptorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStyleDescriptor"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. This operation
+            // models no server error, so an engine that carries no maps
+            // catalog is answered as an operation this emulator cannot serve
+            // rather than as a client mistake.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetStyleDescriptor",
+            ));
+        };
+
+        let Some(style) = MapStyleKind::from_wire(&input.style) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Style must be one of {}",
+                MAP_STYLE_VALUES.join(" | ")
+            )));
+        };
+        // `ColorScheme` is optional; `Light` is the scheme a style is served in
+        // when the request names none.
+        let scheme = match input.color_scheme.as_deref() {
+            None => ColorSchemeKind::Light,
+            Some(value) => match ColorSchemeKind::from_wire(value) {
+                Some(scheme) => scheme,
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "ColorScheme must be one of {}",
+                        COLOR_SCHEME_VALUES.join(" | ")
+                    )))
+                }
+            },
+        };
+
+        // The remaining knobs are enum- or list-of-enum-valued: a value outside
+        // the model's set is refused rather than quietly dropped from the
+        // document it was meant to change.
+        let travel_modes = input.travel_modes.clone().unwrap_or_default();
+        let poi_categories = input.poi_categories.clone().unwrap_or_default();
+        let mut knobs: Vec<(&str, &str, &[&str])> = Vec::new();
+        for (name, value, allowed) in [
+            ("Terrain", input.terrain.as_deref(), TERRAIN_VALUES),
+            (
+                "ContourDensity",
+                input.contour_density.as_deref(),
+                CONTOUR_DENSITY_VALUES,
+            ),
+            ("Traffic", input.traffic.as_deref(), TRAFFIC_VALUES),
+            ("Buildings", input.buildings.as_deref(), BUILDINGS_VALUES),
+            ("PoiDensity", input.poi_density.as_deref(), POI_DENSITY_VALUES),
+        ] {
+            if let Some(value) = value {
+                knobs.push((name, value, allowed));
+            }
+        }
+        for mode in &travel_modes {
+            knobs.push(("TravelModes", mode, TRAVEL_MODE_VALUES));
+        }
+        for category in &poi_categories {
+            knobs.push(("PoiCategories", category, POI_CATEGORY_VALUES));
+        }
+        for (name, value, allowed) in knobs {
+            if !allowed.contains(&value) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "{name} must be drawn from {}, got `{value}`",
+                    allowed.join(" | ")
+                )));
+            }
+        }
+
+        let catalog = state.lock();
+        let Some(record) = catalog.styles.get(&(style, scheme)) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "no style descriptor is published for {}/{}",
+                style.as_wire(),
+                scheme.as_wire()
+            )));
+        };
+        let options = StyleOptions {
+            political_view: input.political_view.clone(),
+            terrain: input.terrain.clone(),
+            contour_density: input.contour_density.clone(),
+            traffic: input.traffic.clone(),
+            travel_modes,
+            buildings: input.buildings.clone(),
+            poi_density: input.poi_density.clone(),
+            poi_categories,
+        };
+        let body = assets::style_descriptor(
+            &catalog,
+            record,
+            &options,
+            request_endpoint(ctx).as_deref(),
+        );
+
+        Ok(GetStyleDescriptorOutput {
+            e_tag: Some(assets::etag(&body)),
+            content_type: Some(record.content_type.clone()),
+            cache_control: Some(record.cache_control.clone()),
+            blob: Some(body),
+        })
     }
+}
+
+/// The endpoint prefix to put in front of the document's templates, so a client
+/// can follow them without knowing where the emulator is listening.
+///
+/// Taken from the request's own `Host`, which is how the caller addressed this
+/// emulator. The SCHEME is only ever one the request itself states — on the URI
+/// or in `x-forwarded-proto` — because guessing it is worse than omitting it: a
+/// client reached over plain http would be handed `https://` templates it
+/// cannot fetch. With no scheme to go on, the templates stay root-relative
+/// paths, which a client resolves against the endpoint it already called; the
+/// same happens when there is no usable host.
+///
+/// Both values are client-controlled, so each is accepted only in the shape it
+/// must have: the characters a host and port are written with, no longer than
+/// the DNS limit plus a port, and a scheme of `http` or `https`. Anything else
+/// falls back to the relative form rather than being pasted into the document.
+fn request_endpoint(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    /// The longest a fully qualified domain name can be, plus room for `:port`.
+    const MAX_HOST_LEN: usize = 253 + 6;
+
+    let parts = ctx.parts();
+    let host = parts
+        .uri
+        .host()
+        .map(ToString::to_string)
+        .or_else(|| {
+            parts
+                .headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string)
+        })
+        .filter(|host| {
+            !host.is_empty()
+                && host.len() <= MAX_HOST_LEN
+                && host.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'[' | b']')
+                })
+        })?;
+    let scheme = parts
+        .uri
+        .scheme_str()
+        .map(ToString::to_string)
+        .or_else(|| {
+            parts
+                .headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_ascii_lowercase)
+        })
+        .filter(|scheme| matches!(scheme.as_str(), "http" | "https"))?;
+    Some(format!("{scheme}://{host}"))
 }
