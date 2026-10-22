@@ -29,6 +29,8 @@ mod preset_lifecycle;
 mod preset_update;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
+#[path = "all/resource_projection_defaults.rs"]
+mod resource_projection_defaults;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
