@@ -149,7 +149,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modeled `arn` pattern is refused by the boundary validator before
         // this runs; what is left to decide is whether the ARN is scoped to the
         // caller's own account and, if so, whether a view is stored under it.
-        let _ = ctx;
         // The account boundary is enforced BEFORE any existence lookup, so this
         // service never reveals whether a view exists in another account: a
         // well-formed ARN whose embedded account id is not the caller's own is
@@ -157,7 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored.
         if !crate::state::is_caller_account_arn(&input.arn) {
             return Err(GetBillingViewErrorModeled::AccessDeniedException(
-                crate::state::cross_account_access_denied(Self::NAME, &input.arn),
+                crate::state::cross_account_access_denied(
+                    Self::NAME,
+                    &input.arn,
+                    &*self.engine,
+                    ctx,
+                ),
             )
             .into());
         }

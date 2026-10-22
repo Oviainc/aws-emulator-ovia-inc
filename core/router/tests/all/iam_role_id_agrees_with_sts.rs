@@ -54,7 +54,7 @@ fn build_router() -> MultiServiceRouter {
 
 /// The text of the first `<name>…</name>` element of an XML body. Every element these
 /// responses carry is uniquely named, so this reads the member without a document model.
-fn xml_element(body: &str, name: &str) -> Option<String> {
+pub(crate) fn xml_element(body: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = body.find(&open)? + open.len();

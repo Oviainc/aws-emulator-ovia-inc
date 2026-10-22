@@ -13,6 +13,9 @@
 //! (and appends to [`ComAmazonawsBillingAwsbillingState::preference_history`] for a
 //! feature the model gives a history feature), and `GetBillingPreferences` reports
 //! exactly what is stored there. Both maps are ordered, so a page boundary is stable.
+//! Which features either operation may touch at all is
+//! [`ComAmazonawsBillingAwsbillingState::feature_access`], the per-feature access
+//! gate both consult before they read or write a preference.
 //!
 //! Beside them, [`ComAmazonawsBillingAwsbillingState::credits`] holds the account
 //! credits `GetCredits` reports, keyed and ordered by `creditId`, and
@@ -23,6 +26,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 
 use crate::ops::types::{
     AccessDeniedException, Expression, ValidationException, ValidationExceptionField,
@@ -123,6 +128,22 @@ pub const PAGE_TOKEN_REFUSAL: &str = "nextToken is not a token this service issu
 /// [`PAGE_TOKEN_REFUSAL`].
 pub const PAGE_TOKEN_FIELD_REFUSAL: &str = "The pagination token is not valid.";
 
+/// The `message` the tagging APIs refuse an unknown resource with.
+///
+/// The tagging operations identify a resource by `ResourceArn` and answer a
+/// FIXED sentence for one that names no resource: the refusal does not echo the
+/// requested ARN back, unlike the billing-view reads, whose refusal is built by
+/// [`invalid_billing_view_arn`]. The ARN is still reported where the model has a
+/// member for it, `ResourceNotFoundException$resourceId`.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The `message` that refuses a tagging request against a view AWS manages.
+///
+/// Shared by the tagging operations so the one rule — a managed view's tags are
+/// the service's own, see [`BillingView::is_managed`] — reads the same whichever
+/// of them answered.
+pub const MANAGED_VIEW_NOT_TAGGABLE: &str = "Managed billing views cannot be tagged";
+
 /// The most credits this emulator keeps resident for the whole billing family.
 ///
 /// `credits` is the store `GetCredits` reports from; like `billing_views` it
@@ -136,6 +157,38 @@ const PRIMARY_VIEW_ID: &str = "primary";
 
 /// The name AWS gives the account's default `PRIMARY` billing view.
 const PRIMARY_VIEW_NAME: &str = "Primary View";
+
+/// The description the account's default `PRIMARY` billing view carries.
+///
+/// `BillingViewElement$description` is "The description of the billing view",
+/// and the view every account owns by default is a resource the service itself
+/// seeded, so it arrives WITH one: a reader of the default view gets a value,
+/// not an absent member. The sentence restates the `ListBillingViews` doc's own
+/// account of what that view is — "a unique `PRIMARY` billing view that
+/// represents the billing data available by default" — and stays inside the
+/// modelled `BillingViewDescription` pattern
+/// `^([ a-zA-Z0-9_\+=\.\-@]+)?$`, which admits no other punctuation.
+const PRIMARY_VIEW_DESCRIPTION: &str = "Represents the billing data available by default";
+
+/// The `BillingFeature` values whose preferences a caller reaches only once
+/// Billing-console access is activated for the account.
+///
+/// The access decision is per FEATURE, not per operation: the recorded service
+/// refuses `BILLING_ALERTS` and `RI_SHARING_HISTORY` reads and
+/// `RI_SHARING`/`RI_SHARING_HISTORY` writes with 403 `AccessDeniedException`
+/// for a caller without that activation, while a credit feature
+/// (`CREDIT_SHARING`) answers normally for the same caller. These are the
+/// features behind the activation — the billing-alerts preference and the
+/// Reserved-Instance sharing pair, whose history feature travels with the
+/// feature whose changes it records (see [`HISTORY_FEATURE_SUFFIX`]); every
+/// other `BILLING_FEATURE_VALUES` member is reachable without it.
+///
+/// What an ACCOUNT has activated is state, not a constant: this is only the
+/// default, which
+/// [`ComAmazonawsBillingAwsbillingState::feature_access`] is seeded from and
+/// [`ComAmazonawsBillingAwsbillingState::grant_feature_access`] moves.
+pub const ACCESS_ACTIVATION_FEATURES: &[&str] =
+    &["BILLING_ALERTS", "RI_SHARING", "RI_SHARING_HISTORY"];
 
 /// The `BillingFeature` values whose preferences are *sharing* preferences.
 ///
@@ -479,6 +532,16 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// family, keyed and ordered by `creditId`, so `GetCredits` answers in a
     /// deterministic order. Bounded by [`MAX_CREDITS`].
     pub credits: BTreeMap<String, Credit>,
+    /// The `BillingFeature` values whose preferences this account's caller may
+    /// reach — read through `GetBillingPreferences` and write through
+    /// `UpdateBillingPreferences`.
+    ///
+    /// Seeded with every feature except [`ACCESS_ACTIVATION_FEATURES`], the
+    /// ones behind a Billing-console access activation this account does not
+    /// have. Both preference operations consult it BEFORE they touch
+    /// `billing_preferences`, so a gated feature is refused whether or not a
+    /// preference is stored under it, and a gated write stores nothing.
+    pub feature_access: BTreeSet<String>,
 }
 
 impl Default for ComAmazonawsBillingAwsbillingState {
@@ -489,7 +552,7 @@ impl Default for ComAmazonawsBillingAwsbillingState {
         let primary = BillingView {
             arn: billing_view_arn(PRIMARY_VIEW_ID),
             name: PRIMARY_VIEW_NAME.to_string(),
-            description: None,
+            description: Some(PRIMARY_VIEW_DESCRIPTION.to_string()),
             billing_view_type: BILLING_VIEW_TYPE_PRIMARY.to_string(),
             owner_account_id: ::engine::emulator_account_id().to_string(),
             source_account_id: None,
@@ -528,6 +591,13 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             // A fresh account holds no credits: the modeled `GetCredits`
             // response "returns an empty list when no credits exist".
             credits: BTreeMap::new(),
+            // Every feature except the ones behind the Billing-console access
+            // activation this account does not have.
+            feature_access: BILLING_FEATURE_VALUES
+                .iter()
+                .filter(|feature| !ACCESS_ACTIVATION_FEATURES.contains(*feature))
+                .map(|feature| (*feature).to_string())
+                .collect(),
         }
     }
 }
@@ -724,6 +794,26 @@ impl ComAmazonawsBillingAwsbillingState {
         Some((account_id.to_string(), name.to_string()))
     }
 
+    /// Whether this account's caller may reach the preferences of `feature`.
+    ///
+    /// The one access decision both preference operations make, so a read and a
+    /// write of the same feature can never disagree about it.
+    pub fn has_feature_access(&self, feature: &str) -> bool {
+        self.feature_access.contains(feature)
+    }
+
+    /// Activate `feature` for this account, so its preferences become
+    /// reachable. Idempotent.
+    pub fn grant_feature_access(&mut self, feature: &str) {
+        self.feature_access.insert(feature.to_string());
+    }
+
+    /// Withdraw `feature`'s activation, so its preferences are refused again.
+    /// Idempotent.
+    pub fn revoke_feature_access(&mut self, feature: &str) {
+        self.feature_access.remove(feature);
+    }
+
     /// Whether `account_id` is the management account of the organization this
     /// account belongs to — see [`Self::organization_management_account_id`]
     /// for why a standalone account is not.
@@ -885,21 +975,79 @@ pub fn is_caller_account_arn(arn: &str) -> bool {
 /// account: the account boundary is enforced before any existence lookup, so
 /// the refusal is built from the caller's identity and the requested ARN and
 /// says nothing about the resource.
-pub fn cross_account_access_denied(operation: &str, arn: &str) -> AccessDeniedException {
+pub fn cross_account_access_denied<Eng: Send + Sync + 'static>(
+    operation: &str,
+    arn: &str,
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> AccessDeniedException {
     AccessDeniedException {
         message: format!(
             "User: {} is not authorized to perform: {BILLING_SERVICE_CODE}:{operation} on \
              resource: {arn} because no resource-based policy allows the \
              {BILLING_SERVICE_CODE}:{operation} action",
-            caller_identity_arn()
+            caller_identity_arn(engine, ctx)
         ),
     }
 }
 
-/// The ARN of the identity this emulator's callers authenticate as, for the
-/// `AccessDeniedException` message.
-fn caller_identity_arn() -> String {
-    ::engine::emulator_arn("iam", "", "root")
+/// The ARN of the identity THIS request authenticates as, for the
+/// `AccessDeniedException` message that names the denied principal.
+///
+/// Taken from the same source `sts:GetCallerIdentity` answers from — the STS
+/// session the request's access key id names, or the ambient identity when it
+/// names none — so the principal a refusal blames is the one a caller reads
+/// back from STS for the credentials it signed with, rather than a second
+/// identity minted here.
+///
+/// Falls back to the ambient identity, STS's own answer for a key that names no
+/// session, when the session cannot be resolved (an expired credential, or an
+/// engine with no STS store).
+pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    sts_state::service_state(engine)
+        .and_then(|sts| {
+            sts_state::resolve_caller(
+                &mut sts.lock(),
+                &access_key_id,
+                SystemTime::now(),
+                ctx.credential_store(),
+            )
+            .ok()
+        })
+        .unwrap_or_else(sts_state::ambient_identity)
+        .arn
+}
+
+/// The `AccessDeniedException` payload for a `BillingFeature` this account's
+/// caller has no access to.
+///
+/// Built from the account, the operation and the feature the request named —
+/// the three things the decision was made from — so a client can tell "this
+/// feature is not accessible to this caller" from "this feature is accessible
+/// and has no preferences stored".
+pub fn feature_access_denied(operation: &str, feature: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: format!(
+            "[Exception=AccessDeniedException][AccountId = {}][Operation = {operation}]\
+             [Message=No access to feature {feature}]",
+            caller_account_id()
+        ),
+    }
+}
+
+/// The message this service's ARN validation answers for a billing-view ARN
+/// that names no view of this account: the requested ARN, in brackets, reported
+/// as an invalid billing view ARN.
+///
+/// One form, stated once: `ListBillingViews` already refuses an `arns` filter
+/// entry with it, and the billing-view reads that resolve a single `arn` answer
+/// the same way.
+pub fn invalid_billing_view_arn(arn: &str) -> String {
+    format!("[{arn}] is an invalid billing view arn")
 }
 
 /// The `ValidationException` payload for an ARN that names no `CUSTOM` billing

@@ -75,7 +75,7 @@ fn create_body(name: &str, token: &str) -> Value {
 }
 
 /// The `message` an error body carries.
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)

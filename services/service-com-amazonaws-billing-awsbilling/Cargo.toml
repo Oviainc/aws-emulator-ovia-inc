@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The caller identity an `AccessDeniedException` message names is STS's own:
+# `sts:GetCallerIdentity` and this service must answer with one principal for
+# one credential, so the identity is resolved from the STS store (src/state.rs).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # Hex-encodes the opaque `nextToken` the list operations hand out
 # (ListBillingViews, ListSourceViewsForBillingView).
 hex = { workspace = true }

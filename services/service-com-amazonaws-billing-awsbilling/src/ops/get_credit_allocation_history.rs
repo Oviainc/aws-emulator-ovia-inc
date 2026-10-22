@@ -174,14 +174,15 @@ const MAX_BILLING_MONTHS_SPANNED: i32 = 24;
 /// Refuse a request member as invalid, in the modeled `ValidationException`
 /// shape (HTTP 400) this operation declares.
 ///
-/// `constraint` continues the sentence the member name starts, so the top-level
-/// `message` names the member and the documented constraint the request broke
-/// ("startDate must be on or before endDate") without echoing the offending
-/// value back, and the `fieldList` entry carries the same constraint against
-/// the member it is about.
+/// `constraint` continues the sentence the member name starts, so the refusal
+/// names the member and the constraint the request broke without echoing the
+/// offending value back. The top-level `message` carries AWS's own form for
+/// this operation's argument refusals — `InvalidArgument: <member>
+/// (DetailedCode=<member> <constraint>)` — and the `fieldList` entry carries the
+/// same constraint against the member it is about.
 fn invalid_field(member: &str, constraint: &str) -> GetCreditAllocationHistoryError {
     GetCreditAllocationHistoryErrorModeled::ValidationException(ValidationException {
-        message: format!("{member} {constraint}"),
+        message: format!("InvalidArgument: {member} (DetailedCode={member} {constraint})"),
         reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
         field_list: Some(vec![ValidationExceptionField {
             name: member.to_string(),
@@ -315,14 +316,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| invalid_field("startDate", "must name a representable calendar date"))?;
         let (end_month, end_index) = billing_month_of(&input.end_date)
             .ok_or_else(|| invalid_field("endDate", "must name a representable calendar date"))?;
-        // "Inclusive start date as Unix epoch seconds. Must be on or before
-        // `endDate`." The recorded corpus answers this request with a refusal
-        // whose own message wording is not derivable from the model, so this
-        // message states the rule: the member and the constraint it broke.
+        // The requested window is HALF-OPEN: `endDate` is exclusive, so
+        // `startDate` must be STRICTLY before it and a zero-width range — the
+        // two bounds at one instant — selects nothing and is refused rather
+        // than answered with an empty page. (The `startDate` member doc says
+        // "Must be on or before `endDate`"; the recorded wire behaviour refuses
+        // the equal case, and the wire is what this emulator answers as.)
         if crate::state::date_time_secs(&input.start_date)
-            > crate::state::date_time_secs(&input.end_date)
+            >= crate::state::date_time_secs(&input.end_date)
         {
-            return Err(invalid_field("startDate", "must be on or before endDate"));
+            return Err(invalid_field(
+                "startDate",
+                "must be strictly before endDate (endDate is exclusive)",
+            ));
         }
         // "The range from `startDate` to `endDate` cannot exceed 24 billing
         // months" — counted as the distance between the two months, see

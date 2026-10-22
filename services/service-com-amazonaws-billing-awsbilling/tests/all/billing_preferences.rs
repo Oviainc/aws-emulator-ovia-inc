@@ -56,8 +56,25 @@ const UPDATABLE_FEATURES: &[&str] = &[
 
 /// One router over ONE shared engine — what `core/router` builds in production, so
 /// every call in a test observes the same state.
+///
+/// Every `BillingFeature` is ACTIVATED on that engine
+/// (`ComAmazonawsBillingAwsbillingState::feature_access`): this suite is about what
+/// the preference store reports for a feature the caller can reach, so it opens the
+/// per-feature access gate that the default state leaves closed for the features
+/// behind the Billing-console access activation. The gate itself — which features
+/// are refused, with what code, on a read and on a write — is pinned in
+/// `tests/all/billing_feature_access.rs`.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    {
+        let state = engine
+            .state::<service_com_amazonaws_billing_awsbilling::ComAmazonawsBillingAwsbillingState>(
+            );
+        let mut state = state.lock();
+        for feature in ALL_FEATURES {
+            state.grant_feature_access(feature);
+        }
+    }
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));

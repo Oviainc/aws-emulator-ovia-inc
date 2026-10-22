@@ -168,13 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The modeled `arn`, `name` and `description` constraints are refused by
         // the boundary validator before this runs.
-        let _ = ctx;
         // The account boundary comes first: a well-formed ARN outside the
         // caller's own account is refused without consulting the store, so no
         // answer of this operation depends on what another account holds.
         if !crate::state::is_caller_account_arn(&input.arn) {
             return Err(UpdateBillingViewErrorModeled::AccessDeniedException(
-                crate::state::cross_account_access_denied(Self::NAME, &input.arn),
+                crate::state::cross_account_access_denied(
+                    Self::NAME,
+                    &input.arn,
+                    &*self.engine,
+                    ctx,
+                ),
             )
             .into());
         }

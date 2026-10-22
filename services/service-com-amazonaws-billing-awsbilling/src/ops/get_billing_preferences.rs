@@ -5,7 +5,9 @@
 //! service's state: the keys `UpdateBillingPreferences` set under that feature, or,
 //! for a history feature, the recorded changes to the feature behind it. The
 //! optional `PREFERENCE_KEY` filter narrows the keys and `maxResults`/`nextToken`
-//! page through them; a feature nothing has set reports an empty list.
+//! page through them; a feature nothing has set reports an empty list, and a
+//! feature the account has no access to (`state::feature_access`) is refused 403
+//! `AccessDeniedException` rather than reported as empty.
 //!
 //! ## Shape of an operation
 //!
@@ -282,11 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_field("features", "specify exactly one feature"));
         };
         validate_filters(&input)?;
-        // The page resumes at the entry the previous page stopped on.
-        let consumed = match input.next_token.as_deref() {
-            Some(token) => decode_page_token(token, feature)?,
-            None => 0,
-        };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetBillingPreferencesErrorModeled::InternalServerException(InternalServerException {
@@ -294,6 +291,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let state = state.lock();
+
+        // The access decision is per FEATURE, and it is made BEFORE the rest of
+        // the request is considered and before anything is read: a feature this
+        // account has no access to is refused with the modeled
+        // `AccessDeniedException` (403) whether or not a preference is stored
+        // under it, so a client can tell "no access to this feature" from "this
+        // feature has no preferences".
+        if !state.has_feature_access(feature) {
+            return Err(GetBillingPreferencesErrorModeled::AccessDeniedException(
+                crate::state::feature_access_denied(Self::NAME, feature),
+            )
+            .into());
+        }
+
+        // The page resumes at the entry the previous page stopped on.
+        let consumed = match input.next_token.as_deref() {
+            Some(token) => decode_page_token(token, feature)?,
+            None => 0,
+        };
 
         let matched: Vec<crate::state::PreferenceEntry> = state
             .preference_entries(feature)

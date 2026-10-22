@@ -166,11 +166,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(ListTagsForResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: "Managed billing views cannot be tagged".to_string(),
+                    message: crate::state::MANAGED_VIEW_NOT_TAGGABLE.to_string(),
                     reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
                     field_list: Some(vec![ValidationExceptionField {
                         name: "resourceArn".to_string(),
-                        message: "Managed billing views cannot be tagged".to_string(),
+                        message: crate::state::MANAGED_VIEW_NOT_TAGGABLE.to_string(),
                     }]),
                 },
             )
@@ -179,7 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let view = state.billing_views.get(&input.resource_arn).ok_or_else(|| {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Resource {} not found", input.resource_arn),
+                // The same fixed sentence `TagResource` answers: the tagging
+                // APIs do not echo the requested ARN into the message, only into
+                // `resourceId`.
+                message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 resource_id: input.resource_arn.clone(),
                 resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
             })

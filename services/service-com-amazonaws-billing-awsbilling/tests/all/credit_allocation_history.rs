@@ -107,7 +107,7 @@ fn error_code(body: &Value) -> String {
 ///
 /// Days-from-civil, the standard proleptic-Gregorian conversion, so the test
 /// needs no date dependency the crate under test does not itself need.
-fn at(year: i64, month: i64, day: i64, hour: i64) -> i64 {
+pub(crate) fn at(year: i64, month: i64, day: i64, hour: i64) -> i64 {
     let shifted_year = if month <= 2 { year - 1 } else { year };
     let era = if shifted_year >= 0 {
         shifted_year
@@ -445,7 +445,7 @@ async fn a_date_range_selects_the_billing_months_it_covers() {
         (
             "one month, both bounds mid-month: a billing month is the unit",
             at(2025, 2, 14, 12),
-            at(2025, 2, 14, 12),
+            at(2025, 2, 14, 12) + 1,
             vec![
                 ("2025-02".into(), "0042".into(), "Amazon Simple Storage Service".into()),
                 ("2025-02".into(), "7".into(), "AWS Lambda".into()),
@@ -715,12 +715,24 @@ async fn a_request_outside_the_documented_rules_is_refused_and_persists_nothing(
     // (case, request, the member the refusal must name)
     let cases: Vec<RefusalCase> = vec![
         (
-            // "Must be on or before endDate."
+            // The window is half-open: `endDate` is exclusive, so `startDate`
+            // must be STRICTLY before it.
             "startDate after endDate",
             json!({
                 "accountId": ACCOUNT_ID,
                 "startDate": at(2026, 2, 1, 0),
                 "endDate": at(2025, 2, 1, 0),
+            }),
+            Some("startDate"),
+        ),
+        (
+            // The boundary of that same rule: a zero-width range selects no
+            // instant at all, so it is refused rather than answered empty.
+            "startDate equal to endDate",
+            json!({
+                "accountId": ACCOUNT_ID,
+                "startDate": at(2025, 2, 10, 12),
+                "endDate": at(2025, 2, 10, 12),
             }),
             Some("startDate"),
         ),

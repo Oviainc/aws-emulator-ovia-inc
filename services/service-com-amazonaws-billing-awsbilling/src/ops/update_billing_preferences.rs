@@ -5,7 +5,9 @@
 //! one feature, in this service's state: a key the request does not name keeps the
 //! value it had, and a sharing change is appended to the record the history
 //! features report. The whole request is validated before anything is written, so
-//! a refused call changes nothing.
+//! a refused call changes nothing. A feature the account has no access to
+//! (`state::feature_access`) is refused 403 `AccessDeniedException` before any of
+//! that validation runs.
 //!
 //! ## Shape of an operation
 //!
@@ -196,6 +198,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let feature = input.feature.as_str();
+        // The access decision is per FEATURE, and the gate is reached BEFORE any
+        // feature-specific validation: a feature this account has no access to
+        // is refused with the modeled `AccessDeniedException` (403) and stores
+        // nothing, whether or not the write would have been legal for it. Only
+        // the activation is read here, so the store is not held for the rest of
+        // this request's validation.
+        {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+                UpdateBillingPreferencesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the billing preference store is unavailable".to_string(),
+                    },
+                )
+            })?;
+            if !state.lock().has_feature_access(feature) {
+                return Err(UpdateBillingPreferencesErrorModeled::AccessDeniedException(
+                    crate::state::feature_access_denied(Self::NAME, feature),
+                )
+                .into());
+            }
+        }
+
         // "The history features (RI_SHARING_HISTORY and CREDIT_SHARING_HISTORY)
         // are read-only and cannot be updated." (`feature` doc.)
         if crate::state::is_history_feature(feature) {

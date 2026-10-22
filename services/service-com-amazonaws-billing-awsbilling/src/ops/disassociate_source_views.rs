@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateSourceViews
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateSourceViews`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateSourceViews::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the source billing views `sourceViews` names from the billing view
+//! `arn` names, in this service's state: the association is a SET, so a source the
+//! view does not draw from removes nothing and a replayed request leaves the same
+//! set behind (the model marks this operation `@idempotent`). Only a `CUSTOM`
+//! billing view has a source-view association a caller owns; a managed view's
+//! definition is the service's, so one is refused with a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +133,18 @@ pub struct DisassociateSourceViews<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The modeled `ResourceNotFoundException` (HTTP 404) for an `arn` no billing
+/// view of this account is stored under, in this service's shared ARN-validation
+/// form (`state::invalid_billing_view_arn`).
+fn not_found(arn: &str) -> DisassociateSourceViewsError {
+    DisassociateSourceViewsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::invalid_billing_view_arn(arn),
+        resource_id: arn.to_string(),
+        resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+    })
+    .into()
+}
+
 impl<Eng> DisassociateSourceViews<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -162,18 +171,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateSourceViews` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateSourceViewsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The modeled constraints (`arn`'s pattern, `sourceViews` 1..10 and each
+        // member's pattern) are refused by the boundary validator before this
+        // runs; what is left is the state this request is legal against.
+        // The account boundary comes first, as it does for every operation that
+        // identifies a billing view by ARN: a well-formed ARN outside the
+        // caller's own account is refused before the store is consulted, so the
+        // answer never depends on what another account holds.
+        if !crate::state::is_caller_account_arn(&input.arn) {
+            return Err(DisassociateSourceViewsErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied(
+                    Self::NAME,
+                    &input.arn,
+                    &*self.engine,
+                    ctx,
+                ),
+            )
+            .into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateSourceViewsErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        if !state.billing_views.contains_key(&input.arn) {
+            return Err(not_found(&input.arn));
+        }
+        // Only a `CUSTOM` view has a source-view association the customer owns:
+        // every other `BillingViewType` names a view the service maintains, so
+        // its composition is not a caller's to change (`BillingView::is_managed`,
+        // and the same refusal `UpdateBillingView` and `DeleteBillingView`
+        // answer through `state::not_a_custom_view`).
+        let now = ::std::time::SystemTime::now();
+        let Some(view) = state.custom_view_mut(&input.arn) else {
+            return Err(DisassociateSourceViewsErrorModeled::ValidationException(
+                crate::state::not_a_custom_view(&input.arn, "disassociated from their source views"),
+            )
+            .into());
+        };
+
+        // `BillingViewHealthStatusException`: "a billing view's health status
+        // prevents an operation from being performed … if the billing view is in
+        // a state other than HEALTHY".
+        if view.health_status_code != crate::state::BILLING_VIEW_STATUS_HEALTHY {
+            return Err(
+                DisassociateSourceViewsErrorModeled::BillingViewHealthStatusException(
+                    BillingViewHealthStatusException {
+                        message: format!(
+                            "Billing view {} is {}; it must be {} to disassociate source views",
+                            input.arn,
+                            view.health_status_code,
+                            crate::state::BILLING_VIEW_STATUS_HEALTHY
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The association is a SET and this operation is `@idempotent`, so the
+        // request's effect is the set difference: a source the view draws from is
+        // removed, and one it does not draw from leaves the set as it was rather
+        // than refusing a retry of a call that already succeeded.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateSourceViews"))
+        // Nothing before this line writes, so every refusal above leaves the
+        // view — and the `sourceViewCount` a later read derives from it —
+        // untouched.
+        let remaining: Vec<String> = view
+            .source_views
+            .iter()
+            .filter(|source| !input.source_views.contains(source))
+            .cloned()
+            .collect();
+        if view.source_views != remaining {
+            view.source_views = remaining;
+            view.updated_at = Some(now);
+            // The set of source views is part of the view definition, so a change
+            // to it moves `viewDefinitionLastUpdatedAt` — the same member
+            // `AssociateSourceViews` moves when it widens that set.
+            view.view_definition_last_updated_at = Some(now);
+        }
+
+        Ok(DisassociateSourceViewsOutput {
+            arn: view.arn.clone(),
+        })
     }
 }

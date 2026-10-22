@@ -82,3 +82,5 @@ mod transfer_user_with_iam_role;
 mod sagemaker_signing_name_routing;
 #[path = "all/bedrock_signing_name_routing.rs"]
 mod bedrock_signing_name_routing;
+#[path = "all/billing_access_denied_principal_agrees_with_sts.rs"]
+mod billing_access_denied_principal_agrees_with_sts;

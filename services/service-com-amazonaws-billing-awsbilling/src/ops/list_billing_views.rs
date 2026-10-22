@@ -151,29 +151,43 @@ fn invalid_field(member: &str, why: &str) -> ListBillingViewsError {
     .into()
 }
 
+/// Enforce the account boundary on every entry of the `arns` filter, BEFORE the
+/// store is locked: the decision needs no billing state, and resolving the
+/// caller's identity for the refusal reaches another service's store, which this
+/// way never happens while this service's own lock is held.
+fn check_arns_filter_accounts<Eng: Send + Sync + 'static>(
+    arns: &[String],
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> Result<(), ListBillingViewsError> {
+    for arn in arns {
+        if !crate::state::is_caller_account_arn(arn) {
+            return Err(ListBillingViewsErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied("ListBillingViews", arn, engine, ctx),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Resolve every entry of the `arns` filter against the store, refusing the
-/// whole request on the first one that names no billing view this caller can
-/// resolve.
+/// whole request on the first one that names no billing view of this account.
 ///
 /// A filter that selects resources by identifier VALIDATES each identifier: an
-/// entry outside the caller's account is refused on the account boundary
-/// (403), and one in the caller's account that no view is stored under makes
-/// the request invalid (400), rather than returning a page that silently omits
-/// it — which a caller cannot tell from "it exists but matched another filter".
+/// entry outside the caller's account is refused on the account boundary (403,
+/// see [`check_arns_filter_accounts`]), and one in the caller's account that no
+/// view is stored under makes the request invalid (400), rather than returning a
+/// page that silently omits it — which a caller cannot tell from "it exists but
+/// matched another filter".
 fn resolve_arns_filter(
     arns: &[String],
     state: &crate::state::ComAmazonawsBillingAwsbillingState,
 ) -> Result<(), ListBillingViewsError> {
     for arn in arns {
-        if !crate::state::is_caller_account_arn(arn) {
-            return Err(ListBillingViewsErrorModeled::AccessDeniedException(
-                crate::state::cross_account_access_denied("ListBillingViews", arn),
-            )
-            .into());
-        }
         if !state.billing_views.contains_key(arn) {
             return Err(ListBillingViewsErrorModeled::ValidationException(ValidationException {
-                message: format!("[{arn}] is an invalid billing view arn"),
+                message: crate::state::invalid_billing_view_arn(arn),
                 reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
                 field_list: Some(vec![ValidationExceptionField {
                     name: "arns".to_string(),
@@ -286,7 +300,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every modeled constraint (`maxResults` 1..100, `arns` 0..10, the
         // `nextToken` pattern, the `names` search option enum) is refused by the
         // boundary validator before this runs.
-        let _ = ctx;
+        // The account boundary of every `arns` entry is decided first, before the
+        // store is locked: it needs no billing state, and it keeps the caller's
+        // identity lookup (another service's store) outside this service's lock.
+        if let Some(arns) = &input.arns {
+            check_arns_filter_accounts(arns, &*self.engine, ctx)?;
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListBillingViewsErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),

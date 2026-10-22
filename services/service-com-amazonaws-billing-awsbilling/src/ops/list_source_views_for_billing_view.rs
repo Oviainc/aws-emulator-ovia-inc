@@ -215,7 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let view = state.billing_views.get(&input.arn).ok_or_else(|| {
             ListSourceViewsForBillingViewErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Billing view {} does not exist", input.arn),
+                    // A read that resolves one `BillingViewArn` reports the ARN
+                    // it could not resolve, in this service's own ARN-validation
+                    // form (`state::invalid_billing_view_arn`).
+                    message: crate::state::invalid_billing_view_arn(&input.arn),
                     resource_id: input.arn.clone(),
                     resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
                 },
