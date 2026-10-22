@@ -21,13 +21,23 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    Category, DocumentItem, FulfillmentOptionSummary, LegalTerm, ListingBadge, ListingSummary,
+    AmazonMachineImageEbsVolume, AmazonMachineImageFulfillmentOption,
+    AmazonMachineImageOperatingSystem, AmazonMachineImageRecommendation,
+    AmazonMachineImageSecurityGroup, ApiFulfillmentOption, AwsSupportedService, Category,
+    CloudFormationFulfillmentOption, ContainerFulfillmentOption, ContainerOperatingSystem,
+    DataArtifact, DataExchangeFulfillmentOption, DocumentItem,
+    Ec2ImageBuilderComponentFulfillmentOption, EksAddOnFulfillmentOption,
+    EksAddOnOperatingSystem, FulfillmentOption, FulfillmentOptionSummary, HelmFulfillmentOption,
+    HelmOperatingSystem, LegalTerm, ListingBadge, ListingSummary,
     ListingSummaryAssociatedEntity, OfferInformation, OfferSetInformation, OfferTerm, PricingModel,
-    PricingUnit, ProductInformation, PurchaseOptionAssociatedEntity, PurchaseOptionBadge,
+    PricingUnit, ProductInformation, ProfessionalServicesFulfillmentOption,
+    PurchaseOptionAssociatedEntity, PurchaseOptionBadge,
     PromotionalEmbeddedImage, PromotionalEmbeddedVideo, PromotionalMedia, PurchaseOptionSummary,
     RateCardItem, RecurringPaymentTerm, Resource, ReviewSourceSummary,
-    ReviewSummary, SellerEngagement, SellerInformation, SupportTerm, UsageBasedPricingTerm,
-    UsageBasedRateCardItem, UseCase, UseCaseEntry, ValidityTerm,
+    ReviewSummary, SaasFulfillmentOption, SageMakerAlgorithmFulfillmentOption,
+    SageMakerAlgorithmRecommendation, SageMakerModelFulfillmentOption,
+    SageMakerModelRecommendation, SellerEngagement, SellerInformation, SupportTerm,
+    UsageBasedPricingTerm, UsageBasedRateCardItem, UseCase, UseCaseEntry, ValidityTerm,
 };
 
 /// The locale the service returns content in when none is requested, and the fallback for
@@ -64,6 +74,180 @@ pub const VISIBILITY_PUBLIC: &str = "PUBLIC";
 
 /// Seconds in a day, for the seeded catalog's relative timestamps.
 const DAY: i64 = 24 * 60 * 60;
+
+/// The human-readable name of every fulfillment option type, which is what both
+/// `FulfillmentOptionSummary$displayName` ("The human-readable name of the fulfillment
+/// option type") and each fulfillment option's `fulfillmentOptionDisplayName` ("A
+/// human-readable name for the fulfillment option type") carry — so one table serves both
+/// and a product's detail can never disagree with its summary on a type's name.
+///
+/// Source: the `FulfillmentOptionType` enum's values
+/// (`smithy_query(query="shape",shape="FulfillmentOptionType")`) paired with the
+/// `FulfillmentOption` union member documentation that names each one.
+pub const FULFILLMENT_OPTION_TYPE_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("AMAZON_MACHINE_IMAGE", "Amazon Machine Image"),
+    ("API", "API"),
+    ("CLOUDFORMATION_TEMPLATE", "AWS CloudFormation template"),
+    ("CONTAINER", "Container"),
+    ("HELM", "Helm chart"),
+    ("EKS_ADD_ON", "Amazon EKS add-on"),
+    ("EC2_IMAGE_BUILDER_COMPONENT", "EC2 Image Builder component"),
+    ("DATA_EXCHANGE", "AWS Data Exchange"),
+    ("PROFESSIONAL_SERVICES", "Professional services"),
+    ("SAAS", "SaaS"),
+    ("SAGEMAKER_ALGORITHM", "SageMaker algorithm"),
+    ("SAGEMAKER_MODEL", "SageMaker model"),
+];
+
+/// The human-readable name of one fulfillment option type, or the type itself when the
+/// model grows a value this table does not name yet.
+pub fn fulfillment_option_display_name(option_type: &str) -> String {
+    FULFILLMENT_OPTION_TYPE_DISPLAY_NAMES
+        .iter()
+        .find(|(value, _)| *value == option_type)
+        .map_or_else(|| option_type.to_string(), |(_, name)| (*name).to_string())
+}
+
+/// The `fulfillmentOptionId` of a fulfillment option, whichever member of the
+/// `FulfillmentOption` union it is: every member of the union declares the member.
+pub fn fulfillment_option_id(option: &FulfillmentOption) -> &str {
+    match option {
+        FulfillmentOption::amazonMachineImageFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::apiFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::cloudFormationFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::containerFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::helmFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::eksAddOnFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::ec2ImageBuilderComponentFulfillmentOption(o) => {
+            &o.fulfillment_option_id
+        }
+        FulfillmentOption::dataExchangeFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::professionalServicesFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::saasFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::sageMakerAlgorithmFulfillmentOption(o) => &o.fulfillment_option_id,
+        FulfillmentOption::sageMakerModelFulfillmentOption(o) => &o.fulfillment_option_id,
+    }
+}
+
+/// The `fulfillmentOptionType` of a fulfillment option, whichever member of the
+/// `FulfillmentOption` union it is.
+pub fn fulfillment_option_type(option: &FulfillmentOption) -> &str {
+    match option {
+        FulfillmentOption::amazonMachineImageFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::apiFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::cloudFormationFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::containerFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::helmFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::eksAddOnFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::ec2ImageBuilderComponentFulfillmentOption(o) => {
+            &o.fulfillment_option_type
+        }
+        FulfillmentOption::dataExchangeFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::professionalServicesFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::saasFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::sageMakerAlgorithmFulfillmentOption(o) => &o.fulfillment_option_type,
+        FulfillmentOption::sageMakerModelFulfillmentOption(o) => &o.fulfillment_option_type,
+    }
+}
+
+/// Replace a fulfillment option's `usageInstructions` — the buyer-facing text every
+/// member of the union that has any carries. Answers `false` for the two members the
+/// model gives no instructions (`DataExchangeFulfillmentOption`,
+/// `ProfessionalServicesFulfillmentOption`), which have nothing to translate.
+fn set_usage_instructions(option: &mut FulfillmentOption, instructions: String) -> bool {
+    let instructions = Some(instructions);
+    match option {
+        FulfillmentOption::amazonMachineImageFulfillmentOption(o) => {
+            o.usage_instructions = instructions;
+        }
+        FulfillmentOption::apiFulfillmentOption(o) => o.usage_instructions = instructions,
+        FulfillmentOption::cloudFormationFulfillmentOption(o) => {
+            o.usage_instructions = instructions;
+        }
+        FulfillmentOption::containerFulfillmentOption(o) => o.usage_instructions = instructions,
+        FulfillmentOption::helmFulfillmentOption(o) => o.usage_instructions = instructions,
+        FulfillmentOption::eksAddOnFulfillmentOption(o) => o.usage_instructions = instructions,
+        FulfillmentOption::ec2ImageBuilderComponentFulfillmentOption(o) => {
+            o.usage_instructions = instructions;
+        }
+        FulfillmentOption::saasFulfillmentOption(o) => o.usage_instructions = instructions,
+        FulfillmentOption::sageMakerAlgorithmFulfillmentOption(o) => {
+            o.usage_instructions = instructions;
+        }
+        FulfillmentOption::sageMakerModelFulfillmentOption(o) => {
+            o.usage_instructions = instructions;
+        }
+        FulfillmentOption::dataExchangeFulfillmentOption(_)
+        | FulfillmentOption::professionalServicesFulfillmentOption(_) => return false,
+    }
+    true
+}
+
+/// A fulfillment option of a product, as the catalog stores it: the option in the default
+/// locale plus whatever translations of its buyer-facing text the catalog holds.
+///
+/// A translation is derived FROM the default-locale option, so it can never disagree with
+/// it on the option's identity, type or deployment detail.
+#[derive(Debug, Clone)]
+pub struct FulfillmentOptionRecord {
+    default: FulfillmentOption,
+    translations: BTreeMap<String, FulfillmentOption>,
+}
+
+impl FulfillmentOptionRecord {
+    /// Store `option` as this product's fulfillment option in the default locale.
+    pub fn new(option: FulfillmentOption) -> Self {
+        Self {
+            default: option,
+            translations: BTreeMap::new(),
+        }
+    }
+
+    /// Record `locale`'s translation of this option's usage instructions.
+    ///
+    /// PANICS in a debug build when this option's union member carries no
+    /// `usageInstructions`, so a translation that would silently store a copy of the
+    /// default-locale option is caught where it is written.
+    #[must_use]
+    pub fn translate(mut self, locale: &str, usage_instructions: &str) -> Self {
+        let mut translated = self.default.clone();
+        let applied = set_usage_instructions(&mut translated, usage_instructions.to_string());
+        debug_assert!(
+            applied,
+            "fulfillment option {} of type {} carries no usageInstructions to translate",
+            self.id(),
+            self.option_type()
+        );
+        self.translations.insert(locale.to_string(), translated);
+        self
+    }
+
+    /// This option in `locale`, falling back to the default-locale option.
+    pub fn option(&self, locale: &str) -> FulfillmentOption {
+        self.translations
+            .get(locale)
+            .unwrap_or(&self.default)
+            .clone()
+    }
+
+    /// The option's `fulfillmentOptionId`, which no translation changes.
+    pub fn id(&self) -> &str {
+        fulfillment_option_id(&self.default)
+    }
+
+    /// The option's `fulfillmentOptionType`, which no translation changes.
+    pub fn option_type(&self) -> &str {
+        fulfillment_option_type(&self.default)
+    }
+
+    /// The summary of this option's type, as `FulfillmentOptionSummary`.
+    pub fn summary(&self) -> FulfillmentOptionSummary {
+        FulfillmentOptionSummary {
+            fulfillment_option_type: self.option_type().to_string(),
+            display_name: fulfillment_option_display_name(self.option_type()),
+        }
+    }
+}
 
 /// Wall-clock seconds since the Unix epoch.
 pub fn now_secs() -> i64 {
@@ -125,9 +309,10 @@ pub struct Listing {
     pub badges: Vec<ListingBadge>,
     pub pricing_models: Vec<PricingModel>,
     pub pricing_units: Vec<PricingUnit>,
-    pub fulfillment_option_summaries: Vec<FulfillmentOptionSummary>,
     /// Products this listing is associated with; every one of them points back here
-    /// through [`Product::listing_id`].
+    /// through [`Product::listing_id`]. A listing's fulfillment option summaries are
+    /// derived from these products' fulfillment options
+    /// ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::listing_fulfillment_option_summaries`]).
     pub product_ids: Vec<String>,
     /// Offers this listing is associated with.
     pub offer_ids: Vec<String>,
@@ -154,7 +339,44 @@ pub struct Product {
     pub promotional_media: Vec<PromotionalMedia>,
     pub resources: Vec<Resource>,
     pub seller_engagements: Vec<SellerEngagement>,
-    pub fulfillment_option_summaries: Vec<FulfillmentOptionSummary>,
+    /// How a buyer can deploy or access this product. The SINGLE record of this
+    /// product's fulfillment: `ListFulfillmentOptions` pages over these options and the
+    /// `fulfillmentOptionSummaries` of `GetProduct`, `GetListing` and `SearchListings`
+    /// are derived from them, so the detail and the summaries cannot disagree.
+    pub fulfillment_options: Vec<FulfillmentOptionRecord>,
+}
+
+impl Product {
+    /// This product's fulfillment options in `locale`, ordered by `fulfillmentOptionId`
+    /// so every page of `ListFulfillmentOptions` is cut from one stable total order.
+    pub fn fulfillment_options(&self, locale: &str) -> Vec<FulfillmentOption> {
+        let mut records: Vec<&FulfillmentOptionRecord> = self.fulfillment_options.iter().collect();
+        records.sort_by(|a, b| a.id().cmp(b.id()));
+        records
+            .into_iter()
+            .map(|record| record.option(locale))
+            .collect()
+    }
+
+    /// The summary of each fulfillment option TYPE this product offers, one per distinct
+    /// type in the order the options are paged over.
+    ///
+    /// `FulfillmentOptionSummary` summarises a type rather than an option, so two options
+    /// of the same type (two AMI versions, say) summarise to one entry.
+    pub fn fulfillment_option_summaries(&self) -> Vec<FulfillmentOptionSummary> {
+        let mut records: Vec<&FulfillmentOptionRecord> = self.fulfillment_options.iter().collect();
+        records.sort_by(|a, b| a.id().cmp(b.id()));
+        let mut summaries: Vec<FulfillmentOptionSummary> = Vec::new();
+        for record in records {
+            if !summaries
+                .iter()
+                .any(|summary| summary.fulfillment_option_type == record.option_type())
+            {
+                summaries.push(record.summary());
+            }
+        }
+        summaries
+    }
 }
 
 /// An offer in the seeded catalog.
@@ -249,7 +471,7 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
             listing_id: listing.listing_id.clone(),
             listing_name: text.name.clone(),
             publisher: listing.publisher.clone(),
-            fulfillment_option_summaries: listing.fulfillment_option_summaries.clone(),
+            fulfillment_option_summaries: self.listing_fulfillment_option_summaries(listing),
             catalog: self.catalog.clone(),
             short_description: text.short_description.clone(),
             logo_thumbnail_url: listing.logo_thumbnail_url.clone(),
@@ -267,6 +489,32 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
                 })
                 .collect(),
         }
+    }
+
+    /// The fulfillment option summaries a LISTING reports: one per distinct fulfillment
+    /// option type its associated products offer, in product order.
+    ///
+    /// A listing is fulfilled through its products, so its summaries are the de-duplicated
+    /// union of theirs rather than a second record that could drift from them.
+    pub fn listing_fulfillment_option_summaries(
+        &self,
+        listing: &Listing,
+    ) -> Vec<FulfillmentOptionSummary> {
+        let mut summaries: Vec<FulfillmentOptionSummary> = Vec::new();
+        for product_id in &listing.product_ids {
+            let Some(product) = self.products.get(product_id) else {
+                continue;
+            };
+            for summary in product.fulfillment_option_summaries() {
+                if !summaries
+                    .iter()
+                    .any(|seen| seen.fulfillment_option_type == summary.fulfillment_option_type)
+                {
+                    summaries.push(summary);
+                }
+            }
+        }
+        summaries
     }
 
     /// Summary information about a stored product, or `None` when no such product exists.
@@ -595,11 +843,335 @@ fn category(category_id: &str, display_name: &str) -> Category {
     }
 }
 
-fn fulfillment(option_type: &str, display_name: &str) -> FulfillmentOptionSummary {
-    FulfillmentOptionSummary {
-        fulfillment_option_type: option_type.to_string(),
+/// An AWS service a fulfillment option can be deployed to or integrated with.
+fn aws_service(service_type: &str, display_name: &str, description: &str) -> AwsSupportedService {
+    AwsSupportedService {
+        supported_service_type: service_type.to_string(),
         display_name: display_name.to_string(),
+        description: description.to_string(),
     }
+}
+
+/// A SaaS fulfillment option: the seller hosts the software and the buyer reaches it over
+/// the web, so the option carries registration and launch URLs rather than a version.
+fn saas_option(
+    id: &str,
+    fulfillment_url: &str,
+    launch_url: &str,
+    quick_launch: &str,
+    usage_instructions: &str,
+    available_from: i64,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::saasFulfillmentOption(
+        SaasFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_type: "SAAS".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("SAAS"),
+            fulfillment_url: Some(fulfillment_url.to_string()),
+            usage_instructions: Some(usage_instructions.to_string()),
+            available_from_time: Some(datetime(available_from)),
+            launch_url: Some(launch_url.to_string()),
+            quick_launch: quick_launch.to_string(),
+        },
+    ))
+}
+
+/// An API fulfillment option: the buyer calls the seller's API, so the option names the
+/// AWS services the integration is supported on.
+fn api_option(
+    id: &str,
+    usage_instructions: &str,
+    services: Vec<AwsSupportedService>,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::apiFulfillmentOption(
+        ApiFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_type: "API".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("API"),
+            usage_instructions: Some(usage_instructions.to_string()),
+            aws_supported_services: services,
+        },
+    ))
+}
+
+/// An Amazon Machine Image fulfillment option, with the operating systems it ships and
+/// the instance type and EBS volumes recommended for running it.
+fn ami_option(
+    id: &str,
+    name: &str,
+    version: &str,
+    architecture: &str,
+    usage_instructions: &str,
+    instance_type: &str,
+    available_from: i64,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::amazonMachineImageFulfillmentOption(
+        AmazonMachineImageFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_name: name.to_string(),
+            fulfillment_option_version: Some(version.to_string()),
+            fulfillment_option_type: "AMAZON_MACHINE_IMAGE".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name(
+                "AMAZON_MACHINE_IMAGE",
+            ),
+            operating_systems: vec![AmazonMachineImageOperatingSystem {
+                operating_system_family_name: "AMAZONLINUX".to_string(),
+                operating_system_name: "Amazon Linux".to_string(),
+                operating_system_version: Some("2023".to_string()),
+            }],
+            recommendation: Some(AmazonMachineImageRecommendation {
+                instance_type: instance_type.to_string(),
+                security_groups: Some(vec![AmazonMachineImageSecurityGroup {
+                    protocol: "tcp".to_string(),
+                    from_port: 443,
+                    to_port: 443,
+                    cidr_ip_addresses: vec!["0.0.0.0/0".to_string()],
+                }]),
+            }),
+            release_notes: Some(format!("Release notes for version {version}.")),
+            usage_instructions: Some(usage_instructions.to_string()),
+            available_from_time: Some(datetime(available_from)),
+            access_url_template: Some("https://{instance_dns}/".to_string()),
+            architecture: architecture.to_string(),
+            ami_alias: Some(format!("resolve:ssm:/aws/marketplace/{id}")),
+            ebs_volume: Some(AmazonMachineImageEbsVolume {
+                volume_types: vec!["gp3".to_string(), "io2".to_string()],
+                iops: Some(3000),
+            }),
+            short_description: Some(format!("{name}, as an Amazon Machine Image.")),
+        },
+    ))
+}
+
+/// An AWS CloudFormation template fulfillment option.
+fn cloudformation_option(
+    id: &str,
+    name: &str,
+    version: &str,
+    usage_instructions: &str,
+    short_description: &str,
+    available_from: i64,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::cloudFormationFulfillmentOption(
+        CloudFormationFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_name: name.to_string(),
+            fulfillment_option_type: "CLOUDFORMATION_TEMPLATE".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name(
+                "CLOUDFORMATION_TEMPLATE",
+            ),
+            fulfillment_option_version: Some(version.to_string()),
+            release_notes: Some(format!("Release notes for version {version}.")),
+            usage_instructions: Some(usage_instructions.to_string()),
+            available_from_time: Some(datetime(available_from)),
+            short_description: Some(short_description.to_string()),
+            long_description: Some(format!(
+                "{short_description} The template provisions every resource the product \
+                 needs in the buyer's own account."
+            )),
+        },
+    ))
+}
+
+/// A container image fulfillment option, deployable to the container services it names.
+fn container_option(
+    id: &str,
+    name: &str,
+    version: &str,
+    usage_instructions: &str,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::containerFulfillmentOption(
+        ContainerFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_name: name.to_string(),
+            fulfillment_option_type: "CONTAINER".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("CONTAINER"),
+            fulfillment_option_version: Some(version.to_string()),
+            operating_systems: Some(vec![ContainerOperatingSystem {
+                operating_system_family_name: "DEBIAN".to_string(),
+                operating_system_name: "Debian".to_string(),
+            }]),
+            aws_supported_services: Some(vec![
+                aws_service("EKS", "Amazon EKS", "Elastic Kubernetes Service"),
+                aws_service("ECS", "Amazon ECS", "Elastic Container Service"),
+            ]),
+            release_notes: Some(format!("Release notes for version {version}.")),
+            usage_instructions: Some(usage_instructions.to_string()),
+        },
+    ))
+}
+
+/// A Helm chart fulfillment option, installed into the buyer's Kubernetes cluster.
+fn helm_option(
+    id: &str,
+    name: &str,
+    version: &str,
+    usage_instructions: &str,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::helmFulfillmentOption(
+        HelmFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_name: name.to_string(),
+            fulfillment_option_type: "HELM".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("HELM"),
+            fulfillment_option_version: Some(version.to_string()),
+            operating_systems: Some(vec![HelmOperatingSystem {
+                operating_system_family_name: "DEBIAN".to_string(),
+                operating_system_name: "Debian".to_string(),
+            }]),
+            release_notes: Some(format!("Release notes for version {version}.")),
+            aws_supported_services: Some(vec![aws_service(
+                "EKS",
+                "Amazon EKS",
+                "Elastic Kubernetes Service",
+            )]),
+            usage_instructions: Some(usage_instructions.to_string()),
+        },
+    ))
+}
+
+/// An Amazon EKS add-on fulfillment option.
+fn eks_add_on_option(
+    id: &str,
+    name: &str,
+    version: &str,
+    usage_instructions: &str,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::eksAddOnFulfillmentOption(
+        EksAddOnFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_name: name.to_string(),
+            fulfillment_option_type: "EKS_ADD_ON".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("EKS_ADD_ON"),
+            fulfillment_option_version: Some(version.to_string()),
+            operating_systems: Some(vec![EksAddOnOperatingSystem {
+                operating_system_family_name: "AMAZONLINUX".to_string(),
+                operating_system_name: "Amazon Linux".to_string(),
+            }]),
+            release_notes: Some(format!("Release notes for version {version}.")),
+            usage_instructions: Some(usage_instructions.to_string()),
+            aws_supported_services: Some(vec![aws_service(
+                "EKS",
+                "Amazon EKS",
+                "Elastic Kubernetes Service",
+            )]),
+        },
+    ))
+}
+
+/// An EC2 Image Builder component fulfillment option.
+fn ec2_image_builder_option(
+    id: &str,
+    name: &str,
+    version: &str,
+    usage_instructions: &str,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(
+        FulfillmentOption::ec2ImageBuilderComponentFulfillmentOption(
+            Ec2ImageBuilderComponentFulfillmentOption {
+                fulfillment_option_id: id.to_string(),
+                fulfillment_option_name: name.to_string(),
+                fulfillment_option_type: "EC2_IMAGE_BUILDER_COMPONENT".to_string(),
+                fulfillment_option_display_name: fulfillment_option_display_name(
+                    "EC2_IMAGE_BUILDER_COMPONENT",
+                ),
+                fulfillment_option_version: Some(version.to_string()),
+                operating_systems: Some(vec![ContainerOperatingSystem {
+                    operating_system_family_name: "AMAZONLINUX".to_string(),
+                    operating_system_name: "Amazon Linux".to_string(),
+                }]),
+                aws_supported_services: Some(vec![aws_service(
+                    "IMAGEBUILDER",
+                    "EC2 Image Builder",
+                    "Image pipeline service",
+                )]),
+                release_notes: Some(format!("Release notes for version {version}.")),
+                usage_instructions: Some(usage_instructions.to_string()),
+            },
+        ),
+    )
+}
+
+/// An AWS Data Exchange fulfillment option, delivering the data sets it names.
+fn data_exchange_option(id: &str, data_set_arn: &str, description: &str) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::dataExchangeFulfillmentOption(
+        DataExchangeFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_type: "DATA_EXCHANGE".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("DATA_EXCHANGE"),
+            data_artifacts: Some(vec![DataArtifact {
+                description: Some(description.to_string()),
+                resource_arn: Some(data_set_arn.to_string()),
+                resource_type: "DATA_SET".to_string(),
+                data_classification: "PUBLIC".to_string(),
+            }]),
+        },
+    ))
+}
+
+/// A professional services fulfillment option, which the model gives no deployment detail
+/// beyond its identity and type.
+fn professional_services_option(id: &str) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::professionalServicesFulfillmentOption(
+        ProfessionalServicesFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_type: "PROFESSIONAL_SERVICES".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name(
+                "PROFESSIONAL_SERVICES",
+            ),
+        },
+    ))
+}
+
+/// A SageMaker algorithm fulfillment option, with the instance types recommended for
+/// training and for inference.
+fn sagemaker_algorithm_option(
+    id: &str,
+    version: &str,
+    usage_instructions: &str,
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::sageMakerAlgorithmFulfillmentOption(
+        SageMakerAlgorithmFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_type: "SAGEMAKER_ALGORITHM".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("SAGEMAKER_ALGORITHM"),
+            fulfillment_option_version: Some(version.to_string()),
+            release_notes: Some(format!("Release notes for version {version}.")),
+            usage_instructions: Some(usage_instructions.to_string()),
+            recommendation: Some(SageMakerAlgorithmRecommendation {
+                recommended_batch_transform_instance_type: "ml.m5.xlarge".to_string(),
+                recommended_realtime_inference_instance_type: Some("ml.g5.xlarge".to_string()),
+                recommended_training_instance_type: "ml.p3.2xlarge".to_string(),
+            }),
+        },
+    ))
+}
+
+/// A SageMaker model fulfillment option, with the content types its endpoint accepts.
+fn sagemaker_model_option(
+    id: &str,
+    version: &str,
+    usage_instructions: &str,
+    content_types: &[&str],
+) -> FulfillmentOptionRecord {
+    FulfillmentOptionRecord::new(FulfillmentOption::sageMakerModelFulfillmentOption(
+        SageMakerModelFulfillmentOption {
+            fulfillment_option_id: id.to_string(),
+            fulfillment_option_type: "SAGEMAKER_MODEL".to_string(),
+            fulfillment_option_display_name: fulfillment_option_display_name("SAGEMAKER_MODEL"),
+            fulfillment_option_version: Some(version.to_string()),
+            release_notes: Some(format!("Release notes for version {version}.")),
+            usage_instructions: Some(usage_instructions.to_string()),
+            recommendation: Some(SageMakerModelRecommendation {
+                recommended_batch_transform_instance_type: "ml.m5.xlarge".to_string(),
+                recommended_realtime_inference_instance_type: Some("ml.g5.xlarge".to_string()),
+            }),
+            supported_content_types: Some(
+                content_types.iter().map(|t| (*t).to_string()).collect(),
+            ),
+            supported_response_mime_types: Some(vec!["application/json".to_string()]),
+        },
+    ))
 }
 
 fn pricing_model(model_type: &str, display_name: &str) -> PricingModel {
@@ -840,7 +1412,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 pricing_model("USAGE", "Usage based"),
             ],
             pricing_units: vec![pricing_unit("USERS", "Users")],
-            fulfillment_option_summaries: vec![fulfillment("SAAS", "SaaS")],
             product_ids: vec!["p-0001-analytics-core".to_string()],
             offer_ids: vec![
                 "o-0001-analytics-annual".to_string(),
@@ -903,7 +1474,31 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "https://example.com/docs/acme-analytics",
             ),
             seller_engagements: engagements("https://example.com/acme/contact"),
-            fulfillment_option_summaries: vec![fulfillment("SAAS", "SaaS")],
+            fulfillment_options: vec![
+                saas_option(
+                    "fo-0001-analytics-saas",
+                    "https://example.com/acme/register",
+                    "https://example.com/acme/launch",
+                    "ENABLED",
+                    "Register with your AWS account, then invite your analysts from the Acme \
+                     console.",
+                    year_ago,
+                )
+                .translate(
+                    "fr",
+                    "Inscrivez-vous avec votre compte AWS, puis invitez vos analystes depuis \
+                     la console Acme.",
+                ),
+                api_option(
+                    "fo-0002-analytics-api",
+                    "Call the Acme Analytics REST API with the key issued at registration.",
+                    vec![aws_service(
+                        "APIGATEWAY",
+                        "Amazon API Gateway",
+                        "Fronts the Acme Analytics REST API.",
+                    )],
+                ),
+            ],
         },
     );
     state.offers.insert(
@@ -1021,10 +1616,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             ],
             pricing_models: vec![pricing_model("USAGE", "Usage based")],
             pricing_units: vec![pricing_unit("HOSTS", "Hosts")],
-            fulfillment_option_summaries: vec![fulfillment(
-                "AMAZON_MACHINE_IMAGE",
-                "Amazon Machine Image",
-            )],
             product_ids: vec!["p-0002-firewall-appliance".to_string()],
             offer_ids: vec!["o-0003-firewall-hourly".to_string()],
             publisher: nimbus.clone(),
@@ -1067,10 +1658,34 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "https://example.com/docs/nimbus-firewall",
             ),
             seller_engagements: engagements("https://example.com/nimbus/contact"),
-            fulfillment_option_summaries: vec![fulfillment(
-                "AMAZON_MACHINE_IMAGE",
-                "Amazon Machine Image",
-            )],
+            fulfillment_options: vec![
+                ami_option(
+                    "fo-0003-firewall-ami",
+                    "Nimbus Firewall Appliance 7.2",
+                    "7.2.1",
+                    "x86_64",
+                    "Launch the AMI into the inspection subnet, then adopt the instance from \
+                     the Nimbus console.",
+                    "c6i.2xlarge",
+                    year_ago,
+                ),
+                cloudformation_option(
+                    "fo-0004-firewall-cfn",
+                    "Nimbus Firewall reference architecture",
+                    "7.2.1",
+                    "Deploy the stack into the VPC whose edge you want inspected.",
+                    "A highly available pair of firewall appliances behind a Gateway Load \
+                     Balancer.",
+                    year_ago,
+                ),
+                ec2_image_builder_option(
+                    "fo-0005-firewall-component",
+                    "Nimbus Firewall hardening component",
+                    "7.2.1",
+                    "Add the component to an Image Builder recipe to bake the firewall agent \
+                     into your own image.",
+                ),
+            ],
         },
     );
     state.offers.insert(
@@ -1121,7 +1736,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             badges: Vec::new(),
             pricing_models: vec![pricing_model("CONTRACT", "Contract")],
             pricing_units: vec![pricing_unit("DATA", "Data")],
-            fulfillment_option_summaries: vec![fulfillment("DATA_EXCHANGE", "AWS Data Exchange")],
             product_ids: vec!["p-0003-datafeed-equities".to_string()],
             offer_ids: vec!["o-0004-datafeed-contract".to_string()],
             publisher: orion.clone(),
@@ -1161,7 +1775,11 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             promotional_media: Vec::new(),
             resources: support_resources("data@example.com", "https://example.com/docs/orion-feed"),
             seller_engagements: engagements("https://example.com/orion/contact"),
-            fulfillment_option_summaries: vec![fulfillment("DATA_EXCHANGE", "AWS Data Exchange")],
+            fulfillment_options: vec![data_exchange_option(
+                "fo-0006-datafeed-dataset",
+                "arn:aws:dataexchange:us-east-1::data-sets/orion-equities-reference-prices",
+                "Daily reference prices for listed equities, as Parquet and CSV.",
+            )],
         },
     );
     state.offers.insert(
@@ -1226,10 +1844,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 pricing_model("FREE", "Free"),
             ],
             pricing_units: vec![pricing_unit("REQUESTS", "Requests")],
-            fulfillment_option_summaries: vec![
-                fulfillment("SAGEMAKER_MODEL", "SageMaker model"),
-                fulfillment("CONTAINER", "Container"),
-            ],
             product_ids: vec![
                 "p-0004-mlkit-vision".to_string(),
                 "p-0005-mlkit-nlp".to_string(),
@@ -1289,7 +1903,20 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             )],
             resources: support_resources("ml@example.com", "https://example.com/docs/zephyr"),
             seller_engagements: engagements("https://example.com/zephyr/contact"),
-            fulfillment_option_summaries: vec![fulfillment("SAGEMAKER_MODEL", "SageMaker model")],
+            fulfillment_options: vec![
+                sagemaker_model_option(
+                    "fo-0007-mlkit-vision-model",
+                    "3.1.0",
+                    "Deploy the model package to a SageMaker endpoint and post images to it.",
+                    &["image/jpeg", "image/png"],
+                ),
+                sagemaker_algorithm_option(
+                    "fo-0008-mlkit-vision-algorithm",
+                    "3.1.0",
+                    "Fine-tune the detector on your own labelled frames with a SageMaker \
+                     training job.",
+                ),
+            ],
         },
     );
     state.products.insert(
@@ -1314,7 +1941,12 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             promotional_media: Vec::new(),
             resources: support_resources("ml@example.com", "https://example.com/docs/zephyr"),
             seller_engagements: engagements("https://example.com/zephyr/contact"),
-            fulfillment_option_summaries: vec![fulfillment("CONTAINER", "Container")],
+            fulfillment_options: vec![container_option(
+                "fo-0009-mlkit-nlp-container",
+                "Zephyr Language Models",
+                "3.1.0",
+                "Pull the image from the registry and run it behind your own ingress.",
+            )],
         },
     );
     state.offers.insert(
@@ -1369,10 +2001,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             badges: Vec::new(),
             pricing_models: vec![pricing_model("BYOL", "Bring your own licence")],
             pricing_units: vec![pricing_unit("UNITS", "Units")],
-            fulfillment_option_summaries: vec![
-                fulfillment("CONTAINER", "Container"),
-                fulfillment("HELM", "Helm chart"),
-            ],
             product_ids: vec!["p-0006-devtools-pipeline".to_string()],
             offer_ids: vec!["o-0006-devtools-byol".to_string()],
             publisher: helios.clone(),
@@ -1409,7 +2037,27 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             promotional_media: Vec::new(),
             resources: support_resources("dev@example.com", "https://example.com/docs/helios"),
             seller_engagements: engagements("https://example.com/helios/contact"),
-            fulfillment_option_summaries: vec![fulfillment("HELM", "Helm chart")],
+            fulfillment_options: vec![
+                helm_option(
+                    "fo-0010-devtools-helm",
+                    "Helios Pipeline Server",
+                    "2.4.0",
+                    "helm install helios oci://example.com/charts/helios-pipeline --version \
+                     2.4.0",
+                ),
+                container_option(
+                    "fo-0011-devtools-container",
+                    "Helios Pipeline Server",
+                    "2.4.0",
+                    "Run the image directly when you do not install with Helm.",
+                ),
+                eks_add_on_option(
+                    "fo-0012-devtools-eks-add-on",
+                    "Helios policy gate",
+                    "2.4.0",
+                    "Enable the add-on on the cluster that runs your pipelines.",
+                ),
+            ],
         },
     );
     state.offers.insert(
@@ -1461,7 +2109,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             badges: vec![listing_badge("FREE_TRIAL", "Free trial")],
             pricing_models: vec![pricing_model("CONTRACT", "Contract")],
             pricing_units: vec![pricing_unit("TIERS", "Tiers")],
-            fulfillment_option_summaries: vec![fulfillment("SAAS", "SaaS")],
             product_ids: vec!["p-0007-backup-agent".to_string()],
             offer_ids: vec!["o-0007-backup-contract".to_string()],
             publisher: vertex.clone(),
@@ -1498,7 +2145,18 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             promotional_media: Vec::new(),
             resources: support_resources("backup@example.com", "https://example.com/docs/vertex"),
             seller_engagements: engagements("https://example.com/vertex/contact"),
-            fulfillment_option_summaries: vec![fulfillment("SAAS", "SaaS")],
+            fulfillment_options: vec![
+                saas_option(
+                    "fo-0013-backup-saas",
+                    "https://example.com/vertex/register",
+                    "https://example.com/vertex/launch",
+                    "DISABLED",
+                    "Grant the collector read-only access to your backup inventories, then \
+                     open the Vertex console.",
+                    month_ago,
+                ),
+                professional_services_option("fo-0014-backup-onboarding"),
+            ],
         },
     );
     state.offers.insert(
