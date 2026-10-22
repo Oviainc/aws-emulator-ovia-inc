@@ -711,6 +711,128 @@ pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The largest a `ManagedDeviceId` or a `TaskId` may be: both are modelled
+/// `@length(min: 1, max: 64)`, so an id outside that bound names no resource this
+/// service can hold, whatever an ARN carrying it looks like.
+pub const RESOURCE_ID_LIMIT: usize = 64;
+
+/// How the tagging operations word a `resourceArn` they cannot parse.
+///
+/// This is the wording the behavioural corpus recorded for this refusal class, and it
+/// is ONE message for the whole class — every unparseable value gets it, whichever ARN
+/// field is wrong — so it states the class and is never fitted to a particular request.
+/// The values a caller sent are not echoed back into it.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// How the tagging operations word a `resourceArn` that parses but addresses no device
+/// and no task.
+///
+/// Recorded wording, and ONE message for the whole class — it names neither the
+/// resource type nor the id, so it is the same whichever resource was addressed and
+/// discloses nothing beyond "not found". The device and task operations keep their own
+/// modelled `ResourceNotFoundException` wording ([`not_found`]), which is a different
+/// shape on a different set of operations.
+pub const TAGGING_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// Which kind of resource a tagging operation's `resourceArn` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResourceKind {
+    /// `…:managed-device/<managedDeviceId>`
+    Device,
+    /// `…:task/<taskId>`
+    Task,
+}
+
+impl TaggedResourceKind {
+    /// The `resourceType` segment this kind's ARN carries, which is also what a
+    /// not-found message names it by.
+    pub fn resource_type(self) -> &'static str {
+        match self {
+            Self::Device => DEVICE_RESOURCE_TYPE,
+            Self::Task => TASK_RESOURCE_TYPE,
+        }
+    }
+}
+
+/// The resource a well-formed `resourceArn` addresses: its kind and its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedResource {
+    pub kind: TaggedResourceKind,
+    pub id: String,
+}
+
+/// Why a `resourceArn` addresses no resource of this service at all.
+///
+/// Distinct from "there is no such resource": the ARN never named one, so the
+/// answer cannot be a 404 about an id this service could hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArnRefusal {
+    /// The value is not an ARN of this service naming a device or a task. The
+    /// tagging operations answer this with HTTP 400 `BadRequestException`.
+    Malformed(String),
+    /// A well-formed ARN whose account is not the one this emulator serves.
+    /// Answered with the modelled `AccessDeniedException` (HTTP 403), which says
+    /// nothing about whether that account holds such a resource.
+    ForeignAccount(String),
+}
+
+/// Resolve a tagging operation's `resourceArn` to the device or task it names.
+///
+/// The ARN has to be this service's own:
+/// `arn:<partition>:snow-device-management:<region>:<account>:managed-device/<id>`
+/// or `…:task/<id>`, with a 12-digit account and an id inside the modelled
+/// `@length(min: 1, max: 64)`. Anything else never named a resource of this
+/// service — [`ArnRefusal::Malformed`]. A well-formed ARN for another account is
+/// [`ArnRefusal::ForeignAccount`]; one for this account resolves to the id a
+/// caller's record is keyed by, whatever region the ARN names, because the
+/// inventory and the task store are per-account.
+pub fn parse_tagged_resource_arn(resource_arn: &str) -> Result<TaggedResource, ArnRefusal> {
+    let malformed = || ArnRefusal::Malformed(INVALID_RESOURCE_ARN_MESSAGE.to_string());
+
+    // `splitn` keeps the resource portion whole, so a resource id carrying a `:`
+    // is not mistaken for a seventh ARN field.
+    let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
+        return Err(malformed());
+    };
+    if *prefix != "arn"
+        || partition.is_empty()
+        || !partition
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || *service != ARN_NAMESPACE
+        || region.is_empty()
+    {
+        return Err(malformed());
+    }
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(malformed());
+    }
+
+    let Some((resource_type, id)) = resource.split_once('/') else {
+        return Err(malformed());
+    };
+    let kind = match resource_type {
+        DEVICE_RESOURCE_TYPE => TaggedResourceKind::Device,
+        TASK_RESOURCE_TYPE => TaggedResourceKind::Task,
+        _ => return Err(malformed()),
+    };
+    if !(1..=RESOURCE_ID_LIMIT).contains(&id.len()) {
+        return Err(malformed());
+    }
+
+    if *account != ::engine::emulator_account_id() {
+        return Err(ArnRefusal::ForeignAccount(format!(
+            "you don't have sufficient access to perform this action on {resource_arn}"
+        )));
+    }
+
+    Ok(TaggedResource {
+        kind,
+        id: id.to_string(),
+    })
+}
+
 /// Encode a pagination resume key as a `NextToken`.
 ///
 /// `NextToken` is modelled `@pattern("[a-zA-Z0-9+/=]*")`, which a raw id does not

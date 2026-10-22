@@ -15,5 +15,7 @@
 mod device_ec2_instances;
 #[path = "all/device_task_lifecycle.rs"]
 mod device_task_lifecycle;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
