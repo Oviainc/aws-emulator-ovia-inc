@@ -25,6 +25,10 @@ mod connected_clusters;
 mod encryption_config_association;
 #[path = "all/identity_provider_config.rs"]
 mod identity_provider_config;
+#[path = "all/identity_provider_config_not_found.rs"]
+mod identity_provider_config_not_found;
+#[path = "all/identity_provider_configs.rs"]
+mod identity_provider_configs;
 #[path = "all/pod_identity_associations.rs"]
 mod pod_identity_associations;
 #[path = "all/state_roundtrip.rs"]
