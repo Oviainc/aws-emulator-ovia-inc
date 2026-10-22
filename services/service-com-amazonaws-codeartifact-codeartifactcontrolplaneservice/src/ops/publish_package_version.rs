@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishPackageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishPackageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishPackageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes one asset into a generic package version, creating the package and the
+//! version on first use, and answers with the stored record's revision, status and
+//! `AssetSummary`. `unfinished` keeps the version open for further assets; omitting it
+//! closes the version at `Published`, after which the version is immutable — a further
+//! publish into it is a `ConflictException` (409). A declared `assetSHA256` that does not
+//! match the bytes received, or a `format` other than `generic`, is a
+//! `ValidationException` (400) that stores nothing; an unknown domain or repository is a
+//! `ResourceNotFoundException` (404); a package whose origin configuration blocks
+//! publishing is an `AccessDeniedException` (403).
 //!
 //! ## Shape of an operation
 //!
@@ -196,20 +196,345 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishPackageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishPackageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishPackageVersion"))
+        // ------------------------------------------------------------------
+        // Request-only rules, refused before the store is touched at all: a
+        // rejected publish must leave nothing behind.
+        // ------------------------------------------------------------------
+
+        // "Only generic packages can be published using this API" — every other format
+        // is published by its own package manager through the repository endpoint, so a
+        // `format` naming one is a bad request rather than an unimplemented path.
+        if input.format != crate::state::PACKAGE_FORMAT_GENERIC {
+            return Err(PublishPackageVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "format '{}' cannot be published with PublishPackageVersion; the only supported value is '{}'.",
+                        input.format,
+                        crate::state::PACKAGE_FORMAT_GENERIC
+                    ),
+                    reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The emulator holds asset bytes in process, so an asset past its own ceiling is
+        // refused the way an over-quota publish is — and refused BEFORE it is hashed, so
+        // the one pass over the bytes below is bounded by this ceiling.
+        if input.asset_content.len() > crate::state::MAX_ASSET_BYTES {
+            return Err(quota_exceeded(
+                format!(
+                    "Asset {} is {} bytes, more than this emulator's maximum of {} bytes (the emulator holds asset content in memory; CodeArtifact's own asset ceiling is larger).",
+                    input.asset_name,
+                    input.asset_content.len(),
+                    crate::state::MAX_ASSET_BYTES
+                ),
+                &input.asset_name,
+                "asset",
+            ));
+        }
+
+        // Hash the request's bytes ONCE, here, outside the store's lock: the asset record
+        // keeps its digests, so neither this response nor any later read hashes stored
+        // content again. The work is proportional to the bytes THIS request carried.
+        let asset = crate::state::Asset::new(&input.asset_name, input.asset_content);
+
+        // `assetSHA256` is the caller's integrity check over `assetContent`: the service
+        // compares the digest of the bytes it actually received with the declared one and
+        // refuses the publish when they disagree. This is an APPLICATION-level comparison
+        // — the request is authentic, its declared content hash is simply wrong.
+        if asset.sha256_hex() != input.asset_sha256 {
+            return Err(PublishPackageVersionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "The provided content hashes do not match the calculated content hashes. \
+                         Hash algorithm 'SHA-256', Expected hash '{}', Actual hash '{}'",
+                        input.asset_sha256,
+                        asset.sha256_hex()
+                    ),
+                    reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PublishPackageVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // What the service already retains, read before the store is borrowed mutably:
+        // every insert below checks the PROJECTED total against
+        // `MAX_STORED_ASSET_BYTES`, so accepted publishes cannot accumulate past the
+        // ceiling even though each one is inside the per-asset bound.
+        let stored_asset_bytes = store.stored_asset_bytes();
+
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                format!("Domain {} not found.", input.domain),
+                &input.domain,
+                "domain",
+            ));
+        };
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(not_found(
+                format!(
+                    "Repository {} not found in domain {}.",
+                    input.repository, input.domain
+                ),
+                &input.repository,
+                "repository",
+            ));
+        };
+        // Borrowed out before the package is taken mutably out of the same record: the
+        // version's origin records the repository it entered the domain through.
+        let repository_name = repository.name.clone();
+
+        let key = crate::state::package_key(
+            &input.format,
+            input.namespace.as_deref(),
+            &input.package,
+        );
+
+        // Origin control decides whether this package accepts a direct publish at all.
+        // Checked against the STORED package: a package that does not exist yet is
+        // created with the default configuration, which allows publishing, and
+        // `PutPackageOriginConfiguration` is what sets `publish` to `BLOCK`.
+        if repository
+            .packages
+            .get(&key)
+            .is_some_and(|existing| !existing.publish_allowed())
+        {
+            return Err(PublishPackageVersionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: format!(
+                        "Publishing package {} is blocked by its package origin configuration.",
+                        input.package
+                    ),
+                },
+            )
+            .into());
+        }
+
+        if !repository.packages.contains_key(&key)
+            && repository.packages.len() >= crate::state::MAX_PACKAGES_PER_REPOSITORY
+        {
+            return Err(quota_exceeded(
+                format!(
+                    "Cannot publish package {}: repository {} already holds the maximum of {} packages.",
+                    input.package,
+                    input.repository,
+                    crate::state::MAX_PACKAGES_PER_REPOSITORY
+                ),
+                &input.package,
+                "package",
+            ));
+        }
+
+        let package = repository.packages.entry(key).or_insert_with(|| {
+            crate::state::Package::new(&input.format, input.namespace.as_deref(), &input.package)
+        });
+
+        // `unfinished` keeps the version open for more assets; omitting it (or sending
+        // `false`) is what closes the version at `Published`.
+        let requested_status = if input.unfinished.unwrap_or(false) {
+            crate::state::PACKAGE_VERSION_STATUS_UNFINISHED
+        } else {
+            crate::state::PACKAGE_VERSION_STATUS_PUBLISHED
+        };
+
+        match package.versions.get_mut(&input.package_version) {
+            // A version nobody has published yet: the asset creates it.
+            None => {
+                if package.versions.len() >= crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE {
+                    return Err(quota_exceeded(
+                        format!(
+                            "Cannot publish {} {}: the package already holds the maximum of {} versions.",
+                            input.package,
+                            input.package_version,
+                            crate::state::MAX_PACKAGE_VERSIONS_PER_PACKAGE
+                        ),
+                        &input.package_version,
+                        "package-version",
+                    ));
+                }
+                refuse_if_store_is_full(stored_asset_bytes, &asset)?;
+                package.versions.insert(
+                    input.package_version.clone(),
+                    crate::state::PackageVersion {
+                        version: input.package_version.clone(),
+                        status: requested_status.to_string(),
+                        published_time: ::std::time::SystemTime::now(),
+                        // Published straight into this repository, not fetched from an
+                        // upstream or an external connection.
+                        origin_type: crate::state::PACKAGE_VERSION_ORIGIN_INTERNAL.to_string(),
+                        entry_point_repository: repository_name,
+                        assets: ::std::collections::BTreeMap::from([(
+                            input.asset_name.clone(),
+                            asset,
+                        )]),
+                    },
+                );
+            }
+            // An unfinished version is still accepting assets.
+            Some(existing)
+                if existing.status == crate::state::PACKAGE_VERSION_STATUS_UNFINISHED =>
+            {
+                match existing.assets.get(&input.asset_name) {
+                    // The same content under the same name: the publish already
+                    // happened, so repeating it changes nothing. Compared by the stored
+                    // SHA-256 of each, which is what identifies an asset's content.
+                    Some(stored) if stored.sha256_hex() == asset.sha256_hex() => {}
+                    // The same name carrying different bytes would rewrite an asset that
+                    // is already part of the version.
+                    Some(_) => {
+                        return Err(conflict(
+                            format!(
+                                "Asset {} already exists in {} version {} with different content.",
+                                input.asset_name, input.package, input.package_version
+                            ),
+                            &input.asset_name,
+                            "asset",
+                        ));
+                    }
+                    None => {
+                        if existing.assets.len() >= crate::state::MAX_ASSETS_PER_PACKAGE_VERSION {
+                            return Err(quota_exceeded(
+                                format!(
+                                    "Cannot publish asset {}: {} version {} already holds the maximum of {} assets.",
+                                    input.asset_name,
+                                    input.package,
+                                    input.package_version,
+                                    crate::state::MAX_ASSETS_PER_PACKAGE_VERSION
+                                ),
+                                &input.asset_name,
+                                "asset",
+                            ));
+                        }
+                        refuse_if_store_is_full(stored_asset_bytes, &asset)?;
+                        existing.assets.insert(input.asset_name.clone(), asset);
+                    }
+                }
+                // The final asset — the one published without `unfinished` — closes the
+                // version.
+                existing.status = requested_status.to_string();
+            }
+            // Every other status is a version that is no longer open: a published
+            // version's content is immutable, and it cannot be reopened as unfinished.
+            Some(existing) => {
+                return Err(conflict(
+                    format!(
+                        "Package version {} {} is {} and cannot be published to.",
+                        input.package, input.package_version, existing.status
+                    ),
+                    &input.package_version,
+                    "package-version",
+                ));
+            }
+        }
+
+        // The response is the projection of what was just STORED, so a later
+        // DescribePackageVersion cannot disagree with it.
+        let Some(stored_version) = package.versions.get(&input.package_version) else {
+            return Err(PublishPackageVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "package version {} {} was not stored",
+                        input.package, input.package_version
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(stored_asset) = stored_version.assets.get(&input.asset_name) else {
+            return Err(PublishPackageVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("asset {} was not stored", input.asset_name),
+                },
+            )
+            .into());
+        };
+
+        Ok(PublishPackageVersionOutput {
+            format: Some(package.format.clone()),
+            namespace: package.namespace.clone(),
+            package: Some(package.name.clone()),
+            version: Some(stored_version.version.clone()),
+            version_revision: Some(stored_version.revision()),
+            status: Some(stored_version.status.clone()),
+            asset: Some(stored_asset.summary()),
+        })
     }
+}
+
+/// The `ValidationExceptionReason` a refused member carries: the request reached the
+/// service and one of its fields failed a rule the model cannot express.
+const VALIDATION_REASON_FIELD_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed.
+fn not_found(message: String, resource_id: &str, resource_type: &str) -> PublishPackageVersionError {
+    PublishPackageVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
+/// A `ConflictException` (409): the resource exists in a state this publish cannot move.
+fn conflict(message: String, resource_id: &str, resource_type: &str) -> PublishPackageVersionError {
+    PublishPackageVersionErrorModeled::ConflictException(ConflictException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
+/// A `ServiceQuotaExceededException` (402): storing this would pass a declared ceiling.
+fn quota_exceeded(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> PublishPackageVersionError {
+    PublishPackageVersionErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
+}
+
+/// Refuse a publish whose asset would push the service's RETAINED asset bytes past
+/// [`crate::state::MAX_STORED_ASSET_BYTES`].
+///
+/// Called immediately before each insert, with the total the store held when this request
+/// took the lock: the per-asset ceiling bounds one publish, and this is what bounds their
+/// accumulation. A publish that stores nothing new (the same asset, byte for byte) never
+/// reaches it, so a repeat is not refused at the boundary.
+fn refuse_if_store_is_full(
+    stored_asset_bytes: i64,
+    asset: &crate::state::Asset,
+) -> Result<(), PublishPackageVersionError> {
+    let projected = stored_asset_bytes.saturating_add(asset.size_bytes());
+    if projected > crate::state::MAX_STORED_ASSET_BYTES {
+        return Err(quota_exceeded(
+            format!(
+                "Cannot store asset {}: this emulator already retains {} bytes of asset content and its ceiling is {} bytes (CodeArtifact stores assets in S3; this emulator holds them in memory).",
+                asset.name(),
+                stored_asset_bytes,
+                crate::state::MAX_STORED_ASSET_BYTES
+            ),
+            asset.name(),
+            "asset",
+        ));
+    }
+    Ok(())
 }

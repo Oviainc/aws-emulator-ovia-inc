@@ -226,7 +226,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption_key: Some(input.encryption_key.clone().unwrap_or_else(|| {
                 crate::state::default_encryption_key_arn(&region, &input.domain)
             })),
-            asset_size_bytes: 0,
             s3_bucket_arn: crate::state::asset_bucket_arn(&region, &input.domain),
             tags: input.tags.clone().unwrap_or_default(),
             policy: None,
