@@ -15,5 +15,7 @@
 mod custom_plugin_and_connector_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_messages.rs"]
+mod validation_messages;
 #[path = "all/worker_configuration_create_and_describe.rs"]
 mod worker_configuration_create_and_describe;

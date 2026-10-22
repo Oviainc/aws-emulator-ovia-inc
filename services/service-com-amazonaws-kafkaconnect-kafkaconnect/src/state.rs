@@ -30,6 +30,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// trait) every ARN this service mints carries.
 pub const ARN_SERVICE: &str = "kafkaconnect";
 
+/// The ARN service namespace of the bucket a custom plugin's file lives in
+/// (`S3Location$bucketArn`: "The Amazon Resource Name (ARN) of an S3 bucket").
+pub const S3_ARN_SERVICE: &str = "s3";
+
+/// The ARN service namespace of the role a connector runs under
+/// (`CreateConnectorRequest$serviceExecutionRoleArn`: "The Amazon Resource Name
+/// (ARN) of the IAM role used by the connector").
+pub const IAM_ARN_SERVICE: &str = "iam";
+
 /// How long after the call that starts it a resource's move out of its transient
 /// state is due.
 ///
@@ -500,6 +509,24 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
             .find(|connector| connector.name == name)
     }
 
+    /// The tags stored on the resource `arn` names, or `None` when this
+    /// emulator holds no resource of that ARN.
+    ///
+    /// Every taggable resource this emulator holds is keyed by its own ARN, so
+    /// one lookup covers all three kinds and a reader never has to know which
+    /// kind an ARN names.
+    pub fn tags_of(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        self.custom_plugins
+            .get(arn)
+            .map(|plugin| &plugin.tags)
+            .or_else(|| self.connectors.get(arn).map(|connector| &connector.tags))
+            .or_else(|| {
+                self.worker_configurations
+                    .get(arn)
+                    .map(|worker| &worker.tags)
+            })
+    }
+
     /// The stored worker configuration of this name, if any. A name identifies
     /// at most one configuration, which is what makes a repeat of it a conflict.
     pub fn worker_configuration_named(&self, name: &str) -> Option<&WorkerConfigurationRecord> {
@@ -557,6 +584,66 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// The validation message every kafkaconnect parameter rejection carries.
+//
+// kafkaconnect answers a rejection it blames on a request member with a message
+// that NAMES that member: `Invalid parameter <member>`, optionally followed by
+// `: <reason>`. The model states no message text, so the form is taken from the
+// service's own recorded rejections (`Invalid parameter nextToken.`,
+// `Invalid parameter bucketArn: Invalid ARN.`,
+// `Invalid parameter customPluginArn: The requested resource doesn't exist.`).
+// Both builders live here so every handler in `src/ops/` renders the one form
+// rather than each inventing a sentence.
+//
+// They are for a rejection of a member's VALUE — a value the service cannot
+// parse, or one naming a resource it does not hold. A conflict with state the
+// account already holds (a name already taken) and a quota refusal are not
+// rejections of the value, and keep their own wording.
+// ---------------------------------------------------------------------------
+
+/// The lead-in of every kafkaconnect parameter-rejection message.
+const INVALID_PARAMETER: &str = "Invalid parameter";
+
+/// The reason a parameter that names a resource this service does not hold is
+/// rejected with. The apostrophe is U+2019, as the service writes it.
+pub const RESOURCE_DOES_NOT_EXIST: &str = "The requested resource doesn\u{2019}t exist.";
+
+/// The reason a parameter that must carry an ARN, and does not, is rejected
+/// with.
+pub const INVALID_ARN: &str = "Invalid ARN.";
+
+/// The message for a rejection of the member `member`, with no further reason:
+/// `Invalid parameter <member>.`
+pub fn invalid_parameter(member: &str) -> String {
+    format!("{INVALID_PARAMETER} {member}.")
+}
+
+/// The message for a rejection of the member `member` for `reason` (itself a
+/// full sentence): `Invalid parameter <member>: <reason>`
+pub fn invalid_parameter_because(member: &str, reason: &str) -> String {
+    format!("{INVALID_PARAMETER} {member}: {reason}")
+}
+
+/// Whether `value` is a well-formed ARN naming `service`.
+///
+/// The grammar is the one AWS publishes for every ARN,
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`: six
+/// `:`-separated fields, the first literally `arn`, a non-empty partition, the
+/// service field the one asked for, and a non-empty resource. `region` and
+/// `account-id` are deliberately unconstrained — an S3 bucket ARN leaves both
+/// empty (`arn:aws:s3:::bucket`) while most other ARNs fill them — and the
+/// resource may itself contain `:` or `/`, so only the first five fields are
+/// split off.
+pub fn is_arn_for(value: &str, service: &str) -> bool {
+    let fields: Vec<&str> = value.splitn(6, ':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && fields[2] == service
+        && !fields[5].is_empty()
 }
 
 /// One page of a list operation: the items to answer with, and the `nextToken`
