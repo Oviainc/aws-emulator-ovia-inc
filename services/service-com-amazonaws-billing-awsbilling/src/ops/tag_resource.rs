@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches tag key/value pairs to the billing view the `resourceArn` names,
+//! writing them into that view's stored record (a key already present takes the
+//! request's value).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A tag is customer metadata on a customer-owned resource, so only a CUSTOM
+//! billing view is taggable: a managed view is refused with the modeled
+//! `ValidationException` (400) and an ARN naming no stored resource with
+//! `ResourceNotFoundException` (404). Both refusals attach nothing.
+//!
+//! The stored set grows with every call, so it carries the explicit ceiling
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`]: a request that would leave the
+//! resource holding more than that is refused, and attaches nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +122,20 @@ pub struct TagResource<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+fn invalid_field(member: &str, why: &str) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message: why.to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
+}
+
 impl<Eng> TagResource<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -145,18 +162,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The modeled constraints (`resourceArn` pattern, `resourceTags` 0..200
+        // and each tag's key length 1..128 / value length 0..256) are refused by
+        // the boundary validator before this runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // A managed view's tags are the service's own, so it is not taggable
+        // whether or not the request is otherwise well formed: see
+        // `BillingView::is_managed`. This is decided before the request's tags
+        // are looked at so that neither refusal depends on the other.
+        if state
+            .billing_views
+            .get(&input.resource_arn)
+            .is_some_and(crate::state::BillingView::is_managed)
+        {
+            return Err(invalid_field(
+                "resourceArn",
+                "Managed billing views cannot be tagged",
+            ));
+        }
+
+        let Some(view) = state.billing_views.get_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Resource {} not found", input.resource_arn),
+                    resource_id: input.resource_arn.clone(),
+                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A tag set is keyed by key, so one request may not carry a key twice:
+        // the two entries would decide the stored value by arrival order.
+        let mut requested: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for tag in &input.resource_tags {
+            if requested
+                .insert(tag.key.clone(), tag.value.clone().unwrap_or_default())
+                .is_some()
+            {
+                return Err(invalid_field(
+                    "resourceTags",
+                    &format!("the tag key {} is given more than once", tag.key),
+                ));
+            }
+        }
+
+        // Attaching a tag whose key is already on the resource replaces that
+        // key's value and leaves every other key alone, so a replayed request
+        // stores exactly what the first one did.
+        let mut merged = view.tags.clone();
+        merged.extend(requested);
+
+        // The merge is computed before anything is written, so the per-resource
+        // ceiling is checked against what the resource WOULD hold — the stored
+        // set grows with every request, which the modeled `resourceTags` length
+        // (one request's list) does not bound — and a refusal leaves the stored
+        // tags exactly as they were.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(invalid_field(
+                "resourceTags",
+                &format!(
+                    "the request would leave this resource with {} tags, over the limit of {}",
+                    merged.len(),
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+            ));
+        }
+        view.tags = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

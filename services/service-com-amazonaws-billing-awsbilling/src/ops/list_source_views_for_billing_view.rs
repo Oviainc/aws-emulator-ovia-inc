@@ -151,7 +151,9 @@ fn encode_page_token(returned: usize) -> String {
 }
 
 /// The number of entries a `nextToken` resumes after, or a `ValidationException`
-/// when the token is not one this service issued.
+/// when the token is not one this service issued. The refusal's wording is the
+/// one in `crate::state`, shared with this service's other paginated reads so a
+/// client sees the same refusal for an unusable token whichever read answered it.
 fn decode_page_token(token: &str) -> Result<usize, ListSourceViewsForBillingViewError> {
     hex::decode(token)
         .ok()
@@ -159,11 +161,11 @@ fn decode_page_token(token: &str) -> Result<usize, ListSourceViewsForBillingView
         .and_then(|text| text.parse::<usize>().ok())
         .ok_or_else(|| {
             ListSourceViewsForBillingViewErrorModeled::ValidationException(ValidationException {
-                message: "nextToken is not a token this service issued".to_string(),
-                reason: "cannotParse".to_string(),
+                message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
                 field_list: Some(vec![ValidationExceptionField {
                     name: "nextToken".to_string(),
-                    message: "The pagination token is not valid.".to_string(),
+                    message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
                 }]),
             })
             .into()

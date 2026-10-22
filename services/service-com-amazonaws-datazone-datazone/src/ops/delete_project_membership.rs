@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DeleteProjectMembershipErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Domain {} was not found", input.domain_identifier),
+                        message: crate::state::ResourceKind::Domain.not_found_message(),
                     },
                 )
             })?;
@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DeleteProjectMembershipErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Project {} was not found", input.project_identifier),
+                        message: crate::state::ResourceKind::Project.not_found_message(),
                     },
                 )
             })?;

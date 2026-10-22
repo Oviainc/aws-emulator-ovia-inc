@@ -533,18 +533,35 @@ async fn a_repeated_client_token_returns_the_first_domain() {
         first.body,
         second.body
     );
-    // A different token creates a different domain, so only the token makes it a repeat.
+    // A different token, with a name no live domain holds, creates a different domain:
+    // only the token makes a request a repeat.
     let other = dz
         .call(
             "POST",
             "/v2/domains",
-            Some(json!({ "name": "idempotent-domain", "clientToken": "token-two" })),
+            Some(json!({ "name": "idempotent-domain-two", "clientToken": "token-two" })),
         )
         .await;
     assert_ne!(
         first.s("id"),
         other.s("id"),
         "a different clientToken must create a second domain"
+    );
+    // A fresh token does NOT excuse a duplicate name: domain names are unique within
+    // the account, so this is the modelled conflict rather than a third domain.
+    let duplicate = dz
+        .call(
+            "POST",
+            "/v2/domains",
+            Some(json!({ "name": "idempotent-domain", "clientToken": "token-three" })),
+        )
+        .await;
+    assert_eq!(
+        (duplicate.status, duplicate.error_code.as_str()),
+        (409, "ConflictException"),
+        "a name already in use must be refused whatever token the repeat carries, got {} {:?}",
+        duplicate.status,
+        duplicate.body
     );
     let listed = dz.call("GET", "/v2/domains", None).await;
     assert_eq!(

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopCanary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopCanary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopCanary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the canary's schedule and finishes whichever run is still open.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +60,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::{CanaryState, STORE_UNAVAILABLE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +135,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopCanary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopCanaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopCanary"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopCanaryError::from(StopCanaryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(STORE_UNAVAILABLE.to_string()),
+                },
+            ))
+        })?;
+
+        let now = SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+        let canary = guard.canaries.get_mut(&input.name).ok_or_else(|| {
+            StopCanaryError::from(StopCanaryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Canary {} not found", input.name)),
+                },
+            ))
+        })?;
+
+        // Only a running canary has a schedule to stop.
+        if canary.state != CanaryState::Running {
+            return Err(StopCanaryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Canary {} cannot be stopped while it is in state {}",
+                    canary.name,
+                    canary.state.as_wire()
+                )),
+            })
+            .into());
+        }
+
+        canary.state = CanaryState::Stopped;
+        canary.state_reason = None;
+        canary.state_reason_code = None;
+        canary.last_stopped = Some(now);
+        // The record observably changed, so its modification instant advances with it.
+        canary.last_modified = now;
+        canary.close_open_run(now);
+
+        Ok(StopCanaryOutput {})
     }
 }

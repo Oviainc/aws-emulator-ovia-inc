@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `Canary$Id` and `CanaryRun$Id` are modelled as UUIDs. The hash and the hex codec the
+# id minting in `src/state.rs` needs, rather than hand-written ones; both are already
+# locked for this package, so no entry is added to Cargo.lock.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `tokio::time::sleep` lets a test step past a transition the clock owes.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

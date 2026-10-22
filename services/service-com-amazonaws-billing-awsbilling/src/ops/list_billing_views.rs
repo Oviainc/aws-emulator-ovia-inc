@@ -186,32 +186,21 @@ fn resolve_arns_filter(
     Ok(())
 }
 
-/// The opaque `nextToken` for a page that ended at `arn`.
-///
-/// Hex keeps the token inside the modeled `PageToken` pattern
-/// (`^[-a-zA-Z0-9+=/_]+$`) and length (1..4095) for every ARN the service mints,
-/// and carries no meaning a client could construct one from.
-fn encode_page_token(arn: &str) -> String {
-    hex::encode(arn.as_bytes())
-}
-
 /// The ARN a `nextToken` resumes after, or a `ValidationException` when the
-/// token is not one this service issued.
+/// token is not one this service issued. The token format and the refusal's
+/// wording live in `crate::state`, shared with every other paginated read.
 fn decode_page_token(token: &str) -> Result<String, ListBillingViewsError> {
-    hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(|| {
-            ListBillingViewsErrorModeled::ValidationException(ValidationException {
-                message: "nextToken is not a token this service issued".to_string(),
-                reason: "cannotParse".to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "nextToken".to_string(),
-                    message: "The pagination token is not valid.".to_string(),
-                }]),
-            })
-            .into()
+    crate::state::decode_page_token(token).ok_or_else(|| {
+        ListBillingViewsErrorModeled::ValidationException(ValidationException {
+            message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+            reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+            field_list: Some(vec![ValidationExceptionField {
+                name: "nextToken".to_string(),
+                message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+            }]),
         })
+        .into()
+    })
 }
 
 /// Whether `view` satisfies every filter the request carries. A filter the
@@ -353,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 matched.truncate(limit);
                 matched
                     .last()
-                    .map(|view| encode_page_token(&view.arn))
+                    .map(|view| crate::state::encode_page_token(&view.arn))
             }
             _ => None,
         };

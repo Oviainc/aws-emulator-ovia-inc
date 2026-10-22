@@ -70,6 +70,35 @@ pub const BILLING_SERVICE_CODE: &str = "billing";
 /// billing-view count.
 pub const BILLING_VIEWS_QUOTA_CODE: &str = "BillingViewsPerAccount";
 
+/// The most source views one billing view can draw from.
+///
+/// This is the model's own bound, not an emulator choice: both
+/// `AssociateSourceViews$sourceViews` and `ListSourceViewsForBillingView`'s
+/// output target `BillingViewSourceViewsList`, whose `@length` is 1..10. A
+/// request that would push a view past it is refused with the modeled
+/// `ServiceQuotaExceededException` ("exceeded the size of an individual
+/// resource").
+pub const MAX_SOURCE_VIEWS_PER_VIEW: usize = 10;
+
+/// The `quotaCode` the modeled `ServiceQuotaExceededException` reports for the
+/// per-view source-view count.
+///
+/// Synthesised in the same shape as [`BILLING_VIEWS_QUOTA_CODE`]: the real
+/// service's quota code for this limit is not published or modelled, so a later
+/// fix can replace the string without re-deriving anything else here.
+pub const SOURCE_VIEWS_QUOTA_CODE: &str = "SourceViewsPerBillingView";
+
+/// The most tags one resource holds.
+///
+/// `TagResource` merges a request's tags into the resource's stored set, so
+/// without a ceiling a caller's request rate would be the only limit on the
+/// memory of a process that also serves every other emulated service — the same
+/// reason [`MAX_BILLING_VIEWS`] exists. 200 is the figure the model itself
+/// names: `ResourceTagList` is `@length` 0..200. That modelled length bounds ONE
+/// request's list; this bounds what a resource ends up holding across requests,
+/// and `TagResource` refuses past it with the modeled `ValidationException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// The `ValidationExceptionReason` a refusal that names the offending member
 /// carries (one of `unknownOperation | cannotParse | fieldValidationFailed |
 /// other`).
@@ -78,6 +107,17 @@ pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
 /// The `ValidationExceptionReason` a refusal that is about the caller rather
 /// than about one request member carries.
 pub const VALIDATION_REASON_OTHER: &str = "other";
+
+/// The `ValidationExceptionReason` a refusal of a value this service cannot
+/// read at all carries — a `nextToken` it did not issue, say.
+pub const VALIDATION_REASON_CANNOT_PARSE: &str = "cannotParse";
+
+/// The `message` every paginated read refuses an unusable `nextToken` with.
+pub const PAGE_TOKEN_REFUSAL: &str = "nextToken is not a token this service issued";
+
+/// The `ValidationExceptionField` message that accompanies
+/// [`PAGE_TOKEN_REFUSAL`].
+pub const PAGE_TOKEN_FIELD_REFUSAL: &str = "The pagination token is not valid.";
 
 /// The most credits this emulator keeps resident for the whole billing family.
 ///
@@ -210,6 +250,30 @@ pub struct BillingView {
     pub health_status_code: String,
     /// The view's resource tags, by key.
     pub tags: BTreeMap<String, String>,
+    /// The resource-based policy document attached to this view, as
+    /// `GetResourcePolicy` reports it.
+    ///
+    /// `None` for every view this emulator creates: only a CUSTOM billing view
+    /// can carry one, and this service's model declares no operation that
+    /// attaches a policy (there is no `PutResourcePolicy` — on AWS the document
+    /// appears when the view is shared), so nothing in the API writes it.
+    /// `GetResourcePolicy` reports the stored document when a view carries one
+    /// and answers `ResourceNotFoundException` when it does not.
+    pub resource_policy: Option<String>,
+}
+
+impl BillingView {
+    /// Whether this view is one AWS manages on the account's behalf rather than
+    /// one a customer created.
+    ///
+    /// `CreateBillingView` is the only way a customer makes a view and it always
+    /// produces [`BILLING_VIEW_TYPE_CUSTOM`]; every other `BillingViewType`
+    /// value (`PRIMARY`, `BILLING_GROUP`, `BILLING_TRANSFER`,
+    /// `BILLING_TRANSFER_SHOWBACK`) names a view the service itself maintains,
+    /// whose tags and definition the customer does not own.
+    pub fn is_managed(&self) -> bool {
+        self.billing_view_type != BILLING_VIEW_TYPE_CUSTOM
+    }
 }
 
 /// A monetary amount, as the modeled `Amount` shape carries it: an ISO-4217
@@ -358,6 +422,7 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             view_definition_last_updated_at: None,
             health_status_code: BILLING_VIEW_STATUS_HEALTHY.to_string(),
             tags: BTreeMap::new(),
+            resource_policy: None,
         };
         let mut billing_views = BTreeMap::new();
         billing_views.insert(primary.arn.clone(), primary);
@@ -418,6 +483,29 @@ impl ComAmazonawsBillingAwsbillingState {
         let removed = self.billing_views.remove(arn);
         self.idempotency_tokens.retain(|_, stored| stored != arn);
         removed
+    }
+
+    /// Whether `needle` is `start` itself or is reachable from `start` by
+    /// following source-view links, i.e. whether making `start` a source of
+    /// `needle` would put `needle` in its own source chain.
+    ///
+    /// The walk keeps a visited set, so a chain this store already holds cannot
+    /// make it loop, and each view is expanded once however many views name it.
+    pub fn draws_from(&self, start: &str, needle: &str) -> bool {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut pending: Vec<&str> = vec![start];
+        while let Some(arn) = pending.pop() {
+            if arn == needle {
+                return true;
+            }
+            if !seen.insert(arn) {
+                continue;
+            }
+            if let Some(view) = self.billing_views.get(arn) {
+                pending.extend(view.source_views.iter().map(String::as_str));
+            }
+        }
+        false
     }
 
     /// Whether another view fits under [`MAX_BILLING_VIEWS`], counting the
@@ -736,6 +824,31 @@ pub fn not_a_custom_view(arn: &str, action: &str) -> ValidationException {
 /// service, so the region segment is empty.
 pub fn billing_view_arn(view_id: &str) -> String {
     ::engine::emulator_arn("billing", "", &format!("billingview/{view_id}"))
+}
+
+/// The opaque `nextToken` for a page that ended at `last`, where the page
+/// boundary is a VALUE the store is keyed by (`ListBillingViews` walks
+/// `billing_views`, a map keyed and ordered by ARN). A read whose page boundary
+/// is a position in a list keeps its own token — see
+/// `ops::list_source_views_for_billing_view`.
+///
+/// Hex keeps the token inside the modeled `PageToken` pattern
+/// (`^[-a-zA-Z0-9+=/_]+$`) and length (1..4095) for every ARN the service mints,
+/// and carries no meaning a client could construct one from.
+pub fn encode_page_token(last: &str) -> String {
+    ::hex::encode(last.as_bytes())
+}
+
+/// The value a `nextToken` resumes after, or `None` when the token is not one
+/// [`encode_page_token`] produced.
+///
+/// The caller renders the `None` as its own modeled `ValidationException`, from
+/// [`PAGE_TOKEN_REFUSAL`] and [`PAGE_TOKEN_FIELD_REFUSAL`] so the refusal reads
+/// the same whichever read answered it.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
 /// A stored instant as the modeled `Timestamp` the wire carries.

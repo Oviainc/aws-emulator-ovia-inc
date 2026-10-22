@@ -21,5 +21,7 @@ mod credits;
 mod rejection_fidelity;
 #[path = "all/source_views.rs"]
 mod source_views;
+#[path = "all/source_views_tags_and_policy.rs"]
+mod source_views_tags_and_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

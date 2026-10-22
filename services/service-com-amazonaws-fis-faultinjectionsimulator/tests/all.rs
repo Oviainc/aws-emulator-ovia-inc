@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/experiment_lifecycle.rs"]
 mod experiment_lifecycle;
+#[path = "all/experiment_target_account_configurations.rs"]
+mod experiment_target_account_configurations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/target_account_configurations.rs"]
