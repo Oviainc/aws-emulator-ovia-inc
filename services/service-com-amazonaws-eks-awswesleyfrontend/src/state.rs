@@ -12,9 +12,19 @@
 //! Amazon EKS publishes rather than per-account data.
 //!
 //! An asynchronous cluster update lives ON the cluster it updates
-//! ([`ClusterRecord::updates`]), so `AssociateEncryptionConfig` writes one there
-//! and `DescribeUpdate` reads it back; deleting the cluster drops its updates
-//! with it rather than leaving them behind in a second map.
+//! ([`ClusterRecord::updates`]), so `AssociateEncryptionConfig` and
+//! `AssociateIdentityProviderConfig` write one there and `DescribeUpdate` reads
+//! it back; deleting the cluster drops its updates with it rather than leaving
+//! them behind in a second map.
+//!
+//! The identity-provider slice lives on the same record:
+//! `AssociateIdentityProviderConfig` writes an [`IdentityProviderConfigRecord`]
+//! into the owning cluster's [`ClusterRecord::identity_provider_configs`], and
+//! `DescribeIdentityProviderConfig` reads it back. Holding them on the cluster —
+//! rather than in a second map beside it — is what makes a config a part of its
+//! cluster: deleting the cluster takes its configs with it, and a config name is
+//! scoped to one cluster, which is exactly how the API addresses it
+//! (`/clusters/{clusterName}/identity-provider-configs/...`).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -25,7 +35,8 @@ use crate::ops::types::{
     AccessConfigResponse, Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
-    KubernetesNetworkConfigResponse, Logging, OutpostConfigResponse, RemoteNetworkConfigResponse,
+    KubernetesNetworkConfigResponse, Logging, OidcIdentityProviderConfig, OutpostConfigResponse,
+    RemoteNetworkConfigResponse,
     StorageConfigResponse, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
     ZonalShiftConfigResponse,
 };
@@ -164,6 +175,118 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// natural default.
 pub const DEFAULT_LIST_PAGE_SIZE: i32 = 100;
 
+/// The only `identityProviderConfig.type` this API defines: "The type of the
+/// identity provider configuration. The only type available is `oidc`"
+/// (`IdentityProviderConfig$type`). The comparison against it is
+/// case-insensitive, because the model gives the member no enum and the
+/// documented token is lower-case.
+pub const IDENTITY_PROVIDER_CONFIG_TYPE_OIDC: &str = "oidc";
+
+/// The `configStatus` members an identity provider configuration reports
+/// (`smithy_query query="shape" shape="configStatus"` is
+/// `CREATING | DELETING | ACTIVE`); `OidcIdentityProviderConfig$status` is a
+/// plain string member, so the status is stored as the wire token.
+pub const CONFIG_STATUS_CREATING: &str = "CREATING";
+/// See [`CONFIG_STATUS_CREATING`].
+pub const CONFIG_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `UpdateType` an `AssociateIdentityProviderConfig` call reports on the
+/// `Update` it answers with (`smithy_query query="shape" shape="UpdateType"`).
+pub const UPDATE_TYPE_ASSOCIATE_IDENTITY_PROVIDER_CONFIG: &str = "AssociateIdentityProviderConfig";
+
+/// The `UpdateParamType` key an identity-provider association reports the
+/// configuration it associates under (`smithy_query query="shape"
+/// shape="UpdateParamType"`).
+pub const UPDATE_PARAM_IDENTITY_PROVIDER_CONFIG: &str = "IdentityProviderConfig";
+
+/// The number of identity provider configurations one cluster holds before
+/// `AssociateIdentityProviderConfig` refuses another.
+///
+/// No quota is published for this resource, so the ceiling is CHOSEN: it bounds
+/// the store, so repeated associates on one cluster cannot grow it without
+/// limit, and it is far above the one OIDC provider a cluster realistically
+/// uses. The service-limit error is not modelled on this operation (its errors
+/// are `Client`, `InvalidParameter`, `InvalidRequest`, `ResourceInUse`,
+/// `ResourceNotFound`, `Server` and `Throttling`), so exceeding it is reported
+/// as `InvalidRequestException` — the request is invalid given the state of the
+/// cluster.
+pub const MAX_IDENTITY_PROVIDER_CONFIGS_PER_CLUSTER: usize = 10;
+
+/// One OIDC identity provider configuration, as this service stores it.
+///
+/// It holds the caller's input and the server-generated parts (`arn`, `status`
+/// and the id of the update the association was reported through), so
+/// `DescribeIdentityProviderConfig` returns exactly what
+/// `AssociateIdentityProviderConfig` wrote.
+#[derive(Debug, Clone)]
+pub struct IdentityProviderConfigRecord {
+    pub name: String,
+    pub arn: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    pub username_claim: Option<String>,
+    pub username_prefix: Option<String>,
+    pub groups_claim: Option<String>,
+    pub groups_prefix: Option<String>,
+    pub required_claims: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub status: String,
+    /// When set, the instant at which the clock owes this configuration the move
+    /// from `CREATING` to `ACTIVE` — the same instant its association update is
+    /// owed `Successful`, because that update IS this association. Cleared once
+    /// the move is materialised.
+    pub active_at: Option<SystemTime>,
+    /// The id of the [`UpdateRecord`] in [`ClusterRecord::updates`] that reported
+    /// this association, so the configuration and the update a caller tracks it
+    /// through are one resource, not two copies.
+    pub update_id: String,
+}
+
+impl IdentityProviderConfigRecord {
+    /// Materialise the status move the clock already owes at `now`.
+    ///
+    /// Only the configuration's own status is moved here; the update that
+    /// reported the association is moved by [`ClusterRecord`]'s own loop over
+    /// [`ClusterRecord::updates`], which is owed at the same instant.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.active_at.is_some_and(|due| now >= due) {
+            self.status = CONFIG_STATUS_ACTIVE.to_string();
+            self.active_at = None;
+        }
+    }
+
+    /// This record as the modelled `OidcIdentityProviderConfig` shape, for the
+    /// cluster it is associated to.
+    pub fn to_oidc_config(&self, cluster_name: &str) -> OidcIdentityProviderConfig {
+        OidcIdentityProviderConfig {
+            identity_provider_config_name: Some(self.name.clone()),
+            identity_provider_config_arn: Some(self.arn.clone()),
+            cluster_name: Some(cluster_name.to_string()),
+            issuer_url: Some(self.issuer_url.clone()),
+            client_id: Some(self.client_id.clone()),
+            username_claim: self.username_claim.clone(),
+            username_prefix: self.username_prefix.clone(),
+            groups_claim: self.groups_claim.clone(),
+            groups_prefix: self.groups_prefix.clone(),
+            required_claims: (!self.required_claims.is_empty()).then(|| {
+                self.required_claims
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            // `TagMap` is bounded 1..50, so an empty map is not a legal value
+            // for the member: a configuration with no tags reports no map.
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            status: Some(self.status.clone()),
+        }
+    }
+}
+
 /// The access policies Amazon EKS publishes, sorted by name.
 ///
 /// These are NOT per-account resources: "An access policy includes permissions
@@ -246,15 +369,29 @@ pub struct ClusterRecord {
     pub kube_api_server_config: Option<KubeApiServerConfigResponse>,
     pub kube_scheduler_config: Option<KubeSchedulerConfigResponse>,
     pub kube_controller_manager_config: Option<KubeControllerManagerConfigResponse>,
+    /// The identity provider configurations associated to this cluster, by
+    /// `identityProviderConfigName`.
+    ///
+    /// A configuration is addressed only through its cluster
+    /// (`/clusters/{clusterName}/identity-provider-configs/...`) and its name is
+    /// unique within that cluster, so the cluster's own record is where it
+    /// lives: nothing else keeps a second copy, and deleting the cluster takes
+    /// its configurations with it. A `BTreeMap` so a later listing walks a
+    /// stable, sorted order. Bounded by
+    /// [`MAX_IDENTITY_PROVIDER_CONFIGS_PER_CLUSTER`], which
+    /// `AssociateIdentityProviderConfig` enforces.
+    pub identity_provider_configs: BTreeMap<String, IdentityProviderConfigRecord>,
     /// The asynchronous updates started against this cluster, by update id.
     ///
     /// They live on the cluster because that is what scopes them: `DescribeUpdate`
     /// and `ListUpdates` both name a cluster, and deleting the cluster must drop
     /// its updates. A `BTreeMap` so a listing walks a stable, sorted order. Each
     /// operation that mints an update refuses to start a second one while one is
-    /// in flight, and `AssociateEncryptionConfig` — the only writer in this slice
-    /// — is refused once encryption is enabled, so this map holds at most one
-    /// entry per cluster and [`MAX_STORED_CLUSTERS`] bounds it.
+    /// in flight, `AssociateEncryptionConfig` is refused once encryption is
+    /// enabled, and `AssociateIdentityProviderConfig` mints at most one update per
+    /// configuration it associates — so this map holds at most
+    /// [`MAX_IDENTITY_PROVIDER_CONFIGS_PER_CLUSTER`] + 1 entries per cluster and
+    /// [`MAX_STORED_CLUSTERS`] bounds it.
     pub updates: BTreeMap<String, UpdateRecord>,
 }
 
@@ -307,14 +444,20 @@ impl ClusterRecord {
     ///
     /// This is the only write a reporting operation may make: each transition was
     /// due at its stored instant whether or not anybody called, so applying it on
-    /// read does not change what a later caller sees. Two are owed here — a new
-    /// cluster's `CREATING` -> `ACTIVE` move, and the completion of an
-    /// asynchronous update, which flips the update to `Successful`, applies the
-    /// change it carries and hands the cluster back to `ACTIVE`.
+    /// read does not change what a later caller sees. Three are owed here — a new
+    /// cluster's `CREATING` -> `ACTIVE` move, the completion of an asynchronous
+    /// update, which flips the update to `Successful`, applies the change it
+    /// carries and hands the cluster back to `ACTIVE`, and the
+    /// `CREATING` -> `ACTIVE` move of every identity provider configuration
+    /// hanging off this record.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         if self.active_at.is_some_and(|due| now >= due) {
             self.status = STATUS_ACTIVE.to_string();
             self.active_at = None;
+        }
+
+        for config in self.identity_provider_configs.values_mut() {
+            config.materialize_due_transitions(now);
         }
 
         let due: Vec<String> = self
@@ -795,6 +938,41 @@ pub fn derive_cluster_endpoint(resource_id: &str, region: &str) -> String {
 /// `https://oidc.eks.<region>.amazonaws.com/id/<resource id>`.
 pub fn derive_oidc_issuer(resource_id: &str, region: &str) -> String {
     format!("https://oidc.eks.{region}.amazonaws.com/id/{resource_id}")
+}
+
+/// A fresh 32-hex-character resource identifier, in the shape
+/// [`derive_cluster_resource_id`] gives a cluster.
+///
+/// A cluster's id is derived from its ARN, because the ARN already identifies it
+/// uniquely. An identity provider configuration's id is the other way round — it
+/// is a part of the ARN — so there is nothing to derive it from and it is minted
+/// per call. The bits are [`new_update_id`]'s, which this crate already mints for
+/// an `Update$id` from OS-seeded randomness, the clock and the store's own
+/// counter; this only drops the hyphens and upper-cases the hex, which is the
+/// shape a cluster's resource id has.
+pub fn new_resource_id(sequence: u64) -> String {
+    new_update_id(sequence).replace('-', "").to_uppercase()
+}
+
+/// The ARN of an identity provider configuration, in the form EKS publishes:
+/// `arn:aws:eks:<region>:<account>:identityproviderconfig/<cluster>/<type>/<name>/<resource id>`.
+///
+/// The configuration is a sub-resource of its cluster, so the cluster name, the
+/// configuration type and its name are all path components of the resource
+/// portion, with the server-minted id last. It is computed once, when the
+/// configuration is associated, and stored on the record; no read recomputes it.
+pub fn identity_provider_config_arn(
+    region: &str,
+    cluster_name: &str,
+    config_type: &str,
+    config_name: &str,
+    resource_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        "eks",
+        region,
+        &format!("identityproviderconfig/{cluster_name}/{config_type}/{config_name}/{resource_id}"),
+    )
 }
 
 /// The IPv6 service CIDR a cluster gets when `ipFamily` is `ipv6`.

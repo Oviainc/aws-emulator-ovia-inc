@@ -7,6 +7,7 @@
 //! modules, and `types/mod.rs` re-exports them all.
 #![allow(unused_imports)]
 
+use super::shared_types::schemas_member;
 use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
@@ -36,7 +37,12 @@ pub struct SearchSchemaSummary {
     pub schema_versions: Option<Vec<SearchSchemaVersionSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.schemas#SearchSchemaVersionSummary")]
+/// `SearchSchemaVersionSummary`, written out by hand rather than produced by
+/// `#[smithy_macros::smithy(shape = ...)]` because `CreatedDate` targets
+/// `__timestampIso8601` and so carries `@timestampFormat("date-time")` — see the block
+/// over `schemas_member!` in `shared_types`. The format has to reach the member schema
+/// of a nested list element too: a `date-time` member renders the same wherever in a
+/// response it is answered.
 #[derive(Debug, Clone, Default)]
 pub struct SearchSchemaVersionSummary {
     pub created_date: Option<::aws_smithy_types::DateTime>,
@@ -44,3 +50,67 @@ pub struct SearchSchemaVersionSummary {
     pub r#type: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl SearchSchemaVersionSummary {
+    /// `@timestampFormat("date-time")` from `__timestampIso8601`.
+    pub const M_CREATED_DATE: ::aws_smithy_schema::Schema =
+        schemas_member!(iso8601 "SearchSchemaVersionSummary", "CreatedDate", 0);
+    pub const M_SCHEMA_VERSION: ::aws_smithy_schema::Schema =
+        schemas_member!("SearchSchemaVersionSummary", "SchemaVersion", String, 1);
+    /// `Type`, an enum: a string on the wire.
+    pub const M_TYPE: ::aws_smithy_schema::Schema =
+        schemas_member!("SearchSchemaVersionSummary", "Type", String, 2);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.schemas#SearchSchemaVersionSummary",
+            "com.amazonaws.schemas",
+            "SearchSchemaVersionSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CREATED_DATE,
+            &Self::M_SCHEMA_VERSION,
+            &Self::M_TYPE,
+        ],
+    );
+}
+
+pub static SEARCH_SCHEMA_VERSION_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema =
+    &SearchSchemaVersionSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for SearchSchemaVersionSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.created_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_DATE, v)?;
+        }
+        if let Some(v) = self.schema_version.as_ref() {
+            s.write_string(&Self::M_SCHEMA_VERSION, v.as_str())?;
+        }
+        if let Some(v) = self.r#type.as_ref() {
+            s.write_string(&Self::M_TYPE, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for SearchSchemaVersionSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.created_date = Some(d.read_timestamp(&Self::M_CREATED_DATE)?),
+                Some(1) => out.schema_version = Some(d.read_string(&Self::M_SCHEMA_VERSION)?),
+                Some(2) => out.r#type = Some(d.read_string(&Self::M_TYPE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
