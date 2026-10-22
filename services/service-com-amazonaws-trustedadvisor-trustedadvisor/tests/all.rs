@@ -17,3 +17,5 @@ mod recommendation_loop;
 mod state_roundtrip;
 #[path = "all/support_level_gate.rs"]
 mod support_level_gate;
+#[path = "all/validation_message_rendering.rs"]
+mod validation_message_rendering;

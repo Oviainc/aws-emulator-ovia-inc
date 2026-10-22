@@ -13,7 +13,7 @@
 //! table — built from the Smithy model at compile time. You do not edit the
 //! entry; you edit the behavioral seams below.
 //!
-//! Five opt-in seams are yours to change; every one defaults to the framework's
+//! Six opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
@@ -34,16 +34,24 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec the modeled sequence reads and answers in.
+//!   The default returns `None`, serving the model-derived protocol; THIS service
+//!   returns [`wire::UnwrappedXmlRestXml`], the model's own restXml with the
+//!   envelope-free output document the model marks `s3UnwrappedXmlOutput`.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod wire;
+
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use wire::UnwrappedXmlRestXml;
 
 /// The first URI path segments another emulated service that SHARES S3's `s3` SigV4
 /// signing name owns, and which S3 must therefore not claim.
@@ -91,6 +99,11 @@ fn addresses_peer_path(parts: &http::request::Parts, peer_segments: &[&str]) -> 
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it. See [`wire`] for what it
+    /// changes about the generated one: the output document of the operations the model
+    /// marks `s3UnwrappedXmlOutput` carries no envelope.
+    protocol: UnwrappedXmlRestXml,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -100,6 +113,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: UnwrappedXmlRestXml::new(),
         }
     }
 }
@@ -168,6 +182,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // word that routing failure in your own envelope instead.
         let _ = req;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restXml protocol in every respect but one: an operation the
+        // model marks `aws.customizations#s3UnwrappedXmlOutput` answers the document AWS
+        // sends for it, its single output member promoted to the response root, which the
+        // framework's generic envelope cannot express. See [`wire`].
+        Some(&self.protocol)
     }
 
     fn override_framework_error(

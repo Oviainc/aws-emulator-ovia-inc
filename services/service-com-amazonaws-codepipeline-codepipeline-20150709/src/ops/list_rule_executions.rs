@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRuleExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRuleExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRuleExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the rule executions of a stored pipeline, from this service's state.
+//!
+//! A rule execution comes into being when a stage condition's rule is EVALUATED, and
+//! the only plane that evaluates one — the stage/action execution plane
+//! (`GetPipelineState`, `PollForJobs`, `PutJobSuccessResult`, `OverrideStageCondition`)
+//! — is still scaffolded here, so this emulator holds no rule-execution record. That
+//! splits the answer in two, and neither half invents an outcome:
+//!
+//! * A pipeline whose stored declaration configures NO condition rules can have no
+//!   rule execution at all, which is also exactly what the real service reports for
+//!   it: the one page there is, empty, and no `nextToken` — a listing that never
+//!   truncates a page issues no cursor, so every `nextToken` a caller presents is one
+//!   this listing did not issue and is refused as `InvalidNextTokenException`.
+//! * A pipeline that DOES configure condition rules would have rule executions the
+//!   real service reports and this emulator never recorded, so the call is refused
+//!   with the scaffold's 501 rather than answered with an empty list that silently
+//!   claims "none ran" — the same choice `ListPipelineExecutions` makes for its
+//!   `succeededInStage` filter. That refusal comes before any cursor is judged: a
+//!   token for a listing this emulator does not record is one it cannot judge.
+//!
+//! Everything else here is computed from the store: the pipeline the required
+//! `pipelineName` names must exist (resolved first, as in `ListPipelineExecutions`),
+//! and an execution id the filter names must name an execution of THAT pipeline.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +139,74 @@ impl From<ListRuleExecutionsErrorModeled> for ListRuleExecutionsError {
     }
 }
 
+/// The message a refused `nextToken` carries: the sentence this service's model
+/// documents for `InvalidNextTokenException`, which states the rule the caller has to
+/// act on ("Make sure that the next token you provide is the token returned by a
+/// previous call") rather than a wording invented here.
+const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next token was specified in an invalid format. \
+                                          Make sure that the next token you provide is the token \
+                                          returned by a previous call.";
+
+/// Whether `declaration` configures any stage condition with rules.
+///
+/// `ListRuleExecutions` reports "the rule executions that have occurred in a pipeline
+/// configured for conditions with rules", and a stage carries conditions at exactly
+/// three sites (`StageDeclaration$beforeEntry`, `$onSuccess`, `$onFailure`), each
+/// holding `Condition`s whose `rules` are the `RuleDeclaration`s that execute. A
+/// declaration with no rule at any of those sites has nothing that could ever produce
+/// a rule execution.
+///
+/// The three sites are normalised to `&[Condition]` first — `BeforeEntryConditions`
+/// and `SuccessConditions` model `conditions` as required and `FailureConditions` as
+/// optional — so one rule is applied to all of them rather than once per site.
+fn declares_condition_rules(declaration: &PipelineDeclaration) -> bool {
+    declaration.stages.iter().any(|stage| {
+        let sites: [&[Condition]; 3] = [
+            stage
+                .before_entry
+                .as_ref()
+                .map_or(&[][..], |before_entry| &before_entry.conditions),
+            stage
+                .on_success
+                .as_ref()
+                .map_or(&[][..], |on_success| &on_success.conditions),
+            stage
+                .on_failure
+                .as_ref()
+                .and_then(|on_failure| on_failure.conditions.as_deref())
+                .unwrap_or_default(),
+        ];
+        sites.iter().flat_map(|conditions| conditions.iter()).any(
+            |condition| {
+                condition
+                    .rules
+                    .as_ref()
+                    .is_some_and(|rules| !rules.is_empty())
+            },
+        )
+    })
+}
+
+/// Every execution id the filter names: `pipelineExecutionId` and the one
+/// `latestInPipelineExecution` requires. Both members name a pipeline execution, so
+/// both are checked against the store the same way.
+fn filtered_execution_ids(filter: Option<&RuleExecutionFilter>) -> Vec<&str> {
+    let Some(filter) = filter else {
+        return Vec::new();
+    };
+    filter
+        .pipeline_execution_id
+        .as_deref()
+        .into_iter()
+        .chain(
+            filter
+                .latest_in_pipeline_execution
+                .as_ref()
+                .map(|latest| latest.pipeline_execution_id.as_str()),
+        )
+        .collect()
+}
+
 /// The `ListRuleExecutions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +243,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRuleExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRuleExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRuleExecutions"))
+        let _ = ctx;
+
+        let state = crate::state::require_state(&*self.engine)?;
+        let state = state.lock();
+
+        // The pipeline a required member names is resolved first, the way
+        // `ListPipelineExecutions` resolves it: there is nothing to list for a
+        // pipeline the store does not hold.
+        let pipeline = state.pipelines.get(&input.pipeline_name).ok_or_else(|| {
+            ListRuleExecutionsError::from(
+                ListRuleExecutionsErrorModeled::PipelineNotFoundException(
+                    PipelineNotFoundException {
+                        message: Some(format!("pipeline {} does not exist", input.pipeline_name)),
+                    },
+                ),
+            )
+        })?;
+
+        // Nothing in this emulator evaluates a condition's rules, so a pipeline that
+        // declares some would have rule executions the real service reports and this
+        // store never recorded: the whole call is refused — including any cursor it
+        // carries, which this emulator is in no position to judge — rather than
+        // answered with a list that claims none ran.
+        if declares_condition_rules(&pipeline.declaration) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListRuleExecutions for a pipeline whose stages declare condition rules",
+            ));
+        }
+
+        // A `nextToken` names a position in THIS listing's order. For a pipeline with
+        // no condition rules the listing never truncates a page (see the module docs),
+        // so it has issued no cursor and any token presented to it is one it did not
+        // issue — exactly the condition the model's `InvalidNextTokenException` states.
+        if input.next_token.is_some() {
+            return Err(ListRuleExecutionsErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `PipelineExecutionNotFoundException` is documented for exactly this: an
+        // execution that "cannot be found, or an execution ID does not belong to the
+        // specified pipeline".
+        for execution_id in filtered_execution_ids(input.filter.as_ref()) {
+            let belongs = state
+                .executions
+                .get(execution_id)
+                .is_some_and(|record| record.pipeline_name == input.pipeline_name);
+            if !belongs {
+                return Err(
+                    ListRuleExecutionsErrorModeled::PipelineExecutionNotFoundException(
+                        PipelineExecutionNotFoundException {
+                            message: Some(format!(
+                                "pipeline {} has no execution {execution_id}",
+                                input.pipeline_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A pipeline configured with no condition rules has no rule execution,
+        // whatever `maxResults` asks for and whichever execution the filter selects:
+        // one empty page, and no cursor to ask for another.
+        Ok(ListRuleExecutionsOutput {
+            rule_execution_details: Some(Vec::new()),
+            next_token: None,
+        })
     }
 }

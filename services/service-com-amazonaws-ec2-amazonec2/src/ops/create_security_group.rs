@@ -211,58 +211,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // "The tags to assign to the security group" — "you must specify the resource type
-        // to tag, otherwise the request will fail" (`TagSpecification`), and the only type
-        // this action tags is the group it creates.
-        let mut tags: Vec<Tag> = Vec::new();
-        for specification in input.tag_specifications.iter().flatten() {
-            match specification.resource_type.as_deref() {
-                Some(state::RESOURCE_TYPE_SECURITY_GROUP) => {
-                    tags.extend(specification.tags.clone().unwrap_or_default());
-                }
-                Some(other) => {
-                    return Err(state::invalid_parameter_value(format!(
-                        "'{other}' is not a valid resource type for tagging on \
-                         CreateSecurityGroup"
-                    )))
-                }
-                None => {
-                    return Err(state::missing_parameter(
-                        "Tag specification resource type must have a value",
-                    ))
-                }
-            }
-        }
-        // The same tag rules `CreateVpc` applies: at most the documented number of tags per
-        // resource, each key and value within its documented length, no reserved prefix,
-        // and no key given twice ("Tag keys must be unique per resource").
-        if tags.len() > state::MAX_TAGS_PER_RESOURCE {
-            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
-                "The request carries {} tags, above the maximum of {max} per resource",
-                tags.len(),
-                max = state::MAX_TAGS_PER_RESOURCE,
-            )));
-        }
-        let mut keys_seen: ::std::collections::BTreeSet<&str> =
-            ::std::collections::BTreeSet::new();
-        for tag in &tags {
-            let key = tag.key.as_deref().unwrap_or_default();
-            if key.is_empty() {
-                return Err(state::invalid_parameter_value("A tag key cannot be empty"));
-            }
-            if key.starts_with(state::RESERVED_TAG_PREFIX) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Tag key '{key}' is invalid: the '{prefix}' prefix is reserved",
-                    prefix = state::RESERVED_TAG_PREFIX,
-                )));
-            }
-            if !keys_seen.insert(key) {
-                return Err(state::invalid_parameter_value(format!(
-                    "Tag key '{key}' is given more than once; tag keys must be unique"
-                )));
-            }
-            state::validate_tag_size(key, tag.value.as_deref().unwrap_or_default())?;
-        }
+        // "The tags to assign to the security group" — the shared reader refuses a
+        // specification naming any other resource type ("you must specify the resource type
+        // to tag, otherwise the request will fail" — `TagSpecification`) and holds the tag
+        // payload to the same documented bounds every create of this crate holds its tags
+        // to, so one rule has one implementation.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_SECURITY_GROUP,
+            Self::NAME,
+        )?;
 
         let state_handle = state::require_service_state(&*self.engine)?;
         let region = state::request_region(ctx.parts());
@@ -278,12 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 vpc_id.to_string()
             }
-            None => match store
-                .vpcs
-                .values()
-                .find(|vpc| vpc.is_default.unwrap_or(false))
-                .and_then(|vpc| vpc.vpc_id.clone())
-            {
+            None => match store.default_vpc_id() {
                 Some(default_vpc) => default_vpc,
                 None => return Err(state::vpc_id_not_specified()),
             },
@@ -340,6 +293,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         // The caller-chosen bytes the record retains, charged against the budget the check
         // above reserved them in, so the store is bounded in bytes and not only in records.
+        // `state::ComAmazonawsEc2Amazonec2State::remove_security_group` releases exactly
+        // this quantity when the group is deleted.
         let charged = store
             .security_groups
             .get(&group_id)

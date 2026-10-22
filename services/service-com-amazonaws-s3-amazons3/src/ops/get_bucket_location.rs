@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketLocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketLocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketLocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Region the named bucket was created in, read from the bucket this
+//! service's store holds: "Returns the Region the bucket resides in. You set the bucket's
+//! Region using the LocationConstraint request parameter in a CreateBucket request."
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketLocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketLocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketLocation"))
+        // A report needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you
+        // provide does not match the actual owner of the bucket, the request fails with
+        // the HTTP status code 403 Forbidden (access denied)"
+        // (`GetBucketLocationRequest$ExpectedBucketOwner`) — judged the way the other
+        // bucket readers in this crate judge it: this emulator serves one account, so
+        // that account owns every bucket it holds. `AccessDenied` is not a shape this
+        // operation models, so it goes out through the unmodelled channel with the code
+        // and status S3 sends.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the S3 store is unavailable",
+            ));
+        };
+
+        // Read-only: the guard is taken, the bucket's Region is copied out, and nothing
+        // is written.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            // `GetBucketLocation` models no error at all, yet S3 answers a bucket it does
+            // not hold with `NoSuchBucket` (404) — the same unmodelled channel the bucket
+            // subresource readers in this crate use for it.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                404,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+
+        // "Buckets in Region us-east-1 have a LocationConstraint of null"
+        // (`GetBucketLocationOutput$LocationConstraint`), which is why `us-east-1` is not
+        // one of `BucketLocationConstraint`'s values
+        // (`smithy_query(query="shape",shape="BucketLocationConstraint")`): the bucket's
+        // Region IS the constraint for every other Region, and absent for that one.
+        let location_constraint = (bucket.region != crate::state::DEFAULT_BUCKET_REGION)
+            .then(|| bucket.region.clone());
+        Ok(GetBucketLocationOutput {
+            location_constraint,
+        })
     }
 }

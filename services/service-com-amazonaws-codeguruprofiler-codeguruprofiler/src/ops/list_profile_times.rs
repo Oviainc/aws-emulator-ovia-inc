@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfileTimes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfileTimes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfileTimes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the start times of the aggregated profiles a stored profiling group holds for
+//! the requested aggregation period, inside the requested time range, in the requested
+//! order and a page at a time. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfileTimes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfileTimesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfileTimes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProfileTimesErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // `period` and `orderBy` target old-style `enum`-trait strings, so an
+        // unmodelled value can reach this handler: it is refused with the operation's
+        // own ValidationException rather than silently treated as a default.
+        let period_seconds = crate::state::aggregation_period_seconds(&input.period)
+            .ok_or_else(|| {
+                ListProfileTimesErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "period must be one of {}, got {}",
+                        AGGREGATION_PERIOD_VALUES.join(", "),
+                        input.period
+                    ),
+                })
+            })?;
+        // The model's doc for `orderBy`: "Defaults to TIMESTAMP_DESCENDING." The two
+        // values it accepts are the generated `ORDER_BY_VALUES`.
+        let descending = match input.order_by.as_deref() {
+            None | Some("TimestampDescending") => true,
+            Some("TimestampAscending") => false,
+            Some(other) => {
+                return Err(ListProfileTimesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "orderBy must be one of {}, got {other}",
+                            ORDER_BY_VALUES.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+        // Instants are compared through `instant_key`, which is exact at nanosecond
+        // resolution, rather than through `f64` epoch seconds.
+        let (range_start, range_end) = (
+            crate::state::instant_key(input.start_time),
+            crate::state::instant_key(input.end_time),
+        );
+        if range_end < range_start {
+            return Err(ListProfileTimesErrorModeled::ValidationException(
+                ValidationException {
+                    message: "endTime must not be before startTime".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The page token is this service's own opaque cursor: the index into the
+        // ordered profile-time list at which the next page starts. It satisfies the
+        // modelled `PaginationToken` constraints (len 1..64, `^[\w-]+$`).
+        let first = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                ListProfileTimesErrorModeled::ValidationException(ValidationException {
+                    message: format!("nextToken is not a token this service issued: {token}"),
+                })
+            })?,
+        };
+
+        let guard = state.lock();
+        let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
+            ListProfileTimesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no profiling group named {}", input.profiling_group_name),
+            })
+        })?;
+
+        // The aggregated profiles the group holds for this period, keeping those whose
+        // start falls in the requested range. The range is half-open at `endTime`, so
+        // paging a time axis with back-to-back ranges reports each aggregated profile
+        // exactly once.
+        let mut starts: Vec<::aws_smithy_types::DateTime> = group
+            .aggregated_profile_starts(period_seconds)
+            .into_iter()
+            .filter(|start| {
+                let at = crate::state::instant_key(*start);
+                at >= range_start && at < range_end
+            })
+            .collect();
+        if descending {
+            starts.reverse();
+        }
+
+        // A cursor is only ever issued while entries remain after it, so a token at or
+        // past the end of the list is one this service never issued: it is refused
+        // rather than answered with an empty page. A request with NO token starts at 0,
+        // which is the whole list however short it is — including empty.
+        if input.next_token.is_some() && first >= starts.len() {
+            return Err(ListProfileTimesErrorModeled::ValidationException(
+                ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                },
+            )
+            .into());
+        }
+        // Without `maxResults` the page is this service's default size, so one
+        // unparameterised request cannot materialise a response that grows with the
+        // number of aggregated profiles a group holds. A page of zero entries would
+        // hand back a token forever, so a `maxResults` the modelled range 1..1000
+        // already refuses before this handler runs is floored at one rather than
+        // silently paging nothing.
+        let limit = input.max_results.map_or(
+            crate::state::DEFAULT_LIST_PAGE_SIZE,
+            |max| usize::try_from(max).unwrap_or(1).max(1),
+        );
+        let last = first.saturating_add(limit).min(starts.len());
+        let page = starts.get(first..last).unwrap_or_default();
+
+        Ok(ListProfileTimesOutput {
+            profile_times: page
+                .iter()
+                .map(|start| ProfileTime { start: Some(*start) })
+                .collect(),
+            next_token: (last < starts.len()).then(|| last.to_string()),
+        })
     }
 }
