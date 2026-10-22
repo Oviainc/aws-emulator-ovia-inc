@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContactChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContactChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContactChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the channels stored under the contact the request's `ContactId` names, in
+//! the order they were created, one `MaxResults`-sized page at a time. A read: it writes
+//! nothing.
+//!
+//! A channel carries no caller-chosen ordering key, so the store stamps each one with the
+//! creation sequence it was minted at and the opaque `NextToken` carries the sequence the
+//! previous page ended on — which keeps the paging stable even if a channel inside an
+//! already-served page is deleted mid-scan.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +158,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContactChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContactChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContactChannels"))
+        use crate::state::{
+            contact_channel_summary, decode_next_token, invalid_next_token_message, page_size,
+            take_page, TOKEN_SCOPE_CONTACT_CHANNELS,
+        };
+
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListContactChannelsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // The resume point: the creation sequence the previous page ended on.
+        let after: Option<u64> = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_CONTACT_CHANNELS, token)
+                    .and_then(|decoded| decoded.parse::<u64>().ok())
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        let state = state.lock();
+        if !state.contacts.contains_key(&input.contact_id) {
+            return Err(ListContactChannelsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_id),
+                    resource_id: input.contact_id.clone(),
+                    resource_type: "contact".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let mut matching: Vec<(u64, ContactChannel)> = state
+            .contact_channels
+            .values()
+            .filter(|channel| channel.contact_arn == input.contact_id)
+            .filter(|channel| after.is_none_or(|last| channel.sequence > last))
+            .map(|channel| (channel.sequence, contact_channel_summary(channel)))
+            .collect();
+        matching.sort_by_key(|(sequence, _)| *sequence);
+
+        let (page, next_token) = take_page(
+            matching,
+            page_size(input.max_results),
+            TOKEN_SCOPE_CONTACT_CHANNELS,
+            |(sequence, _)| sequence.to_string(),
+        );
+
+        Ok(ListContactChannelsOutput {
+            next_token,
+            contact_channels: page.into_iter().map(|(_, channel)| channel).collect(),
+        })
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListContactChannelsError {
+    ListContactChannelsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }
