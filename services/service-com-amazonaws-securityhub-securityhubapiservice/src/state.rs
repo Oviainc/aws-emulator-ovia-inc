@@ -408,6 +408,73 @@ pub fn parse_iso8601_nanos(text: &str) -> Option<i128> {
     Some(i128::from(dt.secs()) * 1_000_000_000 + i128::from(dt.subsec_nanos()))
 }
 
+/// The greatest number of tags one Security Hub resource carries: the modelled
+/// `TagMap`'s own `length` maximum (`smithy_query(query="shape", shape="TagMap")`
+/// reports `length {min: 1, max: 50}`), which is the shape `ListTagsForResource`
+/// reports a resource's whole tag set in.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Whether `arn` is a well-formed ARN: the six colon-separated ARN fields
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`, with a non-empty
+/// partition, service and resource (Region and account are empty on the
+/// service-owned ARNs Security Hub mints, e.g. a product ARN).
+///
+/// The modelled `ResourceArn` pattern (`^arn:aws:securityhub:`) only pins the
+/// prefix, so the boundary validator admits a truncated ARN; that is a bad input
+/// parameter, not a missing resource.
+pub fn is_well_formed_arn(arn: &str) -> bool {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(_region), Some(_account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    !partition.is_empty() && !service.is_empty() && !resource.is_empty()
+}
+
+/// The tag set of the resource `resource_arn` names, for reading, as seen by the
+/// caller whose account and Region are `key`. `None` when that caller has no
+/// resource carrying that ARN.
+///
+/// Tagging addresses a resource by ARN, and Security Hub CSPM is subscribed per
+/// account and Region behind per-Region endpoints, so the search is scoped to the
+/// requesting account/Region: an ARN naming another Region's resource resolves to
+/// nothing here, which is the 404 the call owes it. Every resource kind this crate
+/// persists and the model gives a tag set is looked up here — today that is the
+/// `hub/default` resource `EnableSecurityHub` creates; a resource kind whose create
+/// operation is still a stub has nothing in state to find.
+pub fn resource_tags<'a>(
+    store: &'a ComAmazonawsSecurityhubSecurityhubapiserviceState,
+    key: &HubKey,
+    resource_arn: &str,
+) -> Option<&'a HashMap<String, String>> {
+    store
+        .hubs
+        .get(key)
+        .filter(|hub| hub.hub_arn == resource_arn)
+        .map(|hub| &hub.tags)
+}
+
+/// The tag set of the resource `resource_arn` names, for writing — the mutable twin
+/// of [`resource_tags`], so `TagResource` and `UntagResource` resolve an ARN exactly
+/// as `ListTagsForResource` does.
+pub fn resource_tags_mut<'a>(
+    store: &'a mut ComAmazonawsSecurityhubSecurityhubapiserviceState,
+    key: &HubKey,
+    resource_arn: &str,
+) -> Option<&'a mut HashMap<String, String>> {
+    store
+        .hubs
+        .get_mut(key)
+        .filter(|hub| hub.hub_arn == resource_arn)
+        .map(|hub| &mut hub.tags)
+}
+
 /// The company every standard in [`STANDARDS_CATALOG`] is managed by: "For existing
 /// standards, the value is equal to `Amazon Web Services`"
 /// (`smithy_query(query="shape", shape="StandardsManagedBy")`, member `Company`).
