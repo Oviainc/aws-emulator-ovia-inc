@@ -1,0 +1,33 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: acm.acm-concurrent-reimport-into-one-arn-converges-to-a-single-serial acm.acm-imported-ec-p384-chain-completes-a-real-tls-handshake acm.acm-imported-pem-round-trips-to-byte-identical-der acm.acm-imported-rsa-chain-completes-a-real-tls-handshake acm.acm-reimport-into-an-amazon-issued-certificate-arn-rejected acm.acm-reimport-with-a-mismatched-private-key-rejected acm.acm-serving-only-the-leaf-without-the-chain-fails-verification acm.add-tags-and-list-tags acm.add-tags-exceeds-limit-fails acm.add-tags-reserved-prefix-fails acm.concurrent-add-tags-no-lost-updates acm.delete-certificate-removes-resource acm.describe-certificate-invalid-arn-rejected acm.describe-certificate-malformed-arn-rejected acm.e2e-import-export-delete-consequence-flow acm.export-certificate-key-matches-imported-cert acm.export-certificate-on-imported-rejected acm.get-certificate-chain-present-only-for-chained-import acm.get-certificate-pending-validation-fails acm.get-certificate-returns-imported-pem acm.import-certificate-arn-mismatch-conflict acm.import-certificate-chain-byte-exact-round-trip acm.import-certificate-chain-not-matching-leaf-rejected acm.import-certificate-chain-roundtrip-fingerprint-match acm.import-certificate-ec-key-algorithm-derived acm.import-certificate-expired-rejected acm.import-certificate-issued-immediately acm.import-certificate-key-mismatch-fails acm.import-certificate-pem-byte-exact-round-trip acm.import-certificate-san-extension-parsed-from-der acm.import-certificate-sets-issued acm.import-certificate-unsupported-key-size-rejected acm.list-certificates-filter-by-status acm.list-certificates-filters-by-status acm.list-certificates-key-type-filter-excludes-others acm.list-certificates-pagination-consistent-with-describe acm.list-certificates-pagination-next-token-exactness acm.list-certificates-reflects-created acm.list-certificates-summary-fields-populated acm.op-contract-add-tags-to-certificate acm.op-contract-delete-certificate acm.op-contract-describe-certificate acm.op-contract-export-certificate acm.op-contract-get-certificate acm.op-contract-import-certificate acm.op-contract-list-tags-for-certificate acm.op-contract-renew-certificate acm.op-contract-revoke-certificate acm.reimport-certificate-different-domain-replaces-identity acm.reimport-certificate-keypair-mismatch-rejected acm.reimport-certificate-preserves-arn-updates-content acm.reimport-certificate-public-key-mismatch-rejected acm.reimport-certificate-same-arn-updates-content acm.remove-nonexistent-tag-is-noop acm.remove-tags-from-certificate acm.renew-certificate-ineligible-fails acm.resend-validation-email-already-issued-rejected acm.resend-validation-email-state-gated acm.revoke-certificate-already-revoked-conflicts acm.revoke-certificate-ineligible-type-fails acm.revoke-certificate-unexported-import-fails acm.search-certificates-finds-by-arn acm.search-certificates-shape acm.untag-resource-rejects-certificate-arn acm.untag-resource-removes-tag-added-via-addtags acm.update-certificate-options-imported-fails acm.update-certificate-options-invalid-state-rejected acm.wildcard-san-certificate-matches-exactly-one-label-at-a-real-handshake
+Issue-Shape-Id: com.amazonaws.acm#CertificateManager
+Issue-Key: acm|ImportCertificate|NotImplemented
+Issue-Commit: c73ebf67a23d923b166243bec836d38257c16c68
+
+# Implement acm ImportCertificate: unimplemented scaffold stub
+
+> _Note: this issue was identified against the code base at commit `c73ebf67a23d923b166243bec836d38257c16c68`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ImportCertificate
+
+## Description
+`ImportCertificate` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-acm-certificatemanager/src/ops/import_certificate.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
+
+That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.
+
+68 recorded unit(s) fail on their `ImportCertificate` call, so each one unblocks only when `ImportCertificate` works: `acm.acm-concurrent-reimport-into-one-arn-converges-to-a-single-serial`, `acm.acm-imported-ec-p384-chain-completes-a-real-tls-handshake`, `acm.acm-imported-pem-round-trips-to-byte-identical-der`, `acm.acm-imported-rsa-chain-completes-a-real-tls-handshake`, `acm.acm-reimport-into-an-amazon-issued-certificate-arn-rejected`, `acm.acm-reimport-with-a-mismatched-private-key-rejected`, `acm.acm-serving-only-the-leaf-without-the-chain-fails-verification`, `acm.add-tags-and-list-tags`, `acm.add-tags-exceeds-limit-fails`, `acm.add-tags-reserved-prefix-fails`, `acm.concurrent-add-tags-no-lost-updates`, `acm.delete-certificate-removes-resource`, `acm.describe-certificate-invalid-arn-rejected`, `acm.describe-certificate-malformed-arn-rejected`, `acm.e2e-import-export-delete-consequence-flow`, `acm.export-certificate-key-matches-imported-cert`, `acm.export-certificate-on-imported-rejected`, `acm.get-certificate-chain-present-only-for-chained-import`, `acm.get-certificate-pending-validation-fails`, `acm.get-certificate-returns-imported-pem` (+48 more).
+
+## Evidence
+The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at the top of `services/service-com-amazonaws-acm-certificatemanager/src/ops/import_certificate.rs`. Replaying the corpus, the emulator refused the `ImportCertificate` call: File "context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+  File "client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the ImportCertificate operation: operation ImportCertificate is scaffolded but not implemented in this emulator
+
+## Steps to Reproduce
+Boot the acm emulator
+Call ImportCertificate and observe HTTP 501 with no state persisted
+Replay any of the blocked units above and observe it fail on that refusal
