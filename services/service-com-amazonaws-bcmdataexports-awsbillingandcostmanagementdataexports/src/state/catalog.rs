@@ -19,8 +19,13 @@
 //! The column TYPE vocabulary is the dictionary's: a column's `Type` names the KIND of
 //! data the column stores ("The kind of data a column stores" — smithy_query shape
 //! `Column`, member `Type`) in the dictionary's own mixed-case words — `String`,
-//! `Number`, `Timestamp`, `Boolean`, `Map` — never a storage-engine type name such as
-//! `STRING`, `DOUBLE` or `MAP<STRING,STRING>`, which the catalog does not publish.
+//! `Number`, `Double`, `Integer`, `Timestamp`, `Boolean`, `Map` — never a storage-engine
+//! type name such as `STRING` or `MAP<STRING,STRING>`, which the catalog does not
+//! publish. The vocabulary is PER SCHEMA, not per kind of value: the cost and usage
+//! dictionary measures costs with `Number` while the recommendations dictionary measures
+//! them with `Double` and counts days with `Integer`, so each table below carries the
+//! token ITS dictionary publishes rather than one token chosen for every numeric column
+//! of the catalog.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -29,8 +34,15 @@ use crate::ops::types::{Column, ValidationException, ValidationExceptionField};
 
 /// A column's `Type` for text the dictionary does not further constrain.
 const STRING: &str = "String";
-/// A column's `Type` for a numeric measure (a cost, a rate, a quantity, a count).
+/// A column's `Type` for a numeric measure (a cost, a rate, a quantity, a count) in the
+/// cost and usage dictionary.
 const NUMBER: &str = "Number";
+/// A column's `Type` for a floating-point measure (a cost, a percentage) in the
+/// recommendations dictionary, which publishes its numeric columns as `Double`.
+const DOUBLE: &str = "Double";
+/// A column's `Type` for a whole-number count (a number of days) in the recommendations
+/// dictionary.
+const INTEGER: &str = "Integer";
 /// A column's `Type` for a date and time.
 const TIMESTAMP: &str = "Timestamp";
 /// A column's `Type` for a true/false flag.
@@ -68,6 +80,11 @@ pub const PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA: &str =
 /// discount columns of the legacy Cost and Usage Report.
 pub const PROPERTY_INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY: &str =
     "INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY";
+/// Table property: whether the table carries the IAM principal columns.
+pub const PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA: &str = "INCLUDE_IAM_PRINCIPAL_DATA";
+/// Table property: whether the table is deprecated — published by a preview table the
+/// catalog has superseded.
+pub const PROPERTY_DEPRECATED: &str = "DEPRECATED";
 /// Table property: the filter the recommendations table applies to its rows.
 pub const PROPERTY_FILTER: &str = "FILTER";
 /// Table property: whether the recommendations table reports every recommendation rather
@@ -86,8 +103,11 @@ pub struct TablePropertySpec {
     /// The values this property accepts; anything else is refused. EMPTY for a free-form
     /// property, which accepts any value — see [`Self::accepts`].
     pub valid_values: &'static [&'static str],
-    /// The value the property takes when a request does not name it.
-    pub default_value: &'static str,
+    /// The value the property takes when a request does not name it, or `None` for a
+    /// property the catalog publishes NO default for: such a property is in force only
+    /// for a request that names it, so a request that does not name it reports no value
+    /// for it at all.
+    pub default_value: Option<&'static str>,
     /// What the property changes about the table's data or schema.
     pub description: &'static str,
 }
@@ -149,6 +169,44 @@ const fn col_when(
     }
 }
 
+/// One group of columns a table's schema is built from.
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnGroup {
+    /// Columns this schema describes itself.
+    Own(&'static [ColumnSpec]),
+    /// Columns this schema takes OVER from another table's group, named in the order this
+    /// schema publishes them: a table that is a VIEW over another reports the viewed
+    /// column exactly as the viewed table does — one name, one kind of data, one
+    /// description — so the two readers cannot drift apart. A table property of the
+    /// viewed table gates nothing here, because the viewing table publishes no such
+    /// property: a viewed column is part of every schema of the viewing table.
+    View {
+        /// The group the columns are taken from.
+        of: &'static [ColumnSpec],
+        /// The names taken from it, in the order this schema publishes them. A name the
+        /// group does not describe contributes no column — [`crate::state`]'s tests pin
+        /// the resulting schema, so a name that resolves to nothing fails them.
+        columns: &'static [&'static str],
+    },
+}
+
+impl ColumnGroup {
+    /// This group's columns, in the order it publishes them.
+    fn resolve(&self) -> Vec<ColumnSpec> {
+        match *self {
+            Self::Own(columns) => columns.to_vec(),
+            Self::View { of, columns } => columns
+                .iter()
+                .filter_map(|name| of.iter().find(|column| column.name == *name))
+                .map(|column| ColumnSpec {
+                    requires: None,
+                    ..*column
+                })
+                .collect(),
+        }
+    }
+}
+
 /// One table in the catalog: the name a request names it by, its description, the table
 /// properties it publishes, and the column groups its schema is built from.
 #[derive(Debug, Clone, Copy)]
@@ -164,7 +222,7 @@ pub struct TableSpec {
     /// The column groups this table's schema is built from, concatenated in order: a
     /// schema that extends another's (FOCUS 1.2 over FOCUS 1.0) names the shared group
     /// rather than copying it, so one column is described once.
-    pub column_groups: &'static [&'static [ColumnSpec]],
+    pub column_groups: &'static [ColumnGroup],
 }
 
 impl TableSpec {
@@ -175,16 +233,17 @@ impl TableSpec {
 
     /// Every column this table can carry, including the ones a table property gates, in
     /// the order the catalog publishes them.
-    pub fn columns(&self) -> impl Iterator<Item = &'static ColumnSpec> {
-        let groups: &'static [&'static [ColumnSpec]] = self.column_groups;
-        groups.iter().flat_map(|group| group.iter())
+    pub fn columns(&self) -> impl Iterator<Item = ColumnSpec> {
+        let groups: &'static [ColumnGroup] = self.column_groups;
+        groups.iter().flat_map(ColumnGroup::resolve)
     }
 
     /// The properties in force for a request carrying `requested`: every property this
     /// table publishes, at the requested value where the request names it and at the
     /// published default otherwise ("Each table property has a default value that it
     /// assumes if not specified" — the modelled doc for
-    /// `GetTableRequest$TableProperties`).
+    /// `GetTableRequest$TableProperties`). A property the catalog publishes NO default
+    /// for assumes nothing, so it is in force only for a request that names it.
     ///
     /// `Err` is the modelled 400 for a property this table does not publish, or a value
     /// outside the property's valid values: neither names a configuration of this table,
@@ -196,7 +255,11 @@ impl TableSpec {
         let mut effective: BTreeMap<String, String> = self
             .properties
             .iter()
-            .map(|property| (property.name.to_string(), property.default_value.to_string()))
+            .filter_map(|property| {
+                property
+                    .default_value
+                    .map(|default| (property.name.to_string(), default.to_string()))
+            })
             .collect();
         for (name, value) in requested.into_iter().flatten() {
             let property = self
@@ -308,59 +371,83 @@ fn invalid_table_property_value(
 /// INCLUDE_SPLIT_COST_ALLOCATION_DATA do gate columns, and TIME_GRANULARITY changes the
 /// granularity of the rows.
 const COST_AND_USAGE_REPORT_PROPERTIES: &[TablePropertySpec] = &[
-    TablePropertySpec {
-        name: PROPERTY_TIME_GRANULARITY,
-        valid_values: &["DAILY", "MONTHLY", "HOURLY"],
-        default_value: "HOURLY",
-        description: "The granularity of the line-items in the table.",
-    },
+    TIME_GRANULARITY_PROPERTY,
     TablePropertySpec {
         name: PROPERTY_INCLUDE_CAPACITY_RESERVATION_DATA,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: PROPERTY_FALSE,
-        description: "Whether to include capacity reservation data in the table.",
+        default_value: Some(PROPERTY_FALSE),
+        description: "Whether to include capacity reservation data.",
     },
     BILLING_VIEW_ARN_PROPERTY,
     TablePropertySpec {
-        name: PROPERTY_INCLUDE_RESOURCES,
+        name: PROPERTY_INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: PROPERTY_FALSE,
-        description: "Whether the table includes resource-level data.",
+        default_value: Some(PROPERTY_FALSE),
+        description: "Whether to simulate manual discounts for automated discount data.",
     },
     TablePropertySpec {
         name: PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: PROPERTY_FALSE,
-        description: "Whether the table includes split cost allocation data.",
+        default_value: Some(PROPERTY_FALSE),
+        description: "Whether to include fission columns.",
     },
     TablePropertySpec {
-        name: PROPERTY_INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY,
+        name: PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: PROPERTY_FALSE,
-        description: "Whether the table includes manual discount compatibility data.",
+        // The catalog publishes NO default for this property: it is in force only for a
+        // request that names it, so a request that names none reports no value for it.
+        default_value: None,
+        description: "Whether IAM principal columns should be included or not.",
+    },
+    TablePropertySpec {
+        name: PROPERTY_INCLUDE_RESOURCES,
+        valid_values: BOOLEAN_PROPERTY_VALUES,
+        default_value: Some(PROPERTY_FALSE),
+        description: "Whether to include resource IDs on line items.",
     },
 ];
 
-/// The table properties of `COST_OPTIMIZATION_RECOMMENDATIONS`.
+/// The table properties of `COST_OPTIMIZATION_RECOMMENDATIONS`, in the order the catalog
+/// publishes them.
 const COST_OPTIMIZATION_RECOMMENDATIONS_PROPERTIES: &[TablePropertySpec] = &[
+    TablePropertySpec {
+        name: PROPERTY_INCLUDE_ALL_RECOMMENDATIONS,
+        valid_values: BOOLEAN_PROPERTY_VALUES,
+        default_value: Some(PROPERTY_FALSE),
+        description: "List of all recommendations for a resource, or a single recommendation if de-duped by resourceId.",
+    },
     TablePropertySpec {
         name: PROPERTY_FILTER,
         // Free-form: a JSON filter expression over the recommendation columns, which the
         // catalog cannot enumerate. The default is the empty filter: every row.
         valid_values: FREE_FORM_PROPERTY_VALUES,
-        default_value: "{}",
+        default_value: Some("{}"),
         description: "The filter that the rows in the table are restricted to.",
-    },
-    TablePropertySpec {
-        name: PROPERTY_INCLUDE_ALL_RECOMMENDATIONS,
-        valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: PROPERTY_FALSE,
-        description: "Whether the table includes all recommendations for a resource, or only the recommendation with the highest estimated savings.",
     },
 ];
 
-/// The table properties of the FOCUS tables.
+/// The table properties of the general FOCUS tables.
 const FOCUS_PROPERTIES: &[TablePropertySpec] = &[BILLING_VIEW_ARN_PROPERTY];
+
+/// The table properties of the FOCUS PREVIEW table: a preview table publishes, beside
+/// the billing view, that it is deprecated — which is how a client learns not to build
+/// new exports on it.
+const FOCUS_PREVIEW_PROPERTIES: &[TablePropertySpec] = &[
+    TablePropertySpec {
+        name: PROPERTY_DEPRECATED,
+        // The only value this property takes for a preview table the catalog publishes as
+        // deprecated: there is no configuration of it that is not deprecated.
+        valid_values: &[PROPERTY_TRUE],
+        default_value: Some(PROPERTY_TRUE),
+        description: "Whether the table is deprecated.",
+    },
+    BILLING_VIEW_ARN_PROPERTY,
+];
+
+/// The table properties of the FOCUS 1.2 table, which — unlike FOCUS 1.0 — publishes the
+/// granularity of its rows.
+const FOCUS_1_2_PROPERTIES: &[TablePropertySpec] =
+    &[TIME_GRANULARITY_PROPERTY, BILLING_VIEW_ARN_PROPERTY];
 
 /// The table properties of the tables the catalog scopes by billing view alone.
 const BILLING_VIEW_ONLY_PROPERTIES: &[TablePropertySpec] = &[BILLING_VIEW_ARN_PROPERTY];
@@ -373,8 +460,17 @@ const BILLING_VIEW_ARN_PROPERTY: TablePropertySpec = TablePropertySpec {
     // catalog can enumerate. The default is the empty string: no billing view, so the
     // table covers the whole of the account's data.
     valid_values: FREE_FORM_PROPERTY_VALUES,
-    default_value: "",
-    description: "The ARN of the billing view that the data in the table is scoped to.",
+    default_value: Some(""),
+    description: "The arn of the billing conductor group that this CUR2.0/ FOCUS Data Export is for.",
+};
+
+/// The granularity property, published by every table whose rows are aggregated over a
+/// period of time.
+const TIME_GRANULARITY_PROPERTY: TablePropertySpec = TablePropertySpec {
+    name: PROPERTY_TIME_GRANULARITY,
+    valid_values: &["DAILY", "MONTHLY", "HOURLY"],
+    default_value: Some("HOURLY"),
+    description: "The granularity of the line-items in the table.",
 };
 
 // ---------------------------------------------------------------------------
@@ -386,7 +482,7 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "payer_account_id",
         STRING,
-        "The account ID of the management account that pays for the usage the emissions are estimated for.",
+        "The account ID of the paying account. For an organization in AWS Organizations, this is the account ID of the management account.",
     ),
     col(
         "usage_account_id",
@@ -428,15 +524,79 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The location of the usage that the emissions are estimated for.",
     ),
+    // The emissions MEASURES. Each one is reported as a value and the unit that value is
+    // measured in, rather than as a single column in an assumed unit: the table publishes
+    // the market-based (mbm) and location-based (lbm) totals and, per emissions scope,
+    // the scope's own total.
     col(
-        "total_mbm_carbon_emissions",
+        "total_lbm_emissions_value",
         NUMBER,
-        "The estimated carbon emissions of the usage under the market-based method, in metric tons of carbon dioxide equivalent.",
+        "The total estimated carbon emissions of the usage under the location-based method.",
     ),
     col(
-        "total_lbm_carbon_emissions",
+        "total_lbm_emissions_unit",
+        STRING,
+        "The unit that the total location-based-method emissions are measured in.",
+    ),
+    col(
+        "total_mbm_emissions_value",
         NUMBER,
-        "The estimated carbon emissions of the usage under the location-based method, in metric tons of carbon dioxide equivalent.",
+        "The total estimated carbon emissions of the usage under the market-based method.",
+    ),
+    col(
+        "total_mbm_emissions_unit",
+        STRING,
+        "The unit that the total market-based-method emissions are measured in.",
+    ),
+    col(
+        "total_scope_1_emissions_value",
+        NUMBER,
+        "The total estimated scope 1 carbon emissions of the usage.",
+    ),
+    col(
+        "total_scope_1_emissions_unit",
+        STRING,
+        "The unit that the total scope 1 emissions are measured in.",
+    ),
+    col(
+        "total_scope_2_lbm_emissions_value",
+        NUMBER,
+        "The total estimated scope 2 carbon emissions of the usage under the location-based method.",
+    ),
+    col(
+        "total_scope_2_lbm_emissions_unit",
+        STRING,
+        "The unit that the total scope 2 location-based-method emissions are measured in.",
+    ),
+    col(
+        "total_scope_2_mbm_emissions_value",
+        NUMBER,
+        "The total estimated scope 2 carbon emissions of the usage under the market-based method.",
+    ),
+    col(
+        "total_scope_2_mbm_emissions_unit",
+        STRING,
+        "The unit that the total scope 2 market-based-method emissions are measured in.",
+    ),
+    col(
+        "total_scope_3_lbm_emissions_value",
+        NUMBER,
+        "The total estimated scope 3 carbon emissions of the usage under the location-based method.",
+    ),
+    col(
+        "total_scope_3_lbm_emissions_unit",
+        STRING,
+        "The unit that the total scope 3 location-based-method emissions are measured in.",
+    ),
+    col(
+        "total_scope_3_mbm_emissions_value",
+        NUMBER,
+        "The total estimated scope 3 carbon emissions of the usage under the market-based method.",
+    ),
+    col(
+        "total_scope_3_mbm_emissions_unit",
+        STRING,
+        "The unit that the total scope 3 market-based-method emissions are measured in.",
     ),
 ];
 
@@ -937,7 +1097,9 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     ),
     col(
         "savings_plan_amortized_upfront_commitment_for_billing_period",
-        NUMBER,
+        // The cost and usage dictionary publishes the Savings Plan commitment and rate as
+        // TEXT, not as a numeric measure like the other cost columns of this schema.
+        STRING,
         "The upfront payment for the Savings Plan, amortized over the billing period.",
     ),
     col(
@@ -1002,7 +1164,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     ),
     col(
         "savings_plan_savings_plan_rate",
-        NUMBER,
+        STRING,
         "The Savings Plan rate of the usage in this line item.",
     ),
     col(
@@ -1143,32 +1305,32 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     ),
     col(
         "estimated_monthly_cost_after_discount",
-        NUMBER,
+        DOUBLE,
         "The estimated monthly cost of the recommended resource, after discounts.",
     ),
     col(
         "estimated_monthly_cost_before_discount",
-        NUMBER,
+        DOUBLE,
         "The estimated monthly cost of the recommended resource, before discounts.",
     ),
     col(
         "estimated_monthly_savings_after_discount",
-        NUMBER,
+        DOUBLE,
         "The estimated monthly savings of the recommendation, after discounts.",
     ),
     col(
         "estimated_monthly_savings_before_discount",
-        NUMBER,
+        DOUBLE,
         "The estimated monthly savings of the recommendation, before discounts.",
     ),
     col(
         "estimated_savings_percentage_after_discount",
-        NUMBER,
+        DOUBLE,
         "The estimated savings of the recommendation as a percentage of the current cost, after discounts.",
     ),
     col(
         "estimated_savings_percentage_before_discount",
-        NUMBER,
+        DOUBLE,
         "The estimated savings of the recommendation as a percentage of the current cost, before discounts.",
     ),
     col(
@@ -1181,14 +1343,10 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
         TIMESTAMP,
         "The date and time that the recommendation was last refreshed, in UTC.",
     ),
-    col(
-        "recommendation_id",
-        STRING,
-        "The identifier of the recommendation.",
-    ),
+    col("recommendation_id", STRING, "The ID for the recommendation."),
     col(
         "recommendation_lookback_period_in_days",
-        NUMBER,
+        INTEGER,
         "The number of days of usage that the recommendation was generated from.",
     ),
     col(
@@ -1233,8 +1391,11 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     ),
     col(
         "tags",
-        MAP,
-        "The tags of the resource that the recommendation is for, as key-value pairs.",
+        // The recommendations dictionary publishes the resource's tags as TEXT: one
+        // column carrying the tag set, not a key-value map column like the cost and
+        // usage dictionary's.
+        STRING,
+        "The tags of the resource that the recommendation is for.",
     ),
 ];
 
@@ -1249,7 +1410,7 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "BilledCost",
         NUMBER,
-        "A charge serving as the basis for invoicing, inclusive of all reduced rates and discounts.",
+        "A charge serving as the basis for invoicing, inclusive of all reduced rates and discounts while excluding the amortization of upfront charges (one-time or recurring).",
     ),
     col(
         "BillingAccountId",
@@ -1269,22 +1430,22 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "BillingPeriodEnd",
         TIMESTAMP,
-        "The exclusive end date and time of a billing period.",
+        "The exclusive end bound of a billing period.",
     ),
     col(
         "BillingPeriodStart",
         TIMESTAMP,
-        "The inclusive start date and time of a billing period.",
+        "The inclusive start bound of a billing period.",
     ),
     col(
         "ChargeCategory",
         STRING,
-        "The highest-level classification of a charge, based on the nature of how it is billed.",
+        "Indicates whether the row represents an upfront or recurring fee, cost of usage that already occurred, an after-the-fact adjustment (e.g., credits), or taxes.",
     ),
     col(
         "ChargeClass",
         STRING,
-        "Whether the charge corrects a charge of a previous billing period.",
+        "Indicates whether the row represents a regular charge or a correction to one or more previous charges, its primary use is for differentiating refunds from normal usage.",
     ),
     col(
         "ChargeDescription",
@@ -1295,12 +1456,12 @@ const FOCUS_1_0_COLUMNS: &[ColumnSpec] = &[
     col(
         "ChargePeriodEnd",
         TIMESTAMP,
-        "The exclusive end date and time of a charge period.",
+        "The exclusive end bound of a charge period.",
     ),
     col(
         "ChargePeriodStart",
         TIMESTAMP,
-        "The inclusive start date and time of a charge period.",
+        "The inclusive start bound of a charge period.",
     ),
     col(
         "CommitmentDiscountCategory",
@@ -1459,7 +1620,7 @@ const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
     col(
         "BillingAccountType",
         STRING,
-        "The provider's name for the type of the billing account.",
+        "A provider-assigned name to identify the type of billing account.",
     ),
     col(
         "CapacityReservationId",
@@ -1529,7 +1690,7 @@ const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
 ];
 
 /// The `x_`-prefixed provider extensions Amazon Web Services publishes beside the FOCUS
-/// columns, in the dictionary's order.
+/// 1.0 columns, in the dictionary's order.
 const FOCUS_AWS_EXTENSION_COLUMNS: &[ColumnSpec] = &[
     col(
         "x_CostCategories",
@@ -1558,8 +1719,330 @@ const FOCUS_AWS_EXTENSION_COLUMNS: &[ColumnSpec] = &[
     ),
 ];
 
+/// The `x_`-prefixed provider extensions the FOCUS 1.2 schema publishes. FOCUS 1.2 does
+/// NOT carry the cost-category and usage-type extensions of FOCUS 1.0: the columns the
+/// 1.2 specification standardises cover them, so the 1.2 schema publishes only the
+/// extensions it still needs. Named out of the FOCUS 1.0 group rather than copied, so
+/// one extension column is described once.
+const FOCUS_1_2_AWS_EXTENSION_COLUMNS: &[&str] = &["x_Discounts", "x_Operation", "x_ServiceCode"];
+
 /// The description every FOCUS table carries: the specification the schema implements.
 const FOCUS_DESCRIPTION: &str = "FinOps Open Cost & Usage Specification";
+
+/// What `COST_AND_USAGE_DASHBOARD` is: a VIEW over the cost and usage data, aggregated
+/// per usage date, rather than a dataset of its own.
+const COST_AND_USAGE_DASHBOARD_DESCRIPTION: &str = "A view over CUR for CostAndUsageDashboard";
+
+/// The columns `COST_AND_USAGE_DASHBOARD` describes itself: the dimensions and measures
+/// the view aggregates the underlying cost and usage line items into. The line-item
+/// columns it carries unchanged are taken over from the cost and usage group instead —
+/// see [`COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS`].
+const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
+    col(
+        "billing_period",
+        TIMESTAMP,
+        "The start date of the billing period that is covered by this report, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
+    ),
+    col(
+        "usage_date",
+        TIMESTAMP,
+        "The date of the usage that this row aggregates, in UTC.",
+    ),
+    col(
+        "payer_account_id",
+        STRING,
+        "The account ID of the paying account. For an organization in AWS Organizations, this is the account ID of the management account.",
+    ),
+    col(
+        "payer_account_name",
+        STRING,
+        "The name of the account that pays for the usage in this row.",
+    ),
+    col(
+        "linked_account_id",
+        STRING,
+        "The account ID of the member account that the usage in this row belongs to.",
+    ),
+    col(
+        "linked_account_name",
+        STRING,
+        "The name of the member account that the usage in this row belongs to.",
+    ),
+    col(
+        "invoice_id",
+        STRING,
+        "The ID of the invoice that includes the usage in this row.",
+    ),
+    col(
+        "charge_type",
+        STRING,
+        "The type of charge that this row covers, such as usage, tax, credit or refund.",
+    ),
+    col(
+        "charge_category",
+        STRING,
+        "The classification of the charge that this row covers, based on the nature of how it is billed.",
+    ),
+    col(
+        "billing_entity",
+        STRING,
+        "The Amazon Web Services organization that the charge in this row was made through, which identifies an AWS Marketplace purchase.",
+    ),
+    col(
+        "legal_entity",
+        STRING,
+        "The Amazon Web Services seller of record for the usage in this row.",
+    ),
+    col(
+        "service",
+        STRING,
+        "The Amazon Web Services service that the usage in this row belongs to.",
+    ),
+    col(
+        "product_code",
+        STRING,
+        "The code of the Amazon Web Services service that the usage in this row belongs to.",
+    ),
+    col(
+        "product_name",
+        STRING,
+        "The name of the product that the usage in this row covers.",
+    ),
+    col(
+        "product_family",
+        STRING,
+        "The family of the product that the usage in this row covers.",
+    ),
+    col(
+        "product_group",
+        STRING,
+        "The group of the product that the usage in this row covers.",
+    ),
+    col(
+        "operation",
+        STRING,
+        "The specific operation that the usage in this row covers.",
+    ),
+    col("usage_type", STRING, "The usage details of this row."),
+    col(
+        "item_description",
+        STRING,
+        "The description of the usage in this row.",
+    ),
+    col(
+        "region",
+        STRING,
+        "The Region that the usage in this row ran in.",
+    ),
+    col(
+        "availability_zone",
+        STRING,
+        "The Availability Zone that hosted the usage in this row.",
+    ),
+    col(
+        "instance_type",
+        STRING,
+        "The instance type of the instance that the usage in this row ran on.",
+    ),
+    col(
+        "instance_type_family",
+        STRING,
+        "The instance family of the instance that the usage in this row ran on.",
+    ),
+    col(
+        "current_generation",
+        STRING,
+        "Whether the instance that the usage in this row ran on is of the current generation.",
+    ),
+    col(
+        "platform",
+        STRING,
+        "The operating system of the instance that the usage in this row ran on.",
+    ),
+    col(
+        "processor",
+        STRING,
+        "The processor of the instance that the usage in this row ran on.",
+    ),
+    col(
+        "processor_features",
+        STRING,
+        "The processor features of the instance that the usage in this row ran on.",
+    ),
+    col(
+        "database_engine",
+        STRING,
+        "The database engine that the usage in this row ran.",
+    ),
+    col(
+        "tenancy",
+        STRING,
+        "The tenancy of the instance that the usage in this row ran on.",
+    ),
+    col(
+        "purchase_option",
+        STRING,
+        "How the usage in this row is paid for: On-Demand, Reserved or Spot.",
+    ),
+    col(
+        "usage_quantity",
+        NUMBER,
+        "The amount of usage that this row aggregates.",
+    ),
+    col(
+        "unblended_cost",
+        NUMBER,
+        "The cost of the usage in this row at the rate it was charged at.",
+    ),
+    col(
+        "amortized_cost",
+        NUMBER,
+        "The cost of the usage in this row with upfront payments amortized over the term they cover.",
+    ),
+    col(
+        "public_cost",
+        NUMBER,
+        "The cost of the usage in this row at public On-Demand rates.",
+    ),
+    col(
+        "ri_sp_arn",
+        STRING,
+        "The ARN of the Reserved Instance or Savings Plan that covers the usage in this row.",
+    ),
+    col(
+        "ri_sp_trueup",
+        NUMBER,
+        "The true-up charge of the Reserved Instance or Savings Plan that covers the usage in this row.",
+    ),
+    col(
+        "ri_sp_upfront_fees",
+        NUMBER,
+        "The upfront fees of the Reserved Instance or Savings Plan that covers the usage in this row.",
+    ),
+];
+
+/// The cost and usage columns `COST_AND_USAGE_DASHBOARD` carries unchanged, in the order
+/// it publishes them: the view reports the same column, kind of data and description as
+/// the table it views, so a client that moves a query between the two reads one schema.
+///
+/// The cost and usage columns NOT named here are the ones the view aggregates away: the
+/// line item's own identifier is kept, while the per-resource and split-cost columns the
+/// cost and usage table gates on a table property are not part of this table at all —
+/// this table publishes no such property.
+const COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS: &[&str] = &[
+    "bill_bill_type",
+    "bill_billing_entity",
+    "bill_billing_period_end_date",
+    "bill_billing_period_start_date",
+    "bill_invoice_id",
+    "bill_invoicing_entity",
+    "bill_payer_account_id",
+    "bill_payer_account_name",
+    "cost_category",
+    "discount",
+    "discount_bundled_discount",
+    "discount_total_discount",
+    "identity_line_item_id",
+    "identity_time_interval",
+    "line_item_availability_zone",
+    "line_item_blended_cost",
+    "line_item_blended_rate",
+    "line_item_currency_code",
+    "line_item_legal_entity",
+    "line_item_line_item_description",
+    "line_item_line_item_type",
+    "line_item_net_unblended_cost",
+    "line_item_net_unblended_rate",
+    "line_item_normalization_factor",
+    "line_item_normalized_usage_amount",
+    "line_item_operation",
+    "line_item_product_code",
+    "line_item_tax_type",
+    "line_item_unblended_cost",
+    "line_item_unblended_rate",
+    "line_item_usage_account_id",
+    "line_item_usage_account_name",
+    "line_item_usage_amount",
+    "line_item_usage_end_date",
+    "line_item_usage_start_date",
+    "line_item_usage_type",
+    "line_item_user_identifier",
+    "pricing_currency",
+    "pricing_lease_contract_length",
+    "pricing_offering_class",
+    "pricing_public_on_demand_cost",
+    "pricing_public_on_demand_rate",
+    "pricing_purchase_option",
+    "pricing_rate_code",
+    "pricing_rate_id",
+    "pricing_term",
+    "product",
+    "product_comment",
+    "product_fee_code",
+    "product_fee_description",
+    "product_from_location_type",
+    "product_from_region_code",
+    "product_instance_family",
+    "product_instance_type",
+    "product_instancesku",
+    "product_location",
+    "product_location_type",
+    "product_operation",
+    "product_pricing_unit",
+    "product_product_family",
+    "product_region_code",
+    "product_servicecode",
+    "product_sku",
+    "product_to_location_type",
+    "product_to_region_code",
+    "product_usagetype",
+    "reservation_amortized_upfront_cost_for_usage",
+    "reservation_amortized_upfront_fee_for_billing_period",
+    "reservation_availability_zone",
+    "reservation_effective_cost",
+    "reservation_end_time",
+    "reservation_modification_status",
+    "reservation_net_amortized_upfront_cost_for_usage",
+    "reservation_net_amortized_upfront_fee_for_billing_period",
+    "reservation_net_effective_cost",
+    "reservation_net_recurring_fee_for_usage",
+    "reservation_net_unused_amortized_upfront_fee_for_billing_period",
+    "reservation_net_unused_recurring_fee",
+    "reservation_net_upfront_value",
+    "reservation_normalized_units_per_reservation",
+    "reservation_number_of_reservations",
+    "reservation_recurring_fee_for_usage",
+    "reservation_reservation_a_r_n",
+    "reservation_start_time",
+    "reservation_subscription_id",
+    "reservation_total_reserved_normalized_units",
+    "reservation_total_reserved_units",
+    "reservation_units_per_reservation",
+    "reservation_unused_amortized_upfront_fee_for_billing_period",
+    "reservation_unused_normalized_unit_quantity",
+    "reservation_unused_quantity",
+    "reservation_unused_recurring_fee",
+    "reservation_upfront_value",
+    "resource_tags",
+    "savings_plan_amortized_upfront_commitment_for_billing_period",
+    "savings_plan_end_time",
+    "savings_plan_instance_type_family",
+    "savings_plan_net_amortized_upfront_commitment_for_billing_period",
+    "savings_plan_net_recurring_commitment_for_billing_period",
+    "savings_plan_net_savings_plan_effective_cost",
+    "savings_plan_offering_type",
+    "savings_plan_payment_option",
+    "savings_plan_purchase_term",
+    "savings_plan_recurring_commitment_for_billing_period",
+    "savings_plan_region",
+    "savings_plan_savings_plan_a_r_n",
+    "savings_plan_savings_plan_effective_cost",
+    "savings_plan_savings_plan_rate",
+    "savings_plan_start_time",
+    "savings_plan_total_commitment_to_date",
+    "savings_plan_used_commitment",
+    "tags",
+];
 
 /// Every table data exports publishes, ordered by name — the one catalog `GetTable`
 /// reports an entry of and `ListTables` lists.
@@ -1568,54 +2051,65 @@ pub const TABLE_CATALOG: &[TableSpec] = &[
         name: "CARBON_EMISSIONS",
         description: "Carbon Emissions",
         properties: BILLING_VIEW_ONLY_PROPERTIES,
-        column_groups: &[CARBON_EMISSIONS_COLUMNS],
+        column_groups: &[ColumnGroup::Own(CARBON_EMISSIONS_COLUMNS)],
     },
     TableSpec {
         name: "COST_AND_USAGE_DASHBOARD",
-        description: "Cost and Usage Dashboard",
+        description: COST_AND_USAGE_DASHBOARD_DESCRIPTION,
         properties: BILLING_VIEW_ONLY_PROPERTIES,
-        // The dashboard dataset is the cost and usage dictionary: it reports the same
-        // columns. This table publishes only the billing view property, so the columns
-        // that dictionary gates on a cost-and-usage property (INCLUDE_RESOURCES,
-        // INCLUDE_SPLIT_COST_ALLOCATION_DATA) are never part of THIS table's schema —
-        // intended, since a table reports only the configurations it publishes a
-        // property for.
-        column_groups: &[COST_AND_USAGE_REPORT_COLUMNS],
+        // A VIEW over the cost and usage data: its own aggregate dimensions and measures
+        // first, then the line-item columns it carries over from the viewed table.
+        column_groups: &[
+            ColumnGroup::Own(COST_AND_USAGE_DASHBOARD_COLUMNS),
+            ColumnGroup::View {
+                of: COST_AND_USAGE_REPORT_COLUMNS,
+                columns: COST_AND_USAGE_DASHBOARD_VIEWED_COLUMNS,
+            },
+        ],
     },
     TableSpec {
         name: "COST_AND_USAGE_REPORT",
         description: "Cost and Usage Report",
         properties: COST_AND_USAGE_REPORT_PROPERTIES,
-        column_groups: &[COST_AND_USAGE_REPORT_COLUMNS],
+        column_groups: &[ColumnGroup::Own(COST_AND_USAGE_REPORT_COLUMNS)],
     },
     TableSpec {
         name: "COST_OPTIMIZATION_RECOMMENDATIONS",
         description: "Cost Optimization Recommendations from the Cost Optimization Hub.",
         properties: COST_OPTIMIZATION_RECOMMENDATIONS_PROPERTIES,
-        column_groups: &[COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS],
+        column_groups: &[ColumnGroup::Own(COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS)],
     },
     TableSpec {
         name: "FOCUS_1_0_AWS",
         description: FOCUS_DESCRIPTION,
         properties: FOCUS_PROPERTIES,
-        column_groups: &[FOCUS_1_0_COLUMNS, FOCUS_AWS_EXTENSION_COLUMNS],
+        column_groups: &[
+            ColumnGroup::Own(FOCUS_1_0_COLUMNS),
+            ColumnGroup::Own(FOCUS_AWS_EXTENSION_COLUMNS),
+        ],
     },
     TableSpec {
         name: "FOCUS_1_0_AWS_PREVIEW",
         description: FOCUS_DESCRIPTION,
-        properties: FOCUS_PROPERTIES,
+        properties: FOCUS_PREVIEW_PROPERTIES,
         // The preview table publishes the FOCUS 1.0 schema: it is the same
         // specification, offered for evaluation before the table was general.
-        column_groups: &[FOCUS_1_0_COLUMNS, FOCUS_AWS_EXTENSION_COLUMNS],
+        column_groups: &[
+            ColumnGroup::Own(FOCUS_1_0_COLUMNS),
+            ColumnGroup::Own(FOCUS_AWS_EXTENSION_COLUMNS),
+        ],
     },
     TableSpec {
         name: "FOCUS_1_2_AWS",
         description: FOCUS_DESCRIPTION,
-        properties: FOCUS_PROPERTIES,
+        properties: FOCUS_1_2_PROPERTIES,
         column_groups: &[
-            FOCUS_1_0_COLUMNS,
-            FOCUS_1_2_ADDED_COLUMNS,
-            FOCUS_AWS_EXTENSION_COLUMNS,
+            ColumnGroup::Own(FOCUS_1_0_COLUMNS),
+            ColumnGroup::Own(FOCUS_1_2_ADDED_COLUMNS),
+            ColumnGroup::View {
+                of: FOCUS_AWS_EXTENSION_COLUMNS,
+                columns: FOCUS_1_2_AWS_EXTENSION_COLUMNS,
+            },
         ],
     },
 ];

@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# An object's ETag and the `Content-MD5` request header are both the MD5 digest of the
+# payload, so storing or checking either needs a real MD5 implementation.
+md-5 = "0.10"
+# Renders that digest as the lowercase hex an ETag carries.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 # Reads the restXml bodies the tagging tests assert on, instead of slicing strings.
 quick-xml = "0.41"
 

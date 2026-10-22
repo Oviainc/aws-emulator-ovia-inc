@@ -65,9 +65,13 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
-/// What the emulator answered: the HTTP status and the JSON body.
+/// What the emulator answered: the HTTP status, the `x-amzn-errortype` identity and
+/// the JSON body.
 pub(crate) struct Answer {
     pub(crate) status: u16,
+    /// The `x-amzn-errortype` header, which is how restJson1 names the error shape a
+    /// client branches on. `None` on a success, which carries no such header.
+    pub(crate) error_type: Option<String>,
     pub(crate) body: Value,
 }
 
@@ -77,6 +81,19 @@ impl Answer {
         // restJson1 renders the error shape id in `__type`, which may be namespaced.
         let raw = self.body["__type"].as_str().unwrap_or_default();
         raw.rsplit('#').next().unwrap_or_default()
+    }
+
+    /// The error SHAPE a restJson1 client resolves from the `x-amzn-errortype`
+    /// identity, or `None` when the answer carries no identity.
+    ///
+    /// The protocol admits three forms — `Shape`, `namespace#Shape` and
+    /// `Shape:<namespace URI>` — and a client takes the name after the last `#` and
+    /// before the first `:`, so this is exactly what a client's `catch` keys off.
+    pub(crate) fn resolved_error_shape(&self) -> Option<&str> {
+        self.error_type.as_deref().map(|identity| {
+            let after_namespace = identity.rsplit('#').next().unwrap_or(identity);
+            after_namespace.split(':').next().unwrap_or(after_namespace)
+        })
     }
 
     /// The value at a JSON pointer, or `Value::Null`.
@@ -106,6 +123,11 @@ pub(crate) async fn call(
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
         Value::Null
@@ -117,7 +139,11 @@ pub(crate) async fn call(
             )
         })
     };
-    Answer { status, body }
+    Answer {
+        status,
+        error_type,
+        body,
+    }
 }
 
 pub(crate) async fn create_application(router: &MultiServiceRouter, request: Value) -> Answer {

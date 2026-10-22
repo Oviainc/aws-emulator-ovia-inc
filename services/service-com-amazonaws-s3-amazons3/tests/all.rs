@@ -17,5 +17,7 @@ mod bucket_lifecycle;
 mod bucket_policy_and_tagging;
 #[path = "all/bucket_tagging.rs"]
 mod bucket_tagging;
+#[path = "all/object_and_tagging_roundtrip.rs"]
+mod object_and_tagging_roundtrip;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
