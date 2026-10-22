@@ -19,3 +19,5 @@ mod error_envelope;
 mod quota_workflow;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support_case_and_templates.rs"]
+mod support_case_and_templates;

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the job and, with it, "its related job executions" — the records in the
+//! shared store the IoT Jobs data plane serves, so a device polling for a deleted job
+//! is told the execution is not found rather than being handed work that no longer
+//! exists. A job id the account does not hold is the modelled 404, and a job that
+//! still has an unfinished execution is the modelled 409 unless `force` is set, as
+//! `InvalidStateTransitionException` itself documents ("deleting a job or a job
+//! execution which is IN_PROGRESS without setting the force parameter").
+//!
+//! The documented "DELETION_IN_PROGRESS" window is not modelled: this emulator's
+//! delete is complete when it answers, so no later call can observe a job mid-delete
+//! and the 10-concurrent-deletion limit cannot be reached.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +192,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteJob"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let unavailable = || -> DeleteJobError {
+            DeleteJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        // "Deletes a job AND ITS RELATED JOB EXECUTIONS": those live in the shared
+        // store the IoT Jobs data plane serves, so the delete reaches into it.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        let mut store = state.lock();
+        if !store.jobs.contains_key(&input.job_id) {
+            return Err(DeleteJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Job {} does not exist", input.job_id)),
+                },
+            )
+            .into());
+        }
+
+        let mut pending = executions.lock();
+        // `force`: "When true, you can delete a job which is IN_PROGRESS. Otherwise,
+        // you can only delete a job which is in a terminal state ... or an exception
+        // will occur" — and `InvalidStateTransitionException` (409) is the exception
+        // the model names for "deleting a job ... which is IN_PROGRESS without
+        // setting the force parameter". A job is still running exactly while one of
+        // its executions has not finished.
+        let still_running = pending.pending_executions_of_job(&input.job_id);
+        if still_running > 0 && !input.force {
+            return Err(DeleteJobErrorModeled::InvalidStateTransitionException(
+                InvalidStateTransitionException {
+                    message: Some(format!(
+                        "Job {} has {still_running} job execution(s) that have not finished; \
+                         delete it with force to delete them too",
+                        input.job_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        pending.remove_job_executions(&input.job_id);
+        store.jobs.remove(&input.job_id);
+        Ok(DeleteJobOutput {})
     }
 }

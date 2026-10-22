@@ -15,6 +15,8 @@
 mod execution_redrive;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/state_machine_create_options.rs"]
+mod state_machine_create_options;
 #[path = "all/state_machine_lifecycle.rs"]
 mod state_machine_lifecycle;
 #[path = "all/state_roundtrip.rs"]

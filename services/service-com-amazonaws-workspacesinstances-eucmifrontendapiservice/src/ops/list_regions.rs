@@ -2,7 +2,7 @@
 
 //! @op ListRegions
 //!
-//! Reports the Region catalog this emulator supports,
+//! Reports the service's Region availability set,
 //! [`crate::state::SUPPORTED_REGIONS`], WHOLE in one response: the recorded corpus
 //! unit `workspaces-instances.list-regions-returns-supported-regions` shows the real
 //! service answering a `MaxResults: 1` call with the entire catalog, so `MaxResults`

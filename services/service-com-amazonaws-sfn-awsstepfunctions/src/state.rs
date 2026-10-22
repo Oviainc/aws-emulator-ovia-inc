@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-sfn-awsstepfunctions service.
 //!
-//! Two resources live here, and every operation answers from them:
+//! Three resources live here, and every operation answers from them:
 //!
 //! * a **state machine**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:stateMachine:<name>`). That ARN is a total
@@ -10,6 +10,10 @@
 //!   `CreateStateMachine`'s idempotency check needs — and a name is therefore scoped
 //!   per region and account, the way the service scopes it, with no second copy of
 //!   the record to keep in step;
+//! * a **state machine version**, a numbered snapshot of a state machine's
+//!   configuration taken when `publish` was set, keyed by its own qualified ARN
+//!   (`<stateMachineArn>:<version>`), so one state machine's versions sit
+//!   contiguously under its ARN and go with it when it is deleted;
 //! * an **execution**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:execution:<stateMachineName>:<executionName>`),
 //!   with `executions_by_sm` listing one state machine's executions in start order so
@@ -36,7 +40,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{EncryptionConfiguration, LoggingConfiguration, Tag, TracingConfiguration};
+use crate::ops::types::{
+    EncryptionConfiguration, LoggingConfiguration, Tag, TracingConfiguration,
+    ENCRYPTION_TYPE_VALUES,
+};
 
 /// The ARN service namespace, sigv4 signing name and endpoint prefix of this
 /// service (`OPERATIONS.md`, "Wire protocol").
@@ -84,6 +91,29 @@ pub const STATE_MACHINE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// A state machine `DeleteStateMachine` has begun deleting.
 pub const STATE_MACHINE_STATUS_DELETING: &str = "DELETING";
+
+/// `EncryptionType`'s default: the key Step Functions encrypts with when a request
+/// configures no customer-managed key at all ("For additional control over
+/// security, you can encrypt your data using a customer-managed key" — absent that,
+/// the data is encrypted under the Amazon Web Services owned key).
+pub const ENCRYPTION_TYPE_AWS_OWNED_KEY: &str = "AWS_OWNED_KEY";
+
+/// The `EncryptionType` that encrypts with a KMS key the caller names, so
+/// `kmsKeyId` and `kmsDataKeyReusePeriodSeconds` only mean anything under it
+/// (`kmsDataKeyReusePeriodSeconds`: "Only applies to customer managed keys").
+pub const ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY: &str = "CUSTOMER_MANAGED_KMS_KEY";
+
+/// `LogLevel`'s default, from the `loggingConfiguration` member's own
+/// documentation: "By default, the level is set to OFF."
+pub const LOG_LEVEL_OFF: &str = "OFF";
+
+/// The least `kmsDataKeyReusePeriodSeconds` the modelled
+/// `KmsDataKeyReusePeriodSeconds` accepts (range 60..900).
+pub const MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS: i32 = 60;
+
+/// The most `kmsDataKeyReusePeriodSeconds` the modelled
+/// `KmsDataKeyReusePeriodSeconds` accepts (range 60..900).
+pub const MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS: i32 = 900;
 
 /// An execution that has not reached a terminal status yet.
 pub const EXECUTION_STATUS_RUNNING: &str = "RUNNING";
@@ -306,9 +336,17 @@ pub struct StateMachine {
     pub revision_id: Option<String>,
     pub description: Option<String>,
     pub tags: Vec<Tag>,
-    /// The members `CreateStateMachine`'s idempotency check reads, rendered once at
-    /// create time: see [`configuration_fingerprint`].
-    pub fingerprint: String,
+    /// Whether the create that minted this state machine asked to publish a
+    /// version. `CreateStateMachine`'s idempotency check reads `publish`, so the
+    /// flag the create carried is part of what a repeat is compared against.
+    pub publish: bool,
+    /// The version ARN the create that minted this state machine returned, if it
+    /// published one: an idempotent repeat answers the FIRST response, so it
+    /// reports that same version rather than publishing a second one.
+    pub published_version_arn: Option<String>,
+    /// How many versions have been published of this state machine, so the next
+    /// one takes the next number and a number is never reused.
+    pub version_counter: u32,
     /// When `DeleteStateMachine`'s removal becomes due; `None` while `ACTIVE`.
     pub delete_due_at: Option<SystemTime>,
     /// The bytes the store counts for this record against [`MAX_STORE_BYTES`].
@@ -327,6 +365,23 @@ impl StateMachine {
         self.delete_due_at.is_some()
     }
 
+    /// The members `CreateStateMachine`'s idempotency check reads, rendered from
+    /// this record's CURRENT configuration: see [`configuration_fingerprint`].
+    ///
+    /// Computed rather than stored, so a repeat is always compared against what the
+    /// state machine holds now and no second copy can drift from the record.
+    pub fn fingerprint(&self) -> String {
+        configuration_fingerprint(
+            &self.definition,
+            &self.sm_type,
+            self.logging_configuration.as_ref(),
+            self.tracing_configuration.as_ref(),
+            self.encryption_configuration.as_ref(),
+            self.publish,
+            self.description.as_deref(),
+        )
+    }
+
     /// The bytes this record would retain: its own layout plus every caller-sized
     /// string it holds. This is what a create is admitted against, so the store's
     /// memory is bounded by [`MAX_STORE_BYTES`] and not only by a record count.
@@ -338,10 +393,52 @@ impl StateMachine {
             + self.role_arn.len()
             + self.sm_type.len()
             + self.status.len()
-            + self.fingerprint.len()
+            + self.published_version_arn.as_ref().map_or(0, String::len)
             + self.revision_id.as_ref().map_or(0, String::len)
             + self.description.as_ref().map_or(0, String::len)
             + tags_bytes(&self.tags)
+    }
+}
+
+/// One published version of a state machine: the configuration the state machine
+/// held at the instant it was published, under its own qualified ARN
+/// (`...:stateMachine:<name>:<version>`).
+///
+/// A version is immutable ("a version is a numbered snapshot of a state machine"),
+/// so nothing here changes once it is stored; it disappears with the state machine
+/// it belongs to.
+#[derive(Debug, Clone)]
+pub struct StateMachineVersion {
+    pub arn: String,
+    pub state_machine_arn: String,
+    pub version: u32,
+    pub name: String,
+    pub definition: String,
+    pub role_arn: String,
+    pub sm_type: String,
+    pub creation_date: SystemTime,
+    pub logging_configuration: Option<LoggingConfiguration>,
+    pub tracing_configuration: Option<TracingConfiguration>,
+    pub encryption_configuration: Option<EncryptionConfiguration>,
+    pub revision_id: Option<String>,
+    pub description: Option<String>,
+    /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set
+    /// by [`ComAmazonawsSfnAwsstepfunctionsState::publish_state_machine_version`].
+    pub retained_bytes: usize,
+}
+
+impl StateMachineVersion {
+    /// The bytes this record would retain; see [`StateMachine::measure`].
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.arn.len()
+            + self.state_machine_arn.len()
+            + self.name.len()
+            + self.definition.len()
+            + self.role_arn.len()
+            + self.sm_type.len()
+            + self.revision_id.as_ref().map_or(0, String::len)
+            + self.description.as_ref().map_or(0, String::len)
     }
 }
 
@@ -631,6 +728,16 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// looking up the ARN it would mint, and a name in one region never answers for a
     /// name in another.
     pub state_machines: BTreeMap<String, StateMachine>,
+    /// Every published state machine version, keyed by its own qualified ARN
+    /// (`<stateMachineArn>:<version>`). A `BTreeMap` so one state machine's
+    /// versions sit contiguously under the `<stateMachineArn>:` prefix and go with
+    /// it when it is removed.
+    ///
+    /// Versions live BESIDE the state machines rather than inside them, because a
+    /// version is reached by its own ARN: `DescribeStateMachine` on a qualified ARN
+    /// is one lookup, and `ListStateMachines` — which reports state machines, not
+    /// versions — still walks `state_machines` alone.
+    pub state_machine_versions: BTreeMap<String, StateMachineVersion>,
     /// Every execution, keyed by its ARN.
     pub executions: BTreeMap<String, Execution>,
     /// One state machine's execution ARNs in start order.
@@ -714,6 +821,15 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         uuid_v4(high, low)
     }
 
+    /// A fresh revision id for a state machine `UpdateStateMachine` just changed.
+    ///
+    /// `revisionId` is "the revision identifier for the updated state machine", and
+    /// it has to differ on every update so a client can order revisions, so it is
+    /// minted from the same UUID generator as an execution name.
+    pub fn fresh_revision_id(&mut self) -> String {
+        self.fresh_execution_name()
+    }
+
     /// Whether the store can still take a record of `bytes`.
     ///
     /// Every growth site asks this BEFORE inserting, so a create or a start that
@@ -791,6 +907,137 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         Ok(())
     }
 
+    /// Publish the CURRENT configuration of the state machine `arn` names as its
+    /// next version, and report the version that was stored. `None` when the store
+    /// holds no state machine under `arn`.    ///
+    /// "If you set the publish parameter of this API action to true, it publishes
+    /// version 1 as the first revision of the state machine" — so the number comes
+    /// from the state machine's own counter and is never reused, and the version
+    /// holds a snapshot of the configuration, not a reference to a record that can
+    /// still change.
+    ///
+    /// The caller admits the version's bytes BEFORE calling (see
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::state_machine_rejection`]), so this
+    /// only counts them.
+    pub fn publish_state_machine_version(
+        &mut self,
+        arn: &str,
+        description: Option<String>,
+        now: SystemTime,
+    ) -> Option<StateMachineVersion> {
+        let machine = self.state_machines.get(arn)?;
+        let version = machine.version_counter.saturating_add(1);
+        let mut candidate = StateMachineVersion {
+            arn: state_machine_version_arn(arn, version),
+            state_machine_arn: machine.arn.clone(),
+            version,
+            name: machine.name.clone(),
+            definition: machine.definition.clone(),
+            role_arn: machine.role_arn.clone(),
+            sm_type: machine.sm_type.clone(),
+            creation_date: now,
+            logging_configuration: machine.logging_configuration.clone(),
+            tracing_configuration: machine.tracing_configuration.clone(),
+            encryption_configuration: machine.encryption_configuration.clone(),
+            revision_id: machine.revision_id.clone(),
+            description,
+            retained_bytes: 0,
+        };
+        candidate.retained_bytes = candidate.measure();
+        self.retained_bytes = self.retained_bytes.saturating_add(candidate.retained_bytes);
+
+        let machine = self.state_machines.get_mut(arn)?;
+        machine.version_counter = version;
+        self.state_machine_versions
+            .insert(candidate.arn.clone(), candidate.clone());
+        Some(candidate)
+    }
+
+    /// What one more published version of the state machine `arn` names would
+    /// retain, so a caller can admit it against [`MAX_STORE_BYTES`] BEFORE asking
+    /// for it: a version snapshots the record's caller-sized text, so the record's
+    /// own measurement bounds it from above (a version carries no tags).
+    pub fn version_reserve(&self, arn: &str) -> usize {
+        self.state_machines
+            .get(arn)
+            .map_or(0, |machine| machine.retained_bytes)
+    }
+
+    /// The published versions of one state machine, in version order.    ///
+    /// Every version ARN of one state machine begins with its ARN and a colon, so
+    /// this is a range scan over the contiguous block rather than a filter over
+    /// every version in the store.
+    pub fn versions_of(&self, state_machine_arn: &str) -> Vec<&StateMachineVersion> {
+        let prefix = format!("{state_machine_arn}:");
+        let mut versions: Vec<&StateMachineVersion> = self
+            .state_machine_versions
+            .range(prefix.clone()..)
+            .take_while(|(arn, _)| arn.starts_with(&prefix))
+            .map(|(_, version)| version)
+            .collect();
+        versions.sort_by_key(|version| version.version);
+        versions
+    }
+
+    /// Apply `update` to the state machine `arn` names: every member the update
+    /// carries replaces the stored one, and every member it leaves out keeps the
+    /// value the state machine holds.
+    ///
+    /// "Updates an existing state machine by modifying its definition, roleArn,
+    /// loggingConfiguration, or EncryptionConfiguration" — so this is the write that
+    /// makes the state machine's CURRENT configuration differ from the one it was
+    /// created with, which is what a later `DescribeStateMachine` reports and what
+    /// `CreateStateMachine`'s idempotency check compares a repeat against.
+    ///
+    /// The definition is caller-sized, so the record's measurement moves by what the
+    /// write changed and an update that would take the store past
+    /// [`MAX_STORE_BYTES`] is refused instead of growing it, leaving the state
+    /// machine exactly as it was.
+    pub fn apply_state_machine_update(
+        &mut self,
+        arn: &str,
+        update: StateMachineUpdate,
+    ) -> Result<(), StateMachineUpdateRejection> {
+        let Some(machine) = self.state_machines.get(arn) else {
+            return Err(StateMachineUpdateRejection::NotFound);
+        };
+        if machine.is_deleting() {
+            return Err(StateMachineUpdateRejection::Deleting);
+        }
+
+        let mut updated = machine.clone();
+        if let Some(definition) = update.definition {
+            updated.definition = definition;
+        }
+        if let Some(role_arn) = update.role_arn {
+            updated.role_arn = role_arn;
+        }
+        if update.logging_configuration.is_some() {
+            updated.logging_configuration = update.logging_configuration;
+        }
+        if update.tracing_configuration.is_some() {
+            updated.tracing_configuration = update.tracing_configuration;
+        }
+        if update.encryption_configuration.is_some() {
+            updated.encryption_configuration = update.encryption_configuration;
+        }
+        updated.revision_id = Some(update.revision_id);
+        updated.update_date = update.now;
+
+        let before = machine.retained_bytes;
+        let after = updated.measure();
+        if after > before && !self.has_room_for(after - before) {
+            return Err(StateMachineUpdateRejection::NoRoom);
+        }
+        updated.retained_bytes = after;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        self.state_machines.insert(arn.to_string(), updated);
+        Ok(())
+    }
+
     /// Begin deleting the state machine `arn` names: it reports `DELETING` from now
     /// and is removed once [`DELETE_SETTLE_DELAY`] has passed. `false` when nothing
     /// matched, which `DeleteStateMachine` answers as a success all the same.
@@ -807,13 +1054,25 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         true
     }
 
-    /// Remove a state machine and its executions.
+    /// Remove a state machine, its versions and its executions.
     ///
     /// The executions go with it, so no execution ARN is left naming a state machine
-    /// that no longer exists.
+    /// that no longer exists, and so do its published versions: "when you delete a
+    /// state machine, its versions are deleted too", and a version ARN that outlived
+    /// its state machine would answer for a resource that is gone.
     pub fn remove_state_machine(&mut self, arn: &str) -> Option<StateMachine> {
         let machine = self.state_machines.remove(arn)?;
         self.retained_bytes = self.retained_bytes.saturating_sub(machine.retained_bytes);
+        let version_arns: Vec<String> = self
+            .versions_of(arn)
+            .into_iter()
+            .map(|version| version.arn.clone())
+            .collect();
+        for version_arn in version_arns {
+            if let Some(version) = self.state_machine_versions.remove(&version_arn) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(version.retained_bytes);
+            }
+        }
         for execution_arn in self.executions_by_sm.remove(arn).unwrap_or_default() {
             if let Some(execution) = self.executions.remove(&execution_arn) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(execution.retained_bytes);
@@ -1080,6 +1339,38 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 // ARNs
 // ---------------------------------------------------------------------------
 
+/// What one `UpdateStateMachine` changes about a stored state machine.
+///
+/// Every member is optional because the operation changes only what the request
+/// carries: "you must include at least one of definition or roleArn", and the
+/// configuration structures it leaves out keep the values the state machine holds.
+#[derive(Debug, Clone)]
+pub struct StateMachineUpdate {
+    pub definition: Option<String>,
+    pub role_arn: Option<String>,
+    pub logging_configuration: Option<LoggingConfiguration>,
+    pub tracing_configuration: Option<TracingConfiguration>,
+    pub encryption_configuration: Option<EncryptionConfiguration>,
+    /// The revision the update moves the state machine to; see
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_revision_id`].
+    pub revision_id: String,
+    /// When the update happened, reported as `updateDate`.
+    pub now: SystemTime,
+}
+
+/// Why a state machine update was not applied; see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::apply_state_machine_update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateMachineUpdateRejection {
+    /// The store holds no state machine under that ARN — the modelled
+    /// `StateMachineDoesNotExist`.
+    NotFound,
+    /// The state machine is being deleted — the modelled `StateMachineDeleting`.
+    Deleting,
+    /// The updated record would take the store past [`MAX_STORE_BYTES`].
+    NoRoom,
+}
+
 /// What a Step Functions tagging call named in its `resourceArn`.
 ///
 /// From `TagResource`'s and `ListTagsForResource`'s own `resourceArn`
@@ -1146,8 +1437,7 @@ pub enum RedriveRejection {
 /// Why a tag write was not applied; see
 /// [`ComAmazonawsSfnAwsstepfunctionsState::merge_state_machine_tags`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TagWriteRejection {
-    /// The store holds no resource under that ARN — the modelled `ResourceNotFound`.
+pub enum TagWriteRejection {    /// The store holds no resource under that ARN — the modelled `ResourceNotFound`.
     NotFound,
     /// The merged tag set would hold this many tags, past [`MAX_TAGS`] — the
     /// modelled `TooManyTags`.
@@ -1177,6 +1467,29 @@ pub fn state_machine_arn(region: &str, name: &str) -> String {
 /// name, which no state machine can take (`name` is modelled 1..80).
 pub fn state_machine_arn_prefix(region: &str) -> String {
     state_machine_arn(region, "")
+}
+
+/// The ARN of version `version` of the state machine `state_machine_arn` names.
+///
+/// A version is reached through a QUALIFIED state machine ARN: the state machine's
+/// own ARN with the version number appended
+/// (`arn:<partition>:states:<region>:<account>:stateMachine:<name>:<version>`),
+/// which is the form `CreateStateMachine` reports in `stateMachineVersionArn` and
+/// [`parse_state_machine_arn`] reads back as a `qualifier`.
+pub fn state_machine_version_arn(state_machine_arn: &str, version: u32) -> String {
+    format!("{state_machine_arn}:{version}")
+}
+
+/// The version number a state machine ARN's qualifier names, or `None` when the
+/// qualifier is an alias name rather than a version.
+///
+/// A qualifier is "either a version or an alias": a version qualifier is the
+/// decimal version number, so a qualifier that is not all digits names an alias.
+pub fn qualifier_version(qualifier: &str) -> Option<u32> {
+    if qualifier.is_empty() || !qualifier.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    qualifier.parse().ok()
 }
 
 /// The ARN of one execution of a state machine.
@@ -1308,8 +1621,40 @@ pub fn invalid_name_reason(name: &str) -> Option<String> {
     None
 }
 
-/// The members `CreateStateMachine`'s idempotency check compares, rendered as one
-/// string.
+/// Why `role_arn` is not the ARN of an IAM role, or `None` when it is — the
+/// modelled `InvalidArn` ("The provided Amazon Resource Name (ARN) is not valid"),
+/// whose message is the "Invalid Arn: '<diagnosis>'" envelope the service builds
+/// from the request.
+///
+/// `roleArn` is the only ARN `CreateStateMachine` takes, and the operation models
+/// `InvalidArn`, so the ARN is checked before anything is stored: it is "the Amazon
+/// Resource Name (ARN) of the IAM role to use for this state machine", so it has to
+/// be an ARN, and an IAM `role/` ARN at that. Its length (1..256) is modelled.
+pub fn invalid_role_arn_reason(role_arn: &str) -> Option<String> {
+    if !role_arn.starts_with("arn:") {
+        return Some(format!("Invalid Arn: 'Invalid ARN prefix: {role_arn}'"));
+    }
+    let fields: Vec<&str> = role_arn.splitn(6, ':').collect();
+    let malformed = fields.len() < 6
+        || fields[1].is_empty()
+        || fields[2].is_empty()
+        || fields[5].is_empty();
+    if malformed {
+        return Some(format!("Invalid Arn: 'Invalid ARN: {role_arn}'"));
+    }
+    // IAM is a global service, so an IAM ARN carries no region, and a role is the
+    // `role/<path><name>` resource.
+    let is_role = fields[2] == "iam"
+        && fields[5]
+            .strip_prefix("role/")
+            .is_some_and(|name| !name.is_empty());
+    if !is_role {
+        return Some(format!(
+            "Invalid Arn: 'Expected the ARN {role_arn} to be an IAM role ARN.'"
+        ));
+    }
+    None
+}
 ///
 /// From the operation's own documentation: "CreateStateMachine's idempotency check
 /// is based on the state machine name, definition, type, LoggingConfiguration,
@@ -1319,9 +1664,13 @@ pub fn invalid_name_reason(name: &str) -> Option<String> {
 /// `roleArn` and `tags` are deliberately absent here, and the name is the store key
 /// rather than part of the fingerprint.
 ///
-/// `Debug` renders the three configuration structures: each is a plain record of
-/// `Option<String>`, `bool`, `i32` and `Vec` members, so the rendering is a total,
-/// deterministic function of their contents.
+/// The three configuration structures are compared as the EFFECTIVE configuration
+/// each one denotes, not as the literal members the request carried: a request that
+/// omits a configuration asks for the same thing as a request that spells its
+/// defaults out, and the service stores one state machine either way. So a repeat
+/// that sends `{"level": "OFF", "includeExecutionData": false}` where the first
+/// request sent no `loggingConfiguration` is the SAME request, and a repeat built by
+/// reading a `DescribeStateMachine` response back is idempotent.
 pub fn configuration_fingerprint(
     definition: &str,
     sm_type: &str,
@@ -1331,11 +1680,260 @@ pub fn configuration_fingerprint(
     publish: bool,
     version_description: Option<&str>,
 ) -> String {
+    let logging = effective_logging_configuration(logging_configuration);
+    let tracing = effective_tracing_configuration(tracing_configuration);
+    let encryption = effective_encryption_configuration(encryption_configuration);
     format!(
-        "{definition}\u{1f}{sm_type}\u{1f}{logging_configuration:?}\u{1f}\
-         {tracing_configuration:?}\u{1f}{encryption_configuration:?}\u{1f}\
+        "{definition}\u{1f}{sm_type}\u{1f}{logging}\u{1f}\
+         {tracing}\u{1f}{encryption}\u{1f}\
          {publish}\u{1f}{version_description:?}"
     )
+}
+
+/// The logging configuration a request carrying `configuration` effectively asks
+/// for, rendered deterministically.
+///
+/// Defaults from the member's own documentation ("By default, the level is set to
+/// OFF") and the model (`includeExecutionData` defaults to false, `destinations` is
+/// absent by default).
+pub fn effective_logging_configuration(configuration: Option<&LoggingConfiguration>) -> String {
+    let level = configuration
+        .and_then(|configuration| configuration.level.as_deref())
+        .unwrap_or(LOG_LEVEL_OFF);
+    let include_execution_data =
+        configuration.is_some_and(|configuration| configuration.include_execution_data);
+    let destinations: Vec<&str> = configuration
+        .and_then(|configuration| configuration.destinations.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|destination| destination.cloud_watch_logs_log_group.as_ref())
+        .filter_map(|group| group.log_group_arn.as_deref())
+        .collect();
+    format!("level={level},includeExecutionData={include_execution_data},destinations={destinations:?}")
+}
+
+/// The tracing configuration a request carrying `configuration` effectively asks
+/// for: `enabled` defaults to false in the model, and no `tracingConfiguration` is
+/// the same as one that disables tracing.
+pub fn effective_tracing_configuration(configuration: Option<&TracingConfiguration>) -> String {
+    let enabled = configuration.is_some_and(|configuration| configuration.enabled);
+    format!("enabled={enabled}")
+}
+
+/// The encryption configuration a request carrying `configuration` effectively asks
+/// for.
+///
+/// Absent any configuration the data is encrypted under the Amazon Web Services
+/// owned key, so no `encryptionConfiguration` is the same as
+/// `{"type": "AWS_OWNED_KEY"}`. Under that type the KMS members mean nothing
+/// (`kmsDataKeyReusePeriodSeconds`: "Only applies to customer managed keys") and
+/// [`invalid_encryption_reason`] refuses them, so they are not part of what it
+/// denotes.
+pub fn effective_encryption_configuration(configuration: Option<&EncryptionConfiguration>) -> String {
+    let Some(configuration) = configuration else {
+        return format!("type={ENCRYPTION_TYPE_AWS_OWNED_KEY}");
+    };
+    if configuration.r#type == ENCRYPTION_TYPE_AWS_OWNED_KEY {
+        return format!("type={ENCRYPTION_TYPE_AWS_OWNED_KEY}");
+    }
+    format!(
+        "type={},kmsKeyId={:?},kmsDataKeyReusePeriodSeconds={:?}",
+        configuration.r#type,
+        configuration.kms_key_id.as_deref(),
+        configuration.kms_data_key_reuse_period_seconds
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Encryption configuration
+// ---------------------------------------------------------------------------
+
+/// Why `configuration` is not an encryption configuration this service accepts, or
+/// `None` when it is — the modelled `InvalidEncryptionConfiguration`, which is
+/// "received when encryptionConfiguration is specified but various conditions exist
+/// which make the configuration invalid. For example, if type is set to
+/// CUSTOMER_MANAGED_KMS_KEY, but kmsKeyId is null, or kmsDataKeyReusePeriodSeconds
+/// is not between 60 and 900".
+///
+/// The conditions, from the shape's own members:
+///
+/// * `type` is required and is one of [`ENCRYPTION_TYPE_VALUES`];
+/// * under `CUSTOMER_MANAGED_KMS_KEY`, `kmsKeyId` must be there and must name a KMS
+///   key: "an alias, alias ARN, key ID, or key ARN of a symmetric encryption KMS
+///   key";
+/// * `kmsDataKeyReusePeriodSeconds`, when given, is within the modelled 60..900;
+/// * under `AWS_OWNED_KEY` neither KMS member applies, so a request that sets one
+///   is asking for something the configuration cannot do.
+///
+/// Every operation that accepts an `encryptionConfiguration` reads this, so one
+/// rule covers them all.
+pub fn invalid_encryption_reason(configuration: &EncryptionConfiguration) -> Option<String> {
+    if !ENCRYPTION_TYPE_VALUES.contains(&configuration.r#type.as_str()) {
+        return Some(format!(
+            "Invalid Encryption Configuration: type must be one of [{}].",
+            ENCRYPTION_TYPE_VALUES.join(", ")
+        ));
+    }
+    if let Some(period) = configuration.kms_data_key_reuse_period_seconds {
+        if !(MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS..=MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS)
+            .contains(&period)
+        {
+            return Some(format!(
+                "Invalid Encryption Configuration: kmsDataKeyReusePeriodSeconds must be between \
+                 {MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS} and \
+                 {MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS}."
+            ));
+        }
+    }
+    if configuration.r#type == ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY {
+        if !configuration
+            .kms_key_id
+            .as_deref()
+            .is_some_and(names_kms_key)
+        {
+            return Some("Invalid Encryption Configuration: Must set a valid kmsKeyId.".to_string());
+        }
+        return None;
+    }
+    if configuration.kms_key_id.is_some() {
+        return Some(format!(
+            "Invalid Encryption Configuration: Custom kmsKeyId is not allowed when selecting \
+             {ENCRYPTION_TYPE_AWS_OWNED_KEY}."
+        ));
+    }
+    if configuration.kms_data_key_reuse_period_seconds.is_some() {
+        return Some(format!(
+            "Invalid Encryption Configuration: kmsDataKeyReusePeriodSeconds is not allowed when \
+             selecting {ENCRYPTION_TYPE_AWS_OWNED_KEY}."
+        ));
+    }
+    None
+}
+
+/// Whether `value` names a KMS key the way `kmsKeyId` documents: "an alias, alias
+/// ARN, key ID, or key ARN".
+fn names_kms_key(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if let Some(resource) = kms_arn_resource(value) {
+        return match resource.split_once('/') {
+            Some(("key", key_id)) => is_kms_key_id(key_id),
+            Some(("alias", alias)) => !alias.is_empty(),
+            _ => false,
+        };
+    }
+    if let Some(alias) = value.strip_prefix("alias/") {
+        return !alias.is_empty();
+    }
+    is_kms_key_id(value)
+}
+
+/// The resource portion of a KMS ARN, or `None` when `value` is not one.
+fn kms_arn_resource(value: &str) -> Option<&str> {
+    let mut fields = value.splitn(6, ':');
+    let scheme = fields.next()?;
+    let partition = fields.next()?;
+    let service = fields.next()?;
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    (scheme == "arn" && !partition.is_empty() && service == "kms").then_some(resource)
+}
+
+/// Whether `value` is a KMS key id: a UUID, or the `mrk-` form a multi-Region key
+/// carries.
+fn is_kms_key_id(value: &str) -> bool {
+    if let Some(hex) = value.strip_prefix("mrk-") {
+        return hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    let groups: Vec<&str> = value.split('-').collect();
+    if groups.len() != 5 {
+        return false;
+    }
+    groups
+        .iter()
+        .zip([8, 4, 4, 4, 12])
+        .all(|(group, width)| {
+            group.len() == width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Logging configuration
+// ---------------------------------------------------------------------------
+
+/// The most log destinations one logging configuration may carry, from the
+/// `destinations` member's own documentation: "Limited to size 1."
+pub const MAX_LOG_DESTINATIONS: usize = 1;
+
+/// Why `configuration` is not a logging configuration this service accepts, or
+/// `None` when it is — the modelled `InvalidLoggingConfiguration`.
+///
+/// The conditions come from the shape's own members:
+///
+/// * `destinations` is "limited to size 1" and is "required, if your log level is
+///   not set to OFF", so a level that logs needs exactly one destination and no
+///   configuration may carry two;
+/// * a destination describes a CloudWatch log group, so one that names no log group
+///   describes nothing;
+/// * `logGroupArn` is the ARN of a CloudWatch Logs log group and "must end with
+///   `:*`".
+///
+/// `level` is a modelled enum, so the centralized walk has already refused a value
+/// outside it. Every operation that accepts a `loggingConfiguration` reads this, so
+/// one rule covers them all.
+pub fn invalid_logging_reason(configuration: &LoggingConfiguration) -> Option<String> {
+    let level = configuration.level.as_deref().unwrap_or(LOG_LEVEL_OFF);
+    let destinations = configuration.destinations.as_deref().unwrap_or_default();
+    if destinations.len() > MAX_LOG_DESTINATIONS
+        || (level != LOG_LEVEL_OFF && destinations.len() != MAX_LOG_DESTINATIONS)
+    {
+        return Some(
+            "Invalid Logging Configuration: Must specify exactly one Log Destination.".to_string(),
+        );
+    }
+    for destination in destinations {
+        let Some(log_group_arn) = destination
+            .cloud_watch_logs_log_group
+            .as_ref()
+            .and_then(|group| group.log_group_arn.as_deref())
+        else {
+            return Some(
+                "Invalid Logging Configuration: Must specify a CloudWatch Logs log group."
+                    .to_string(),
+            );
+        };
+        if !names_log_group(log_group_arn) {
+            return Some(format!(
+                "Invalid Logging Configuration: '{log_group_arn}' is not the ARN of a CloudWatch \
+                 Logs log group ending with ':*'."
+            ));
+        }
+    }
+    None
+}
+
+/// Whether `value` is the ARN of a CloudWatch Logs log group, which `logGroupArn`
+/// documents as ending with `:*`.
+fn names_log_group(value: &str) -> bool {
+    let mut fields = value.splitn(6, ':');
+    let (Some(scheme), Some(partition), Some(service), Some(_region), Some(_account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    scheme == "arn"
+        && !partition.is_empty()
+        && service == "logs"
+        && resource.starts_with("log-group:")
+        && resource.ends_with(":*")
 }
 
 // ---------------------------------------------------------------------------

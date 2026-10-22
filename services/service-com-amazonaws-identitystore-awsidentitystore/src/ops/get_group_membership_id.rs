@@ -140,14 +140,11 @@ impl From<GetGroupMembershipIdErrorModeled> for GetGroupMembershipIdError {
 ///
 /// Built with the shared helper for a resource an ALTERNATE identifier names: the pair
 /// is the ONLY way this operation names a membership, so what the caller sent is not a
-/// `MembershipId` and `ResourceId` stays unset rather than echoing it. The message
-/// names the identifiers that failed to resolve, not their values.
+/// `MembershipId` and `ResourceId` stays unset rather than echoing it. The message is
+/// the resource class's own constant for a resolve, with nothing of the request in it.
 fn membership_not_found() -> GetGroupMembershipIdErrorModeled {
     GetGroupMembershipIdErrorModeled::ResourceNotFoundException(
-        crate::state::not_found_by_alternate_identifier(
-            crate::state::ResourceKind::Membership,
-            "GroupId and MemberId",
-        ),
+        crate::state::not_found_by_alternate_identifier(crate::state::ResourceKind::Membership),
     )
 }
 

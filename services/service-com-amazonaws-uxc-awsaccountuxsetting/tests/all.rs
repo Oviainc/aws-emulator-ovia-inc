@@ -23,5 +23,7 @@ mod list_setting_order;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/visible_services_round_trip.rs"]
+mod visible_services_round_trip;
 #[path = "all/wire.rs"]
 mod wire;

@@ -11,6 +11,11 @@
 //! `ServerTransition` rule `StartServer`/`StopServer` share), the ARN shapes, and the
 //! opaque pagination token codec the `List*` operations share.
 //!
+//! The service-managed security policy catalog ([`SECURITY_POLICIES`]) lives here too.
+//! No operation creates or changes a security policy — a server or connector only
+//! attaches one by name — so the catalog is published data rather than per-account
+//! state, and `DescribeSecurityPolicy` answers out of it.
+//!
 //! `UserCount` and `SshPublicKeyCount` are DERIVED at read time ([`
 //! ComAmazonawsTransferTransferserviceState::user_count`],
 //! [`User::ssh_public_key_count`]) rather than stored, so they cannot go stale when a
@@ -360,6 +365,544 @@ pub fn unknown_workflow(workflow_id: &str) -> ResourceNotFoundException {
 /// the one status decision through this function.
 pub fn not_found<E>(error: E) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::modeled_with_status(error, RESOURCE_NOT_FOUND_HTTP_STATUS)
+}
+
+// ---------------------------------------------------------------------------
+// The service-managed security policy catalog
+// ---------------------------------------------------------------------------
+//
+// Security policies are SERVICE-managed, not per-account resources: no Transfer
+// Family operation creates, updates or deletes one. `CreateServer`/`UpdateServer`
+// and `CreateConnector`/`UpdateConnector` only ATTACH a published policy by name, and
+// `DescribeSecurityPolicy`/`ListSecurityPolicies` report the published set. So the
+// catalog is fixed data the service publishes — which is why it lives here as a
+// table rather than in [`ComAmazonawsTransferTransferserviceState`], and why nothing
+// in this crate writes to it.
+//
+// Source: the per-policy tables in the AWS Transfer Family User Guide (*Security
+// policies for AWS Transfer Family servers* and *Security policies for AWS Transfer
+// Family SFTP connectors*), whose columns are exactly
+// `DescribedSecurityPolicy`'s members — FIPS status, the protocols the policy covers
+// and the enabled SSH ciphers, SSH KEXs, SSH MACs, TLS ciphers and SSH host key
+// algorithms (`smithy_query(query="shape",shape="DescribedSecurityPolicy")`).
+
+/// The `SecurityPolicyResourceType` enum's `SERVER` value: the policy is attachable to
+/// a server.
+pub const SECURITY_POLICY_TYPE_SERVER: &str = "SERVER";
+
+/// The `SecurityPolicyResourceType` enum's `CONNECTOR` value: the policy is attachable
+/// to an SFTP connector.
+pub const SECURITY_POLICY_TYPE_CONNECTOR: &str = "CONNECTOR";
+
+/// A server policy covers both file transfer protocols `SecurityPolicyProtocol`
+/// models (`[SFTP, FTPS]`): its SSH algorithms apply to SFTP and its TLS ciphers to
+/// FTPS.
+const POLICY_PROTOCOLS_SFTP_FTPS: &[&str] = &[DEFAULT_PROTOCOL, PROTOCOL_FTPS];
+
+/// An SSH-only policy covers SFTP alone — every SFTP connector policy, and the
+/// post-quantum server policies, which change key exchange only and carry no TLS
+/// ciphers.
+const POLICY_PROTOCOLS_SFTP: &[&str] = &[DEFAULT_PROTOCOL];
+
+/// The SSH ciphers the pre-2022 server policies enable: ChaCha20-Poly1305 on top of
+/// the AES CTR and GCM set.
+const SSH_CIPHERS_WITH_CHACHA: &[&str] = &[
+    "chacha20-poly1305@openssh.com",
+    "aes128-ctr",
+    "aes192-ctr",
+    "aes256-ctr",
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
+];
+
+/// The AES-only SSH cipher set: the 2022-03 and later server policies, every FIPS and
+/// restricted policy, and every SFTP connector policy.
+const SSH_CIPHERS_AES: &[&str] = &[
+    "aes128-ctr",
+    "aes192-ctr",
+    "aes256-ctr",
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
+];
+
+/// The key exchanges the original 2018-11 server policy enables, including the SHA1
+/// and group14 exchanges every later policy dropped.
+const SSH_KEXS_LEGACY: &[&str] = &[
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group14-sha256",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group-exchange-sha256",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+];
+
+/// The key exchanges the 2020-06 and later non-FIPS policies enable: the legacy set
+/// without the SHA1 and group14 exchanges.
+const SSH_KEXS_MODERN: &[&str] = &[
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group-exchange-sha256",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+];
+
+/// The key exchanges the FIPS policies enable: the FIPS-approved ones only, so no
+/// Curve25519.
+const SSH_KEXS_FIPS: &[&str] = &[
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group-exchange-sha256",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+];
+
+/// The hybrid NIST-P384 + Kyber-768 exchange the experimental post-quantum policies
+/// offer first.
+///
+/// This published identifier is 56 characters, longer than the `len 0..50` the model
+/// puts on `SecurityPolicyOption`'s member. That bound constrains a value a caller
+/// SENDS, and no operation in this service takes a `SecurityPolicyOption` as input,
+/// so reporting the published identifier is what lets a client match the algorithm
+/// its SSH stack negotiates.
+const SSH_KEX_PQ_KYBER_768: &str = "ecdh-nistp384-kyber-768r3-sha384-d00@openquantumsafe.org";
+
+/// The hybrid NIST-P256 + Kyber-512 exchange the experimental post-quantum policies
+/// offer second. Same length note as [`SSH_KEX_PQ_KYBER_768`].
+const SSH_KEX_PQ_KYBER_512: &str = "ecdh-nistp256-kyber-512r3-sha256-d00@openquantumsafe.org";
+
+/// The message authentication codes the 2018-11 server policy enables, including the
+/// SHA1 and 64-bit UMAC codes every later policy dropped.
+const SSH_MACS_LEGACY: &[&str] = &[
+    "hmac-sha1",
+    "hmac-sha1-etm@openssh.com",
+    "hmac-sha2-256",
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512",
+    "hmac-sha2-512-etm@openssh.com",
+    "umac-64@openssh.com",
+    "umac-64-etm@openssh.com",
+    "umac-128@openssh.com",
+    "umac-128-etm@openssh.com",
+];
+
+/// The SHA2 and 128-bit UMAC codes the 2020-06 and later non-FIPS, non-restricted
+/// policies enable.
+const SSH_MACS_SHA2: &[&str] = &[
+    "hmac-sha2-256",
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512",
+    "hmac-sha2-512-etm@openssh.com",
+    "umac-128@openssh.com",
+    "umac-128-etm@openssh.com",
+];
+
+/// The codes the FIPS policies enable: HMAC-SHA2 only, so no UMAC.
+const SSH_MACS_FIPS: &[&str] = &[
+    "hmac-sha2-256",
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512",
+    "hmac-sha2-512-etm@openssh.com",
+];
+
+/// The codes the restricted and post-quantum policies enable: encrypt-then-MAC only.
+const SSH_MACS_ETM_ONLY: &[&str] = &[
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512-etm@openssh.com",
+    "umac-128-etm@openssh.com",
+];
+
+/// The TLS ciphers the 2018-11 server policy enables, including the CBC suites every
+/// later policy dropped.
+const TLS_CIPHERS_LEGACY: &[&str] = &[
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+];
+
+/// The AEAD-only TLS 1.2 suites the 2020-06 through 2022-03 server policies enable.
+const TLS_CIPHERS_TLS12_GCM: &[&str] = &[
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+];
+
+/// The suites the 2023-05 and later non-FIPS server policies enable: the TLS 1.2 AEAD
+/// set plus the TLS 1.3 suites.
+const TLS_CIPHERS_TLS13: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+];
+
+/// The suites the 2023-05 and later FIPS server policies enable: [`TLS_CIPHERS_TLS13`]
+/// without the ChaCha20-Poly1305 suite, which is not FIPS-approved.
+const TLS_CIPHERS_TLS13_FIPS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+];
+
+/// The host key algorithms a connector accepts from the remote SFTP server under a
+/// non-FIPS connector policy. `SshHostKeyAlgorithms` "only applies to security
+/// policies for connectors", so every server policy leaves it empty.
+const HOST_KEY_ALGORITHMS_CONNECTOR: &[&str] = &[
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-256",
+    "rsa-sha2-512",
+    "ssh-ed25519",
+    "ssh-rsa",
+];
+
+/// The host key algorithms a FIPS connector policy accepts: Ed25519 is not
+/// FIPS-approved, so it is not among them.
+const HOST_KEY_ALGORITHMS_CONNECTOR_FIPS: &[&str] = &[
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-256",
+    "rsa-sha2-512",
+];
+
+/// No list for this member under this policy — the member is absent from the
+/// description rather than reported empty (TLS ciphers on an SSH-only policy, host key
+/// algorithms on a server policy).
+const NO_OPTIONS: &[&str] = &[];
+
+/// One published security policy, as `DescribeSecurityPolicy` reports it.
+#[derive(Debug, Clone, Copy)]
+pub struct SecurityPolicy {
+    /// `SecurityPolicyName`: the policy's text name, the value a server or connector
+    /// stores when it attaches this policy.
+    pub name: &'static str,
+    /// `Type`: [`SECURITY_POLICY_TYPE_SERVER`] or
+    /// [`SECURITY_POLICY_TYPE_CONNECTOR`] — the resource kind the policy attaches to.
+    pub resource_type: &'static str,
+    /// `Fips`: whether the policy enables Federal Information Processing Standards
+    /// algorithms only.
+    pub fips: bool,
+    /// `Protocols`: the file transfer protocols the policy's algorithms apply to.
+    pub protocols: &'static [&'static str],
+    /// `SshCiphers`.
+    pub ssh_ciphers: &'static [&'static str],
+    /// `SshKexs`.
+    pub ssh_kexs: &'static [&'static str],
+    /// `SshMacs`.
+    pub ssh_macs: &'static [&'static str],
+    /// `TlsCiphers` — empty for an SSH-only policy, which reports no TLS ciphers.
+    pub tls_ciphers: &'static [&'static str],
+    /// `SshHostKeyAlgorithms` — empty for a server policy, which reports none.
+    pub ssh_host_key_algorithms: &'static [&'static str],
+}
+
+/// The experimental post-quantum key exchanges, non-FIPS: the two hybrids in front of
+/// [`SSH_KEXS_MODERN`]'s classical fallbacks.
+const SSH_KEXS_POST_QUANTUM_MODERN: &[&str] = &[
+    SSH_KEX_PQ_KYBER_768,
+    SSH_KEX_PQ_KYBER_512,
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group-exchange-sha256",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+];
+
+/// The experimental post-quantum key exchanges, FIPS: the two hybrids in front of
+/// [`SSH_KEXS_FIPS`]'s classical fallbacks.
+const SSH_KEXS_POST_QUANTUM_FIPS: &[&str] = &[
+    SSH_KEX_PQ_KYBER_768,
+    SSH_KEX_PQ_KYBER_512,
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group-exchange-sha256",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+];
+
+/// Every security policy this service publishes, sorted by `SecurityPolicyName`.
+///
+/// Sorted so a listing pages in a stable, resumable order (the same ordering
+/// [`page_bounds`] needs) and so [`security_policy`] reads as a lookup in a catalog
+/// rather than a search through unordered rows.
+pub const SECURITY_POLICIES: &[SecurityPolicy] = &[
+    // ---- SFTP connector policies: SSH only, so no TLS ciphers, and they are the
+    // only policies that report host key algorithms. ----
+    SecurityPolicy {
+        name: "TransferSFTPConnectorSecurityPolicy-2023-07",
+        resource_type: SECURITY_POLICY_TYPE_CONNECTOR,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_SHA2,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: HOST_KEY_ALGORITHMS_CONNECTOR,
+    },
+    SecurityPolicy {
+        name: "TransferSFTPConnectorSecurityPolicy-2024-03",
+        resource_type: SECURITY_POLICY_TYPE_CONNECTOR,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_SHA2,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: HOST_KEY_ALGORITHMS_CONNECTOR,
+    },
+    SecurityPolicy {
+        name: "TransferSFTPConnectorSecurityPolicy-FIPS-2023-07",
+        resource_type: SECURITY_POLICY_TYPE_CONNECTOR,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: HOST_KEY_ALGORITHMS_CONNECTOR_FIPS,
+    },
+    SecurityPolicy {
+        name: "TransferSFTPConnectorSecurityPolicy-FIPS-2024-03",
+        resource_type: SECURITY_POLICY_TYPE_CONNECTOR,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: HOST_KEY_ALGORITHMS_CONNECTOR_FIPS,
+    },
+    SecurityPolicy {
+        name: "TransferSFTPConnectorSecurityPolicy-PQ-SSH-Experimental-2023-07",
+        resource_type: SECURITY_POLICY_TYPE_CONNECTOR,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_POST_QUANTUM_MODERN,
+        ssh_macs: SSH_MACS_ETM_ONLY,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: HOST_KEY_ALGORITHMS_CONNECTOR,
+    },
+    SecurityPolicy {
+        name: "TransferSFTPConnectorSecurityPolicy-PQ-SSH-FIPS-Experimental-2023-07",
+        resource_type: SECURITY_POLICY_TYPE_CONNECTOR,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_POST_QUANTUM_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: HOST_KEY_ALGORITHMS_CONNECTOR_FIPS,
+    },
+    // ---- Server policies. ----
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-2018-11",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_WITH_CHACHA,
+        ssh_kexs: SSH_KEXS_LEGACY,
+        ssh_macs: SSH_MACS_LEGACY,
+        tls_ciphers: TLS_CIPHERS_LEGACY,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-2020-06",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_WITH_CHACHA,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_SHA2,
+        tls_ciphers: TLS_CIPHERS_TLS12_GCM,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-2022-03",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_SHA2,
+        tls_ciphers: TLS_CIPHERS_TLS12_GCM,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-2023-05",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_SHA2,
+        tls_ciphers: TLS_CIPHERS_TLS13,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        // The policy a server gets when `CreateServer` names none; see
+        // [`DEFAULT_SECURITY_POLICY_NAME`].
+        name: DEFAULT_SECURITY_POLICY_NAME,
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_SHA2,
+        tls_ciphers: TLS_CIPHERS_TLS13,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-FIPS-2020-06",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: TLS_CIPHERS_TLS12_GCM,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-FIPS-2023-05",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: TLS_CIPHERS_TLS13_FIPS,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-FIPS-2024-01",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: TLS_CIPHERS_TLS13_FIPS,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-FIPS-2024-05",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: TLS_CIPHERS_TLS13_FIPS,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-PQ-SSH-Experimental-2023-04",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        // Post-quantum key exchange is an SSH mechanism, so this policy covers SFTP
+        // alone and reports no TLS ciphers.
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_POST_QUANTUM_MODERN,
+        ssh_macs: SSH_MACS_ETM_ONLY,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-PQ-SSH-FIPS-Experimental-2023-04",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: true,
+        protocols: POLICY_PROTOCOLS_SFTP,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_POST_QUANTUM_FIPS,
+        ssh_macs: SSH_MACS_FIPS,
+        tls_ciphers: NO_OPTIONS,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-Restricted-2018-11",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_ETM_ONLY,
+        tls_ciphers: TLS_CIPHERS_TLS12_GCM,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+    SecurityPolicy {
+        name: "TransferSecurityPolicy-Restricted-2020-06",
+        resource_type: SECURITY_POLICY_TYPE_SERVER,
+        fips: false,
+        protocols: POLICY_PROTOCOLS_SFTP_FTPS,
+        ssh_ciphers: SSH_CIPHERS_AES,
+        ssh_kexs: SSH_KEXS_MODERN,
+        ssh_macs: SSH_MACS_ETM_ONLY,
+        tls_ciphers: TLS_CIPHERS_TLS12_GCM,
+        ssh_host_key_algorithms: NO_OPTIONS,
+    },
+];
+
+/// The published policy named `name`, or `None` when the service publishes none.
+///
+/// Exact match: `SecurityPolicyName` is a text name the caller copies from the
+/// catalog, and the real service does not fold case.
+pub fn security_policy(name: &str) -> Option<&'static SecurityPolicy> {
+    SECURITY_POLICIES.iter().find(|policy| policy.name == name)
+}
+
+/// Every published policy name, in catalog order — what a listing pages over.
+pub fn security_policy_names() -> impl Iterator<Item = &'static str> {
+    SECURITY_POLICIES.iter().map(|policy| policy.name)
+}
+
+/// One `SecurityPolicyOptions` member of a description: the listed algorithms, or
+/// `None` when this policy has no such list.
+///
+/// A policy that enables nothing for a member reports the member as ABSENT rather
+/// than as an empty list, because the member is modelled optional and the real
+/// service only reports a list where it applies — `TlsCiphers` "only applies to
+/// security policies for servers", `SshHostKeyAlgorithms` "only applies to security
+/// policies for connectors".
+pub fn policy_options(options: &[&str]) -> Option<Vec<String>> {
+    (!options.is_empty()).then(|| options.iter().map(|option| (*option).to_string()).collect())
+}
+
+/// `ResourceType` for a security policy, addressed by its `SecurityPolicyName`. Same
+/// convention as [`RESOURCE_TYPE_SERVER`]; it lives beside the catalog rather than
+/// beside the per-account resource types because a policy is published, not created.
+pub const RESOURCE_TYPE_SECURITY_POLICY: &str = "SecurityPolicy";
+
+/// The not-found payload for a `SecurityPolicyName` the service publishes no policy
+/// for. Built through [`resource_not_found`] like every other not-found in this
+/// service, so the body cannot drift from them; "not found" here means "not in
+/// [`SECURITY_POLICIES`]", never "not created yet".
+pub fn unknown_security_policy(security_policy_name: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_SECURITY_POLICY, security_policy_name)
 }
 
 /// One stored SSH public key of a user.

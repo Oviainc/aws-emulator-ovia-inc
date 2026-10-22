@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Long enough to pass `state::ENDPOINT_IN_SERVICE_AFTER` (300 ms).
 const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
@@ -29,12 +29,15 @@ const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
 const CREATE_SPACING: Duration = Duration::from_millis(5);
 
 /// One emulator: the shared engine plus the SageMaker service mounted on the router.
-struct Emulator {
+///
+/// Shared with this crate's other suites (`use super::inference_deployment_lifecycle::*`)
+/// so every wire test drives the same router the production one assembles.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not SigV4; the request below carries a
@@ -47,7 +50,7 @@ impl Emulator {
     }
 
     /// Call `target` with a SigV4 credential scope naming `region`.
-    async fn call_in(&self, region: &str, target: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(&self, region: &str, target: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -94,12 +97,12 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
         self.call_in("us-east-1", target, body).await
     }
 
     /// Call `target` and require a 200, returning the parsed output.
-    async fn ok(&self, target: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, target: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(target, body).await;
         assert_eq!(
             status, 200,
@@ -110,7 +113,7 @@ impl Emulator {
 }
 
 /// The `__type` an error body carries, with any `namespace#` prefix stripped.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -120,7 +123,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -128,7 +131,7 @@ fn message(body: &Value) -> String {
         .to_string()
 }
 
-fn str_field(body: &Value, member: &str) -> String {
+pub(crate) fn str_field(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a string member {member} in {body}"))
