@@ -18,4 +18,10 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: GetSupportedResourceTypes — unsupported shape construct: operation 'GetSupportedResourceTypes' has a Unit/absent input, which the generator does not emit yet
+// HAND-AUTHORED since: GetSupportedResourceTypes — the generator declined it
+// ("operation 'GetSupportedResourceTypes' has a Unit/absent input, which the
+// generator does not emit yet"), so it was written by hand in
+// `ops/get_supported_resource_types.rs` with its `Unit` input schema and serde
+// impls in `ops/types/get_supported_resource_types_types.rs`. It is wired into
+// the service's `operations(...)` allow-list like any other operation, so
+// nothing on this list is unwired any more.

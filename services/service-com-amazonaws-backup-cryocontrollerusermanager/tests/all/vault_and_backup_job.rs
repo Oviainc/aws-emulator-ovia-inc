@@ -51,7 +51,10 @@ const PAST_SETTLE: Duration = Duration::from_millis(900);
 /// The alphabet the `BackupVaultName` pattern admits: `^[a-zA-Z0-9\-\_]{2,50}$`.
 const NAME_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
 
-fn router() -> MultiServiceRouter {
+/// Shared with the sibling suites in this target (`tests/all.rs` declares them
+/// as modules of one test crate), so there is ONE request harness for this
+/// service rather than one per file.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -63,7 +66,7 @@ fn router() -> MultiServiceRouter {
 
 /// Send one request and return its status and parsed JSON body (`Value::Null`
 /// for an empty body).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -92,14 +95,18 @@ async fn call(
 }
 
 /// The wire error code of an error response (`__type`), or `"<none>"`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<none>")
         .to_string()
 }
 
-async fn create_vault(router: &MultiServiceRouter, name: &str, body: &str) -> (u16, Value) {
+pub(crate) async fn create_vault(
+    router: &MultiServiceRouter,
+    name: &str,
+    body: &str,
+) -> (u16, Value) {
     call(
         router,
         "PUT",
@@ -109,11 +116,11 @@ async fn create_vault(router: &MultiServiceRouter, name: &str, body: &str) -> (u
     .await
 }
 
-async fn start_job(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
+pub(crate) async fn start_job(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
     call(router, "PUT", "/backup-jobs", Some(body)).await
 }
 
-fn string_at(body: &Value, member: &str) -> String {
+pub(crate) fn string_at(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
