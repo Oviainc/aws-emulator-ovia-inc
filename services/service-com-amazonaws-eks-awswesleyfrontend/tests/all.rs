@@ -19,5 +19,7 @@ mod cluster_lifecycle;
 mod cluster_versions;
 #[path = "all/encryption_config_association.rs"]
 mod encryption_config_association;
+#[path = "all/identity_provider_config.rs"]
+mod identity_provider_config;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

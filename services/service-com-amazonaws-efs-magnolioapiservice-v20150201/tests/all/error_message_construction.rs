@@ -74,16 +74,18 @@ enum FileSystemEntry {
     CreateMountTarget,
     PutLifecycleConfiguration,
     DescribeLifecycleConfiguration,
+    UpdateFileSystem,
 }
 
 impl FileSystemEntry {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::DescribeFileSystems,
         Self::DeleteFileSystem,
         Self::DescribeMountTargets,
         Self::CreateMountTarget,
         Self::PutLifecycleConfiguration,
         Self::DescribeLifecycleConfiguration,
+        Self::UpdateFileSystem,
     ];
 
     fn takes_id_in_path(self) -> bool {
@@ -92,6 +94,7 @@ impl FileSystemEntry {
             Self::DeleteFileSystem
                 | Self::PutLifecycleConfiguration
                 | Self::DescribeLifecycleConfiguration
+                | Self::UpdateFileSystem
         )
     }
 
@@ -128,6 +131,14 @@ impl FileSystemEntry {
                     "GET",
                     &format!("/2015-02-01/file-systems/{requested}/lifecycle-configuration"),
                     None,
+                )
+                .await
+            }
+            Self::UpdateFileSystem => {
+                efs.send(
+                    "PUT",
+                    &format!("/2015-02-01/file-systems/{requested}"),
+                    Some(json!({ "ThroughputMode": "elastic" })),
                 )
                 .await
             }
