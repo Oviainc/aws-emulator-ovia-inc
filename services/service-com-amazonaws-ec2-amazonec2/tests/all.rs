@@ -24,5 +24,7 @@ mod ec2_query;
 mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
+#[path = "all/launch_templates.rs"]
+mod launch_templates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLaunchTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLaunchTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLaunchTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the launch template the request names from
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::launch_templates`] and answers with the
+//! template as it was, so a later reader no longer reports it.
+//!
+//! "Deleting a launch template deletes all of its versions": the versions live on the one
+//! record this removes, so they go with it, and so does any `CreateLaunchTemplate` client
+//! token that named the template.
+//!
+//! The template is resolved by id or by name — "you must specify either the launch
+//! template ID or the launch template name, but not both" — by
+//! [`crate::state::resolve_launch_template_id`], which this operation and every later one
+//! that takes the same pair share.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +141,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLaunchTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLaunchTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLaunchTemplate"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{require_service_state, resolve_launch_template_id};
+
+        // A launch template carries no Region member, so nothing here depends on the
+        // Region the request was signed for.
+        let _ = ctx;
+
+        // An empty value names nothing, so it is read as a parameter the request did not
+        // give rather than as an id or a name to look up.
+        let launch_template_id = input
+            .launch_template_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
+        let launch_template_name = input
+            .launch_template_name
+            .as_deref()
+            .filter(|name| !name.is_empty());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Resolving reads only, so it is what a DryRun request is answered against: the
+        // flag asks whether the delete WOULD have succeeded, so one naming a template
+        // that does not exist is refused with that reason instead.
+        let launch_template_id =
+            resolve_launch_template_id(&store, launch_template_id, launch_template_name)?;
+
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The response is the template as it was last stored, taken out of the store by
+        // the removal itself, so it cannot disagree with what the readers reported.
+        let removed = store
+            .remove_launch_template(&launch_template_id)
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "launch template '{launch_template_id}' resolved but was not stored"
+                ))
+            })?;
+        Ok(DeleteLaunchTemplateOutput {
+            launch_template: Some(removed.template),
+        })
     }
 }
