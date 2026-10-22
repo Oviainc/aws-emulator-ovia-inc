@@ -210,6 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_date_time: now,
                 update_date_time: now,
                 entities: ::std::collections::BTreeMap::new(),
+                component_types: ::std::collections::BTreeMap::new(),
             },
         );
         // Indexed after the record is stored, so the index can never name a
