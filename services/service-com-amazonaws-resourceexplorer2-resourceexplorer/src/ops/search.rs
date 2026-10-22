@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Search
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Search`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the view, intersects the caller's `QueryString` with the view's
+//! `Filters.FilterString` over the contents of that Region's index in `crate::state`, and
+//! reports the matching resources with a `Count` taken from the same match.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Search::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An explicit `ViewArn` identifies the view wherever the request was signed for, and the
+//! index searched is the one belonging to THAT view's Region — a view ARN carries its own
+//! Region, and a view only ever reports its own Region's resources. The request's Region
+//! is used only to find the default view, which is per-Region by definition.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +191,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Search` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Search"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        // A read, so the only write is the index lifecycle the clock already owed.
+        guard.settle(now);
+
+        // "All search queries must use a view. If you don't explicitly specify a view,
+        // then Resource Explorer uses the default view for the Region in which you call
+        // this operation."
+        let view = match input.view_arn.as_deref() {
+            Some(arn) => guard.views.get(arn).ok_or_else(|| {
+                SearchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!("View not found: {arn}")),
+                })
+            })?,
+            None => guard
+                .default_view_arns
+                .get(&region)
+                .and_then(|arn| guard.views.get(arn))
+                .ok_or_else(|| {
+                    SearchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(format!(
+                            "Region {region} has no default view: specify ViewArn, or set a \
+                             default with AssociateDefaultView."
+                        )),
+                    })
+                })?,
+        };
+
+        // "The results are the logical intersection of the results that match both the
+        // QueryString parameter supplied to this operation and the SearchFilter
+        // parameter attached to the view."
+        let view_filter = view.filter_string.clone().unwrap_or_default();
+        let include_tags = view.includes_property("tags");
+        let mut matched: Vec<crate::state::IndexedResource> = guard
+            .indexed_resources(&view.region)
+            .into_iter()
+            .filter(|resource| {
+                crate::state::query_matches(&input.query_string, resource)
+                    && crate::state::query_matches(&view_filter, resource)
+            })
+            // ONE past the limit, so a match of exactly the limit can be told from a
+            // match that was truncated by it — that is what `Count.Complete` reports.
+            .take(crate::state::SEARCH_RESULT_LIMIT + 1)
+            .collect();
+        let complete = matched.len() <= crate::state::SEARCH_RESULT_LIMIT;
+        matched.truncate(crate::state::SEARCH_RESULT_LIMIT);
+        let total = matched.len();
+
+        let resources: Vec<Resource> = matched
+            .iter()
+            .map(|resource| Resource {
+                arn: Some(resource.arn.clone()),
+                owning_account_id: Some(resource.owning_account_id.clone()),
+                region: Some(resource.region.clone()),
+                resource_type: Some(resource.resource_type.clone()),
+                service: Some(resource.service.clone()),
+                cfn_resource_type: resource.cfn_resource_type.clone(),
+                last_reported_at: Some(::aws_smithy_types::DateTime::from(
+                    resource.last_reported_at,
+                )),
+                // IncludedProperties "specifies optional fields that you want included
+                // in search results from this view": `tags` is the one property name the
+                // model documents, so a view that does not ask for it gets no properties.
+                properties: include_tags.then(|| {
+                    vec![ResourceProperty {
+                        name: Some("tags".to_string()),
+                        last_reported_at: Some(::aws_smithy_types::DateTime::from(
+                            resource.last_reported_at,
+                        )),
+                        data: Some(::aws_smithy_types::Document::Object(
+                            resource
+                                .tags
+                                .iter()
+                                .map(|(key, value)| {
+                                    (
+                                        key.clone(),
+                                        ::aws_smithy_types::Document::String(value.clone()),
+                                    )
+                                })
+                                .collect(),
+                        )),
+                    }]
+                }),
+            })
+            .collect();
+
+        let view_arn = view.view_arn.clone();
+        // The cursor is bound to the request it was issued for, so a NextToken from one
+        // query or view cannot resume a different one at that offset.
+        let cursor = format!(
+            "{}:{}",
+            Self::NAME,
+            crate::state::request_fingerprint(&[&input.query_string, &view_arn])
+        );
+        let (page, next_token) = crate::state::paginate(
+            &resources,
+            &cursor,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|message| {
+            SearchErrorModeled::ValidationException(ValidationException {
+                message,
+                field_list: None,
+            })
+        })?;
+        Ok(SearchOutput {
+            resources: Some(page),
+            next_token,
+            view_arn: Some(view_arn),
+            count: Some(ResourceCount {
+                // The number of resources matching the query across every page, which
+                // this operation can never report above its own result limit.
+                total_resources: Some(total as i64),
+                complete: Some(complete),
+            }),
+        })
     }
 }

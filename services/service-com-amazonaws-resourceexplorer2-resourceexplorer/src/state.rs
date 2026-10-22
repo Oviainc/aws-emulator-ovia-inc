@@ -1,11 +1,396 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-resourceexplorer2-resourceexplorer service.
+//!
+//! Everything the implemented operations answer with is derived from the values
+//! stored here: one index per Region, the views created in each Region, the
+//! Region's default view, and the resource inventory the Region's index holds.
+//!
+//! This module also carries the few rules more than one operation needs, because
+//! an operation file is the only file for that operation and may not be reached
+//! from a sibling:
+//!
+//! * [`ComAmazonawsResourceexplorer2ResourceexplorerState::settle`] — the
+//!   clock-owed index lifecycle transitions (`CREATING` -> `ACTIVE`, `DELETING` ->
+//!   gone, taking the Region's views with it).
+//! * [`ViewEntry::to_wire`] — the modelled `View` structure, so `CreateView` and
+//!   `GetView` cannot disagree about what a stored view looks like.
+//! * [`paginate`] / [`encode_page_token`] — the opaque `NextToken` cursors the
+//!   `@paginated` operations share. The offset travels INSIDE the token, so a
+//!   `@readonly` list operation never writes cursor state.
+//! * [`query_matches`] — the Resource Explorer search query syntax, used by
+//!   `Search` for both the caller's `QueryString` and the view's
+//!   `Filters.FilterString`.
+
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
+
+/// The ARN namespace, SigV4 signing name and endpoint prefix of this service, and
+/// therefore the `Service` of every resource it owns.
+pub const SERVICE_NAMESPACE: &str = "resource-explorer-2";
+
+/// The Region an unsigned request (one carrying no SigV4 credential scope to read
+/// a Region from) is served in. Generated emulators default to `us-east-1`.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// How long after `CreateIndex` / `DeleteIndex` the index's non-terminal state
+/// (`CREATING` / `DELETING`) settles.
+///
+/// CHOSEN, not documented: AWS gives no duration for index creation or deletion,
+/// only that both are asynchronous background tasks. The span is deliberately
+/// non-zero, so a caller that reads straight after the call still observes the
+/// transient state, and short enough that nothing has to sleep for long.
+pub const INDEX_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// `Search` returns at most this many resources in total, and `Count` cannot
+/// exceed it. Documented on `SearchInput$QueryString`: "You can specify an empty
+/// string to return all results up to the limit of 1,000 total results. The
+/// operation can return only the first 1,000 results."
+pub const SEARCH_RESULT_LIMIT: usize = 1000;
+
+/// The maximum number of views one Region holds, from Resource Explorer's "Views per
+/// Region" service quota (an adjustable default of 100).
+///
+/// It is also what BOUNDS the stored view map: `CreateView` is caller-driven, so without
+/// a ceiling a caller could grow `views` without end. Reaching it is the operation's own
+/// modelled `ServiceQuotaExceededException`, which carries the quota's name and value.
+pub const VIEWS_PER_REGION_QUOTA: usize = 100;
+
+/// Whether `region` is an AWS Region this emulator serves.
+///
+/// A request's Region comes from its SigV4 credential scope, which is caller-controlled
+/// text, and the index map is KEYED by Region — so the key space has to be the closed set
+/// of AWS Regions rather than whatever the header says. The check is
+/// `emulator_telemetry::Region::new`, the workspace's one validator for a Region token: it
+/// enforces the closed grammar, the maximum length AND membership of
+/// `policy::KNOWN_REGIONS`. Creating an index is therefore refused for a Region that has
+/// no endpoint, and an account's indexes are bounded by that list.
+pub fn is_servable_region(region: &str) -> bool {
+    ::emulator_telemetry::Region::new(region).is_ok()
+}
+
+/// The lifecycle of an index, as the `IndexState` enum names it on the wire.
+///
+/// Only the three states this slice can reach are modelled here; `UPDATING` is
+/// `UpdateIndexType`'s, which is still a stub, and `DELETED` is never observable
+/// because a settled deletion removes the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexLifecycle {
+    /// The index was just created and has not finished coming up.
+    Creating,
+    /// The index is usable.
+    Active,
+    /// The index is being torn down, along with the Region's views.
+    Deleting,
+}
+
+impl IndexLifecycle {
+    /// The `IndexState` value this state is called on the wire.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Active => "ACTIVE",
+            Self::Deleting => "DELETING",
+        }
+    }
+}
+
+/// The `IndexType` value `CreateIndex` produces: "This operation creates only a
+/// *local* index" (`CreateIndex` documentation).
+pub const INDEX_TYPE_LOCAL: &str = "LOCAL";
+
+/// One Region's index.
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    /// `arn:aws:resource-explorer-2:<region>:<account>:index/<uuid>`.
+    pub arn: String,
+    pub region: String,
+    /// `LOCAL` or `AGGREGATOR`.
+    pub index_type: String,
+    pub state: IndexLifecycle,
+    /// When the clock owes this index its next state change, if it is in a
+    /// non-terminal one. Never slept on: the transition is materialised by
+    /// whichever call next looks at the state.
+    pub settles_at: Option<SystemTime>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    pub tags: HashMap<String, String>,
+    /// The `@idempotencyToken` the creating request carried, for replaying it.
+    pub client_token: Option<String>,
+}
+
+/// One view, as `CreateView` stored it.
+#[derive(Debug, Clone)]
+pub struct ViewEntry {
+    /// `arn:aws:resource-explorer-2:<region>:<account>:view/<name>/<uuid>`.
+    pub view_arn: String,
+    /// Unique within its Region.
+    pub view_name: String,
+    pub region: String,
+    /// The account that owns the view.
+    pub owner: String,
+    /// The account, organization or OU ARN the view's results are scoped to.
+    pub scope: String,
+    /// `SearchFilter$FilterString`, ANDed into every `Search` through this view.
+    pub filter_string: Option<String>,
+    /// `IncludedProperty$Name` values, e.g. `tags`.
+    pub included_properties: Vec<String>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    pub tags: HashMap<String, String>,
+    /// The `@idempotencyToken` the creating request carried, for replaying it.
+    pub client_token: Option<String>,
+}
+
+impl ViewEntry {
+    /// The modelled `View` structure for this stored view.
+    ///
+    /// The ONE place a `View` is built, so `CreateView` cannot return a shape that
+    /// `GetView` reads back differently.
+    pub fn to_wire(&self) -> crate::ops::types::View {
+        crate::ops::types::View {
+            view_arn: Some(self.view_arn.clone()),
+            view_name: Some(self.view_name.clone()),
+            owner: Some(self.owner.clone()),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
+            scope: Some(self.scope.clone()),
+            included_properties: Some(
+                self.included_properties
+                    .iter()
+                    .map(|name| crate::ops::types::IncludedProperty { name: name.clone() })
+                    .collect(),
+            ),
+            filters: self
+                .filter_string
+                .as_ref()
+                .map(|filter_string| crate::ops::types::SearchFilter {
+                    filter_string: filter_string.clone(),
+                }),
+        }
+    }
+
+    /// Whether this view asks for the named optional property
+    /// (`IncludedProperty$Name`) in search results. Case-insensitive, like every
+    /// other Resource Explorer comparison.
+    pub fn includes_property(&self, name: &str) -> bool {
+        self.included_properties
+            .iter()
+            .any(|included| included.eq_ignore_ascii_case(name))
+    }
+}
+
+/// A resource the Region's index holds, in the form `Search` reports it.
+///
+/// The emulator indexes the resources it can actually observe: the ones this
+/// service owns in that Region — its index and its views — each described from
+/// the values persisted for it, never from the caller's request.
+#[derive(Debug, Clone)]
+pub struct IndexedResource {
+    pub arn: String,
+    pub owning_account_id: String,
+    pub region: String,
+    pub service: String,
+    /// `<service>:<type>`, as Resource Explorer derives it from the ARN.
+    pub resource_type: String,
+    /// The CloudFormation type name for this resource type, when there is one.
+    pub cfn_resource_type: Option<String>,
+    pub last_reported_at: SystemTime,
+    pub tags: HashMap<String, String>,
+}
+
+impl IndexedResource {
+    /// Every value a free-form (unprefixed) query term is matched against.
+    pub fn searchable_fields(&self) -> Vec<&str> {
+        let mut fields = vec![
+            self.arn.as_str(),
+            self.owning_account_id.as_str(),
+            self.region.as_str(),
+            self.service.as_str(),
+            self.resource_type.as_str(),
+        ];
+        if let Some(cfn) = &self.cfn_resource_type {
+            fields.push(cfn.as_str());
+        }
+        for (key, value) in &self.tags {
+            fields.push(key.as_str());
+            fields.push(value.as_str());
+        }
+        fields
+    }
+}
 
 /// Per-service state for com-amazonaws-resourceexplorer2-resourceexplorer. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResourceexplorer2ResourceexplorerState {
-    // TODO: add service-specific state fields
+    /// At most one index per Region: "You can create only one index in a Region."
+    pub indexes: HashMap<String, IndexEntry>,
+    /// Every view, keyed by its own ARN.
+    pub views: HashMap<String, ViewEntry>,
+    /// The default view of each Region, as `AssociateDefaultView` set it.
+    pub default_view_arns: HashMap<String, String>,
+    /// How many resources this store has minted, so the identifier it derives for the
+    /// next one cannot collide with any it has already handed out.
+    pub minted_resources: u64,
+}
+
+impl ComAmazonawsResourceexplorer2ResourceexplorerState {
+    /// Mint the identifier for a resource of `kind` this store is creating now: the
+    /// `<uuid>` segment of a Resource Explorer index or view ARN.
+    ///
+    /// Uniqueness comes from the PERSISTED [`minted_resources`] counter, not from
+    /// randomness, so two resources created in the same instant can never share an
+    /// identifier. That counter, the resource kind and the creating instant are hashed
+    /// with SHA-256 (the `sha2` crate) and the first 16 bytes are laid out as the
+    /// 8-4-4-4-12 hex form, with the version and variant nibbles RFC 4122 requires —
+    /// version 8 ("custom"), because the value is derived rather than random, and the
+    /// digest is what keeps the counter and the clock out of the identifier.
+    ///
+    /// [`minted_resources`]: Self::minted_resources
+    pub fn mint_resource_id(&mut self, kind: &str, now: SystemTime) -> String {
+        let serial = self.minted_resources;
+        self.minted_resources = self.minted_resources.wrapping_add(1);
+        let nanos = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+
+        let mut hasher = Sha256::new();
+        hasher.update(kind.as_bytes());
+        hasher.update(serial.to_be_bytes());
+        hasher.update(nanos.to_be_bytes());
+        let digest = hasher.finalize();
+
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex = ::hex::encode(bytes);
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    }
+
+    /// Materialise every index lifecycle transition the clock already owes at
+    /// `now`, and nothing else.
+    ///
+    /// Each transition was due at `now` whether or not anybody called, so running
+    /// it here — rather than on a timer — changes no outcome a caller could
+    /// observe. Every handler, including the `@readonly` ones, calls this first so
+    /// they all answer from the same settled state.
+    pub fn settle(&mut self, now: SystemTime) {
+        let due: Vec<(String, IndexLifecycle)> = self
+            .indexes
+            .iter()
+            .filter(|(_, index)| index.settles_at.is_some_and(|at| at <= now))
+            .map(|(region, index)| (region.clone(), index.state))
+            .collect();
+        for (region, state) in due {
+            match state {
+                IndexLifecycle::Creating => {
+                    if let Some(index) = self.indexes.get_mut(&region) {
+                        index.state = IndexLifecycle::Active;
+                        index.settles_at = None;
+                        index.last_updated_at = now;
+                    }
+                }
+                IndexLifecycle::Deleting => {
+                    // "Resource Explorer also deletes all views in that Region."
+                    self.indexes.remove(&region);
+                    self.views.retain(|_, view| view.region != region);
+                    self.default_view_arns.remove(&region);
+                }
+                IndexLifecycle::Active => {
+                    // An Active index is never put on the clock, so nothing is owed.
+                }
+            }
+        }
+    }
+
+    /// The Region's index when it can back view creation and search — that is,
+    /// when it exists and is not being torn down.
+    pub fn live_index(&self, region: &str) -> Option<&IndexEntry> {
+        self.indexes
+            .get(region)
+            .filter(|index| index.state != IndexLifecycle::Deleting)
+    }
+
+    /// The Region's view with this name, if any. View names are unique per Region;
+    /// the comparison is exact, because the model's `ViewName` pattern admits mixed
+    /// case and AWS documents only that "the name must be unique within its Amazon Web
+    /// Services Region".
+    pub fn view_by_name(&self, region: &str, name: &str) -> Option<&ViewEntry> {
+        self.views
+            .values()
+            .find(|view| view.region == region && view.view_name == name)
+    }
+
+    /// The Region's views, ordered by ARN so paging over them is stable.
+    pub fn views_in_region(&self, region: &str) -> Vec<&ViewEntry> {
+        let mut views: Vec<&ViewEntry> = self
+            .views
+            .values()
+            .filter(|view| view.region == region)
+            .collect();
+        views.sort_by(|a, b| a.view_arn.cmp(&b.view_arn));
+        views
+    }
+
+    /// The indexes a `ListIndexes` caller can see, ordered by ARN.
+    ///
+    /// An index that is being torn down is left out: `Index` carries no state
+    /// member, so listing one would report a usable index that is not.
+    pub fn listable_indexes(&self) -> Vec<&IndexEntry> {
+        let mut indexes: Vec<&IndexEntry> = self
+            .indexes
+            .values()
+            .filter(|index| index.state != IndexLifecycle::Deleting)
+            .collect();
+        indexes.sort_by(|a, b| a.arn.cmp(&b.arn));
+        indexes
+    }
+
+    /// The contents of the Region's index: the resources this service owns there,
+    /// described from persisted state and ordered by ARN.
+    ///
+    /// A Region with no index holds nothing, which is what turning Resource
+    /// Explorer off in a Region means.
+    pub fn indexed_resources(&self, region: &str) -> Vec<IndexedResource> {
+        let Some(index) = self.live_index(region) else {
+            return Vec::new();
+        };
+        let account = ::engine::emulator_account_id().to_string();
+        let mut resources = vec![IndexedResource {
+            arn: index.arn.clone(),
+            owning_account_id: account.clone(),
+            region: index.region.clone(),
+            service: SERVICE_NAMESPACE.to_string(),
+            resource_type: format!("{SERVICE_NAMESPACE}:index"),
+            // The CloudFormation registry names for this service's resources.
+            cfn_resource_type: Some("AWS::ResourceExplorer2::Index".to_string()),
+            last_reported_at: index.last_updated_at,
+            tags: index.tags.clone(),
+        }];
+        for view in self.views_in_region(region) {
+            resources.push(IndexedResource {
+                arn: view.view_arn.clone(),
+                owning_account_id: account.clone(),
+                region: view.region.clone(),
+                service: SERVICE_NAMESPACE.to_string(),
+                resource_type: format!("{SERVICE_NAMESPACE}:view"),
+                cfn_resource_type: Some("AWS::ResourceExplorer2::View".to_string()),
+                last_reported_at: view.last_updated_at,
+                tags: view.tags.clone(),
+            });
+        }
+        resources.sort_by(|a, b| a.arn.cmp(&b.arn));
+        resources
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +402,212 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsResourceexplorer2ResourceexplorerState>)
+}
+
+// ---------------------------------------------------------------------------
+// Request metadata
+// ---------------------------------------------------------------------------
+
+/// The Region this request is addressed to: the Region of its SigV4 credential
+/// scope, falling back to [`DEFAULT_REGION`] for an unsigned request.
+///
+/// Resource Explorer is a regional service whose index, views and default view
+/// all belong to "the Region in which you call this operation", so every handler
+/// resolves the Region the same way.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The resource-id portion of an ARN: whatever follows the last `/` or `:`.
+pub fn resource_id_of_arn(arn: &str) -> &str {
+    arn.rsplit(['/', ':']).next().unwrap_or(arn)
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+
+/// A short, stable digest of the values a paginated request is bound to.
+///
+/// Folded into the page token's `kind` so a `NextToken` issued for one request cannot
+/// resume a DIFFERENT one at that offset: a token whose fingerprint does not match the
+/// request is refused, rather than answered with a slice of an unrelated result set.
+pub fn request_fingerprint(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        // Length-prefixed, so no two different part lists hash the same bytes.
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    ::hex::encode(&hasher.finalize()[..8])
+}
+
+/// Build the opaque `NextToken` that resumes `kind`'s listing at `offset`.
+///
+/// The offset travels inside the token rather than in a server-side cursor table,
+/// so a `@readonly` paginated operation stores nothing and a token stays valid
+/// for the life of the emulator.
+pub fn encode_page_token(kind: &str, offset: usize) -> String {
+    ::hex::encode(format!("{kind}:{offset}"))
+}
+
+/// The offset a `NextToken` issued by [`encode_page_token`] for `kind` resumes
+/// at, or `None` when the token was not issued for this listing.
+pub fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
+    let decoded = ::hex::decode(token).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    text.strip_prefix(&format!("{kind}:"))?.parse().ok()
+}
+
+/// One page of `items`, plus the token that resumes after it.
+///
+/// `max_results` absent means "no page limit from the caller", so the whole
+/// remainder is returned and no token is issued. An unparseable or out-of-range
+/// token is an error, with the message naming the member — the caller has to fix
+/// the request from that text.
+pub fn paginate<T: Clone>(
+    items: &[T],
+    kind: &str,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<(Vec<T>, Option<String>), String> {
+    let offset = match next_token {
+        Some(token) => decode_page_token(kind, token).ok_or_else(|| {
+            "NextToken is not a token this operation issued; omit it to start from \
+             the first page"
+                .to_string()
+        })?,
+        None => 0,
+    };
+    if offset > items.len() {
+        return Err(
+            "NextToken refers to a page that no longer exists; omit it to start from \
+             the first page"
+                .to_string(),
+        );
+    }
+    let limit = match max_results {
+        Some(max) if max > 0 => max as usize,
+        // A non-positive MaxResults is refused by the modelled range before a
+        // handler runs, so only "absent" reaches here.
+        _ => items.len().saturating_sub(offset),
+    };
+    let end = offset.saturating_add(limit).min(items.len());
+    let page = items[offset..end].to_vec();
+    let next = (end < items.len()).then(|| encode_page_token(kind, end));
+    Ok((page, next))
+}
+
+// ---------------------------------------------------------------------------
+// Search query syntax
+// ---------------------------------------------------------------------------
+
+/// Whether `resource` matches a Resource Explorer search query.
+///
+/// The grammar is the one documented in the "Search query syntax reference for
+/// Resource Explorer" that `SearchInput$QueryString` and
+/// `SearchFilter$FilterString` both point at:
+///
+/// * a query is whitespace-separated TERMS, all of which must match (logical AND);
+/// * a term prefixed with `-` must NOT match;
+/// * `name:value` filters one field, for the filter names [`filter_fields`] lists;
+/// * any other term is free-form text, matched against every indexed field;
+/// * a value ending in `*` matches by prefix;
+/// * "the search is completely case insensitive";
+/// * an empty query matches everything.
+///
+/// The syntax is proprietary to this service — no published crate parses it — so
+/// it is implemented here, from the grammar rather than from any one query.
+pub fn query_matches(query: &str, resource: &IndexedResource) -> bool {
+    query
+        .split_whitespace()
+        .all(|term| term_matches(term, resource))
+}
+
+/// The candidate values of the field a documented filter name selects, or `None`
+/// when the name is not a filter name (so the term is free-form text).
+///
+/// The names are those of the search query syntax reference: `arn`, `id`,
+/// `region`, `service`, `resourcetype`, `globalresourcetype`, `accountid`, `tag`,
+/// `tag.key` and `tag.value`.
+fn filter_fields(name: &str, resource: &IndexedResource) -> Option<Vec<String>> {
+    let fields = match name.to_ascii_lowercase().as_str() {
+        "arn" => vec![resource.arn.clone()],
+        "id" => vec![resource_id_of_arn(&resource.arn).to_string()],
+        "region" => vec![resource.region.clone()],
+        "service" => vec![resource.service.clone()],
+        "resourcetype" => vec![resource.resource_type.clone()],
+        "accountid" => vec![resource.owning_account_id.clone()],
+        // A global resource has no Region in its ARN; a regional one can never
+        // match a globalresourcetype filter.
+        "globalresourcetype" => {
+            if resource.region.is_empty() {
+                vec![resource.resource_type.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+        "tag" => resource
+            .tags
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect(),
+        "tag.key" => resource.tags.keys().cloned().collect(),
+        "tag.value" => resource.tags.values().cloned().collect(),
+        _ => return None,
+    };
+    Some(fields)
+}
+
+/// Whether one term of a query holds for `resource`.
+fn term_matches(term: &str, resource: &IndexedResource) -> bool {
+    let (negated, body) = match term.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, term),
+    };
+    if body.is_empty() {
+        return true;
+    }
+    // Split on the FIRST colon only: a filter value may itself contain colons
+    // (`resourcetype:ec2:instance`).
+    let hit = match body.split_once(':') {
+        Some((name, value)) => match filter_fields(name, resource) {
+            Some(fields) => fields.iter().any(|field| value_matches(value, field)),
+            // An unrecognized prefix is not a filter, so the whole term is text.
+            None => free_text_matches(body, resource),
+        },
+        None => free_text_matches(body, resource),
+    };
+    hit != negated
+}
+
+/// Whether a filter value matches one field value: case-insensitive equality, or
+/// a prefix match when the value ends in the `*` wildcard.
+fn value_matches(value: &str, field: &str) -> bool {
+    match value.strip_suffix('*') {
+        Some(prefix) => field
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase()),
+        None => field.eq_ignore_ascii_case(value),
+    }
+}
+
+/// Whether free-form text occurs in any indexed field of `resource`.
+///
+/// Deliberately an unanchored, case-insensitive SUBSTRING match, not the prefix match
+/// [`value_matches`] applies to a filtered value: free-form text in a Resource Explorer
+/// query is matched against the whole of each indexed field, so a trailing `*` adds
+/// nothing and is stripped. The two rules differ on purpose; keep them that way.
+fn free_text_matches(text: &str, resource: &IndexedResource) -> bool {
+    let needle = text.trim_end_matches('*').to_ascii_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    resource
+        .searchable_fields()
+        .iter()
+        .any(|field| field.to_ascii_lowercase().contains(&needle))
 }
