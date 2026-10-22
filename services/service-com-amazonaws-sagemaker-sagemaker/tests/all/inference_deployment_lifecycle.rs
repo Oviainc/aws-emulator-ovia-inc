@@ -31,7 +31,8 @@ const CREATE_SPACING: Duration = Duration::from_millis(5);
 /// One emulator: the shared engine plus the SageMaker service mounted on the router.
 ///
 /// Shared with this crate's other suites (`use super::inference_deployment_lifecycle::*`)
-/// so every wire test drives the same router the production one assembles.
+/// so every wire test drives the same router the production one assembles, rather than
+/// each suite growing its own copy.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -72,7 +73,7 @@ impl Emulator {
 
     /// Call `target` unsigned: no credential scope, so the request routes by
     /// `X-Amz-Target` alone and the ARN region falls back to the emulator default.
-    async fn call_unsigned(&self, target: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_unsigned(&self, target: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")

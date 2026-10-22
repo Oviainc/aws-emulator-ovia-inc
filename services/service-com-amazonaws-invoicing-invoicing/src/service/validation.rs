@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! How this service states a request the boundary validator refused, in the modelled
+//! `ValidationException`.
+//!
+//! The framework walks every modelled input constraint and hands the result over
+//! STRUCTURALLY — one [`Violation`] per offending value, carrying the path it sits at,
+//! what it failed and what it held — and leaves the wording to the service, because no
+//! model records it. This module is that wording for every modelled input constraint of
+//! this service: ONE formatter, reached by every refusal this service answers, so no
+//! operation can word a refusal its own way.
+//!
+//! The rules it implements, as AWS states a constraint violation:
+//!
+//! * a clause names the offending MEMBER PATH and the CONSTRAINT that member violated,
+//!   and NOTHING of the value the caller sent: `Value at '<path>' failed to satisfy
+//!   constraint: <requirement>`. An absent member is the one exception, reported as the
+//!   `null` it was — a fact of the request's shape rather than a rendering of a value.
+//!   Echoing the value back is wrong whatever the member: the clause's job is to say
+//!   what the request must satisfy, which the rejected value does not help with, and
+//!   anything that surfaces or persists the message would otherwise reproduce caller
+//!   input AWS deliberately omits;
+//! * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` anchors a
+//!   model spells it with to demand a whole-string match: a caller that lifts the
+//!   advertised expression out of the message and re-applies it locally must get the
+//!   expression the service advertises;
+//! * the clauses are counted and joined into the AWS envelope — `1 validation error
+//!   detected: <clause>` for one, `N validation errors detected: <clause>; <clause>`
+//!   for several — in the order the walk found them.
+//!
+//! Both halves of a refusal body are built from the same clause: the `message`
+//! envelope and each `fieldList` entry's own `message` (see
+//! [`field_validation_failed`]), so the two cannot drift.
+//!
+//! Nothing here is keyed to an operation, a member name or a value: the rule is applied
+//! to whatever [`Violation`] the walk produces, so it holds for every constrained member
+//! of every operation of this service — `InvoiceReceiver`'s `@pattern`, `Name`'s length
+//! and pattern, `MaxResults`' range, the ARN patterns, a member nested in `Rule` or in a
+//! `ResourceTag` alike.
+//!
+//! A violation class this module has no wording for declines the WHOLE refusal, which
+//! keeps the framework's own sentence rather than inventing one: [`ViolationKind`] is
+//! `#[non_exhaustive]`, so a class can be added upstream.
+//!
+//! One recorded body cannot be matched here and is deliberately not fitted: the wire
+//! recording this rendering was filed against carries a `fieldList` entry whose
+//! `message` is SCRUBBED — the part of the clause that named the rejected value was
+//! replaced, when the recording was taken, by a literal `[redacted]` placeholder (the
+//! same recording's top-level `message`, which this module reproduces exactly, carries
+//! no value at all). No rule of the service produces that placeholder, so the entry
+//! states the clause the rule gives.
+
+use smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
+
+use crate::ops::types::{ValidationException, ValidationExceptionField};
+
+/// The error code this service answers an input-constraint violation with: its own
+/// modelled `ValidationException`, which every operation declares and which the model
+/// gives `@error("client")` with `httpError 400` (`smithy_query(query="shape",
+/// shape="ValidationException")`). Restated here because `override_refusal` replaces
+/// the code and the message TOGETHER.
+pub(crate) const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// `ValidationExceptionReason$fieldValidationFailed` — a named member of the request
+/// carries a value the service does not accept. One of the values the modelled
+/// `ValidationExceptionReason` enum admits
+/// ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
+pub(crate) const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// How many violations one refusal states. Each one is rendered TWICE into the body (a
+/// clause of `message` and a `fieldList` entry), so an unbounded count turns a small
+/// request into an arbitrarily large refusal. The bound is the boundary validator's own
+/// (`MAX_VIOLATIONS` in `aws_smithy_schema_server::constraints`), so the two refusal
+/// paths read alike.
+const MAX_VIOLATIONS: usize = 100;
+
+/// The sentence a refusal falls back to when no violation has a wording here: the
+/// documentation of the modelled shape itself (`smithy_query(query="shape",
+/// shape="ValidationException")`).
+const VALIDATION_EXCEPTION_DOC: &str =
+    "The input fails to satisfy the constraints specified by an Amazon Web Services service.";
+
+/// A `@pattern` expression without the anchors a model spells it with.
+///
+/// A `$` preceded by an odd number of backslashes is an ESCAPED dollar sign — a literal
+/// character of the expression rather than the end anchor — so it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let escapes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if escapes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The requirement a violation states, worded as AWS words it. `None` for a class this
+/// service has no wording for.
+fn requirement(kind: &ViolationKind) -> Option<String> {
+    let text = match kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    };
+    Some(text)
+}
+
+/// One violation as the clause that goes into the envelope and into that member's
+/// `fieldList` entry, or `None` for a class this service has no wording for.
+///
+/// The rejected value is never rendered. An absent member is reported as the `null` it
+/// was, which is the shape of the request rather than a value the caller sent.
+pub(crate) fn clause(violation: &Violation) -> Option<String> {
+    let requirement = requirement(&violation.kind)?;
+    let subject = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Value null",
+        _ => "Value",
+    };
+    Some(format!(
+        "{subject} at '{}' failed to satisfy constraint: {requirement}",
+        violation.path
+    ))
+}
+
+/// The `message` of a refused request: the AWS envelope over one clause per violation,
+/// in the order the walk found them. `None` declines the whole refusal — see [`clause`].
+pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
+    let clauses = violations
+        .iter()
+        .map(clause)
+        .collect::<Option<Vec<String>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// The 400 `ValidationException` that states `violations` — a member constraint the
+/// request failed — in the shape's own modelled members.
+///
+/// ONE rendering for every refused member, wherever the refusal is found: `message` is
+/// the `N validation error(s) detected: …` envelope, `reason` is
+/// [`REASON_FIELD_VALIDATION_FAILED`], and `fieldList` carries one entry per violation —
+/// `name` the dotted member path, `message` that violation's own clause naming the
+/// constraint it failed. A client can therefore branch on `reason` and report which
+/// member was rejected and why, instead of parsing the prose.
+pub(crate) fn field_validation_failed(violations: &[Violation]) -> ValidationException {
+    let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
+    ValidationException {
+        message: envelope(violations).or_else(|| Some(VALIDATION_EXCEPTION_DOC.to_string())),
+        resource_name: None,
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(
+            violations
+                .iter()
+                .map(|violation| ValidationExceptionField {
+                    name: violation.path.clone(),
+                    // The same clause the envelope states for this member, so the two
+                    // halves of the body cannot word one violation two ways.
+                    //
+                    // The recording this rendering was filed against carries a SCRUBBED
+                    // text here (the corpus replaced the part of the clause that named
+                    // the rejected value with a literal `[redacted]` placeholder, which
+                    // no rule of the service produces), so the clause is what the rule
+                    // gives rather than what that one body holds.
+                    message: clause(violation)
+                        .unwrap_or_else(|| VALIDATION_EXCEPTION_DOC.to_string()),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// How this service states `refusal`, or `None` to keep the framework's wording.
+///
+/// Only an input-constraint refusal is reworded. An authentication refusal is a
+/// different failure with a different code and status, and nothing about it is this
+/// service's to word.
+pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
+    match refusal {
+        Refusal::Invalid(violations) => Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: envelope(&violations[..violations.len().min(MAX_VIOLATIONS)])?,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The anchor stripping, over the forms a `@pattern` takes. The forms this
+    /// service's own model reaches are covered end-to-end by
+    /// `tests/all/validation_message_wording.rs`; these pin the ones no input shape of
+    /// THIS model spells today, so the rule stays stated for a model that grows one.
+    #[test]
+    fn anchors_are_stripped_and_an_escaped_dollar_is_kept() {
+        for (pattern, expected) in [
+            // The form this model spells on `AccountIdString`.
+            (r"^\d{12}$", r"\d{12}"),
+            (r"^[\S\s]*$", r"[\S\s]*"),
+            // Unanchored already, and anchored at one end only.
+            (r"[a-z]+", "[a-z]+"),
+            (r"^[a-z]+", "[a-z]+"),
+            (r"[a-z]+$", "[a-z]+"),
+            // An escaped `$` is a literal character of the expression.
+            (r"^\$[0-9]+$", r"\$[0-9]+"),
+            (r"^\$", r"\$"),
+            // An escaped backslash before the `$` leaves the `$` an anchor.
+            (r"^[a-z]\\$", r"[a-z]\\"),
+            (r"^", ""),
+        ] {
+            let actual = unanchored(pattern);
+            assert_eq!(
+                actual, expected,
+                "case {pattern:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A clause never reproduces the value, whatever the violation held; an absent
+    /// member keeps the `null` the request shape states.
+    #[test]
+    fn a_clause_states_the_member_and_the_requirement_only() {
+        let rejected = "not-an-account-id";
+        let cases = [
+            (
+                Violation {
+                    path: "invoiceReceiver".to_string(),
+                    kind: ViolationKind::Pattern(r"^\d{12}$".to_string()),
+                    value: Some(rejected.to_string()),
+                },
+                "Value at 'invoiceReceiver' failed to satisfy constraint: Member must \
+                 satisfy regular expression pattern: \\d{12}",
+            ),
+            (
+                Violation {
+                    path: "name".to_string(),
+                    kind: ViolationKind::MaxLength(50),
+                    value: Some(rejected.to_string()),
+                },
+                "Value at 'name' failed to satisfy constraint: Member must have length \
+                 less than or equal to 50",
+            ),
+            (
+                Violation {
+                    path: "name".to_string(),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                },
+                "Value null at 'name' failed to satisfy constraint: Member must not be null",
+            ),
+        ];
+        for (violation, expected) in cases {
+            let actual = clause(&violation).expect("a modelled violation class is worded");
+            assert_eq!(
+                actual, expected,
+                "case {violation:?}: expected {expected:?}, got {actual:?}"
+            );
+            assert!(
+                !actual.contains(rejected),
+                "case {violation:?}: the clause must not reproduce the value, got {actual:?}"
+            );
+        }
+    }
+
+    /// The envelope counts and joins the clauses the AWS way.
+    #[test]
+    fn the_envelope_counts_the_clauses() {
+        let one = vec![Violation {
+            path: "maxResults".to_string(),
+            kind: ViolationKind::MaxValue("500".to_string()),
+            value: Some("501".to_string()),
+        }];
+        let two = vec![
+            one[0].clone(),
+            Violation {
+                path: "nextToken".to_string(),
+                kind: ViolationKind::MinLength(1),
+                value: Some(String::new()),
+            },
+        ];
+        for (violations, expected) in [
+            (
+                &one,
+                "1 validation error detected: Value at 'maxResults' failed to satisfy \
+                 constraint: Member must have value less than or equal to 500",
+            ),
+            (
+                &two,
+                "2 validation errors detected: Value at 'maxResults' failed to satisfy \
+                 constraint: Member must have value less than or equal to 500; Value at \
+                 'nextToken' failed to satisfy constraint: Member must have length greater \
+                 than or equal to 1",
+            ),
+        ] {
+            let actual = envelope(violations).expect("a worded refusal");
+            assert_eq!(
+                actual, expected,
+                "case {violations:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+}

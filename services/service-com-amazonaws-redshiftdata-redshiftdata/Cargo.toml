@@ -16,11 +16,36 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+hex = { workspace = true }
+# The SQL engine the Data API runs submitted statements on, in-process.
+#
+# MEMORY-SAFETY POSTURE (SR-MEM-001): the rationale, the bounds and the
+# alternatives considered are recorded in this crate's README.md, section "The
+# SQL engine, and its memory-safety posture". In short: this crate itself keeps
+# `#![forbid(unsafe_code)]` and contains no `unsafe`; the native component the
+# `bundled` feature links is the SAME engine the workspace already links through
+# `vendor/emulator-telemetry` (`rusqlite` 0.37, `bundled`), so no new native
+# library enters the emulator process.
+#
+# CAPABILITY: this is an EXECUTION SUBSTRATE — it compiles caller-supplied text
+# into instructions and runs them — and a NATIVE component: the `bundled`
+# feature makes libsqlite3-sys compile the SQLite C amalgamation on the
+# builder's machine at build time and link it in. The host-filesystem escapes it
+# re-opens (`ATTACH DATABASE '<path>'`, `VACUUM INTO '<path>'`, a `PRAGMA` that
+# re-enables a switch, extension loading, a virtual-table module) are all closed
+# in `Database::open` in src/state.rs, before any request reaches the engine:
+# default-deny authorizer, `SQLITE_LIMIT_ATTACHED = 0`, defensive mode,
+# untrusted schema, no URI filenames, `temp_store = MEMORY`, `max_page_count`,
+# plus length, column, depth and compound-select limits. `limits` and `hooks`
+# are the features those controls need; `load_extension` is deliberately absent.
+rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "hooks", "limits"] }
+# Mints the `UUID`-shaped statement, query and session identifiers.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -122,10 +122,32 @@ pub const LOGGING_CONFIGURATION_RESOURCE_TYPE: &str = "AWS::APS::LoggingConfigur
 /// stored and applied by [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`].
 pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 
+/// `RuleGroupsNamespaceStatusCode` values a rule groups namespace moves through here.
+/// Each is an entry of the modelled `com.amazonaws.amp#RuleGroupsNamespaceStatusCode`
+/// enum, whose own documentation states the lifecycle rules this crate enforces:
+/// `CREATING` — "Namespace is being created. Update/Deletion is disallowed until
+/// namespace is ACTIVE and workspace status is ACTIVE."; `ACTIVE` — "Namespace has been
+/// created/updated. …"; `UPDATING` — "Namespace is being updated. …"; `DELETING` —
+/// "Namespace is being deleting. …". (`crate::ops::types::RULE_GROUPS_NAMESPACE_STATUS_CODE_VALUES`
+/// carries the full list.) They are spelled separately from the `WorkspaceStatusCode`
+/// constants above because they belong to a different modelled enum.
+pub const NAMESPACE_STATUS_CREATING: &str = "CREATING";
+/// See [`NAMESPACE_STATUS_CREATING`].
+pub const NAMESPACE_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`NAMESPACE_STATUS_CREATING`].
+pub const NAMESPACE_STATUS_UPDATING: &str = "UPDATING";
+/// See [`NAMESPACE_STATUS_CREATING`].
+pub const NAMESPACE_STATUS_DELETING: &str = "DELETING";
+
 /// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
 /// report for a workspace. The member is a free-form `String` documented as "Type of
 /// the resource affected", so the emulator reports the resource's AWS type name.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "AWS::APS::Workspace";
+
+/// The `resourceType` those same exceptions report for a rule groups namespace. The
+/// name is the one the model itself gives the resource: `RuleGroupsNamespaceArn`
+/// carries `@arnReference(type: "AWS::APS::RuleGroupsNamespace")`.
+pub const RULE_GROUPS_NAMESPACE_RESOURCE_TYPE: &str = "AWS::APS::RuleGroupsNamespace";
 
 /// `QueryLoggingConfigurationStatusCode` values a query logging configuration moves
 /// through here. Each is an entry of the modelled
@@ -169,6 +191,18 @@ pub const QUERY_LOGGING_NOT_FOUND_MESSAGE: &str = "Workspace logging configurati
 /// released by `DeleteWorkspace`, which also drops that workspace's ARN index entry
 /// and forgets its client tokens, so neither of those maps can outgrow it either.
 pub const WORKSPACE_QUOTA: usize = 1_000;
+
+/// How many rule groups namespaces ONE workspace holds before
+/// `CreateRuleGroupsNamespace` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// Amazon Managed Service for Prometheus publishes an adjustable quota on rule groups
+/// namespaces per workspace, and this emulator models neither Service Quotas nor an
+/// account's adjustments — so this is the emulator's OWN bound on the store, not a
+/// claim about any account's limit. It is what stops one workspace's namespace map
+/// growing without end; the map itself is owned by the workspace record, so deleting
+/// the workspace releases every namespace in it.
+pub const RULE_GROUPS_NAMESPACES_PER_WORKSPACE: usize = 1_000;
 
 /// The largest page `ListWorkspaces` serves, and the page size it uses when the request
 /// names no `maxResults`: `ListWorkspacesRequest$maxResults` is modelled
@@ -220,6 +254,43 @@ pub struct Workspace {
     /// but the workspace — so it lives ON the workspace record: a workspace that goes
     /// away takes its logging configuration with it.
     pub logging_configuration: Option<LoggingConfiguration>,
+    /// This workspace's rule groups namespaces, keyed by `RuleGroupsNamespaceName`
+    /// (unique within a workspace, which is what `CreateRuleGroupsNamespace` refuses a
+    /// second time). They hang off the workspace record because the namespace is a
+    /// child of the workspace: dropping the workspace releases every one of them.
+    /// Sorted, so a listing reports one stable order.
+    pub rule_groups_namespaces: BTreeMap<String, RuleGroupsNamespace>,
+}
+
+/// One stored rule groups namespace: every member `RuleGroupsNamespaceDescription` /
+/// `RuleGroupsNamespaceSummary` report, plus the bookkeeping the lifecycle needs.
+#[derive(Debug, Clone)]
+pub struct RuleGroupsNamespace {
+    pub name: String,
+    pub arn: String,
+    /// The rules file the namespace holds, exactly as the request carried it:
+    /// `RuleGroupsNamespaceData` is a blob, so the bytes are stored unaltered and read
+    /// back unaltered.
+    pub data: Vec<u8>,
+    /// One of [`NAMESPACE_STATUS_CREATING`], [`NAMESPACE_STATUS_ACTIVE`],
+    /// [`NAMESPACE_STATUS_UPDATING`], [`NAMESPACE_STATUS_DELETING`].
+    pub status_code: String,
+    /// `RuleGroupsNamespaceStatus$statusReason` — "The reason for the failure, if any",
+    /// so it is absent while nothing failed.
+    pub status_reason: Option<String>,
+    pub created_at: SystemTime,
+    /// When the namespace was "most recently changed"
+    /// (`RuleGroupsNamespaceDescription$modifiedAt`): the creation instant until a
+    /// later call changes the record.
+    pub modified_at: SystemTime,
+    /// Sorted so a listing and a describe report the tags in one stable order.
+    pub tags: BTreeMap<String, String>,
+    /// When the clock owes this namespace's next lifecycle transition, if one is
+    /// pending: `CREATING`/`UPDATING` become `ACTIVE`, `DELETING` is removed.
+    pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the call that created this namespace, which is what makes
+    /// `CreateRuleGroupsNamespace` idempotent per its `@idempotencyToken`.
+    pub create_token: Option<String>,
 }
 
 /// One entry of a configuration's `limitsPerLabelSet`: a label set and the active time
@@ -404,6 +475,7 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
             if let Some(logging) = workspace.logging_configuration.as_mut() {
                 logging.materialize_due(now);
             }
+            materialize_namespaces_due(&mut workspace.rule_groups_namespaces, now);
             let Some(due) = workspace.transition_due else {
                 continue;
             };
@@ -454,6 +526,30 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     }
 }
 
+/// Apply every rule-groups-namespace transition the clock owes at `now` inside one
+/// workspace: a namespace whose due instant has passed becomes `ACTIVE`, or is removed
+/// when it was being deleted. Called from
+/// [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`], for the same
+/// reason — the transition was owed at an instant recorded when the call that started
+/// it ran, whether or not anybody calls again.
+fn materialize_namespaces_due(
+    namespaces: &mut BTreeMap<String, RuleGroupsNamespace>,
+    now: SystemTime,
+) {
+    namespaces.retain(|_, namespace| match namespace.transition_due {
+        Some(due) if now >= due => {
+            namespace.transition_due = None;
+            if namespace.status_code == NAMESPACE_STATUS_DELETING {
+                false
+            } else {
+                namespace.status_code = NAMESPACE_STATUS_ACTIVE.to_string();
+                true
+            }
+        }
+        _ => true,
+    });
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -477,6 +573,18 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// requires. The account segment comes from the engine, never from a literal.
 pub fn workspace_arn(region: &str, workspace_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("workspace/{workspace_id}"))
+}
+
+/// A rule groups namespace ARN, in the form
+/// `RuleGroupsNamespaceDescription$arn` documents: "For example,
+/// `arn:aws:aps:<region>:123456789012:rulegroupsnamespace/ws-example1-1234-abcd-5678-ef90abcd1234/rulesfile1`".
+/// The account segment comes from the engine, never from a literal.
+pub fn rule_groups_namespace_arn(region: &str, workspace_id: &str, name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("rulegroupsnamespace/{workspace_id}/{name}"),
+    )
 }
 
 /// The workspace's Prometheus endpoint, in the form

@@ -186,6 +186,38 @@ pub(crate) fn is_modelled_profile_id(id: &str) -> bool {
         && id[2..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
+/// `HostKeyId` is modelled `len 25..25`, pattern `^hostkey-[0-9a-f]{17}$`.
+pub(crate) fn is_modelled_host_key_id(id: &str) -> bool {
+    id.len() == 25
+        && id.starts_with("hostkey-")
+        && id[8..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// An OpenSSH Ed25519 private key and the SHA256 fingerprint `ssh-keygen -l` prints
+/// for it, both produced here by the OpenSSH key-format crate — so the expectation
+/// comes from the key, not from the handler under test.
+pub(crate) fn generated_host_key() -> (String, String) {
+    let keypair = ssh_key::private::Ed25519Keypair::random(&mut ssh_key::rand_core::OsRng);
+    let key = ssh_key::PrivateKey::from(keypair);
+    let material = key
+        .to_openssh(ssh_key::LineEnding::LF)
+        .expect("the generated key encodes as an OpenSSH private key")
+        .to_string();
+    let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+    (material, fingerprint)
+}
+
+/// The SSH algorithm name of private key MATERIAL, read back out of the material by
+/// the OpenSSH key-format crate — one of the values `DescribedHostKey.Type` documents
+/// (`ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`).
+pub(crate) fn host_key_algorithm(material: &str) -> String {
+    ssh_key::PrivateKey::from_openssh(material)
+        .expect("the test's own key material parses as an OpenSSH private key")
+        .algorithm()
+        .as_str()
+        .to_string()
+}
+
 /// Assert that `actual` carries each member `expected` names, where a `null`
 /// expectation means "the response must not carry this member at all".
 pub(crate) fn assert_members(case: &str, actual: &Value, expected: &Value) {

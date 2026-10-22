@@ -300,10 +300,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let return_old = match input.return_values.as_deref() {
             None | Some("NONE") => false,
             Some("ALL_OLD") => true,
-            Some(other) => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "ReturnValues can only be ALL_OLD or NONE for DeleteItem, got {other}"
-                )))
+            Some(_) => {
+                return Err(lift(
+                    crate::state::return_values_must_be_old_or_none(),
+                ))
             }
         };
 

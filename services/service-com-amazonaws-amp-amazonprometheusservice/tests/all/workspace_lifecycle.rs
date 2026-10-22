@@ -203,7 +203,7 @@ pub(crate) fn text(value: &serde_json::Value) -> String {
     value.as_str().unwrap_or_default().to_string()
 }
 
-fn tags_of(value: &serde_json::Value) -> BTreeMap<String, String> {
+pub(crate) fn tags_of(value: &serde_json::Value) -> BTreeMap<String, String> {
     value
         .as_object()
         .map(|map| {

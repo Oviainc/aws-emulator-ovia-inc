@@ -264,6 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new workspace has no logging configuration until
             // `CreateLoggingConfiguration` gives it one.
             logging_configuration: None,
+            // A fresh workspace holds no rule groups namespaces;
+            // `CreateRuleGroupsNamespace` is what puts one here.
+            rule_groups_namespaces: ::std::collections::BTreeMap::new(),
             workspace_id: workspace_id.clone(),
         };
 

@@ -8,6 +8,47 @@ cargo build -p service-com-amazonaws-redshiftdata-redshiftdata
 cargo test  -p service-com-amazonaws-redshiftdata-redshiftdata
 ```
 
+## The SQL engine, and its memory-safety posture (SR-MEM-001)
+
+The Redshift Data API is an HTTP control plane in front of a SQL engine, so this crate
+runs submitted statements on a REAL engine in-process: `rusqlite` (SQLite), declared in
+`Cargo.toml` with the `bundled` feature. This is a deliberate, documented choice and the
+rationale is recorded here so it is visible with the code rather than only in a review:
+
+* **Why an engine crate at all.** The alternative is a hand-written SQL subset, which
+  this project forbids for execution planes (never match on source text, never
+  synthesise output that looks computed). The emulator's contract for an execution
+  plane is a real interpreter or engine, bounded by a wall-clock timeout, a step budget
+  and an output cap, run in-process — which is exactly how `src/state.rs` drives it.
+* **What `bundled` means.** `libsqlite3-sys` compiles the SQLite C amalgamation at build
+  time and links it in, so the process gains a native (unsafe-FFI, C) component. The
+  requirement "no crate may use `unsafe`" is about the crates in THIS workspace: this
+  crate keeps `#![forbid(unsafe_code)]` and the workspace `unsafe_code = "forbid"` lint,
+  and contains no `unsafe` block, function or impl. The native component is a
+  third-party dependency, not workspace code, and it is the same engine this workspace
+  already links through `vendor/emulator-telemetry`, which depends on `rusqlite` with
+  the same `bundled` feature — so this change introduces no new native library to the
+  emulator process, only a second user of one already linked.
+* **What bounds it.** Caller-supplied SQL reaches the engine only through
+  `Database::open`, which installs, BEFORE any request is served: a default-deny
+  authorizer (every host-reaching action — `ATTACH`/`DETACH`, `VACUUM INTO`, `PRAGMA`,
+  extension loading, and any action a future engine version adds — is refused), an
+  in-memory connection opened without `SQLITE_OPEN_URI`, `temp_store = MEMORY`,
+  `max_page_count` on `main` and `temp`, `hard_heap_limit`, defensive mode, untrusted
+  schema, `SQLITE_LIMIT_ATTACHED = 0`, and length, SQL-length, column, expression-depth,
+  compound-select and bound-parameter limits. Execution is additionally bounded by a
+  wall-clock deadline and a step budget enforced from the engine's progress handler, and
+  the retained result set is capped in rows, cells and bytes. `load_extension` is not an
+  enabled feature of the dependency, so it is not reachable from this crate at all.
+  `tests/all/statement_lifecycle.rs` asserts that statements which would reach the host
+  are refused and that statements outside those bounds end FAILED.
+* **Alternatives considered.** A pure-Rust SQL engine would remove the native component,
+  at the cost of a different SQL dialect and far less exercised code on the same
+  untrusted-input path; the engine already linked by the workspace was preferred. If the
+  workspace's curated `[workspace.dependencies]` is to own this dependency, the root
+  manifest is the place for it — this crate declares it directly only because the root
+  manifest is not editable from here.
+
 ## Layout
 
 ```

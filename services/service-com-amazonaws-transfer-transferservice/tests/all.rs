@@ -15,6 +15,8 @@
 mod connector_listing;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/host_key_lifecycle.rs"]
+mod host_key_lifecycle;
 #[path = "all/input_validation.rs"]
 mod input_validation;
 #[path = "all/not_found_errors.rs"]

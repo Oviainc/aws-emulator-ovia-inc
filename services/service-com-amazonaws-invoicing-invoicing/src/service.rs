@@ -28,7 +28,9 @@
 //!   [`FrontDoor`]).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   wording; this service words it itself, through the one formatter in
+//!   [`validation`] that also words the modelled refusal body [`FrontDoor`] answers
+//!   with. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -67,6 +69,8 @@
 //! refusal envelopes keep the media type the model's protocol trait declares, which
 //! is the one seam `override_protocol` deliberately does not reach, and which is the
 //! media type the recorded refusals carry too.
+
+pub(crate) mod validation;
 
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused,
@@ -139,7 +143,7 @@ struct ServedOperation {
 ///    and an empty field list, so it can neither branch on the reason nor report which
 ///    member was rejected. The refusal is therefore stated HERE, where the violations
 ///    the boundary found are still in hand, through the one rendering
-///    [`crate::state::field_validation_failed`] owns; a request with no violation is
+///    [`validation::field_validation_failed`] owns; a request with no violation is
 ///    handed to the generated walk unchanged.
 /// 2. The TAG operations announce [`TAG_PLANE_MEDIA_TYPE`] rather than the media type
 ///    `override_protocol` serves service-wide (see the module docs): the media type is
@@ -316,7 +320,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FrontDoor<Eng> {
                 return svc.definition().routing_error_response(req);
             };
             if let Some(violations) = (entry.violations)(protocol, req) {
-                let modelled = crate::state::field_validation_failed(&violations);
+                let modelled = validation::field_validation_failed(&violations);
                 return protocol
                     .serialize_error(
                         &modelled,
@@ -397,14 +401,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Nothing to reword here: a refusal of an implemented operation never reaches
-        // this seam — [`FrontDoor`] answers it BEFORE the framework renders it, because
-        // the words are not the problem: the generic refusal body cannot carry the
-        // modelled `reason`/`fieldList` members at all, and `Refused` is only a code
-        // and a message. Every other operation is a scaffold answering 501, whose
-        // refusals keep the framework's conventional wording.
-        let _ = refusal;
-        None
+        // A refusal of an IMPLEMENTED operation never reaches this seam — [`FrontDoor`]
+        // answers it BEFORE the framework renders it, because the generic refusal body
+        // cannot carry the modelled `reason`/`fieldList` members at all and `Refused` is
+        // only a code and a message. What does reach it is a refusal of a request for a
+        // scaffolded operation, whose modelled constraints the framework validates
+        // before it ever reaches the 501. Its `message` is worded by the same formatter
+        // the modelled body uses ([`validation`]), so one constraint violation is stated
+        // one way wherever this service refuses it: the member path and the requirement,
+        // never the rejected value, and a `@pattern` without its anchors.
+        validation::refused(refusal)
     }
 
     fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {

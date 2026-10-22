@@ -688,3 +688,4 @@ async fn the_metrics_endpoint_round_trips_its_own_data_plane_through_the_whole_r
         );
     }
 }
+

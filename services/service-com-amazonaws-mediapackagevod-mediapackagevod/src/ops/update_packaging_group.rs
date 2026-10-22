@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePackagingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePackagingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replaces a stored PackagingGroup's CDN `Authorization` — the only
+//! member this request carries — and answers with the record as it now stands in
+//! [`crate::state`], so the following `DescribePackagingGroup` reports the same
+//! `Authorization` and the unchanged `Id`, `Arn`, `CreatedAt` and `DomainName`.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePackagingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The route is `PUT /packaging_groups/{Id}` and the request shape documents itself
+//! as "A MediaPackage VOD PackagingGroup resource configuration", so the body is the
+//! group's whole mutable configuration rather than a patch: a request carrying no
+//! `Authorization` leaves the group with none. Everything else the response reports
+//! is system-generated (`Id`, `Arn`, `CreatedAt`, `DomainName`), derived
+//! (`ApproximateAssetCount`) or owned by another operation (`EgressAccessLogs` by
+//! `ConfigureLogs`, `Tags` by `TagResource`), and this operation leaves all of it
+//! alone — "You can't change the id attribute or any other system-generated
+//! attributes."
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +161,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePackagingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePackagingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePackagingGroup"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePackagingGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the MediaPackage VOD state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // This operation addresses an existing group by its `Id` path label, so a
+        // group this service holds none of is a missing addressed resource (404),
+        // never a member violation.
+        let Some(stored) = state.packaging_groups.get_mut(&input.id) else {
+            return Err(UpdatePackagingGroupErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::scaffolded::not_found_message(
+                        "PackagingGroup",
+                        &input.id,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The one mutable member, replaced by what this request carries — so an
+        // absent `Authorization` removes the CDN authorization the group had. The
+        // system-generated members (`Arn`, `CreatedAt`, `DomainName`, `Id`) and the
+        // ones other operations own (`EgressAccessLogs`, the tag store) stay as they
+        // are.
+        stored.authorization = input.authorization;
+
+        // Answer from what is now stored, not from the request: a difference between
+        // the two would show up only on the next describe.
+        let Some(stored) = state.packaging_groups.get(&input.id) else {
+            return Err(UpdatePackagingGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the PackagingGroup could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        let arn = stored.arn.clone();
+        Ok(UpdatePackagingGroupOutput {
+            // Counted from the asset map on every read, exactly as the describe path
+            // counts it, so an update never disturbs it.
+            approximate_asset_count: Some(state.asset_count(&input.id)),
+            arn: Some(arn.clone()),
+            authorization: stored.authorization.clone(),
+            created_at: Some(stored.created_at.clone()),
+            domain_name: Some(stored.domain_name.clone()),
+            egress_access_logs: stored.egress_access_logs.clone(),
+            id: Some(stored.id.clone()),
+            tags: Some(state.tags_of(&arn)),
+        })
     }
 }

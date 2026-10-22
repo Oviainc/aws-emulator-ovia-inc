@@ -15,6 +15,8 @@
 mod logging_configuration;
 #[path = "all/query_logging_configuration.rs"]
 mod query_logging_configuration;
+#[path = "all/rule_groups_namespace_lifecycle.rs"]
+mod rule_groups_namespace_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/workspace_configuration.rs"]

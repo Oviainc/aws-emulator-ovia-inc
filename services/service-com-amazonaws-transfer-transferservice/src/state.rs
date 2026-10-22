@@ -2,9 +2,10 @@
 
 //! Engine state for the com-amazonaws-transfer-transferservice service.
 //!
-//! Everything AWS Transfer Family's server + user + AS2 profile + connector lifecycle
-//! needs to answer a read from stored state lives here: the resource maps (servers,
-//! their users, the AS2 profiles, the connectors, and the workflows a server's
+//! Everything AWS Transfer Family's server + user + AS2 profile + connector + host-key
+//! lifecycle needs to answer a read from stored state lives here: the resource maps
+//! (servers, their users and host keys, the AS2 profiles, the connectors, and the
+//! workflows a server's
 //! `WorkflowDetails` attach), the
 //! id-minting counter, the
 //! documented create-time defaults and the clock-due server state transitions (the
@@ -309,6 +310,38 @@ pub const DEFAULT_OVERWRITE_EXISTING: &str = "FALSE";
 /// `len 1..50`, `StructuredLogDestinations` `len 0..1`), which the framework's boundary
 /// validator enforces before a handler runs, and `DeleteWorkflow` releases one.
 pub const MAX_STORED_WORKFLOWS: usize = 200;
+
+/// `ResourceType` for one of a server's host keys, addressed by its `HostKeyId`.
+/// Same convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_HOST_KEY: &str = "HostKey";
+
+/// `HostKeyStorageType`'s value for a key the service itself stores (the enum is
+/// `[SERVICE_MANAGED, SECRETS_MANAGER]`).
+pub const HOST_KEY_STORAGE_SERVICE_MANAGED: &str = "SERVICE_MANAGED";
+
+/// `HostKeyStorageType`'s value for a key whose private material lives in a Secrets
+/// Manager secret.
+pub const HOST_KEY_STORAGE_SECRETS_MANAGER: &str = "SECRETS_MANAGER";
+
+/// `StorageType` for an import that named none.
+///
+/// `StorageType` documents Secrets Manager storage as the OPT-IN half of the pair
+/// ("When you specify SECRETS_MANAGER, Transfer Family stores the private host key
+/// material in an Secrets Manager secret"), so a request that specifies nothing leaves
+/// the key stored by Transfer Family itself.
+pub const DEFAULT_HOST_KEY_STORAGE_TYPE: &str = HOST_KEY_STORAGE_SERVICE_MANAGED;
+
+/// How many host keys ONE server holds before `ImportHostKey` refuses instead of
+/// growing.
+///
+/// Chosen on the same basis as [`MAX_STORED_SERVERS`] — the emulator's own bound on
+/// the store, not a claim about any account's quota. Each stored record is itself
+/// bounded by the modelled lengths of what a caller may send (`HostKeyBody`
+/// `len 0..4096`, `Description` `len 0..200`, `Tags` `len 1..50`), which the
+/// framework's boundary validator enforces before a handler runs, so this bounds a
+/// server's key set in bytes as well as in count. `DeleteHostKey` releases one record,
+/// `DeleteServer` all of a server's.
+pub const MAX_HOST_KEYS_PER_SERVER: usize = 10;
 
 /// How many SSH public keys ONE user holds before `ImportSshPublicKey` refuses
 /// instead of growing.
@@ -916,6 +949,35 @@ pub struct SshKey {
     pub date_imported: SystemTime,
 }
 
+/// One stored host key of a server, keyed by `(ServerId, HostKeyId)`.
+///
+/// The private material the import carried is NOT kept: nothing in this emulator can
+/// use it (it serves no SSH transport) and no modelled member returns it. What the
+/// readers report is derived from that material once, at import time — the genuine
+/// OpenSSH fingerprint and algorithm name [`read_host_key`] parses out of it — so a
+/// read reports a real property of a real key rather than an echo of the request.
+#[derive(Debug, Clone)]
+pub struct HostKey {
+    /// The minted `hostkey-` + 17 hex-digit identifier (`^hostkey-[0-9a-f]{17}$`).
+    pub host_key_id: String,
+    /// `arn:aws:transfer:<region>:<account>:host-key/<ServerId>/<HostKeyId>`.
+    pub arn: String,
+    /// The Base64 SHA256 fingerprint of the imported key, in the `SHA256:<base64>`
+    /// form `ssh-keygen -l` prints.
+    pub fingerprint: String,
+    /// `DescribedHostKey.Type`: the imported key's SSH algorithm name, one of the
+    /// values that member documents (`ssh-rsa`, `ssh-ed25519`,
+    /// `ecdsa-sha2-nistp256/384/521`).
+    pub key_type: String,
+    /// The caller's `Description`, absent when the import named none.
+    pub description: Option<String>,
+    /// `DateImported`: when this key was added to the server.
+    pub date_imported: SystemTime,
+    /// The resolved `HostKeyStorageType` (see [`DEFAULT_HOST_KEY_STORAGE_TYPE`]).
+    pub storage_type: String,
+    pub tags: Vec<Tag>,
+}
+
 /// One stored Transfer Family workflow, keyed by `WorkflowId`.
 ///
 /// The steps are held in the caller's own order — a workflow runs its steps in the
@@ -1267,6 +1329,21 @@ pub fn merge_s3_storage_options(
     }))
 }
 
+/// The genuine fingerprint and SSH algorithm name of private key MATERIAL a caller
+/// supplied, when the material is a key the emulator can read.
+///
+/// `None` for material in a format the emulator cannot read: it implements no
+/// private-key format other than OpenSSH's (what `ssh-keygen` writes) and serves no
+/// SSH transport, so there is nothing to compute a fingerprint or an algorithm name
+/// from — and neither may be invented for material nothing parsed.
+pub fn read_host_key(material: &str) -> Option<(String, String)> {
+    let key = ::ssh_key::PrivateKey::from_openssh(material).ok()?;
+    Some((
+        key.fingerprint(::ssh_key::HashAlg::Sha256).to_string(),
+        key.algorithm().as_str().to_string(),
+    ))
+}
+
 /// Mint a host key for a new server and return its Base64 SHA256 fingerprint.
 ///
 /// AWS generates a host key for a server whose host key it manages, and reports that
@@ -1296,9 +1373,7 @@ pub fn mint_host_key_fingerprint() -> String {
 /// transport): the server then keeps the host key it already has, whose genuine
 /// fingerprint it reports, rather than one invented for material nothing read.
 pub fn supplied_host_key_fingerprint(material: &str) -> Option<String> {
-    ::ssh_key::PrivateKey::from_openssh(material)
-        .ok()
-        .map(|key| key.fingerprint(::ssh_key::HashAlg::Sha256).to_string())
+    read_host_key(material).map(|(fingerprint, _algorithm)| fingerprint)
 }
 
 // =============================================================================
@@ -1754,6 +1829,9 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// Users by `(ServerId, UserName)`, so one server's users are a contiguous,
     /// ordered range for `ListUsers`.
     pub users: BTreeMap<(String, String), User>,
+    /// Host keys by `(ServerId, HostKeyId)`, so one server's keys are a contiguous,
+    /// ordered range for `ListHostKeys`.
+    pub host_keys: BTreeMap<(String, String), HostKey>,
     /// Connectors by `ConnectorId` (`"c-" + 17 hex`). `BTreeMap` for the same reason
     /// as [`Self::servers`]: `ListConnectors` pages it in a stable, resumable order.
     /// BOUNDED by [`MAX_STORED_CONNECTORS`], which
@@ -1795,6 +1873,25 @@ impl ComAmazonawsTransferTransferserviceState {
             .range((Bound::Included(lower), Bound::Unbounded))
             .take_while(move |((sid, _), _)| sid == server_id)
             .map(|(_, user)| user)
+    }
+
+    /// The host keys stored for `server_id`, in `ListHostKeys` paging order.
+    ///
+    /// A RANGE scan over that server's contiguous run of the key map, on the same rule
+    /// as [`Self::users_of`].
+    pub fn host_keys_of<'a>(&'a self, server_id: &'a str) -> impl Iterator<Item = &'a HostKey> + 'a {
+        use ::std::ops::Bound;
+        let lower = (server_id.to_string(), String::new());
+        self.host_keys
+            .range((Bound::Included(lower), Bound::Unbounded))
+            .take_while(move |((sid, _), _)| sid == server_id)
+            .map(|(_, host_key)| host_key)
+    }
+
+    /// Whether `server_id` can take another host key, i.e. is below
+    /// [`MAX_HOST_KEYS_PER_SERVER`].
+    pub fn server_has_host_key_capacity(&self, server_id: &str) -> bool {
+        self.host_keys_of(server_id).count() < MAX_HOST_KEYS_PER_SERVER
     }
 
     /// `UserCount`: the live number of users assigned to `server_id`.
@@ -1897,6 +1994,20 @@ pub fn user_arn(region: &str, server_id: &str, user_name: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("user/{server_id}/{user_name}"),
+    )
+}
+
+/// `arn:aws:transfer:<region>:<account>:host-key/<ServerId>/<HostKeyId>`.
+///
+/// The model declares no `aws.api#arn` template for a host key, so this follows the
+/// shape its templates give every OTHER resource a server owns —
+/// `user/{ServerId}/{UserName}`, `agreement/{ServerId}/{AgreementId}` — with the
+/// resource name the API uses for this one.
+pub fn host_key_arn(region: &str, server_id: &str, host_key_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("host-key/{server_id}/{host_key_id}"),
     )
 }
 
