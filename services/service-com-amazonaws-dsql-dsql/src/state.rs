@@ -6,12 +6,13 @@
 //! map of clusters keyed by their 26-character identifier, plus the two
 //! bookkeeping maps the cluster lifecycle needs: the retired (deleted) clusters
 //! a repeated `@idempotent` `DeleteCluster` must still answer from, and the
-//! `clientToken` -> identifier bindings that make `CreateCluster` idempotent.
+//! `clientToken` ledgers that make every `@idempotencyToken`-carrying operation
+//! idempotent.
 //!
 //! Besides the data, this module owns the few derivations every cluster handler
 //! shares — the request's region, the cluster ARN, the connection endpoint, the
-//! encryption details and the modelled "no such cluster" error — so the five
-//! handlers compute them one way rather than five.
+//! encryption details and the modelled "no such resource" errors — so the
+//! handlers compute them one way rather than once each.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::sha2::{Digest, Sha256};
 
-use crate::ops::types::{EncryptionDetails, MultiRegionProperties, ResourceNotFoundException};
+use crate::ops::types::{
+    EncryptionDetails, MultiRegionProperties, ResourceNotFoundException, TargetDefinition,
+};
 
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
 /// the enum spells them on the wire (`smithy_query(query="shape",
@@ -37,9 +40,15 @@ pub const STATUS_DELETING: &str = "DELETING";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETED: &str = "DELETED";
 
+/// The `StreamStatus` values a stream is driven through, spelled as the enum
+/// spells them on the wire (`smithy_query(query="shape", shape="StreamStatus")`:
+/// ACTIVE | CREATING | DELETED | DELETING | FAILED | IMPAIRED).
+pub const STREAM_STATUS_CREATING: &str = "CREATING";
+/// See [`STREAM_STATUS_CREATING`].
+pub const STREAM_STATUS_ACTIVE: &str = "ACTIVE";
+
 /// `EncryptionType` values (`smithy_query(query="shape", shape="EncryptionType")`).
-pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
-/// See [`ENCRYPTION_AWS_OWNED`].
+pub const ENCRYPTION_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";/// See [`ENCRYPTION_AWS_OWNED`].
 pub const ENCRYPTION_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED_KMS_KEY";
 /// `EncryptionStatus` value for a cluster whose encryption is in place
 /// (`smithy_query(query="shape", shape="EncryptionStatus")`).
@@ -56,6 +65,16 @@ pub const ARN_SERVICE: &str = "dsql";
 /// The resource-type segment of a cluster ARN (`...:cluster/{identifier}`), and
 /// the `resourceType` a cluster's `ResourceNotFoundException` carries.
 pub const RESOURCE_TYPE_CLUSTER: &str = "cluster";
+
+/// The resource-type segment of a stream ARN
+/// (`...:cluster/{cluster}/stream/{stream}`), and the `resourceType` a stream's
+/// `ResourceNotFoundException` carries.
+pub const RESOURCE_TYPE_STREAM: &str = "stream";
+
+/// The `resourceType` the `ResourceNotFoundException` of a cluster's
+/// resource-based policy carries. A policy has no ARN of its own: it is addressed
+/// by the cluster's identifier.
+pub const RESOURCE_TYPE_POLICY: &str = "policy";
 
 /// How long a cluster stays in a transient status (`CREATING`, `UPDATING`,
 /// `DELETING`) before the clock settles it into its terminal one.
@@ -74,6 +93,39 @@ pub struct PendingTransition {
     pub due_at: SystemTime,
     /// The `ClusterStatus` the cluster holds from `due_at` on.
     pub next_status: &'static str,
+}
+
+/// The resource-based policy attached to a cluster: the document the caller
+/// supplied and the version token `PutClusterPolicy` answered with.
+#[derive(Debug, Clone)]
+pub struct ClusterPolicy {
+    /// The `PolicyDocument` verbatim.
+    pub document: String,
+    /// The `PolicyVersion` token this document was stored under.
+    pub version: String,
+}
+
+/// One persisted change data capture (CDC) stream of a cluster.
+#[derive(Debug, Clone)]
+pub struct Stream {
+    /// The 26-character lowercase identifier (`StreamId`).
+    pub stream_identifier: String,
+    /// The stream ARN, as [`stream_arn`] builds it.
+    pub arn: String,
+    /// The current `StreamStatus`.
+    pub status: String,
+    /// When `CreateStream` minted this stream.
+    pub creation_time: SystemTime,
+    /// The `StreamOrdering` the caller asked for.
+    pub ordering: String,
+    /// The `StreamFormat` the caller asked for.
+    pub format: String,
+    /// Where the stream writes its records.
+    pub target_definition: TargetDefinition,
+    /// The stream's tags. Sorted so a read is deterministic.
+    pub tags: BTreeMap<String, String>,
+    /// The status change the clock owes this stream, if any.
+    pub pending: Option<PendingTransition>,
 }
 
 /// One persisted Aurora DSQL cluster.
@@ -99,10 +151,16 @@ pub struct Cluster {
     pub endpoint: Option<String>,
     /// The cluster's tags. Sorted so a read is deterministic.
     pub tags: BTreeMap<String, String>,
-    /// The resource-based policy document, if one was supplied.
-    pub policy: Option<String>,
-    /// The version of the stored policy, if one was supplied.
-    pub policy_version: Option<String>,
+    /// The resource-based policy currently attached, if any.
+    pub policy: Option<ClusterPolicy>,
+    /// How many policy versions this cluster has ever issued, so a version token
+    /// is never reused after a policy is deleted and another attached — an
+    /// `expectedPolicyVersion` from the first policy cannot match the second.
+    pub policy_versions_issued: u64,
+    /// The cluster's CDC streams, keyed by `StreamId`. Bounded by
+    /// [`MAX_STREAMS_PER_CLUSTER`], which `CreateStream` checks before it
+    /// inserts.
+    pub streams: BTreeMap<String, Stream>,
     /// The status change the clock owes this cluster, if any.
     pub pending: Option<PendingTransition>,
     /// The `clientToken` of the `DeleteCluster` call that retired this cluster,
@@ -116,6 +174,13 @@ impl Cluster {
     /// its way out (`DELETING`) is not.
     pub fn accepts_mutation(&self) -> bool {
         self.status == STATUS_ACTIVE || self.status == STATUS_IDLE
+    }
+
+    /// Mint the next unused `PolicyVersion` token for this cluster and record
+    /// that it was issued.
+    pub fn next_policy_version(&mut self) -> String {
+        self.policy_versions_issued += 1;
+        self.policy_versions_issued.to_string()
     }
 }
 
@@ -137,18 +202,226 @@ pub const MAX_CLUSTERS: usize = 100;
 /// live cluster.
 pub const MAX_RETIRED_CLUSTERS: usize = MAX_CLUSTERS;
 
-/// The most `clientToken` entries kept for `CreateCluster` idempotency.
+/// The most `clientToken` entries one ledger keeps.
 ///
-/// At most one token is recorded per stored cluster, and a token is dropped with
-/// the cluster it minted, so this cap is never the binding one in practice; it is
-/// enforced anyway, by evicting the oldest token, so the map cannot accumulate
-/// caller-chosen strings independently of the clusters they name.
-pub const MAX_CREATE_TOKENS: usize = MAX_CLUSTERS;
+/// At most one token is recorded per call that carried one, and a token is
+/// dropped with the resource it names, so this cap is rarely the binding one; it
+/// is enforced anyway, by evicting the oldest token, so a ledger cannot
+/// accumulate caller-chosen strings without bound.
+pub const MAX_CLIENT_TOKENS: usize = MAX_CLUSTERS;
+
+/// The cap on `CreateCluster`'s ledger, named for the operation; every ledger
+/// shares [`MAX_CLIENT_TOKENS`].
+pub const MAX_CREATE_TOKENS: usize = MAX_CLIENT_TOKENS;
+
+/// The most CDC streams one cluster holds.
+///
+/// A ceiling this emulator CHOOSES for the same reason as [`MAX_CLUSTERS`]:
+/// every stream lives in memory for the life of the process. `CreateStream`
+/// models `ServiceQuotaExceededException`, which is the refusal once a cluster's
+/// stream table is full.
+pub const MAX_STREAMS_PER_CLUSTER: usize = 20;
+
+/// Which operation's `clientToken`s a ledger holds. One ledger per operation, so
+/// the same token used on two different operations is two separate requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenScope {
+    /// `CreateCluster.clientToken`.
+    CreateCluster,
+    /// `UpdateCluster.clientToken`.
+    UpdateCluster,
+    /// `CreateStream.clientToken`.
+    CreateStream,
+    /// `PutClusterPolicy.clientToken`.
+    PutClusterPolicy,
+    /// `DeleteClusterPolicy.clientToken`.
+    DeleteClusterPolicy,
+}
+
+impl TokenScope {
+    /// Every scope, in ledger order. The array the state holds is indexed by
+    /// this order, so the two cannot drift.
+    pub const ALL: [TokenScope; 5] = [
+        TokenScope::CreateCluster,
+        TokenScope::UpdateCluster,
+        TokenScope::CreateStream,
+        TokenScope::PutClusterPolicy,
+        TokenScope::DeleteClusterPolicy,
+    ];
+
+    /// This scope's slot in the state's ledger array.
+    fn index(self) -> usize {
+        match self {
+            TokenScope::CreateCluster => 0,
+            TokenScope::UpdateCluster => 1,
+            TokenScope::CreateStream => 2,
+            TokenScope::PutClusterPolicy => 3,
+            TokenScope::DeleteClusterPolicy => 4,
+        }
+    }
+}
+
+/// What a `clientToken` the ledger may already hold means for the call carrying
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenVerdict {
+    /// The token has not been used on this operation: serve the request.
+    Unused,
+    /// The token was used with the SAME parameters: this is a retry of that
+    /// request, so answer from the resource it names and have no further effect.
+    Replay(String),
+    /// The token was used with DIFFERENT parameters: refuse with the
+    /// operation's `ConflictException`.
+    Mismatch,
+}
+
+/// One recorded use of a `clientToken`.
+#[derive(Debug, Clone)]
+struct TokenEntry {
+    /// [`request_fingerprint`] of the parameters the first call carried.
+    fingerprint: String,
+    /// The resource that call acted on, as the handler names it.
+    resource: String,
+}
+
+/// The `clientToken`s one operation has already served, bounded by
+/// [`MAX_CLIENT_TOKENS`].
+#[derive(Debug, Default)]
+pub struct TokenLedger {
+    entries: HashMap<String, TokenEntry>,
+    /// Insertion order, so the cap evicts the oldest token rather than an
+    /// arbitrary one.
+    order: VecDeque<String>,
+}
+
+impl TokenLedger {
+    /// What `token` means for a call carrying `fingerprint`.
+    pub fn verdict(&self, token: &str, fingerprint: &str) -> TokenVerdict {
+        match self.entries.get(token) {
+            None => TokenVerdict::Unused,
+            Some(entry) if entry.fingerprint == fingerprint => {
+                TokenVerdict::Replay(entry.resource.clone())
+            }
+            Some(_) => TokenVerdict::Mismatch,
+        }
+    }
+
+    /// Record that `token` served a request with `fingerprint` against
+    /// `resource`, evicting the oldest token first if that would push the ledger
+    /// past [`MAX_CLIENT_TOKENS`].
+    pub fn record(&mut self, token: String, fingerprint: String, resource: &str) {
+        while self.entries.len() >= MAX_CLIENT_TOKENS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.entries.remove(&oldest);
+                }
+                // The order queue and the map are written together, so this is
+                // unreachable; clearing rather than looping forever keeps the
+                // cap an invariant even if they ever drift.
+                None => {
+                    self.entries.clear();
+                    break;
+                }
+            }
+        }
+        let entry = TokenEntry {
+            fingerprint,
+            resource: resource.to_string(),
+        };
+        if self.entries.insert(token.clone(), entry).is_none() {
+            self.order.push_back(token);
+        }
+    }
+
+    /// How many tokens the ledger holds.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the ledger holds no tokens.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Drop every token recorded against `resource`, so a token never outlives
+    /// the resource it names.
+    pub fn forget(&mut self, resource: &str) {
+        self.entries.retain(|_, entry| entry.resource != resource);
+        let live = &self.entries;
+        self.order.retain(|token| live.contains_key(token));
+    }
+}
+
+/// A fingerprint of the parameters a `clientToken` was first used with.
+///
+/// The `@idempotencyToken` contract compares the WHOLE request, so a handler
+/// renders every member it honours into `parts` (in a fixed order, maps and
+/// lists sorted) and this hashes them into one comparable value. Hashed rather
+/// than stored verbatim so a ledger entry's size does not grow with the request
+/// it describes.
+pub fn request_fingerprint(parts: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        // The length prefix keeps the parts unambiguous: without it
+        // ["a", "bc"] and ["ab", "c"] hash alike.
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    ::hex::encode(hasher.finalize())
+}
+
+/// Render a tag map into one fingerprint part, in key order.
+pub fn fingerprint_tags(tags: Option<&std::collections::HashMap<String, String>>) -> String {
+    let sorted: BTreeMap<&str, &str> = tags
+        .map(|tags| {
+            tags.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    sorted
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Render `multiRegionProperties` into one fingerprint part, peer clusters in
+/// sorted order (the member is a set of peers, so the order a caller sends them
+/// in is not part of the request's meaning).
+pub fn fingerprint_multi_region(properties: Option<&MultiRegionProperties>) -> String {
+    match properties {
+        None => String::new(),
+        Some(properties) => {
+            let mut clusters: Vec<&str> = properties
+                .clusters
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            clusters.sort_unstable();
+            format!(
+                "witness={};clusters={}",
+                properties.witness_region.as_deref().unwrap_or_default(),
+                clusters.join(",")
+            )
+        }
+    }
+}
+
+/// The message every `@idempotencyToken` operation refuses a token reuse with.
+///
+/// The token names a request, so reusing it for a DIFFERENT request is a
+/// conflict rather than a retry; AWS states it with this sentence.
+pub const CLIENT_TOKEN_MISMATCH_MESSAGE: &str =
+    "Requests using a client token should supply identical request parameters";
 
 /// Per-service state for com-amazonaws-dsql-dsql. A handler reaches it through [`service_state`].
 ///
 /// Every collection here is caller-driven and therefore BOUNDED: see
-/// [`MAX_CLUSTERS`], [`MAX_RETIRED_CLUSTERS`] and [`MAX_CREATE_TOKENS`].
+/// [`MAX_CLUSTERS`], [`MAX_RETIRED_CLUSTERS`], [`MAX_CLIENT_TOKENS`] and
+/// [`MAX_STREAMS_PER_CLUSTER`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDsqlDsqlState {
     /// Live clusters, keyed by identifier. A `BTreeMap` because `ListClusters`
@@ -164,47 +437,69 @@ pub struct ComAmazonawsDsqlDsqlState {
     /// The order [`Self::retired_clusters`] was written in, so the cap evicts the
     /// oldest tombstone rather than an arbitrary one.
     retired_order: VecDeque<String>,
-    /// `CreateCluster` `clientToken` -> the identifier that call minted. Bounded
-    /// by [`MAX_CREATE_TOKENS`]; write it through [`Self::record_create_token`],
-    /// never directly.
-    pub create_client_tokens: HashMap<String, String>,
-    /// The order [`Self::create_client_tokens`] was written in, so the cap evicts
-    /// the oldest token rather than an arbitrary one.
-    create_token_order: VecDeque<String>,
+    /// One `clientToken` ledger per [`TokenScope`], reached through
+    /// [`Self::tokens`] / [`Self::tokens_of`].
+    tokens: [TokenLedger; TokenScope::ALL.len()],
 }
 
 impl ComAmazonawsDsqlDsqlState {
+    /// The `clientToken` ledger of `scope`, for writing.
+    pub fn tokens(&mut self, scope: TokenScope) -> &mut TokenLedger {
+        &mut self.tokens[scope.index()]
+    }
+
+    /// The `clientToken` ledger of `scope`, for reading.
+    pub fn tokens_of(&self, scope: TokenScope) -> &TokenLedger {
+        &self.tokens[scope.index()]
+    }
+
     /// Materialise every status change the clock already owes at `now`.
     ///
     /// Called by reporting operations too: it writes nothing a caller asked for,
     /// only what was already due at this instant even if nobody had called.
     ///
     /// The scan is over [`Self::clusters`], which is capped at [`MAX_CLUSTERS`],
-    /// so the per-request cost and the critical section it runs in are bounded by
-    /// a constant rather than by anything a caller can grow. Nothing is allocated
+    /// and each cluster's streams, capped at [`MAX_STREAMS_PER_CLUSTER`], so the
+    /// per-request cost and the critical section it runs in are bounded by a
+    /// constant rather than by anything a caller can grow. Nothing is allocated
     /// unless a transition is actually due.
     pub fn settle(&mut self, now: SystemTime) {
-        let is_due = |cluster: &Cluster| {
-            cluster
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.due_at <= now)
+        let is_due = |pending: &Option<PendingTransition>| {
+            pending.as_ref().is_some_and(|pending| pending.due_at <= now)
         };
-        if !self.clusters.values().any(is_due) {
+        let anything_due = self.clusters.values().any(|cluster| {
+            is_due(&cluster.pending)
+                || cluster
+                    .streams
+                    .values()
+                    .any(|stream| is_due(&stream.pending))
+        });
+        if !anything_due {
             return;
         }
 
-        let due: Vec<String> = self
-            .clusters
-            .iter()
-            .filter(|(_, cluster)| is_due(cluster))
-            .map(|(identifier, _)| identifier.clone())
-            .collect();
+        // Every cluster is visited, because a settled stream transition can be
+        // owed to a cluster that owes none itself.
+        let identifiers: Vec<String> = self.clusters.keys().cloned().collect();
 
-        for identifier in due {
+        for identifier in identifiers {
             let Some(cluster) = self.clusters.get_mut(&identifier) else {
                 continue;
             };
+            for stream in cluster.streams.values_mut() {
+                let settled = stream
+                    .pending
+                    .as_ref()
+                    .filter(|pending| pending.due_at <= now)
+                    .map(|pending| pending.next_status);
+                if let Some(next_status) = settled {
+                    stream.status = next_status.to_string();
+                    stream.pending = None;
+                }
+            }
+            if !is_due(&cluster.pending) {
+                continue;
+            }
             let Some(pending) = cluster.pending.take() else {
                 continue;
             };
@@ -213,7 +508,7 @@ impl ComAmazonawsDsqlDsqlState {
             // `ResourceNotFoundException` and `ListClusters` stops listing it.
             if pending.next_status == STATUS_DELETED {
                 if let Some(retired) = self.clusters.remove(&identifier) {
-                    self.forget_create_tokens_for(&identifier);
+                    self.forget_tokens_for(&identifier);
                     self.retire(identifier, retired);
                 }
             }
@@ -222,12 +517,12 @@ impl ComAmazonawsDsqlDsqlState {
 
     /// Mint a fresh, unused cluster identifier.
     ///
-    /// The shape comes from [`new_cluster_identifier`]; the loop re-draws rather
+    /// The shape comes from [`new_resource_identifier`]; the loop re-draws rather
     /// than ever handing back an identifier this store already holds, live or
     /// retired.
     pub fn mint_cluster_identifier(&mut self) -> String {
         loop {
-            let candidate = new_cluster_identifier();
+            let candidate = new_resource_identifier();
             if !self.clusters.contains_key(&candidate)
                 && !self.retired_clusters.contains_key(&candidate)
             {
@@ -236,40 +531,12 @@ impl ComAmazonawsDsqlDsqlState {
         }
     }
 
-    /// Record `token` as having minted `identifier`, evicting the oldest token
-    /// first if that would push the map past [`MAX_CREATE_TOKENS`].
-    pub fn record_create_token(&mut self, token: String, identifier: &str) {
-        while self.create_client_tokens.len() >= MAX_CREATE_TOKENS {
-            match self.create_token_order.pop_front() {
-                Some(oldest) => {
-                    self.create_client_tokens.remove(&oldest);
-                }
-                // The order queue and the map are written together, so this is
-                // unreachable; clearing rather than looping forever keeps the cap
-                // an invariant even if they ever drift.
-                None => {
-                    self.create_client_tokens.clear();
-                    break;
-                }
-            }
+    /// Drop every idempotency token recorded against `resource` in every ledger,
+    /// so a token never outlives the resource it names.
+    fn forget_tokens_for(&mut self, resource: &str) {
+        for scope in TokenScope::ALL {
+            self.tokens(scope).forget(resource);
         }
-        if self
-            .create_client_tokens
-            .insert(token.clone(), identifier.to_string())
-            .is_none()
-        {
-            self.create_token_order.push_back(token);
-        }
-    }
-
-    /// Drop every idempotency token that minted `identifier`, so a token never
-    /// outlives the cluster it names.
-    fn forget_create_tokens_for(&mut self, identifier: &str) {
-        self.create_client_tokens
-            .retain(|_, minted| minted != identifier);
-        let live = &self.create_client_tokens;
-        self.create_token_order
-            .retain(|token| live.contains_key(token));
     }
 
     /// Keep `cluster` as a delete-idempotency tombstone, evicting the oldest one
@@ -280,7 +547,7 @@ impl ComAmazonawsDsqlDsqlState {
                 Some(oldest) => {
                     self.retired_clusters.remove(&oldest);
                 }
-                // Same invariant as `record_create_token`: unreachable, and
+                // Same invariant as `TokenLedger::record`: unreachable, and
                 // clearing keeps the cap rather than spinning.
                 None => {
                     self.retired_clusters.clear();
@@ -386,6 +653,21 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
     })
 }
 
+/// The ARN of a stream of a cluster:
+/// `arn:aws:dsql:{region}:{account}:cluster/{cluster}/stream/{stream}`, which is
+/// what `StreamArn`'s pattern
+/// (`^arn:aws(-[^:]+)?:dsql:[a-z0-9-]{1,20}:[0-9]{12}:cluster/[a-z0-9]{26}/stream/[a-z0-9]{26}$`,
+/// `smithy_query(query="shape", shape="StreamArn")`) accepts.
+pub fn stream_arn(region: &str, cluster_identifier: &str, stream_identifier: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{RESOURCE_TYPE_CLUSTER}/{cluster_identifier}/{RESOURCE_TYPE_STREAM}/{stream_identifier}"
+        ),
+    )
+}
+
 /// The connection endpoint of a cluster, in Aurora DSQL's own form
 /// (`{identifier}.dsql.{region}.on.aws`), which satisfies `Endpoint`'s
 /// `^[a-zA-Z0-9.-]+$`.
@@ -426,17 +708,17 @@ fn kms_key_arn(region: &str, kms_encryption_key: &str) -> String {
     }
 }
 
-/// A fresh cluster identifier: a ULID, lowercased.
+/// A fresh cluster or stream identifier: a ULID, lowercased.
 ///
 /// A ULID is a 48-bit millisecond timestamp followed by 80 bits of entropy,
 /// rendered in Crockford base32 — 26 characters, which is the form Aurora DSQL
-/// cluster ids take and which satisfies `ClusterId`'s `^[a-z0-9]{26}$`. The
-/// timestamp leads, so ULIDs sort in creation order and the identifier order
-/// `ListClusters` pages over is creation order.
+/// cluster and stream ids take and which satisfies `ClusterId`'s and `StreamId`'s
+/// `^[a-z0-9]{26}$`. The timestamp leads, so ULIDs sort in creation order and the
+/// identifier order `ListClusters` pages over is creation order.
 ///
 /// Prefer [`ComAmazonawsDsqlDsqlState::mint_cluster_identifier`], which re-draws
 /// rather than ever handing back an id already in use.
-pub fn new_cluster_identifier() -> String {
+pub fn new_resource_identifier() -> String {
     /// Distinguishes two ids minted inside the same nanosecond.
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -477,19 +759,77 @@ fn crockford_base32(value: u128) -> String {
         .collect()
 }
 
-/// The modelled `ResourceNotFoundException` for a cluster this service does not
-/// hold.
-pub fn cluster_not_found(identifier: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_CLUSTER, identifier)
-}
-
-/// The modelled `ResourceNotFoundException` for any resource of this service that
-/// the store does not hold. Every member of the shape is `@required`, so all three
-/// are filled.
-pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
+/// The modelled `ResourceNotFoundException` for a resource this service does not
+/// hold, worded the way AWS words it: the message NAMES THE ARN the call
+/// addressed, which is how a caller learns which resource was missing. Every
+/// member of the shape is `@required`, so all three are filled.
+pub fn resource_not_found(
+    arn: &str,
+    resource_id: &str,
+    resource_type: &str,
+) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{resource_type} {resource_id} not found"),
+        message: format!("The resource with ARN {arn} doesn't exist. Verify the ARN and try again."),
         resource_id: resource_id.to_string(),
         resource_type: resource_type.to_string(),
     }
 }
+
+/// The modelled `ResourceNotFoundException` for a cluster this service does not
+/// hold: [`resource_not_found`] over the ARN the addressed identifier has in the
+/// request's own region.
+pub fn cluster_not_found(region: &str, identifier: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        &cluster_arn(region, identifier),
+        identifier,
+        RESOURCE_TYPE_CLUSTER,
+    )
+}
+
+/// The modelled `ResourceNotFoundException` for a stream a cluster does not hold.
+pub fn stream_not_found(
+    region: &str,
+    cluster_identifier: &str,
+    stream_identifier: &str,
+) -> ResourceNotFoundException {
+    resource_not_found(
+        &stream_arn(region, cluster_identifier, stream_identifier),
+        stream_identifier,
+        RESOURCE_TYPE_STREAM,
+    )
+}
+
+/// The modelled `ResourceNotFoundException` for a cluster that has no
+/// resource-based policy attached.
+///
+/// A policy is not an ARN-addressed resource of its own — the call addresses it
+/// by the cluster's identifier — so this is the sentence AWS words that case
+/// with, built from the identifier the request carried.
+pub fn cluster_policy_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "Aurora DSQL can't find the policy for the resource {identifier}. \
+             Verify that the policy exists."
+        ),
+        resource_id: identifier.to_string(),
+        resource_type: RESOURCE_TYPE_POLICY.to_string(),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` for a call that named a policy
+/// version the cluster does not hold (including the version of a policy that is
+/// already gone).
+pub fn cluster_policy_version_not_found(
+    identifier: &str,
+    expected_version: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "Aurora DSQL can't find policy version {expected_version} for resource {identifier}. \
+             Verify that the policy exists and that the version is correct."
+        ),
+        resource_id: identifier.to_string(),
+        resource_type: RESOURCE_TYPE_POLICY.to_string(),
+    }
+}
+

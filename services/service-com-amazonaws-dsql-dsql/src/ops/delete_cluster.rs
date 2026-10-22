@@ -5,9 +5,11 @@
 //! Retires the persisted cluster named by the `@httpLabel` `identifier`: it reports
 //! `DELETING` and the clock removes it, so a later `GetCluster` answers
 //! `ResourceNotFoundException` and `ListClusters` stops listing it. A cluster with
-//! deletion protection enabled is refused with `ConflictException` (409); an unknown
-//! identifier with `ResourceNotFoundException` (404). `@idempotent`: a retry carrying
-//! the same `client-token` answers from the retired cluster rather than 404.
+//! deletion protection enabled is refused with `ValidationException` (400) — the
+//! condition is permanent until the caller changes the cluster, not a transient
+//! conflict; an unknown identifier with `ResourceNotFoundException` (404).
+//! `@idempotent`: a retry carrying the same `client-token` answers from the retired
+//! cluster rather than 404.
 //!
 //! ## Shape of an operation
 //!
@@ -97,15 +99,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // widened in with `extra_errors`: the service declares it for every operation (its
 // `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
 // per-operation list the macro checks against does not repeat it.
+// `ValidationException` is widened in for the same reason: it is one of this
+// service's `common_errors` (AccessDenied / InternalServer / Throttling /
+// Validation), so `DeleteCluster` answers it even though its per-operation error
+// list does not repeat it — and an input-constraint refusal (deletion protection
+// is enabled) is a `ValidationException`, not a transient conflict.
 #[smithy_macros::operation_error(
     "com.amazonaws.dsql#DeleteCluster",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum DeleteClusterErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteClusterErrorModeled::InternalServerException(
                 InternalServerException {
@@ -170,6 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
         state.settle(now);
@@ -188,22 +196,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Ok(delete_cluster_output(retired));
             }
             return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
-                crate::state::cluster_not_found(&input.identifier),
+                crate::state::cluster_not_found(&region, &input.identifier),
             )
             .into());
         };
 
         // Deletion protection is exactly what it says: the cluster cannot be deleted
         // until the property is disabled.
+        //
+        // This is an INPUT-CONSTRAINT refusal, not a transient conflict: it is
+        // permanent until the caller changes the cluster, so it answers 400
+        // `ValidationException` with the `deletionProtectionEnabled` reason the
+        // model carries for exactly this case — a 409 would tell a retry loop keyed
+        // on the code to try again, forever.
         if cluster.deletion_protection_enabled {
-            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} cannot be deleted while deletion protection is enabled",
-                    cluster.identifier
-                ),
-                resource_id: Some(cluster.identifier.clone()),
-                resource_type: Some("cluster".to_string()),
-            })
+            return Err(DeleteClusterErrorModeled::ValidationException(
+                ValidationException {
+                    message: "Can't delete cluster: Deletion protection is enabled. \
+                              To proceed, disable deletion protection and try again."
+                        .to_string(),
+                    reason: DELETION_PROTECTION_ENABLED.to_string(),
+                    field_list: None,
+                },
+            )
             .into());
         }
 
@@ -234,6 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(delete_cluster_output(cluster))
     }
 }
+
+/// The `ValidationExceptionReason` for a refusal caused by the cluster's
+/// deletion-protection setting (`smithy_query(query="shape",
+/// shape="ValidationExceptionReason")`: unknownOperation | cannotParse |
+/// fieldValidationFailed | deletionProtectionEnabled | other).
+const DELETION_PROTECTION_ENABLED: &str = "deletionProtectionEnabled";
 
 /// `DeleteClusterOutput` read off the stored cluster the call retired.
 fn delete_cluster_output(cluster: &crate::state::Cluster) -> DeleteClusterOutput {

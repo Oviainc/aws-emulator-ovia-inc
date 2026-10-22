@@ -3,8 +3,13 @@
 //! @op GetCustomAction
 //! Implemented: answers the custom action stored under `CustomActionArn`, projected
 //! through [`crate::state::CustomActionRecord::view`], so it reports exactly what the
-//! create (or a later update) left in the store. An ARN the store does not hold is a
-//! 404 `ResourceNotFoundException`.
+//! create (or a later update) left in the store.
+//!
+//! An ARN the store does not hold is refused with the modelled 403 `UnauthorizedException`,
+//! NOT a 404: AWS Chatbot decides a custom-action request against the ARN it names BEFORE
+//! any existence lookup, so the answer discloses nothing about whether the action exists.
+//! See [`crate::state::ChatbotResourceKind::CustomAction`], which the tagging operations
+//! answer a custom-action ARN through for the same reason.
 //!
 //! `@readonly`: it reads the store and writes nothing. An ARN fully qualifies an action,
 //! its region included, so the lookup is by ARN alone and the signing region does not
@@ -153,15 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
+        // Fail closed: the authorization decision is made against the requested ARN before
+        // the store is consulted, so an ARN this account holds no custom action for is an
+        // authorization failure and never a 404 — the answer must not disclose whether the
+        // action exists. The ARN fully qualifies the action, its region included, so the
+        // signing region is not part of the lookup.
         let record = store
             .custom_actions
             .get(&input.custom_action_arn)
             .ok_or_else(|| {
-                GetCustomActionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "no custom action with ARN {}",
-                        input.custom_action_arn
-                    )),
+                GetCustomActionErrorModeled::UnauthorizedException(UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
                 })
             })?;
 

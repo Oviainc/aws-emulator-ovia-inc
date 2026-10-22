@@ -4,7 +4,8 @@
 //!
 //! This is the single store every handler in `src/ops/` reads and writes: the
 //! applications, the application versions and the environments the lifecycle
-//! operations create, describe and delete. It also owns the few derivations all
+//! operations create, describe and delete, plus the managed platform branch
+//! catalog the service publishes. It also owns the few derivations all
 //! of them share — the server clock, the request's region, this service's ARN
 //! forms, and the clock-owed environment status transitions — so no handler
 //! spells one of them a second way.
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
-    ConfigurationOptionSetting, EnvironmentTier, S3Location, Tag,
+    ConfigurationOptionSetting, EnvironmentTier, PlatformBranchSummary, S3Location, Tag,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -64,6 +65,30 @@ pub const HEALTH_GREEN: &str = "Green";
 pub const HEALTH_STATUS_PENDING: &str = "Pending";
 /// See [`HEALTH_STATUS_PENDING`].
 pub const HEALTH_STATUS_OK: &str = "Ok";
+
+/// The support life-cycle states a platform branch reports, from
+/// `PlatformBranchSummary$LifecycleState`'s own documentation ("Possible values:
+/// `beta` | `supported` | `deprecated` | `retired`"). The model types that
+/// member as a plain string with no enum trait, so the value set is named here.
+/// Sorted, so a message that lists them reads the same every time.
+pub const PLATFORM_BRANCH_LIFECYCLE_STATES: &[&str] =
+    &["beta", "deprecated", "retired", "supported"];
+
+/// The environment tiers a platform branch can support, from
+/// `PlatformBranchSummary$SupportedTierList`'s documentation ("Possible values:
+/// `WebServer/Standard` | `Worker/SQS/HTTP`"). Also a plain string in the model.
+pub const SUPPORTED_TIERS: &[&str] = &[TIER_WEB_SERVER, TIER_WORKER];
+
+/// See [`SUPPORTED_TIERS`].
+pub const TIER_WEB_SERVER: &str = "WebServer/Standard";
+/// See [`SUPPORTED_TIERS`].
+pub const TIER_WORKER: &str = "Worker/SQS/HTTP";
+
+/// Both tiers, for the catalog table below.
+const BOTH_TIERS: &[&str] = &[TIER_WEB_SERVER, TIER_WORKER];
+/// Web server tier only (the Windows Server branches, which run no worker
+/// tier), for the catalog table below.
+const WEB_SERVER_ONLY: &[&str] = &[TIER_WEB_SERVER];
 
 /// The only `ApplicationVersionStatus` this service reports: it runs no version
 /// processing pipeline, so a stored version is never `Processing`/`Processed`.
@@ -211,6 +236,304 @@ impl ApplicationVersion {
             status: Some(self.status.clone()),
         }
     }
+}
+
+/// A platform branch: one line of the managed platform catalog Elastic
+/// Beanstalk publishes for an account in a region, which is what
+/// `ListPlatformBranches` reports.
+#[derive(Debug, Clone)]
+pub struct PlatformBranch {
+    pub platform_name: String,
+    pub branch_name: String,
+    /// One of [`PLATFORM_BRANCH_LIFECYCLE_STATES`].
+    pub lifecycle_state: String,
+    /// "A larger `BranchOrder` value designates a newer platform branch within
+    /// the platform."
+    pub branch_order: i32,
+    /// A subset of [`SUPPORTED_TIERS`].
+    pub supported_tiers: Vec<String>,
+}
+
+impl PlatformBranch {
+    /// The identity of a branch in the catalog: a branch name is unique within
+    /// its platform, so the pair is the store's key and the value a
+    /// `NextToken` names.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.platform_name, self.branch_name)
+    }
+
+    /// Whether `token` is this branch's [`Self::key`] — the same test, without
+    /// building the key, for the page-boundary scan.
+    pub fn has_key(&self, token: &str) -> bool {
+        token
+            .strip_prefix(self.platform_name.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|rest| rest == self.branch_name)
+    }
+
+    /// The modelled `PlatformBranchSummary` for this record.
+    pub fn to_summary(&self) -> PlatformBranchSummary {
+        PlatformBranchSummary {
+            platform_name: Some(self.platform_name.clone()),
+            branch_name: Some(self.branch_name.clone()),
+            lifecycle_state: Some(self.lifecycle_state.clone()),
+            branch_order: self.branch_order,
+            supported_tier_list: Some(self.supported_tiers.clone()),
+        }
+    }
+}
+
+/// The managed platform branches an account can see in a region, as
+/// `(PlatformName, BranchName, LifecycleState, BranchOrder, SupportedTierList)`.
+///
+/// Elastic Beanstalk's platform catalog is service-owned reference data, not
+/// something a caller creates, so it is seeded into the store by
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::default`] and
+/// read from there like any other record. The names and the solution-stack
+/// generations are Elastic Beanstalk's own published platform branches; the
+/// life-cycle states span all four of [`PLATFORM_BRANCH_LIFECYCLE_STATES`] and
+/// the tier lists both of [`SUPPORTED_TIERS`], because the real catalog does
+/// and a caller filtering on either must have something to match. Which
+/// generation sits in which state moves whenever AWS retires one, so this
+/// table is the emulator's catalog rather than a snapshot of any one day's.
+#[allow(clippy::type_complexity)]
+const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] = &[
+    // .NET on Linux.
+    (
+        ".NET Core on Linux",
+        ".NET 9 running on 64bit Amazon Linux 2023",
+        "beta",
+        2,
+        BOTH_TIERS,
+    ),
+    (
+        ".NET Core on Linux",
+        ".NET 8 running on 64bit Amazon Linux 2023",
+        "supported",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        ".NET Core on Linux",
+        ".NET Core running on 64bit Amazon Linux 2",
+        "deprecated",
+        0,
+        BOTH_TIERS,
+    ),
+    // .NET on Windows Server: no worker tier runs on Windows.
+    (
+        ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server 2019",
+        "supported",
+        1,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server Core 2016",
+        "retired",
+        0,
+        WEB_SERVER_ONLY,
+    ),
+    // Docker.
+    (
+        "Docker",
+        "Docker running on 64bit Amazon Linux 2023",
+        "supported",
+        2,
+        BOTH_TIERS,
+    ),
+    (
+        "Docker",
+        "Docker running on 64bit Amazon Linux 2",
+        "deprecated",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "Docker",
+        "Multi-container Docker running on 64bit Amazon Linux",
+        "retired",
+        0,
+        BOTH_TIERS,
+    ),
+    // Go.
+    (
+        "Go",
+        "Go 1 running on 64bit Amazon Linux 2023",
+        "supported",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "Go",
+        "Go 1 running on 64bit Amazon Linux 2",
+        "retired",
+        0,
+        BOTH_TIERS,
+    ),
+    // Java SE (Corretto).
+    (
+        "Corretto",
+        "Corretto 21 running on 64bit Amazon Linux 2023",
+        "supported",
+        2,
+        BOTH_TIERS,
+    ),
+    (
+        "Corretto",
+        "Corretto 17 running on 64bit Amazon Linux 2023",
+        "supported",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "Corretto",
+        "Corretto 11 running on 64bit Amazon Linux 2",
+        "deprecated",
+        0,
+        BOTH_TIERS,
+    ),
+    // Node.js.
+    (
+        "Node.js",
+        "Node.js 22 running on 64bit Amazon Linux 2023",
+        "supported",
+        3,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js 20 running on 64bit Amazon Linux 2023",
+        "supported",
+        2,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js 18 running on 64bit Amazon Linux 2023",
+        "deprecated",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js 16 running on 64bit Amazon Linux 2",
+        "retired",
+        0,
+        BOTH_TIERS,
+    ),
+    // PHP.
+    (
+        "PHP",
+        "PHP 8.4 running on 64bit Amazon Linux 2023",
+        "supported",
+        2,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 8.3 running on 64bit Amazon Linux 2023",
+        "supported",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 8.1 running on 64bit Amazon Linux 2",
+        "retired",
+        0,
+        BOTH_TIERS,
+    ),
+    // Python.
+    (
+        "Python",
+        "Python 3.13 running on 64bit Amazon Linux 2023",
+        "supported",
+        3,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.11 running on 64bit Amazon Linux 2023",
+        "supported",
+        2,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.9 running on 64bit Amazon Linux 2023",
+        "deprecated",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.8 running on 64bit Amazon Linux 2",
+        "retired",
+        0,
+        BOTH_TIERS,
+    ),
+    // Ruby.
+    (
+        "Ruby",
+        "Ruby 3.4 running on 64bit Amazon Linux 2023",
+        "supported",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 3.2 running on 64bit Amazon Linux 2023",
+        "deprecated",
+        0,
+        BOTH_TIERS,
+    ),
+    // Tomcat.
+    (
+        "Tomcat",
+        "Tomcat 10.1 with Corretto 21 running on 64bit Amazon Linux 2023",
+        "supported",
+        2,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 9 with Corretto 11 running on 64bit Amazon Linux 2023",
+        "supported",
+        1,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 8.5 with Corretto 11 running on 64bit Amazon Linux 2",
+        "retired",
+        0,
+        BOTH_TIERS,
+    ),
+];
+
+/// [`MANAGED_PLATFORM_BRANCHES`] as stored records, keyed by
+/// [`PlatformBranch::key`].
+fn managed_platform_branch_catalog() -> BTreeMap<String, PlatformBranch> {
+    MANAGED_PLATFORM_BRANCHES
+        .iter()
+        .map(
+            |(platform_name, branch_name, lifecycle_state, branch_order, supported_tiers)| {
+                let branch = PlatformBranch {
+                    platform_name: (*platform_name).to_string(),
+                    branch_name: (*branch_name).to_string(),
+                    lifecycle_state: (*lifecycle_state).to_string(),
+                    branch_order: *branch_order,
+                    supported_tiers: supported_tiers
+                        .iter()
+                        .map(|tier| (*tier).to_string())
+                        .collect(),
+                };
+                (branch.key(), branch)
+            },
+        )
+        .collect()
 }
 
 /// A status change the clock owes an environment: what it moves to, and when
@@ -378,7 +701,7 @@ macro_rules! environment_description {
 pub(crate) use environment_description;
 
 /// Per-service state for com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// Applications by `ApplicationName` (unique within an account).
     pub applications: BTreeMap<String, Application>,
@@ -389,8 +712,30 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// `EnvironmentName` -> `EnvironmentId`, so an operation that takes either
     /// one resolves the same record.
     pub environment_name_index: BTreeMap<String, String>,
+    /// The managed platform branches this account can see, by
+    /// [`PlatformBranch::key`]. Service-owned reference data: seeded from
+    /// [`MANAGED_PLATFORM_BRANCHES`] when the store is created, so every
+    /// platform operation reads one catalog.
+    pub platform_branches: BTreeMap<String, PlatformBranch>,
     /// Source of unique `EnvironmentId` values and of version sequence numbers.
     pub next_id_counter: u64,
+}
+
+/// The store a fresh engine starts from: no applications, versions or
+/// environments, and the managed platform catalog already published — the
+/// latter is service-owned data no caller creates, so `ListPlatformBranches`
+/// reads it rather than writing it on first use.
+impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
+    fn default() -> Self {
+        Self {
+            applications: BTreeMap::new(),
+            application_versions: BTreeMap::new(),
+            environments: BTreeMap::new(),
+            environment_name_index: BTreeMap::new(),
+            platform_branches: managed_platform_branch_catalog(),
+            next_id_counter: 0,
+        }
+    }
 }
 
 impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
@@ -435,6 +780,23 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         }
         let name = environment_name?;
         self.environment_name_index.get(name).cloned()
+    }
+
+    /// Every platform branch in the catalog, in the one order
+    /// `ListPlatformBranches` reports and pages through: by platform name, then
+    /// newest branch first within a platform (`BranchOrder`: "A larger
+    /// BranchOrder value designates a newer platform branch within the
+    /// platform"), then by branch name so the order is total and a page
+    /// boundary falls in the same place on every call.
+    pub fn ordered_platform_branches(&self) -> Vec<&PlatformBranch> {
+        let mut branches: Vec<&PlatformBranch> = self.platform_branches.values().collect();
+        branches.sort_by(|left, right| {
+            left.platform_name
+                .cmp(&right.platform_name)
+                .then(right.branch_order.cmp(&left.branch_order))
+                .then(left.branch_name.cmp(&right.branch_name))
+        });
+        branches
     }
 
     /// How many environments have not reached `Terminated` — the count the

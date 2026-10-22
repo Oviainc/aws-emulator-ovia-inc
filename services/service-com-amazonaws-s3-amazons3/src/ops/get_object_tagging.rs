@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetObjectTagging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetObjectTagging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetObjectTagging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set `PutObjectTagging` stored on the named object, and an EMPTY
+//! `TagSet` when the object carries none — this operation's documentation names no
+//! `NoSuchTagSet` error, unlike `GetBucketTagging`'s. Reporting only: nothing about the
+//! object changes, so a later caller sees what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -104,14 +100,25 @@ use super::types::*;
 // `GetObjectTaggingError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetObjectTaggingError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetObjectTagging")]
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes this
+// SERVICE models for an address that does not exist.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetObjectTagging")` reports `errors: []`),
+// yet `Bucket` and `Key` are both @httpLabels, so a request can name a bucket or a key
+// that does not exist — AWS answers `NoSuchBucket` ("The specified bucket does not
+// exist") and `NoSuchKey` ("The specified key does not exist"), each modelled
+// `@httpError(404)`. Widening the set with those two shapes is what lets this handler
+// answer the same two 404s `GetObject` answers for the same two causes, rather than
+// inventing a rule of its own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetObjectTagging",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum GetObjectTaggingErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,18 +172,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetObjectTagging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetObjectTaggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetObjectTagging"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `GetObjectTaggingRequest$ExpectedBucketOwner`, judged exactly as
+        // `HeadObject` judges it: this emulator serves one account, so the owner of every
+        // bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // "To retrieve tags of any other version, use the versionId query parameter" — a
+        // version this emulator holds nothing of, because object versioning is not
+        // emulated (`PutObject` keeps one object per key), so there is no version whose
+        // tag set could be reported. The 501 says that rather than answering the current
+        // object's tag set as if it were the named version's — the same refusal
+        // `GetObject` and `HeadObject` make for `versionId`.
+        if input.version_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetObjectTagging with versionId",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about an object the emulator cannot look up, and
+            // either modelled error would be a false statement about the address the
+            // request names. The scaffold's 501 says what is true: this emulator cannot
+            // serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetObjectTagging",
+            ));
+        };
+
+        // Read-only: the guard is taken, the tag set is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetObjectTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(object) = bucket.object(&input.key) else {
+            return Err(GetObjectTaggingErrorModeled::NoSuchKey(NoSuchKey {}).into());
+        };
+
+        Ok(GetObjectTaggingOutput {
+            // An object with no tag set associated reports an EMPTY `TagSet`, not an
+            // error: `TagSet` is a required output member and this operation's
+            // documentation names no special error for "no tags", where
+            // `GetBucketTagging`'s names `NoSuchTagSet` for exactly that case on a
+            // bucket. "No tags" and "an empty tag set" are the same state.
+            tag_set: object
+                .tags
+                .iter()
+                .map(|tag| Tag {
+                    key: tag.key.clone(),
+                    value: tag.value.clone(),
+                })
+                .collect(),
+            // "The versionId of the object for which you got the tagging information" —
+            // reported for a versioned bucket, and a `versionId` request is refused
+            // above; this emulator holds no object versions, so no version is named
+            // rather than one being invented.
+            version_id: None,
+        })
     }
 }

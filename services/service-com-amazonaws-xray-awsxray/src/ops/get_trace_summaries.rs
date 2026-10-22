@@ -379,13 +379,12 @@ fn invalid_request(message: impl Into<String>) -> GetTraceSummariesError {
 /// The request is well formed; what it would COST is the problem, so it takes
 /// the throttling error this operation models rather than one that blames the
 /// input — and it is an error rather than a short page, because a selection that
-/// stopped halfway is indistinguishable from one that found nothing more.
+/// stopped halfway is indistinguishable from one that found nothing more. The
+/// sentence is the crate's one wording for a spent query budget, shared with
+/// every other reader that evaluates an expression.
 fn budget_spent() -> GetTraceSummariesError {
     GetTraceSummariesErrorModeled::ThrottledException(ThrottledException {
-        message: Some(
-            "the FilterExpression could not be evaluated over every trace in [StartTime, EndTime) within the work one request may do; narrow the time range or simplify the expression"
-                .to_string(),
-        ),
+        message: Some(crate::state::FILTER_BUDGET_SPENT_MESSAGE.to_string()),
     })
     .into()
 }

@@ -11,10 +11,20 @@
 //! work or moves a status: the only state this writes is the expiry the clock
 //! already owed ([`crate::state::ComAmazonawsXrayAwsxrayState::trace_retrieval`]).
 //!
-//! Three refusals:
+//! Five refusals, and the ORDER is part of the contract: the request's own form
+//! is judged first, so a caller can tell a request it must fix (400) from a
+//! retrieval that is gone (404).
 //!
-//! * a token this service never issued, or whose retrieval has timed out, names
-//!   no retrieval and is refused with `ResourceNotFoundException` (404);
+//! * an absent or blank `TraceFormat` is refused with `InvalidRequestException`
+//!   (400): the member says what the answer is rendered in, so there is nothing
+//!   to answer in without it;
+//! * a `RetrievalToken` that is not of the form this service issues
+//!   ([`crate::state::is_retrieval_token_form`]) is refused with
+//!   `InvalidRequestException` (400) BEFORE the store is consulted \u2014 it could
+//!   never have named a retrieval;
+//! * a well-formed token this service never issued, or whose retrieval has timed
+//!   out, names no retrieval and is refused with `ResourceNotFoundException`
+//!   (404);
 //! * a `NextToken` this operation never issued for this retrieval is refused
 //!   with `InvalidRequestException` (400), the same refusal `BatchGetTraces`
 //!   makes for a page token it did not mint; and
@@ -183,6 +193,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now_epoch_seconds();
+
+        // VALIDATED BEFORE THE TOKEN IS RESOLVED, because a request that is
+        // wrong in itself is wrong whatever the token names: X-Ray refuses an
+        // absent `TraceFormat` ("TraceFormat cannot be empty. Valid values are:
+        // XRAY, OTEL") and a `RetrievalToken` that is not of the form it issues
+        // with `InvalidRequestException` at HTTP 400, and reserves the 404 for a
+        // well-formed token whose retrieval is gone — which is exactly the
+        // distinction a polling client branches on.
+        //
+        // `TraceFormat` carries no `@required` in the model, but the service
+        // requires it: "format of the requested traces" is what the answer is
+        // rendered in, so there is no format to answer in when it is absent.
+        let requested_format = match input.trace_format.as_deref().map(str::trim) {
+            Some(format) if !format.is_empty() => format,
+            _ => return Err(refuse(trace_format_required())),
+        };
+        if !crate::state::is_retrieval_token_form(&input.retrieval_token) {
+            return Err(refuse(crate::state::malformed_retrieval_token_message(
+                "retrieval token",
+                &input.retrieval_token,
+            )));
+        }
+
         let mut store = state.lock();
         // Cloned out of the store: the lookup materialises the clock's expiry, so
         // it borrows the store mutably, and deriving the traces below reads it
@@ -201,13 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The only format these spans exist in is the one they were ingested in.
-        // Asked AFTER the token is resolved, so a token no retrieval stands
-        // behind is answered by the one refusal that names it, whatever format
-        // the request asked for.
-        let requested_format = input
-            .trace_format
-            .as_deref()
-            .unwrap_or(crate::state::TRACE_FORMAT_XRAY);
+        // Asked AFTER the token is resolved — unlike the request's own form above
+        // — because which formats a retrieval can be rendered in is a fact about
+        // THAT retrieval rather than about the request.
         if requested_format != crate::state::TRACE_FORMAT_XRAY {
             return Err(refuse(format!(
                 "TraceFormat `{requested_format}` is not available: these spans were ingested as X-Ray segment documents, so only `{}` can be retrieved",
@@ -292,6 +321,30 @@ fn retrieval_not_found(retrieval_token: &str) -> String {
     format!("RetrievalToken `{retrieval_token}` was not issued by this service, or its retrieval has timed out")
 }
 
+/// What an absent or blank `TraceFormat` is refused with: the member, and the
+/// values it may carry.
+///
+/// The values are the GENERATED `TraceFormatType` set itself
+/// (`crate::ops::types::TRACE_FORMAT_TYPE_VALUES`), so a value added to the enum
+/// is one more value this sentence offers rather than one it hides. Only the
+/// ORDER is stated here: the model declares `TraceFormatType` as `["XRAY",
+/// "OTEL"]` (`smithy_query(query="shape",shape="TraceFormatType")`) and X-Ray
+/// lists them in that order, while the generated slice is sorted — so the format
+/// these spans exist in leads and the rest follow as generated.
+fn trace_format_required() -> String {
+    let mut values = vec![crate::state::TRACE_FORMAT_XRAY];
+    values.extend(
+        crate::ops::types::TRACE_FORMAT_TYPE_VALUES
+            .iter()
+            .copied()
+            .filter(|value| *value != crate::state::TRACE_FORMAT_XRAY),
+    );
+    format!(
+        "TraceFormat cannot be empty. Valid values are: {}",
+        values.join(", ")
+    )
+}
+
 /// One trimmed stored trace as the modelled `RetrievedTrace`: its spans are the
 /// stored segment documents, byte for byte, the way `BatchGetTraces` answers
 /// them ("For information on what each trace returns, see BatchGetTraces").
@@ -319,4 +372,30 @@ fn refuse(message: String) -> ListRetrievedTracesError {
         message: Some(message),
     })
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The "TraceFormat cannot be empty" sentence offers every modelled
+    /// `TraceFormatType` value, and names the format these spans exist in first.
+    #[test]
+    fn the_refusal_offers_every_modelled_trace_format() {
+        let message = trace_format_required();
+        let offered = message.rsplit_once(": ").map(|(_, values)| values);
+        let mut listed: Vec<&str> = offered.unwrap_or_default().split(", ").collect();
+        assert_eq!(
+            listed.first().copied(),
+            Some(crate::state::TRACE_FORMAT_XRAY),
+            "the format these spans exist in must be named first: got {message:?}"
+        );
+        listed.sort_unstable();
+        let mut modelled = crate::ops::types::TRACE_FORMAT_TYPE_VALUES.to_vec();
+        modelled.sort_unstable();
+        assert_eq!(
+            listed, modelled,
+            "the refusal must offer every modelled TraceFormatType value: expected {modelled:?}, got {listed:?}"
+        );
+    }
 }

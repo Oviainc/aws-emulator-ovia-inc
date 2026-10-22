@@ -150,9 +150,11 @@ async fn create_config(router: &MultiServiceRouter, id: &str, group: &str, forma
         body[key] = value;
     }
     let answer = call(router, "POST", "/packaging_configurations", Some(body)).await;
+    // 202 Accepted: the recorded status of a successful create (the model declares
+    // 200) — see `src/ops/create_packaging_configuration.rs`.
     assert_eq!(
-        answer.status, 200,
-        "setup: CreatePackagingConfiguration {id:?} ({format}): expected 200, got {} body {}",
+        answer.status, 202,
+        "setup: CreatePackagingConfiguration {id:?} ({format}): expected 202, got {} body {}",
         answer.status, answer.body
     );
 }

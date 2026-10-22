@@ -14,12 +14,12 @@
 //! the forms an unresolvable ARN takes. The recorded case — a cluster created with
 //! tags, then listed — is one row.
 //!
-//! The client is the `Dsql` harness in `cluster_lifecycle.rs`: one test client per
-//! crate, driving `MultiServiceRouter::dispatch` exactly as an SDK does.
+//! The client is the `Dsql` harness in `harness.rs`: one test client per crate,
+//! driving `MultiServiceRouter::dispatch` exactly as an SDK does.
 
 use serde_json::{json, Value};
 
-use crate::cluster_lifecycle::{absent_identifier, expected_arn, wait_for_the_clock, Answer, Dsql};
+use crate::harness::{absent_identifier, expected_arn, wait_for_the_clock, Answer, Dsql};
 
 /// `TagKey` and `TagValue` bounds. Source: `smithy_query(query="shape",
 /// shape="TagKey,TagValue")` — key `@length(1..128)`, value `@length(0..256)`, both

@@ -17,6 +17,7 @@ use crate::ops::types::{
     GlobalSecondaryIndexDescription, ItemCollectionMetrics, KeySchemaElement,
     LocalSecondaryIndexDescription, Projection, ProvisionedThroughput,
     ProvisionedThroughputDescription, Tag, TableClassSummary, TableDescription,
+    TableWarmThroughputDescription, WarmThroughput,
 };
 
 /// A DynamoDB item: the attribute-name -> attribute-value map a client put.
@@ -215,6 +216,27 @@ const MAX_POINT: i32 = 126;
 /// and its message names this limit.
 const MAX_NUMBER_TEXT_DIGITS: usize =
     MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
+
+/// How often the figures a description reports as `ItemCount` and
+/// `TableSizeBytes`/`IndexSizeBytes` are recomputed from what is stored.
+///
+/// These members are a METERING SNAPSHOT, not a live count: "DynamoDB updates this
+/// value approximately every six hours. Recent changes might not be reflected in this
+/// value" (the `TableDescription$ItemCount`, `$TableSizeBytes` and
+/// `GlobalSecondaryIndexDescription$IndexSizeBytes` docs). The interval is the
+/// documented one, so a client is never handed an exact count the real service does not
+/// give; the refresh is materialised by [`ComAmazonawsDynamodbDynamodb20120810State::apply_due_transitions`]
+/// when the clock has already made it due, and nothing on the write path moves it.
+pub const COUNTER_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// The warm throughput every table has until a request asks for another: "All newly
+/// created DynamoDB tables and global secondary indexes have a default warm throughput
+/// value of 12,000 read units per second and 4,000 write units per second" (DynamoDB
+/// Developer Guide, "Warm throughput"). Stored on the table at `CreateTable` and
+/// reported by every description, so a client that polls `WarmThroughput` to decide
+/// whether a throughput change has settled always has a value to read.
+pub const DEFAULT_WARM_READ_UNITS_PER_SECOND: i64 = 12_000;
+pub const DEFAULT_WARM_WRITE_UNITS_PER_SECOND: i64 = 4_000;
 
 /// One write capacity unit covers a write of up to 1 KB (DynamoDB Developer Guide,
 /// "Read/write capacity mode").
@@ -774,8 +796,8 @@ impl PartialOrd for NumberKey {
 ///
 /// An index holds no items of its own — "attributes that are copied (projected) from
 /// the table into the global secondary index" (the `GlobalSecondaryIndex$Projection`
-/// doc) — so `ItemCount` and `IndexSizeBytes` are DERIVED from the table's items here
-/// rather than stored and bumped.
+/// doc) — so its `ItemCount` and `IndexSizeBytes` are computed from the TABLE's items,
+/// on the metering schedule [`MeteredCounters`] describes rather than per write.
 #[derive(Debug, Clone)]
 pub struct GlobalSecondaryIndex {
     pub name: String,
@@ -791,6 +813,9 @@ pub struct GlobalSecondaryIndex {
     /// decreases have been applied today, as `ProvisionedThroughputDescription`
     /// reports them.
     pub throughput_history: ThroughputHistory,
+    /// The metered figures this index's `ItemCount` and `IndexSizeBytes` report,
+    /// refreshed with the table's on the documented schedule.
+    pub reported_counters: MeteredCounters,
 }
 
 impl GlobalSecondaryIndex {
@@ -802,16 +827,6 @@ impl GlobalSecondaryIndex {
             self.transient_status
         }
     }
-
-    /// Whether `item` is projected into this index.
-    fn covers(&self, item: &Item) -> bool {
-        index_covers(&self.key_schema, item)
-    }
-
-    /// The bytes this index stores for one covered item.
-    fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
-        index_projected_size(&self.key_schema, &self.projection, item, table_key_schema)
-    }
 }
 
 /// One stored local secondary index: an index that shares the table's partition key
@@ -822,13 +837,17 @@ impl GlobalSecondaryIndex {
 /// `LocalSecondaryIndexDescription` declares no `IndexStatus` or throughput — so unlike
 /// [`GlobalSecondaryIndex`] there is no per-index lifecycle or capacity to record here.
 /// Like a global index it holds no items of its own, so its `ItemCount` and
-/// `IndexSizeBytes` are DERIVED from the table's items.
+/// `IndexSizeBytes` are computed from the TABLE's items, on the metering schedule
+/// [`MeteredCounters`] describes rather than per write.
 #[derive(Debug, Clone)]
 pub struct LocalSecondaryIndex {
     pub name: String,
     pub arn: String,
     pub key_schema: Vec<KeySchemaElement>,
     pub projection: Projection,
+    /// The metered figures this index's `ItemCount` and `IndexSizeBytes` report,
+    /// refreshed with the table's on the documented schedule.
+    pub reported_counters: MeteredCounters,
 }
 
 impl LocalSecondaryIndex {
@@ -1015,13 +1034,38 @@ impl ThroughputHistory {
         }
     }
 
+    /// Record that the table's provisioned capacity was WITHDRAWN at `now` — the table
+    /// went on-demand, so the capacity a description reports drops to zero.
+    ///
+    /// That is the last time the reported capacity went down, so it moves
+    /// `LastDecreaseDateTime`. It does NOT move the day's count: what
+    /// `NumberOfDecreasesToday` counts is the capacity decreases the documented daily
+    /// allowance counts — "For every table and global secondary index in an UpdateTable
+    /// operation, you can decrease ReadCapacityUnits or WriteCapacityUnits (or both)"
+    /// (`ProvisionedThroughputDescription$NumberOfDecreasesToday`'s "current maximums on
+    /// provisioned throughput decreases") — and a table with no provisioned capacity at
+    /// all has not spent one of them.
+    pub fn record_capacity_withdrawal(&mut self, now: SystemTime) {
+        self.last_decrease = Some(now);
+    }
+
     /// The description members a `ProvisionedThroughputDescription` carries.
-    fn describe(&self, now: SystemTime) -> (Option<i64>, Option<::aws_smithy_types::DateTime>, Option<::aws_smithy_types::DateTime>) {
-        let decreases = self.decreases_today(now);
+    fn describe(
+        &self,
+        now: SystemTime,
+    ) -> (
+        Option<i64>,
+        Option<::aws_smithy_types::DateTime>,
+        Option<::aws_smithy_types::DateTime>,
+    ) {
         (
-            // `NumberOfDecreasesToday` is modelled `PositiveLongObject` (range min 1),
-            // so a table that has had none reports no value rather than zero.
-            (decreases > 0).then_some(decreases),
+            // `NumberOfDecreasesToday` is always reported, as the count of decreases
+            // applied in this UTC calendar day — zero for a table that has had none.
+            // The `PositiveLongObject` range (min 1) the model puts on the member
+            // constrains what a REQUEST may carry; what a description reports is the
+            // day's count, and a client polling it to decide whether a decrease has
+            // landed needs the member to be there before the first one.
+            Some(self.decreases_today(now)),
             self.last_increase.map(::aws_smithy_types::DateTime::from),
             self.last_decrease.map(::aws_smithy_types::DateTime::from),
         )
@@ -1038,11 +1082,185 @@ fn utc_day(instant: SystemTime) -> i64 {
         })
 }
 
+/// The METERED figures a table or index description reports as `ItemCount` and
+/// `TableSizeBytes`/`IndexSizeBytes`.
+///
+/// They are a snapshot of what was stored when the figures were last computed, NOT the
+/// live store: "DynamoDB updates this value approximately every six hours. Recent
+/// changes might not be reflected in this value" (the `TableDescription$ItemCount` doc,
+/// and the same sentence on `$TableSizeBytes` and
+/// `GlobalSecondaryIndexDescription$IndexSizeBytes`). So a write never moves them, and a
+/// client cannot use them as an exact count the real service never gives; the next
+/// refresh falls due [`COUNTER_REFRESH_INTERVAL`] after the last one.
+#[derive(Debug, Clone)]
+pub struct MeteredCounters {
+    /// What the last refresh counted, which is what `ItemCount` reports.
+    pub item_count: i64,
+    /// What the last refresh measured, which is what `TableSizeBytes`/`IndexSizeBytes`
+    /// reports.
+    pub size_bytes: i64,
+    /// When those two figures were computed. Held so the next refresh can be recognised
+    /// as due from the clock alone, with nothing having to run on a timer.
+    refreshed_at: SystemTime,
+}
+
+impl MeteredCounters {
+    /// The figures a table or index created at `now` starts life with: it holds nothing
+    /// yet, and its first refresh is owed one interval later.
+    pub fn new(now: SystemTime) -> Self {
+        Self {
+            item_count: 0,
+            size_bytes: 0,
+            refreshed_at: now,
+        }
+    }
+
+    /// Whether the clock has already made the next refresh due.
+    fn refresh_due(&self, now: SystemTime) -> bool {
+        now.duration_since(self.refreshed_at)
+            .is_ok_and(|elapsed| elapsed >= COUNTER_REFRESH_INTERVAL)
+    }
+
+    /// Record the figures a refresh at `now` computed.
+    fn refresh(&mut self, now: SystemTime, item_count: i64, size_bytes: i64) {
+        self.item_count = item_count;
+        self.size_bytes = size_bytes;
+        self.refreshed_at = now;
+    }
+}
+
+/// One table's warm throughput: the read and write units per second it keeps warm, and
+/// when the pair in force became (or becomes) `ACTIVE`.
+///
+/// "Warm throughput ... specifies the minimum provisioned capacity maintained for
+/// immediate data access" (the `TableWarmThroughputDescription` doc), and every table
+/// has one — the request's values when `CreateTable`/`UpdateTable` named them, otherwise
+/// the documented default pair ([`DEFAULT_WARM_READ_UNITS_PER_SECOND`] /
+/// [`DEFAULT_WARM_WRITE_UNITS_PER_SECOND`]). `Status` is the status of this SETTING, not
+/// of the table: `UPDATING` while an `UpdateTable` that changed it is still in flight,
+/// `ACTIVE` once the pair is in force.
+#[derive(Debug, Clone)]
+pub struct WarmThroughputSettings {
+    pub read_units_per_second: i64,
+    pub write_units_per_second: i64,
+    /// When the clock makes this pair `ACTIVE`. Equal to the creation instant for the
+    /// pair a table is created with, so a table never reports a warm throughput that is
+    /// not yet in force.
+    pub active_at: SystemTime,
+}
+
+impl WarmThroughputSettings {
+    /// The documented default pair, in force from `now`.
+    pub fn default_at(now: SystemTime) -> Self {
+        Self {
+            read_units_per_second: DEFAULT_WARM_READ_UNITS_PER_SECOND,
+            write_units_per_second: DEFAULT_WARM_WRITE_UNITS_PER_SECOND,
+            active_at: now,
+        }
+    }
+
+    /// The status this setting reports at `now`.
+    fn status(&self, now: SystemTime) -> TableStatus {
+        if now >= self.active_at {
+            TableStatus::Active
+        } else {
+            TableStatus::Updating
+        }
+    }
+
+    /// Whether this pair carries different values from `other`, which is what decides
+    /// whether a request asking for a warm throughput asks for a CHANGE.
+    fn differs_from(&self, other: &Self) -> bool {
+        self.read_units_per_second != other.read_units_per_second
+            || self.write_units_per_second != other.write_units_per_second
+    }
+}
+
+/// The warm throughput a `CreateTable`/`UpdateTable` request leaves in force: the
+/// members it names, falling back to `current` for the ones it does not, becoming
+/// `ACTIVE` at `active_at` when it changes anything.
+///
+/// The FLOOR applied here is the model's: the description reports both members as
+/// `PositiveLongObject` (range min 1), so a value below 1 is one no description could
+/// carry and is refused. The Developer Guide's "Warm throughput" 12,000 read / 4,000
+/// write pair is the value every table STARTS with — a default, which is why
+/// [`WarmThroughputSettings::default_at`] uses it — and no sentence in the model or the
+/// guide makes it a minimum a request may not go under, so this stores a lower value the
+/// caller asks for and reports it back rather than refusing on an unsourced rule.
+pub fn resolved_warm_throughput(
+    requested: Option<&WarmThroughput>,
+    current: &WarmThroughputSettings,
+    active_at: SystemTime,
+) -> Result<WarmThroughputSettings, RequestError> {
+    let Some(requested) = requested else {
+        return Ok(current.clone());
+    };
+    let read = requested
+        .read_units_per_second
+        .unwrap_or(current.read_units_per_second);
+    let write = requested
+        .write_units_per_second
+        .unwrap_or(current.write_units_per_second);
+    for (member, value) in [
+        ("ReadUnitsPerSecond", read),
+        ("WriteUnitsPerSecond", write),
+    ] {
+        if value < 1 {
+            return Err(RequestError::Validation(format!(
+                "Invalid WarmThroughput: {member} must be at least 1, got {value}"
+            )));
+        }
+    }
+    let resolved = WarmThroughputSettings {
+        read_units_per_second: read,
+        write_units_per_second: write,
+        active_at,
+    };
+    // A request that asks for the values already in force asks for no change, so the
+    // setting keeps the instant it became ACTIVE rather than going UPDATING again.
+    if resolved.differs_from(current) {
+        Ok(resolved)
+    } else {
+        Ok(current.clone())
+    }
+}
+
+/// The capacity pair a `ProvisionedThroughputDescription` reports for a table or index:
+/// the stored one, or zeroes when there is none — "For a table or global secondary index
+/// that uses on-demand capacity mode (`PAY_PER_REQUEST`), this value is `0`, because
+/// on-demand mode does not use provisioned throughput"
+/// (`ProvisionedThroughputDescription$ReadCapacityUnits`).
+///
+/// This is also the pair a capacity MOVE is measured against, so going on-demand reads as
+/// a decrease of both dimensions to zero, exactly as the reported description shows it.
+pub fn reported_capacity(throughput: Option<&ProvisionedThroughput>) -> ProvisionedThroughput {
+    ProvisionedThroughput {
+        read_capacity_units: throughput.map_or(0, |throughput| throughput.read_capacity_units),
+        write_capacity_units: throughput.map_or(0, |throughput| throughput.write_capacity_units),
+    }
+}
+
+/// A new table's `TableId`: "A unique identifier for the table, in UUID format,
+/// generated by DynamoDB when the table is created" (the `TableDescription$TableId`
+/// doc), in the pattern that member declares
+/// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).
+///
+/// Drawn from the `uuid` crate's v4 generator (OS randomness) ONCE, at create, and
+/// stored on the table: every later description echoes the same value, so a client that
+/// keys its own records by `TableId` keeps resolving them.
+pub fn new_table_id() -> String {
+    ::uuid::Uuid::new_v4().to_string()
+}
+
 /// One stored table: its configuration, its lifecycle instants, and its items.
 #[derive(Debug)]
 pub struct Table {
     pub name: String,
     pub arn: String,
+    /// This table's `TableId`, minted by [`new_table_id`] when the table was created and
+    /// never changed after: "A unique identifier for the table, in UUID format,
+    /// generated by DynamoDB when the table is created" (`TableDescription$TableId`).
+    pub id: String,
     /// The region this table lives in. A table name is unique only within a region
     /// ("table names must be unique within each Region" — the `CreateTable` doc), so
     /// the store keys by region and the table remembers which one it answers for.
@@ -1052,6 +1270,9 @@ pub struct Table {
     /// `PROVISIONED` or `PAY_PER_REQUEST`, as resolved at CreateTable.
     pub billing_mode: String,
     pub provisioned_throughput: Option<ProvisionedThroughput>,
+    /// The warm throughput in force, which every description reports as
+    /// `WarmThroughput`.
+    pub warm_throughput: WarmThroughputSettings,
     /// The table's own past capacity changes, as `ProvisionedThroughputDescription`
     /// reports them.
     pub throughput_history: ThroughputHistory,
@@ -1099,12 +1320,15 @@ pub struct Table {
     /// reports.
     pub resource_policy: Option<AttachedPolicy>,
     pub items: BTreeMap<ItemKey, Item>,
+    /// The metered figures `ItemCount` and `TableSizeBytes` report — refreshed on the
+    /// documented schedule by [`Table::refresh_due_counters`], never on the write path.
+    pub reported_counters: MeteredCounters,
     /// The summed size of `items`, kept current as items are written and removed.
     ///
     /// This is admission-control bookkeeping ONLY: what a response reports as
-    /// `TableSizeBytes` is derived from `items` by [`Table::table_size_bytes`], so a
-    /// client is never told this number. Keeping it lets `PutItem` check its budget
-    /// without walking the table.
+    /// `TableSizeBytes` is [`Table::reported_counters`], the metered snapshot
+    /// [`Table::refresh_due_counters`] maintains, so a client is never told this number.
+    /// Keeping it lets `PutItem` check its budget without walking the table.
     pub stored_bytes: i64,
 }
 
@@ -1376,14 +1600,77 @@ impl Table {
             .collect()
     }
 
-    /// The number of items stored, which is what `ItemCount` reports.
-    pub fn item_count(&self) -> i64 {
+    /// The number of items stored right now.
+    fn live_item_count(&self) -> i64 {
         i64::try_from(self.items.len()).unwrap_or(i64::MAX)
     }
 
-    /// The stored size of every item, which is what `TableSizeBytes` reports.
-    pub fn table_size_bytes(&self) -> i64 {
+    /// The stored size of every item right now.
+    fn live_table_size_bytes(&self) -> i64 {
         self.items.values().map(item_size).sum()
+    }
+
+    /// The items one index projects, and the bytes they take there, right now. One rule
+    /// for both index kinds, from the key schema and projection each of them carries, in
+    /// a single pass over the items.
+    fn live_index_figures(
+        &self,
+        key_schema: &[KeySchemaElement],
+        projection: &Projection,
+    ) -> (i64, i64) {
+        self.items
+            .values()
+            .filter(|item| index_covers(key_schema, item))
+            .fold((0i64, 0i64), |(count, bytes), item| {
+                (
+                    count.saturating_add(1),
+                    bytes.saturating_add(index_projected_size(
+                        key_schema,
+                        projection,
+                        item,
+                        &self.key_schema,
+                    )),
+                )
+            })
+    }
+
+    /// Materialise the metering refresh the clock has already made due for this table
+    /// and every index on it.
+    ///
+    /// This is the ONLY thing that moves what `ItemCount` and
+    /// `TableSizeBytes`/`IndexSizeBytes` report: "DynamoDB updates this value
+    /// approximately every six hours. Recent changes might not be reflected in this
+    /// value" (`TableDescription$ItemCount`). A refresh owed at this instant was owed
+    /// whether or not anybody called, so a reporting operation may finish it; a write is
+    /// never allowed to.
+    pub fn refresh_due_counters(&mut self, now: SystemTime) {
+        if !self.reported_counters.refresh_due(now) {
+            return;
+        }
+        let item_count = self.live_item_count();
+        let size_bytes = self.live_table_size_bytes();
+        self.reported_counters.refresh(now, item_count, size_bytes);
+        // Each index's figures are metered from the table's items on the same schedule,
+        // computed first (they read `self`) and then recorded.
+        let global: Vec<(i64, i64)> = self
+            .global_secondary_indexes
+            .iter()
+            .map(|index| self.live_index_figures(&index.key_schema, &index.projection))
+            .collect();
+        let local: Vec<(i64, i64)> = self
+            .local_secondary_indexes
+            .iter()
+            .map(|index| self.live_index_figures(&index.key_schema, &index.projection))
+            .collect();
+        for (index, (item_count, size_bytes)) in
+            self.global_secondary_indexes.iter_mut().zip(global)
+        {
+            index.reported_counters.refresh(now, item_count, size_bytes);
+        }
+        for (index, (item_count, size_bytes)) in self.local_secondary_indexes.iter_mut().zip(local)
+        {
+            index.reported_counters.refresh(now, item_count, size_bytes);
+        }
     }
 
     /// The index by that name, as `UpdateTable` and the index describes need it.
@@ -1401,20 +1688,16 @@ impl Table {
     }
 
     /// Project one global secondary index into the description `DescribeTable` and the
-    /// table-mutating operations report. `ItemCount` and `IndexSizeBytes` are computed
-    /// from the table's items, never stored.
+    /// table-mutating operations report. `ItemCount` and `IndexSizeBytes` are the
+    /// metered figures of the last refresh, never the live projection.
     fn describe_index(
         &self,
         index: &GlobalSecondaryIndex,
         now: SystemTime,
     ) -> GlobalSecondaryIndexDescription {
-        let covered = self.items.values().filter(|item| index.covers(item));
-        let item_count = i64::try_from(covered.clone().count()).unwrap_or(i64::MAX);
-        let index_size_bytes = covered
-            .map(|item| index.projected_size(item, &self.key_schema))
-            .sum();
         let (number_of_decreases_today, last_increase_date_time, last_decrease_date_time) =
             index.throughput_history.describe(now);
+        let capacity = reported_capacity(index.provisioned_throughput.as_ref());
         GlobalSecondaryIndexDescription {
             index_name: Some(index.name.clone()),
             index_arn: Some(index.arn.clone()),
@@ -1427,44 +1710,29 @@ impl Table {
             // table on every read, so no index is ever backfilling.
             backfilling: None,
             provisioned_throughput: Some(ProvisionedThroughputDescription {
-                read_capacity_units: Some(
-                    index
-                        .provisioned_throughput
-                        .as_ref()
-                        .map_or(0, |throughput| throughput.read_capacity_units),
-                ),
-                write_capacity_units: Some(
-                    index
-                        .provisioned_throughput
-                        .as_ref()
-                        .map_or(0, |throughput| throughput.write_capacity_units),
-                ),
+                read_capacity_units: Some(capacity.read_capacity_units),
+                write_capacity_units: Some(capacity.write_capacity_units),
                 number_of_decreases_today,
                 last_increase_date_time,
                 last_decrease_date_time,
             }),
-            item_count: Some(item_count),
-            index_size_bytes: Some(index_size_bytes),
+            item_count: Some(index.reported_counters.item_count),
+            index_size_bytes: Some(index.reported_counters.size_bytes),
             ..GlobalSecondaryIndexDescription::default()
         }
     }
 
     /// Project one local secondary index into the description `DescribeTable` and the
-    /// table-mutating operations report. `ItemCount` and `IndexSizeBytes` are computed
-    /// from the table's items by the same rule the global indexes use.
+    /// table-mutating operations report. `ItemCount` and `IndexSizeBytes` are the metered
+    /// figures of the last refresh, by the same rule the global indexes follow.
     fn describe_local_index(&self, index: &LocalSecondaryIndex) -> LocalSecondaryIndexDescription {
-        let covered = self.items.values().filter(|item| index.covers(item));
-        let item_count = i64::try_from(covered.clone().count()).unwrap_or(i64::MAX);
-        let index_size_bytes = covered
-            .map(|item| index.projected_size(item, &self.key_schema))
-            .sum();
         LocalSecondaryIndexDescription {
             index_name: Some(index.name.clone()),
             index_arn: Some(index.arn.clone()),
             key_schema: Some(index.key_schema.clone()),
             projection: Some(index.projection.clone()),
-            item_count: Some(item_count),
-            index_size_bytes: Some(index_size_bytes),
+            item_count: Some(index.reported_counters.item_count),
+            index_size_bytes: Some(index.reported_counters.size_bytes),
         }
     }
 
@@ -1577,19 +1845,25 @@ impl Table {
     }
 
     /// Project this table into the `TableDescription` every table operation returns.
-    /// `ItemCount` and `TableSizeBytes` are derived from `items` here, never stored.
+    ///
+    /// Every member here comes from what a previous request wrote: the id minted at
+    /// create, the metered counters of the last refresh, the billing mode and the
+    /// instant `PAY_PER_REQUEST` was last set, the throughput and its history, and the
+    /// warm throughput in force.
     pub fn describe(&self, now: SystemTime) -> TableDescription {
         let (number_of_decreases_today, last_increase_date_time, last_decrease_date_time) =
             self.throughput_history.describe(now);
+        let capacity = reported_capacity(self.provisioned_throughput.as_ref());
         TableDescription {
             table_name: Some(self.name.clone()),
             table_arn: Some(self.arn.clone()),
+            table_id: Some(self.id.clone()),
             key_schema: Some(self.key_schema.clone()),
             attribute_definitions: Some(self.attribute_definitions.clone()),
             table_status: Some(self.status(now).as_str().to_string()),
             creation_date_time: Some(::aws_smithy_types::DateTime::from(self.creation_date_time)),
-            item_count: Some(self.item_count()),
-            table_size_bytes: Some(self.table_size_bytes()),
+            item_count: Some(self.reported_counters.item_count),
+            table_size_bytes: Some(self.reported_counters.size_bytes),
             billing_mode_summary: Some(BillingModeSummary {
                 billing_mode: Some(self.billing_mode.clone()),
                 // Reported only once the mode it records is in effect: the stored
@@ -1601,18 +1875,10 @@ impl Table {
                     .map(::aws_smithy_types::DateTime::from),
             }),
             provisioned_throughput: Some(ProvisionedThroughputDescription {
-                // A PAY_PER_REQUEST table reports zeroes: it has no provisioned
-                // throughput, and no increase or decrease has ever been applied.
-                read_capacity_units: Some(
-                    self.provisioned_throughput
-                        .as_ref()
-                        .map_or(0, |throughput| throughput.read_capacity_units),
-                ),
-                write_capacity_units: Some(
-                    self.provisioned_throughput
-                        .as_ref()
-                        .map_or(0, |throughput| throughput.write_capacity_units),
-                ),
+                // A PAY_PER_REQUEST table reports zeroes: on-demand mode does not use
+                // provisioned throughput.
+                read_capacity_units: Some(capacity.read_capacity_units),
+                write_capacity_units: Some(capacity.write_capacity_units),
                 number_of_decreases_today,
                 last_increase_date_time,
                 last_decrease_date_time,
@@ -1634,6 +1900,13 @@ impl Table {
             table_class_summary: self.table_class.as_ref().map(|class| TableClassSummary {
                 table_class: Some(class.clone()),
                 last_update_date_time: None,
+            }),
+            // Every table has a warm throughput, so every description carries one: the
+            // pair in force, and the status of that pair rather than of the table.
+            warm_throughput: Some(TableWarmThroughputDescription {
+                read_units_per_second: Some(self.warm_throughput.read_units_per_second),
+                write_units_per_second: Some(self.warm_throughput.write_units_per_second),
+                status: Some(self.warm_throughput.status(now).as_str().to_string()),
             }),
             deletion_protection_enabled: Some(self.deletion_protection_enabled),
             ..TableDescription::default()
@@ -1657,14 +1930,18 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
 }
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
-    /// Materialise the status changes the clock has already made due: a table whose
-    /// `DeleteTable` span has elapsed is gone.
+    /// Materialise the changes the clock has already made due: a table whose
+    /// `DeleteTable` span has elapsed is gone, and a table whose metering interval has
+    /// elapsed reports freshly counted `ItemCount`/`TableSizeBytes` figures.
     ///
-    /// This is the only write a reporting operation makes — it finishes a transition
+    /// These are the only writes a reporting operation makes — each finishes something
     /// that was owed at this instant whether or not anybody called.
     pub fn apply_due_transitions(&mut self, now: SystemTime) {
         for tables in self.regions.values_mut() {
             tables.retain(|_, table| !table.removal_due(now));
+            for table in tables.values_mut() {
+                table.refresh_due_counters(now);
+            }
         }
         self.regions.retain(|_, tables| !tables.is_empty());
     }

@@ -202,14 +202,29 @@ async fn create_numbers_table(router: &MultiServiceRouter, name: &str) {
     );
 }
 
-/// The `ItemCount` a table reports, which is derived from the items it holds.
-async fn item_count(router: &MultiServiceRouter, name: &str) -> i64 {
-    let (status, described) = call(router, "DescribeTable", json!({"TableName": name})).await;
+/// How many items a table holds RIGHT NOW, counted by reading them: a table's reported
+/// `ItemCount` is the metered figure ("DynamoDB updates this value approximately every
+/// six hours" — `TableDescription$ItemCount`), so it says nothing about a write that just
+/// landed. Every item this suite writes shares one partition key, so one `Query` over
+/// that partition sees all of them.
+async fn items_in_partition(router: &MultiServiceRouter, name: &str, partition: &str) -> i64 {
+    let (status, queried) = call(
+        router,
+        "Query",
+        json!({
+            "TableName": name,
+            "KeyConditionExpression": "#pk = :pk",
+            "ExpressionAttributeNames": {"#pk": "pk"},
+            "ExpressionAttributeValues": {":pk": {"S": partition}},
+            "ConsistentRead": true,
+        }),
+    )
+    .await;
     assert_eq!(
         status, 200,
-        "case describe {name}: expected HTTP 200, got {status} with {described}"
+        "case query {name}: expected HTTP 200, got {status} with {queried}"
     );
-    described["Table"]["ItemCount"].as_i64().unwrap_or(-1)
+    queried["Count"].as_i64().unwrap_or(-1)
 }
 
 #[tokio::test]
@@ -335,12 +350,12 @@ async fn generated_spellings_of_one_value_all_read_back_as_that_value() {
 
     // Every spelling of one value wrote the SAME item, so the table holds exactly one
     // item per distinct value — not one per spelling.
-    let count = item_count(&router, "generated").await;
+    let count = items_in_partition(&router, "generated", "p").await;
     let expected = i64::try_from(BASE_VALUES.len()).unwrap_or(-1);
     assert_eq!(
         count, expected,
         "case generated spellings: every spelling of a value addresses one item, so \
-         expected ItemCount {expected}, got {count}"
+         expected {expected} items in the partition, got {count}"
     );
 }
 

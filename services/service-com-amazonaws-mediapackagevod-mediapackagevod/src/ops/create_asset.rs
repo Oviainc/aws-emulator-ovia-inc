@@ -214,15 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let arn = crate::state::resource_arn("assets", &region, &input.id);
-        // `ResourceId` is "The resource ID to include in SPEKE key requests"; when
-        // the caller names none the asset's own id identifies it.
-        let resource_id = input.resource_id.unwrap_or_else(|| input.id.clone());
         let record = crate::state::AssetRecord {
             id: input.id.clone(),
             arn: arn.clone(),
             created_at: crate::state::now_iso8601(),
             packaging_group_id: input.packaging_group_id,
-            resource_id,
+            // `ResourceId` is "The resource ID to include in SPEKE key requests":
+            // the caller's own id for the content, carried as stated and reported
+            // only where stated — the service does not mint one for a request that
+            // named none.
+            resource_id: input.resource_id,
             source_arn: input.source_arn,
             source_role_arn: input.source_role_arn,
             created_instant: std::time::Instant::now(),
@@ -246,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             id: Some(stored.id.clone()),
             packaging_group_id: Some(stored.packaging_group_id.clone()),
-            resource_id: Some(stored.resource_id.clone()),
+            resource_id: stored.resource_id.clone(),
             source_arn: Some(stored.source_arn.clone()),
             source_role_arn: Some(stored.source_role_arn.clone()),
             tags: Some(state.tags_of(&arn)),

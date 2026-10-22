@@ -40,12 +40,13 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     Attribute, CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterSetting,
-    Container, ContainerDefinition, ContainerInstance, Deployment, DeploymentConfiguration,
-    DeploymentController, EphemeralStorage, Failure, KeyValuePair, LoadBalancer,
-    NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice,
+    Container, ContainerDefinition, ContainerInstance, Deployment, DeploymentCircuitBreaker,
+    DeploymentConfiguration, DeploymentController, EphemeralStorage, Failure, KeyValuePair,
+    LoadBalancer, NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice,
     ProxyConfiguration, Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
-    ServiceRegistry, ServiceVolumeConfiguration, Tag, Task, TaskDefinition,
-    TaskDefinitionPlacementConstraint, TaskOverride, VersionInfo, Volume, VpcLatticeConfiguration,
+    ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration, Tag,
+    Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride, ThresholdConfiguration,
+    VersionInfo, Volume, VpcLatticeConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -188,6 +189,50 @@ pub const ROLLOUT_IN_PROGRESS: &str = "IN_PROGRESS";
 /// "When the service reaches a steady state, the deployment transitions to a
 /// `COMPLETED` state."
 pub const ROLLOUT_COMPLETED: &str = "COMPLETED";
+
+/// `deploymentConfiguration.strategy` a service takes when the request names none. The
+/// `CreateService` doc: "When you create a service which uses the ECS deployment
+/// controller, you can choose between the following deployment strategies ... ROLLING:
+/// ... the Amazon ECS service scheduler replaces the currently running tasks with new
+/// tasks" — the rolling update is the ECS controller's own deployment strategy, and the
+/// other three (`BLUE_GREEN`, `LINEAR`, `CANARY`) each need configuration the request
+/// has to supply.
+pub const DEPLOYMENT_STRATEGY_ROLLING: &str = "ROLLING";
+
+/// `bakeTimeInMinutes` of a deployment configuration the request gave none for. The
+/// member's doc: "The time period when both blue and green service revisions are running
+/// simultaneously after the production traffic has shifted. You must provide this
+/// parameter when you use the BLUE_GREEN deployment strategy" — a deployment with no
+/// bake time configured bakes for no time at all.
+pub const DEFAULT_BAKE_TIME_MINUTES: i32 = 0;
+
+/// `thresholdConfiguration.type` of a deployment circuit breaker the request gave none
+/// for. The `ThresholdConfiguration` doc: "By default, the threshold configuration uses
+/// a type of BOUNDED_PERCENT with a value of 50."
+pub const THRESHOLD_BOUNDED_PERCENT: &str = "BOUNDED_PERCENT";
+/// See [`THRESHOLD_BOUNDED_PERCENT`]: the default `value` of that threshold.
+pub const THRESHOLD_DEFAULT_VALUE: i32 = 50;
+/// `resetOnHealthyTask` of a deployment circuit breaker the request gave none for. The
+/// member's doc: "When set to true, a task that reaches a healthy state resets the
+/// failure count to 0. ... The default is true."
+pub const CIRCUIT_BREAKER_RESETS_ON_HEALTHY_TASK: bool = true;
+
+/// `healthCheckGracePeriodSeconds` a CREATE takes when the request names none. The
+/// member's doc: "If you do not specify a health check grace period value, the default
+/// value of 0 is used."
+pub const DEFAULT_HEALTH_CHECK_GRACE_PERIOD_SECONDS: i32 = 0;
+
+/// The resource part of the ECS service-linked role's ARN. The `CreateService$role` doc:
+/// "If your account has already created the Amazon ECS service-linked role, that role is
+/// used for your service unless you specify a role here. The service-linked role is
+/// required if ... the service is configured to use ... an external deployment
+/// controller ... in which case you don't specify a role here."
+pub const SERVICE_LINKED_ROLE_RESOURCE: &str =
+    "role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS";
+
+/// How many of a service's events a response carries. The `Service$events` doc: "The
+/// event stream for your service. A maximum of 100 of the latest events are displayed."
+pub const MAX_SERVICE_EVENTS: usize = 100;
 
 /// The scheduling strategy a service takes when the request names none. The
 /// `CreateService$desiredCount` doc — "This is required if schedulingStrategy is
@@ -658,6 +703,15 @@ pub struct ServiceRecord {
     pub enable_execute_command: bool,
     pub availability_zone_rebalancing: String,
     pub tags: Vec<Tag>,
+    /// `Service$createdBy`: "The principal that created the service" — the principal of
+    /// the request that created it, resolved by [`caller_principal`].
+    pub created_by: String,
+    /// `Service$events`: "The event stream for your service", OLDEST first. The
+    /// scheduler's own narrative: an entry is appended only when a transition the clock
+    /// owed actually happened (see
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`]), never
+    /// because somebody read the service.
+    pub events: Vec<ServiceEventRecord>,
     /// The `clientToken` the create carried, so repeating that create is idempotent
     /// ("An identifier that you provide to ensure the idempotency of the request").
     pub client_token: Option<String>,
@@ -668,6 +722,35 @@ pub struct ServiceRecord {
     pub deployment_id: String,
     pub deployment_created_at: DateTime,
     pub deployment_updated_at: DateTime,
+    /// The ARN of the service revision the current deployment rolls out, minted with
+    /// that deployment. `ServiceCurrentRevisionSummary$arn`: "The ARN of the current
+    /// service revision."
+    pub service_revision_arn: String,
+    /// When the current deployment's rollout is owed its steady state, or `None` once it
+    /// has reached one. `Deployment$rolloutState`: "When a service deployment is started,
+    /// it begins in an IN_PROGRESS state. When the service reaches a steady state, the
+    /// deployment transitions to a COMPLETED state" — so a rollout is never COMPLETED in
+    /// the same instant the call that started it answers; the CLOCK settles it.
+    pub deployment_steady_due_at: Option<SystemTime>,
+}
+
+/// One entry of a service's event stream (`ServiceEvent`), as stored.
+#[derive(Debug, Clone)]
+pub struct ServiceEventRecord {
+    pub id: String,
+    pub created_at: DateTime,
+    pub message: String,
+}
+
+impl ServiceEventRecord {
+    /// The modelled shape a response carries for this event.
+    pub fn view(&self) -> ServiceEvent {
+        ServiceEvent {
+            id: Some(self.id.clone()),
+            created_at: Some(self.created_at),
+            message: Some(self.message.clone()),
+        }
+    }
 }
 
 impl ServiceRecord {
@@ -763,6 +846,12 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Monotonic source of service-deployment ids, so every deployment of every service
     /// is distinct.
     next_deployment_seq: u64,
+    /// Monotonic source of service-revision ids, so every revision of every service is
+    /// distinct.
+    next_service_revision_seq: u64,
+    /// Monotonic source of service-event ids, so every event of every service is
+    /// distinct.
+    next_service_event_seq: u64,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -798,6 +887,101 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             }
         }
+        self.settle_services(now);
+    }
+
+    /// Materialise the SERVICE-level transitions the clock owes, as of `now`: the steady
+    /// state a started rollout settles into, and the `INACTIVE` a drained service
+    /// reaches once the tasks it was still cleaning up have stopped.
+    ///
+    /// Both were owed at this instant whether or not anybody called, so a reporting
+    /// operation may run them — and each happens at most once, because the instant it
+    /// settles is cleared with it.
+    fn settle_services(&mut self, now: SystemTime) {
+        let keys: Vec<(String, String)> = self.services.keys().cloned().collect();
+        for key in keys {
+            if !self.services.contains_key(&key) {
+                continue;
+            }
+            // `Deployment$rolloutState`: the rollout completes "when the service reaches
+            // a steady state" — which needs BOTH the instant it falls due and the task
+            // set the service wants.
+            let tally = self.service_tally(&key.0, &key.1);
+            let service = &self.services[&key];
+            let settled = service.deployment_steady_due_at.filter(|due| {
+                *due <= now
+                    && service.places_tasks()
+                    && tally.running == service.desired_count
+                    && tally.pending == 0
+            });
+            // `DeleteService`: "After all tasks have transitioned to either STOPPING or
+            // STOPPED status, the service status moves from DRAINING to INACTIVE."
+            let drained = service.status == SERVICE_DRAINING
+                && !self.service_has_active_tasks(&key.0, &key.1);
+
+            let events = match settled {
+                // The two events the scheduler writes when a rollout reaches its steady
+                // state, in the order it writes them. The wording follows the service
+                // event messages Amazon ECS documents ("Amazon ECS service event
+                // messages" in the Developer Guide).
+                Some(due) => {
+                    let name = service.name.clone();
+                    let deployment_id = service.deployment_id.clone();
+                    vec![
+                        self.mint_service_event(
+                            due,
+                            format!(
+                                "(service {name}) (deployment {deployment_id}) deployment \
+                                 completed."
+                            ),
+                        ),
+                        self.mint_service_event(
+                            due,
+                            format!("(service {name}) has reached a steady state."),
+                        ),
+                    ]
+                }
+                None => Vec::new(),
+            };
+
+            let Some(service) = self.services.get_mut(&key) else {
+                continue;
+            };
+            if settled.is_some() {
+                service.deployment_steady_due_at = None;
+                service.events.extend(events);
+                // "A maximum of 100 of the latest events are displayed", so only the
+                // latest are kept at all.
+                if service.events.len() > MAX_SERVICE_EVENTS {
+                    let first_kept = service.events.len() - MAX_SERVICE_EVENTS;
+                    service.events.drain(..first_kept);
+                }
+            }
+            if drained {
+                service.status = SERVICE_INACTIVE.to_string();
+            }
+        }
+    }
+
+    /// Mint one service event at `at`, with the next event id (32 lowercase hex digits,
+    /// the shape every id this emulator mints takes). `ServiceEvent$id` is "The ID string
+    /// of the event", with no documented format.
+    fn mint_service_event(&mut self, at: SystemTime, message: String) -> ServiceEventRecord {
+        self.next_service_event_seq += 1;
+        ServiceEventRecord {
+            id: format!("{:032x}", self.next_service_event_seq),
+            created_at: DateTime::from(at),
+            message,
+        }
+    }
+
+    /// Whether the service still holds a task that has not reached `STOPPED`.
+    pub fn service_has_active_tasks(&self, cluster_name: &str, service_name: &str) -> bool {
+        self.tasks.values().any(|task| {
+            task.cluster_name == cluster_name
+                && task.service_name.as_deref() == Some(service_name)
+                && task.is_active()
+        })
     }
 
     /// Mint the next task id (32 lowercase hex digits, the shape of an ECS task id).
@@ -834,6 +1018,25 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub fn next_deployment_id(&mut self) -> String {
         self.next_deployment_seq += 1;
         format!("ecs-svc/{:019}", self.next_deployment_seq)
+    }
+
+    /// Mint the ARN of the service revision a deployment rolls out. A service revision is
+    /// "a version of your service that includes the task definition and configuration"
+    /// and is created with the deployment that rolls it out, so the counter is what makes
+    /// every revision of every service distinct.
+    pub fn next_service_revision_arn(
+        &mut self,
+        region: &str,
+        cluster_name: &str,
+        service_name: &str,
+    ) -> String {
+        self.next_service_revision_seq += 1;
+        service_revision_arn(
+            region,
+            cluster_name,
+            service_name,
+            &format!("{:019}", self.next_service_revision_seq),
+        )
     }
 
     /// Mint the container records of ONE task of `definition`, each with its own ARN and
@@ -914,17 +1117,23 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// `runningCount` and `pendingCount` are COUNTED off the task map, so they always
     /// agree with the tasks the scheduler actually placed, and the deployment's
-    /// `rolloutState` follows from them rather than being asserted.
+    /// `rolloutState` follows from the steady state the CLOCK settled rather than being
+    /// asserted.
     ///
-    /// The `CreateService$service` doc decides which deployment members are reported:
-    /// "If a service is using the ECS deployment controller, the deploymentController
-    /// and taskSets parameters will not be returned. if the service uses the CODE_DEPLOY
-    /// deployment controller, the deploymentController, taskSets and deployments
-    /// parameters will be returned, however the deployments parameter will be an empty
-    /// list."
+    /// Which members a service carries follows its DEPLOYMENT CONTROLLER, not the
+    /// operation that reports it: only the ECS controller's own scheduler owns a
+    /// deployment and a service revision (`Deployment$rolloutState` is "only returned for
+    /// services that use the rolling update (ECS) deployment type"), while the other
+    /// controllers' tasks come from a task set (`CreateService$service`: "if the service
+    /// uses the CODE_DEPLOY deployment controller, the deploymentController, taskSets and
+    /// deployments parameters will be returned, however the deployments parameter will be
+    /// an empty list"). `deploymentController` itself is reported for EVERY service: the
+    /// recorded responses of the real service carry it for an ECS-controller service too,
+    /// which is what the same doc's "will not be returned" sentence no longer matches.
     pub fn service_view(&self, service: &ServiceRecord, fields: ServiceFields) -> Service {
         let tally = self.service_tally(&service.cluster_name, &service.name);
         let scheduler_owned = service.places_tasks();
+        let settled = service.deployment_steady_due_at.is_none();
         // "A service will return either a capacityProviderStrategy or launchType
         // parameter, but not both, depending where one was specified when it was
         // created."
@@ -949,15 +1158,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             platform_version: service.platform_version.clone(),
             platform_family: None,
             network_configuration: service.network_configuration.clone(),
+            // "When a service deployment is started, it begins in an IN_PROGRESS state.
+            // When the service reaches a steady state, the deployment transitions to a
+            // COMPLETED state" — the steady state is the clock-owed transition the
+            // record holds the due instant of, so a rollout the scheduler has not
+            // settled yet is IN_PROGRESS whatever the counts already say.
             rollout_state: Some(
-                if tally.running >= service.desired_count {
+                if settled {
                     ROLLOUT_COMPLETED
                 } else {
                     ROLLOUT_IN_PROGRESS
                 }
                 .to_string(),
             ),
-            rollout_state_reason: Some(if tally.running >= service.desired_count {
+            rollout_state_reason: Some(if settled {
                 format!("ECS deployment {} completed.", service.deployment_id)
             } else {
                 format!("ECS deployment {} in progress.", service.deployment_id)
@@ -1000,32 +1214,48 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 Vec::new()
             }),
             role_arn: service.role_arn.clone(),
-            // "The event stream for your service": the scheduler's own narrative, which
-            // this emulator writes none of, so there is no event to report.
-            events: Some(Vec::new()),
+            // "The event stream for your service. A maximum of 100 of the latest events
+            // are displayed" — newest first, which is the order the service's own event
+            // stream reads in.
+            events: Some(
+                service
+                    .events
+                    .iter()
+                    .rev()
+                    .take(MAX_SERVICE_EVENTS)
+                    .map(ServiceEventRecord::view)
+                    .collect(),
+            ),
             created_at: Some(service.created_at),
-            // A service deployment resource (`ListServiceDeployments`) is not part of
-            // this slice, so there is no deployment ARN or service revision to name.
+            // The service DEPLOYMENT resource (`ListServiceDeployments` /
+            // `DescribeServiceDeployments`) is not part of this slice, so there is no
+            // deployment ARN to name; the service REVISION the current deployment rolls
+            // out is minted with it.
             current_service_deployment: None,
-            current_service_revisions: None,
+            current_service_revisions: if scheduler_owned {
+                Some(vec![ServiceCurrentRevisionSummary {
+                    arn: Some(service.service_revision_arn.clone()),
+                    requested_task_count: service.desired_count,
+                    running_task_count: tally.running,
+                    pending_task_count: tally.pending,
+                }])
+            } else {
+                None
+            },
             placement_constraints: Some(service.placement_constraints.clone()),
             placement_strategy: Some(service.placement_strategy.clone()),
             network_configuration: service.network_configuration.clone(),
             health_check_grace_period_seconds: service.health_check_grace_period_seconds,
             scheduling_strategy: Some(service.scheduling_strategy.clone()),
-            deployment_controller: if scheduler_owned {
-                None
-            } else {
-                Some(service.deployment_controller.clone())
-            },
+            deployment_controller: Some(service.deployment_controller.clone()),
             tags: if fields.tags {
                 Some(service.tags.clone())
             } else {
                 None
             },
-            // "The principal that created the service": the request's own principal,
-            // which this emulator does not resolve, so it stays absent.
-            created_by: None,
+            // "The principal that created the service": the principal of the request
+            // that created it, as stored.
+            created_by: Some(service.created_by.clone()),
             enable_ecs_managed_tags: service.enable_ecs_managed_tags,
             propagate_tags: Some(service.propagate_tags.clone()),
             enable_execute_command: service.enable_execute_command,
@@ -1041,6 +1271,48 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.services
             .values()
             .any(|service| service.cluster_name == cluster_name && service.status != SERVICE_INACTIVE)
+    }
+
+    /// Drain a DELETED service: it keeps nothing running and keeps no task set.
+    ///
+    /// `DeleteService`: "When you delete a service, if there are still running tasks that
+    /// require cleanup, the service status moves from ACTIVE to DRAINING ... After all
+    /// tasks have transitioned to either STOPPING or STOPPED status, the service status
+    /// moves from DRAINING to INACTIVE." The record is KEPT either way: "Services in the
+    /// DRAINING or INACTIVE status can still be viewed with the DescribeServices API
+    /// operation."
+    pub fn drain_service(&mut self, key: &(String, String), now: SystemTime) {
+        let Some(service) = self.services.get(key) else {
+            return;
+        };
+        let mut task_arns: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.cluster_name == service.cluster_name
+                    && task.service_name.as_deref() == Some(service.name.as_str())
+                    && task.is_active()
+            })
+            .map(|task| task.task_arn.clone())
+            .collect();
+        task_arns.sort();
+        let name = service.name.clone();
+        for arn in &task_arns {
+            self.stop_service_task(arn, now, &format!("Service {name} was deleted"));
+        }
+        let still_cleaning_up = self.service_has_active_tasks(&key.0, &key.1);
+        let Some(service) = self.services.get_mut(key) else {
+            return;
+        };
+        service.desired_count = 0;
+        service.status = if still_cleaning_up {
+            SERVICE_DRAINING
+        } else {
+            SERVICE_INACTIVE
+        }
+        .to_string();
+        // A deleted service has no rollout left to settle.
+        service.deployment_steady_due_at = None;
     }
 
     /// Place or stop tasks so the service holds exactly the `desiredCount` tasks it
@@ -1524,7 +1796,7 @@ pub fn container_instance_arn_from_reference(
 }
 
 /// The deployment configuration a service stores: what the request supplied, with the
-/// documented defaults materialised for the two percentages a response always carries.
+/// documented defaults materialised for the members a response always carries.
 ///
 /// `maximumPercent`: "The default maximumPercent value for a service using the REPLICA
 /// service scheduler is 200%" — a daemon runs exactly one task per container instance,
@@ -1532,9 +1804,17 @@ pub fn container_instance_arn_from_reference(
 /// default value for a replica service for minimumHealthyPercent is 100%. The default
 /// minimumHealthyPercent value for a service using the DAEMON service schedule is 0% for
 /// the CLI, the Amazon Web Services SDKs, and the APIs".
+///
+/// The two members that belong to the ROLLING update the ECS controller performs —
+/// `strategy` and `deploymentCircuitBreaker` ("The deployment circuit breaker can only be
+/// used for services using the rolling update (ECS) deployment type") — are defaulted
+/// only for a service whose scheduler owns that rollout; a service driven by an external
+/// deployment controller carries neither. `bakeTimeInMinutes` belongs to the
+/// configuration itself and is defaulted for every service.
 pub fn deployment_configuration(
     requested: Option<DeploymentConfiguration>,
     daemon: bool,
+    scheduler_owned: bool,
 ) -> DeploymentConfiguration {
     let mut configuration = requested.unwrap_or_default();
     configuration.maximum_percent = Some(configuration.maximum_percent.unwrap_or(if daemon {
@@ -1552,7 +1832,110 @@ pub fn deployment_configuration(
                     REPLICA_MINIMUM_HEALTHY_PERCENT
                 }),
         );
+    configuration.bake_time_in_minutes = Some(
+        configuration
+            .bake_time_in_minutes
+            .unwrap_or(DEFAULT_BAKE_TIME_MINUTES),
+    );
+    if scheduler_owned {
+        configuration.strategy = Some(
+            configuration
+                .strategy
+                .unwrap_or_else(|| DEPLOYMENT_STRATEGY_ROLLING.to_string()),
+        );
+        configuration.deployment_circuit_breaker = Some(
+            configuration
+                .deployment_circuit_breaker
+                .unwrap_or_else(default_deployment_circuit_breaker),
+        );
+    }
     configuration
+}
+
+/// The deployment circuit breaker a service that configured none carries: off, with the
+/// documented failure threshold.
+///
+/// `DeploymentCircuitBreaker$enable` is what "determines whether to use the deployment
+/// circuit breaker logic for the service", so a service that configured none has it
+/// turned off and rolls nothing back. `resetOnHealthyTask`: "The default is true".
+/// `ThresholdConfiguration`: "By default, the threshold configuration uses a type of
+/// BOUNDED_PERCENT with a value of 50."
+fn default_deployment_circuit_breaker() -> DeploymentCircuitBreaker {
+    DeploymentCircuitBreaker {
+        enable: false,
+        rollback: false,
+        reset_on_healthy_task: Some(CIRCUIT_BREAKER_RESETS_ON_HEALTHY_TASK),
+        threshold_configuration: Some(ThresholdConfiguration {
+            r#type: THRESHOLD_BOUNDED_PERCENT.to_string(),
+            value: THRESHOLD_DEFAULT_VALUE,
+        }),
+    }
+}
+
+/// The ARN of the IAM role a service reports in `Service$roleArn`, from the `role` the
+/// request named and the deployment controller the service uses.
+///
+/// `Service$roleArn` is "The ARN of the IAM role that's associated with the service",
+/// and `CreateService$role` names the role that gets associated: the one the request
+/// named — "The name or full Amazon Resource Name (ARN) of the IAM role" — or, when it
+/// named none, the ECS service-linked role, which "is required if ... the service is
+/// configured to use ... an external deployment controller ... in which case you don't
+/// specify a role here". A service whose own scheduler runs the rollout and that named
+/// no role has no role associated with it, so it reports none.
+pub fn service_role_arn(requested: Option<&str>, scheduler_owned: bool) -> Option<String> {
+    match requested {
+        // "If your specified role has a path other than /, then you must either specify
+        // the full role ARN (this is recommended) or prefix the role name with the path."
+        Some(reference) if reference.starts_with("arn:") => Some(reference.to_string()),
+        Some(name) => Some(::engine::emulator_arn(
+            "iam",
+            "",
+            &format!("role/{}", name.trim_start_matches('/')),
+        )),
+        None if !scheduler_owned => Some(service_linked_role_arn()),
+        None => None,
+    }
+}
+
+/// The ARN of the ECS service-linked role, `AWSServiceRoleForECS`. An IAM ARN carries no
+/// region, which is what the empty region renders.
+pub fn service_linked_role_arn() -> String {
+    ::engine::emulator_arn("iam", "", SERVICE_LINKED_ROLE_RESOURCE)
+}
+
+/// The principal that made this request, for `Service$createdBy`.
+///
+/// Derived from the request's own SigV4 access key id, so the member reports WHO called
+/// rather than a fabricated identity. That id is caller-controlled text, so it is first
+/// reduced to the characters an access key id can hold.
+pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    let raw = ::engine::extract_akid(&ctx.parts().headers);
+    let filtered: String = raw
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(128)
+        .collect();
+    let akid = if filtered.is_empty() {
+        "default"
+    } else {
+        filtered.as_str()
+    };
+    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+}
+
+/// The ARN of a service revision:
+/// `arn:aws:ecs:<region>:<account>:service-revision/<cluster>/<service>/<id>`.
+pub fn service_revision_arn(
+    region: &str,
+    cluster_name: &str,
+    service_name: &str,
+    revision_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("service-revision/{cluster_name}/{service_name}/{revision_id}"),
+    )
 }
 
 /// The ARN of a service: `arn:aws:ecs:<region>:<account>:service/<cluster>/<name>`.

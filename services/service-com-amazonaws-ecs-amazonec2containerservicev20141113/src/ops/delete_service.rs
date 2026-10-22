@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a service in a cluster and reports the deleted service. The stored record is
+//! KEPT in the status the deletion leaves it — the operation's own doc: "if there are
+//! still running tasks that require cleanup, the service status moves from ACTIVE to
+//! DRAINING ... After all tasks have transitioned to either STOPPING or STOPPED status,
+//! the service status moves from DRAINING to INACTIVE. Services in the DRAINING or
+//! INACTIVE status can still be viewed with the DescribeServices API operation" — so a
+//! `DescribeServices` after a delete reports the service rather than a MISSING failure.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +167,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteService"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteServiceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // A service ARN carries the cluster that hosts it, so an ARN names the cluster
+        // too; `cluster` is what names it otherwise ("If you do not specify a cluster,
+        // the default cluster is assumed"). Naming two different clusters in one request
+        // names no service at all.
+        let (arn_cluster, name) = crate::state::cluster_and_service_from_reference(&input.service);
+        let cluster_name = match (&arn_cluster, input.cluster.as_deref()) {
+            (Some(from_arn), Some(requested))
+                if *from_arn != crate::state::cluster_name_from_reference(Some(requested)) =>
+            {
+                return Err(DeleteServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "the service ARN names cluster {from_arn:?} but cluster \
+                             {requested:?} was requested"
+                        )),
+                    },
+                )
+                .into());
+            }
+            (Some(from_arn), _) => from_arn.clone(),
+            (None, requested) => crate::state::cluster_name_from_reference(requested),
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(DeleteServiceErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+
+        let key = (cluster_name.clone(), name.clone());
+        let Some(stored) = guard.services.get(&key) else {
+            return Err(DeleteServiceErrorModeled::ServiceNotFoundException(
+                ServiceNotFoundException {
+                    message: Some(format!(
+                        "service {name:?} was not found in cluster {cluster_name:?}"
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "You can delete a service if you have no running tasks in it and the desired
+        // task count is zero. If the service is actively maintaining tasks, you can't
+        // delete it, and you must update the service to a desired task count of zero" —
+        // unless `force` is set: "If true, allows you to delete a service even if it
+        // wasn't scaled down to zero tasks."
+        let force = input.force.unwrap_or_default();
+        if !force && stored.desired_count > 0 {
+            return Err(DeleteServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "the service cannot be deleted while it is scaled above 0; \
+                         service {name:?} wants {} tasks",
+                        stored.desired_count
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record is KEPT, in the status the deletion leaves it: "Services in the
+        // DRAINING or INACTIVE status can still be viewed with the DescribeServices API
+        // operation", which is what tells a deleted service apart from one that never
+        // existed. Deleting an already-INACTIVE service changes nothing more.
+        guard.drain_service(&key, now);
+
+        let stored = guard
+            .services
+            .get(&key)
+            .expect("the deleted service's record is kept");
+        // `DeleteService` has no `include` member to narrow the response with, so "the
+        // full description of the deleted service" carries its tags.
+        let view = guard.service_view(stored, crate::state::ServiceFields::all());
+        Ok(DeleteServiceOutput {
+            service: Some(view),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObjectTagging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObjectTagging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObjectTagging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the tag set associated with the named object with the `Tagging` container the
+//! request carries, and answers 200. `GetObjectTagging` reads the same state back.
 //!
 //! ## Shape of an operation
 //!
@@ -118,14 +112,24 @@ use super::types::*;
 // `PutObjectTaggingError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutObjectTaggingError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutObjectTagging")]
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes this
+// SERVICE models for an address that does not exist.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutObjectTagging")` reports `errors: []`),
+// yet `Bucket` and `Key` are both @httpLabels, so a request can name a bucket or a key
+// that does not exist — AWS answers `NoSuchBucket` ("The specified bucket does not
+// exist") and `NoSuchKey` ("The specified key does not exist"), each modelled
+// `@httpError(404)`. Widening the set with those two shapes is what lets this handler
+// answer the same two 404s its reader `GetObjectTagging` answers for the same two causes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutObjectTagging",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum PutObjectTaggingErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -180,17 +184,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObjectTagging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectTaggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata only, and this write needs nothing from it.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `PutObjectTaggingRequest$ExpectedBucketOwner`, judged the way every
+        // other handler here judges it: this emulator serves one account, so the owner of
+        // every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // "To put tags of any other version, use the versionId query parameter" — a
+        // version this emulator holds nothing of, because object versioning is not
+        // emulated (`PutObject` keeps one object per key), so there is no version to
+        // associate a tag set with. The 501 says that rather than tagging the current
+        // object as if it were the version the request named.
+        if input.version_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObjectTagging with versionId",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the tag set cannot be recorded at all, and neither
+            // modelled error says that, so the scaffold's 501 carries what is true: this
+            // emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObjectTagging",
+            ));
+        };
+
+        // The tag set the request carries, in the order it arrived. `Tagging` is the
+        // @httpPayload and `Tagging$TagSet` is required, so reaching here means the
+        // boundary already parsed both.
+        let tags: Vec<crate::state::ResourceTag> = input
+            .tagging
+            .tag_set
+            .iter()
+            .map(|tag| crate::state::ResourceTag {
+                key: tag.key.clone(),
+                value: tag.value.clone(),
+            })
+            .collect();
+
+        let mut store = state.lock();
+
+        // The ADDRESS is resolved first, so a request naming a bucket or a key this
+        // emulator does not hold answers that — the way the service orders the refusals —
+        // rather than reporting whatever is wrong with a tag set no object could have
+        // carried.
+        match store
+            .bucket(&input.bucket)
+            .map(|bucket| bucket.object(&input.key).is_some())
+        {
+            None => return Err(PutObjectTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
+            Some(false) => {
+                return Err(PutObjectTaggingErrorModeled::NoSuchKey(NoSuchKey {}).into())
+            }
+            Some(true) => {}
+        }
+
+        // Validated BEFORE anything is written, so a refused tag set leaves the object's
+        // current tags exactly as they were, and against the OBJECT's own published
+        // limits — "Amazon S3 limits the maximum number of tags to 10 tags per object"
+        // (this operation's own documentation), with the key and value character bounds
+        // every tag set shares. AWS refuses these with `InvalidTag`, a code this
+        // service's model does not declare as a shape and so cannot render, so the
+        // refusal goes out through the framework's 400 `ValidationException` channel —
+        // the same channel `PutBucketTagging` uses for a bucket's tag set.
+        if let Err(rejection) =
+            crate::state::validate_tag_set(&tags, crate::state::OBJECT_TAG_SET_LIMITS)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                rejection.to_string(),
+            ));
+        }
+
+        // A replacement, not a merge: the request carries the complete `Tagging`
+        // container, so what the object holds afterwards is exactly this `TagSet` and
+        // nothing of the one before it; an empty `TagSet` leaves the object with no tags.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObjectTagging"))
+        // The store reports what the write did, because it may refuse: a tag set is
+        // retained with the object, so one that would take the bucket or the whole store
+        // past the byte budgets this emulator keeps is refused rather than recorded.
+        let outcome = store.replace_object_tags(&input.bucket, &input.key, tags);
+        match outcome {
+            Some(crate::state::ObjectTagWrite::Applied) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => return Err(PutObjectTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
+            Some(crate::state::ObjectTagWrite::NoSuchKey) => {
+                return Err(PutObjectTaggingErrorModeled::NoSuchKey(NoSuchKey {}).into())
+            }
+            // The emulator's own ceilings, not AWS limits (S3 bounds neither the number of
+            // objects nor their total size), so no AWS error code describes them: they go
+            // out through the framework's 400 `ValidationException` channel, the same
+            // channel `PutObject` uses for the same two budgets.
+            Some(crate::state::ObjectTagWrite::ByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "tagging {:?} would leave the bucket {:?} holding {would_hold} bytes \
+                     of objects, past the {} bytes this emulator keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            Some(crate::state::ObjectTagWrite::TotalByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "tagging {:?} would leave this emulator holding {would_hold} bytes of \
+                     objects across every bucket, past the {} bytes it keeps in total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(PutObjectTaggingOutput {
+            // "The versionId of the object the tag-set was added to" — reported for a
+            // versioned bucket, and a `versionId` request is refused above; this emulator
+            // holds no object versions, so no version is named rather than one being
+            // invented.
+            version_id: None,
+        })
     }
 }

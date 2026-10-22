@@ -209,11 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The tag set the request carries, in the order it arrived. `Tagging` is the
         // @httpPayload and `Tagging$TagSet` is required, so reaching here means the
         // boundary already parsed both.
-        let tags: Vec<crate::state::BucketTag> = input
+        let tags: Vec<crate::state::ResourceTag> = input
             .tagging
             .tag_set
             .iter()
-            .map(|tag| crate::state::BucketTag {
+            .map(|tag| crate::state::ResourceTag {
                 key: tag.key.clone(),
                 value: tag.value.clone(),
             })
@@ -229,11 +229,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Validated BEFORE anything is written, so a refused tag set leaves the bucket's
-        // current tags exactly as they were. AWS refuses these with `InvalidTag`, a code
-        // this service's model does not declare as a shape and so cannot render, so the
-        // refusal goes out through the framework's 400 `ValidationException` channel —
-        // the same channel `CreateBucket` uses for the unmodelled bucket quota refusal.
-        if let Err(rejection) = crate::state::validate_tag_set(&tags) {
+        // current tags exactly as they were, and against the BUCKET's own published
+        // limits (the shared rule, with this resource's tag count). AWS refuses these with
+        // `InvalidTag`, a code this service's model does not declare as a shape and so
+        // cannot render, so the refusal goes out through the framework's 400
+        // `ValidationException` channel — the same channel `CreateBucket` uses for the
+        // unmodelled bucket quota refusal.
+        if let Err(rejection) =
+            crate::state::validate_tag_set(&tags, crate::state::BUCKET_TAG_SET_LIMITS)
+        {
             return Err(crate::scaffolded::Scaffolded::validation(
                 rejection.to_string(),
             ));

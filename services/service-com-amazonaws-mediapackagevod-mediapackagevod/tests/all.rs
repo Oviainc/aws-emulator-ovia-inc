@@ -27,3 +27,5 @@ mod packaging_group_update;
 mod packaging_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/success_path_projections.rs"]
+mod success_path_projections;

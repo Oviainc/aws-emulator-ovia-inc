@@ -22,12 +22,16 @@
 //!   nothing a call does changes what a later caller sees;
 //! * a `NextToken` is emitted only when the aggregation was truncated, and
 //!   resuming from it yields the remaining periods exactly once;
+//! * a group selector narrows the aggregation to the traffic that group's own
+//!   `FilterExpression` selects \u2014 all of it when the group carries none, none of
+//!   it when the expression matches nothing \u2014 and either way the request is
+//!   ANSWERED, with `ContainsOldGroupVersions` false;
 //! * a selection this slice does not evaluate (an `EntitySelectorExpression`, a
-//!   forecast, a group that does not exist or whose filter expression narrows
-//!   the aggregation), a `Period` that is not a positive number of seconds and
-//!   a window the crate's shared check refuses (inverted, or a bound no
-//!   recorded traffic could carry) are REFUSED with `InvalidRequestException`,
-//!   never answered with an aggregation that ignored them.
+//!   forecast, a group that does not exist), a `Period` that is not a positive
+//!   number of seconds and a window the crate's shared check refuses (inverted,
+//!   or a bound no recorded traffic could carry) are REFUSED with
+//!   `InvalidRequestException`, never answered with an aggregation that ignored
+//!   them.
 
 use serde_json::{json, Value};
 
@@ -712,11 +716,12 @@ async fn refuses_what_it_cannot_aggregate() {
         .await;
     assert_eq!(put.status, 200, "the ingest must succeed, got {put:?}");
 
-    // The reserved account-level `Default` group is the group with NO filter
-    // expression: X-Ray refuses a `CreateGroup` that supplies none (see
-    // `group_control_plane.rs`), so the group every region already holds is what
-    // narrows nothing and is ANSWERED; one carrying a filter expression would
-    // narrow the aggregation further than this slice evaluates.
+    // Three groups to pull statistics from: the reserved account-level `Default`
+    // group, which carries NO filter expression (X-Ray refuses a `CreateGroup`
+    // that supplies none, see `group_control_plane.rs`), one whose expression
+    // SELECTS the ingested traffic, and one whose expression selects none of it.
+    // All three are answered — the expression narrows WHAT is aggregated, it is
+    // not a reason to refuse.
     let listed = xray.call("/Groups", &json!({})).await;
     assert_eq!(listed.status, 200, "GetGroups must succeed, got {listed:?}");
     let plain_arn = array(&listed.body, "Groups")
@@ -734,6 +739,16 @@ async fn refuses_what_it_cannot_aggregate() {
     assert_eq!(
         filtered.status, 200,
         "CreateGroup must succeed, got {filtered:?}"
+    );
+    let unmatched = xray
+        .call(
+            "/CreateGroup",
+            &json!({"GroupName": "unmatched", "FilterExpression": "service(\"other\")"}),
+        )
+        .await;
+    assert_eq!(
+        unmatched.status, 200,
+        "CreateGroup must succeed, got {unmatched:?}"
     );
 
     let base = json!({"StartTime": ALIGNED, "EndTime": ALIGNED + 60.0});
@@ -765,10 +780,6 @@ async fn refuses_what_it_cannot_aggregate() {
         (
             "a GroupARN that names no group",
             json!({"GroupARN": "arn:aws:xray:us-east-1:123456789012:group/absent/0123456789ab"}),
-        ),
-        (
-            "a group whose FilterExpression narrows the aggregation",
-            json!({"GroupName": "filtered"}),
         ),
         // The crate's one window check, shared with GetServiceGraph and
         // StartTraceRetrieval (`crate::state::validate_window`).
@@ -804,11 +815,23 @@ async fn refuses_what_it_cannot_aggregate() {
         );
     }
 
-    // And the supported group selectors still answer the aggregation, by either
-    // selector.
-    for (label, selector) in [
-        ("by GroupName", json!({"GroupName": "Default"})),
-        ("by GroupARN", json!({"GroupARN": plain_arn})),
+    // And every group selector answers the aggregation the group's own
+    // `FilterExpression` selects: by either selector for the unfiltered group,
+    // the matching traffic for a group whose expression selects it, and an empty
+    // series for one whose expression selects nothing.
+    for (label, selector, periods_expected) in [
+        ("by GroupName", json!({"GroupName": "Default"}), 1),
+        ("by GroupARN", json!({"GroupARN": plain_arn}), 1),
+        (
+            "a group whose FilterExpression selects the traffic",
+            json!({"GroupName": "filtered"}),
+            1,
+        ),
+        (
+            "a group whose FilterExpression selects none of it",
+            json!({"GroupName": "unmatched"}),
+            0,
+        ),
     ] {
         let mut body = base.clone();
         for (member, value) in selector.as_object().expect("the selector is an object") {
@@ -818,9 +841,17 @@ async fn refuses_what_it_cannot_aggregate() {
         let periods = array(&answered.body, "TimeSeriesServiceStatistics");
         assert_eq!(
             (answered.status, periods.len()),
-            (200, 1),
-            "case {label:?}: a group without a filter expression must answer the aggregation, got {answered:?}"
+            (200, periods_expected),
+            "case {label:?}: a group selector must answer the aggregation its FilterExpression selects, got {answered:?}"
         );
+        assert_eq!(
+            answered.get("ContainsOldGroupVersions"),
+            &json!(false),
+            "case {label:?}: the aggregation is recomputed from stored segments, so it mixes no older group version, got {answered:?}"
+        );
+        if periods_expected == 0 {
+            continue;
+        }
         assert_period(
             label,
             &periods[0],

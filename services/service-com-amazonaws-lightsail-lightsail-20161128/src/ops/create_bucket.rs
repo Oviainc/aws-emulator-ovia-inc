@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one bucket record into this service's store and answers the record it
+//! stored, together with the operation-log entry the create wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBucket"))
+        // A bucket is a REGIONAL resource — `GetBuckets` reports "all of your
+        // buckets in the Amazon Web Services Region where the request is made" —
+        // so the region the request is signed for is part of the record's
+        // identity, exactly as it is for a container service.
+        let region = crate::state::request_region(ctx.parts());
+        // The address a caller is told to reach the bucket on has to be the
+        // endpoint THIS request arrived at: a literal AWS hostname would send the
+        // next client out of the emulator. A request that names no host names no
+        // endpoint to announce, and then `url` is omitted.
+        let endpoint = crate::state::request_endpoint(ctx.parts());
+
+        // `bucketName` and `bundleId` are modelled `@required` members and the
+        // name carries the modelled length and pattern, so the centralized walk
+        // refused anything outside them before this body ran. What is left is
+        // what the model cannot express: the bundle must name a plan this service
+        // publishes, the caller-sized tag list must be within its bound, and the
+        // name must still be free in this region. Each is checked BEFORE the
+        // first write, so a refused request creates nothing.
+        let bundle = crate::state::bucket_bundle_spec(&input.bundle_id).ok_or_else(|| {
+            invalid(format!(
+                "bundleId '{}' is not a bucket bundle this service offers; use GetBucketBundles \
+                 to list the bundle IDs you can specify",
+                input.bundle_id
+            ))
+        })?;
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+        let object_versioning =
+            crate::state::object_versioning_from_request(input.enable_object_versioning);
+        let now = crate::state::now_ms();
+        let location = crate::state::StoredLocation::regional(&region);
+
+        crate::state::with_state(&*self.engine, |store| {
+            if store.bucket(&region, &input.bucket_name).is_some() {
+                return Err(invalid(format!(
+                    "bucketName '{}' already names a bucket of this account in {region}",
+                    input.bucket_name
+                )));
+            }
+            if store.buckets.len() >= crate::state::MAX_BUCKETS {
+                return Err(invalid(format!(
+                    "creating another bucket would take this emulator's store, which holds \
+                     every Region's buckets together, past the {} it keeps",
+                    crate::state::MAX_BUCKETS
+                )));
+            }
+
+            let id = store.mint_uuid();
+            let bucket = crate::state::StoredBucket {
+                name: input.bucket_name.clone(),
+                arn: crate::state::bucket_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags: tags.clone(),
+                // The plan resolved above, named by the id the catalog carries
+                // rather than by whatever the request spelled it.
+                bundle_id: bundle.bundle_id.to_string(),
+                object_versioning: object_versioning.to_string(),
+                // Nothing has moved this bucket between bundles yet, so its one
+                // monthly bundle change is still available.
+                able_to_update_bundle: true,
+                // A new bucket and its objects are private until `UpdateBucket`
+                // widens them.
+                access_rules: AccessRules {
+                    get_object: Some(crate::state::ACCESS_TYPE_PRIVATE.to_string()),
+                    allow_public_overrides: Some(false),
+                },
+                // No account has been granted read-only access, no instance has
+                // been given access through `SetResourceAccessForBucket`, no
+                // access log has been turned on and no CORS rule has been set:
+                // each of those is its own operation's business.
+                readonly_access_accounts: Vec::new(),
+                resources_receiving_access: Vec::new(),
+                access_log_config: BucketAccessLogConfig {
+                    enabled: false,
+                    destination: None,
+                    prefix: None,
+                },
+                cors_rules: Vec::new(),
+                // The bucket is serving as this call returns: the modelled
+                // `BucketState` has no transient code, so there is nothing for
+                // the clock to settle later.
+                state_code: crate::state::BUCKET_STATE_OK.to_string(),
+            };
+            let view = bucket.view(endpoint.as_deref(), false, false);
+            store.insert_bucket(bucket);
+            // The bucket exists as this call returns, which is why the operation
+            // it logs is answered terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_BUCKET,
+                crate::state::RESOURCE_TYPE_BUCKET,
+                &input.bucket_name,
+                &location,
+                None,
+            );
+            Ok(CreateBucketOutput {
+                bucket: Some(view),
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateBucketError {
+    CreateBucketErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateBucketError {
+    CreateBucketErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

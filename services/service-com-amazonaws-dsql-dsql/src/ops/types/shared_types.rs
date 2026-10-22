@@ -11,6 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 
+#[smithy_macros::smithy(shape = "com.amazonaws.dsql#AccessDeniedException")]
+#[derive(Debug, Clone, Default)]
+pub struct AccessDeniedException {
+    pub message: String,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.dsql#ResourceNotFoundException")]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceNotFoundException {

@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/error_contract.rs"]
+mod error_contract;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

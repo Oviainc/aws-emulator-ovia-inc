@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a persisted stream of a cluster: the identifiers, ARN, status,
+//! creation time, ordering, format, target definition and tags `CreateStream`
+//! stored. Neither an unknown cluster nor an unknown stream is reported as an
+//! empty answer: both are `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -97,10 +93,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `GetStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#GetStream")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#GetStream",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetStreamErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -154,18 +154,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStream"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetStreamErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        state.settle(std::time::SystemTime::now());
+
+        let Some(cluster) = state.clusters.get(&input.cluster_identifier) else {
+            return Err(GetStreamErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.cluster_identifier),
+            )
+            .into());
+        };
+        let Some(stream) = cluster.streams.get(&input.stream_identifier) else {
+            return Err(GetStreamErrorModeled::ResourceNotFoundException(
+                crate::state::stream_not_found(
+                    &region,
+                    &input.cluster_identifier,
+                    &input.stream_identifier,
+                ),
+            )
+            .into());
+        };
+
+        Ok(GetStreamOutput {
+            cluster_identifier: cluster.identifier.clone(),
+            stream_identifier: stream.stream_identifier.clone(),
+            arn: stream.arn.clone(),
+            status: stream.status.clone(),
+            creation_time: ::aws_smithy_types::DateTime::from(stream.creation_time),
+            ordering: stream.ordering.clone(),
+            format: stream.format.clone(),
+            target_definition: Some(stream.target_definition.clone()),
+            // `statusReason` carries the error behind a FAILED or IMPAIRED
+            // status; a stream the clock is driving to ACTIVE has none.
+            status_reason: None,
+            // `tags` is modelled as an optional map, and a stream created
+            // without tags has none to report.
+            tags: (!stream.tags.is_empty()).then(|| {
+                stream
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+        })
     }
 }

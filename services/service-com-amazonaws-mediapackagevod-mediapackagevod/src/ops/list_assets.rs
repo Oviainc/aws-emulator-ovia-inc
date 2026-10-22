@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_at: Some(asset.created_at.clone()),
                 id: Some(asset.id.clone()),
                 packaging_group_id: Some(asset.packaging_group_id.clone()),
-                resource_id: Some(asset.resource_id.clone()),
+                resource_id: asset.resource_id.clone(),
                 source_arn: Some(asset.source_arn.clone()),
                 source_role_arn: Some(asset.source_role_arn.clone()),
                 tags: Some(state.tags_of(&asset.arn)),
@@ -204,7 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             None
         };
-
         Ok(ListAssetsOutput {
             assets: Some(page),
             next_token,

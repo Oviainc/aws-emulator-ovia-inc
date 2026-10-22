@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCrawler
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCrawler`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCrawler::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a crawler in this service's store: the request's members are persisted as
+//! written, the server-set members (`State`, `Version`, `CreationTime`, `LastUpdated`)
+//! are filled here, and a later `GetCrawler` reports exactly what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCrawler` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCrawlerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCrawler"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is
+            // reported as the operation's own timeout error rather than invented as a
+            // shape the model does not declare for it.
+            return Err(CreateCrawlerErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "At least one crawl target must be specified, in the s3Targets field, the
+        // jdbcTargets field, or the DynamoDBTargets field." The rule is about naming a
+        // data store to crawl, so every target list `CrawlerTargets` carries counts,
+        // and a list that is present but empty names none.
+        if !crate::state::has_crawl_target(&input.targets) {
+            return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Targets must specify at least one crawl target".to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // A `Schedule` is "a cron expression used to specify the schedule", whose
+        // documented form is `cron(<six fields>)`. Anything else is not a schedule this
+        // service can run, so it is refused rather than stored and reported back.
+        if let Some(schedule) = input.schedule.as_deref() {
+            if !crate::state::is_cron_expression(schedule) {
+                return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Schedule {schedule} is not a cron expression of the form \
+                             cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)"
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A `CatalogId` this emulator does not hold must not be conjured into existence
+        // by the create: on the real service it is another account's catalog, or one
+        // `CreateCatalog` has not made. This operation models no not-found error, so
+        // the refusal is the modelled client-input error.
+        if !crate::state::is_known_catalog(&catalog_id) {
+            return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "CatalogId {catalog_id} is not a Data Catalog in this account"
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        if store.crawlers.contains_key(&input.name) {
+            return Err(CreateCrawlerErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Crawler already exists: {}", input.name)),
+                },
+            )
+            .into());
+        }
+        // The store is resident memory and this create is reachable by any caller, so
+        // the number of records one process will hold is bounded. Past the ceiling the
+        // request is refused with the operation's own modelled limit error.
+        if !store.can_store_crawler() {
+            return Err(
+                CreateCrawlerErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} crawlers",
+                            crate::state::MAX_CRAWLERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = crate::state::CrawlerEntry::from_create_input(
+            &input,
+            &catalog_id,
+            ::std::time::SystemTime::now(),
+        );
+        store.crawlers.insert(input.name.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateCrawler",
+            catalog_id = %catalog_id,
+            crawler = %input.name,
+            "created a Glue crawler"
+        );
+
+        Ok(CreateCrawlerOutput {})
     }
 }

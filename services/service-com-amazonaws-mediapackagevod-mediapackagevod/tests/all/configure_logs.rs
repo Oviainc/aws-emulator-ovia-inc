@@ -338,9 +338,10 @@ async fn configure_logs_refuses_an_id_no_group_is_stored_under() {
     // shape.
     create_group(&router, "vod-group-deleted", json!({})).await;
     let deleted = call(&router, "DELETE", "/packaging_groups/vod-group-deleted", None).await;
-    // `DeletePackagingGroup`'s modelled success status is 202, not 200.
+    // `DeletePackagingGroup` answers the recorded 204 No Content, not the 202 the
+    // model declares — see `src/ops/delete_packaging_group.rs`.
     assert_eq!(
-        deleted.status, 202,
+        deleted.status, 204,
         "DeletePackagingGroup must succeed, got {} with body {}",
         deleted.status, deleted.body
     );

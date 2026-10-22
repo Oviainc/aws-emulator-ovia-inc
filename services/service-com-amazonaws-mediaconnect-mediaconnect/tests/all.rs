@@ -19,6 +19,8 @@ mod flow_lifecycle;
 mod flow_media_streams;
 #[path = "all/flow_outputs.rs"]
 mod flow_outputs;
+#[path = "all/gateway_lifecycle.rs"]
+mod gateway_lifecycle;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
 #[path = "all/resource_tags.rs"]

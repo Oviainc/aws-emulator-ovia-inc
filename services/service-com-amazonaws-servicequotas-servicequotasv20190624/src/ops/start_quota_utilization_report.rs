@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQuotaUtilizationReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQuotaUtilizationReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQuotaUtilizationReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Initiates a quota utilization report: mints a report over the quotas in this
+//! service's state, stores it `PENDING` with the instants its generation comes due at,
+//! and returns its `ReportId` for `GetQuotaUtilizationReport` to poll.
 //!
 //! ## Shape of an operation
 //!
@@ -151,23 +145,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_QUOTA_UTILIZATION_REPORT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Initiate a quota utilization report.
+    ///
+    /// MUTATING by its own specification ("Initiates the generation of a quota
+    /// utilization report"): every call mints a report, so two calls answer with two
+    /// `ReportId`s and neither reuses the other's. The report is stored `PENDING` —
+    /// the status the model documents for a report that was just initiated — with the
+    /// snapshot of the quota values in force now and the instants its generation and
+    /// its deletion come due at; nothing here sleeps for them.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQuotaUtilizationReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQuotaUtilizationReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQuotaUtilizationReport"))
+        let _ = &input;
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartQuotaUtilizationReportErrorModeled::ServiceException(ServiceException {
+                message: Some("the Service Quotas state store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut quotas_state = state.lock();
+        // The snapshot the report analyses must see every increase the clock has
+        // already made due, the same way a quota read does.
+        quotas_state.settle_due_requests(&region, now);
+        quotas_state.settle_due_reports(&region, now);
+
+        let report = quotas_state
+            .start_utilization_report(&region, now)
+            .ok_or_else(|| {
+                StartQuotaUtilizationReportErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "this region already has {} quota utilization reports in flight; \
+                             retrieve or wait for one to expire before starting another",
+                            crate::state::MAX_LIVE_REPORTS_PER_REGION
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(StartQuotaUtilizationReportOutput {
+            report_id: Some(report.id.clone()),
+            status: Some(report.status.clone()),
+            message: Some(format!(
+                "report generation started for {} quotas; call GetQuotaUtilizationReport with \
+                 this ReportId to retrieve the results",
+                report.quotas.len()
+            )),
+        })
     }
 }

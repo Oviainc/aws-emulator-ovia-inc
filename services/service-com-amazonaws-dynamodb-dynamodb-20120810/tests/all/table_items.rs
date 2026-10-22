@@ -292,17 +292,22 @@ async fn table_and_item_round_trip_reports_what_was_written() {
         "case get Z: a missing item is a 200 with no Item, got {missing}"
     );
 
-    // DESCRIBE: ItemCount and TableSizeBytes are derived from what was written.
+    // DESCRIBE: the metered figures are what a description reports, and a write does
+    // not move them — "DynamoDB updates this value approximately every six hours.
+    // Recent changes might not be reflected in this value"
+    // (`TableDescription$ItemCount`), so three fresh puts are not reflected yet.
     let described = ok(&router, "DescribeTable", json!({"TableName": "Music"})).await;
     assert_eq!(
         described["Table"]["ItemCount"],
-        json!(3),
-        "case describe after 3 puts: expected ItemCount 3, got {described}"
+        json!(0),
+        "case describe after 3 puts: expected the metered ItemCount, not a live count, \
+         got {described}"
     );
-    let size = described["Table"]["TableSizeBytes"].as_i64().unwrap_or(0);
-    assert!(
-        size > 0,
-        "case describe after 3 puts: expected a non-zero TableSizeBytes, got {described}"
+    assert_eq!(
+        described["Table"]["TableSizeBytes"],
+        json!(0),
+        "case describe after 3 puts: expected the metered TableSizeBytes, not a live \
+         total, got {described}"
     );
 
     // QUERY: one page at a time, resuming from LastEvaluatedKey.
@@ -425,8 +430,9 @@ async fn table_and_item_round_trip_reports_what_was_written() {
     let still_three = ok(&router, "DescribeTable", json!({"TableName": "Music"})).await;
     assert_eq!(
         still_three["Table"]["ItemCount"],
-        json!(3),
-        "case replace B: a replacement does not add an item, got {still_three}"
+        json!(0),
+        "case replace B: a write of any kind leaves the metered ItemCount alone, got \
+         {still_three}"
     );
 
     // DELETE one item: it is gone from GetItem and from Query.
@@ -1154,19 +1160,26 @@ async fn a_write_past_the_stores_budget_is_refused_and_a_delete_frees_it() {
         "case bulk writes: every write before the refusal must have been accepted, got {accepted} of {index}"
     );
 
-    // What the table reports is derived from the items, and stays inside the budget.
-    let described = ok(&router, "DescribeTable", json!({"TableName": "Bulk"})).await;
-    let size = described["Table"]["TableSizeBytes"]
-        .as_i64()
-        .unwrap_or_default();
+    // The budget bounds what was ACCEPTED, which is where it is enforced: every item that
+    // landed carries at least the 399 KB payload, and together they fit inside it.
+    let accepted_bytes = i64::try_from(accepted)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(i64::try_from(payload.len()).unwrap_or(i64::MAX));
     assert!(
-        size <= MAX_TABLE_SIZE_BYTES,
-        "case budget reached: expected TableSizeBytes at or under {MAX_TABLE_SIZE_BYTES}, got {size}"
+        accepted_bytes <= MAX_TABLE_SIZE_BYTES,
+        "case budget reached: the {accepted} accepted writes must fit the \
+         {MAX_TABLE_SIZE_BYTES}-byte budget, got at least {accepted_bytes} bytes"
     );
+    // What a description reports is the metered snapshot, which those writes do not move.
+    let described = ok(&router, "DescribeTable", json!({"TableName": "Bulk"})).await;
     assert_eq!(
-        described["Table"]["ItemCount"],
-        json!(accepted as i64),
-        "case budget reached: expected ItemCount {accepted}, got {described}"
+        (
+            described["Table"]["ItemCount"].clone(),
+            described["Table"]["TableSizeBytes"].clone(),
+        ),
+        (json!(0), json!(0)),
+        "case budget reached: expected the metered figures, which {accepted} accepted \
+         writes do not move, got {described}"
     );
 
     // Deleting an item gives its bytes back, so the write that was just refused is

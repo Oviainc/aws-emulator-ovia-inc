@@ -340,7 +340,7 @@ async fn a_whole_request_violation_is_attributed_to_base() {
         )
         .await;
         assert_eq!(
-            answer.status, 200,
+            answer.status, 202,
             "case {format:?}: exactly one package block must be accepted, got {} body {}",
             answer.status, answer.body
         );
@@ -488,7 +488,7 @@ async fn a_duplicate_id_conflict_message_binds_the_requested_id() {
         )
         .await;
         assert_eq!(
-            created.status, 200,
+            created.status, 202,
             "setup: CreatePackagingConfiguration {id:?}: body {}",
             created.body
         );

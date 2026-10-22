@@ -17,5 +17,7 @@ mod abort_environment_update;
 mod application_versions;
 #[path = "all/lifecycle.rs"]
 mod lifecycle;
+#[path = "all/platform_branches.rs"]
+mod platform_branches;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

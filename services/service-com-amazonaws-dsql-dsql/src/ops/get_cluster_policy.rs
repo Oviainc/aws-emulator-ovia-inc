@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClusterPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetClusterPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetClusterPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource-based policy attached to a cluster: the document and the
+//! `policyVersion` token the `PutClusterPolicy` that attached it answered with. A
+//! cluster with no policy attached is `ResourceNotFoundException`, which is how a
+//! caller probes whether a policy is attached at all.
 //!
 //! ## Shape of an operation
 //!
@@ -84,11 +80,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `GetClusterPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#GetClusterPolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#GetClusterPolicy",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetClusterPolicyErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +142,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetClusterPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClusterPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetClusterPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetClusterPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        state.settle(std::time::SystemTime::now());
+
+        let Some(cluster) = state.clusters.get(&input.identifier) else {
+            return Err(GetClusterPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.identifier),
+            )
+            .into());
+        };
+
+        // A cluster with no policy attached has nothing to report, and the absence
+        // IS the answer: 404, never an empty document.
+        let Some(policy) = cluster.policy.as_ref() else {
+            return Err(GetClusterPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_policy_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        Ok(GetClusterPolicyOutput {
+            policy: policy.document.clone(),
+            policy_version: policy.version.clone(),
+        })
     }
 }

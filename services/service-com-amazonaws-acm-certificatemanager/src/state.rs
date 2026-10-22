@@ -736,16 +736,51 @@ pub fn is_validation_domain_for(validation_domain: &str, domain_name: &str) -> b
 pub fn tag_map(tags: &[Tag]) -> Result<BTreeMap<String, String>, String> {
     let mut mapped = BTreeMap::new();
     for tag in tags {
-        if tag.key.starts_with("aws:") || tag.value.as_deref().is_some_and(|v| v.starts_with("aws:"))
-        {
-            return Err(format!(
-                "tag {} is reserved: neither a tag key nor its value may begin with aws:",
-                tag.key
-            ));
-        }
+        check_tag_not_reserved(tag)?;
         mapped.insert(tag.key.clone(), tag.value.clone().unwrap_or_default());
     }
     Ok(mapped)
+}
+
+/// `Ok(())` for a tag any caller may name, or the `InvalidTagException` message for
+/// one it may not.
+///
+/// The `aws:` prefix is reserved on both halves of the pair, which is what
+/// `InvalidTagException` names ("you cannot specify a tag value that begins with
+/// aws:"). Shared by every operation that takes tags from a request, so the tagging
+/// and the untagging paths refuse the same pairs with the same sentence.
+pub fn check_tag_not_reserved(tag: &Tag) -> Result<(), String> {
+    if tag.key.starts_with("aws:") || tag.value.as_deref().is_some_and(|v| v.starts_with("aws:")) {
+        return Err(format!(
+            "tag {} is reserved: neither a tag key nor its value may begin with aws:",
+            tag.key
+        ));
+    }
+    Ok(())
+}
+
+/// Drop the requested tags from a stored tag map, as ACM's untagging operations
+/// define it: a requested pair that carries no value removes its key whatever value
+/// the key holds, and one that carries a value removes the key only when the stored
+/// value is that value (`RemoveTagsFromCertificate` doc: "If you do not specify the
+/// value portion of the tag when calling this function, the tag will be removed
+/// regardless of value. If you specify a value, the tag is removed only if it is
+/// associated with the specified value").
+///
+/// Entries are applied in request order and a key the map does not hold is simply
+/// absent afterwards, so removing is idempotent.
+pub fn remove_tags(stored: &mut BTreeMap<String, String>, requested: &[Tag]) {
+    for tag in requested {
+        let matches = match tag.value.as_deref() {
+            None => stored.contains_key(&tag.key),
+            Some(value) => stored
+                .get(&tag.key)
+                .is_some_and(|stored_value| stored_value == value),
+        };
+        if matches {
+            stored.remove(&tag.key);
+        }
+    }
 }
 
 /// The stored tags as the modelled `Tag` list, in key order.

@@ -23,6 +23,7 @@ pub struct CreatePackagingGroupInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.mediapackagevod#CreatePackagingGroupResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct CreatePackagingGroupOutput {
+    pub approximate_asset_count: Option<i32>,
     pub arn: Option<String>,
     pub authorization: Option<Authorization>,
     pub created_at: Option<String>,

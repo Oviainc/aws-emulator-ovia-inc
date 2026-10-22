@@ -31,6 +31,10 @@ pub(crate) const SSH_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==";
 /// A role ARN satisfying `Role`'s modelled pattern `^arn:.*role/\S+$` and `len 20..2048`.
 pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/transfer-s3";
 
+/// This service's own store in the shared engine, as a suite seeds and reads it.
+pub(crate) type TransferState =
+    service_com_amazonaws_transfer_transferservice::ComAmazonawsTransferTransferserviceState;
+
 /// Identifiers satisfying `CertificateIds`' member shape `CertificateId`
 /// (`len 22..22`, pattern `^cert-([0-9a-f]{17})$`, from
 /// `smithy_query(query="shape",shape="CertificateIds")`): the low end of the id space,
@@ -100,11 +104,7 @@ impl Emulator {
     ///
     /// For a suite that has to SEED a resource whose write operation is still a
     /// scaffold stub; a suite whose write operation exists goes over the wire instead.
-    pub(crate) fn store(
-        &self,
-    ) -> engine::ServiceState<
-        service_com_amazonaws_transfer_transferservice::ComAmazonawsTransferTransferserviceState,
-    > {
+    pub(crate) fn store(&self) -> engine::ServiceState<TransferState> {
         self.engine.state()
     }
 

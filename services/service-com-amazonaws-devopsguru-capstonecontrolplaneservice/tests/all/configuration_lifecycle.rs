@@ -27,13 +27,13 @@ use service_com_amazonaws_devopsguru_capstonecontrolplaneservice::state::{
 const HOST: &str = "devops-guru.us-east-1.amazonaws.com";
 
 /// One reply, as a client sees it.
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
     /// The error SHAPE NAME the reply carries, from the `x-amzn-errortype` header or
     /// the body's `__type`, with any namespace/URL prefix stripped. Empty on a success.
     error_name: String,
-    raw: String,
+    pub(crate) raw: String,
 }
 
 impl Reply {
@@ -43,7 +43,7 @@ impl Reply {
         self.error_name == code
     }
 
-    fn at(&self, pointer: &str) -> Option<&Value> {
+    pub(crate) fn at(&self, pointer: &str) -> Option<&Value> {
         self.body.pointer(pointer)
     }
 
@@ -61,12 +61,12 @@ impl Reply {
 }
 
 /// A fresh emulator holding only this service, over its own engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Pin authentication off so the suite does not depend on the process-wide switch.
@@ -79,7 +79,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -126,7 +126,7 @@ impl Emulator {
         }
     }
 
-    async fn update_resource_collection(&self, action: &str, collection: Value) -> Reply {
+    pub(crate) async fn update_resource_collection(&self, action: &str, collection: Value) -> Reply {
         self.call(
             "PUT",
             "/resource-collections",

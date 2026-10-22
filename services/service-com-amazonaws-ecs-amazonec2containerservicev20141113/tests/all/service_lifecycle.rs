@@ -371,12 +371,9 @@ async fn service_create_reads_back_with_the_task_set_its_scheduler_placed() {
         );
         assert_eq!(
             string(deployment, "rolloutState", case),
-            if test.desired == 0 {
-                "COMPLETED"
-            } else {
-                "IN_PROGRESS"
-            },
-            "case {case:?}: the rollout state must follow the counts, got {deployment}"
+            "IN_PROGRESS",
+            "case {case:?}: a deployment the create just started is IN_PROGRESS until \
+             the clock settles it, got {deployment}"
         );
 
         // The scheduler placed REAL task records: ListTasks reports one per wanted task.

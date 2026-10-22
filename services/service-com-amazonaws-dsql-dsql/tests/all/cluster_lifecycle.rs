@@ -13,20 +13,22 @@
 //! several cluster counts, and the refusals for the whole class of malformed
 //! identifiers.
 //!
-//! The `Dsql` harness below is this crate's ONE test client: a sibling suite
-//! (`tests/all/resource_tags.rs`) drives the same `dispatch` path through it rather
-//! than building a second one.
+//! The `Dsql` harness in `tests/all/harness.rs` is this crate's ONE test client:
+//! the sibling suites (`tests/all/resource_tags.rs`, `tests/all/error_contract.rs`)
+//! drive the same `dispatch` path through it rather than building a second one.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::state::{
-    Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, MAX_CLUSTERS, MAX_CREATE_TOKENS,
-    MAX_RETIRED_CLUSTERS, SETTLE_AFTER, STATUS_DELETED,
+    Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, TokenScope, MAX_CLUSTERS,
+    MAX_CREATE_TOKENS, MAX_RETIRED_CLUSTERS, STATUS_DELETED,
 };
-use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{
+    absent_identifier, expected_arn, is_cluster_id, wait_for_the_clock, Dsql,
+};
 
 /// The values `ClusterStatus` accepts on the wire. Source: the service's own model,
 /// `smithy_query(query="shape", shape="ClusterStatus")`.
@@ -47,162 +49,6 @@ const CLUSTER_STATUS_VALUES: &[&str] = &[
 /// operation="ListClusters")` — `@range(min: 1, max: 100)`, `@default: 20`.
 const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
-
-/// One emulator plus the region its requests are signed for.
-pub(crate) struct Dsql {
-    router: MultiServiceRouter,
-    region: String,
-}
-
-/// One answer from the emulator: the status, the restJson1 error code, and the body.
-pub(crate) struct Answer {
-    pub(crate) status: u16,
-    pub(crate) error: Option<String>,
-    pub(crate) body: Value,
-}
-
-impl Answer {
-    /// A string member of the response body, or the empty string when absent.
-    pub(crate) fn str(&self, member: &str) -> String {
-        self.body
-            .get(member)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// A member of the response body, or `Value::Null` when absent.
-    pub(crate) fn get(&self, member: &str) -> Value {
-        self.body.get(member).cloned().unwrap_or(Value::Null)
-    }
-}
-
-impl Dsql {
-    pub(crate) fn in_region(region: &str) -> Self {
-        // The one shared engine the router builds in production, handed to the
-        // service through its constructor.
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(engine));
-        Self {
-            router,
-            region: region.to_string(),
-        }
-    }
-
-    pub(crate) fn new() -> Self {
-        Self::in_region("us-east-1")
-    }
-
-    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
-        let payload = body
-            .map(|v| serde_json::to_vec(&v).expect("a JSON body serializes"))
-            .unwrap_or_default();
-        let request = ::http::Request::builder()
-            .method(method)
-            .uri(format!("https://dsql.{}.amazonaws.com{path}", self.region))
-            // The routing key and the region both come from the SigV4 credential
-            // scope, exactly as they do for an SDK request.
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTESTTEST/20260101/{}/dsql/aws4_request, \
-                     SignedHeaders=host;x-amz-date, Signature=0123456789abcdef",
-                    self.region
-                ),
-            )
-            .header("content-type", "application/json")
-            .body(::bytes::Bytes::from(payload))
-            .expect("the request builds");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let raw = response.into_body();
-        let body = if raw.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&raw).unwrap_or(Value::Null)
-        };
-        let error = error.or_else(|| {
-            body.get("__type")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        Answer {
-            status,
-            error,
-            body,
-        }
-    }
-
-    pub(crate) async fn create(&self, body: Value) -> Answer {
-        self.call("POST", "/cluster", Some(body)).await
-    }
-
-    pub(crate) async fn get(&self, identifier: &str) -> Answer {
-        self.call("GET", &format!("/cluster/{identifier}"), None).await
-    }
-
-    async fn update(&self, identifier: &str, body: Value) -> Answer {
-        self.call("POST", &format!("/cluster/{identifier}"), Some(body))
-            .await
-    }
-
-    async fn delete(&self, identifier: &str) -> Answer {
-        self.call("DELETE", &format!("/cluster/{identifier}"), None)
-            .await
-    }
-
-    async fn list(&self, query: &str) -> Answer {
-        self.call("GET", &format!("/cluster{query}"), None).await
-    }
-
-    /// Create a cluster that accepts a mutation straight away: deletion protection
-    /// off, and the clock's `CREATING -> ACTIVE` transition already settled.
-    pub(crate) async fn create_settled(&self) -> String {
-        let created = self.create(json!({"deletionProtectionEnabled": false})).await;
-        assert_eq!(
-            created.status, 200,
-            "CreateCluster must succeed, got {} {:?}",
-            created.status, created.body
-        );
-        wait_for_the_clock().await;
-        created.str("identifier")
-    }
-}
-
-/// Let the clock's pending transition come due. The emulator never sleeps for it —
-/// it stores the due instant — so a test that wants the settled state waits past it.
-pub(crate) async fn wait_for_the_clock() {
-    ::tokio::time::sleep(SETTLE_AFTER + Duration::from_millis(150)).await;
-}
-
-/// `ClusterId`'s `^[a-z0-9]{26}$`.
-fn is_cluster_id(value: &str) -> bool {
-    value.len() == 26
-        && value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-}
-
-/// The ARN `ClusterArn`'s pattern requires for `identifier` in `region`.
-pub(crate) fn expected_arn(region: &str, identifier: &str) -> String {
-    format!(
-        "arn:aws:dsql:{region}:{}:cluster/{identifier}",
-        engine::EMULATOR_ACCOUNT_ID
-    )
-}
-
-/// A syntactically valid cluster id for a cluster that was never created.
-pub(crate) fn absent_identifier() -> String {
-    "zzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
-}
 
 /// One `CreateCluster` request and what the persisted cluster must then report.
 struct CreateCase {
@@ -674,14 +520,15 @@ async fn delete_is_refused_while_protected_and_retires_the_cluster_once_not() {
 
     let refused = dsql.delete(&identifier).await;
     assert_eq!(
-        refused.status, 409,
-        "a protected cluster must refuse deletion with 409, got {} {:?}",
+        refused.status, 400,
+        "a protected cluster must refuse deletion with 400, got {} {:?}",
         refused.status, refused.body
     );
     assert_eq!(
         refused.error.as_deref(),
-        Some("ConflictException"),
-        "the refusal must be a ConflictException, got {:?}",
+        Some("ValidationException"),
+        "the refusal must be a ValidationException \u{2014} the condition is permanent until the \
+         caller changes the cluster, not a transient conflict \u{2014} got {:?}",
         refused.error
     );
     assert_eq!(
@@ -1087,18 +934,22 @@ fn the_bookkeeping_stores_stay_bounded() {
     let mut state = ComAmazonawsDsqlDsqlState::default();
 
     for n in 0..(MAX_CREATE_TOKENS * 2) {
-        state.record_create_token(format!("token-{n}"), &cluster_id_for(n));
+        state.tokens(TokenScope::CreateCluster).record(
+            format!("token-{n}"),
+            format!("fingerprint-{n}"),
+            &cluster_id_for(n),
+        );
         assert!(
-            state.create_client_tokens.len() <= MAX_CREATE_TOKENS,
-            "case token #{n}: the idempotency map must stay at or below {MAX_CREATE_TOKENS}, got {}",
-            state.create_client_tokens.len()
+            state.tokens_of(TokenScope::CreateCluster).len() <= MAX_CREATE_TOKENS,
+            "case token #{n}: the idempotency ledger must stay at or below {MAX_CREATE_TOKENS}, got {}",
+            state.tokens_of(TokenScope::CreateCluster).len()
         );
     }
     assert_eq!(
-        state.create_client_tokens.len(),
+        state.tokens_of(TokenScope::CreateCluster).len(),
         MAX_CREATE_TOKENS,
-        "the idempotency map must fill to its cap and then evict, got {}",
-        state.create_client_tokens.len()
+        "the idempotency ledger must fill to its cap and then evict, got {}",
+        state.tokens_of(TokenScope::CreateCluster).len()
     );
 
     // Each round retires one cluster through the clock, which is the only writer of
@@ -1149,7 +1000,8 @@ fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
         endpoint: None,
         tags: Default::default(),
         policy: None,
-        policy_version: None,
+        policy_versions_issued: 0,
+        streams: Default::default(),
         pending: Some(PendingTransition {
             due_at,
             next_status: STATUS_DELETED,

@@ -21,6 +21,7 @@ pub struct ConfigureLogsInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.mediapackagevod#ConfigureLogsResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct ConfigureLogsOutput {
+    pub approximate_asset_count: Option<i32>,
     pub arn: Option<String>,
     pub authorization: Option<Authorization>,
     pub created_at: Option<String>,
