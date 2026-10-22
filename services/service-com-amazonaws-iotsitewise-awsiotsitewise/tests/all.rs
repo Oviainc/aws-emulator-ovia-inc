@@ -31,3 +31,5 @@ mod state_roundtrip;
 mod support;
 #[path = "all/time_series.rs"]
 mod time_series;
+#[path = "all/update_asset.rs"]
+mod update_asset;

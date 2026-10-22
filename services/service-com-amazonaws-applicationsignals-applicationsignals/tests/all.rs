@@ -21,3 +21,5 @@ mod sli_metric_type;
 mod slo_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/time_ranged_reads.rs"]
+mod time_ranged_reads;

@@ -203,15 +203,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let group_name = crate::state::effective_group_name(input.group_name.as_deref());
+
+        // EventBridge Scheduler resolves the execution role when the schedule is
+        // WRITTEN, so a role this account does not hold — or one that does not
+        // let Scheduler assume it — is refused here, before anything is
+        // persisted. The IAM lookup runs before the store is locked: the guard
+        // is not held across an await.
+        if let Some(message) =
+            crate::state::execution_role_violation(ctx, &region, &input.target.role_arn).await
+        {
+            return Err(
+                CreateScheduleErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        store.settle(now);
 
         if !store.group_exists(&group_name) {
             return Err(CreateScheduleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Schedule group {group_name} does not exist."),
+                    message: crate::state::group_does_not_exist(&group_name),
                 },
             )
             .into());
+        }
+
+        // A group whose deletion is under way takes no new schedules: it and
+        // everything in it is on its way out ("Deleting a schedule group results
+        // in EventBridge Scheduler deleting all schedules associated with the
+        // group"), which is the inconsistent state ConflictException names.
+        if store.group_is_deleting(&group_name) {
+            return Err(
+                CreateScheduleErrorModeled::ConflictException(ConflictException {
+                    message: format!("Schedule group {group_name} is being deleted."),
+                })
+                .into(),
+            );
         }
 
         let key = (group_name.clone(), input.name.clone());
@@ -236,7 +266,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = ::std::time::SystemTime::now();
         let arn = crate::state::schedule_arn(&region, &group_name, &input.name);
         store.schedules.insert(
             key,

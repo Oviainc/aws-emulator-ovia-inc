@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below resolves the asset the request names out of this
+//! service's store, replaces the caller-owned attributes of the stored record, and
+//! starts the `UPDATING` -> `ACTIVE` transition the call owes, so a later
+//! `DescribeAsset`/`ListAssets` reports exactly what was written here.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +169,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAsset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAssetError::Modeled(UpdateAssetErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token updates the asset a
+        // second time rather than replaying the first answer. Left to the idempotency
+        // issue, exactly as `CreateAsset` leaves it; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let id = store
+            .resolve_asset_id(&input.asset_id)
+            .ok_or_else(|| not_found(&input.asset_id))?;
+
+        // `assetExternalId` ASSIGNS an external id to an asset that has none: the
+        // model documents that the asset must not already have one and that the id
+        // must be unique within the account. Both checks run before anything is
+        // written, so a refused update leaves the stored record exactly as it was.
+        let external_id = input.asset_external_id.as_deref();
+        if let Some(requested) = external_id {
+            if let Some(owner) = store.asset_external_ids.get(requested) {
+                // Re-assigning the id this asset already carries asks for the state it
+                // is already in, so it is a no-op rather than a collision.
+                if owner != &id {
+                    let owner = owner.clone();
+                    return Err(already_exists(&region, &owner));
+                }
+            } else if let Some(current) = store
+                .assets
+                .get(&id)
+                .and_then(|asset| asset.external_id.clone())
+            {
+                return Err(UpdateAssetError::Modeled(
+                    UpdateAssetErrorModeled::InvalidRequestException(InvalidRequestException {
+                        message: format!(
+                            "The asset {id} already has the external ID {current}, so the \
+                             external ID {requested} cannot be assigned to it."
+                        ),
+                    }),
+                ));
+            }
+        }
+
+        let asset = store
+            .assets
+            .get_mut(&id)
+            .ok_or_else(|| not_found(&input.asset_id))?;
+
+        // The caller-owned attributes are REPLACED by what this request carries, so an
+        // omitted optional member clears the stored one: the request describes the
+        // asset's new state rather than patching selected members.
+        asset.name = input.asset_name.clone();
+        asset.description = input.asset_description.clone();
+        if let Some(requested) = external_id {
+            asset.external_id = Some(requested.to_string());
+        }
+        // The asset reports UPDATING until the transition this call owes falls due.
+        asset.begin_update(now);
+        let output = UpdateAssetOutput {
+            asset_id: Some(asset.id.clone()),
+            asset_status: asset.status(now),
+        };
+
+        // Keep the `externalId:` lookup index in step with the record it resolves to.
+        if let Some(requested) = external_id {
+            store
+                .asset_external_ids
+                .insert(requested.to_string(), id.clone());
+        }
+
+        Ok(output)
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the label that resolved to nothing.
+fn not_found(label: &str) -> UpdateAssetError {
+    UpdateAssetError::Modeled(UpdateAssetErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("The asset {label} could not be found."),
+        },
+    ))
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` naming the asset that already holds the
+/// requested external id.
+fn already_exists(region: &str, asset_id: &str) -> UpdateAssetError {
+    UpdateAssetError::Modeled(UpdateAssetErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message: format!("The asset {asset_id} already exists."),
+            resource_id: asset_id.to_string(),
+            resource_arn: crate::state::asset_arn(region, asset_id),
+        },
+    ))
 }

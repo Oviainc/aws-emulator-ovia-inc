@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAuditFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAuditFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAuditFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,23 +161,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_AUDIT_FINDINGS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the audit findings of the named targets over the requested period.
+    ///
+    /// A read: it reports over a time range and persists nothing. The range is refused
+    /// when it does not run forwards — a rule about the PAIR of members, so it is enforced
+    /// here rather than by a per-member constraint.
+    ///
+    /// No finding is reported. The model names the auditors that produce them — `slo` (SLO
+    /// violations and breached thresholds), `operation_metric` (anomalies in Application
+    /// Signals RED metrics), `service_quota` (utilization against quotas), `trace` — and
+    /// every one of them analyses telemetry: the request, error and latency metrics and
+    /// the traces an instrumented application sends Application Signals. This emulator
+    /// receives none of that telemetry and runs no auditor over it, so there is no finding
+    /// to report; reporting one would claim an analysis that never ran. `AuditFindings` is
+    /// therefore empty for every target and every window, as it is on the real service for
+    /// a window whose targets it observed nothing in.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAuditFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAuditFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAuditFindings"))
+        let _ = (ctx, &self.engine);
+        if let Some(message) = crate::state::time_range_refusal(&input.start_time, &input.end_time)
+        {
+            return Err(refused(message));
+        }
+
+        // `MaxResults` declares no `@default`, so an absent one means the default the
+        // member documents. A value outside the modelled `range 1..10` is already refused
+        // before this handler runs.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_AUDIT_FINDING_PAGE)
+            .max(0) as usize;
+
+        // Paged through the same cursor the other lists of this service use, so a
+        // `NextToken` this service did not issue is refused rather than read as a page
+        // boundary.
+        let (audit_findings, next_token) = crate::state::page_of(
+            Vec::new(),
+            crate::state::AUDIT_FINDINGS_TOKEN_TAG,
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .map_err(refused)?;
+
+        Ok(ListAuditFindingsOutput {
+            start_time: Some(input.start_time),
+            end_time: Some(input.end_time),
+            audit_findings,
+            next_token,
+        })
     }
+}
+
+/// This operation's modelled refusal of a request it will not serve: `ValidationException`
+/// (HTTP 400), the only client error it declares beyond throttling.
+fn refused(message: String) -> ListAuditFindingsError {
+    ListAuditFindingsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

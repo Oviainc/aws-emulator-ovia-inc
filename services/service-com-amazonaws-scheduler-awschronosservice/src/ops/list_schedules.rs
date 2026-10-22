@@ -179,7 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Materialise any group deletion the clock has already made due, so a
+        // page never carries a schedule whose group is gone.
+        store.settle(::std::time::SystemTime::now());
 
         // `ScheduleGroup` names a group, so a name no group has is a missing
         // resource rather than a filter that matches nothing — which is why this
@@ -189,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.group_exists(group_name) {
                 return Err(ListSchedulesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Schedule group {group_name} does not exist."),
+                        message: crate::state::group_does_not_exist(group_name),
                     },
                 )
                 .into());

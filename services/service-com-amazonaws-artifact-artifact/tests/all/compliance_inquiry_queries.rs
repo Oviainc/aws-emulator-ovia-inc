@@ -57,14 +57,12 @@ const REVIEW_TYPES: &[&str] = &["HUMAN", "AI"];
 /// `QueryStatusMessage`'s value a query carries while the inquiry is still processing.
 const QUERY_IN_PROGRESS: &str = "Query processing is in-progress.";
 
-/// `QueryStatus`'s value a query ends in when nothing generated a response for it, and the
-/// message that goes with it: no response-generating engine runs in this emulator, so a
-/// query that was enumerated ends in its modelled failure rather than carrying text
-/// nothing produced.
-const QUERY_TERMINAL: (&str, &str) = (
-    "FAILED",
-    "An internal error occurred while processing the query. Try again at a later time.",
-);
+/// `QueryStatus`'s value a query ends in, and the message that goes with it: the query
+/// text came from the request itself, so its processing is over at the inquiry's due
+/// instant. No `response` is ever reported with it — a compliance answer is
+/// model-generated text and no such engine runs in this emulator — and its absence, not a
+/// query-level error that never happened, is what says so.
+const QUERY_TERMINAL: (&str, &str) = ("COMPLETED", "Query processing is complete.");
 
 /// The span after which an inquiry's processing is due to be over, plus slack. The handler
 /// stores the due instant rather than sleeping, so only the test waits.

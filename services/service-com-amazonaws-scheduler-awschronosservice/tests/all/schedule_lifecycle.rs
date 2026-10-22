@@ -406,13 +406,15 @@ async fn schedule_group_arns_track_the_requests_region_and_names_are_unique() {
         );
     }
 
-    // The implicit `default` group exists without being created, so creating it
-    // conflicts too.
+    // The reserved `default` group is refused on the NAME, as a validation
+    // failure, rather than as a collision with the group the account already has
+    // — `reserved_schedule_group.rs` is where that rule is pinned over the whole
+    // class.
     let (status, body) = call(&router, "POST", "/schedule-groups/default", None).await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (409, "ConflictException"),
-        "the implicit default group must already exist, got {status} {body}"
+        (400, "ValidationException"),
+        "the reserved default group must be refused as a validation failure, got {status} {body}"
     );
 }
 
@@ -895,18 +897,9 @@ async fn an_unparameterised_list_is_capped_at_the_modelled_maximum_page() {
     );
 }
 
-#[tokio::test]
-async fn out_of_scope_operations_still_answer_501() {
-    let router = scheduler_router();
-    // The rest of the surface is still scaffolded, and a scaffold answers 501 —
-    // never an empty 200 that a client cannot tell from a real implementation.
-    for (method, uri) in [
-        ("DELETE", "/schedule-groups/default"),
-    ] {
-        let (status, body) = call(&router, method, uri, None).await;
-        assert_eq!(
-            status, 501,
-            "{method} {uri}: an unimplemented operation must answer 501, got {status} {body}"
-        );
-    }
-}
+// Every operation this service models is now implemented — `ListScheduleGroups`,
+// `GetScheduleGroup`, the tagging trio and `DeleteScheduleGroup` were the last
+// scaffolds — so the suite that pinned the remaining 501s has nothing left to
+// assert and is gone. Each operation's own behaviour is asserted by the suite
+// that owns it (`schedule_group_read.rs`, `resource_tags.rs`,
+// `reserved_schedule_group.rs`, and the tables above).
