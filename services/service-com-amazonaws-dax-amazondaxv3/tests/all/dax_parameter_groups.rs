@@ -699,3 +699,74 @@ async fn deleting_a_parameter_group_a_cluster_uses_is_refused() {
         "the group is gone after the delete, got {status} {read:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The bound on how far one account's parameter-group store grows.
+// ---------------------------------------------------------------------------
+
+/// The store holds at most [`state::MAX_PARAMETER_GROUPS`] parameter groups, counting the
+/// default group it starts with: every create up to the bound is accepted, the first one
+/// past it is refused with `ParameterGroupQuotaExceededFault` ("You have attempted to
+/// exceed the maximum number of parameter groups"), and that refusal stores nothing — so
+/// no sequence of creates grows the store without limit. The names below span the bound
+/// rather than one cited value: the last accepted create and the first refused one are
+/// both asserted.
+#[tokio::test]
+async fn a_create_past_the_parameter_group_bound_is_refused() {
+    let router = emulator();
+
+    // The default group already occupies one of the slots.
+    for index in 0..(state::MAX_PARAMETER_GROUPS - 1) {
+        let name = format!("quota-{index:03}");
+        let (status, body) = call(
+            &router,
+            "CreateParameterGroup",
+            json!({ "ParameterGroupName": name }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: a create inside the bound is accepted, got {status} {body:?}"
+        );
+    }
+
+    let (status, body) = call(
+        &router,
+        "CreateParameterGroup",
+        json!({ "ParameterGroupName": "one-group-too-many" }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ParameterGroupQuotaExceededFault"),
+        "case one past the bound: expected 400 ParameterGroupQuotaExceededFault, \
+         got {status} {body:?}"
+    );
+
+    // The refusal wrote nothing: the store still holds exactly the bound, and the
+    // refused name resolves to no group.
+    let (status, page) = call(
+        &router,
+        "DescribeParameterGroups",
+        json!({ "MaxResults": state::MAX_MAX_RESULTS }),
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeParameterGroups: got {page:?}");
+    assert_eq!(
+        reported_names(&page).len(),
+        state::MAX_PARAMETER_GROUPS,
+        "case one past the bound: the store must still hold exactly {} groups, got {page:?}",
+        state::MAX_PARAMETER_GROUPS
+    );
+    let (status, read) = call(
+        &router,
+        "DescribeParameterGroups",
+        json!({ "ParameterGroupNames": ["one-group-too-many"] }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&read).as_str()),
+        (404, "ParameterGroupNotFoundFault"),
+        "case one past the bound: the refused name must name no group, got {status} {read:?}"
+    );
+}
