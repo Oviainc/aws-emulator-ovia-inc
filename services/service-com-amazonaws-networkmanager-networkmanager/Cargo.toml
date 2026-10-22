@@ -7,6 +7,8 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# Opaque pagination tokens: this service encodes the key offset a `NextToken` names.
+hex = { workspace = true }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
