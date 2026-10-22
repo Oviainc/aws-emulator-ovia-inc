@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchExecuteStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchExecuteStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchExecuteStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Runs ONE SQL statement once per parameter set against this service's data
+//! plane, in order, and reports one `UpdateResult` per set. [`crate::state`] owns
+//! the data plane; the statement is executed by the SQL engine there, exactly as
+//! `ExecuteStatement` executes it.
+//!
+//! ## Members this operation accepts and does not act on
+//!
+//! The same ones `ExecuteStatement` lists, for the same reasons: `schema` (the
+//! model says it "isn't supported"), and `database` when a `transactionId` is
+//! given, because the transaction already names the database it was opened for.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +206,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchExecuteStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchExecuteStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchExecuteStatement"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchExecuteStatementError::from(
+                BatchExecuteStatementErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException::default(),
+                ),
+            )
+        })?;
+        // The engine work is synchronous and CPU-bound, and it holds the state
+        // lock, so it runs on the blocking pool under one wall clock rather than on
+        // an async worker.
+        crate::state::in_data_plane(move || execute_batch(&store, &input))
+            .await
+            .map_err(statement_failed)
     }
+}
+
+/// Run the statement once per parameter set and build the response, inside the
+/// data plane.
+fn execute_batch(
+    store: &crate::state::Store,
+    input: &BatchExecuteStatementInput,
+) -> Result<BatchExecuteStatementOutput, crate::state::SqlError> {
+    crate::state::require_arn("resourceArn", &input.resource_arn)?;
+    crate::state::require_arn("secretArn", &input.secret_arn)?;
+    let parameter_sets = input.parameter_sets.clone().unwrap_or_default();
+    if parameter_sets.len() > crate::state::MAX_PARAMETER_SETS {
+        // A property of the REQUEST, not of this emulator's room: the caller sent
+        // more parameter sets than one call runs, so it is a bad request.
+        return Err(crate::state::SqlError::InvalidRequest(format!(
+            "parameterSets carries {} sets; this emulator runs at most {} in one call",
+            parameter_sets.len(),
+            crate::state::MAX_PARAMETER_SETS
+        )));
+    }
+    let mut state = store.lock();
+    let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.expire_timed_out_transactions();
+
+    // A `transactionId` runs the batch inside that transaction, against its own
+    // copy of the database; without one the batch runs against the committed
+    // database and auto-commits.
+    let database = match input.transaction_id.as_deref() {
+        Some(transaction_id) => {
+            let transaction = cluster
+                .transactions
+                .get_mut(transaction_id)
+                .ok_or(crate::state::SqlError::TransactionNotFound)?;
+            transaction.touch();
+            &transaction.pending
+        }
+        None => &*cluster.database_mut(&crate::state::database_key(input.database.as_ref()))?,
+    };
+
+    // Exactly one `UpdateResult` per parameter set, in the order the sets arrived:
+    // the statement is run once per set against the same database, so N sets of an
+    // INSERT leave N rows behind. ONE budget covers the whole batch — one deadline
+    // and one output cap, shared by every statement — so a long `parameterSets`
+    // can buy neither more engine time nor more result memory than a single
+    // statement gets.
+    let mut budget = crate::state::RequestBudget::new();
+    let mut update_results = Vec::with_capacity(parameter_sets.len());
+    for parameters in &parameter_sets {
+        let outcome = database.run_within(&mut budget, &input.sql, parameters)?;
+        update_results.push(UpdateResult {
+            generated_fields: Some(outcome.generated_fields()),
+        });
+    }
+    // An access record for the data plane: who was addressed and how much the
+    // engine ran. The statement text and the secret are NOT recorded — both carry
+    // caller secrets.
+    tracing::info!(
+        resource_arn = %input.resource_arn,
+        database = input.database.as_deref().unwrap_or(""),
+        in_transaction = input.transaction_id.is_some(),
+        statements = update_results.len(),
+        "rds-data executed a batch"
+    );
+    Ok(BatchExecuteStatementOutput {
+        update_results: Some(update_results),
+    })
+}
+
+/// Report a statement that did not run as the error this operation models for it.
+/// This operation returns no result set, so a result-shaped failure can only come
+/// from the statement itself and is reported as a bad request.
+fn statement_failed(error: crate::state::SqlError) -> BatchExecuteStatementError {
+    let message = Some(error.message());
+    match error {
+        crate::state::SqlError::TransactionNotFound => {
+            BatchExecuteStatementErrorModeled::TransactionNotFoundException(
+                TransactionNotFoundException { message },
+            )
+        }
+        crate::state::SqlError::Timeout => {
+            BatchExecuteStatementErrorModeled::StatementTimeoutException(
+                StatementTimeoutException {
+                    message,
+                    db_connection_id: 0,
+                },
+            )
+        }
+        crate::state::SqlError::Unavailable(detail) => {
+            tracing::error!(%detail, "the rds-data data plane could not serve a batch");
+            BatchExecuteStatementErrorModeled::InternalServerErrorException(
+                InternalServerErrorException::default(),
+            )
+        }
+        // This emulator is out of its own room, which is not the caller's
+        // request being wrong: the model's `ServiceUnavailableError` (503) is
+        // what says the service could not serve it. The shape carries no
+        // members, so which cap it was is logged rather than returned.
+        crate::state::SqlError::Capacity(detail) => {
+            tracing::warn!(%detail, "the rds-data data plane is at a stored-object cap");
+            BatchExecuteStatementErrorModeled::ServiceUnavailableError(
+                ServiceUnavailableError::default(),
+            )
+        }
+        crate::state::SqlError::Engine(_)
+        | crate::state::SqlError::MissingParameter(_)
+        | crate::state::SqlError::UnsupportedParameter(_)
+        | crate::state::SqlError::UnsupportedResult(_)
+        | crate::state::SqlError::InvalidRequest(_)
+        | crate::state::SqlError::ResultTooLarge => {
+            BatchExecuteStatementErrorModeled::BadRequestException(BadRequestException { message })
+        }
+    }
+    .into()
 }
