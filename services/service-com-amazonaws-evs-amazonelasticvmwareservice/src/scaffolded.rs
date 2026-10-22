@@ -177,6 +177,28 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service answers a modeled error with, from the status its
+/// model declares for that error shape.
+///
+/// Amazon EVS speaks `awsJson1_0` (`smithy_query(query="service_info")`), and an
+/// awsJson front end does not use the exact code an error shape's `@httpError` trait
+/// names: it reports the error's FAULT, so every modeled client error (`@error:
+/// "client"`) is HTTP 400 and the body's `__type` is what distinguishes one from
+/// another, while a server error keeps its 5xx status so a client's retry classifier
+/// still sees a server fault. The recorded wire confirms it: the recording answers
+/// `ResourceNotFoundException` — `@httpError(404)` in the model — with HTTP 400.
+///
+/// Classified from the modeled status rather than from a list of shape names, so a
+/// shape this service adds later is covered without touching this function:
+/// `@httpError(402)`/`(404)`/`(429)` all render as 400, `@httpError(500)` stays 500.
+pub fn wire_http_status(modeled_status: u16) -> u16 {
+    if modeled_status >= 500 {
+        modeled_status
+    } else {
+        400
+    }
+}
+
 /// The `message` member of the tagging surface's not-found error shape.
 static TAGGING_NOT_FOUND_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
@@ -292,7 +314,8 @@ impl SerializableStruct for TaggingResourceNotFound {
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service
+    /// puts on the wire for that error's fault — see [`wire_http_status`].
     Modeled(E),
     /// A tagging operation named an ARN this service holds no resource for. Renders as
     /// HTTP 400 with the error code `ResourceNotFoundException` and a body carrying the
@@ -418,10 +441,14 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error is reported with the status THIS service puts on the wire for
+    /// that error's fault ([`wire_http_status`]), which for an awsJson service is not
+    /// the exact code the shape's `@httpError` trait names.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => wire_http_status(e.http_status()),
             Self::TaggingResourceNotFound(_) => TAGGING_RESOURCE_NOT_FOUND_STATUS,
             Self::ValidationException(_) => 400,
         }

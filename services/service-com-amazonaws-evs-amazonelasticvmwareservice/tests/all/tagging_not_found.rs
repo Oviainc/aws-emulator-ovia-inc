@@ -6,9 +6,10 @@
 //! the operations that address a resource by `resourceArn` — an ARN this service holds
 //! no resource for is refused with HTTP **400** `ResourceNotFoundException`, a body
 //! whose `message` is one fixed, resource-agnostic string, and a `resourceArn` member
-//! echoing the request's ARN verbatim. That is NOT the error an operation addressing an
-//! environment by `environmentId` answers: that one keeps the modelled shape
-//! (`@httpError(404)`, `resourceId` + `resourceType`), which the last test here pins.
+//! echoing the request's ARN verbatim. That BODY is not the one an operation addressing
+//! an environment by `environmentId` answers: that one keeps the modelled shape
+//! (`resourceId` + `resourceType`, and a message naming the requested id), on the same
+//! 400 — which the last test here pins.
 //!
 //! Every test drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: AmazonElasticVMwareService.<Operation>` through the same
@@ -265,25 +266,35 @@ async fn every_tagging_operation_refuses_a_missing_arn_with_400_and_echoes_it() 
 }
 
 #[tokio::test]
-async fn an_environment_id_lookup_still_answers_the_modelled_404() {
-    // The rule is scoped to the ARN-addressed tagging surface. An operation that
+async fn an_environment_id_lookup_answers_the_modelled_body_on_the_same_400() {
+    // The BODY rule is scoped to the ARN-addressed tagging surface. An operation that
     // resolves an environment BY ID answers the modelled `ResourceNotFoundException`
-    // with its `@httpError(404)` and its `resourceId` / `resourceType` members
-    // (`smithy_query(query="shape",shape="ResourceNotFoundException")`).
+    // with its `resourceId` / `resourceType` members
+    // (`smithy_query(query="shape",shape="ResourceNotFoundException")`) and a message
+    // naming the requested id. The STATUS is the same 400 for both surfaces: every
+    // modeled client error of this awsJson1_0 service goes on the wire as a 400,
+    // whatever exact code its `@httpError` trait names (see
+    // `tests/all/error_wire_status.rs`).
     let router = emulator();
     let absent = "env-0000000000";
 
     for operation in ["GetEnvironment", "DeleteEnvironment", "ListEnvironmentVlans"] {
         let (status, body) = call(&router, operation, &json!({ "environmentId": absent })).await;
         assert_eq!(
-            status, 404,
-            "case {operation:?}: expected HTTP 404, got {status} {body}"
+            status, 400,
+            "case {operation:?}: expected HTTP 400, got {status} {body}"
         );
         assert_eq!(
             error_type(&body),
             "ResourceNotFoundException",
             "case {operation:?}: expected a ResourceNotFoundException, got {}",
             error_type(&body)
+        );
+        assert_eq!(
+            body["message"],
+            json!(format!("Environment {absent} was not found")),
+            "case {operation:?}: the message must name the requested id, got {}",
+            body["message"]
         );
         assert_eq!(
             body["resourceId"],

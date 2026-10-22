@@ -22,6 +22,9 @@
 //! * `maxResults` is a real page bound and `nextToken` resumes exactly where the page
 //!   stopped; a token this service did not issue, or one issued more than 24 hours
 //!   ago, is refused (`nextToken` doc).
+//! * Every modeled CLIENT error of this awsJson1_0 service is reported with HTTP 400,
+//!   whatever exact code its `@httpError` trait names — see
+//!   `tests/all/error_wire_status.rs`, which owns that rule.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,10 +34,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test client signs for, so the ARNs under test carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Long enough for the lifecycle transition this service owes a new or deleted
 /// environment to come due (its span is under a second by construction).
@@ -58,7 +61,7 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Va
 }
 
 /// Call one operation as a client signing for `region`.
-async fn call_in_region(
+pub(crate) async fn call_in_region(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -189,7 +192,7 @@ pub(crate) fn error_type(body: &Value) -> String {
 }
 
 /// Create an environment and return its id, failing the test if it is refused.
-async fn create(router: &MultiServiceRouter, name: Option<&str>) -> String {
+pub(crate) async fn create(router: &MultiServiceRouter, name: Option<&str>) -> String {
     let (status, body) = call(router, "CreateEnvironment", &create_request(name)).await;
     assert_eq!(
         status, 200,
@@ -714,8 +717,8 @@ async fn an_environment_is_only_visible_at_the_region_it_was_created_in() {
     for (operation, request) in rows {
         let (status, body) = call_in_region(&router, "eu-central-1", operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {operation:?} from another Region: expected HTTP 404, got {status} {body}"
+            status, 400,
+            "case {operation:?} from another Region: expected HTTP 400, got {status} {body}"
         );
         assert!(
             error_type(&body).contains("ResourceNotFoundException"),
@@ -787,17 +790,18 @@ async fn unknown_resources_are_reported_as_not_found() {
     let absent_arn = format!("arn:aws:evs:{REGION}:{ACCOUNT}:environment/{absent}");
 
     // Each row: an operation, its request, and the status it answers an absent
-    // resource with. An operation addressing an environment BY ID answers the modeled
-    // `ResourceNotFoundException` and its `@httpError(404)`; the ARN-addressed tagging
-    // surface answers 400 — see `tests/all/tagging_not_found.rs`, which pins the whole
-    // tagging rule including the `resourceArn` member.
+    // resource with. Every modeled client error of this awsJson1_0 service goes on the
+    // wire as a 400, whatever exact code its `@httpError` trait names, so an operation
+    // addressing an environment BY ID and the ARN-addressed tagging surface answer the
+    // same status and differ only in the body — see `tests/all/error_wire_status.rs`
+    // for the status rule and `tests/all/tagging_not_found.rs` for the tagging body.
     let rows: Vec<(&str, Value, u16)> = vec![
-        ("GetEnvironment", json!({ "environmentId": absent }), 404),
-        ("DeleteEnvironment", json!({ "environmentId": absent }), 404),
+        ("GetEnvironment", json!({ "environmentId": absent }), 400),
+        ("DeleteEnvironment", json!({ "environmentId": absent }), 400),
         (
             "ListEnvironmentVlans",
             json!({ "environmentId": absent }),
-            404,
+            400,
         ),
         (
             "ListTagsForResource",
@@ -1063,8 +1067,8 @@ async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
     // At the cap, a create is refused with a quota error rather than growing the store.
     let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
     assert_eq!(
-        status, 402,
-        "create past the cap of {MAX_ENVIRONMENTS}: expected HTTP 402, got {status} {body}"
+        status, 400,
+        "create past the cap of {MAX_ENVIRONMENTS}: expected HTTP 400, got {status} {body}"
     );
     assert!(
         error_type(&body).contains("ServiceQuotaExceededException"),
@@ -1083,8 +1087,8 @@ async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
     assert_eq!(status, 200, "delete: expected 200, got {status} {body}");
     let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
     assert_eq!(
-        status, 402,
-        "create while the only deletion is still DELETING: expected HTTP 402, got {status} {body}"
+        status, 400,
+        "create while the only deletion is still DELETING: expected HTTP 400, got {status} {body}"
     );
 
     // Once it is DELETED, its room is reclaimed and the next create is admitted; the
@@ -1102,8 +1106,8 @@ async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "get a purged environment: expected HTTP 404, got {status} {body}"
+        status, 400,
+        "get a purged environment: expected HTTP 400, got {status} {body}"
     );
 }
 

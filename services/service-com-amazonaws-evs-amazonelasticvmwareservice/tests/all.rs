@@ -15,6 +15,8 @@
 mod create_environment_validation;
 #[path = "all/environment_lifecycle.rs"]
 mod environment_lifecycle;
+#[path = "all/error_wire_status.rs"]
+mod error_wire_status;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_not_found.rs"]

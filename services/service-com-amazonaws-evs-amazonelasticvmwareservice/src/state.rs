@@ -130,9 +130,13 @@ pub fn request_validation_error(message: impl Into<String>) -> ValidationExcepti
 
 /// The `ResourceNotFoundException` every operation answers for an environment id
 /// (or environment ARN) this service holds no record of.
+///
+/// The message is built from the request: the service names the environment the
+/// caller asked for, in the form `Environment <requested id> was not found`, so the
+/// text is a function of the lookup key and never of the store's contents.
 pub fn environment_not_found(resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Environment {resource_id} does not exist."),
+        message: format!("Environment {resource_id} was not found"),
         resource_id: resource_id.to_string(),
         resource_type: RESOURCE_TYPE_ENVIRONMENT.to_string(),
     }
