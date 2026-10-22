@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartExperiment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartExperiment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts an experiment from a persisted experiment template: mints the experiment's
+//! `id` and `arn`, COPIES the template's `roleArn`, targets, actions, stop conditions and
+//! configuration onto the new record, stamps `creationTime` / `startTime` and persists it
+//! with `state.status` `initiating`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartExperiment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The move to `running` is owed to the clock, not to this call, so a caller reading the
+//! experiment immediately still sees it initiating; see
+//! [`crate::state::ExperimentRecord::settle`]. A template id naming no record answers
+//! `ResourceNotFoundException` (HTTP 404), and replaying the `@idempotencyToken` returns
+//! the experiment it already started rather than a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +150,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartExperiment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartExperimentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartExperiment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `actionsMode` is enum-typed, which the boundary validator does not check, and
+        // it is persisted on the experiment — so a value `ActionsMode` does not admit is
+        // refused here rather than stored.
+        let actions_mode = match crate::state::resolve_actions_mode(
+            input
+                .experiment_options
+                .as_ref()
+                .and_then(|options| options.actions_mode.as_deref()),
+        ) {
+            Ok(mode) => mode,
+            Err(refusal) => {
+                return Err(StartExperimentErrorModeled::ValidationException(refusal).into())
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed `@idempotencyToken` reports the experiment the first call started.
+        if let Some(id) = store
+            .replayed(
+                crate::state::IdempotentResource::Experiment,
+                &input.client_token,
+            )
+            .cloned()
+        {
+            if let Some(record) = store.settled_experiment_mut(&id, now) {
+                return Ok(StartExperimentOutput {
+                    experiment: Some(record.to_experiment()),
+                });
+            }
+        }
+
+        // The experiment is built from the PERSISTED template, so it carries what that
+        // template holds and not what any request said.
+        let Some(template) = store
+            .experiment_templates
+            .get(&input.experiment_template_id)
+            .cloned()
+        else {
+            return Err(StartExperimentErrorModeled::ResourceNotFoundException(
+                crate::state::template_not_found(&input.experiment_template_id),
+            )
+            .into());
+        };
+
+        if store.experiments.len() >= crate::state::MAX_EXPERIMENTS {
+            return Err(StartExperimentErrorModeled::ServiceQuotaExceededException(
+                crate::state::store_full("experiment", crate::state::MAX_EXPERIMENTS),
+            )
+            .into());
+        }
+
+        let id = store.mint_experiment_id();
+        let arn = crate::state::experiment_arn(&region, &id);
+        let record = crate::state::ExperimentRecord::from_template(
+            id.clone(),
+            arn,
+            &template,
+            &actions_mode,
+            input.tags.clone(),
+            now,
+        );
+        let experiment = record.to_experiment();
+        store.experiments.insert(id.clone(), record);
+        store.remember_token(
+            crate::state::IdempotentResource::Experiment,
+            &input.client_token,
+            &id,
+        );
+
+        Ok(StartExperimentOutput {
+            experiment: Some(experiment),
+        })
     }
 }

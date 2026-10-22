@@ -1,11 +1,1004 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-fis-faultinjectionsimulator service.
+//!
+//! AWS FIS has two caller-owned resources, and this module holds both:
+//!
+//! * an EXPERIMENT TEMPLATE, created by `CreateExperimentTemplate`, read back by
+//!   `GetExperimentTemplate`, enumerated by `ListExperimentTemplates` and removed by
+//!   `DeleteExperimentTemplate`;
+//! * an EXPERIMENT, minted by `StartExperiment` from a template, read back by
+//!   `GetExperiment`, enumerated by `ListExperiments` and stopped by `StopExperiment`.
+//!
+//! Both records are the one copy every handler reads and writes, so a value a create
+//! call returns is the value a later read reports. An experiment also owes the clock a
+//! transition (`initiating` -> `running`, `stopping` -> `stopped`): the instant it falls
+//! due is stored on the record and materialised by [`ExperimentRecord::settle`], so no
+//! handler ever sleeps and a read never invents a status the clock did not already owe.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, SystemTime};
+
+use crate::ops::types::{
+    CreateExperimentTemplateActionInput, CreateExperimentTemplateExperimentOptionsInput,
+    CreateExperimentTemplateInput, CreateExperimentTemplateLogConfigurationInput,
+    CreateExperimentTemplateReportConfigurationInput, CreateExperimentTemplateStopConditionInput,
+    CreateExperimentTemplateTargetInput, Experiment, ExperimentAction,
+    ExperimentCloudWatchLogsLogConfiguration, ExperimentLogConfiguration, ExperimentOptions,
+    ExperimentReportConfiguration, ExperimentReportConfigurationCloudWatchDashboard,
+    ExperimentReportConfigurationDataSources, ExperimentReportConfigurationOutputs,
+    ExperimentReportConfigurationOutputsS3Configuration, ExperimentS3LogConfiguration,
+    ExperimentState, ExperimentStopCondition, ExperimentSummary, ExperimentTarget,
+    ExperimentTargetFilter, ExperimentTemplate, ExperimentTemplateAction,
+    ExperimentTemplateCloudWatchLogsLogConfiguration,
+    ExperimentTemplateCloudWatchLogsLogConfigurationInput, ExperimentTemplateExperimentOptions,
+    ExperimentTemplateLogConfiguration, ExperimentTemplateReportConfiguration,
+    ExperimentTemplateReportConfigurationCloudWatchDashboard,
+    ExperimentTemplateReportConfigurationDataSources,
+    ExperimentTemplateReportConfigurationDataSourcesInput,
+    ExperimentTemplateReportConfigurationOutputs,
+    ExperimentTemplateReportConfigurationOutputsInput, ExperimentTemplateS3LogConfiguration,
+    ExperimentTemplateS3LogConfigurationInput, ExperimentTemplateStopCondition,
+    ExperimentTemplateSummary, ExperimentTemplateTarget, ExperimentTemplateTargetFilter,
+    ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
+    ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResourceNotFoundException,
+    ServiceQuotaExceededException, ValidationException, ACCOUNT_TARGETING_VALUES,
+    ACTIONS_MODE_VALUES, EMPTY_TARGET_RESOLUTION_MODE_VALUES,
+};
+
+/// What a handler reports when the engine it was built on carries no store for this
+/// service — a server fault, never a bad request.
+pub const STORE_UNAVAILABLE: &str = "the fis experiment store is unavailable";
+
+/// The region an ARN names when the request carries no SigV4 credential scope to read
+/// one from.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// This service's `arnNamespace` / `sigv4Name` — the third field of every ARN it mints.
+pub const ARN_SERVICE: &str = "fis";
+
+/// The ARN resource prefix of an experiment template
+/// (`arn:aws:fis:<region>:<account>:experiment-template/<id>`).
+pub const TEMPLATE_RESOURCE: &str = "experiment-template";
+
+/// The ARN resource prefix of an experiment
+/// (`arn:aws:fis:<region>:<account>:experiment/<id>`).
+pub const EXPERIMENT_RESOURCE: &str = "experiment";
+
+/// The prefix of a minted experiment-template id, as FIS writes it (`EXT…`).
+pub const TEMPLATE_ID_PREFIX: &str = "EXT";
+
+/// The prefix of a minted experiment id, as FIS writes it (`EXP…`).
+pub const EXPERIMENT_ID_PREFIX: &str = "EXP";
+
+/// How many characters follow the prefix in a minted id.
+///
+/// `ExperimentTemplateId` and `ExperimentId` are modelled `length(0..64)`,
+/// `pattern ^[\S]+$`, which admits any short token; FIS itself writes a short
+/// alphanumeric suffix, and twelve base-36 characters is far more than this emulator can
+/// exhaust.
+pub const ID_SUFFIX_LEN: usize = 12;
+
+/// The largest page `ListExperimentTemplates` and `ListExperiments` serve, and the page
+/// size used when a request names no `maxResults`: both `maxResults` members are modelled
+/// `@range(min: 1, max: 100)`.
+pub const PAGE_LIMIT: i32 = 100;
+
+/// How many experiment templates the store holds before `CreateExperimentTemplate`
+/// refuses with `ServiceQuotaExceededException`.
+///
+/// This is the emulator's OWN bound on its store rather than a claim about any quota AWS
+/// publishes: without it a caller could mint records without end. It is set far above any
+/// workflow an emulator serves, and it is checked only when a request would ADD a record.
+pub const MAX_EXPERIMENT_TEMPLATES: usize = 1_000;
+
+/// How many experiments the store holds before `StartExperiment` refuses with
+/// `ServiceQuotaExceededException`. See [`MAX_EXPERIMENT_TEMPLATES`].
+pub const MAX_EXPERIMENTS: usize = 1_000;
+
+/// The value FIS applies to `accountTargeting` when the request names none: the
+/// experiment targets the caller's own account (`AccountTargeting` is modelled
+/// `multi-account | single-account`, and multi-account targeting is what target-account
+/// configurations opt into).
+pub const DEFAULT_ACCOUNT_TARGETING: &str = "single-account";
+
+/// The value FIS applies to `emptyTargetResolutionMode` when the request names none: an
+/// action whose target resolves to nothing fails the experiment rather than being skipped
+/// (`EmptyTargetResolutionMode` is modelled `fail | skip`).
+pub const DEFAULT_EMPTY_TARGET_RESOLUTION_MODE: &str = "fail";
+
+/// The value FIS applies to `actionsMode` when `StartExperiment` names none: the
+/// experiment runs all of its actions (`ActionsMode` is modelled `run-all | skip-all`).
+pub const DEFAULT_ACTIONS_MODE: &str = "run-all";
+
+/// The two sources a stop condition may name.
+///
+/// The model types `StopConditionSource` as a plain string, but FIS documents the value:
+/// "Specify `aws:cloudwatch:alarm` if the stop condition is defined by a CloudWatch
+/// alarm. Specify `none` if there is no stop condition." Anything else is refused as a
+/// `ValidationException`.
+pub const STOP_CONDITION_SOURCE_NONE: &str = "none";
+
+/// See [`STOP_CONDITION_SOURCE_NONE`]. A stop condition naming this source carries the
+/// alarm's ARN in `value`, which FIS documents as required for it.
+pub const STOP_CONDITION_SOURCE_ALARM: &str = "aws:cloudwatch:alarm";
+
+/// How long after the call that starts it a transition this service owes falls due.
+///
+/// AWS publishes no duration for `initiating` -> `running` or `stopping` -> `stopped`, so
+/// this span is the emulator's own choice. It is deliberately NOT zero: a caller that
+/// reads the experiment straight after `StartExperiment` or `StopExperiment` observes the
+/// transient status, exactly as it would against the real service.
+pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `state.reason` an experiment carries once `StopExperiment` has been called on it.
+///
+/// FIS documents no wording for `ExperimentState$reason` ("The reason for the state"), so
+/// this is an explanatory string rather than a reproduction of the service's own text.
+pub const STOPPED_BY_REQUEST: &str = "Stopped by a StopExperiment request";
+
+/// The status an experiment this emulator persists can be in.
+///
+/// `ExperimentStatus` is modelled
+/// `pending | initiating | running | completed | stopping | stopped | failed | cancelled`.
+/// Only the four below are reachable here: an experiment is minted `initiating`, becomes
+/// `running` when the clock says so, and goes `stopping` -> `stopped` when
+/// `StopExperiment` is called. `completed`, `failed` and `cancelled` report the outcome
+/// of RUNNING an experiment's actions — injecting faults into other services — which this
+/// emulator does not perform, so it never claims one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperimentStatus {
+    /// The experiment has been accepted and is starting up.
+    Initiating,
+    /// The experiment is live.
+    Running,
+    /// A stop has been requested and is being carried out.
+    Stopping,
+    /// The experiment is over. Terminal.
+    Stopped,
+}
+
+impl ExperimentStatus {
+    /// The wire value of this status — one of `ExperimentStatus`'s enum values.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Initiating => "initiating",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// True when no further transition can leave this status.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopped)
+    }
+}
+
+/// One experiment template, exactly as `CreateExperimentTemplate` stored it.
+#[derive(Debug, Clone)]
+pub struct ExperimentTemplateRecord {
+    /// `ExperimentTemplateId`, minted by [`ComAmazonawsFisFaultinjectionsimulatorState::mint_template_id`].
+    pub id: String,
+    /// `ResourceArn`, built by [`template_arn`] for the region the request was signed for.
+    pub arn: String,
+    pub description: String,
+    pub targets: HashMap<String, ExperimentTemplateTarget>,
+    pub actions: HashMap<String, ExperimentTemplateAction>,
+    pub stop_conditions: Vec<ExperimentTemplateStopCondition>,
+    pub role_arn: String,
+    pub tags: HashMap<String, String>,
+    pub log_configuration: Option<ExperimentTemplateLogConfiguration>,
+    pub experiment_options: ExperimentTemplateExperimentOptions,
+    pub experiment_report_configuration: Option<ExperimentTemplateReportConfiguration>,
+    pub creation_time: SystemTime,
+    /// Set to `creation_time` when the record is created, and moved only by a call that
+    /// changes the template.
+    pub last_update_time: SystemTime,
+    /// How many target account configurations this template carries. The operations that
+    /// create them are still 501, so a template created here carries none.
+    pub target_account_configurations_count: i64,
+}
+
+impl ExperimentTemplateRecord {
+    /// The record `CreateExperimentTemplate` persists for `input`.
+    pub fn from_create_input(
+        id: String,
+        arn: String,
+        input: &CreateExperimentTemplateInput,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            arn,
+            description: input.description.clone(),
+            targets: input
+                .targets
+                .iter()
+                .flatten()
+                .map(|(name, target)| (name.clone(), template_target(target)))
+                .collect(),
+            actions: input
+                .actions
+                .iter()
+                .map(|(name, action)| (name.clone(), template_action(action)))
+                .collect(),
+            stop_conditions: input
+                .stop_conditions
+                .iter()
+                .map(template_stop_condition)
+                .collect(),
+            role_arn: input.role_arn.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            log_configuration: input.log_configuration.as_ref().map(template_log_configuration),
+            experiment_options: template_experiment_options(input.experiment_options.as_ref()),
+            experiment_report_configuration: input
+                .experiment_report_configuration
+                .as_ref()
+                .map(template_report_configuration),
+            creation_time: now,
+            last_update_time: now,
+            target_account_configurations_count: 0,
+        }
+    }
+
+    /// The `ExperimentTemplate` every template operation returns: every member is the
+    /// stored one.
+    pub fn to_experiment_template(&self) -> ExperimentTemplate {
+        ExperimentTemplate {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            description: Some(self.description.clone()),
+            targets: Some(self.targets.clone()),
+            actions: Some(self.actions.clone()),
+            stop_conditions: Some(self.stop_conditions.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            last_update_time: Some(::aws_smithy_types::DateTime::from(self.last_update_time)),
+            role_arn: Some(self.role_arn.clone()),
+            tags: Some(self.tags.clone()),
+            log_configuration: self.log_configuration.clone(),
+            experiment_options: Some(self.experiment_options.clone()),
+            target_account_configurations_count: Some(self.target_account_configurations_count),
+            experiment_report_configuration: self.experiment_report_configuration.clone(),
+        }
+    }
+
+    /// The `ExperimentTemplateSummary` `ListExperimentTemplates` returns for this record.
+    pub fn to_summary(&self) -> ExperimentTemplateSummary {
+        ExperimentTemplateSummary {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            description: Some(self.description.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            last_update_time: Some(::aws_smithy_types::DateTime::from(self.last_update_time)),
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
+/// One experiment, exactly as `StartExperiment` stored it and `StopExperiment` left it.
+#[derive(Debug, Clone)]
+pub struct ExperimentRecord {
+    /// `ExperimentId`, minted by [`ComAmazonawsFisFaultinjectionsimulatorState::mint_experiment_id`].
+    pub id: String,
+    /// `ResourceArn`, built by [`experiment_arn`].
+    pub arn: String,
+    /// The template this experiment was started from.
+    pub experiment_template_id: String,
+    /// Copied from that template.
+    pub role_arn: String,
+    pub status: ExperimentStatus,
+    pub reason: Option<String>,
+    /// Copied from the template, as `ExperimentTarget`s.
+    pub targets: HashMap<String, ExperimentTarget>,
+    /// Copied from the template, as `ExperimentAction`s.
+    pub actions: HashMap<String, ExperimentAction>,
+    /// Copied from the template, as `ExperimentStopCondition`s.
+    pub stop_conditions: Vec<ExperimentStopCondition>,
+    pub tags: HashMap<String, String>,
+    /// The template's options, plus the `actionsMode` `StartExperiment` chose.
+    pub experiment_options: ExperimentOptions,
+    pub log_configuration: Option<ExperimentLogConfiguration>,
+    pub experiment_report_configuration: Option<ExperimentReportConfiguration>,
+    /// See [`ExperimentTemplateRecord::target_account_configurations_count`].
+    pub target_account_configurations_count: i64,
+    pub creation_time: SystemTime,
+    pub start_time: SystemTime,
+    /// "The time that the experiment ended" — set when the experiment reaches a terminal
+    /// status, and absent until then.
+    pub end_time: Option<SystemTime>,
+    /// When the transition this experiment owes the clock falls due, or `None` when it
+    /// owes none. [`ExperimentRecord::settle`] is what spends it.
+    pub transition_due: Option<SystemTime>,
+}
+
+impl ExperimentRecord {
+    /// The record `StartExperiment` persists for `template`.
+    pub fn from_template(
+        id: String,
+        arn: String,
+        template: &ExperimentTemplateRecord,
+        actions_mode: &str,
+        tags: Option<HashMap<String, String>>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            arn,
+            experiment_template_id: template.id.clone(),
+            role_arn: template.role_arn.clone(),
+            // An accepted experiment starts up before it runs; the clock owes the move to
+            // `running`.
+            status: ExperimentStatus::Initiating,
+            reason: None,
+            targets: template
+                .targets
+                .iter()
+                .map(|(name, target)| (name.clone(), experiment_target(target)))
+                .collect(),
+            actions: template
+                .actions
+                .iter()
+                .map(|(name, action)| (name.clone(), experiment_action(action)))
+                .collect(),
+            stop_conditions: template
+                .stop_conditions
+                .iter()
+                .map(experiment_stop_condition)
+                .collect(),
+            tags: tags.unwrap_or_default(),
+            experiment_options: ExperimentOptions {
+                account_targeting: template.experiment_options.account_targeting.clone(),
+                empty_target_resolution_mode: template
+                    .experiment_options
+                    .empty_target_resolution_mode
+                    .clone(),
+                actions_mode: Some(actions_mode.to_string()),
+            },
+            log_configuration: template
+                .log_configuration
+                .as_ref()
+                .map(experiment_log_configuration),
+            experiment_report_configuration: template
+                .experiment_report_configuration
+                .as_ref()
+                .map(experiment_report_configuration),
+            target_account_configurations_count: template.target_account_configurations_count,
+            creation_time: now,
+            start_time: now,
+            end_time: None,
+            transition_due: Some(now + TRANSITION_DELAY),
+        }
+    }
+
+    /// Materialise the transition the clock already owes at `now`, if it is due.
+    ///
+    /// This is the one write a REPORTING operation performs, and it only makes a change
+    /// that was owed at `now` whether or not anybody called: an experiment that was
+    /// `initiating` when [`TRANSITION_DELAY`] elapsed is `running` from that instant, and
+    /// one that was `stopping` is `stopped` from it. Nothing here depends on the call
+    /// being made, so two reads at the same instant report the same status.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.transition_due else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.transition_due = None;
+        match self.status {
+            ExperimentStatus::Initiating => self.status = ExperimentStatus::Running,
+            ExperimentStatus::Stopping => {
+                self.status = ExperimentStatus::Stopped;
+                // The experiment ended when the transition fell due, not when somebody
+                // happened to look.
+                self.end_time = Some(due);
+            }
+            ExperimentStatus::Running | ExperimentStatus::Stopped => {}
+        }
+    }
+
+    /// Start the move to `stopped`, due [`TRANSITION_DELAY`] from `now`.
+    ///
+    /// A no-op on an experiment that is already stopping or stopped, so a repeated
+    /// `StopExperiment` neither restarts the span nor moves `endTime`.
+    pub fn request_stop(&mut self, now: SystemTime) {
+        if matches!(
+            self.status,
+            ExperimentStatus::Stopping | ExperimentStatus::Stopped
+        ) {
+            return;
+        }
+        self.status = ExperimentStatus::Stopping;
+        self.reason = Some(STOPPED_BY_REQUEST.to_string());
+        self.transition_due = Some(now + TRANSITION_DELAY);
+    }
+
+    /// The `ExperimentState` this record reports.
+    pub fn to_state(&self) -> ExperimentState {
+        ExperimentState {
+            status: Some(self.status.as_wire().to_string()),
+            reason: self.reason.clone(),
+            // `ExperimentError` carries "the error information of the experiment when the
+            // action has failed"; no status this emulator reaches is a failure.
+            error: None,
+        }
+    }
+
+    /// The `Experiment` every experiment operation returns: every member is the stored
+    /// one.
+    pub fn to_experiment(&self) -> Experiment {
+        Experiment {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            experiment_template_id: Some(self.experiment_template_id.clone()),
+            role_arn: Some(self.role_arn.clone()),
+            state: Some(self.to_state()),
+            targets: Some(self.targets.clone()),
+            actions: Some(self.actions.clone()),
+            stop_conditions: Some(self.stop_conditions.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
+            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+            tags: Some(self.tags.clone()),
+            log_configuration: self.log_configuration.clone(),
+            experiment_options: Some(self.experiment_options.clone()),
+            target_account_configurations_count: Some(self.target_account_configurations_count),
+            experiment_report_configuration: self.experiment_report_configuration.clone(),
+            // `ExperimentReport` describes a report this emulator does not generate: the
+            // report configuration is persisted, but no report is produced for it.
+            experiment_report: None,
+        }
+    }
+
+    /// The `ExperimentSummary` `ListExperiments` returns for this record.
+    pub fn to_summary(&self) -> ExperimentSummary {
+        ExperimentSummary {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            experiment_template_id: Some(self.experiment_template_id.clone()),
+            state: Some(self.to_state()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            tags: Some(self.tags.clone()),
+            experiment_options: Some(self.experiment_options.clone()),
+        }
+    }
+}
+
+/// Which resource an idempotency token created, so a token a client reuses across two
+/// different operations is not mistaken for a replay of the other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IdempotentResource {
+    ExperimentTemplate,
+    Experiment,
+}
 
 /// Per-service state for com-amazonaws-fis-faultinjectionsimulator. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsFisFaultinjectionsimulatorState {
-    // TODO: add service-specific state fields
+    /// Every experiment template, keyed by its id. A `BTreeMap` is what gives
+    /// `ListExperimentTemplates` the stable total order its pagination token indexes
+    /// into; ids are minted fixed-width, so that order is creation order.
+    pub experiment_templates: BTreeMap<String, ExperimentTemplateRecord>,
+    /// Every experiment, keyed by its id — ordered for the same reason.
+    pub experiments: BTreeMap<String, ExperimentRecord>,
+    /// The resource each `@idempotencyToken` has already created, so replaying a token
+    /// returns the first resource instead of minting a second one.
+    ///
+    /// An entry is dropped when the resource it names leaves the store, which is what
+    /// keeps this map bounded by the live records.
+    pub idempotency: BTreeMap<(IdempotentResource, String), String>,
+    /// The counter template ids are minted from, so two calls never share an id.
+    pub template_seq: u64,
+    /// The counter experiment ids are minted from.
+    pub experiment_seq: u64,
+}
+
+impl ComAmazonawsFisFaultinjectionsimulatorState {
+    /// A fresh experiment-template id, which no earlier call has used.
+    pub fn mint_template_id(&mut self) -> String {
+        self.template_seq += 1;
+        format_id(TEMPLATE_ID_PREFIX, self.template_seq)
+    }
+
+    /// A fresh experiment id, which no earlier call has used.
+    pub fn mint_experiment_id(&mut self) -> String {
+        self.experiment_seq += 1;
+        format_id(EXPERIMENT_ID_PREFIX, self.experiment_seq)
+    }
+
+    /// The resource `token` already created for `resource`, when it is still in the store.
+    pub fn replayed(&self, resource: IdempotentResource, token: &str) -> Option<&String> {
+        let id = self.idempotency.get(&(resource, token.to_string()))?;
+        let live = match resource {
+            IdempotentResource::ExperimentTemplate => self.experiment_templates.contains_key(id),
+            IdempotentResource::Experiment => self.experiments.contains_key(id),
+        };
+        live.then_some(id)
+    }
+
+    /// Record that `token` created `id`.
+    pub fn remember_token(&mut self, resource: IdempotentResource, token: &str, id: &str) {
+        self.idempotency
+            .insert((resource, token.to_string()), id.to_string());
+    }
+
+    /// Drop every idempotency entry that names `id`, so the map does not outlive the
+    /// records it points at.
+    pub fn forget_tokens_for(&mut self, resource: IdempotentResource, id: &str) {
+        self.idempotency
+            .retain(|(kind, _), created| *kind != resource || created != id);
+    }
+
+    /// The experiment `id` names, with every transition the clock already owes at `now`
+    /// materialised. `None` when the store holds no such experiment.
+    pub fn settled_experiment_mut(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<&mut ExperimentRecord> {
+        let record = self.experiments.get_mut(id)?;
+        record.settle(now);
+        Some(record)
+    }
+
+    /// Every experiment, with each one's owed transition materialised at `now`. This is
+    /// what `ListExperiments` reports from, so a listed status agrees with the status
+    /// `GetExperiment` reports for the same experiment at the same instant.
+    pub fn settle_experiments(&mut self, now: SystemTime) {
+        for record in self.experiments.values_mut() {
+            record.settle(now);
+        }
+    }
+}
+
+/// `prefix` followed by [`ID_SUFFIX_LEN`] base-36 characters holding `seq`.
+///
+/// Fixed width and upper-case base 36 mean the lexicographic order of two minted ids is
+/// their minting order, which is the order a paginated list walks and resumes in.
+fn format_id(prefix: &str, seq: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    // The invariant the pagination tokens rest on: a sequence number that needs more
+    // than ID_SUFFIX_LEN digits would wrap, and the lexicographic order of two ids would
+    // stop being their minting order. Unreachable while the store is bounded by
+    // MAX_EXPERIMENT_TEMPLATES / MAX_EXPERIMENTS, so this states the invariant rather
+    // than correcting anything.
+    debug_assert!(
+        seq < 36u64.pow(ID_SUFFIX_LEN as u32),
+        "sequence number {seq} does not fit in {ID_SUFFIX_LEN} base-36 digits"
+    );
+    let mut suffix = [b'0'; ID_SUFFIX_LEN];
+    let mut rest = seq;
+    for slot in suffix.iter_mut().rev() {
+        *slot = DIGITS[usize::try_from(rest % 36).unwrap_or(0)];
+        rest /= 36;
+    }
+    // Every byte came from DIGITS, so the suffix is ASCII.
+    format!("{prefix}{}", String::from_utf8_lossy(&suffix))
+}
+
+/// True when `value` has the shape [`format_id`] mints with `prefix`.
+///
+/// The boundary validator refuses a modelled id member that is empty or carries
+/// whitespace, so this is for a value the model does not constrain beyond that — a
+/// `nextToken`, which a paginated list carries a resource id in.
+pub fn is_minted_id(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    suffix.len() == ID_SUFFIX_LEN
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+}
+
+/// The ARN of the experiment template `id` names, in `region`.
+pub fn template_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("{TEMPLATE_RESOURCE}/{id}"))
+}
+
+/// The ARN of the experiment `id` names, in `region`.
+pub fn experiment_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("{EXPERIMENT_RESOURCE}/{id}"))
+}
+
+/// The region this request was signed for — what a minted ARN names.
+///
+/// The scope's region is only honoured when it has an AWS region's SHAPE
+/// (`<partition>-<area>[-<area>]-<number>`, e.g. `us-east-1`, `ap-southeast-3`): the
+/// value is interpolated into an ARN, so an arbitrary header value must not be able to
+/// shape one. Anything else falls back to [`DEFAULT_REGION`].
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_region_shaped(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// True when `value` has an AWS region's shape: lowercase alphabetic segments joined by
+/// `-`, ending in a digit group, at least three segments.
+fn is_region_shaped(value: &str) -> bool {
+    let mut segments = value.split('-').rev();
+    let Some(number) = segments.next() else {
+        return false;
+    };
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let words: Vec<&str> = segments.collect();
+    words.len() >= 2
+        && words
+            .iter()
+            .all(|word| !word.is_empty() && word.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
+/// The page size a paginated FIS list serves for `max_results`.
+///
+/// Both `maxResults` members are modelled `@range(min: 1, max: 100)` and the boundary
+/// validator refused anything outside it before a handler ran, so the only case left is
+/// an absent value: serve the largest page the model allows. The `clamp` states that
+/// invariant rather than correcting a caller — a value reaching here outside the range is
+/// a validator bug, which the debug assertion surfaces instead of silently repairing.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    let requested = max_results.unwrap_or(PAGE_LIMIT);
+    debug_assert!(
+        (1..=PAGE_LIMIT).contains(&requested),
+        "maxResults {requested} should have been refused at the boundary"
+    );
+    usize::try_from(requested.clamp(1, PAGE_LIMIT)).unwrap_or(1)
+}
+
+/// `None` when every stop condition in `conditions` satisfies what FIS documents for
+/// `StopCondition`; otherwise the `ValidationException` that refuses the request.
+///
+/// Two rules the model cannot express: `source` is one of
+/// [`STOP_CONDITION_SOURCE_NONE`] / [`STOP_CONDITION_SOURCE_ALARM`], and a stop condition
+/// naming the alarm source carries the alarm's ARN in `value` ("This is required if the
+/// source is a CloudWatch alarm").
+pub fn stop_conditions_refusal(
+    conditions: &[CreateExperimentTemplateStopConditionInput],
+) -> Option<ValidationException> {
+    for (index, condition) in conditions.iter().enumerate() {
+        let source = condition.source.as_str();
+        if source != STOP_CONDITION_SOURCE_NONE && source != STOP_CONDITION_SOURCE_ALARM {
+            return Some(invalid_input(format!(
+                "stopConditions[{index}].source must be \
+                 {STOP_CONDITION_SOURCE_NONE} or {STOP_CONDITION_SOURCE_ALARM}, got {source:?}"
+            )));
+        }
+        if source == STOP_CONDITION_SOURCE_ALARM
+            && condition
+                .value
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Some(invalid_input(format!(
+                "stopConditions[{index}].value is required when source is \
+                 {STOP_CONDITION_SOURCE_ALARM}"
+            )));
+        }
+    }
+    None
+}
+
+/// `None` when `value` is absent or is one of `admitted`; otherwise the
+/// `ValidationException` that refuses the member `member` carries.
+///
+/// The boundary validator does not check enum membership, so an operation that persists
+/// an enum-typed member checks it here rather than storing a value the model does not
+/// admit.
+pub fn enum_refusal(
+    member: &str,
+    value: Option<&str>,
+    admitted: &[&str],
+) -> Option<ValidationException> {
+    let value = value?;
+    if admitted.contains(&value) {
+        return None;
+    }
+    Some(invalid_input(format!(
+        "{member} must be one of {}, got {value:?}",
+        admitted.join(" | ")
+    )))
+}
+
+/// The `ValidationException` refusals of the experiment options a
+/// `CreateExperimentTemplate` request carries.
+pub fn template_experiment_options_refusal(
+    options: Option<&CreateExperimentTemplateExperimentOptionsInput>,
+) -> Option<ValidationException> {
+    let options = options?;
+    enum_refusal(
+        "experimentOptions.accountTargeting",
+        options.account_targeting.as_deref(),
+        ACCOUNT_TARGETING_VALUES,
+    )
+    .or_else(|| {
+        enum_refusal(
+            "experimentOptions.emptyTargetResolutionMode",
+            options.empty_target_resolution_mode.as_deref(),
+            EMPTY_TARGET_RESOLUTION_MODE_VALUES,
+        )
+    })
+}
+
+/// The `actionsMode` an experiment runs under, or the `ValidationException` that refuses
+/// the value the request named.
+pub fn resolve_actions_mode(requested: Option<&str>) -> Result<String, ValidationException> {
+    if let Some(refusal) = enum_refusal(
+        "experimentOptions.actionsMode",
+        requested,
+        ACTIONS_MODE_VALUES,
+    ) {
+        return Err(refusal);
+    }
+    Ok(requested.unwrap_or(DEFAULT_ACTIONS_MODE).to_string())
+}
+
+/// The `ValidationException` payload for a request this service refuses.
+pub fn invalid_input(message: impl Into<String>) -> ValidationException {
+    ValidationException {
+        message: Some(message.into()),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an experiment template id that names no
+/// record — "the specified resource cannot be found".
+pub fn template_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("No experiment template found with id {id}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an experiment id that names no record.
+pub fn experiment_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("No experiment found with id {id}")),
+    }
+}
+
+/// The `ServiceQuotaExceededException` payload for a create that would push the store
+/// past the bound it holds.
+pub fn store_full(resource: &str, limit: usize) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: Some(format!(
+            "this emulator already holds the maximum of {limit} {resource} records"
+        )),
+    }
+}
+
+/// The experiment options a template carries: what the request named, with FIS's
+/// documented default filling in each member it left out.
+fn template_experiment_options(
+    input: Option<&CreateExperimentTemplateExperimentOptionsInput>,
+) -> ExperimentTemplateExperimentOptions {
+    ExperimentTemplateExperimentOptions {
+        account_targeting: Some(
+            input
+                .and_then(|options| options.account_targeting.clone())
+                .unwrap_or_else(|| DEFAULT_ACCOUNT_TARGETING.to_string()),
+        ),
+        empty_target_resolution_mode: Some(
+            input
+                .and_then(|options| options.empty_target_resolution_mode.clone())
+                .unwrap_or_else(|| DEFAULT_EMPTY_TARGET_RESOLUTION_MODE.to_string()),
+        ),
+    }
+}
+
+fn template_target(input: &CreateExperimentTemplateTargetInput) -> ExperimentTemplateTarget {
+    ExperimentTemplateTarget {
+        resource_type: Some(input.resource_type.clone()),
+        resource_arns: input.resource_arns.clone(),
+        resource_tags: input.resource_tags.clone(),
+        filters: input
+            .filters
+            .as_ref()
+            .map(|filters| filters.iter().map(template_target_filter).collect()),
+        selection_mode: Some(input.selection_mode.clone()),
+        parameters: input.parameters.clone(),
+    }
+}
+
+fn template_target_filter(
+    input: &ExperimentTemplateTargetInputFilter,
+) -> ExperimentTemplateTargetFilter {
+    ExperimentTemplateTargetFilter {
+        path: Some(input.path.clone()),
+        values: Some(input.values.clone()),
+    }
+}
+
+fn template_action(input: &CreateExperimentTemplateActionInput) -> ExperimentTemplateAction {
+    ExperimentTemplateAction {
+        action_id: Some(input.action_id.clone()),
+        description: input.description.clone(),
+        parameters: input.parameters.clone(),
+        targets: input.targets.clone(),
+        start_after: input.start_after.clone(),
+    }
+}
+
+fn template_stop_condition(
+    input: &CreateExperimentTemplateStopConditionInput,
+) -> ExperimentTemplateStopCondition {
+    ExperimentTemplateStopCondition {
+        source: Some(input.source.clone()),
+        value: input.value.clone(),
+    }
+}
+
+fn template_log_configuration(
+    input: &CreateExperimentTemplateLogConfigurationInput,
+) -> ExperimentTemplateLogConfiguration {
+    ExperimentTemplateLogConfiguration {
+        cloud_watch_logs_configuration: input
+            .cloud_watch_logs_configuration
+            .as_ref()
+            .map(template_cloud_watch_logs_configuration),
+        s3_configuration: input.s3_configuration.as_ref().map(template_s3_configuration),
+        log_schema_version: Some(input.log_schema_version),
+    }
+}
+
+fn template_cloud_watch_logs_configuration(
+    input: &ExperimentTemplateCloudWatchLogsLogConfigurationInput,
+) -> ExperimentTemplateCloudWatchLogsLogConfiguration {
+    ExperimentTemplateCloudWatchLogsLogConfiguration {
+        log_group_arn: Some(input.log_group_arn.clone()),
+    }
+}
+
+fn template_s3_configuration(
+    input: &ExperimentTemplateS3LogConfigurationInput,
+) -> ExperimentTemplateS3LogConfiguration {
+    ExperimentTemplateS3LogConfiguration {
+        bucket_name: Some(input.bucket_name.clone()),
+        prefix: input.prefix.clone(),
+    }
+}
+
+fn template_report_configuration(
+    input: &CreateExperimentTemplateReportConfigurationInput,
+) -> ExperimentTemplateReportConfiguration {
+    ExperimentTemplateReportConfiguration {
+        outputs: input.outputs.as_ref().map(template_report_outputs),
+        data_sources: input.data_sources.as_ref().map(template_report_data_sources),
+        pre_experiment_duration: input.pre_experiment_duration.clone(),
+        post_experiment_duration: input.post_experiment_duration.clone(),
+    }
+}
+
+fn template_report_outputs(
+    input: &ExperimentTemplateReportConfigurationOutputsInput,
+) -> ExperimentTemplateReportConfigurationOutputs {
+    ExperimentTemplateReportConfigurationOutputs {
+        s3_configuration: input.s3_configuration.as_ref().map(
+            |s3: &ReportConfigurationS3OutputInput| ReportConfigurationS3Output {
+                bucket_name: s3.bucket_name.clone(),
+                prefix: s3.prefix.clone(),
+            },
+        ),
+    }
+}
+
+fn template_report_data_sources(
+    input: &ExperimentTemplateReportConfigurationDataSourcesInput,
+) -> ExperimentTemplateReportConfigurationDataSources {
+    ExperimentTemplateReportConfigurationDataSources {
+        cloud_watch_dashboards: input.cloud_watch_dashboards.as_ref().map(|dashboards| {
+            dashboards
+                .iter()
+                .map(|dashboard: &ReportConfigurationCloudWatchDashboardInput| {
+                    ExperimentTemplateReportConfigurationCloudWatchDashboard {
+                        dashboard_identifier: dashboard.dashboard_identifier.clone(),
+                    }
+                })
+                .collect()
+        }),
+    }
+}
+
+fn experiment_target(target: &ExperimentTemplateTarget) -> ExperimentTarget {
+    ExperimentTarget {
+        resource_type: target.resource_type.clone(),
+        resource_arns: target.resource_arns.clone(),
+        resource_tags: target.resource_tags.clone(),
+        filters: target.filters.as_ref().map(|filters| {
+            filters
+                .iter()
+                .map(|filter| ExperimentTargetFilter {
+                    path: filter.path.clone(),
+                    values: filter.values.clone(),
+                })
+                .collect()
+        }),
+        selection_mode: target.selection_mode.clone(),
+        parameters: target.parameters.clone(),
+    }
+}
+
+/// The experiment's copy of one of the template's actions.
+///
+/// `state`, `startTime` and `endTime` are left unset on purpose: they report the progress
+/// of an action that injects a fault into another service, and this emulator runs no
+/// action, so it reports no per-action status rather than claiming one for work nothing
+/// performed.
+fn experiment_action(action: &ExperimentTemplateAction) -> ExperimentAction {
+    ExperimentAction {
+        action_id: action.action_id.clone(),
+        description: action.description.clone(),
+        parameters: action.parameters.clone(),
+        targets: action.targets.clone(),
+        start_after: action.start_after.clone(),
+        state: None,
+        start_time: None,
+        end_time: None,
+    }
+}
+
+fn experiment_stop_condition(
+    condition: &ExperimentTemplateStopCondition,
+) -> ExperimentStopCondition {
+    ExperimentStopCondition {
+        source: condition.source.clone(),
+        value: condition.value.clone(),
+    }
+}
+
+fn experiment_log_configuration(
+    configuration: &ExperimentTemplateLogConfiguration,
+) -> ExperimentLogConfiguration {
+    ExperimentLogConfiguration {
+        cloud_watch_logs_configuration: configuration
+            .cloud_watch_logs_configuration
+            .as_ref()
+            .map(|logs| ExperimentCloudWatchLogsLogConfiguration {
+                log_group_arn: logs.log_group_arn.clone(),
+            }),
+        s3_configuration: configuration
+            .s3_configuration
+            .as_ref()
+            .map(|s3| ExperimentS3LogConfiguration {
+                bucket_name: s3.bucket_name.clone(),
+                prefix: s3.prefix.clone(),
+            }),
+        log_schema_version: configuration.log_schema_version,
+    }
+}
+
+fn experiment_report_configuration(
+    configuration: &ExperimentTemplateReportConfiguration,
+) -> ExperimentReportConfiguration {
+    ExperimentReportConfiguration {
+        outputs: configuration
+            .outputs
+            .as_ref()
+            .map(|outputs| ExperimentReportConfigurationOutputs {
+                s3_configuration: outputs.s3_configuration.as_ref().map(|s3| {
+                    ExperimentReportConfigurationOutputsS3Configuration {
+                        bucket_name: s3.bucket_name.clone(),
+                        prefix: s3.prefix.clone(),
+                    }
+                }),
+            }),
+        data_sources: configuration.data_sources.as_ref().map(|sources| {
+            ExperimentReportConfigurationDataSources {
+                cloud_watch_dashboards: sources.cloud_watch_dashboards.as_ref().map(
+                    |dashboards| {
+                        dashboards
+                            .iter()
+                            .map(|dashboard| ExperimentReportConfigurationCloudWatchDashboard {
+                                dashboard_identifier: dashboard.dashboard_identifier.clone(),
+                            })
+                            .collect()
+                    },
+                ),
+            }
+        }),
+        pre_experiment_duration: configuration.pre_experiment_duration.clone(),
+        post_experiment_duration: configuration.post_experiment_duration.clone(),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

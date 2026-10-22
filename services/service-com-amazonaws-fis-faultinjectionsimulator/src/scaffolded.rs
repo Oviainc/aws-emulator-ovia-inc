@@ -177,6 +177,63 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `InternalFailure` error shape.
+static INTERNAL_FAILURE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InternalFailure$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InternalFailure` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// shape is not in this service's model, so it must not collide with a modelled one.
+pub static INTERNAL_FAILURE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InternalFailure",
+        "smithy.framework",
+        "InternalFailure",
+    ),
+    ShapeType::Structure,
+    &[&INTERNAL_FAILURE_MESSAGE],
+);
+
+/// The payload of an `InternalFailure`: what about the emulator itself went wrong.
+#[derive(Debug, Clone)]
+pub struct InternalFailure {
+    pub message: String,
+}
+
+impl InternalFailure {
+    /// An `InternalFailure` carrying `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InternalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InternalFailure: {}", self.message)
+    }
+}
+
+impl std::error::Error for InternalFailure {}
+
+impl SerializableStruct for InternalFailure {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INTERNAL_FAILURE_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +253,14 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The emulator itself could not serve the request. Renders as HTTP 500 with the
+    /// error code `InternalFailure`.
+    ///
+    /// This service's model declares no server-fault error on any operation, so a
+    /// handler that cannot reach its own store has nowhere else to report it: a 501
+    /// would claim the operation was never written, and a 400 would blame the caller
+    /// for the emulator's own failure.
+    InternalFailure(InternalFailure),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +286,16 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Report that the emulator itself could not serve the request, with HTTP 500
+    /// `InternalFailure`.
+    ///
+    /// Reach for this ONLY for a failure of the emulator, never for anything a request
+    /// carries: SDK retry classifiers treat a 500 as retryable, so a bad request
+    /// answered with one is retried until the client gives up.
+    pub fn internal_failure(message: impl Into<String>) -> Self {
+        Self::InternalFailure(InternalFailure::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +304,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::InternalFailure(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +317,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::InternalFailure(e) => e.source(),
         }
     }
 }
@@ -255,6 +332,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::InternalFailure(e) => e,
         }
     }
 
@@ -263,6 +341,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::InternalFailure(_) => &INTERNAL_FAILURE_SCHEMA,
         }
     }
 
@@ -275,6 +354,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::InternalFailure(_) => "InternalFailure",
         }
     }
 
@@ -287,6 +367,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::InternalFailure(_) => 500,
         }
     }
 
@@ -299,6 +380,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::InternalFailure(_) => None,
         }
     }
 }

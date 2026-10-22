@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExperimentTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExperimentTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one `ExperimentTemplateSummary` per persisted experiment template, in the
+//! store's id order, cutting the page at `maxResults`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExperimentTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A page is followed by a `nextToken` exactly when templates remain; that token is the
+//! id the next page starts at, so walking the pages at any admissible size enumerates
+//! every template exactly once. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +138,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExperimentTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExperimentTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExperimentTemplates"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The token is the template id the next page starts at, so anything that is not
+        // an id this service mints was never issued by this operation.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_minted_id(token, crate::state::TEMPLATE_ID_PREFIX) {
+                return Err(ListExperimentTemplatesErrorModeled::ValidationException(
+                    crate::state::invalid_input(
+                        "nextToken is not a token returned by ListExperimentTemplates",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let store = state.lock();
+        let mut experiment_templates =
+            Vec::with_capacity(page_size.min(store.experiment_templates.len()));
+        let mut next_token = None;
+        for (id, record) in &store.experiment_templates {
+            // Resume at the first id at or after the token, so a page is still served
+            // when the template the token named was deleted meanwhile.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| id.as_str() < token)
+            {
+                continue;
+            }
+            if experiment_templates.len() >= page_size {
+                next_token = Some(id.clone());
+                break;
+            }
+            experiment_templates.push(record.to_summary());
+        }
+
+        Ok(ListExperimentTemplatesOutput {
+            experiment_templates: Some(experiment_templates),
+            next_token,
+        })
     }
 }

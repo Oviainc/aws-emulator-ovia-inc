@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExperiments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExperiments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one `ExperimentSummary` per persisted experiment, in the store's id order,
+//! optionally narrowed to one `experimentTemplateId` and cut at `maxResults`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExperiments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Paginates exactly as `ListExperimentTemplates` does: the `nextToken` is the id the
+//! next page starts at, and it arrives only when experiments remain. Reporting, with the
+//! one write [`crate::state::ExperimentRecord::settle`] performs — so a status listed
+//! here agrees with the status `GetExperiment` reports at the same instant.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +141,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExperiments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExperimentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExperiments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The token is the experiment id the next page starts at, so anything that is
+        // not an id this service mints was never issued by this operation.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_minted_id(token, crate::state::EXPERIMENT_ID_PREFIX) {
+                return Err(ListExperimentsErrorModeled::ValidationException(
+                    crate::state::invalid_input(
+                        "nextToken is not a token returned by ListExperiments",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_experiments(now);
+
+        let mut experiments = Vec::with_capacity(page_size.min(store.experiments.len()));
+        let mut next_token = None;
+        for (id, record) in &store.experiments {
+            // Resume at the first id at or after the token.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| id.as_str() < token)
+            {
+                continue;
+            }
+            // The filter is applied BEFORE the page is cut, so a page holds `maxResults`
+            // matching experiments and the token only names one the filter admits.
+            if input
+                .experiment_template_id
+                .as_deref()
+                .is_some_and(|wanted| record.experiment_template_id != wanted)
+            {
+                continue;
+            }
+            if experiments.len() >= page_size {
+                next_token = Some(id.clone());
+                break;
+            }
+            experiments.push(record.to_summary());
+        }
+
+        Ok(ListExperimentsOutput {
+            experiments: Some(experiments),
+            next_token,
+        })
     }
 }
