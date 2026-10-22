@@ -15,3 +15,5 @@
 mod case_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subscription_gate.rs"]
+mod subscription_gate;

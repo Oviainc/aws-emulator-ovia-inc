@@ -22,26 +22,59 @@ const EPOCH: &str = "1970-01-01T00:00:00Z";
 /// An instant after any case this emulator can create.
 const FAR_FUTURE: &str = "2999-12-31T23:59:59Z";
 
+/// A Support plan that may use this API, so the suites below reach the operations
+/// at all: the Support API is served only to an account whose plan qualifies (see
+/// `subscription_gate.rs` for that rule), and this harness records one the way an
+/// operator does with `SUPPORT_PLAN`, before any request runs.
+pub(crate) const SUBSCRIBED_PLAN: &str = "enterprise";
+
 /// One emulator with just this service mounted, driven through the production
 /// router so routing, deserialization, constraint validation and error
 /// rendering are the real ones.
-struct Support {
+pub(crate) struct Support {
     router: smithy_server_runtime::MultiServiceRouter,
+    /// The one shared engine the mounted service reads, kept so a suite can change
+    /// the account's Support plan on a running emulator ([`Support::set_plan`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Support {
-    fn new() -> Self {
+    /// An emulator whose account holds [`SUBSCRIBED_PLAN`], so every operation is
+    /// reachable.
+    pub(crate) fn new() -> Self {
+        Self::with_plan(Some(SUBSCRIBED_PLAN))
+    }
+
+    /// An emulator whose account holds `plan` — `None` for an account with no
+    /// Premium Support subscription at all. Written into the store rather than read
+    /// from the environment, so one suite's account cannot change another's.
+    pub(crate) fn with_plan(plan: Option<&str>) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        service_com_amazonaws_support_awssupport_20130415::state::service_state(&*engine)
+            .expect("the support store is reachable from the shared in-memory engine")
+            .lock()
+            .support_plan = plan.map(str::to_string);
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_support_awssupport_20130415::EmulatedService::new(engine),
+            service_com_amazonaws_support_awssupport_20130415::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// Record `plan` as the account's Support plan on a running emulator, leaving
+    /// every case already in the store where it is.
+    pub(crate) fn set_plan(&self, plan: Option<&str>) {
+        service_com_amazonaws_support_awssupport_20130415::state::service_state(&*self.engine)
+            .expect("the support store is reachable from the shared in-memory engine")
+            .lock()
+            .support_plan = plan.map(str::to_string);
     }
 
     /// Call one operation; answer its HTTP status and JSON body.
-    async fn call(&self, operation: &str, input: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, input: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -63,7 +96,7 @@ impl Support {
     }
 
     /// Call one operation and require a 200.
-    async fn ok(&self, operation: &str, input: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, input: Value) -> Value {
         let (status, body) = self.call(operation, &input).await;
         assert_eq!(
             status, 200,
@@ -73,7 +106,7 @@ impl Support {
     }
 
     /// Create a case and answer its `caseId`.
-    async fn create_case(&self, input: Value) -> String {
+    pub(crate) async fn create_case(&self, input: Value) -> String {
         let body = self.ok("CreateCase", input).await;
         body["caseId"]
             .as_str()
@@ -101,7 +134,7 @@ impl Support {
 }
 
 /// The error code an awsJson1_1 failure carries in its body.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_else(|| panic!("an error body carries __type, got {body}"))
