@@ -2,13 +2,14 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet`, `Rule`, `RuleGroup`, `SizeConstraintSet`,
-//! `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet` records and the change tokens
-//! every mutating call consumes live here, so `GetChangeToken`, `GetChangeTokenStatus`
-//! and the `Create*`, `Update*`, `Get*`, `List*` and `Delete*` handlers of every
-//! resource kind all read and write ONE copy of each resource. The helpers below (id
-//! minting, the change-token protocol, CIDR parsing, metric-name validation, filter
-//! identity, the `IPSet`/`IPSetSummary`, `Rule`, `RuleGroup`, `SizeConstraintSet`,
+//! AWS WAF Classic's `IPSet`, `Rule`, `RateBasedRule`, `RuleGroup`,
+//! `SizeConstraintSet`, `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet` records and
+//! the change tokens every mutating call consumes live here, so `GetChangeToken`,
+//! `GetChangeTokenStatus` and the `Create*`, `Update*`, `Get*`, `List*` and `Delete*`
+//! handlers of every resource kind all read and write ONE copy of each resource. The
+//! helpers below (id minting, the change-token protocol, pagination, CIDR parsing,
+//! metric-name validation, filter identity, the `IPSet`/`IPSetSummary`, `Rule`,
+//! `RateBasedRule`/`RuleSummary`, `RuleGroup`, `SizeConstraintSet`,
 //! `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet`/`XssMatchSetSummary`
 //! projections) are shared by those handlers rather than duplicated per operation.
 
@@ -17,9 +18,9 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, RuleGroup, RuleSummary,
-    SizeConstraint, SizeConstraintSet, SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction,
-    WebACL, XssMatchSet,
+    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, RateBasedRule, Rule, RuleGroup,
+    RuleSummary, SizeConstraint, SizeConstraintSet, SqlInjectionMatchSet, SqlInjectionMatchTuple,
+    WafAction, WebACL, XssMatchSet,
     XssMatchSetSummary, XssMatchTuple,
 };
 
@@ -168,11 +169,22 @@ pub fn web_acl_arn(region: &str, web_acl_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("webacl/{web_acl_id}"))
 }
 
-/// The largest page a paginated `List*` returns (`ListIPSets`, `ListRules`, …), and
-/// the page size a `Limit` of 0 (the model's declared default) asks for.
+/// The largest page a paginated `List*` returns (`ListIPSets`, `ListRules`,
+/// `ListRateBasedRules`, …), and the page size a `Limit` of 0 (the model's declared
+/// default) asks for.
 ///
 /// Source: `PaginationLimit`'s modelled `@range` of 0..100.
 pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The most `RateBasedRule`s this emulator stores for the account before
+/// `CreateRateBasedRule` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is NOT modelled and NOT cited: it is the
+/// per-account rate-based-rule quota AWS WAF Classic publishes in its Limits page (10),
+/// chosen because every rate-based rule is a stored record, so the number a caller can
+/// create has to be bounded somewhere. Raising it changes only how many rules one
+/// account may hold, never how a stored rule behaves.
+pub const MAX_RATE_BASED_RULES: usize = 10;
 
 /// The most `Rule`s this emulator stores for the account before `CreateRule` answers
 /// its modelled `WAFLimitsExceededException`.
@@ -212,13 +224,48 @@ pub const RESERVED_METRIC_NAMES: &[&str] = &["All", "Default_Action"];
 /// (which excludes whitespace, punctuation and non-ASCII letters alike) and the
 /// reserved names in [`RESERVED_METRIC_NAMES`].
 ///
-/// Shared by every handler whose input carries a `MetricName` (`CreateRule`, and the
-/// `CreateRateBasedRule` / `CreateRuleGroup` / `CreateWebACL` handlers once they are
-/// implemented), so one rule is enforced in one place.
+/// Shared by every handler whose input carries a `MetricName` (`CreateRule`,
+/// `CreateRateBasedRule`, and the `CreateRuleGroup` / `CreateWebACL` handlers once they
+/// are implemented), so one rule is enforced in one place.
 pub fn metric_name_is_allowed(metric_name: &str) -> bool {
     !metric_name.is_empty()
         && metric_name.chars().all(|c| c.is_ascii_alphanumeric())
         && !RESERVED_METRIC_NAMES.contains(&metric_name)
+}
+
+/// One page of a `List*` operation over records keyed by their resource id, plus the
+/// `NextMarker` that resumes the walk, or `None` when nothing remains past the page.
+///
+/// This is the pagination rule every AWS WAF Classic `List*` operation follows, held
+/// once rather than per operation: `Limit` bounds the page (0 — the model's declared
+/// default — asks for the service's own page size, [`MAX_PAGE_SIZE`]), `NextMarker`
+/// names the id the page resumes at, and the returned marker is the id of the first
+/// record AFTER the page, so it is present exactly when a record remains.
+pub fn page<'records, Record>(
+    records: &'records BTreeMap<String, Record>,
+    limit: i32,
+    next_marker: Option<&str>,
+) -> (Vec<&'records Record>, Option<String>) {
+    // `Limit`'s `@range` of 0..100 is enforced at the boundary, so a larger value
+    // cannot arrive; it is bounded here anyway.
+    let page_size = match usize::try_from(limit) {
+        Ok(0) => MAX_PAGE_SIZE,
+        Ok(limit) => limit.min(MAX_PAGE_SIZE),
+        Err(_) => MAX_PAGE_SIZE,
+    };
+    // Borrowed bounds, so resuming copies no id.
+    let start = match next_marker {
+        Some(marker) => ::std::ops::Bound::Included(marker),
+        None => ::std::ops::Bound::Unbounded,
+    };
+    let mut remaining = records.range::<str, _>((start, ::std::ops::Bound::Unbounded));
+    let page: Vec<&Record> = remaining
+        .by_ref()
+        .take(page_size)
+        .map(|(_, record)| record)
+        .collect();
+    let next_marker = remaining.next().map(|(id, _)| id.clone());
+    (page, next_marker)
 }
 
 /// AWS WAF Classic answers each refusal class with ONE fixed sentence that carries no
@@ -684,6 +731,65 @@ impl RuleEntry {
     }
 }
 
+/// One stored `RateBasedRule`.
+///
+/// A rate-based rule is a `Rule` with a rate limit: the same id, name, metric name and
+/// predicates, plus the `RateKey`/`RateLimit` pair, so it is stored as a [`RuleEntry`]
+/// beside them.
+#[derive(Debug, Clone)]
+pub struct RateBasedRuleEntry {
+    /// The rule's own record: id, name, metric name, predicates and tags.
+    pub rule: RuleEntry,
+    /// `RateKey` as it goes on the wire; the model admits only `IP`.
+    pub rate_key: String,
+    /// The requests allowed in a five-minute period before the rule's action applies.
+    pub rate_limit: i64,
+}
+
+impl RateBasedRuleEntry {
+    /// A new rate-based rule record holding no predicates and no tags.
+    pub fn new(
+        rule_id: String,
+        name: String,
+        metric_name: String,
+        rate_key: String,
+        rate_limit: i64,
+    ) -> Self {
+        Self {
+            rule: RuleEntry::new(rule_id, name, metric_name),
+            rate_key,
+            rate_limit,
+        }
+    }
+
+    /// This record projected onto the modelled `RateBasedRule` shape the Create and
+    /// Get responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> RateBasedRule {
+        RateBasedRule {
+            rule_id: self.rule.rule_id.clone(),
+            name: Some(self.rule.name.clone()),
+            metric_name: Some(self.rule.metric_name.clone()),
+            match_predicates: self
+                .rule
+                .predicates
+                .iter()
+                .map(PredicateEntry::to_modelled)
+                .collect(),
+            rate_key: self.rate_key.clone(),
+            rate_limit: self.rate_limit,
+        }
+    }
+
+    /// This record projected onto the `RuleSummary` shape `ListRateBasedRules`
+    /// returns.
+    pub fn summary(&self) -> RuleSummary {
+        RuleSummary {
+            rule_id: self.rule.rule_id.clone(),
+            name: self.rule.name.clone(),
+        }
+    }
+}
+
 /// One stored `SqlInjectionMatchSet`.
 #[derive(Debug, Clone)]
 pub struct SqlInjectionMatchSetEntry {
@@ -787,6 +893,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// Every stored `Rule`, keyed by its `RuleId`. A `BTreeMap` for the same reason as
     /// [`Self::ip_sets`]: one stable order for the paginated `ListRules`.
     pub rules: BTreeMap<String, RuleEntry>,
+    /// Every stored `RateBasedRule`, keyed by its `RuleId`. Rate-based rules are a
+    /// resource of their own — `ListRateBasedRules` reports these and `ListRules` the
+    /// regular ones — so they live in their own map, walked in the same stable order.
+    pub rate_based_rules: BTreeMap<String, RateBasedRuleEntry>,
     /// Every stored `SizeConstraintSet`, keyed by its `SizeConstraintSetId`. A
     /// `BTreeMap` so `ListSizeConstraintSets` walks them in one stable order and a
     /// `NextMarker` taken on one page resumes at the right place on the next.
