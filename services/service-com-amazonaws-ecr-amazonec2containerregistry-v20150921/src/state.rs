@@ -357,6 +357,49 @@ pub fn check_registry(registry_id_input: Option<&String>) -> Result<(), Fault> {
     }
 }
 
+/// The resource-type prefix of an ECR repository ARN's resource field.
+pub const REPOSITORY_RESOURCE_PREFIX: &str = "repository/";
+
+/// The repository a tagging operation's `resourceArn` names.
+///
+/// ECR's tagging operations address their resource by ARN, and "currently, the only
+/// supported resource is an Amazon ECR repository" (`resourceArn`'s own documentation),
+/// so a usable value is an `arn:<partition>:ecr:<region>:<account>:repository/<name>`
+/// of THIS registry: anything else — a malformed ARN, another service, another resource
+/// type — is [`Fault::InvalidParameter`], and another account's registry is refused the
+/// way [`check_registry`] refuses it. Whether the named repository exists is the
+/// caller's lookup, so a well-formed ARN for an absent repository is reported as
+/// [`Fault::RepositoryNotFound`] by the store rather than as an invalid parameter.
+pub fn repository_name_from_arn(arn: &str) -> Result<String, Fault> {
+    let invalid = || {
+        Fault::InvalidParameter(format!(
+            "resourceArn '{arn}' is not a valid Amazon ECR repository ARN; the only \
+             supported resource is an Amazon ECR repository"
+        ))
+    };
+    // `splitn(6, ..)` keeps the resource field whole: it is the only one that may carry
+    // a colon of its own.
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = fields[..] else {
+        return Err(invalid());
+    };
+    if prefix != "arn" || partition.is_empty() || service != "ecr" || region.is_empty() {
+        return Err(invalid());
+    }
+    let name = resource
+        .strip_prefix(REPOSITORY_RESOURCE_PREFIX)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(invalid)?;
+    if account != registry_id() {
+        return Err(Fault::InvalidParameter(format!(
+            "resourceArn '{arn}' names the registry '{account}'; the only registry \
+             served here is '{}'",
+            registry_id()
+        )));
+    }
+    Ok(name.to_string())
+}
+
 /// The content digest of an image manifest: `sha256:<hex>` over the manifest bytes,
 /// which is how a registry addresses a manifest it was handed.
 pub fn manifest_digest(manifest: &str) -> String {

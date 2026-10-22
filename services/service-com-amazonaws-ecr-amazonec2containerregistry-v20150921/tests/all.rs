@@ -15,6 +15,8 @@
 mod pull_time_update_exclusions;
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/scanning_configuration.rs"]
 mod scanning_configuration;
 #[path = "all/state_roundtrip.rs"]
