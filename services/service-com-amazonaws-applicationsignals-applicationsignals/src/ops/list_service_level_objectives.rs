@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceLevelObjectives
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceLevelObjectives`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceLevelObjectives::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the persisted service level objectives, filtered by the request's selectors.
 //!
 //! ## Shape of an operation
 //!
@@ -163,23 +155,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SERVICE_LEVEL_OBJECTIVES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report one summary per stored SLO that passes every supplied filter, a page at a
+    /// time.
+    ///
+    /// A read: it only projects stored records. The store is ordered by SLO name, so the
+    /// page boundary is a cursor on that order and paging over more SLOs than `MaxResults`
+    /// terminates having visited each matching SLO exactly once. `NextToken` is returned
+    /// only while matching SLOs remain after the page.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceLevelObjectives` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceLevelObjectivesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceLevelObjectives"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListServiceLevelObjectivesErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `MaxResults` declares no default, so an absent one means "as many as a page can
+        // hold": the modelled maximum of `ListServiceLevelObjectivesMaxResults`. A value
+        // outside the modelled `range 1..50` is refused rather than coerced, so a caller
+        // never reads an empty page as "nothing is stored".
+        let page_size = match input.max_results {
+            None => crate::state::MAX_SLO_PAGE as usize,
+            Some(max_results) => {
+                if !(1..=crate::state::MAX_SLO_PAGE).contains(&max_results) {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "MaxResults must be between 1 and {}, but was {max_results}",
+                        crate::state::MAX_SLO_PAGE
+                    )));
+                }
+                max_results as usize
+            }
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a token this service issued",
+                    ))
+                }
+            },
+        };
+
+        // This emulator holds exactly one account's SLOs, so a request that asks for
+        // another account's selects nothing. For the same reason `IncludeLinkedAccounts` is
+        // not consulted: there is no second account whose SLOs it could add, so the flag
+        // selects nothing extra and the answer is the same either way.
+        let other_account = input
+            .slo_owner_aws_account_id
+            .as_deref()
+            .is_some_and(|account| account != ::engine::emulator_account_id());
+
+        let store = state.lock();
+        let (slo_summaries, next_token) = if other_account {
+            (Vec::new(), None)
+        } else {
+            store.page(cursor.as_deref(), page_size, |slo| {
+                matches_filters(slo, &input)
+            })
+        };
+
+        Ok(ListServiceLevelObjectivesOutput {
+            slo_summaries: Some(slo_summaries),
+            next_token,
+        })
     }
+}
+
+/// Whether a stored SLO passes every selector the request supplied.
+///
+/// Each selector names part of the entity an SLO's SLI identifies, so it is matched against
+/// the entity read out of the stored record — never against the request that created it.
+/// An absent selector filters nothing.
+fn matches_filters(
+    slo: &ServiceLevelObjective,
+    input: &ListServiceLevelObjectivesInput,
+) -> bool {
+    let entity = crate::state::entity_of(slo);
+
+    if let Some(filter) = input.key_attributes.as_ref() {
+        if !crate::state::attributes_contain(entity.key_attributes.as_ref(), filter) {
+            return false;
+        }
+    }
+    if let Some(operation_name) = input.operation_name.as_deref() {
+        if entity.operation_name.as_deref() != Some(operation_name) {
+            return false;
+        }
+    }
+    if let Some(dependency) = input.dependency_config.as_ref() {
+        if !crate::state::same_dependency(entity.dependency_config.as_ref(), dependency) {
+            return false;
+        }
+    }
+    if let Some(metric_source) = input.metric_source.as_ref() {
+        let stored = entity
+            .metric_source
+            .as_ref()
+            .map(|source| &source.metric_source_key_attributes);
+        if !crate::state::attributes_contain(stored, &metric_source.metric_source_key_attributes) {
+            return false;
+        }
+    }
+    if let Some(kinds) = input.metric_source_types.as_ref() {
+        let stored = slo.metric_source_type.as_deref();
+        if !kinds.iter().any(|kind| stored == Some(kind.as_str())) {
+            return false;
+        }
+    }
+    true
 }

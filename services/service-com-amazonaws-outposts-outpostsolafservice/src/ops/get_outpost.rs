@@ -147,10 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same stored record.
         let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
             GetOutpostErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "OutpostId must be an Outpost id or Outpost ARN, got {}",
-                    input.outpost_id
-                )),
+                message: Some(crate::state::outpost_id_pattern_report()),
             })
         })?;
 
@@ -165,7 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| record.outpost.clone())
             .ok_or_else(|| {
                 GetOutpostErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!("the Outpost {outpost_id} does not exist")),
+                    // The identifier echo, of the value AS SUPPLIED — not of
+                    // `outpost_id`, which is the bare id an ARN resolved to.
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_ID_MEMBER,
+                        &input.outpost_id,
+                    )),
                 })
             })?;
 

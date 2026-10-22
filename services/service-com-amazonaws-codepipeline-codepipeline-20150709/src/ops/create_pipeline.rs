@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the caller's `PipelineDeclaration` under its name at version 1, mints the
+//! pipeline's ARN and its created/updated instants, and answers with the stored
+//! declaration — so a later `GetPipeline` reports the same stages and actions.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePipeline"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // Structural defects the model's own constraints cannot express, refused with
+        // the error shape each one is modelled as.
+        if let Err(problem) = crate::state::validate_declaration(&input.pipeline) {
+            let message = Some(problem.message().to_string());
+            return Err(match problem {
+                crate::state::DeclarationProblem::Structure(_) => {
+                    CreatePipelineErrorModeled::InvalidStructureException(
+                        InvalidStructureException { message },
+                    )
+                }
+                crate::state::DeclarationProblem::Stage(_) => {
+                    CreatePipelineErrorModeled::InvalidStageDeclarationException(
+                        InvalidStageDeclarationException { message },
+                    )
+                }
+            }
+            .into());
+        }
+
+        let name = input.pipeline.name.clone();
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &crate::state::request_region(&ctx.parts().headers),
+            &name,
+        );
+        let tags = input.tags.unwrap_or_default();
+        let pipeline = crate::state::Pipeline::create(
+            input.pipeline,
+            arn,
+            ::std::time::SystemTime::now(),
+            tags.clone(),
+        );
+        let stored = pipeline.declaration.clone();
+
+        {
+            let mut state = state.lock();
+            if state.pipelines.contains_key(&name) {
+                return Err(CreatePipelineErrorModeled::PipelineNameInUseException(
+                    PipelineNameInUseException {
+                        message: Some(format!("pipeline {name} already exists")),
+                    },
+                )
+                .into());
+            }
+            // The store is bounded: past the account's pipeline limit the service
+            // refuses another one with the error the model declares for it.
+            if state.pipelines.len() >= crate::state::MAX_PIPELINES_PER_ACCOUNT {
+                return Err(CreatePipelineErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "the number of pipelines for this account has reached the limit of {}",
+                            crate::state::MAX_PIPELINES_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into());
+            }
+            state.pipelines.insert(name, pipeline);
+        }
+
+        Ok(CreatePipelineOutput {
+            pipeline: Some(stored),
+            // Tags are reported only when the caller applied some: an absent member
+            // and an empty list state the same fact, and AWS omits the member.
+            tags: (!tags.is_empty()).then_some(tags),
+        })
     }
 }
+

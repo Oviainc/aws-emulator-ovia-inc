@@ -21,13 +21,19 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# A StartBuild idempotency entry keeps a fixed-size SHA-256 of the request it was
+# issued for, rather than the request itself; the same digest derives a build's
+# RFC 9562 version-8 id.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# The settle test has to let real time pass; the timer is enabled for the test
+# targets only, so the production dependency does not carry it.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

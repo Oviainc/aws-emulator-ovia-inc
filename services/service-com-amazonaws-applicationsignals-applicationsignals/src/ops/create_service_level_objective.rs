@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceLevelObjective
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceLevelObjective`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceLevelObjective::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a service level objective, and answers the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -202,23 +194,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SERVICE_LEVEL_OBJECTIVE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Mint a new SLO and persist it under its name.
+    ///
+    /// The response is the record that was written, never a re-echo of the request: `Arn`
+    /// is computed from this service's namespace, the request's region and the name,
+    /// `CreatedTime`/`LastUpdatedTime` come from the clock, `EvaluationType` follows from
+    /// which of the two mutually exclusive SLI configs was supplied, `Goal` carries the
+    /// defaults the model documents, and `MetricSourceType` is derived from the source the
+    /// SLI config names. A second create under the same name is a `ConflictException`.
+    ///
+    /// `CreateRecommendedSlo` needs no branch of its own. Its model doc states exactly one
+    /// effect — "When set to true, you don't need to specify the MetricThreshold or
+    /// ComparisonOperator in the SliConfig or RequestBasedSliConfig" — and this handler
+    /// already accepts a config that omits either, filling in the modelled `@default` of 0
+    /// and `"LessThan"`. So `true` and `false` produce the same record for the same config,
+    /// and nothing is answered with success that the handler has not done: the recommended
+    /// SLO's metric selection is Application Signals' own, and this emulator neither
+    /// invents it nor claims to have applied it.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceLevelObjective` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceLevelObjectiveErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceLevelObjective"))
+        // Model doc on both members: "You can't specify both RequestBasedSliConfig and
+        // SliConfig in the same operation." The model cannot express the exclusion, so the
+        // boundary validator let it through and it is refused here.
+        if input.sli_config.is_some() && input.request_based_sli_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "You can't specify both RequestBasedSliConfig and SliConfig in the same operation.",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceLevelObjectiveErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::region_of(ctx.parts());
+        let mut store = state.lock();
+
+        if store.slos.contains_key(input.name.as_str()) {
+            return Err(CreateServiceLevelObjectiveErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!("Service level objective {} already exists", input.name),
+                },
+            )
+            .into());
+        }
+
+        // The per-account, per-Region quota on service level objectives. Refusing here is
+        // what keeps the store's record count a property of the service rather than of the
+        // caller: nothing evicts or expires an SLO, so only an explicit quota bounds it.
+        if store.at_slo_quota() {
+            return Err(
+                CreateServiceLevelObjectiveErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The number of service level objectives has reached the quota of {}",
+                            crate::state::MAX_SLOS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let sli = input.sli_config.as_ref().map(crate::state::sli_from_config);
+        let request_based_sli = input
+            .request_based_sli_config
+            .as_ref()
+            .map(crate::state::request_based_sli_from_config);
+        let evaluation_type = if sli.is_some() {
+            Some(crate::state::EVALUATION_TYPE_PERIOD_BASED.to_string())
+        } else if request_based_sli.is_some() {
+            Some(crate::state::EVALUATION_TYPE_REQUEST_BASED.to_string())
+        } else {
+            None
+        };
+        let metric_source_type =
+            crate::state::derive_metric_source_type(sli.as_ref(), request_based_sli.as_ref());
+
+        let slo = ServiceLevelObjective {
+            arn: crate::state::slo_arn(&region, &input.name),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            created_time: now,
+            last_updated_time: now,
+            sli,
+            request_based_sli,
+            evaluation_type,
+            goal: crate::state::goal_with_defaults(input.goal.as_ref()),
+            burn_rate_configurations: input.burn_rate_configurations.clone(),
+            metric_source_type,
+            auto_investigation_enabled: input.auto_investigation_enabled,
+        };
+
+        // Tags are addressed by resource ARN, the key this service's tagging operations
+        // take, so they are stored there rather than on the record.
+        if let Some(tags) = input.tags.as_ref().filter(|tags| !tags.is_empty()) {
+            store.tags.insert(
+                slo.arn.clone(),
+                tags.iter()
+                    .map(|tag| (tag.key.clone(), tag.value.clone()))
+                    .collect(),
+            );
+        }
+
+        store.slos.insert(slo.name.clone(), slo.clone());
+        Ok(CreateServiceLevelObjectiveOutput { slo })
     }
 }
