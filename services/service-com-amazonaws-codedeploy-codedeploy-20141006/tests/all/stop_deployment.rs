@@ -7,11 +7,13 @@
 //! [`Emulator`] harness in `codedeploy_lifecycle` — so the awsJson1_1 envelope,
 //! the boundary validator and this service's refusal wording are all exercised.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::codedeploy_lifecycle::{error_code, s3_revision, seeded_group, Emulator};
+use crate::codedeploy_lifecycle::{
+    error_code, s3_revision, seeded_group, terminal_deployment, Emulator,
+};
 
 /// Create a deployment of `revision` on `application`/`group`, answering its id.
 async fn create_deployment(
@@ -44,22 +46,26 @@ async fn deployment_info(emulator: &Emulator, deployment_id: &str) -> Value {
         .clone()
 }
 
-/// Poll `deployment_id` until the clock has given it its terminal `Succeeded`
-/// status, answering its stored record then.
-async fn awaited_success(emulator: &Emulator, case: &str, deployment_id: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let info = deployment_info(emulator, deployment_id).await;
-        if info["status"].as_str() == Some("Succeeded") {
-            return info;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: expected Succeeded within 5s, got {:?}",
-            info["status"]
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+/// Poll `deployment_id` until the clock has given it its terminal status,
+/// requiring that status to be `expected`, and answer its stored record.
+///
+/// The poll itself is the shared [`terminal_deployment`] of `codedeploy_lifecycle`;
+/// `expected` is the terminal status the deployment's group implies — a group
+/// that resolves at least one deployment target ends `Succeeded`, one that
+/// resolves none ends `Failed` (see `codedeploy_deployment_outcome`).
+async fn awaited_terminal(
+    emulator: &Emulator,
+    case: &str,
+    deployment_id: &str,
+    expected: &str,
+) -> Value {
+    let info = terminal_deployment(emulator, deployment_id, case).await;
+    assert_eq!(
+        info["status"].as_str(),
+        Some(expected),
+        "case {case:?}: expected the terminal status {expected}, got {info:?}"
+    );
+    info
 }
 
 /// RULE: stopping a deployment that has not reached an outcome yet takes effect
@@ -165,12 +171,16 @@ async fn stopping_an_in_flight_deployment_makes_it_terminal() {
 #[tokio::test]
 async fn stopping_a_completed_deployment_is_refused() {
     // Rows differ along HOW the deployment reached its outcome: the clock
-    // completing it, and a caller stopping it.
-    let cases: &[(&str, &str)] = &[("clock-completed", "Succeeded"), ("already-stopped", "Stopped")];
+    // completing it — on a Lambda group, which resolves a target, so the clock's
+    // outcome is `Succeeded` — and a caller stopping it.
+    let cases: &[(&str, &str, &str)] = &[
+        ("clock-completed", "Lambda", "Succeeded"),
+        ("already-stopped", "Server", "Stopped"),
+    ];
 
-    for (case, terminal) in cases {
+    for (case, platform, terminal) in cases {
         let emulator = Emulator::new();
-        let group = seeded_group(&emulator, case, "Server").await;
+        let group = seeded_group(&emulator, case, platform).await;
         let revision = s3_revision("stop-bucket", "app.zip");
         let deployment_id = create_deployment(&emulator, case, &group, &revision).await;
 
@@ -179,7 +189,7 @@ async fn stopping_a_completed_deployment_is_refused() {
                 .ok("StopDeployment", json!({"deploymentId": deployment_id}))
                 .await;
         } else {
-            awaited_success(&emulator, case, &deployment_id).await;
+            awaited_terminal(&emulator, case, &deployment_id, terminal).await;
         }
         let before = deployment_info(&emulator, &deployment_id).await;
         assert_eq!(
@@ -345,8 +355,10 @@ async fn a_rollback_is_created_only_when_a_previous_revision_exists() {
             Some(rollback_id.as_str()),
             "case {name:?}: expected the rollback as the newest deployment, got {listed:?}"
         );
-        // It runs to its own terminal status without anybody driving it.
-        awaited_success(&emulator, name, &rollback_id).await;
+        // It runs to its own terminal status without anybody driving it. The
+        // group here is an EC2/on-premises one, which resolves no deployment
+        // target, so that status is `Failed`.
+        awaited_terminal(&emulator, name, &rollback_id, "Failed").await;
     }
 }
 
@@ -363,7 +375,7 @@ async fn an_unusable_deployment_id_is_refused() {
 
     // Rows span the ways an id can be unusable: absent, empty, blank, an id of
     // the minted `d-XXXXXXXXX` form that was never minted, and one of another
-    // form entirely.
+    // form entirely, which is refused on FORMAT before any lookup.
     let cases: &[(&str, Value, &str)] = &[
         ("absent", json!({}), "DeploymentIdRequiredException"),
         (
@@ -384,7 +396,7 @@ async fn an_unusable_deployment_id_is_refused() {
         (
             "another form",
             json!({"deploymentId": "not-a-deployment-id"}),
-            "DeploymentDoesNotExistException",
+            "InvalidDeploymentIdException",
         ),
     ];
 

@@ -176,6 +176,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // An id that is not shaped like one the service mints names no deployment
+        // at all, which is what `InvalidDeploymentIdException` is for — the same
+        // reading `GetDeployment` and `StopDeployment` use, so every operation
+        // taking a deployment id agrees about one, and the FORMAT is gated before
+        // the existence lookup.
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(
+                SkipWaitTimeForInstanceTerminationErrorModeled::InvalidDeploymentIdException(
+                    InvalidDeploymentIdException {
+                        message: Some(crate::state::malformed_deployment_id_message(
+                            &deployment_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let outcome = crate::state::with_state(&*self.engine, |state| {
             let Some(deployment) = state.deployments.get_mut(&deployment_id) else {

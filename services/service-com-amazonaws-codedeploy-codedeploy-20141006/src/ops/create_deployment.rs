@@ -296,34 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // A deployment needs something to deploy. The revision is STORED VERBATIM —
-        // nothing about it is inferred into the record — so it is only inspected far
-        // enough to tell an empty one from a usable one.
-        let Some(revision) = input.revision else {
-            return Err(CreateDeploymentErrorModeled::RevisionRequiredException(
-                RevisionRequiredException {
-                    message: Some("The revision was not specified".to_string()),
-                },
-            )
-            .into());
-        };
-        // The revision's own identity, which is also what refuses one that names
-        // nowhere to deploy from.
-        let Some(revision_key) = crate::state::revision_key(&revision) else {
-            return Err(CreateDeploymentErrorModeled::InvalidRevisionException(
-                InvalidRevisionException {
-                    message: Some(
-                        "The revision was specified in an invalid format: it names no S3, GitHub, \
-                         string or AppSpec content location"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
-        };
-
         let application_name = input.application_name;
         let requested_config = input.deployment_config_name;
+        let requested_revision = input.revision;
+        let requested_auto_rollback = input.auto_rollback_configuration;
 
         let outcome = crate::state::with_state(&*self.engine, |state| {
             let Some(application) = state.applications.get(&application_name) else {
@@ -348,6 +324,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let compute_platform = application.compute_platform.clone();
             let group_config = group.deployment_config_name.clone();
             let group_style = group.deployment_style.clone();
+            // The targets this deployment group resolves, which is what decides
+            // the terminal status the clock owes the deployment.
+            let target_count = crate::state::deployment_target_count(state, group);
             // What this deployment owes the original environment: a blue/green
             // group that terminates its instances holds the deployment open for
             // the wait it configured.
@@ -386,6 +365,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => group_config,
             };
 
+            // Only now that every resource the request NAMES has been resolved are
+            // its own members validated: a request against an application or a
+            // deployment group that does not exist is answered for that resource,
+            // not for a member it also got wrong.
+            //
+            // A deployment needs something to deploy. The revision is STORED
+            // VERBATIM — nothing about it is inferred into the record — so it is
+            // only inspected far enough to tell an empty one from a usable one.
+            let Some(revision) = requested_revision else {
+                return Err(CreateDeploymentErrorModeled::RevisionRequiredException(
+                    RevisionRequiredException {
+                        message: Some("The revision was not specified".to_string()),
+                    },
+                ));
+            };
+            // The revision's own identity, which is also what refuses one that
+            // names nowhere to deploy from.
+            let Some(revision_key) = crate::state::revision_key(&revision) else {
+                return Err(CreateDeploymentErrorModeled::InvalidRevisionException(
+                    InvalidRevisionException {
+                        message: Some(
+                            "The revision was specified in an invalid format: it names no S3, \
+                             GitHub, string or AppSpec content location"
+                                .to_string(),
+                        ),
+                    },
+                ));
+            };
+            // An automatic rollback that is enabled but names no triggering event
+            // cannot ever fire; an all-empty disabled one carries no information
+            // and is normalised away rather than stored and echoed.
+            if requested_auto_rollback
+                .as_ref()
+                .is_some_and(crate::state::auto_rollback_is_enabled_without_events)
+            {
+                return Err(
+                    CreateDeploymentErrorModeled::InvalidAutoRollbackConfigException(
+                        InvalidAutoRollbackConfigException {
+                            message: Some(
+                                "The automatic rollback configuration is enabled but lists no \
+                                 triggering event type"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                );
+            }
+            let auto_rollback_configuration =
+                crate::state::normalized_auto_rollback_configuration(requested_auto_rollback);
+
             let create_time_ms = crate::state::now_ms();
             let deployment_id = state.mint_deployment_id();
             let used_revision = revision.clone();
@@ -408,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 update_outdated_instances_only: input.update_outdated_instances_only,
                 file_exists_behavior: input.file_exists_behavior,
                 deployment_mode: input.deployment_mode,
-                auto_rollback_configuration: input.auto_rollback_configuration,
+                auto_rollback_configuration,
                 target_instances: input.target_instances,
                 override_alarm_configuration: input.override_alarm_configuration,
                 ec2_deployment_options: input.ec2_deployment_options,
@@ -424,6 +453,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 starts_at_ms: crate::state::deployment_start_due(create_time_ms),
                 completes_at_ms: crate::state::deployment_completion_due(create_time_ms)
                     + termination_wait_millis,
+                target_count,
                 terminates_original_instances,
                 termination_wait_millis,
                 instance_termination_wait_time_started: false,

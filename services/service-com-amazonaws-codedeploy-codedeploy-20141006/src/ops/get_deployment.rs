@@ -140,14 +140,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // `deploymentId` is @required but carries no modelled length, so an empty one
-        // reaches the handler and is what `DeploymentIdRequiredException` is for. Any
-        // non-empty id that names no stored deployment is simply unknown.
+        // `deploymentId` is @required but carries no modelled length or pattern, so
+        // both an empty one and a malformed one reach the handler. They are
+        // different refusals: an absent or empty id is what
+        // `DeploymentIdRequiredException` is for, an id that is not shaped like one
+        // the service issues is what `InvalidDeploymentIdException` is for, and only
+        // a WELL-FORMED id is then discriminated on existence.
         let deployment_id = input.deployment_id;
         if deployment_id.trim().is_empty() {
             return Err(GetDeploymentErrorModeled::DeploymentIdRequiredException(
                 DeploymentIdRequiredException {
                     message: Some("The deployment ID was not specified".to_string()),
+                },
+            )
+            .into());
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(GetDeploymentErrorModeled::InvalidDeploymentIdException(
+                InvalidDeploymentIdException {
+                    message: Some(crate::state::malformed_deployment_id_message(
+                        &deployment_id,
+                    )),
                 },
             )
             .into());
