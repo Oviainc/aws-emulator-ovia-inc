@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRepositoryCatalogData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRepositoryCatalogData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRepositoryCatalogData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates the catalog data of one repository in this public registry.
+//!
+//! `catalogData` is a complete document, not a patch: this operation PUTs the
+//! repository's whole catalog record, so every member the request omits ends up unset on
+//! the repository — which is also what makes two concurrent puts settle on exactly the
+//! document the last one supplied. The record is derived by
+//! [`crate::state::catalog_data_of`], the same helper `CreateRepository` uses, so the
+//! `catalogData` the two operations report agrees member for member: text and list
+//! members pass through unchanged, `logoUrl` exists only while a logo payload is
+//! supplied and names that payload's own digest, and `marketplaceCertified` is left
+//! unset — nothing a caller of this API does makes a Marketplace certification statement
+//! about a repository, so the member is absent from the reported record rather than
+//! reported as `false`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +156,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRepositoryCatalogData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRepositoryCatalogDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRepositoryCatalogData"))
+        // Request metadata is used for the audit record only: which repository's catalog
+        // record this call replaces comes from the request body.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+
+        // The catalog record this request resolves to. Derived before the store is
+        // locked, because it depends on the request alone — and derived by the same
+        // helper `CreateRepository` uses, so one repository cannot end up carrying two
+        // different readings of the same catalog input.
+        let catalog_data =
+            crate::state::catalog_data_of(&input.repository_name, Some(&input.catalog_data));
+
+        let mut store = state.lock();
+        if let Some(registry_id) = input.registry_id.as_deref() {
+            if !store.is_this_registry(registry_id) {
+                return Err(
+                    PutRepositoryCatalogDataErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "Invalid parameter at 'registryId' failed to satisfy \
+                                 constraint: 'Member must name the public registry of this \
+                                 account ({})'",
+                                store.registry_id
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Catalog data is part of a repository, so there is nothing to put until that
+        // repository exists: this operation never creates one.
+        let registry_id = store.registry_id.clone();
+        let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            return Err(
+                PutRepositoryCatalogDataErrorModeled::RepositoryNotFoundException(
+                    RepositoryNotFoundException {
+                        message: Some(format!(
+                            "The repository with name '{}' does not exist in the registry \
+                             with id '{registry_id}'",
+                            input.repository_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        repository.catalog_data = catalog_data.clone();
+        let repository_name = input.repository_name;
+        drop(store);
+
+        // Audit record for a state-changing operation, as `PutRegistryCatalogData` words
+        // it: who asked, what changed, how it ended. The outcome distinguishes a
+        // document that leaves every caller-supplied member unset — which clears the
+        // record — from one that sets at least one. Only wire metadata and the
+        // identifiers are logged; the catalog document itself is caller content, so none
+        // of it is copied into the log.
+        let outcome = if catalog_data.description.is_none()
+            && catalog_data.architectures.is_none()
+            && catalog_data.operating_systems.is_none()
+            && catalog_data.logo_url.is_none()
+            && catalog_data.about_text.is_none()
+            && catalog_data.usage_text.is_none()
+        {
+            "cleared"
+        } else {
+            "replaced"
+        };
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "PutRepositoryCatalogData",
+            outcome = outcome,
+            caller_akid = %caller_akid,
+            registry_id = %registry_id,
+            repository_name = %repository_name,
+            "repository catalog data written"
+        );
+
+        Ok(PutRepositoryCatalogDataOutput {
+            catalog_data: Some(catalog_data),
+        })
     }
+}
+
+/// The modelled server fault for a state store this service could not reach.
+fn server_error() -> PutRepositoryCatalogDataError {
+    PutRepositoryCatalogDataErrorModeled::ServerException(ServerException {
+        message: Some("The ECR Public emulator could not reach its state store.".to_string()),
+    })
+    .into()
 }

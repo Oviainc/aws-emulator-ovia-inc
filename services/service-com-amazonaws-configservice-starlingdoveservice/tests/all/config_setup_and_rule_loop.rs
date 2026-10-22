@@ -1317,7 +1317,7 @@ async fn an_unimplemented_operation_still_answers_not_implemented() {
     // scaffolded and must say so rather than answer an empty success.
     let emulator = Emulator::new();
     let (status, code) = emulator
-        .refused("DescribeConfigurationAggregators", &json!({}))
+        .refused("DescribePendingAggregationRequests", &json!({}))
         .await;
     assert_eq!(
         (status, code.as_str()),

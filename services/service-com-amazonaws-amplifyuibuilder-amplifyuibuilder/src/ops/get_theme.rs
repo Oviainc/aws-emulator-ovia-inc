@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(theme) = store.theme(&input.app_id, &input.environment_name, &input.id) else {
             return Err(GetThemeErrorModeled::ResourceNotFoundException(
-                crate::state::theme_not_found(&input.app_id, &input.environment_name, &input.id),
+                crate::state::item_not_found(),
             )
             .into());
         };
