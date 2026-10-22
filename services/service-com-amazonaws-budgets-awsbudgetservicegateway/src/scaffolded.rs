@@ -177,13 +177,40 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service answers a MODELED error with.
+///
+/// A Smithy model binds one `@httpError` to each error shape, but AWS Budgets does not
+/// send those statuses. It is an awsJson1_1 service, and its recorded wire responses
+/// answer a refusal of the REQUEST — its values, the state of the resource it names, a
+/// quota or a limit — with HTTP 400 whatever 4xx the shape declares: `NotFoundException`
+/// (`@httpError` 404) and `DuplicateRecordException` (`@httpError` 409) are both recorded
+/// as 400. Clients branch on the status as well as the code, so the pair has to be the
+/// pair the service really sends; the `__type` and the members stay the model's, only the
+/// status is the service's.
+///
+/// Two statuses are NOT folded in:
+///
+/// * `403` — an authentication/authorization refusal, which the framework answers with
+///   403 before any handler runs too, so the modeled `AccessDeniedException` and the
+///   framework's own refusal agree. No recording contradicts it.
+/// * `5xx` — a server fault is not a refusal of the request, and an SDK's retry
+///   classifier keys on that difference.
+pub fn modeled_error_status(modeled_status: u16) -> u16 {
+    match modeled_status {
+        403 => 403,
+        400..=499 => 400,
+        other => other,
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the model's own shape,
+    /// members and wire `__type`, at the status [`modeled_error_status`] gives it.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -282,10 +309,14 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled failure takes the status THIS SERVICE answers it with, which is not
+    /// always the one its shape's `@httpError` declares — see
+    /// [`modeled_error_status`].
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => modeled_error_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

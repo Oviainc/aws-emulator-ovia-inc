@@ -155,38 +155,90 @@ pub const MAX_BUDGETS_PER_ACCOUNT: usize = 20_000;
 /// It is answered with the same modelled `ServiceQuotaExceededException`.
 pub const MAX_BUDGETS_TOTAL: usize = 100_000;
 
-/// The `BudgetName` rule the model's own `@pattern` states:
-/// `^(?![^:\\]*/action/|(?i).*<script>.*</script>.*)[^:\\]+$` — documented on
-/// `BudgetName` as "The ':' and '\' characters, and the '/action/' substring, aren't
-/// allowed", with names "validated for content".
+/// `BudgetName`'s modelled `@pattern`, verbatim from the model
+/// (`smithy_query(query="shape",shape="BudgetName")`). The rule
+/// [`budget_name_matches_pattern`] enforces, in one place, so the code and the
+/// comment above it cannot drift from the model.
+pub const BUDGET_NAME_PATTERN: &str =
+    r"^(?![^:\\]*/action/|(?i).*<script>.*</script>.*)[^:\\]+$";
+
+/// Whether `name` satisfies [`BUDGET_NAME_PATTERN`] — documented on `BudgetName` as
+/// "The ':' and '\' characters, and the '/action/' substring, aren't allowed", with
+/// names "validated for content".
 ///
-/// Enforced here rather than left to the boundary validator because that pattern uses
+/// Checked here rather than left to the boundary validator because that pattern uses
 /// a negative look-ahead, which the framework's regex engine cannot compile, and an
 /// uncompilable `@pattern` is treated as matching ("we never reject a value because of
 /// an unparseable model pattern"). The `@length(1, 100)` half of the constraint IS
 /// enforced upstream, so it is not repeated here.
-///
-/// `Err` carries the sentence that goes in `InvalidParameterException$Message`.
-pub fn validate_budget_name(name: &str) -> Result<(), String> {
-    if name.contains(':') || name.contains('\\') || name.contains("/action/") {
-        return Err(
-            "Invalid BudgetName: the ':' and '\\' characters, and the '/action/' \
-             substring, aren't allowed in a budget name."
-                .to_string(),
-        );
+fn budget_name_matches_pattern(name: &str) -> bool {
+    // `[^:\\]+`: at least one character, and no ':' or '\' anywhere. Any name holding
+    // one of those two also fails the look-ahead's `[^:\\]*/action/` alternative, so
+    // rejecting them here covers "/action/" with a prefix of other characters too.
+    if name.is_empty() || name.contains(':') || name.contains('\\') {
+        return false;
     }
+    if name.contains("/action/") {
+        return false;
+    }
+    // `(?i).*<script>.*</script>.*` — the case-insensitive half of the look-ahead.
     let lowered = name.to_lowercase();
-    if lowered
+    !lowered
         .split_once("<script>")
         .is_some_and(|(_, rest)| rest.contains("</script>"))
-    {
-        return Err("Invalid BudgetName: the name failed content validation.".to_string());
+}
+
+/// The refusal a `BudgetName` outside its modelled `@pattern` takes, or `None` when
+/// the name satisfies it.
+///
+/// A value outside a MODELLED constraint is refused at request validation, before the
+/// operation runs — the same class of refusal as a bad `AccountId` or an out-of-range
+/// `MaxResults`, which the boundary validator answers with HTTP 400
+/// `ValidationException` and a message naming the failing member path and the
+/// constraint it violated. This pattern reaches a handler only because the framework's
+/// regex engine cannot compile a negative look-ahead, so the refusal states the same
+/// two facts, in the clause shape the framework's own renderer uses
+/// (`N validation error(s) detected: Value … at '<path>' failed to satisfy constraint:
+/// <requirement>` — [`::aws_smithy_schema_server::Violation::message`]).
+///
+/// It states them WITHOUT the rejected name and without the pattern, which is where it
+/// departs from that renderer. `BudgetName` is a content rule, not a syntax rule: the
+/// model documents that "Budget names are validated for content. Names that contain
+/// phone numbers, URLs, or email addresses combined with certain terms may be
+/// rejected", and the pattern itself refuses `<script>…</script>`. Echoing a name back
+/// because it was refused for its content reflects exactly the content the rule exists
+/// to keep out of this service, and restating the filter tells a caller how to get
+/// around it. The member path and the constraint are what a caller needs to fix the
+/// request, and they are what AWS's recorded refusal states.
+///
+/// `member_path` is the trail of Smithy member names from the operation input inwards
+/// (`["Budget", "BudgetName"]` for `CreateBudget`, `["BudgetName"]` for the
+/// operations that take the name directly); each segment is lowerCamel-ed by the
+/// framework's own path builder.
+pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String> {
+    if budget_name_matches_pattern(name) {
+        return None;
     }
-    Ok(())
+    let path: Vec<String> = member_path
+        .iter()
+        .map(|segment| ::aws_smithy_schema_server::constraints::path::member(segment))
+        .collect();
+    // Every segment is a Smithy member name chosen by a call site in this crate, so
+    // nothing a caller sent reaches the sentence below.
+    let path = ::aws_smithy_schema_server::constraints::path::join(&path);
+    Some(format!(
+        "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern"
+    ))
 }
 
 /// The cross-member rules `CreateBudget` and `UpdateBudget` document for the
 /// `Budget` they accept, none of which a Smithy constraint trait can express.
+///
+/// A rule the model DOES express is not checked here: a value outside a modelled
+/// constraint is a request-validation refusal, answered by
+/// [`budget_name_violation`]'s renderers, not by this service's own
+/// `InvalidParameterException`.
 ///
 /// `Err` carries the sentence that goes in `InvalidParameterException$Message`
 /// ("An error on the client occurred. Typically, the cause is an invalid input
@@ -199,7 +251,6 @@ pub fn validate_budget_name(name: &str) -> Result<(), String> {
 ///   `CostTypes`, not both or a different combination." (`CreateBudget`)
 /// * "The start date must come before the end date." (`Budget$TimePeriod`)
 pub fn validate_budget(budget: &Budget) -> Result<(), String> {
-    validate_budget_name(&budget.budget_name)?;
     if budget.budget_limit.is_some() && budget.planned_budget_limits.is_some() {
         return Err(
             "Unable to create/update budget: BudgetLimit can't be used with \

@@ -96,29 +96,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        match refusal {
-            // Budgets names every bad or absent input value `InvalidParameterException`
-            // ("An error on the client occurred. Typically, the cause is an invalid input
-            // value."), the error its model declares on all 26 operations — so that is
-            // the code a Budgets client branches on. The framework's default,
-            // `ValidationException`, is not a shape this service models at all, so a
-            // client could not resolve it. The status stays with the protocol (400), which
-            // is the status the modelled `InvalidParameterException` carries too.
-            //
-            // The message keeps the framework's structural account of what failed
-            // (member path, constraint); AWS documents no wording for it.
-            Refusal::Invalid(violations) => Some(Refused {
-                code: "InvalidParameterException".to_string(),
-                message: violations
-                    .iter()
-                    .map(smithy_server_runtime::Violation::message)
-                    .collect::<Vec<String>>()
-                    .join("; "),
-            }),
-            // An unauthenticated caller is not an input problem: keep the framework's
-            // 403 wording.
-            _ => None,
-        }
+        // The framework's own wording, for every class of refusal.
+        //
+        // A request refused BEFORE any handler runs — an absent required member, or a
+        // value outside a constraint the model declares — is not one of this service's
+        // modelled errors at all: AWS's request-validation layer answers it with HTTP
+        // 400 and the error code `ValidationException`, carrying a message built from
+        // the request that names the failing member path and the constraint it
+        // violated. `ValidationException` is not in the Budgets model, and that is the
+        // point: it comes from the layer in front of the service, so a client can tell
+        // "my request is malformed" from a service-side `InvalidParameterException`
+        // ("An error on the client occurred"), which the handlers answer the rules the
+        // model documents but cannot express with.
+        //
+        // Naming the modelled `InvalidParameterException` here instead erased that
+        // distinction, and its message dropped the `N validation error(s) detected:`
+        // envelope the framework renders. Both are the framework's defaults, so this
+        // seam rewords nothing; `crate::state::budget_name_violation` renders the one
+        // constraint that reaches a handler (an uncompilable `@pattern`) through the
+        // same framework renderers, so the two cannot drift.
+        //
+        // An unauthenticated caller is not an input problem either: it keeps the
+        // framework's 403 wording.
+        let _ = refusal;
+        None
     }
 
     fn override_routing_error(

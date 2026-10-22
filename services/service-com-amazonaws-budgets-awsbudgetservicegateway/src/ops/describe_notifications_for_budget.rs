@@ -167,14 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The `BudgetName` pattern the boundary validator cannot compile.
-        crate::state::validate_budget_name(&input.budget_name).map_err(|message| {
-            DescribeNotificationsForBudgetErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(message),
-                },
-            )
-        })?;
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
 
         let store = state.lock();
         let stored = store

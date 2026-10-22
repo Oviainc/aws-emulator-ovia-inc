@@ -177,9 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile:
+        // a value outside a constraint the MODEL declares is a request-validation
+        // refusal (HTTP 400 `ValidationException`, naming the member path and the
+        // constraint), not one of this operation's modelled errors.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["Budget", "BudgetName"], &input.budget.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         // The rules the model documents but no constraint trait can express; every
-        // modelled constraint (the 12-digit AccountId, the BudgetName pattern, the
-        // TimeUnit/BudgetType enums, the list bounds) was already refused upstream.
+        // modelled constraint (the 12-digit AccountId, the BudgetName pattern above,
+        // the TimeUnit/BudgetType enums, the list bounds) is refused as a validation
+        // failure rather than reaching here.
         crate::state::validate_budget(&input.budget).map_err(|message| {
             CreateBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
                 message: Some(message),

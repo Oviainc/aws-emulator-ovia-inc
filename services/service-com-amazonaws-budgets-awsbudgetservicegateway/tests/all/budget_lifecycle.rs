@@ -27,7 +27,10 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 /// `core/router/src/lib.rs` builds, narrowed to the service under test. Request
 /// authentication is off so the suite needs no signing keys; routing still goes
 /// through the SigV4 credential scope on the `authorization` header below.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the sibling suites in this test target drive the same harness
+/// rather than copying it.
+pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
@@ -44,7 +47,7 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// Call one operation and return `(status, body)`. The body is `Value::Null` when the
 /// response carried no bytes.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -76,7 +79,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 
 /// Whether an error body names `exception`. The awsJson `__type` is either the bare
 /// shape name or the namespaced shape id, so the suffix is what is matched.
-fn is_error(body: &Value, exception: &str) -> bool {
+pub(crate) fn is_error(body: &Value, exception: &str) -> bool {
     body.get("__type")
         .and_then(Value::as_str)
         .is_some_and(|found| found.ends_with(exception))
@@ -98,7 +101,7 @@ fn same(left: &Value, right: &Value) -> bool {
 }
 
 /// An account id: 12 digits, as `AccountId`'s `^\d{12}$` requires.
-fn account(n: u64) -> String {
+pub(crate) fn account(n: u64) -> String {
     format!("{n:012}")
 }
 
@@ -330,11 +333,13 @@ async fn a_budget_round_trips_through_its_whole_lifecycle() {
             "case {case:?}: expected CreateBudget to answer 200, got {status} {body}"
         );
 
-        // A second create for the same (AccountId, BudgetName) is a duplicate.
+        // A second create for the same (AccountId, BudgetName) is a duplicate. The
+        // status is 400, not the `@httpError` 409 the shape declares — see
+        // `client_error_envelopes.rs` for the rule.
         let (status, body) = call(&router, "CreateBudget", &create).await;
         assert_eq!(
-            status, 409,
-            "case {case:?}: expected a duplicate CreateBudget to answer 409, got {status} {body}"
+            status, 400,
+            "case {case:?}: expected a duplicate CreateBudget to answer 400, got {status} {body}"
         );
         assert!(
             is_error(&body, "DuplicateRecordException"),
@@ -442,7 +447,8 @@ async fn a_budget_round_trips_through_its_whole_lifecycle() {
             "case {case:?}: expected UpdateBudget to leave the notifications alone, got {after}"
         );
 
-        // DeleteBudget removes it; the read and a second delete both answer 404.
+        // DeleteBudget removes it; the read and a second delete both answer
+        // `NotFoundException` at HTTP 400 (the status this service sends for it).
         let (status, body) = call(&router, "DeleteBudget", &describe).await;
         assert_eq!(
             status, 200,
@@ -455,8 +461,8 @@ async fn a_budget_round_trips_through_its_whole_lifecycle() {
         ] {
             let (status, body) = call(&router, operation, &describe).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected {operation} after delete to answer 404, \
+                status, 400,
+                "case {case:?}: expected {operation} after delete to answer 400, \
                  got {status} {body}"
             );
             assert!(
@@ -816,7 +822,7 @@ async fn an_undecodable_next_token_is_refused() {
 
 /// RULE: a budget is scoped to its account, so a name stored for one account is not
 /// visible to another — every read and write keyed on it answers `NotFoundException`
-/// (HTTP 404).
+/// (HTTP 400, the status this service sends for it).
 #[tokio::test]
 async fn budgets_are_scoped_to_their_account() {
     let router = router();
@@ -863,8 +869,8 @@ async fn budgets_are_scoped_to_their_account() {
     ] {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {operation} {request}: expected 404, got {status} {body}"
+            status, 400,
+            "case {operation} {request}: expected 400, got {status} {body}"
         );
         assert!(
             is_error(&body, "NotFoundException"),
@@ -905,8 +911,10 @@ async fn budgets_are_scoped_to_their_account() {
 }
 
 /// RULE: a request outside a modelled constraint is refused before any state changes,
-/// with the error Budgets declares for a bad input value — `InvalidParameterException`
-/// (HTTP 400).
+/// at request validation — HTTP 400 `ValidationException`, whose message names the
+/// member path and the constraint it violated. `client_error_envelopes.rs` asserts the
+/// message; this table asserts the status and the code over the whole constraint
+/// surface.
 #[tokio::test]
 async fn a_request_outside_a_modelled_constraint_is_refused() {
     let router = router();
@@ -1109,7 +1117,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
             }),
         ),
         // The same name rule on the operations that take `BudgetName` directly: it is
-        // refused as an invalid parameter, not reported as a budget that is missing.
+        // refused as a constraint violation, not reported as a budget that is missing.
         (
             "budget name with a colon on DescribeBudget",
             "DescribeBudget",
@@ -1151,8 +1159,8 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
             "case {case:?}: expected {operation} to answer 400, got {status} {body}"
         );
         assert!(
-            is_error(&body, "InvalidParameterException"),
-            "case {case:?}: expected InvalidParameterException, got {body}"
+            is_error(&body, "ValidationException"),
+            "case {case:?}: expected ValidationException, got {body}"
         );
     }
 
@@ -1480,8 +1488,8 @@ async fn an_account_cannot_exceed_its_budget_quota() {
     )
     .await;
     assert_eq!(
-        status, 402,
-        "case at-quota: expected CreateBudget to answer 402, got {status} {body}"
+        status, 400,
+        "case at-quota: expected CreateBudget to answer 400, got {status} {body}"
     );
     assert!(
         is_error(&body, "ServiceQuotaExceededException"),
