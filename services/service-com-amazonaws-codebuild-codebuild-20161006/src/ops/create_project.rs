@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a build project and persists it in [`crate::state`]: this is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +196,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProject"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateProject (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let created = crate::state::datetime(now);
+        let mut guard = state.lock();
+
+        if guard.projects.contains_key(&input.name) {
+            return Err(CreateProjectErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "Project already exists: {}",
+                        crate::state::project_arn(&region, &input.name)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's build-project quota, which is also the ceiling that keeps the
+        // store from growing without bound as requests arrive.
+        if guard.projects.len() >= crate::state::MAX_PROJECTS {
+            return Err(CreateProjectErrorModeled::AccountLimitExceededException(
+                AccountLimitExceededException {
+                    message: Some(format!(
+                        "Cannot have more than {} build projects in this account",
+                        crate::state::MAX_PROJECTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let project = Project {
+            arn: Some(crate::state::project_arn(&region, &input.name)),
+            name: Some(input.name.clone()),
+            description: input.description,
+            source: Some(input.source),
+            secondary_sources: input.secondary_sources,
+            source_version: input.source_version,
+            secondary_source_versions: input.secondary_source_versions,
+            artifacts: Some(input.artifacts),
+            secondary_artifacts: input.secondary_artifacts,
+            cache: input.cache,
+            environment: Some(input.environment),
+            service_role: Some(input.service_role),
+            // The one defaulted member: AWS documents 60 minutes for an absent
+            // `timeoutInMinutes`. `queuedTimeoutInMinutes` has no documented default,
+            // so an absent one stays absent.
+            timeout_in_minutes: Some(
+                input
+                    .timeout_in_minutes
+                    .unwrap_or(crate::state::DEFAULT_BUILD_TIMEOUT_MINUTES),
+            ),
+            queued_timeout_in_minutes: input.queued_timeout_in_minutes,
+            encryption_key: input.encryption_key,
+            tags: input.tags,
+            created: Some(created),
+            last_modified: Some(created),
+            // Written by CreateWebhook / UpdateProjectVisibility, both still
+            // scaffolded, so a freshly created project carries neither.
+            webhook: None,
+            vpc_config: input.vpc_config,
+            // `badgeEnabled` is the input flag; `badge` is the stored view of it. No
+            // `badgeRequestUrl`: that URL addresses a public badge endpoint this
+            // emulator does not serve.
+            badge: Some(ProjectBadge {
+                badge_enabled: input.badge_enabled.unwrap_or(false),
+                badge_request_url: None,
+            }),
+            logs_config: input.logs_config,
+            file_system_locations: input.file_system_locations,
+            build_batch_config: input.build_batch_config,
+            concurrent_build_limit: input.concurrent_build_limit,
+            // A new project's builds are private until UpdateProjectVisibility says
+            // otherwise; `PRIVATE` is one of ProjectVisibilityType's two values.
+            project_visibility: Some("PRIVATE".to_string()),
+            public_project_alias: None,
+            resource_access_role: None,
+            auto_retry_limit: input.auto_retry_limit,
+        };
+
+        guard.projects.insert(
+            input.name,
+            crate::state::StoredProject {
+                project: project.clone(),
+                created_millis: now,
+                last_modified_millis: now,
+            },
+        );
+
+        Ok(CreateProjectOutput {
+            project: Some(project),
+        })
     }
 }
