@@ -141,6 +141,12 @@ pub const ARCHIVE_RULE_NAME_CONFLICT_MESSAGE: &str =
 pub const ARCHIVE_RULE_QUOTA_EXCEEDED_MESSAGE: &str =
     "Service quota met for archive rules on this analyzer";
 
+/// The fixed `message` of the `ResourceNotFoundException` that answers an ARN-addressed
+/// call (the tagging surface) naming a resource this account and Region does not hold.
+/// Same provenance as [`ANALYZER_NOT_FOUND_MESSAGE`]: constant text, with the ARN the
+/// request named travelling in `resourceId`.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
 /// The 404 for an analyzer that is not stored: fixed text, identifier in the modelled
 /// `resourceId`/`resourceType` members.
 pub fn analyzer_not_found(analyzer_name: &str) -> ResourceNotFoundException {
@@ -244,6 +250,24 @@ pub const MAX_ANALYZERS: usize = 1_000;
 /// and `CreateArchiveRule` models the same `ServiceQuotaExceededException`.
 pub const MAX_ARCHIVE_RULES_PER_ANALYZER: usize = 1_000;
 
+/// How many tags one resource will hold.
+///
+/// `TagsMap` carries no `@length` in the model, so nothing in the model bounds how many
+/// tags one `TagResource` call can add: this is the emulator's own ceiling on a
+/// caller-driven map, set at the AWS-wide tagging limit of 50 tags per resource
+/// ("Tagging AWS resources", tag restrictions). A call that would take a resource past
+/// it is refused with the modelled `ValidationException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The longest tag key this service accepts, from the same AWS-wide tag restrictions
+/// (maximum key length 128 Unicode characters); the shortest is one character, since an
+/// empty key names nothing.
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The longest tag value this service accepts, from the same AWS-wide tag restrictions
+/// (maximum value length 256 Unicode characters). A value MAY be empty.
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
 /// How many `clientToken` records are kept per idempotency store.
 ///
 /// Tokens are caller-chosen, so the store is caller-driven growth holding no resource of
@@ -342,9 +366,10 @@ impl ComAmazonawsAccessanalyzerAccessanalyzerState {
     /// The analyzer an `analyzerArn` names, or `None` when this account and Region hold
     /// no analyzer with that ARN.
     ///
-    /// Analyzers are keyed by name, but the preview operations are scoped by ARN, and
-    /// the ARN pins the partition, Region and account as well as the name — so the
-    /// lookup compares the whole stored ARN rather than parsing a name out of it.
+    /// Analyzers are keyed by name, but the preview and tagging operations are scoped by
+    /// ARN, and the ARN pins the partition, Region and account as well as the name — so
+    /// the lookup compares the whole stored ARN rather than parsing a name out of it,
+    /// and an ARN this account and Region never minted names no resource.
     pub fn analyzer_by_arn(&self, arn: &str) -> Option<&Analyzer> {
         self.analyzers
             .values()
@@ -383,7 +408,7 @@ pub struct Analyzer {
     pub last_resource_analyzed: Option<String>,
     pub last_resource_analyzed_at: Option<SystemTime>,
     /// The analyzer's tag set: exactly the `tags` map the create carried, EMPTY when it
-    /// carried none.
+    /// carried none, as the tagging operations have since changed it.
     ///
     /// A tagged resource always has a tag collection — an untagged one has an empty
     /// collection, not a missing one — so this is a map and never an `Option`, and
@@ -500,6 +525,38 @@ impl Analyzer {
             managed_by: None,
         }
     }
+
+    /// This resource's tag set, as `ListTagsForResource` reports it: the stored map,
+    /// empty when the resource carries no tags.
+    pub fn tag_set(&self) -> HashMap<String, String> {
+        self.tags.clone()
+    }
+
+    /// How many tags the resource carries.
+    pub fn tag_count(&self) -> usize {
+        self.tags.len()
+    }
+
+    /// Add `tags` to the tag set: a key the set does not hold is added, and a key it
+    /// already holds takes the new value. Every other tag is left alone, so tagging is
+    /// a merge and never a replacement of the set.
+    pub fn add_tags(&mut self, tags: impl IntoIterator<Item = (String, String)>) {
+        self.tags.extend(tags);
+    }
+
+    /// Whether the tag set holds `key`, so a caller can tell an overwrite from an
+    /// addition.
+    pub fn holds_tag(&self, key: &str) -> bool {
+        self.tags.contains_key(key)
+    }
+
+    /// Remove every tag whose key `doomed` accepts, keeping the rest. A key the set
+    /// does not hold removes nothing, so removal is idempotent, and removing the last
+    /// tag leaves the set EMPTY rather than absent — the resource still has a tag
+    /// collection.
+    pub fn remove_tags(&mut self, doomed: impl Fn(&str) -> bool) {
+        self.tags.retain(|key, _| !doomed(key.as_str()));
+    }
 }
 
 /// A stored access preview: the state the modelled `AccessPreview` is rebuilt from.
@@ -586,8 +643,9 @@ pub fn configuration_defect(resource: &str, configuration: &Configuration) -> Op
 
 /// Whether `candidate` is an ARN: the six colon-separated segments of
 /// `arn:partition:service:region:account:resource`, the form every `configurations`
-/// key (`ConfigurationsMapKey`, documented as "a map of resource ARNs") takes.
-fn is_resource_arn(candidate: &str) -> bool {
+/// key (`ConfigurationsMapKey`, documented as "a map of resource ARNs") takes, and the
+/// form the ARN-addressed operations (the tagging surface) require of `resourceArn`.
+pub fn is_resource_arn(candidate: &str) -> bool {
     let segments: Vec<&str> = candidate.splitn(6, ':').collect();
     segments.len() == 6 && segments[0] == "arn" && !segments[5].is_empty()
 }
@@ -975,6 +1033,82 @@ pub fn page_validation_exception(error: &PageError) -> ValidationException {
     field_validation_exception(name, message)
 }
 
+/// Refuse a `resourceArn` member that is not an ARN ([`is_resource_arn`]).
+pub fn resource_arn_validation_exception(resource_arn: &str) -> ValidationException {
+    field_validation_exception(
+        "resourceArn",
+        format!("resourceArn must be an ARN, but was {resource_arn}"),
+    )
+}
+
+/// Report that no resource in this account and Region has the ARN `resource_arn`.
+///
+/// Same provenance as [`ANALYZER_NOT_FOUND_MESSAGE`] and the refusals beside it: the
+/// text is FIXED and the ARN travels in the modelled `resourceId`. `resourceType` is
+/// this service's only taggable resource kind, which is what an ARN this service minted
+/// always names — the ARN's own segments are not echoed back as a type.
+pub fn resource_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: resource_arn.to_string(),
+        resource_type: ANALYZER_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// Refuse a tag key outside this service's tag restrictions, naming the `member` that
+/// carried it: a key is 1 to [`MAX_TAG_KEY_CHARS`] characters.
+///
+/// Applied to the keys of a tag map AND to the keys named for removal: a key outside
+/// the restrictions is not a key this service could ever have stored, so naming one is
+/// a malformed request rather than the removal of a tag the resource does not hold.
+pub fn validate_tag_key(member: &str, key: &str) -> Result<(), ValidationException> {
+    let chars = key.chars().count();
+    if chars == 0 {
+        return Err(field_validation_exception(
+            member,
+            format!("{member} must not name an empty tag key"),
+        ));
+    }
+    if chars > MAX_TAG_KEY_CHARS {
+        return Err(field_validation_exception(
+            member,
+            format!(
+                "{member} must name a tag key of at most {MAX_TAG_KEY_CHARS} characters, but one was {chars} characters"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a tag value outside this service's tag restrictions: at most
+/// [`MAX_TAG_VALUE_CHARS`] characters. An empty value is allowed.
+pub fn validate_tag_value(member: &str, key: &str, value: &str) -> Result<(), ValidationException> {
+    let chars = value.chars().count();
+    if chars > MAX_TAG_VALUE_CHARS {
+        return Err(field_validation_exception(
+            member,
+            format!(
+                "{member} must carry a value of at most {MAX_TAG_VALUE_CHARS} characters, but the value of tag {key} was {chars} characters"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a tagging call that would leave a resource holding more than
+/// [`MAX_TAGS_PER_RESOURCE`] tags.
+pub fn validate_tag_count(member: &str, resulting: usize) -> Result<(), ValidationException> {
+    if resulting > MAX_TAGS_PER_RESOURCE {
+        return Err(field_validation_exception(
+            member,
+            format!(
+                "{member} must leave a resource holding at most {MAX_TAGS_PER_RESOURCE} tags, but this call would leave it holding {resulting}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// This service's modelled `ValidationException` for the violations a modelled-constraint
 /// walk reported.
 ///
@@ -1083,6 +1217,10 @@ pub enum AuditOutcome {
     AnalyzerCreated,
     /// A stored analyzer's configuration was replaced.
     AnalyzerUpdated,
+    /// Tags were merged into a resource's tag set.
+    TagsAdded,
+    /// Tags were removed from a resource's tag set.
+    TagsRemoved,
     /// An `@idempotent` call changed nothing and replayed what it already held.
     NoChange,
     /// A policy check ran and answered a result.
@@ -1109,6 +1247,8 @@ impl AuditOutcome {
         match self {
             Self::AnalyzerCreated => "analyzer-created",
             Self::AnalyzerUpdated => "analyzer-updated",
+            Self::TagsAdded => "tags-added",
+            Self::TagsRemoved => "tags-removed",
             Self::NoChange => "no-change",
             Self::CheckEvaluated => "check-evaluated",
             Self::ValidationRefused => "validation-refused",
