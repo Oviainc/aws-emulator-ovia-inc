@@ -23,6 +23,8 @@ mod id_namespace_lifecycle;
 mod matching_job_lifecycle;
 #[path = "all/matching_workflow_update.rs"]
 mod matching_workflow_update;
+#[path = "all/policy_statements.rs"]
+mod policy_statements;
 #[path = "all/provider_service_catalog.rs"]
 mod provider_service_catalog;
 #[path = "all/resource_policy.rs"]
