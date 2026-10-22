@@ -294,4 +294,3 @@ pub struct GuardrailAutomatedReasoningPolicy {
     pub policies: Vec<String>,
     pub confidence_threshold: Option<f64>,
 }
-

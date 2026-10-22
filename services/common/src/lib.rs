@@ -7,6 +7,10 @@
 //!
 //! * [`claims_request`], the request-claim rule a service whose SigV4 signing name is
 //!   SHARED with other services uses for its `Service::can_handle`;
+//! * [`claims_modeled_route`], the REST form of that rule at full strength — the WHOLE
+//!   modelled route, method AND URI template — which a REST service under a shared
+//!   signing name should reach for by DEFAULT, keeping [`claims_modeled_path`]'s
+//!   first-segment form only where the service's own route table is out of reach;
 //! * [`arn`], the one parse of a caller-supplied resource ARN, so no two services
 //!   disagree about which vendor an ARN names;
 //! * [`nth_path_segment`] and [`addresses_modeled_route`], for the rarer case of two such
@@ -62,8 +66,12 @@
 //! nothing here names a service:
 //!
 //! * A REST protocol (`restJson1`, `restXml`) binds each operation to a URI, so the
-//!   request's first URI path segment must be one the service's model declares —
-//!   the framework's own discriminator, [`claims_modeled_path`].
+//!   request must address a URI this service's model binds. The framework's own
+//!   discriminator, [`claims_modeled_path`], compares just the FIRST path segment; when
+//!   two peers' path spaces are not disjoint that segment separates nothing, and the
+//!   whole route — method and URI template, from the service's own generated route
+//!   table — decides instead: [`claims_modeled_route`], the default for a REST service
+//!   here.
 //! * An RPC protocol carries the target service out of band and posts every
 //!   operation to one path: `awsJson1_0` / `awsJson1_1` name it in
 //!   `X-Amz-Target: <Service>.<Operation>`, and `rpcv2Cbor` in the URI
@@ -214,6 +222,31 @@ pub fn claims_request(
     }
 }
 
+/// The borrowed request `parts` as the runtime-API request a `ServerProtocol` reads,
+/// with an empty body. `None` when the URI or method is one the runtime API refuses.
+///
+/// This mirrors the router's own `runtime_api_request_from_parts`
+/// (`vendor/smithy-server-runtime/src/multi_service_router.rs`), which is private to that
+/// agent-immutable crate and so cannot be called here; keep the two in step. It differs
+/// only in carrying no body (no route lookup reads one) and in answering `None` where the
+/// router, which has already accepted the request, may expect a valid URI and method.
+fn runtime_request_from(parts: &http::request::Parts) -> Option<RuntimeApiRequest> {
+    let mut request = RuntimeApiRequest::new(SdkBody::empty());
+    request.set_uri(parts.uri.to_string().as_str()).ok()?;
+    request.set_method(parts.method.as_str()).ok()?;
+    for (name, value) in parts.headers.iter() {
+        if let Ok(value) = value.to_str() {
+            // `append`, not `insert`: `HeaderMap::iter` yields one entry per value, so a
+            // repeated or multi-valued header keeps every one of them, as the router's own
+            // conversion does.
+            request
+                .headers_mut()
+                .append(name.as_str().to_string(), value.to_string());
+        }
+    }
+    Some(request)
+}
+
 /// Whether `parts` is addressed in an RPC form: `awsJson1_0` / `awsJson1_1` name their
 /// target service in `X-Amz-Target: <Service>.<Operation>`, and `rpcv2Cbor` in the URI
 /// `/service/<Service>/operation/<Operation>`.
@@ -357,7 +390,8 @@ pub fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str])
 /// when the protocol resolves no routing key, and when the key it resolves names no
 /// operation this service wires.
 ///
-/// The rebuild mirrors the router's own `runtime_api_request_from_parts`
+/// The rebuild is [`runtime_request_from`], the ONE copy in this crate of the router's
+/// own `runtime_api_request_from_parts`
 /// (`vendor/smithy-server-runtime/src/multi_service_router.rs`), which is private to that
 /// agent-immutable crate: the URI, the method and every header value, `append`ed so a
 /// repeated header keeps all of its values. The two must stay in step — the ONE
@@ -367,22 +401,9 @@ pub fn addresses_modeled_route(
     parts: &http::request::Parts,
     definition: &dyn ErasedServiceDefinition,
 ) -> bool {
-    let mut request = RuntimeApiRequest::new(SdkBody::empty());
-    if request.set_uri(parts.uri.to_string().as_str()).is_err() {
+    let Some(request) = runtime_request_from(parts) else {
         return false;
-    }
-    if request.set_method(parts.method.as_str()).is_err() {
-        return false;
-    }
-    for (name, value) in parts.headers.iter() {
-        if let Ok(value) = value.to_str() {
-            // `append`, not `insert`: `HeaderMap::iter` yields one entry per value, so a
-            // repeated header keeps every one of them, as the router's own rebuild does.
-            request
-                .headers_mut()
-                .append(name.as_str().to_string(), value.to_string());
-        }
-    }
+    };
     match definition.protocol().routing_key(&request) {
         Ok(key) => definition.routing_table().get(key).is_some(),
         Err(_) => false,
