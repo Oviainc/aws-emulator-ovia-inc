@@ -327,7 +327,9 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
             .unwrap_or_else(|| {
                 panic!("case {family:?}: the published family has no expectation row")
             });
-        let group = format!("group-{family}");
+        // A group name holds no underscore (the service's name rule), so the family it
+        // is derived from contributes its hyphenated spelling.
+        let group = format!("group-{}", family.replace('_', "-"));
         create_group(&router, &group, family).await;
         let reported = parameters(&router, &group).await;
         assert!(
@@ -398,8 +400,8 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
     }
 
     // Two families of different engine lines do not report the same set of settings.
-    let redis6 = parameters(&router, "group-memorydb_redis6").await;
-    let redis7 = parameters(&router, "group-memorydb_redis7").await;
+    let redis6 = parameters(&router, "group-memorydb-redis6").await;
+    let redis7 = parameters(&router, "group-memorydb-redis7").await;
     assert_ne!(
         redis6.keys().collect::<Vec<_>>(),
         redis7.keys().collect::<Vec<_>>(),
@@ -420,8 +422,10 @@ async fn an_update_persists_its_values_and_the_describe_reports_them() {
     for family in &families {
         // A second group of the SAME family, never updated, is the reference for "every
         // other parameter is untouched".
-        let group = format!("updated-{family}");
-        let reference = format!("pristine-{family}");
+        // A group name holds no underscore (the service's name rule), so the family it
+        // is derived from contributes its hyphenated spelling.
+        let group = format!("updated-{}", family.replace('_', "-"));
+        let reference = format!("pristine-{}", family.replace('_', "-"));
         create_group(&router, &group, family).await;
         create_group(&router, &reference, family).await;
 
@@ -583,8 +587,10 @@ async fn a_refused_update_leaves_the_group_unchanged() {
     );
 
     // A group that is not in state is the modelled not-found fault, for both the read
-    // and the write.
-    for name in ["no-such-group", "REJECTIONS", "rejection"] {
+    // and the write. A name that only differs by CASE is the same group (a MemoryDB
+    // resource name is a case-insensitive identifier), so the rows differ in the part
+    // of the name itself.
+    for name in ["no-such-group", "rejection", "rejections-2"] {
         let (status, refused) = update(&router, name, &[("timeout", "30")]).await;
         assert_eq!(
             status, 404,

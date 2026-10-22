@@ -11,9 +11,9 @@
 //! removed from all clusters."):
 //!
 //! * a delete takes the named user out of the store AND out of the `UserNames` of
-//!   every ACL that listed it, however many ACLs that is — none, one or several — and
-//!   whether the user was created by a caller or is the built-in one the account
-//!   already had;
+//!   every ACL that listed it, however many ACLs that is — none, one or several;
+//! * the user every account ALREADY HAD is the service's, not the caller's: a delete
+//!   naming it is refused with the modelled invalid-value error and it stays;
 //! * it answers with that user as the caller last had it, in the terminal `deleting`
 //!   status, carrying the membership it held up to the call;
 //! * it touches no other user and no other ACL member, and a deleted user never comes
@@ -38,8 +38,11 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The built-in user MemoryDB creates in every account
-/// (`crate::state::DEFAULT_USER_NAME`), which a delete must treat like any other.
+/// (`crate::state::DEFAULT_USER_NAME`), which a delete must refuse, and the built-in
+/// ACL that holds it (`crate::state::OPEN_ACCESS_ACL_NAME`), which no caller's delete
+/// touches either.
 const DEFAULT_USER: &str = "default";
+const OPEN_ACCESS_ACL: &str = "open-access";
 
 /// A user that belongs to every ACL below and is deleted by nothing, so each case can
 /// assert that a delete left the OTHER members of an ACL exactly where they were.
@@ -59,13 +62,16 @@ fn acl_members(acl: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Every ACL in state, as `(ACLName, UserNames)` pairs in name order.
+/// Every ACL in state, as `(ACLName, UserNames)` pairs in name order. The built-in
+/// `open-access` ACL is left out: no caller's delete can reach it, because the only
+/// user it holds is the built-in one a delete refuses.
 async fn acl_membership(router: &MultiServiceRouter, case: &str) -> Vec<(String, Vec<String>)> {
     let listed = ok(router, "DescribeACLs", &json!({}), case).await;
     listed["ACLs"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected ACLs in {listed}"))
         .iter()
+        .filter(|acl| acl["Name"] != json!(OPEN_ACCESS_ACL))
         .map(|acl| {
             (
                 acl["Name"]
@@ -79,28 +85,24 @@ async fn acl_membership(router: &MultiServiceRouter, case: &str) -> Vec<(String,
 }
 
 /// A delete removes the user from the store and from every ACL that listed it, for a
-/// user that belongs to no ACL, to one, to several, and for the built-in user.
+/// user that belongs to no ACL, to one and to several — and refuses the built-in user
+/// the account already had.
 #[tokio::test]
 async fn deleting_a_user_removes_it_from_state_and_from_every_acl() {
     let router = router();
     // The ACLs this case builds, in name order.
     let acls = ["acl-one", "acl-three", "acl-two"];
     // (user, the ACLs that list it) — the rows differ in HOW MANY ACLs name the user
-    // (none, one, every one of them), and the last row is the built-in user the account
-    // already had rather than one this test created.
+    // (none, one, every one of them).
     let cases: Vec<(&str, Vec<&str>)> = vec![
         ("in-no-acl", vec![]),
         ("in-one-acl", vec!["acl-one"]),
         ("in-every-acl", vec!["acl-one", "acl-three", "acl-two"]),
-        (DEFAULT_USER, vec!["acl-two"]),
     ];
 
     create_user(&router, BYSTANDER).await;
     for (name, _) in &cases {
-        // The built-in user is already in the account: creating it would collide.
-        if *name != DEFAULT_USER {
-            create_user(&router, name).await;
-        }
+        create_user(&router, name).await;
     }
     for acl in acls {
         let mut members: Vec<&str> = cases
@@ -198,7 +200,7 @@ async fn deleting_a_user_removes_it_from_state_and_from_every_acl() {
             );
         }
         // Deleting it a second time is the modelled not-found fault: it did not come
-        // back, not even the built-in user.
+        // back.
         let (status, body) = call(&router, "DeleteUser", &json!({ "UserName": name })).await;
         assert_eq!(
             status, 404,
@@ -225,11 +227,24 @@ async fn deleting_a_user_removes_it_from_state_and_from_every_acl() {
         "case {BYSTANDER:?}: a user no delete named must still belong to every ACL, \
          got {described}"
     );
+
+    // The user every account already has is not the caller's to delete, under any
+    // spelling of its name, and it is still there afterwards.
+    for spelling in [DEFAULT_USER, "Default", "DEFAULT"] {
+        let (status, body) = call(&router, "DeleteUser", &json!({ "UserName": spelling })).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {spelling:?}: a built-in user must refuse the delete, got {status} \
+             with {body}"
+        );
+    }
     let listed = ok(&router, "DescribeUsers", &json!({}), "listing").await;
     assert_eq!(
         user_names(&listed),
-        vec![BYSTANDER.to_string()],
-        "case \"listing\": only the user no delete named is left, got {listed}"
+        vec![BYSTANDER.to_string(), DEFAULT_USER.to_string()],
+        "case \"listing\": the user no delete named and the built-in one are left, got \
+         {listed}"
     );
 }
 

@@ -69,6 +69,10 @@
 //! * `ACLNotFoundFault` (HTTP 404) — The specified ACL does not exist.
 //! * `InvalidParameterCombinationException` (HTTP 400) — The specified parameter combination
 //!   is not valid.
+//! * `InvalidParameterValueException` (HTTP 400) — The specified parameter value is not
+//!   valid. Widened in through `extra_errors` (see below): the service answers an
+//!   out-of-window `MaxResults` or a `NextToken` naming no position with it, and the
+//!   model's `errors` list for this operation omits it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -84,11 +88,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-memorydb-amazonmemorydb
 // here — hence the `DescribeACLsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.memorydb#DescribeACLs")]
+//
+// `InvalidParameterValueException` — the shape this SERVICE models for a member whose
+// VALUE it cannot serve, and the error every other listing in this service answers a
+// bad page size with — is widened in through `extra_errors`: the model's own `errors`
+// list for this operation omits it, while the service refuses an out-of-window
+// `MaxResults` with exactly it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.memorydb#DescribeACLs",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum DescribeACLsErrorModeled {
     ACLNotFoundFault(ACLNotFoundFault),
     InvalidParameterCombinationException(InvalidParameterCombinationException),
+    InvalidParameterValueException(InvalidParameterValueException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -140,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in a mounted emulator (the router hands every service the
@@ -150,20 +164,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if input.max_results.is_some_and(|max| max < 1) {
-            // The same refusal `DescribeClusters` makes for a page size below 1; this
-            // operation's model declares no `InvalidParameterValueException`, so the
-            // framework's 400 `ValidationException` carries it.
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "MaxResults must be at least 1.",
-            ));
+        if let Some(message) = crate::state::max_results_rejection(input.max_results) {
+            // A page size outside the window names no page: refused with the service's
+            // own modelled invalid-value error, the same one every other listing in
+            // this service answers with.
+            return Err(DescribeACLsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
+        let region = crate::state::request_region(ctx);
+        // An ACL name is a case-insensitive identifier, so the name this request asks
+        // about is folded exactly as the store is keyed.
+        let acl_name = input.acl_name.as_deref().map(crate::state::fold_name);
         let mut state = state.lock();
-        // The only write a describe makes: the `creating` -> `active` transition the
-        // clock already owed at this instant.
+        // The writes a describe makes, neither asked for by this caller: the `creating`
+        // -> `active` transition the clock already owed at this instant, and the
+        // resources the account ALREADY HAD before any call (the built-in `default`
+        // user and the `open-access` ACL holding it), which this store materialises on
+        // first touch because the engine hands every service an empty one.
         state.settle(std::time::Instant::now());
+        state.ensure_builtins(&region);
 
-        let entries: Vec<(String, ACL)> = match input.acl_name.as_deref() {
+        let entries: Vec<(String, ACL)> = match acl_name.as_deref() {
             Some(name) => {
                 if !state.acls.contains_key(name) {
                     return Err(DescribeACLsErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
@@ -173,7 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 let clusters = state.clusters_using_acl(name);
                 let acl = &state.acls[name];
-                vec![(acl.name.clone(), acl.to_api(clusters))]
+                let minimum_engine_version = state.acl_minimum_engine_version(&acl.user_names);
+                vec![(acl.name.clone(), acl.to_api(clusters, minimum_engine_version))]
             }
             None => {
                 // ONE pass over the clusters builds every ACL's membership, so
@@ -186,7 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let clusters = membership
                             .remove(acl.name.as_str())
                             .unwrap_or_default();
-                        (acl.name.clone(), acl.to_api(clusters))
+                        let minimum_engine_version =
+                            state.acl_minimum_engine_version(&acl.user_names);
+                        (
+                            acl.name.clone(),
+                            acl.to_api(clusters, minimum_engine_version),
+                        )
                     })
                     .collect()
             }
@@ -198,9 +229,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(
-                "NextToken does not name a position in this listing.",
-            )
+            // A token that names no position in this listing was never minted for it:
+            // reported rather than served as a silently empty page.
+            DescribeACLsError::from(DescribeACLsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(
+                        "NextToken does not name a position in this listing.".to_string(),
+                    ),
+                },
+            ))
         })?;
         Ok(DescribeACLsOutput {
             ac_ls: Some(ac_ls),

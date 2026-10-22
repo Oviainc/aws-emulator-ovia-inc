@@ -426,7 +426,9 @@ async fn describing_engine_versions_changes_nothing() {
     let acls = ok(&router, "DescribeACLs", &json!({}), case).await;
     assert_eq!(
         acls["ACLs"].as_array().expect("ACLs is a list").len(),
-        1,
+        // The created ACL, beside the built-in `open-access` ACL every MemoryDB
+        // account already has.
+        2,
         "case {case:?}: a read must not change the ACLs, got {acls}"
     );
 }
