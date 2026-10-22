@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts tags on the resource the ARN names — for this service a search job. Each entry
+//! is merged into the tags stored on that job, so a key already present takes the new
+//! value and the others are left alone; `ListTagsForResource` then returns the merged
+//! set. An ARN no resource of this account matches is a `ResourceNotFoundException`
+//! (404).
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +64,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::SEARCH_JOB_RESOURCE;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -79,10 +77,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupsearch#TagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupsearch#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    /// Declared on the service, not on this operation: the store this emulator keeps
+    /// its search jobs in could not be reached, which is a server fault.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -134,20 +138,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let job = state.job_by_arn_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceError::from(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no resource with ARN '{}' exists", input.resource_arn),
+                    resource_id: input.resource_arn.clone(),
+                    resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                },
+            ))
+        })?;
+
+        // The caps that bound caller-driven growth of one stored record: every entry has
+        // to fit, and the merged tag set has to stay within the per-resource maximum.
+        // Refused whole, so a partial write never lands.
+        for (key, value) in &input.tags {
+            crate::state::check_tag_entry(key, value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        let merged = job.tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !job.tags.contains_key(*key))
+                .count();
+        crate::state::check_tag_count(merged).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        for (key, value) in input.tags {
+            job.tags.insert(key, value);
+        }
+        Ok(TagResourceOutput {})
     }
 }
