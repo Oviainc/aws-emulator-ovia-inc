@@ -5,8 +5,10 @@
 //! Removes the `tagKeys` the `@httpQuery` names from the tag map of the one stored
 //! deployment parameter whose `resourceArn` the `@httpLabel` names. `@idempotent`:
 //! a key that is already absent is removed by doing nothing, so a repeat of the
-//! same call answers 204 again. An ARN that names no stored record is a modelled
-//! `ResourceNotFoundException` (404).
+//! same call answers 204 again. An ARN that names no stored record is a 404 carrying
+//! this service's own `NotFoundException` code
+//! (`crate::state::parameter_not_found`), which is the code its recorded responses
+//! use rather than the modelled `ResourceNotFoundException` shape name.
 //!
 //! ## Shape of an operation
 //!
@@ -153,10 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(record) = store.parameters.get_mut(&input.resource_arn) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::parameter_not_found(&input.resource_arn),
-            )
-            .into());
+            // The not-found CODE this service emits is `NotFoundException`, not the
+            // modelled `ResourceNotFoundException` shape name; see
+            // `crate::state::parameter_not_found`.
+            return Err(crate::state::parameter_not_found());
         };
 
         // `@idempotent`: removing a key the record does not hold is a no-op, so the
