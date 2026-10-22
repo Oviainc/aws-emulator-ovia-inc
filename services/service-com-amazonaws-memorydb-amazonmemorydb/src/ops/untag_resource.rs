@@ -287,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut state = state.lock();
         state.settle(std::time::Instant::now());
-        state.ensure_builtin_users(&region);
+        state.ensure_builtins(&region);
 
         let resource_arn = state.tag_target(&input.resource_arn).map_err(reject)?;
         let mut remaining = state.tags.get(&resource_arn).cloned().unwrap_or_default();

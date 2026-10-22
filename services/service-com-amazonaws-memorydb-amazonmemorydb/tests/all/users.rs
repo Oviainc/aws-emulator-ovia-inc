@@ -51,9 +51,11 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The built-in user MemoryDB creates in every account, and the access string it gives
-/// it (`crate::state::DEFAULT_USER_NAME` / `DEFAULT_USER_ACCESS_STRING`).
+/// it (`crate::state::DEFAULT_USER_NAME` / `DEFAULT_USER_ACCESS_STRING`), plus the
+/// built-in ACL that holds it (`crate::state::OPEN_ACCESS_ACL_NAME`).
 const DEFAULT_USER: &str = "default";
 const DEFAULT_USER_ACCESS_STRING: &str = "on ~* &* +@all";
+const OPEN_ACCESS_ACL: &str = "open-access";
 
 /// `User$Status`: "Indicates the user status. Can be \"active\", \"modifying\" or
 /// \"deleting\"." — the catalog the rows below draw from, so a describe is shown to
@@ -132,9 +134,9 @@ impl Harness {
     }
 }
 
-/// One row of the stored-user table: a user the store holds, spanning the name forms
-/// `UserName` admits (`^[a-zA-Z][a-zA-Z0-9\-]*$`), the statuses `User$Status` lists and
-/// every `AuthenticationType` the model declares.
+/// One row of the stored-user table: a user the store holds, spanning the name forms a
+/// folded `UserName` takes, the statuses `User$Status` lists and every
+/// `AuthenticationType` the model declares.
 struct Seeded {
     name: &'static str,
     status: &'static str,
@@ -150,14 +152,14 @@ fn seeded_users() -> Vec<Seeded> {
         Seeded {
             name: "a",
             status: "active",
-            access_string: "on ~app::* +@read",
+            access_string: "on ~app::* resetchannels +@read",
             authentication_type: "password",
             // `Authentication$PasswordCount`: "The number of passwords belonging to
             // the user. The maximum is two."
             password_count: Some(2),
         },
         Seeded {
-            name: "App",
+            name: "app",
             status: "modifying",
             access_string: "on ~* &* +@all",
             authentication_type: "password",
@@ -166,14 +168,14 @@ fn seeded_users() -> Vec<Seeded> {
         Seeded {
             name: "data-reader-1",
             status: "deleting",
-            access_string: "off ~* -@all",
+            access_string: "off ~* resetchannels -@all",
             authentication_type: "iam",
             password_count: None,
         },
         Seeded {
             name: "zeta-service-account",
             status: "active",
-            access_string: "on ~metrics:* +get +mget",
+            access_string: "on ~metrics:* resetchannels +get +mget",
             authentication_type: "no-password",
             password_count: None,
         },
@@ -200,8 +202,11 @@ async fn the_builtin_default_user_is_reported_from_an_untouched_store() {
         ("Name", json!(DEFAULT_USER)),
         ("Status", json!("active")),
         ("AccessString", json!(DEFAULT_USER_ACCESS_STRING)),
-        ("ACLNames", json!([])),
+        // The built-in ACL every account already has lists the built-in user.
+        ("ACLNames", json!([OPEN_ACCESS_ACL])),
         ("Authentication", json!({ "Type": "no-password" })),
+        // A password-less user works from MemoryDB's first engine version on.
+        ("MinimumEngineVersion", json!("6.2")),
         (
             "ARN",
             json!(format!("arn:aws:memorydb:{REGION}:{ACCOUNT}:user/{DEFAULT_USER}")),
@@ -285,6 +290,16 @@ async fn every_stored_user_is_reported_with_the_members_state_holds() {
             ("Status", json!(row.status)),
             ("AccessString", json!(row.access_string)),
             ("Authentication", authentication),
+            // DERIVED from how the user authenticates: IAM authentication needs 7.0,
+            // a password or no password works from 6.2 on.
+            (
+                "MinimumEngineVersion",
+                json!(if row.authentication_type == "iam" {
+                    "7.0"
+                } else {
+                    "6.2"
+                }),
+            ),
             (
                 "ARN",
                 json!(format!("arn:aws:memorydb:{REGION}:{ACCOUNT}:user/{}", row.name)),
@@ -295,10 +310,6 @@ async fn every_stored_user_is_reported_with_the_members_state_holds() {
                 "case {case:?}: expected {member} to be {expected}, got {user}"
             );
         }
-        assert!(
-            user.get("MinimumEngineVersion").is_none(),
-            "case {case:?}: nothing tracks a user's minimum engine version, got {user}"
-        );
     }
 }
 
@@ -311,8 +322,8 @@ async fn acl_names_are_derived_from_the_acls_that_list_the_user() {
         harness.seed_user(row);
     }
 
-    // Before any ACL exists, no user belongs to one.
-    for name in ["a", "App", DEFAULT_USER] {
+    // Before any ACL of this test's own exists, only the built-in ACL names a user.
+    for name in ["a", "app"] {
         let body = harness
             .ok("DescribeUsers", &json!({ "UserName": name }), "no acls")
             .await;
@@ -323,11 +334,24 @@ async fn acl_names_are_derived_from_the_acls_that_list_the_user() {
             "no acls"
         );
     }
+    let body = harness
+        .ok(
+            "DescribeUsers",
+            &json!({ "UserName": DEFAULT_USER }),
+            "no acls",
+        )
+        .await;
+    assert_eq!(
+        body["Users"][0]["ACLNames"],
+        json!([OPEN_ACCESS_ACL]),
+        "case {:?}: the built-in user belongs to the built-in ACL, got {body}",
+        "no acls"
+    );
 
     // One row per ACL: the users it lists, in the order the request named them.
     let acls: &[(&str, &[&str])] = &[
-        ("shared-acl", &["a", "App"]),
-        ("solo-acl", &["App"]),
+        ("shared-acl", &["a", "app"]),
+        ("solo-acl", &["app"]),
         ("default-acl", &[DEFAULT_USER]),
     ];
     for (acl_name, user_names) in acls {
@@ -343,9 +367,9 @@ async fn acl_names_are_derived_from_the_acls_that_list_the_user() {
     // One row per user: the ACLs listing it, in name order.
     let expected: &[(&str, &[&str])] = &[
         ("a", &["shared-acl"]),
-        ("App", &["shared-acl", "solo-acl"]),
+        ("app", &["shared-acl", "solo-acl"]),
         ("data-reader-1", &[]),
-        (DEFAULT_USER, &["default-acl"]),
+        (DEFAULT_USER, &["default-acl", OPEN_ACCESS_ACL]),
     ];
     for (name, acl_names) in expected {
         let case = format!("ACLNames of {name}");
@@ -377,21 +401,23 @@ async fn filters_select_the_users_whose_named_property_matches() {
         )
         .await;
 
-    // One row per filter shape: the request, and the names it must select.
+    // One row per filter shape: the request, and the names it must select. The values
+    // are deliberately written in mixed case, which a filter folds like any other
+    // reference to a resource name.
     let cases: &[(&str, Value, &[&str])] = &[
         (
             "one UserName value",
             json!({ "Filters": [{ "Name": "UserName", "Values": ["App"] }] }),
-            &["App"],
+            &["app"],
         ),
         (
             "several UserName values",
             json!({ "Filters": [{ "Name": "UserName", "Values": ["App", "a", "nobody"] }] }),
-            &["App", "a"],
+            &["a", "app"],
         ),
         (
             "an ACLName value",
-            json!({ "Filters": [{ "Name": "ACLName", "Values": ["reader-acl"] }] }),
+            json!({ "Filters": [{ "Name": "ACLName", "Values": ["Reader-ACL"] }] }),
             &["a", "data-reader-1"],
         ),
         (
@@ -512,9 +538,9 @@ async fn refusals_come_from_state_and_from_the_filterable_properties() {
     }
 
     let cases: &[(Value, u16, &str)] = &[
-        // Absent names, in each form `UserName` admits.
+        // Absent names, in each form a folded `UserName` takes.
         (json!({ "UserName": "nobody" }), 404, "UserNotFoundFault"),
-        (json!({ "UserName": "A" }), 404, "UserNotFoundFault"),
+        (json!({ "UserName": "Z" }), 404, "UserNotFoundFault"),
         (
             json!({ "UserName": "data-reader-2" }),
             404,
@@ -548,12 +574,25 @@ async fn refusals_come_from_state_and_from_the_filterable_properties() {
             "InvalidParameterCombinationException",
         ),
         // The page size and token rules the other listings in this slice follow.
-        (json!({ "MaxResults": 0 }), 400, "ValidationException"),
-        (json!({ "MaxResults": -3 }), 400, "ValidationException"),
+        (
+            json!({ "MaxResults": 0 }),
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            json!({ "MaxResults": -3 }),
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            json!({ "MaxResults": 51 }),
+            400,
+            "InvalidParameterValueException",
+        ),
         (
             json!({ "NextToken": "zzz-no-such-position" }),
             400,
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
     ];
     for (request, expected_status, expected_code) in cases {

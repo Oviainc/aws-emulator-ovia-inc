@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the stored ACL's `UserNames` by `UserNamesToAdd` /
+//! `UserNamesToRemove` and answers with the stored record, so `DescribeACLs` reports
+//! exactly what was persisted — including the `MinimumEngineVersion` the new membership
+//! requires, which is DERIVED and so follows every change made here. The ACLs an
+//! account already had are refused: a built-in ACL is not the caller's to change.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +75,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -117,6 +115,44 @@ impl From<UpdateACLErrorModeled> for UpdateACLError {
     }
 }
 
+/// The folded, de-duplicated names one of the request's membership lists carries, or
+/// why the list is refused.
+///
+/// BOUND FIRST, then walked: `UserNameListInput` is `len 1..` — a minimum with no
+/// maximum — so the list arrives caller-sized, and it is one factor of every membership
+/// comparison in the handler. The length is refused against
+/// [`crate::state::MAX_USERS_PER_ACL`] before a single name is folded or compared, so
+/// no work below is sized by the request; a name listed twice is refused with the
+/// modelled `DuplicateUserNameFault` rather than silently collapsed, and the set the
+/// handler then works with makes each membership test one logarithmic lookup.
+fn member_set(
+    member: &str,
+    names: Option<Vec<String>>,
+) -> Result<BTreeSet<String>, UpdateACLError> {
+    let names = names.unwrap_or_default();
+    if let Some(message) = crate::state::member_count_rejection(member, names.len()) {
+        return Err(UpdateACLErrorModeled::InvalidParameterValueException(
+            InvalidParameterValueException {
+                message: Some(message),
+            },
+        )
+        .into());
+    }
+    let mut folded = BTreeSet::new();
+    for name in names {
+        let name = crate::state::fold_name(&name);
+        if !folded.insert(name.clone()) {
+            return Err(UpdateACLErrorModeled::DuplicateUserNameFault(
+                DuplicateUserNameFault {
+                    message: Some(format!("{member} names user {name} more than once.")),
+                },
+            )
+            .into());
+        }
+    }
+    Ok(folded)
+}
+
 /// The `UpdateACL` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +189,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateACL"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than
+            // reporting a membership change nothing applied.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        // Every name this request carries is folded the way the stores are keyed, so a
+        // reference written in mixed case names the one resource. BOTH membership lists
+        // are bounded and de-duplicated here, BEFORE the store is locked and before any
+        // per-name comparison runs, so no factor of the work below is request-sized.
+        let acl_name = crate::state::fold_name(&input.acl_name);
+        let to_add = member_set("UserNamesToAdd", input.user_names_to_add)?;
+        let to_remove = member_set("UserNamesToRemove", input.user_names_to_remove)?;
+
+        if to_add.is_empty() && to_remove.is_empty() {
+            // Neither member supplied asks for nothing at all: reported rather than
+            // answered with an ACL this call left exactly as it was.
+            return Err(
+                UpdateACLErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "At least one of UserNamesToAdd and UserNamesToRemove must be \
+                             supplied."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // One name cannot be added and removed by the same call: the two members cannot
+        // hold together as supplied.
+        if let Some(name) = to_add.intersection(&to_remove).next() {
+            return Err(
+                UpdateACLErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "User {name} cannot be both added to and removed from the ACL."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::Instant::now();
+        let mut state = state.lock();
+        state.settle(now);
+        // The ACLs the account ALREADY HAD before any call are materialised on first
+        // touch, so this call refuses to modify a built-in one instead of answering
+        // that it does not exist.
+        state.ensure_builtins(&region);
+
+        let Some(acl) = state.acls.get(&acl_name) else {
+            return Err(UpdateACLErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
+                message: Some(format!("ACL {acl_name} not found.")),
+            })
+            .into());
+        };
+        // The ACL every MemoryDB account already has is the service's, not the
+        // caller's: its membership cannot be changed.
+        if acl_name == crate::state::OPEN_ACCESS_ACL_NAME {
+            return Err(UpdateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "ACL {acl_name} is a default ACL and cannot be modified."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The stored membership as a SET, so each of the comparisons below costs one
+        // logarithmic lookup per named name rather than a scan of the membership.
+        let current: std::collections::BTreeSet<&str> =
+            acl.user_names.iter().map(String::as_str).collect();
+        // A removal names a CURRENT member: a name the ACL does not list is resolved
+        // against the stored membership rather than silently ignored.
+        if let Some(name) = to_remove
+            .iter()
+            .find(|name| !current.contains(name.as_str()))
+        {
+            return Err(UpdateACLErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(format!("User {name} is not a member of ACL {acl_name}.")),
+            })
+            .into());
+        }
+        // An addition names a user the ACL does not list yet. Whether that user EXISTS
+        // is not resolved here, exactly as `CreateACL` does not resolve its
+        // `UserNames`: the two write paths of one membership must agree about what a
+        // member is.
+        if let Some(name) = to_add.iter().find(|name| current.contains(name.as_str())) {
+            return Err(UpdateACLErrorModeled::DuplicateUserNameFault(
+                DuplicateUserNameFault {
+                    message: Some(format!(
+                        "User {name} is already a member of ACL {acl_name}."
+                    )),
+                },
+            )
+            .into());
+        }
+        // The new membership, in the order the ACL already held its members plus the
+        // added ones. Bounded by `MAX_USERS_PER_ACL` like the lists that built it, so a
+        // sequence of calls cannot grow one ACL's membership without end.
+        let mut user_names: Vec<String> = acl
+            .user_names
+            .iter()
+            .filter(|name| !to_remove.contains(name.as_str()))
+            .cloned()
+            .collect();
+        user_names.extend(to_add.iter().cloned());
+        if let Some(message) =
+            crate::state::member_count_rejection("The ACL's members", user_names.len())
+        {
+            return Err(UpdateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let acl = state
+            .acls
+            .get_mut(&acl_name)
+            .expect("the ACL was just resolved under the same lock");
+        acl.user_names = user_names.clone();
+        // An ACL AWS has accepted a change to is not active again yet: it reports
+        // `modifying`, and the clock owes it `active` once `SETTLE_AFTER` has passed,
+        // so a caller polling straight away still sees the transient status.
+        acl.status = crate::state::acl_status::MODIFYING.to_string();
+        acl.settles_at = Some(now + crate::state::SETTLE_AFTER);
+
+        // Both derived lists are computed the way `DescribeACLs` computes them, so the
+        // answer to this call and the next read cannot disagree.
+        let clusters = state.clusters_using_acl(&acl_name);
+        let minimum_engine_version = state.acl_minimum_engine_version(&user_names);
+        let acl = &state.acls[&acl_name];
+        Ok(UpdateACLOutput {
+            acl: Some(acl.to_api(clusters, minimum_engine_version)),
+        })
     }
 }

@@ -19,6 +19,8 @@ mod cluster_lifecycle;
 mod compatible_kafka_versions;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
+#[path = "all/describe_cluster_v2.rs"]
+mod describe_cluster_v2;
 #[path = "all/kafka_harness.rs"]
 mod kafka_harness;
 #[path = "all/list_clusters_v2.rs"]

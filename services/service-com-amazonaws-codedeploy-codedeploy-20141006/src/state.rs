@@ -78,6 +78,22 @@ pub const STATE_UNAVAILABLE: &str =
 /// (`smithy_query(query="shape",shape="DeploymentCreator")`).
 pub const DEPLOYMENT_CREATOR_USER: &str = "user";
 
+/// The `DeploymentType` of a blue/green deployment
+/// (`smithy_query(query="shape",shape="DeploymentType")`: IN_PLACE | BLUE_GREEN).
+pub const DEPLOYMENT_TYPE_BLUE_GREEN: &str = "BLUE_GREEN";
+
+/// The `InstanceAction` that terminates the original environment's instances
+/// after a successful blue/green deployment
+/// (`smithy_query(query="shape",shape="InstanceAction")`: TERMINATE |
+/// KEEP_ALIVE).
+pub const INSTANCE_ACTION_TERMINATE: &str = "TERMINATE";
+
+/// The largest `terminationWaitTimeInMinutes` a deployment group may ask for, as
+/// the model documents for the member
+/// (`smithy_query(query="doc",shape="BlueInstanceTerminationOption",member="terminationWaitTimeInMinutes")`:
+/// "The maximum setting is 2880 minutes (2 days)").
+pub const MAX_TERMINATION_WAIT_MINUTES: i32 = 2880;
+
 /// The `DeploymentCreator` value for the deployment CodeDeploy itself creates to
 /// roll a deployment back
 /// (`smithy_query(query="shape",shape="DeploymentCreator")`).
@@ -106,6 +122,15 @@ pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
 /// is applied as RETENTION: creating a deployment past it drops the oldest
 /// deployments, oldest first, so a caller cannot grow the store without limit.
 pub const MAX_DEPLOYMENT_HISTORY: usize = 500;
+
+/// How many application revisions one application's registry keeps.
+///
+/// CodeDeploy publishes no quota for retained revisions and does not refuse a
+/// registration because the registry is full, so — like
+/// [`MAX_DEPLOYMENT_HISTORY`] — this bound is CHOSEN and is applied as
+/// RETENTION: registering past it drops the oldest-registered revisions first,
+/// so a caller cannot grow the store without limit.
+pub const MAX_REVISIONS_PER_APPLICATION: usize = 500;
 
 /// How many on-premises instance names one call may name, the bound
 /// `InstanceLimitExceededException` ("The maximum number of allowed on-premises
@@ -151,7 +176,8 @@ pub fn tag_key_value(tag: &Tag) -> Option<(&str, &str)> {
 /// refuses a further registration, which is the one case no eviction can serve.
 pub const MAX_ON_PREMISES_INSTANCES: usize = 1_000;
 
-/// A registered application, with the deployment groups that belong to it.
+/// A registered application, with the deployment groups and the application
+/// revisions that belong to it.
 #[derive(Debug, Clone)]
 pub struct Application {
     pub application_id: String,
@@ -165,6 +191,101 @@ pub struct Application {
     /// Creation order of this application's deployment group names, so a listing
     /// of them is deterministic and pages stably.
     pub deployment_group_order: Vec<String>,
+    /// The revisions CodeDeploy knows for this application, by
+    /// [`revision_key`]. CodeDeploy tracks revisions by REGISTRATION — it never
+    /// probes the location — so a revision is here only because
+    /// `RegisterApplicationRevision` registered it or a deployment used it.
+    pub revisions: HashMap<String, ApplicationRevision>,
+    /// Registration order of this application's revision keys, so a listing is
+    /// deterministic and pages stably.
+    pub revision_order: Vec<String>,
+}
+
+/// One revision of an application, as CodeDeploy's `GenericRevisionInfo`
+/// reports it.
+#[derive(Debug, Clone)]
+pub struct ApplicationRevision {
+    /// The location exactly as the caller supplied it; nothing about a revision
+    /// is inferred into the stored record.
+    pub revision: RevisionLocation,
+    pub description: Option<String>,
+    pub register_time_ms: i64,
+    /// When a deployment first used this revision, and when it last did —
+    /// `None` for a revision that was registered but never deployed.
+    pub first_used_time_ms: Option<i64>,
+    /// See [`ApplicationRevision::first_used_time_ms`].
+    pub last_used_time_ms: Option<i64>,
+}
+
+impl Application {
+    /// Register `revision` with this application, as
+    /// `RegisterApplicationRevision` does.
+    ///
+    /// `registerTime` is when the revision first became known to the
+    /// application and is not moved by a later registration of the same
+    /// revision — a second registration only carries a new `description`, which
+    /// is the member it exists to set.
+    pub fn register_revision(
+        &mut self,
+        key: String,
+        revision: RevisionLocation,
+        description: Option<String>,
+        now_ms: i64,
+    ) {
+        let entry = self.revision_entry(key, revision, now_ms);
+        if description.is_some() {
+            entry.description = description;
+        }
+    }
+
+    /// Record that a deployment used `revision`, which is also how CodeDeploy
+    /// learns a revision a deployment named but nobody registered.
+    pub fn record_revision_use(
+        &mut self,
+        key: String,
+        revision: RevisionLocation,
+        now_ms: i64,
+    ) {
+        let entry = self.revision_entry(key, revision, now_ms);
+        entry.first_used_time_ms = entry.first_used_time_ms.or(Some(now_ms));
+        entry.last_used_time_ms = Some(now_ms);
+    }
+
+    /// This application's entry for `key`, inserted as newly registered when the
+    /// registry does not hold it yet, dropping the oldest-registered revisions
+    /// past [`MAX_REVISIONS_PER_APPLICATION`].
+    fn revision_entry(
+        &mut self,
+        key: String,
+        revision: RevisionLocation,
+        now_ms: i64,
+    ) -> &mut ApplicationRevision {
+        if !self.revisions.contains_key(&key) {
+            self.revisions.insert(
+                key.clone(),
+                ApplicationRevision {
+                    revision,
+                    description: None,
+                    register_time_ms: now_ms,
+                    first_used_time_ms: None,
+                    last_used_time_ms: None,
+                },
+            );
+            self.revision_order.push(key.clone());
+            if let Some(excess) = self
+                .revision_order
+                .len()
+                .checked_sub(MAX_REVISIONS_PER_APPLICATION)
+            {
+                for oldest in self.revision_order.drain(..excess).collect::<Vec<_>>() {
+                    self.revisions.remove(&oldest);
+                }
+            }
+        }
+        self.revisions
+            .get_mut(&key)
+            .expect("the entry was just inserted")
+    }
 }
 
 /// A deployment group: every member `CreateDeploymentGroup` accepts, so the
@@ -207,6 +328,11 @@ pub struct Deployment {
     /// The EFFECTIVE configuration: the request's, else the group's.
     pub deployment_config_name: String,
     pub revision: Option<RevisionLocation>,
+    /// The identity of `revision` ([`revision_key`]), computed ONCE when the
+    /// deployment was recorded. Deriving a group's target revision reads this
+    /// rather than re-deriving it, so no later request re-hashes an inline
+    /// revision's content.
+    pub revision_key: Option<String>,
     pub previous_revision: Option<RevisionLocation>,
     pub status: String,
     pub creator: String,
@@ -234,6 +360,49 @@ pub struct Deployment {
     pub starts_at_ms: i64,
     /// See [`Deployment::starts_at_ms`].
     pub completes_at_ms: i64,
+    /// Whether this deployment terminates the instances of the original (blue)
+    /// environment after traffic routing: true only for a blue/green deployment
+    /// whose group chose the `TERMINATE` action, which is also exactly when the
+    /// model says `instanceTerminationWaitTimeStarted` is reported
+    /// (`smithy_query(query="doc",shape="DeploymentInfo",member="instanceTerminationWaitTimeStarted")`:
+    /// "'false' if the KEEP_ALIVE option is specified").
+    pub terminates_original_instances: bool,
+    /// How much of the group's `terminationWaitTimeInMinutes` this deployment
+    /// still owes before it terminates those instances and completes.
+    ///
+    /// Subtracting it from [`Deployment::completes_at_ms`] gives the instant
+    /// traffic routing is complete, which is when the wait starts;
+    /// `SkipWaitTimeForInstanceTermination` sets it to zero, which is what
+    /// "overrides any specified wait time" means.
+    pub termination_wait_millis: i64,
+    /// Whether the termination wait has started, materialised by the clock; see
+    /// [`ComAmazonawsCodedeployCodedeploy20141006State::advance_clock`].
+    pub instance_termination_wait_time_started: bool,
+}
+
+impl Deployment {
+    /// The instant this deployment's traffic routing is complete, which is when
+    /// a termination wait starts and from which it is measured.
+    pub fn traffic_routing_complete_at_ms(&self) -> i64 {
+        self.completes_at_ms - self.termination_wait_millis
+    }
+
+    /// Whether this deployment has reached a terminal status, by the one
+    /// definition of terminal this service has ([`deployment_is_terminal`]).
+    pub fn is_complete(&self) -> bool {
+        deployment_is_terminal(&self.status)
+    }
+
+    /// Whether this deployment is a blue/green one, which is what
+    /// `SkipWaitTimeForInstanceTermination` and `ContinueDeployment` act on
+    /// (`smithy_query(query="shape",shape="DeploymentType")`: IN_PLACE |
+    /// BLUE_GREEN).
+    pub fn is_blue_green(&self) -> bool {
+        self.deployment_style
+            .as_ref()
+            .and_then(|style| style.deployment_type.as_deref())
+            == Some(DEPLOYMENT_TYPE_BLUE_GREEN)
+    }
 }
 
 /// A deployment configuration — one of the `CodeDeployDefault.*` built-ins, or
@@ -481,6 +650,14 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 deployment.status = DEPLOYMENT_STATUS_IN_PROGRESS.to_string();
                 deployment.start_time_ms = Some(deployment.starts_at_ms);
             }
+            // A blue/green deployment that terminates the original instances
+            // reports its termination wait as started once traffic routing is
+            // complete, which the clock owes at the same instant whoever asks.
+            if deployment.terminates_original_instances
+                && deployment.traffic_routing_complete_at_ms() <= now_ms
+            {
+                deployment.instance_termination_wait_time_started = true;
+            }
             if deployment.start_time_ms.is_some()
                 && deployment.complete_time_ms.is_none()
                 && deployment.completes_at_ms <= now_ms
@@ -714,6 +891,39 @@ pub fn deployment_start_due(create_time_ms: i64) -> i64 {
 /// terminal status.
 pub fn deployment_completion_due(create_time_ms: i64) -> i64 {
     create_time_ms + DEPLOYMENT_COMPLETION_MILLIS
+}
+
+/// What a deployment of `group` owes the original (blue) environment: whether it
+/// terminates its instances at all, and how long it waits before doing so.
+///
+/// Only a blue/green deployment group has an original environment to terminate
+/// (`DeploymentStyle.deploymentType`), and only its `TERMINATE` action
+/// terminates it; the wait is the group's own
+/// `terminationWaitTimeInMinutes` — a duration the caller asked for, so it keeps
+/// its value — held to the range the model documents for that member
+/// ([`MAX_TERMINATION_WAIT_MINUTES`]).
+pub fn termination_wait(group: &DeploymentGroup) -> (bool, i64) {
+    let blue_green = group
+        .deployment_style
+        .as_ref()
+        .and_then(|style| style.deployment_type.as_deref())
+        == Some(DEPLOYMENT_TYPE_BLUE_GREEN);
+    let option = group
+        .blue_green_deployment_configuration
+        .as_ref()
+        .and_then(|config| config.terminate_blue_instances_on_deployment_success.as_ref());
+    let terminates = blue_green
+        && option
+            .and_then(|option| option.action.as_deref())
+            .is_some_and(|action| action == INSTANCE_ACTION_TERMINATE);
+    if !terminates {
+        return (false, 0);
+    }
+    let minutes = option
+        .map(|option| option.termination_wait_time_in_minutes)
+        .unwrap_or_default()
+        .clamp(0, MAX_TERMINATION_WAIT_MINUTES);
+    (true, i64::from(minutes) * 60_000)
 }
 
 /// Epoch milliseconds as the modelled `timestamp` type.
@@ -974,7 +1184,8 @@ pub fn deployment_info(deployment: &Deployment) -> crate::ops::types::Deployment
         rollback_info: deployment.rollback_info.clone(),
         deployment_style: deployment.deployment_style.clone(),
         target_instances: deployment.target_instances.clone(),
-        instance_termination_wait_time_started: false,
+        instance_termination_wait_time_started: deployment
+            .instance_termination_wait_time_started,
         blue_green_deployment_configuration: None,
         load_balancer_info: None,
         additional_deployment_status_info: None,
@@ -1066,6 +1277,141 @@ pub fn deployment_group_info(
 /// so a group created without one does not report an empty list for it.
 fn non_empty<T: Clone>(items: &[T]) -> Option<Vec<T>> {
     (!items.is_empty()).then(|| items.to_vec())
+}
+
+/// A stored revision as the modelled `GenericRevisionInfo`, with the deployment
+/// groups this revision is the current target revision of.
+///
+/// `deploymentGroups` is DERIVED from the deployment index — the groups whose
+/// last attempted deployment deployed this revision — rather than kept as a
+/// second copy that could disagree with it. `targets` is the one
+/// [`target_revision_keys`] map the caller built for this request, so projecting
+/// a page of revisions walks the index ONCE however many revisions it carries.
+pub fn generic_revision_info(
+    application: &Application,
+    targets: &HashMap<String, String>,
+    key: &str,
+) -> crate::ops::types::GenericRevisionInfo {
+    let revision = application.revisions.get(key);
+    crate::ops::types::GenericRevisionInfo {
+        description: revision.and_then(|revision| revision.description.clone()),
+        deployment_groups: non_empty(&deployment_groups_targeting(application, targets, key)),
+        first_used_time: revision
+            .and_then(|revision| revision.first_used_time_ms)
+            .map(timestamp),
+        last_used_time: revision
+            .and_then(|revision| revision.last_used_time_ms)
+            .map(timestamp),
+        register_time: revision.map(|revision| timestamp(revision.register_time_ms)),
+    }
+}
+
+/// The names of `application`'s deployment groups whose target revision — the
+/// revision of their last attempted deployment, from the `targets` map — is the
+/// revision `key` names, in the application's own group order so the answer is
+/// deterministic.
+pub fn deployment_groups_targeting(
+    application: &Application,
+    targets: &HashMap<String, String>,
+    key: &str,
+) -> Vec<String> {
+    application
+        .deployment_group_order
+        .iter()
+        .filter(|group| targets.get(group.as_str()).map(String::as_str) == Some(key))
+        .cloned()
+        .collect()
+}
+
+/// The target revision of each of `application`'s deployment groups that has
+/// one: the [`revision_key`] of its last attempted deployment, by group name.
+///
+/// A group's target revision is the revision of its last attempted deployment,
+/// which is what `DeploymentGroupInfo.targetRevision` reports; it is DERIVED
+/// from the deployment index rather than kept as a second copy that could
+/// disagree with it.
+///
+/// ONE reverse pass over the deployment index answers every group at once — the
+/// newest deployment of a group is the first one the pass meets — and it reads
+/// each deployment's STORED revision key, so nothing here re-hashes a revision's
+/// content. Build it once per request and hand it to the projection.
+pub fn target_revision_keys(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    application: &Application,
+) -> HashMap<String, String> {
+    let mut targets: HashMap<String, String> = HashMap::new();
+    for deployment in state
+        .deployment_order
+        .iter()
+        .rev()
+        .filter_map(|id| state.deployments.get(id))
+    {
+        if deployment.application_name != application.application_name {
+            continue;
+        }
+        let (Some(group), Some(key)) = (
+            deployment.deployment_group_name.clone(),
+            deployment.revision_key.clone(),
+        ) else {
+            continue;
+        };
+        targets.entry(group).or_insert(key);
+    }
+    targets
+}
+
+/// The identity of an application revision: which artifact it names, not how it
+/// is packaged.
+///
+/// `None` for a `RevisionLocation` that names no location at all — the model
+/// holds one location per `revisionType`
+/// (`smithy_query(query="shape",shape="RevisionLocation")`: s3Location,
+/// gitHubLocation, string, appSpecContent) and `revisionType` itself only says
+/// which of them to read — which is what `InvalidRevisionException` describes.
+///
+/// `s3Location.bundleType` is NOT part of the identity: it says how to unpack
+/// the object, not which object it is. The inline `string` and `appSpecContent`
+/// revisions are identified by the digest of their content, so two requests
+/// carrying the same AppSpec name the same revision however they were sent.
+pub fn revision_key(revision: &RevisionLocation) -> Option<String> {
+    if let Some(s3) = &revision.s3_location {
+        let field = |value: &Option<String>| value.clone().unwrap_or_default();
+        return Some(format!(
+            "S3|{}|{}|{}|{}",
+            field(&s3.bucket),
+            field(&s3.key),
+            field(&s3.version),
+            field(&s3.e_tag)
+        ));
+    }
+    if let Some(github) = &revision.git_hub_location {
+        let field = |value: &Option<String>| value.clone().unwrap_or_default();
+        return Some(format!(
+            "GitHub|{}|{}",
+            field(&github.repository),
+            field(&github.commit_id)
+        ));
+    }
+    if let Some(raw) = &revision.string {
+        return Some(format!(
+            "String|{}",
+            content_digest(raw.content.as_deref().unwrap_or_default())
+        ));
+    }
+    if let Some(app_spec) = &revision.app_spec_content {
+        return Some(format!(
+            "AppSpecContent|{}",
+            content_digest(app_spec.content.as_deref().unwrap_or_default())
+        ));
+    }
+    None
+}
+
+/// The hex SHA-256 of an inline revision's content, which is what identifies it.
+fn content_digest(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Run `body` against this service's store, with the built-ins seeded and every

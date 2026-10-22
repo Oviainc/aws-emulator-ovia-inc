@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SkipWaitTimeForInstanceTermination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SkipWaitTimeForInstanceTermination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Overrides a blue/green deployment's instance-termination wait, so it completes
+//! as soon as traffic routing is done.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SkipWaitTimeForInstanceTermination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SkipWaitTimeForInstanceTermination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SkipWaitTimeForInstanceTerminationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SkipWaitTimeForInstanceTermination"))
+        let _ = ctx;
+        // `deploymentId` is modelled OPTIONAL, but there is no deployment to act
+        // on without one, and CodeDeploy has its own code for that: a request
+        // that named none — or named a blank one, which `DeploymentId` carries no
+        // modelled length to refuse at the boundary — is refused here.
+        let deployment_id = input.deployment_id.unwrap_or_default();
+        if deployment_id.trim().is_empty() {
+            return Err(
+                SkipWaitTimeForInstanceTerminationErrorModeled::DeploymentIdRequiredException(
+                    DeploymentIdRequiredException {
+                        message: Some("The deployment ID was not specified".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get_mut(&deployment_id) else {
+                return Err(
+                    SkipWaitTimeForInstanceTerminationErrorModeled::DeploymentDoesNotExistException(
+                        DeploymentDoesNotExistException {
+                            message: Some(format!(
+                                "No deployment found for ID {deployment_id} with this account"
+                            )),
+                        },
+                    ),
+                );
+            };
+            // The lifecycle refusals come first, newest state outwards: a
+            // deployment that already reached a terminal status has no wait left
+            // to skip, whatever kind of deployment it was.
+            if deployment.is_complete() {
+                return Err(
+                    SkipWaitTimeForInstanceTerminationErrorModeled::DeploymentAlreadyCompletedException(
+                        DeploymentAlreadyCompletedException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} is already complete with status {}",
+                                deployment.status
+                            )),
+                        },
+                    ),
+                );
+            }
+            // Only a blue/green deployment has an original environment whose
+            // instances wait to be terminated, so this action does not apply to
+            // any other deployment type.
+            if !deployment.is_blue_green() {
+                return Err(
+                    SkipWaitTimeForInstanceTerminationErrorModeled::UnsupportedActionForDeploymentTypeException(
+                        UnsupportedActionForDeploymentTypeException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} is not a blue/green deployment, so \
+                                 it has no instance termination wait to skip"
+                            )),
+                        },
+                    ),
+                );
+            }
+            if deployment.start_time_ms.is_none() {
+                return Err(
+                    SkipWaitTimeForInstanceTerminationErrorModeled::DeploymentNotStartedException(
+                        DeploymentNotStartedException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} has not started yet, so there is \
+                                 no traffic routing to terminate instances after"
+                            )),
+                        },
+                    ),
+                );
+            }
+
+            // "Overrides any specified wait time and starts terminating
+            // instances immediately after the traffic routing is complete":
+            // dropping the remaining wait moves the completion the clock owes
+            // back to the instant traffic routing completes, which is now for a
+            // deployment already past it. Nothing is terminated by this call
+            // itself — the clock still owes the transition, so a caller reading
+            // the deployment sees the same record every later caller does.
+            deployment.completes_at_ms = deployment.traffic_routing_complete_at_ms();
+            deployment.termination_wait_millis = 0;
+            Ok(())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+        outcome?;
+
+        Ok(SkipWaitTimeForInstanceTerminationOutput)
     }
 }

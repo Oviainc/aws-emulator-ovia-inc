@@ -133,7 +133,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateInputSecurityGroup";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_INPUT_SECURITY_GROUP_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_INPUT_SECURITY_GROUP_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // 201 Created, NOT the 200 the model declares for this one operation: the
+    // recorded wire response to `POST /prod/inputSecurityGroups` is 201, and the
+    // wire is the authority where it and the model disagree. It is also the
+    // status this model itself declares for every other MediaLive operation that
+    // mints a resource (`CreateChannel`, `CreateInput`, `CreatePartnerInput`,
+    // `CreateMultiplex`, `CreateCluster`, `CreateNetwork`, `CreateNode`,
+    // `CreateSignalMap`, …), so a client keying a retry or idempotency decision
+    // off the exact 2xx code sees a create here, as it does there.
+    const SUCCESS_STATUS: u16 = 201u16;
 
     async fn handle(
         &self,
@@ -179,7 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything the request supplied is stored verbatim; the response is then
         // read back out of the stored record, never from `input`. `State`,
         // `Inputs` and `Channels` are not stored at all: they report what
-        // currently uses the group, so they are derived on every read.
+        // currently uses the group and whether it has been deleted, so they are
+        // derived on every read.
         state.input_security_groups.insert(
             id.clone(),
             crate::state::InputSecurityGroupRecord {

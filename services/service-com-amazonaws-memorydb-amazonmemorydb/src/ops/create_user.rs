@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! IMPLEMENTED: inserts the user into [`crate::state`] keyed by `UserName` and answers
-//! with the stored record, so `DescribeUsers` reports exactly what was persisted. The
-//! request's `AuthenticationMode` is checked against the password rules AWS documents
-//! (see [`crate::state::authentication_from_mode`]) and only the password COUNT is
+//! IMPLEMENTED: inserts the user into [`crate::state`] keyed by its FOLDED `UserName`
+//! (a MemoryDB resource name is a case-insensitive identifier, refused outright when it
+//! breaks the service's name rule) and answers with the stored record, so
+//! `DescribeUsers` reports exactly what was persisted. The `AccessString` is stored in
+//! the canonical form the service reports (see
+//! [`crate::state::normalise_access_string`]). The request's `AuthenticationMode` is
+//! checked against the password rules AWS documents (see
+//! [`crate::state::authentication_from_mode`]) and only the password COUNT is
 //! kept: the passwords themselves are secrets this emulator never stores or returns.
 //!
 //! ## Shape of an operation
@@ -187,6 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
         let region = crate::state::request_region(ctx);
+        // A MemoryDB user name is a case-insensitive identifier the service bounds more
+        // tightly than the model's pattern does, so it is checked and folded BEFORE
+        // anything is persisted and the folded spelling is what state is keyed by.
+        if let Some(message) = crate::state::resource_name_rejection("UserName", &input.user_name)
+        {
+            return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The request's tag keys are refused before the user is created: `Tag$Key` may
         // not be null, and the `aws:` prefix is reserved for AWS.
         if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
@@ -197,22 +213,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let user_name = crate::state::fold_name(&input.user_name);
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);
-        // The users the account ALREADY HAD before any call (MemoryDB's built-in
-        // `default` user) are materialised on first touch, exactly as `DescribeUsers`
-        // does, so a create naming one of them collides with it instead of replacing
-        // it, and the quota below counts it.
-        state.ensure_builtin_users(&region);
+        // The resources the account ALREADY HAD before any call (MemoryDB's built-in
+        // `default` user and `open-access` ACL) are materialised on first touch,
+        // exactly as `DescribeUsers` does, so a create naming one of them collides with
+        // it instead of replacing it, and the quota below counts it.
+        state.ensure_builtins(&region);
 
-        if state.users.contains_key(&input.user_name) {
+        if state.users.contains_key(&user_name) {
             return Err(CreateUserErrorModeled::UserAlreadyExistsFault(
                 UserAlreadyExistsFault {
-                    message: Some(format!(
-                        "User with name {} already exists.",
-                        input.user_name
-                    )),
+                    message: Some(format!("User with name {user_name} already exists.")),
                 },
             )
             .into());
@@ -230,14 +244,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let arn = crate::state::user_arn(&region, &input.user_name);
+        let arn = crate::state::user_arn(&region, &user_name);
         let user = crate::state::StoredUser {
-            name: input.user_name.clone(),
+            name: user_name.clone(),
             // A user AWS has accepted is usable at once: `CreateUser` answers with it
             // already `active`, so there is no transition for the clock to owe. Only
             // a later `UpdateUser`/`DeleteUser` moves it off that status.
             status: crate::state::user_status::ACTIVE.to_string(),
-            access_string: input.access_string,
+            // The service canonicalises the ACL rule list before storing it, so what a
+            // later describe reports is the normalised form rather than the request's.
+            access_string: crate::state::normalise_access_string(&input.access_string),
             authentication_type,
             password_count,
             // Nothing is owed on a user that is already `active`.
@@ -254,10 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // list the user, through the one rule `DescribeUsers` reads it with.
         let acl_names = state
             .user_membership()
-            .remove(input.user_name.as_str())
+            .remove(user_name.as_str())
             .unwrap_or_default();
         let response = user.to_api(acl_names);
-        state.users.insert(input.user_name, user);
+        state.users.insert(user_name, user);
         Ok(CreateUserOutput {
             user: Some(response),
         })

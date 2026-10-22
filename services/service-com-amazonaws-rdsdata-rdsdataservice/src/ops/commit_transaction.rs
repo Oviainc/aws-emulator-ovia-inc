@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CommitTransaction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CommitTransaction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CommitTransaction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Commits a transaction opened by `BeginTransaction`: the database copy the
+//! transaction was writing into becomes the committed database, so a later
+//! non-transactional read sees its writes, and the transaction is removed.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CommitTransaction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CommitTransactionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CommitTransaction"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CommitTransactionError::from(
+                CommitTransactionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException::default(),
+                ),
+            )
+        })?;
+        // Installing the transaction's database is engine-owned state under the
+        // service lock, so it runs on the blocking pool under one wall clock.
+        crate::state::in_data_plane(move || commit(&store, &input))
+            .await
+            .map_err(request_failed)
     }
+}
+
+/// Apply the transaction's writes, inside the data plane.
+fn commit(
+    store: &crate::state::Store,
+    input: &CommitTransactionInput,
+) -> Result<CommitTransactionOutput, crate::state::SqlError> {
+    crate::state::require_arn("resourceArn", &input.resource_arn)?;
+    crate::state::require_arn("secretArn", &input.secret_arn)?;
+    let mut state = store.lock();
+    let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.expire_timed_out_transactions();
+    // The name the transaction's writes belong to, read before the transaction is
+    // taken out of the store: the destination slot is claimed through the CAPPED
+    // accessor first, so a commit that cannot be served (the cluster is at
+    // `MAX_DATABASES_PER_CLUSTER` and this name is new, because the committed
+    // database was swept while the transaction was open) is refused with the
+    // transaction still intact rather than losing its writes.
+    let database = crate::state::database_key(
+        cluster
+            .transactions
+            .get(&input.transaction_id)
+            .ok_or(crate::state::SqlError::TransactionNotFound)?
+            .database
+            .as_ref(),
+    );
+    cluster.database_mut(&database)?;
+    let transaction = cluster
+        .transactions
+        .remove(&input.transaction_id)
+        .ok_or(crate::state::SqlError::TransactionNotFound)?;
+    // Applying the transaction's writes: the database it wrote into becomes the
+    // cluster's committed database for that name, which is what makes those writes
+    // visible to a later non-transactional statement.
+    //
+    // ISOLATION, stated here because it is observable: installing the whole
+    // database gives ONE database database-granularity last-writer-wins, so a
+    // write committed outside this transaction after it opened is replaced by this
+    // commit rather than merged with it. A real engine would serialise the two.
+    // The emulator keeps the simpler rule deliberately — the transaction's own
+    // statements are all the engine's own behaviour, and a caller that needs two
+    // writers on one database serialises them itself — and
+    // `two_writers_on_one_database_are_last_writer_wins` in
+    // `tests/all/sql_data_api.rs` pins it, so the semantics are asserted and not
+    // merely commented.
+    cluster.databases.insert(database, transaction.pending);
+    Ok(CommitTransactionOutput {
+        transaction_status: Some("Transaction Committed".to_string()),
+    })
+}
+
+/// Report a request that could not be served as the error this operation models
+/// for it. A `transactionId` this cluster has no open transaction for — one that
+/// was never opened, or one already committed, rolled back or timed out — is the
+/// modelled 404.
+fn request_failed(error: crate::state::SqlError) -> CommitTransactionError {
+    let message = Some(error.message());
+    match error {
+        crate::state::SqlError::TransactionNotFound => {
+            CommitTransactionErrorModeled::TransactionNotFoundException(
+                TransactionNotFoundException { message },
+            )
+        }
+        crate::state::SqlError::Timeout => {
+            CommitTransactionErrorModeled::StatementTimeoutException(StatementTimeoutException {
+                message,
+                db_connection_id: 0,
+            })
+        }
+        crate::state::SqlError::Unavailable(detail) => {
+            tracing::error!(%detail, "the rds-data data plane could not commit a transaction");
+            CommitTransactionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException::default(),
+            )
+        }
+        crate::state::SqlError::Capacity(detail) => {
+            tracing::warn!(%detail, "the rds-data data plane is at a stored-object cap");
+            CommitTransactionErrorModeled::ServiceUnavailableError(
+                ServiceUnavailableError::default(),
+            )
+        }
+        _ => CommitTransactionErrorModeled::BadRequestException(BadRequestException { message }),
+    }
+    .into()
 }

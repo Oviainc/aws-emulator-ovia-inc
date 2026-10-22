@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RollbackTransaction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RollbackTransaction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RollbackTransaction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rolls a transaction opened by `BeginTransaction` back: the database copy it
+//! was writing into is discarded, so a later read sees the rows as they were
+//! before the transaction, and the transaction is removed.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RollbackTransaction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RollbackTransactionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RollbackTransaction"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RollbackTransactionError::from(
+                RollbackTransactionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException::default(),
+                ),
+            )
+        })?;
+        // Dropping the transaction's database is engine-owned state under the
+        // service lock, so it runs on the blocking pool under one wall clock.
+        crate::state::in_data_plane(move || rollback(&store, &input))
+            .await
+            .map_err(request_failed)
     }
+}
+
+/// Discard the transaction's writes, inside the data plane.
+fn rollback(
+    store: &crate::state::Store,
+    input: &RollbackTransactionInput,
+) -> Result<RollbackTransactionOutput, crate::state::SqlError> {
+    crate::state::require_arn("resourceArn", &input.resource_arn)?;
+    crate::state::require_arn("secretArn", &input.secret_arn)?;
+    let mut state = store.lock();
+    let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.expire_timed_out_transactions();
+    let transaction = cluster
+        .transactions
+        .remove(&input.transaction_id)
+        .ok_or(crate::state::SqlError::TransactionNotFound)?;
+    // Discarding the transaction drops the database copy it was writing into, so
+    // none of its writes ever reach the committed database.
+    drop(transaction);
+    Ok(RollbackTransactionOutput {
+        transaction_status: Some("Transaction Rolled Back".to_string()),
+    })
+}
+
+/// Report a request that could not be served as the error this operation models
+/// for it. A `transactionId` this cluster has no open transaction for — one that
+/// was never opened, or one already committed, rolled back or timed out — is the
+/// modelled 404.
+fn request_failed(error: crate::state::SqlError) -> RollbackTransactionError {
+    let message = Some(error.message());
+    match error {
+        crate::state::SqlError::TransactionNotFound => {
+            RollbackTransactionErrorModeled::TransactionNotFoundException(
+                TransactionNotFoundException { message },
+            )
+        }
+        crate::state::SqlError::Timeout => {
+            RollbackTransactionErrorModeled::StatementTimeoutException(StatementTimeoutException {
+                message,
+                db_connection_id: 0,
+            })
+        }
+        crate::state::SqlError::Unavailable(detail) => {
+            tracing::error!(%detail, "the rds-data data plane could not roll a transaction back");
+            RollbackTransactionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException::default(),
+            )
+        }
+        crate::state::SqlError::Capacity(detail) => {
+            tracing::warn!(%detail, "the rds-data data plane is at a stored-object cap");
+            RollbackTransactionErrorModeled::ServiceUnavailableError(
+                ServiceUnavailableError::default(),
+            )
+        }
+        _ => RollbackTransactionErrorModeled::BadRequestException(BadRequestException { message }),
+    }
+    .into()
 }

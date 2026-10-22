@@ -31,3 +31,11 @@ mod resource_tags;
 mod response_field_fidelity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// `authorization_token` is declared AFTER the sorted list rather than in its
+// alphabetical place at the top, for the reason `service-com-amazonaws-transfer-
+// transferservice` records for its own out-of-place suite: every suite this crate gains
+// is inserted into the sorted list, so the first lines of that list are exactly what a
+// concurrent change also edits, and this declaration kept landing on top of one. Fold it
+// into the list once the churn settles.
+#[path = "all/authorization_token.rs"]
+mod authorization_token;
