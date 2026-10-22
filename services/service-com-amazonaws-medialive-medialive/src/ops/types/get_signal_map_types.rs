@@ -17,7 +17,11 @@ pub struct GetSignalMapInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#GetSignalMapResponse")]
+/// `GetSignalMapResponse`, with its schema written out instead of derived because
+/// `CreatedAt`, `LastDiscoveredAt` and `ModifiedAt` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape: same ids, same order, same
+/// indices.
 #[derive(Debug, Clone, Default)]
 pub struct GetSignalMapOutput {
     pub arn: Option<String>,
@@ -39,4 +43,10 @@ pub struct GetSignalMapOutput {
     pub status: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+shared_types::signal_map_response!(
+    GetSignalMapOutput,
+    GET_SIGNAL_MAP_OUTPUT_SCHEMA,
+    "GetSignalMapResponse"
+);
 

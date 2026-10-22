@@ -15,7 +15,7 @@ use service_com_amazonaws_medialive_medialive::state::MAX_LIST_PAGE_SIZE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
-use crate::support::timestamp;
+use crate::support::{entry_point, timestamp};
 use crate::wire::{call, call_in_region, error_code, medialive, DEFAULT_REGION};
 
 /// The collection URI `ListSignalMaps` is bound to
@@ -40,25 +40,6 @@ fn summaries(case: &str, body: &Value) -> Vec<Value> {
         .as_array()
         .cloned()
         .unwrap_or_else(|| panic!("case {case:?}: expected a signalMaps list, got {body}"))
-}
-
-/// One channel to enter discovery from, answering its ARN.
-async fn entry_point(router: &MultiServiceRouter) -> String {
-    let (status, created) = call(
-        router,
-        "POST",
-        "/prod/channels",
-        Some(json!({ "name": "entry" })),
-    )
-    .await;
-    assert_eq!(
-        status, 201,
-        "CreateChannel: expected 201, got {status}: {created}"
-    );
-    created["channel"]["arn"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// `CreateSignalMap` with `body`, answering the created map's id.
@@ -215,7 +196,7 @@ async fn list_signal_maps_pages_through_every_stored_map_in_mint_order() {
     } in table
     {
         let router = medialive();
-        let entry = entry_point(&router).await;
+        let entry = entry_point(&router, "entry").await;
 
         let mut created: Vec<String> = Vec::new();
         for index in 0..maps {
@@ -313,7 +294,7 @@ async fn a_listed_summary_reads_the_stored_signal_map() {
     } in table
     {
         let router = medialive();
-        let entry = entry_point(&router).await;
+        let entry = entry_point(&router, "entry").await;
         let name = format!("map-{}", case.replace(' ', "-"));
 
         let mut body = json!({ "name": name, "discoveryEntryPointArn": entry });
@@ -430,7 +411,7 @@ async fn a_listed_summary_reads_the_stored_signal_map() {
 #[tokio::test]
 async fn a_group_filter_lists_only_the_maps_associated_with_that_group() {
     let router = medialive();
-    let entry = entry_point(&router).await;
+    let entry = entry_point(&router, "entry").await;
 
     let alarm_one = create_group(&router, ALARM_GROUPS, "alarm-one").await;
     let alarm_two = create_group(&router, ALARM_GROUPS, "alarm-two").await;

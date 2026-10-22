@@ -3367,9 +3367,8 @@ pub(crate) use input_security_group_description_output;
 /// `UpdateEventBridgeRuleTemplateGroupOutput` when its own issue lands).
 ///
 /// One macro rather than a hand-written copy per operation, so the operations
-/// that report a group cannot drift from each other. `Tags` is reported only
-/// when the group carries tags: an empty map would claim a tag set the caller
-/// never supplied.
+/// that report a group cannot drift from each other. `Tags` is always reported,
+/// as the map it is modelled as; see [`template_group_output`].
 macro_rules! event_bridge_rule_template_group_output {
     ($out:ident, $group:expr) => {
         $crate::state::template_group_output!(
@@ -3387,9 +3386,16 @@ pub(crate) use event_bridge_rule_template_group_output;
 ///
 /// Every monitor template group the service models carries the same members, so
 /// the per-resource macros above and below delegate here rather than each
-/// carrying its own copy of the projection, which could then drift. `Tags` is
-/// reported only when the group carries tags: an empty map would claim a tag set
-/// the caller never supplied.
+/// carrying its own copy of the projection, which could then drift.
+///
+/// `Tags` reports the group's tag set WHATEVER it holds — an untagged group
+/// reports the empty map, not an absent member. The member is modelled as a
+/// `TagMap`, and a resource that carries no tags carries zero tags rather than
+/// an unknown number of them, so a caller that iterates the map sees an empty
+/// map instead of a null it has to special-case. It is also how this service's
+/// own signal maps already report their tags
+/// ([`ComAmazonawsMedialiveMedialiveState::signal_map_description`]), so one
+/// resource of this service cannot answer "no tags" differently from another.
 macro_rules! template_group_output {
     ($out:ident, $record:ty, $group:expr) => {{
         let group: &$record = $group;
@@ -3400,11 +3406,7 @@ macro_rules! template_group_output {
             id: Some(group.id.clone()),
             modified_at: Some(::aws_smithy_types::DateTime::from(group.modified_at)),
             name: Some(group.name.clone()),
-            tags: if group.tags.is_empty() {
-                None
-            } else {
-                Some(group.tags.clone())
-            },
+            tags: Some(group.tags.clone()),
         }
     }};
 }

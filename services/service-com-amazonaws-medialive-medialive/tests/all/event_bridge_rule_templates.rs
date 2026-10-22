@@ -14,7 +14,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{member, timestamp};
+use crate::support::{member, reported_tags, timestamp};
 use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 
 /// `CreateEventBridgeRuleTemplate` / `ListEventBridgeRuleTemplates` URI, and the
@@ -255,9 +255,11 @@ async fn a_created_template_is_read_back_by_its_id_and_by_its_name() {
             "case {case:?}: expected the description the request supplied, got {:?}",
             created["description"]
         );
+        // `Tags` is always reported, as the map it is modelled as: a template
+        // created with no tags reports the empty map.
         assert_eq!(
             member(&created, "tags"),
-            member(&request, "tags"),
+            reported_tags(request.get("tags")),
             "case {case:?}: expected the tags the request supplied, got {:?}",
             created["tags"]
         );
