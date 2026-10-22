@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventSourcesConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventSourcesConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventSourcesConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the event-source integration this account persisted: a pure read of
+//! [`crate::state::EventSourcesRecord`], which `UpdateEventSourcesConfig` is the only
+//! writer of. Before any update the record is the opted-out default, so this read
+//! answers `DISABLED` rather than an absent configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +140,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventSourcesConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventSourcesConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventSourcesConfig"))
+        // `DescribeEventSourcesConfigRequest` models no members, and this read writes
+        // nothing: a later caller sees exactly what `UpdateEventSourcesConfig` left.
+        let _ = (&input, ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEventSourcesConfigError::Modeled(
+                DescribeEventSourcesConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru event sources store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // Cloned out under the lock so the critical section is just the read.
+        let status = state
+            .lock()
+            .event_sources
+            .code_guru_profiler_status
+            .clone();
+
+        // `EventSourcesConfig` models exactly one integration, and the record always
+        // holds a status for it, so the read reports the whole shape rather than
+        // omitting a member a caller would have to guess the meaning of.
+        Ok(DescribeEventSourcesConfigOutput {
+            event_sources: Some(EventSourcesConfig {
+                amazon_code_guru_profiler: Some(AmazonCodeGuruProfilerIntegration {
+                    status: Some(status),
+                }),
+            }),
+        })
     }
 }

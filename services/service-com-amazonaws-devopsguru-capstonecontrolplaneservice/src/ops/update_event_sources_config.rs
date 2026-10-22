@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEventSourcesConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEventSourcesConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEventSourcesConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists the event-source integration this account asks for, into
+//! [`crate::state::EventSourcesRecord`], which `DescribeEventSourcesConfig` reports.
+//! Every member of `EventSourcesConfig` is optional, so an absent one leaves the
+//! stored status as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEventSourcesConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEventSourcesConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEventSourcesConfig"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEventSourcesConfigError::Modeled(
+                UpdateEventSourcesConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru event sources store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // `EventSources`, `AmazonCodeGuruProfiler` and `Status` are each optional, so an
+        // absent one names nothing to change and leaves the stored configuration alone.
+        let Some(status) = input
+            .event_sources
+            .as_ref()
+            .and_then(|sources| sources.amazon_code_guru_profiler.as_ref())
+            .and_then(|integration| integration.status.as_ref())
+        else {
+            return Ok(UpdateEventSourcesConfigOutput::default());
+        };
+
+        // `Status` targets the `EventSourceOptInStatus` enum, whose value set the
+        // boundary validator enforces before this handler runs (see the enum-value
+        // constraint in `vendor/smithy-schema-server/src/constraints.rs`), so a value
+        // the enum does not declare is already refused with a 400 `ValidationException`
+        // and never reaches the store. The sibling writer
+        // `update_service_integration.rs` relies on the same boundary check for
+        // `OptInStatus`, so both per-account configuration writers leave that rule where
+        // the model expresses it rather than restating it here.
+        state.lock().event_sources.code_guru_profiler_status = status.clone();
+
+        Ok(UpdateEventSourcesConfigOutput::default())
     }
 }

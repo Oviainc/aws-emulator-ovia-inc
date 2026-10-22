@@ -64,6 +64,8 @@ impl Reply {
 }
 
 /// A fresh emulator holding only this service, over its own engine.
+///
+/// Shared with the sibling suites of this test target (see `tests/all.rs`).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The one engine the registered service reads and writes, kept so a suite can

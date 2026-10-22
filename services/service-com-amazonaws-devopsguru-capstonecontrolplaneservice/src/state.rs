@@ -4,8 +4,9 @@
 //!
 //! Everything a DevOps Guru client can itself create lives here: the analysis
 //! coverage it declares (`UpdateResourceCollection`), the notification channels it
-//! adds (`AddNotificationChannel`), and the service-integration configuration it
-//! sets (`UpdateServiceIntegration`).
+//! adds (`AddNotificationChannel`), the service-integration configuration it sets
+//! (`UpdateServiceIntegration`) and the event-source integration it toggles
+//! (`UpdateEventSourcesConfig`).
 //!
 //! Insights are produced by DevOps Guru's own analysis, never by a client call, so
 //! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insights`] is the map
@@ -35,6 +36,9 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// The last `UpdateServiceIntegration` configuration, which
     /// `DescribeServiceIntegration` reports.
     pub service_integration: ServiceIntegrationRecord,
+    /// The last `UpdateEventSourcesConfig` configuration, which
+    /// `DescribeEventSourcesConfig` reports.
+    pub event_sources: EventSourcesRecord,
     /// The insights DevOps Guru's analysis produced for this account, keyed by
     /// `InsightId`.
     ///
@@ -318,6 +322,27 @@ pub struct ServiceIntegrationRecord {
     pub kms_server_side_encryption: KmsServerSideEncryptionRecord,
 }
 
+/// The persisted `EventSourcesConfig`.
+///
+/// One record per account and region, of fixed shape: `EventSourcesConfig` models a
+/// single integration (`AmazonCodeGuruProfiler`), so this store grows by nothing when
+/// it is written.
+#[derive(Debug, Clone)]
+pub struct EventSourcesRecord {
+    /// `EventSources.AmazonCodeGuruProfiler.Status` (`EventSourceOptInStatus`).
+    pub code_guru_profiler_status: String,
+}
+
+/// Before any `UpdateEventSourcesConfig`, DevOps Guru consumes nothing from CodeGuru
+/// Profiler: the integration is opted out until a client enables it.
+impl Default for EventSourcesRecord {
+    fn default() -> Self {
+        Self {
+            code_guru_profiler_status: OPT_IN_STATUS_DISABLED.to_string(),
+        }
+    }
+}
+
 /// The persisted `KMSServerSideEncryptionIntegration`.
 #[derive(Debug, Clone)]
 pub struct KmsServerSideEncryptionRecord {
@@ -330,7 +355,9 @@ pub struct KmsServerSideEncryptionRecord {
 }
 
 /// `OptInStatus` as the model spells "off" — see `OPT_IN_STATUS_VALUES` in
-/// `ops/types/shared_types.rs`.
+/// `ops/types/shared_types.rs`. `EventSourceOptInStatus` declares the same two
+/// values (`DISABLED` | `ENABLED`), so the event-source record spells "off" with
+/// this same constant.
 pub const OPT_IN_STATUS_DISABLED: &str = "DISABLED";
 
 /// The `ResourceType` a channel-shaped `ConflictException` or

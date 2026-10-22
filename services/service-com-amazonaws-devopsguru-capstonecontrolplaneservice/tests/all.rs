@@ -15,6 +15,8 @@
 mod account_health;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
+#[path = "all/event_sources_config.rs"]
+mod event_sources_config;
 #[path = "all/insight_listing.rs"]
 mod insight_listing;
 #[path = "all/insight_reads.rs"]
