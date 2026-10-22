@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFileSystem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFileSystem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFileSystem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a file system, persists it in [`crate::state`] and answers with the stored record
+//! projected onto the modelled `FileSystem` shape. The record starts in `CREATING` with the
+//! clock owing it a transition to `AVAILABLE`, which is what AWS documents: "The
+//! CreateFileSystem call returns while the file system's lifecycle state is still CREATING."
+//!
+//! The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -30,7 +28,7 @@
 //!     state.lock().your_field = /* ... */;
 //! ```
 //!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
+//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only:
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
@@ -178,6 +176,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use sha2::{Digest, Sha256};
+
+use crate::state::{
+    file_system_dns_name, file_system_type_version, fsx_arn, stored_lustre_configuration,
+    stored_ontap_configuration, stored_open_zfs_configuration, stored_windows_configuration,
+    FileSystemRecord, IdempotentCreate, PendingTransition, TransitionTarget,
+    DEFAULT_NETWORK_TYPE, DEFAULT_STORAGE_TYPE, FILE_SYSTEM_RESOURCE_TYPE, LIFECYCLE_CREATING,
+    MAX_FILE_SYSTEMS, SERVICE_LIMIT_FILE_SYSTEM_COUNT,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -255,18 +266,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFileSystem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFileSystemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFileSystem"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFileSystemErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the FSx file-system store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // The modelled `SubnetIds` list declares `length min 0`, so an EMPTY list satisfies
+        // the boundary validator and reaches here, but a file system has to be reachable
+        // from at least one subnet.
+        if input.subnet_ids.is_empty() {
+            return Err(CreateFileSystemErrorModeled::InvalidNetworkSettings(
+                InvalidNetworkSettings {
+                    message: Some("SubnetIds must specify at least one subnet".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // Every ARN and DNS name is built for the region the caller signed for.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let fingerprint = create_parameter_fingerprint(&input);
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // `@idempotencyToken`, as AWS documents it for this operation: "If a file system
+        // with the specified client request token exists and the parameters match,
+        // CreateFileSystem returns the description of the existing file system. If a file
+        // system with the specified client request token exists and the parameters don't
+        // match, this call returns IncompatibleParameterError."
+        if let Some(token) = input.client_request_token.clone() {
+            if let Some(previous) = store.idempotency_tokens.get(&token).cloned() {
+                match store.file_systems.get(&previous.file_system_id) {
+                    Some(_) if previous.fingerprint != fingerprint => {
+                        return Err(CreateFileSystemErrorModeled::IncompatibleParameterError(
+                            IncompatibleParameterError {
+                                parameter: "ClientRequestToken".to_string(),
+                                message: Some(format!(
+                                    "the client request token {token} was already used to create {} with different parameters",
+                                    previous.file_system_id
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    Some(record) => {
+                        return Ok(CreateFileSystemOutput {
+                            file_system: Some(record.to_file_system()),
+                        });
+                    }
+                    // The file system that token created is gone, so the token replays
+                    // nothing: drop it and create a new file system below.
+                    None => {
+                        store.forget_idempotency_token(&token);
+                    }
+                }
+            }
+        }
+
+        // The record store is bounded by the service's own published limit on file systems
+        // per account per Region, so a create past it is refused with the modelled error
+        // instead of growing the store without end. Checked here, before an id is minted,
+        // and enforced again by `insert_file_system` below, which is the one write path.
+        if store.file_systems.len() >= MAX_FILE_SYSTEMS {
+            return Err(file_system_count_limit_exceeded());
+        }
+
+        let file_system_id = store.mint_file_system_id();
+        let record = FileSystemRecord {
+            file_system_id: file_system_id.clone(),
+            owner_id: ::emulator_server::emulator_account_id().to_string(),
+            creation_time: SystemTime::now(),
+            file_system_type: input.file_system_type.clone(),
+            lifecycle: LIFECYCLE_CREATING.to_string(),
+            storage_capacity: input.storage_capacity,
+            storage_type: input
+                .storage_type
+                .clone()
+                .unwrap_or_else(|| DEFAULT_STORAGE_TYPE.to_string()),
+            vpc_id: None,
+            subnet_ids: input.subnet_ids.clone(),
+            security_group_ids: input.security_group_ids.clone().unwrap_or_default(),
+            network_interface_ids: Vec::new(),
+            dns_name: file_system_dns_name(&file_system_id, &region),
+            kms_key_id: input.kms_key_id.clone(),
+            resource_arn: fsx_arn(&region, FILE_SYSTEM_RESOURCE_TYPE, &file_system_id),
+            file_system_type_version: file_system_type_version(
+                input.file_system_type_version.as_deref(),
+                &input.file_system_type,
+                input.lustre_configuration.as_ref(),
+            ),
+            network_type: input
+                .network_type
+                .clone()
+                .unwrap_or_else(|| DEFAULT_NETWORK_TYPE.to_string()),
+            windows_configuration: input
+                .windows_configuration
+                .as_ref()
+                .map(|config| stored_windows_configuration(config, &input.subnet_ids)),
+            lustre_configuration: input
+                .lustre_configuration
+                .as_ref()
+                .map(stored_lustre_configuration),
+            ontap_configuration: input
+                .ontap_configuration
+                .as_ref()
+                .map(|config| stored_ontap_configuration(config, &input.subnet_ids)),
+            open_zfs_configuration: input
+                .open_zfs_configuration
+                .as_ref()
+                .map(|config| stored_open_zfs_configuration(config, &input.subnet_ids)),
+            tags: input
+                .tags
+                .iter()
+                .flatten()
+                .map(|tag| (tag.key.clone(), tag.value.clone()))
+                .collect::<BTreeMap<String, String>>(),
+            pending: Some(PendingTransition::due_now_plus_span(
+                TransitionTarget::Available,
+            )),
+        };
+
+        // The response is the STORED record, so it can never disagree with what the next
+        // `DescribeFileSystems` returns.
+        let file_system = record.to_file_system();
+        if store.insert_file_system(record).is_err() {
+            return Err(file_system_count_limit_exceeded());
+        }
+        if let Some(token) = input.client_request_token.clone() {
+            store.remember_idempotent_create(
+                token,
+                IdempotentCreate {
+                    file_system_id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(CreateFileSystemOutput {
+            file_system: Some(file_system),
+        })
     }
 }
+
+/// The modelled refusal for a create that would take the account past
+/// [`MAX_FILE_SYSTEMS`]: `ServiceLimitExceeded` naming the `FILE_SYSTEM_COUNT` limit.
+fn file_system_count_limit_exceeded() -> CreateFileSystemError {
+    CreateFileSystemErrorModeled::ServiceLimitExceeded(ServiceLimitExceeded {
+        limit: SERVICE_LIMIT_FILE_SYSTEM_COUNT.to_string(),
+        message: Some(format!(
+            "this account already has the maximum of {MAX_FILE_SYSTEMS} file systems in this Region"
+        )),
+    })
+    .into()
+}
+
+/// A fixed-size digest of a create call's parameters, for the `@idempotencyToken`
+/// comparison.
+///
+/// Every input member except `ClientRequestToken` itself takes part, so two calls carrying
+/// one token are "the same parameters" exactly when every other member agrees. `Tags` is
+/// sorted first, so the same tag set in a different order compares equal. The members are
+/// rendered and then DIGESTED, so what the service remembers per token is 32 bytes
+/// whatever the request's size; the digest is only ever compared against another digest
+/// from this same function, and is never parsed, stored as a resource value, or returned.
+fn create_parameter_fingerprint(input: &CreateFileSystemInput) -> String {
+    let mut tags: Vec<(&str, &str)> = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    tags.sort_unstable();
+    // The rendering is `Debug`, which every one of these generated shapes derives. That is
+    // sound ONLY because the digest is compared against another digest from this same
+    // function in the same process: it is never persisted across builds, parsed, or
+    // returned, so a change in the generator's `Debug` output can at worst make one token
+    // replay look like a parameter change, never corrupt a stored resource.
+    let rendered = format!(
+        "{:?}|{:?}",
+        (
+            &input.file_system_type,
+            input.storage_capacity,
+            &input.storage_type,
+            &input.subnet_ids,
+            &input.security_group_ids,
+            &input.kms_key_id,
+        ),
+        (
+            &input.file_system_type_version,
+            &input.network_type,
+            &tags,
+            &input.windows_configuration,
+            &input.lustre_configuration,
+            &input.ontap_configuration,
+            &input.open_zfs_configuration,
+        )
+    );
+    hex::encode(Sha256::digest(rendered.as_bytes()))
+}
+

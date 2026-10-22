@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFileSystems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFileSystems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFileSystems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the file systems this service has stored, filtered by `FileSystemIds` when the
+//! request names any, paged by `MaxResults` with an opaque `NextToken`. The ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +91,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    decode_page_token, file_systems_page_scope, page_size, paginate, FileSystemRecord,
+    MAX_FILE_SYSTEMS_PER_PAGE,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,17 +167,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFileSystems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFileSystemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFileSystems"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeFileSystemsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the FSx file-system store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // A reporting operation, so this only materialises transitions the clock had
+        // already made due at this instant.
+        store.settle_due_transitions();
+
+        // `FileSystemIds` selects which file systems to report; an absent (or empty) list
+        // reports them all. AWS raises `FileSystemNotFound` when a requested id does not
+        // exist, rather than silently returning a shorter list.
+        let requested = input.file_system_ids.clone().unwrap_or_default();
+        let mut selected = requested.clone();
+        selected.sort();
+        selected.dedup();
+        let keys: Vec<String> = if requested.is_empty() {
+            store.file_systems.keys().cloned().collect()
+        } else {
+            if let Some(missing) = requested
+                .iter()
+                .find(|id| !store.file_systems.contains_key(*id))
+            {
+                return Err(DescribeFileSystemsErrorModeled::FileSystemNotFound(
+                    FileSystemNotFound {
+                        message: Some(format!("file system {missing} does not exist")),
+                    },
+                )
+                .into());
+            }
+            selected.clone()
+        };
+
+        // The page token is scoped to the SELECTION it was minted for, so a token from an
+        // unfiltered listing is not accepted for a filtered one (or for a different
+        // filter): a cursor only means anything over the same ordered set of keys.
+        let page_scope = file_systems_page_scope(&selected);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match decode_page_token(&page_scope, token) {
+                Some(cursor) => Some(cursor),
+                // A token this service did not mint means nothing to it.
+                None => {
+                    return Err(DescribeFileSystemsErrorModeled::BadRequest(BadRequest {
+                        message: Some("NextToken is not a token this service issued".to_string()),
+                    })
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        let (page, next_token) = paginate(
+            &page_scope,
+            &keys,
+            resume_after.as_deref(),
+            page_size(input.max_results, MAX_FILE_SYSTEMS_PER_PAGE),
+        );
+
+        Ok(DescribeFileSystemsOutput {
+            file_systems: Some(
+                page.iter()
+                    .filter_map(|id| store.file_systems.get(id))
+                    .map(FileSystemRecord::to_file_system)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
