@@ -213,6 +213,17 @@ impl User {
         self.revision.to_string()
     }
 
+    /// Record that this user was modified at `at`: the next revision, and the new
+    /// `UpdatedAt`.
+    ///
+    /// `User$Revision` is "the current revision of the user in the identity store. This
+    /// value changes each time the user is modified", so every successful update moves
+    /// it on.
+    pub fn record_update(&mut self, at: SystemTime) {
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = at;
+    }
+
     /// The extensions a `DescribeUser` naming `requested` must report: the stored
     /// entries under exactly those names.
     ///
@@ -556,6 +567,17 @@ impl ComAmazonawsIdentitystoreAwsidentitystoreState {
     pub fn store(&self, identifier: &str) -> Option<&IdentityStoreData> {
         self.stores.get(&identity_store_key(identifier))
     }
+
+    /// The store `identifier` names, for writing, or `None` when none was ever
+    /// created.
+    ///
+    /// Unlike [`Self::try_store_mut`] this NEVER brings a store into being: an
+    /// operation that changes or removes an existing resource has nothing to change in
+    /// a store that holds none, so it answers `ResourceNotFoundException` instead of
+    /// vivifying an empty store the caller never had.
+    pub fn store_mut(&mut self, identifier: &str) -> Option<&mut IdentityStoreData> {
+        self.stores.get_mut(&identity_store_key(identifier))
+    }
 }
 
 /// The modelled form of a stored list: `None` when it is empty.
@@ -656,6 +678,20 @@ pub fn uniqueness_conflict(message: String) -> ConflictException {
         message: Some(message),
         request_id: None,
         reason: Some("UNIQUENESS_CONSTRAINT_VIOLATION".to_string()),
+    }
+}
+
+/// The `ConflictException` for a conditional request whose `Revision` precondition no
+/// longer holds: the caller's expected revision is not the one the store carries, so
+/// something else changed the resource first.
+///
+/// `reason` is the modelled `ConflictExceptionReason` value for exactly that case
+/// (`CONFLICT_EXCEPTION_REASON_VALUES`).
+pub fn concurrent_modification(message: String) -> ConflictException {
+    ConflictException {
+        message: Some(message),
+        request_id: None,
+        reason: Some("CONCURRENT_MODIFICATION".to_string()),
     }
 }
 
