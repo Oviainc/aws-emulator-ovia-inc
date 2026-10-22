@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored AS2 profile `ProfileId` names, and the modelled
+//! `ResourceNotFoundException` when the store holds no such profile. A pure read: it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProfile"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeProfileErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        let stored = guard.profiles.get(&input.profile_id).ok_or_else(|| {
+            st::not_found(DescribeProfileErrorModeled::ResourceNotFoundException(
+                st::unknown_profile(&input.profile_id),
+            ))
+        })?;
+
+        let profile = DescribedProfile {
+            arn: stored.arn.clone(),
+            profile_id: Some(stored.profile_id.clone()),
+            profile_type: Some(stored.profile_type.clone()),
+            as2_id: Some(stored.as2_id.clone()),
+            // `CertificateIds` and `Tags` are optional LISTS: a profile created
+            // without either carries none, so the member is absent rather than an
+            // empty list (`Tags` is modelled `len 1..50`, which an empty list does not
+            // satisfy).
+            certificate_ids: Some(stored.certificate_ids.clone())
+                .filter(|ids| !ids.is_empty()),
+            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+        };
+
+        Ok(DescribeProfileOutput { profile })
     }
 }

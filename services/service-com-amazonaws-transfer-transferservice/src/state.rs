@@ -2,8 +2,8 @@
 
 //! Engine state for the com-amazonaws-transfer-transferservice service.
 //!
-//! Everything AWS Transfer Family's server + user lifecycle needs to answer a read
-//! from stored state lives here: the two resource maps, the id-minting counter, the
+//! Everything AWS Transfer Family's server + user + AS2 profile lifecycle needs to
+//! answer a read from stored state lives here: the resource maps, the id-minting counter, the
 //! documented create-time defaults and the clock-due server state transitions (the
 //! `ServerTransition` rule `StartServer`/`StopServer` share), the ARN shapes, and the
 //! opaque pagination token codec the `List*` operations share.
@@ -172,6 +172,18 @@ pub const MAX_STORED_SERVERS: usize = 200;
 /// runs. `DeleteUser` releases one record; `DeleteServer` releases all of a server's.
 pub const MAX_USERS_PER_SERVER: usize = 1_000;
 
+/// How many AS2 profiles the store holds before `CreateProfile` refuses with the
+/// modelled `ServiceUnavailableException` instead of growing.
+///
+/// Chosen on the same basis as [`MAX_STORED_SERVERS`] — the emulator's OWN bound on
+/// the store, not a claim about any account's quota, since this emulator models
+/// neither Service Quotas nor an account's adjustments. Each stored record is itself
+/// bounded by the modelled lengths of the members it holds (`As2Id` `len 1..128`,
+/// `CertificateIds` entries `len 22..22`, `Tags` `len 1..50`), which the framework's
+/// boundary validator enforces before a handler runs, and `DeleteProfile` releases a
+/// record.
+pub const MAX_STORED_PROFILES: usize = 200;
+
 /// How long after `CreateServer` or `StartServer` a server leaves `STARTING` for
 /// `ONLINE`.
 ///
@@ -237,6 +249,10 @@ pub const RESOURCE_TYPE_USER: &str = "User";
 /// `SshPublicKeyId`. Same convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_SSH_PUBLIC_KEY: &str = "SshPublicKey";
 
+/// `ResourceType` for the AS2 profile resource, addressed by its `ProfileId`. Same
+/// convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_PROFILE: &str = "Profile";
+
 /// How many SSH public keys ONE user holds before `ImportSshPublicKey` refuses
 /// instead of growing.
 ///
@@ -271,6 +287,12 @@ pub fn unknown_server(server_id: &str) -> ResourceNotFoundException {
 /// The not-found payload for a `UserName` the named server does not hold.
 pub fn unknown_user(user_name: &str) -> ResourceNotFoundException {
     resource_not_found(RESOURCE_TYPE_USER, user_name)
+}
+
+/// The not-found payload for a `ProfileId` the store does not hold — never created, or
+/// already deleted.
+pub fn unknown_profile(profile_id: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_PROFILE, profile_id)
 }
 
 /// Lift an operation's modelled not-found variant into its error channel, answered
@@ -314,6 +336,24 @@ impl User {
     pub fn ssh_public_key_count(&self) -> i32 {
         i32::try_from(self.ssh_public_keys.len()).unwrap_or(i32::MAX)
     }
+}
+
+/// One stored AS2 profile, keyed by `ProfileId`.
+///
+/// Everything `DescribeProfile` reports is RESOLVED here, at create time, so a reader
+/// projects the stored record without re-deriving anything: the minted id, its ARN,
+/// the AS2-name, the profile type and the certificate ids and tags the create carried.
+#[derive(Debug, Clone)]
+pub struct Profile {
+    /// The minted `p-` + 17 hex-digit identifier (`^p-([0-9a-f]{17})$`).
+    pub profile_id: String,
+    pub arn: String,
+    /// The AS2-name (RFC 4130) exactly as the caller supplied it.
+    pub as2_id: String,
+    /// `LOCAL` or `PARTNER` — the `ProfileType` enum, enforced before a handler runs.
+    pub profile_type: String,
+    pub certificate_ids: Vec<String>,
+    pub tags: Vec<Tag>,
 }
 
 /// One stored Transfer Family server, keyed by `ServerId`.
@@ -854,6 +894,9 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// Users by `(ServerId, UserName)`, so one server's users are a contiguous,
     /// ordered range for `ListUsers`.
     pub users: BTreeMap<(String, String), User>,
+    /// AS2 profiles by `ProfileId` (`"p-" + 17 hex`). `BTreeMap` so `ListProfiles`
+    /// pages in a stable, resumable order, like [`Self::servers`].
+    pub profiles: BTreeMap<String, Profile>,
     /// Monotonic counter behind every minted id, so ids are unique and reproducible.
     pub next_id_seq: u64,
 }
@@ -861,8 +904,9 @@ pub struct ComAmazonawsTransferTransferserviceState {
 impl ComAmazonawsTransferTransferserviceState {
     /// Mint the next `<prefix>-<17 hex digits>` identifier.
     ///
-    /// `ServerId` is `^s-([0-9a-f]{17})$` and `SshPublicKeyId` is `^key-[0-9a-f]{17}$`,
-    /// so both are this shape; `{:017x}` is exactly 17 lowercase hex digits for every
+    /// `ServerId` is `^s-([0-9a-f]{17})$`, `SshPublicKeyId` is `^key-[0-9a-f]{17}$`
+    /// and `ProfileId` is `^p-([0-9a-f]{17})$`, so all three are this shape;
+    /// `{:017x}` is exactly 17 lowercase hex digits for every
     /// counter value below 16^17, which a counter incremented once per created
     /// resource cannot reach.
     pub fn mint_id(&mut self, prefix: &str) -> String {
@@ -906,6 +950,12 @@ impl ComAmazonawsTransferTransferserviceState {
         self.servers.len() < MAX_STORED_SERVERS
     }
 
+    /// Whether the store can take another AS2 profile, i.e. is below
+    /// [`MAX_STORED_PROFILES`].
+    pub fn has_profile_capacity(&self) -> bool {
+        self.profiles.len() < MAX_STORED_PROFILES
+    }
+
     /// `UserCount` for every server that has users, in ONE pass over the user map.
     ///
     /// `ListServers` renders up to [`MAX_PAGE_SIZE`] servers per call; counting each
@@ -936,6 +986,11 @@ impl ComAmazonawsTransferTransferserviceState {
 /// `arn:aws:transfer:<region>:<account>:server/<ServerId>`.
 pub fn server_arn(region: &str, server_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("server/{server_id}"))
+}
+
+/// `arn:aws:transfer:<region>:<account>:profile/<ProfileId>`.
+pub fn profile_arn(region: &str, profile_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("profile/{profile_id}"))
 }
 
 /// `arn:aws:transfer:<region>:<account>:user/<ServerId>/<UserName>`.

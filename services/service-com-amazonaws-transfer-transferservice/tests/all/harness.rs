@@ -162,6 +162,13 @@ pub(crate) fn is_modelled_key_id(id: &str) -> bool {
         && id[4..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
+/// `ProfileId` is modelled `len 19..19`, pattern `^p-([0-9a-f]{17})$`.
+pub(crate) fn is_modelled_profile_id(id: &str) -> bool {
+    id.len() == 19
+        && id.starts_with("p-")
+        && id[2..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
 /// Assert that `actual` carries each member `expected` names, where a `null`
 /// expectation means "the response must not carry this member at all".
 pub(crate) fn assert_members(case: &str, actual: &Value, expected: &Value) {

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one AS2 profile from the request and PERSISTS it in this service's state, so
+//! `DescribeProfile` reports the stored record rather than replaying the request.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProfile"))
+        use crate::state as st;
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateProfileErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        // The profile store is BOUNDED: past its capacity a create is refused rather
+        // than adding another record. The modelled `ServiceUnavailableException` is the
+        // refusal that says the service cannot take this request; `DeleteProfile`
+        // releases the capacity again.
+        if !guard.has_profile_capacity() {
+            return Err(CreateProfileErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "the account already holds the maximum of {} profiles; \
+                         delete one before creating another",
+                        st::MAX_STORED_PROFILES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every create mints a NEW system-assigned identifier: two creates carrying
+        // identical configuration are two independent profiles.
+        let profile_id = guard.mint_id("p");
+        let profile = st::Profile {
+            arn: st::profile_arn(&region, &profile_id),
+            as2_id: input.as2_id,
+            profile_type: input.profile_type,
+            certificate_ids: input.certificate_ids.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default(),
+            profile_id: profile_id.clone(),
+        };
+        guard.profiles.insert(profile_id.clone(), profile);
+        drop(guard);
+
+        Ok(CreateProfileOutput { profile_id })
     }
 }
