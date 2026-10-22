@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the tag set the file system named by `FileSystemId` holds in
+//! [`crate::state`], paginated by `Marker`. A pure read — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +153,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTags"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+
+        // "Returns the tags associated with a file system" — a report, so this handler
+        // only reads the store and writes nothing to it.
+        let state = state.lock();
+
+        // "The ID of the file system whose tag set you want to retrieve": the member's
+        // pattern accepts a bare `fs-…` id or a file-system ARN, and the store is keyed
+        // by the id.
+        let file_system_id = efs::file_system_id_of(&input.file_system_id);
+        let Some(file_system) = state.file_systems.get(file_system_id) else {
+            return Err(not_found(format!(
+                "File system {file_system_id} does not exist"
+            )));
+        };
+        // The tag set reported is the one the file system record carries, so whatever
+        // wrote it (a create carrying `Tags`, a later tag write) is what is read back.
+        let tags = &file_system.tags;
+
+        // "An opaque pagination token returned from a previous DescribeTags operation
+        // (String). If present, it specifies to continue the list from where the previous
+        // call left off." As in this service's other paginated describes, the token is
+        // the key of the entry the next page starts at; one naming no entry of this tag
+        // set cannot have come from a previous call, so it is refused.
+        let start = match input.marker.as_deref() {
+            Some(marker) => tags
+                .iter()
+                .position(|tag| tag.key == marker)
+                .ok_or_else(|| {
+                    bad_request(format!(
+                        "Marker {marker} does not name a tag of file system {file_system_id}"
+                    ))
+                })?,
+            None => 0,
+        };
+
+        // `MaxItems`: "Currently, this number is automatically set to 100, and other
+        // values are ignored. The response is paginated at 100 per page if you have more
+        // than 100 tags." So the page is that documented 100 whatever the request asks
+        // for, and a `MaxItems` the model accepts cannot change the answer.
+        let page: Vec<Tag> = tags[start..]
+            .iter()
+            .take(efs::MAX_PAGE_SIZE)
+            .cloned()
+            .collect();
+        // "If a value is present, there are more tags to return": the entry that follows
+        // this page, absent when the page ended the set. A tag key is a well-formed
+        // `Marker` — both are 1..128 characters.
+        let next_marker = tags.get(start + page.len()).map(|tag| tag.key.clone());
+
+        Ok(DescribeTagsOutput {
+            // "If the request included a Marker, the response returns that value in this
+            // field."
+            marker: input.marker.clone(),
+            tags: page,
+            next_marker,
+        })
     }
+}
+
+/// A 404 `FileSystemNotFound`: "the specified FileSystemId value doesn't exist in the
+/// requester's Amazon Web Services account".
+fn not_found(message: impl Into<String>) -> DescribeTagsError {
+    DescribeTagsErrorModeled::FileSystemNotFound(FileSystemNotFound {
+        error_code: "FileSystemNotFound".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> DescribeTagsError {
+    DescribeTagsErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DescribeTagsError {
+    DescribeTagsErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }
