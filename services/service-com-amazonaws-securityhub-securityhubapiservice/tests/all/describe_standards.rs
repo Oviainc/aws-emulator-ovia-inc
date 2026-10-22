@@ -1,0 +1,604 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end HTTP coverage of `DescribeStandards`: the published standards catalog,
+//! the Region its ARNs are built for, the `Providers` filter, and
+//! `MaxResults`/`NextToken` paging.
+//!
+//! Every case drives the real restJson1 wire path through `MultiServiceRouter`, so a
+//! route, a status code or a serialized member that is wrong on the wire fails here.
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use service_com_amazonaws_securityhub_securityhubapiservice::ops::types::STANDARDS_PROVIDER_VALUES;
+use service_com_amazonaws_securityhub_securityhubapiservice::state::{
+    standard_arn, StandardDefinition, STANDARDS_CATALOG, STANDARDS_MANAGED_BY_COMPANY,
+    STANDARDS_MANAGED_BY_PRODUCT,
+};
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The account every emulated caller presents.
+const ACCOUNT_ID: &str = "000000000000";
+
+/// One emulator with the Security Hub service mounted, driven over HTTP, signed for
+/// one Region. The handler reads the Region out of the SigV4 credential scope,
+/// exactly as a signed SDK request carries it.
+struct Harness {
+    router: MultiServiceRouter,
+    region: String,
+}
+
+impl Harness {
+    fn new(region: &str) -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_securityhub_securityhubapiservice::EmulatedService::new(engine),
+        );
+        Self {
+            router,
+            region: region.to_string(),
+        }
+    }
+
+    /// An emulator whose hub is already subscribed in `region`.
+    async fn subscribed(region: &str) -> Self {
+        let harness = Self::new(region);
+        let (status, body) = harness.enable().await;
+        assert_eq!(
+            status, 200,
+            "region {region:?}: EnableSecurityHub must succeed, got {status} with {body}"
+        );
+        harness
+    }
+
+    /// Dispatch one request signed for this harness' Region.
+    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let region = self.region.clone();
+        self.call_in(&region, method, path, body).await
+    }
+
+    /// Dispatch one request signed for `region`, whichever Region this harness was
+    /// built for, and return `(status, parsed body)`.
+    async fn call_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let serialized = body.map(|b| serde_json::to_vec(&b).expect("serializable request body"));
+        let request = http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261021/{region}/securityhub/aws4_request, \
+                     SignedHeaders=host, Signature=0000"
+                ),
+            )
+            .header("content-type", "application/json")
+            .body(bytes::Bytes::from(serialized.unwrap_or_default()))
+            .expect("valid request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let raw = response.into_body();
+        let parsed = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&raw).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    async fn enable(&self) -> (u16, Value) {
+        self.call("POST", "/accounts", Some(json!({}))).await
+    }
+
+    async fn disable(&self) -> (u16, Value) {
+        self.call("DELETE", "/accounts", None).await
+    }
+
+    /// `DescribeStandards` with `query` appended to the path (without the leading
+    /// `?`, which this adds when the query is non-empty).
+    async fn describe_standards(&self, query: &str) -> (u16, Value) {
+        let region = self.region.clone();
+        self.describe_standards_in(&region, query).await
+    }
+
+    /// `DescribeStandards` signed for `region`.
+    async fn describe_standards_in(&self, region: &str, query: &str) -> (u16, Value) {
+        let path = if query.is_empty() {
+            "/standards".to_string()
+        } else {
+            format!("/standards?{query}")
+        };
+        self.call_in(region, "GET", &path, None).await
+    }
+}
+
+/// The `Standards` entries of a response, in the order it listed them.
+fn returned_standards(body: &Value) -> Vec<Value> {
+    body["Standards"].as_array().cloned().unwrap_or_default()
+}
+
+/// The `StandardsArn`s of a response, in the order it listed them.
+fn returned_arns(body: &Value) -> Vec<String> {
+    returned_standards(body)
+        .iter()
+        .map(|standard| {
+            standard["StandardsArn"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every catalog ARN for `region`, in catalog order.
+fn catalog_arns(region: &str) -> Vec<String> {
+    STANDARDS_CATALOG
+        .iter()
+        .map(|definition| standard_arn(region, definition))
+        .collect()
+}
+
+/// The catalog entries whose `Provider` is one of `providers`, in catalog order.
+fn catalog_arns_for_providers(region: &str, providers: &[&str]) -> Vec<String> {
+    STANDARDS_CATALOG
+        .iter()
+        .filter(|definition| providers.contains(&definition.provider))
+        .map(|definition| standard_arn(region, definition))
+        .collect()
+}
+
+/// Walk every page of `query` and return the concatenated `StandardsArn`s, asserting
+/// that no page exceeds `page_size` and that only the final page omits `NextToken`.
+async fn page_through(harness: &Harness, query: &str, page_size: usize) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let mut full = format!("MaxResults={page_size}");
+        if !query.is_empty() {
+            full = format!("{query}&{full}");
+        }
+        if let Some(token) = token.as_ref() {
+            full = format!("{full}&NextToken={token}");
+        }
+        let (status, body) = harness.describe_standards(&full).await;
+        assert_eq!(
+            status, 200,
+            "query {full:?}: expected 200, got {status} with {body}"
+        );
+        let page = returned_arns(&body);
+        assert!(
+            page.len() <= page_size,
+            "query {full:?}: a page must hold at most {page_size}, got {}",
+            page.len()
+        );
+        seen.extend(page);
+        pages += 1;
+        assert!(
+            pages <= STANDARDS_CATALOG.len() + 1,
+            "query {full:?}: paging did not terminate after {pages} pages"
+        );
+        match body["NextToken"].as_str() {
+            Some(next) => token = Some(next.to_string()),
+            None => break,
+        }
+    }
+    seen
+}
+
+/// RULE: `DescribeStandards` reports every standard the service publishes, each with
+/// the ARN, name, description, provider, default-enablement flag and managing
+/// product the catalog records for it; a standard's ARN is owned by the provider and
+/// not by the subscriber, so it carries an EMPTY account segment and the Region the
+/// request was made in (the one legacy `ruleset/` standard carries no Region at
+/// all).
+///
+/// The table spans Regions in three partitions-worth of geographies, so an ARN built
+/// from a fixed Region rather than from the request fails here.
+#[tokio::test]
+async fn describe_standards_reports_the_published_catalog_for_the_request_region() {
+    for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+        let harness = Harness::subscribed(region).await;
+        let (status, body) = harness.describe_standards("").await;
+        assert_eq!(
+            status, 200,
+            "region {region:?}: expected 200, got {status} with {body}"
+        );
+
+        let standards = returned_standards(&body);
+        assert_eq!(
+            standards.len(),
+            STANDARDS_CATALOG.len(),
+            "region {region:?}: expected {} standards, got {body}",
+            STANDARDS_CATALOG.len()
+        );
+        assert!(
+            body["NextToken"].as_str().is_none(),
+            "region {region:?}: one page holds the whole catalog, so NextToken must be absent, got {body}"
+        );
+
+        for (definition, returned) in STANDARDS_CATALOG.iter().zip(standards.iter()) {
+            let case = definition.name;
+            let expected_arn = standard_arn(region, definition);
+            assert_eq!(
+                returned["StandardsArn"].as_str(),
+                Some(expected_arn.as_str()),
+                "case {case:?} in {region}: expected {expected_arn}, got {returned}"
+            );
+            // The ARN is assembled, not stored: an account segment would claim the
+            // subscriber owns the standard, and the Region segment must be the
+            // request's for a Region-scoped standard.
+            let expected_prefix = if definition.partition_wide_ruleset {
+                "arn:aws:securityhub:::".to_string()
+            } else {
+                format!("arn:aws:securityhub:{region}::")
+            };
+            assert!(
+                expected_arn.starts_with(&expected_prefix),
+                "case {case:?} in {region}: expected an ARN under {expected_prefix:?}, got {expected_arn}"
+            );
+            assert!(
+                !expected_arn.contains(ACCOUNT_ID),
+                "case {case:?} in {region}: a standards ARN carries no account id, got {expected_arn}"
+            );
+            assert_eq!(
+                returned["Name"].as_str(),
+                Some(definition.name),
+                "case {case:?} in {region}: expected Name {:?}, got {returned}",
+                definition.name
+            );
+            assert_eq!(
+                returned["Description"].as_str(),
+                Some(definition.description),
+                "case {case:?} in {region}: expected the catalog description, got {returned}"
+            );
+            assert_eq!(
+                returned["EnabledByDefault"].as_bool(),
+                Some(definition.enabled_by_default),
+                "case {case:?} in {region}: expected EnabledByDefault {}, got {returned}",
+                definition.enabled_by_default
+            );
+            assert_eq!(
+                returned["Provider"].as_str(),
+                Some(definition.provider),
+                "case {case:?} in {region}: expected Provider {:?}, got {returned}",
+                definition.provider
+            );
+            assert!(
+                STANDARDS_PROVIDER_VALUES.contains(&definition.provider),
+                "case {case:?}: Provider {:?} is not a modelled StandardsProvider",
+                definition.provider
+            );
+            assert_eq!(
+                returned["StandardsManagedBy"]["Company"].as_str(),
+                Some(STANDARDS_MANAGED_BY_COMPANY),
+                "case {case:?} in {region}: expected managing Company {STANDARDS_MANAGED_BY_COMPANY:?}, got {returned}"
+            );
+            assert_eq!(
+                returned["StandardsManagedBy"]["Product"].as_str(),
+                Some(STANDARDS_MANAGED_BY_PRODUCT),
+                "case {case:?} in {region}: expected managing Product {STANDARDS_MANAGED_BY_PRODUCT:?}, got {returned}"
+            );
+        }
+
+        // Reporting the catalog twice reports the same thing: a read changes nothing.
+        let (status, again) = harness.describe_standards("").await;
+        assert_eq!(status, 200, "region {region:?}: second call got {status}");
+        assert_eq!(
+            returned_standards(&again),
+            standards,
+            "region {region:?}: a second DescribeStandards must report the same catalog"
+        );
+    }
+}
+
+/// RULE: `EnabledByDefault` is true for exactly the standards `EnableSecurityHub`
+/// turns on when `EnableDefaultStandards` is left at its default — "you also
+/// automatically enable the following standards: Center for Internet Security (CIS)
+/// Amazon Web Services Foundations Benchmark v1.2.0 [and] Amazon Web Services
+/// Foundational Security Best Practices. Other standards are not automatically
+/// enabled" (`smithy_query(query="doc", shape="EnableSecurityHubRequest")`).
+#[tokio::test]
+async fn only_the_documented_default_standards_are_enabled_by_default() {
+    let region = "us-west-2";
+    let harness = Harness::subscribed(region).await;
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(status, 200, "expected 200, got {status} with {body}");
+
+    // Written from EnableSecurityHub's own documentation, not from the catalog.
+    let expected = vec![
+        format!(
+            "arn:aws:securityhub:{region}::standards/aws-foundational-security-best-practices/v/1.0.0"
+        ),
+        "arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.2.0".to_string(),
+    ];
+    let mut defaults: Vec<String> = returned_standards(&body)
+        .iter()
+        .filter(|standard| standard["EnabledByDefault"].as_bool() == Some(true))
+        .map(|standard| standard["StandardsArn"].as_str().unwrap_or("").to_string())
+        .collect();
+    defaults.sort();
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    assert_eq!(
+        defaults, expected_sorted,
+        "expected exactly {expected_sorted:?} enabled by default, got {body}"
+    );
+}
+
+/// RULE: `Providers` selects the standards whose `Provider` it names; a provider the
+/// catalog holds no standard for selects none, and naming no provider at all
+/// constrains nothing.
+///
+/// The table is driven by `StandardsProvider`'s own value list, so every modelled
+/// provider — including the one no published standard uses — is exercised, together
+/// with the empty filter and the full list.
+#[tokio::test]
+async fn providers_selects_the_standards_of_the_providers_it_names() {
+    let region = "eu-central-1";
+    let harness = Harness::subscribed(region).await;
+
+    // (case, query, expected ARNs)
+    let mut cases: Vec<(String, String, Vec<String>)> = vec![
+        (
+            "omitted".to_string(),
+            String::new(),
+            catalog_arns_for_providers(region, STANDARDS_PROVIDER_VALUES),
+        ),
+        (
+            "every provider".to_string(),
+            STANDARDS_PROVIDER_VALUES
+                .iter()
+                .map(|provider| format!("Providers={provider}"))
+                .collect::<Vec<_>>()
+                .join("&"),
+            catalog_arns_for_providers(region, STANDARDS_PROVIDER_VALUES),
+        ),
+    ];
+    for provider in STANDARDS_PROVIDER_VALUES {
+        cases.push((
+            (*provider).to_string(),
+            format!("Providers={provider}"),
+            catalog_arns_for_providers(region, &[provider]),
+        ));
+    }
+
+    for (case, query, expected) in cases {
+        let (status, body) = harness.describe_standards(&query).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            returned_arns(&body),
+            expected,
+            "case {case:?}: expected {expected:?}, got {body}"
+        );
+    }
+
+    // The unfiltered catalog is the union of the per-provider selections, so no
+    // standard is reachable only without a filter.
+    let mut union: Vec<String> = STANDARDS_PROVIDER_VALUES
+        .iter()
+        .flat_map(|provider| catalog_arns_for_providers(region, &[provider]))
+        .collect();
+    union.sort();
+    let mut all = catalog_arns(region);
+    all.sort();
+    assert_eq!(
+        union, all,
+        "every catalog standard must be selectable by its own provider"
+    );
+}
+
+/// RULE: `MaxResults` bounds a page and `NextToken` resumes the listing where the
+/// previous page stopped, so walking the pages yields every standard exactly once in
+/// catalog order.
+///
+/// The table spans page sizes that divide the catalog, that do not, that equal it,
+/// and that exceed it — plus the published `MaxResults` bounds.
+#[tokio::test]
+async fn paging_truncates_at_max_results_and_resumes_from_next_token() {
+    let region = "us-east-2";
+    let harness = Harness::subscribed(region).await;
+    let expected = catalog_arns(region);
+    let total = expected.len();
+
+    for page_size in [1usize, 2, 3, total - 1, total, total + 1, 100] {
+        let seen = page_through(&harness, "", page_size).await;
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "page size {page_size}: no standard may repeat across pages, got {seen:?}"
+        );
+        assert_eq!(
+            seen, expected,
+            "page size {page_size}: expected the whole catalog in order, got {seen:?}"
+        );
+    }
+
+    // Paging composes with the filter: the filtered listing pages the same way.
+    let aws_only = catalog_arns_for_providers(region, &["AWS"]);
+    let seen = page_through(&harness, "Providers=AWS", 2).await;
+    assert_eq!(
+        seen, aws_only,
+        "a filtered listing must page over just its own selection, got {seen:?}"
+    );
+}
+
+/// RULE: `MaxResults` is `@range(min: 1, max: 100)`, so each published bound is
+/// accepted and a value one past either bound is refused (400); a `NextToken` the
+/// operation did not issue, or one that points past the end of the selection, is a
+/// client error rather than an empty page; and a `Providers` value
+/// `StandardsProvider` does not define is refused.
+#[tokio::test]
+async fn out_of_range_and_unissued_inputs_are_refused() {
+    let region = "us-east-1";
+    let harness = Harness::subscribed(region).await;
+
+    // A token this operation really issued, resuming after the first standard.
+    let (status, body) = harness.describe_standards("MaxResults=1").await;
+    assert_eq!(status, 200, "first page: got {status} with {body}");
+    let issued = body["NextToken"]
+        .as_str()
+        .expect("a catalog larger than one page must carry a NextToken")
+        .to_string();
+
+    // (case, query, expected status, expected error code)
+    let cases: Vec<(&str, String, u16, &str)> = vec![
+        ("MaxResults at the lower bound", "MaxResults=1".into(), 200, ""),
+        ("MaxResults at the upper bound", "MaxResults=100".into(), 200, ""),
+        (
+            "MaxResults below the lower bound",
+            "MaxResults=0".into(),
+            400,
+            "ValidationException",
+        ),
+        (
+            "MaxResults above the upper bound",
+            "MaxResults=101".into(),
+            400,
+            "ValidationException",
+        ),
+        (
+            "NextToken this operation never issued",
+            "NextToken=not-a-token".into(),
+            400,
+            "InvalidInputException",
+        ),
+        (
+            "NextToken that decodes to another list's cursor",
+            // hex of "nope", so it decodes as text but carries no standards cursor.
+            "NextToken=6e6f7065".into(),
+            400,
+            "InvalidInputException",
+        ),
+        (
+            "NextToken past the end of the selection",
+            // Issued against the whole catalog, replayed against a selection that
+            // holds nothing, so its offset is past the end.
+            format!("Providers=Azure&NextToken={issued}"),
+            400,
+            "InvalidInputException",
+        ),
+        (
+            "Providers value StandardsProvider does not define",
+            "Providers=GCP".into(),
+            400,
+            "",
+        ),
+        (
+            "an issued NextToken replayed against its own selection",
+            format!("NextToken={issued}"),
+            200,
+            "",
+        ),
+    ];
+
+    for (case, query, expected_status, expected_code) in cases {
+        let (status, body) = harness.describe_standards(&query).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} with {body}"
+        );
+        if !expected_code.is_empty() {
+            let rendered = body.to_string();
+            assert!(
+                rendered.contains(expected_code),
+                "case {case:?}: expected the error code {expected_code}, got {rendered}"
+            );
+        }
+    }
+}
+
+/// RULE: an account with no Security Hub CSPM subscription is not permitted to call
+/// the service, which is `InvalidAccessException` (401) — before it ever enabled,
+/// and again once the subscription is removed. A subscription is per Region, so a
+/// Region that was never enabled is refused while the enabled one still answers.
+#[tokio::test]
+async fn an_unsubscribed_account_cannot_describe_standards() {
+    let harness = Harness::new("us-east-1");
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(
+        status, 401,
+        "before enable: expected 401, got {status} with {body}"
+    );
+
+    let (status, body) = harness.enable().await;
+    assert_eq!(status, 200, "enable: got {status} with {body}");
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(
+        status, 200,
+        "after enable: expected 200, got {status} with {body}"
+    );
+
+    // The same emulator, a Region that was never subscribed: a subscription is per
+    // account AND Region, so the unsubscribed Region is still refused.
+    let (status, body) = harness.describe_standards_in("eu-west-3", "").await;
+    assert_eq!(
+        status, 401,
+        "an unsubscribed Region: expected 401, got {status} with {body}"
+    );
+
+    let (status, body) = harness.disable().await;
+    assert_eq!(status, 200, "disable: got {status} with {body}");
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(
+        status, 401,
+        "after disable: expected 401, got {status} with {body}"
+    );
+}
+
+/// RULE: the catalog is service metadata — every entry carries a non-empty name and
+/// description (`NonEmptyString`, `@pattern("\\S")`), a provider the model defines,
+/// and an ARN unique across the catalog.
+#[tokio::test]
+async fn every_catalog_entry_satisfies_the_modelled_constraints() {
+    let region = "ca-central-1";
+    let harness = Harness::subscribed(region).await;
+    let (status, body) = harness.describe_standards("").await;
+    assert_eq!(status, 200, "expected 200, got {status} with {body}");
+
+    let mut arns: Vec<String> = Vec::new();
+    for standard in returned_standards(&body) {
+        let case = standard["Name"].as_str().unwrap_or("<unnamed>").to_string();
+        for member in ["StandardsArn", "Name", "Description"] {
+            let value = standard[member].as_str().unwrap_or_default();
+            assert!(
+                !value.trim().is_empty(),
+                "case {case:?}: {member} must be a NonEmptyString, got {standard}"
+            );
+        }
+        let provider = standard["Provider"].as_str().unwrap_or_default();
+        assert!(
+            STANDARDS_PROVIDER_VALUES.contains(&provider),
+            "case {case:?}: Provider {provider:?} is not a modelled StandardsProvider"
+        );
+        arns.push(standard["StandardsArn"].as_str().unwrap_or("").to_string());
+    }
+
+    let mut unique = arns.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        arns.len(),
+        "a standard's ARN identifies it, so the catalog may not repeat one: {arns:?}"
+    );
+    let definitions: &[StandardDefinition] = &STANDARDS_CATALOG;
+    assert_eq!(
+        arns.len(),
+        definitions.len(),
+        "every catalog definition must be reported: {arns:?}"
+    );
+}
