@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a new monitor in [`crate::state`] and reports the ARN it minted plus the
+//! monitor's initial `Status`. `ClientToken` makes the call idempotent; a second create
+//! of a name that already exists is a `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +190,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMonitor"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMonitorError::Modeled(CreateMonitorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // IDEMPOTENCY: a repeat of the same `ClientToken` reports the monitor that token
+        // already created rather than conflicting with it. A token whose monitor has since
+        // been deleted creates again, because there is nothing left to report.
+        let client_token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if let Some(token) = client_token.as_deref() {
+            // A token replays only the request it recorded: one recorded for a DIFFERENT
+            // `MonitorName` is a different request, so it creates rather than reporting
+            // that other monitor and silently storing nothing.
+            if let Some(name) = store
+                .create_token_target(token)
+                .filter(|name| *name == input.monitor_name)
+            {
+                if let Some(existing) = store.monitors.get(&name) {
+                    return Ok(CreateMonitorOutput {
+                        arn: existing.arn.clone(),
+                        status: existing.status.clone(),
+                    });
+                }
+            }
+        }
+
+        if store.monitors.contains_key(&input.monitor_name) {
+            return Err(CreateMonitorErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("The monitor {} already exists.", input.monitor_name)),
+            })
+            .into());
+        }
+
+        // The store is bounded, so a create that would carry it past its ceiling is
+        // refused with the quota error this operation models rather than growing it.
+        if store.monitors.len() >= crate::state::MAX_MONITORS {
+            return Err(CreateMonitorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of monitors ({}) for this account has been reached.",
+                        crate::state::MAX_MONITORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `Resources` is a `SetOfARNs`: duplicates in the request collapse. The stored set
+        // is bounded, so a request carrying more than it can hold is refused rather than
+        // allocating what it asks for.
+        let resources: ::std::collections::BTreeSet<String> =
+            input.resources.unwrap_or_default().into_iter().collect();
+        if resources.len() > crate::state::MAX_RESOURCES_PER_MONITOR {
+            return Err(CreateMonitorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Resources carries {} resources; a monitor holds at most {}.",
+                        resources.len(),
+                        crate::state::MAX_RESOURCES_PER_MONITOR
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The model states the per-monitor tag maximum, and `TagMap`'s own 0..200 length
+        // does not enforce it.
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        if tags.len() > crate::state::MAX_TAGS_PER_MONITOR {
+            return Err(CreateMonitorErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Tags carries {} tags; a monitor holds at most {}.",
+                    tags.len(),
+                    crate::state::MAX_TAGS_PER_MONITOR
+                )),
+            })
+            .into());
+        }
+
+        let status = crate::state::MONITOR_STATE_PENDING.to_string();
+        let record = crate::state::MonitorRecord {
+            name: input.monitor_name.clone(),
+            arn: crate::state::monitor_arn(&region, &input.monitor_name),
+            resources,
+            processing_status: Some(crate::state::MonitorRecord::processing_status_for(&status)),
+            processing_status_info: None,
+            status,
+            created_at: now,
+            modified_at: now,
+            // A created monitor is returned non-terminal (`PENDING`), so the clock owes it
+            // `ACTIVE` once the activation span has passed.
+            active_at: Some(now + crate::state::MONITOR_ACTIVATION_DELAY),
+            tags,
+            max_city_networks_to_monitor: input.max_city_networks_to_monitor,
+            traffic_percentage_to_monitor: input.traffic_percentage_to_monitor,
+            internet_measurements_log_delivery: input.internet_measurements_log_delivery,
+            health_events_config: input.health_events_config,
+        };
+
+        let output = CreateMonitorOutput {
+            arn: record.arn.clone(),
+            status: record.status.clone(),
+        };
+        if let Some(token) = client_token {
+            store.record_create_token(token, record.name.clone(), now);
+        }
+        store.monitors.insert(record.name.clone(), record);
+        Ok(output)
     }
 }

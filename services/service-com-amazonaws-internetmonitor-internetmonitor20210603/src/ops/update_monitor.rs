@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates one stored monitor in [`crate::state`]: `ResourcesToAdd` / `ResourcesToRemove`
+//! are a union / difference over its `Resources` set, every other member present
+//! overwrites what is stored, and `ModifiedAt` is bumped. A `MonitorName` no monitor
+//! carries is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +112,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `MonitorConfigState` values `UpdateMonitor` accepts, from the model's own
+/// documentation of `UpdateMonitorInput$Status`: "The accepted values for `Status` with
+/// the `UpdateMonitor` API call are the following: `ACTIVE` and `INACTIVE`. The following
+/// values are *not* accepted: `PENDING`, and `ERROR`."
+/// (`smithy_query(query="doc",shape="UpdateMonitorInput",member="Status")`).
+const UPDATABLE_STATUS_VALUES: &[&str] = &[
+    crate::state::MONITOR_STATE_ACTIVE,
+    crate::state::MONITOR_STATE_INACTIVE,
+];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -187,20 +193,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMonitor"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMonitorError::Modeled(UpdateMonitorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // The boundary validator has already refused a `Status` outside
+        // `MonitorConfigState`; only the subset this operation accepts is left to check.
+        if let Some(status) = input.status.as_deref() {
+            if !UPDATABLE_STATUS_VALUES.contains(&status) {
+                return Err(UpdateMonitorErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Status {} cannot be set with UpdateMonitor; accepted values are: {}.",
+                        status,
+                        UPDATABLE_STATUS_VALUES.join(", ")
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // IDEMPOTENCY: a repeat of the same `ClientToken` reports the monitor that token
+        // already updated without applying the change (or bumping `ModifiedAt`) twice.
+        let client_token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if let Some(token) = client_token.as_deref() {
+            // Scoped to the monitor the token recorded: a token reused on a DIFFERENT
+            // `MonitorName` is a different request, so that request is applied rather
+            // than answered with the earlier monitor's result.
+            if let Some(name) = store
+                .update_token_target(token)
+                .filter(|name| *name == input.monitor_name)
+            {
+                if let Some(existing) = store.monitors.get(&name) {
+                    return Ok(UpdateMonitorOutput {
+                        monitor_arn: existing.arn.clone(),
+                        status: existing.status.clone(),
+                    });
+                }
+            }
+        }
+
+        let Some(monitor) = store.monitors.get_mut(&input.monitor_name) else {
+            return Err(UpdateMonitorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("The monitor {} does not exist.", input.monitor_name)),
+                },
+            )
+            .into());
+        };
+
+        // `Resources` is a `SetOfARNs`: an add is a union, a remove a difference, so
+        // adding what is already monitored or removing what is not changes nothing. The
+        // result is computed first and only then stored, so a request that would carry the
+        // bounded set past its ceiling is refused without having applied half of itself.
+        let mut resources = monitor.resources.clone();
+        for resource in input.resources_to_remove.unwrap_or_default() {
+            resources.remove(&resource);
+        }
+        for resource in input.resources_to_add.unwrap_or_default() {
+            resources.insert(resource);
+        }
+        if resources.len() > crate::state::MAX_RESOURCES_PER_MONITOR {
+            return Err(UpdateMonitorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The update would leave the monitor with {} resources; a monitor holds at most {}.",
+                        resources.len(),
+                        crate::state::MAX_RESOURCES_PER_MONITOR
+                    )),
+                },
+            )
+            .into());
+        }
+        monitor.resources = resources;
+        if let Some(status) = input.status {
+            monitor.processing_status =
+                Some(crate::state::MonitorRecord::processing_status_for(&status));
+            monitor.status = status;
+            // An explicitly set state is the one the monitor is in: the clock no longer
+            // owes it the activation transition a create started.
+            monitor.active_at = None;
+        }
+        if let Some(max_city_networks) = input.max_city_networks_to_monitor {
+            monitor.max_city_networks_to_monitor = Some(max_city_networks);
+        }
+        if let Some(traffic_percentage) = input.traffic_percentage_to_monitor {
+            monitor.traffic_percentage_to_monitor = Some(traffic_percentage);
+        }
+        if let Some(log_delivery) = input.internet_measurements_log_delivery {
+            monitor.internet_measurements_log_delivery = Some(log_delivery);
+        }
+        if let Some(health_events_config) = input.health_events_config {
+            monitor.health_events_config = Some(health_events_config);
+        }
+        monitor.modified_at = now;
+
+        let output = UpdateMonitorOutput {
+            monitor_arn: monitor.arn.clone(),
+            status: monitor.status.clone(),
+        };
+        if let Some(token) = client_token {
+            store.record_update_token(token, input.monitor_name.clone(), now);
+        }
+        Ok(output)
     }
 }

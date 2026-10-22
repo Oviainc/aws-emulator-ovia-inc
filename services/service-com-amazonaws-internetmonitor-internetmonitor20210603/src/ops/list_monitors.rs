@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMonitors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMonitors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMonitors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `Monitor` summary per monitor stored in [`crate::state`], in `MonitorName`
+//! order, filtered by `MonitorStatus` when given and paged with `MaxResults` plus an
+//! opaque `NextToken`.
+//!
+//! `IncludeLinkedAccounts` asks for monitors owned by accounts linked to this monitoring
+//! account; this emulator serves exactly one account, so there are none to add and the
+//! listing is the same either way.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +84,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `MaxResults` allows, from its modelled range 1..25 (see
+/// `smithy_query(query="operation",operation="ListMonitors")`). An absent `MaxResults`
+/// takes a full page.
+const MAX_PAGE_SIZE: i32 = 25;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,20 +158,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMonitors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMonitorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMonitors"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMonitorsError::Modeled(ListMonitorsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // `MonitorStatus` targets a plain `String` in the model, not the
+        // `MonitorConfigState` enum, so the boundary validator does not constrain it and
+        // this operation has to.
+        let status_filter = input.monitor_status.as_deref();
+        if let Some(filter) = status_filter {
+            if !MONITOR_CONFIG_STATE_VALUES.contains(&filter) {
+                return Err(ListMonitorsErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "MonitorStatus {} is not one of: {}.",
+                        filter,
+                        MONITOR_CONFIG_STATE_VALUES.join(", ")
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // The token is opaque to the caller, so one this service did not mint is a bad
+        // request rather than an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(name) => Some(name),
+                None => {
+                    return Err(ListMonitorsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("NextToken is not a token this service issued.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `MaxResults` is modelled 1..25, so the boundary validator has already refused
+        // anything outside that; an absent one takes the maximum page. The clamp is a real
+        // bound rather than a fallback for an impossible value: it keeps the page size
+        // inside the modelled range even if the request ever reaches here unvalidated.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE))
+            .unwrap_or(1);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise every clock-owed PENDING -> ACTIVE transition before reading, so a
+        // status filter and the reported status agree with the state at `now`.
+        store.settle_all(now);
+
+        // One past the page, so the presence of a further monitor is what decides whether
+        // there is a `NextToken` — never a token that pages to nothing.
+        let mut page: Vec<&crate::state::MonitorRecord> = store
+            .monitors
+            .values()
+            .filter(|monitor| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| monitor.name.as_str() > after)
+            })
+            .filter(|monitor| status_filter.is_none_or(|filter| monitor.status == filter))
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = if page.len() > page_size {
+            page.truncate(page_size);
+            page.last()
+                .map(|monitor| crate::state::encode_page_token(&monitor.name))
+        } else {
+            None
+        };
+
+        Ok(ListMonitorsOutput {
+            monitors: page
+                .into_iter()
+                .map(|monitor| Monitor {
+                    monitor_name: monitor.name.clone(),
+                    monitor_arn: monitor.arn.clone(),
+                    status: monitor.status.clone(),
+                    processing_status: monitor.processing_status.clone(),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }
