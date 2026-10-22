@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the clusters actually in state, narrowed by
+//! `DBClusterIdentifier` and the `db-cluster-id` filter and paged by `MaxRecords` /
+//! `Marker`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusters"))
+        use crate::state as docdb;
+
+        let _ = ctx;
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        // Reporting only: this materialises the `creating` -> `available` transitions the
+        // clock already owed. Each was due at the same instant whether or not anybody
+        // asked, so settling them here changes nothing a later caller would not have seen.
+        store.settle_clock();
+
+        // `DBClusterIdentifier` names one cluster by identifier or by ARN; an id that
+        // names nothing in state is the modeled 404 rather than an empty page.
+        let mut selected: Vec<String> = match &input.db_cluster_identifier {
+            Some(requested) => {
+                let Some(key) = store.resolve_cluster_key(requested) else {
+                    return Err(DescribeDBClustersErrorModeled::DBClusterNotFoundFault(
+                        DBClusterNotFoundFault {
+                            message: Some(format!("DBCluster not found: {requested}")),
+                        },
+                    )
+                    .into());
+                };
+                vec![key]
+            }
+            None => store.clusters.keys().cloned().collect(),
+        };
+
+        // `Filters` doc: the one supported filter is `db-cluster-id`, which "accepts
+        // cluster identifiers and cluster Amazon Resource Names (ARNs)". A value naming
+        // nothing in state simply matches nothing, which is why this narrows the page to
+        // empty rather than answering a 404: the real service reports an empty list for a
+        // filter that matches no resource.
+        for filter in input.filters.iter().flatten() {
+            // `Filter$Name`: "Filter names are case sensitive."
+            if filter.name != "db-cluster-id" {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Unrecognized filter name '{}' for DescribeDBClusters: the only supported \
+                     filter is 'db-cluster-id'",
+                    filter.name
+                )));
+            }
+            let wanted: ::std::collections::BTreeSet<String> = filter
+                .values
+                .iter()
+                .filter_map(|value| store.resolve_cluster_key(value))
+                .collect();
+            selected.retain(|key| wanted.contains(key));
+        }
+
+        let (page, marker) = docdb::paginate(&selected, input.marker.as_deref(), page_size);
+        let db_clusters = page
+            .iter()
+            .filter_map(|key| store.clusters.get(key))
+            .map(|record| docdb::cluster_to_shape(record, &store.instances))
+            .collect();
+
+        Ok(DescribeDBClustersOutput {
+            marker,
+            db_clusters: Some(db_clusters),
+        })
     }
 }

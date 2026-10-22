@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the cluster from state and answers with it in
+//! `deleting`, refusing while `DeletionProtection` is enabled or member instances remain,
+//! and taking the final snapshot the caller did not skip.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBCluster"))
+        use crate::state as docdb;
+
+        let _ = ctx;
+        docdb::validate_identifier("DBClusterIdentifier", &input.db_cluster_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        if let Some(snapshot_identifier) = &input.final_db_snapshot_identifier {
+            // This member's own documentation states the identifier rule with a 255-
+            // character bound, not the 63 the cluster and instance identifiers carry.
+            docdb::validate_identifier_within(
+                "FinalDBSnapshotIdentifier",
+                snapshot_identifier,
+                docdb::MAX_SNAPSHOT_IDENTIFIER_LEN,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // `SkipFinalSnapshot`: "If false is specified, a cluster snapshot is created
+        // before the DB cluster is deleted ... If SkipFinalSnapshot is false, you must
+        // specify a FinalDBSnapshotIdentifier parameter. Default: false."
+        let skip_final_snapshot = input.skip_final_snapshot.unwrap_or(false);
+        if !skip_final_snapshot && input.final_db_snapshot_identifier.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "FinalDBSnapshotIdentifier is required when SkipFinalSnapshot is false",
+            ));
+        }
+        // The mirror of that combination: skipping the final snapshot means no snapshot is
+        // taken, so naming one cannot be honoured and is refused rather than ignored.
+        if skip_final_snapshot && input.final_db_snapshot_identifier.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "FinalDBSnapshotIdentifier cannot be specified when SkipFinalSnapshot is true",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let Some(key) = store.resolve_cluster_key(&input.db_cluster_identifier) else {
+            return Err(DeleteDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!(
+                        "DBCluster not found: {}",
+                        input.db_cluster_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        {
+            let record = store
+                .clusters
+                .get(&key)
+                .expect("the cluster key was resolved from this same map above");
+            // `DeletionProtection`: "If DeletionProtection is enabled, the cluster cannot
+            // be deleted unless it is modified and DeletionProtection is disabled."
+            if record.deletion_protection {
+                return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {key} cannot be deleted while DeletionProtection is enabled"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !record.members.is_empty() {
+                return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {key} still has {} member instance(s); delete them before \
+                             deleting the cluster",
+                            record.members.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+            if record.status != docdb::STATUS_AVAILABLE {
+                return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {key} is in {} state but must be {} to be deleted",
+                            record.status,
+                            docdb::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Reached only when the final snapshot IS being taken: the two refusals above
+        // leave `FinalDBSnapshotIdentifier` present exactly when `skip_final_snapshot`
+        // is false, so these checks never fire for a snapshot the request would not take.
+        // The snapshot is keyed the way every other identifier here is, lowercased, so
+        // the duplicate check is case-insensitive.
+        let snapshot_key = input
+            .final_db_snapshot_identifier
+            .as_ref()
+            .map(|identifier| identifier.to_ascii_lowercase());
+        if let Some(snapshot_identifier) = &snapshot_key {
+            if store.snapshots.contains_key(snapshot_identifier) {
+                return Err(
+                    DeleteDBClusterErrorModeled::DBClusterSnapshotAlreadyExistsFault(
+                        DBClusterSnapshotAlreadyExistsFault {
+                            message: Some(format!(
+                                "DB cluster snapshot already exists: {snapshot_identifier}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The snapshot store's own cap. It is the one store with no reclamation path
+            // yet (every snapshot operation is still scaffolded), so an over-quota final
+            // snapshot is refused rather than stored, and the cluster is left alone.
+            if store.snapshots.len() >= docdb::MAX_DB_CLUSTER_SNAPSHOTS {
+                return Err(DeleteDBClusterErrorModeled::SnapshotQuotaExceededFault(
+                    SnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} manual cluster snapshots in this Region",
+                            docdb::MAX_DB_CLUSTER_SNAPSHOTS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut record = store
+            .clusters
+            .remove(&key)
+            .expect("the cluster key was resolved from this same map above");
+
+        // The final snapshot the caller asked for is really written to state, so the
+        // snapshot the API says it took exists for the snapshot operations to read once
+        // they are implemented (they are still scaffolded and answer 501).
+        if let Some(snapshot_identifier) = snapshot_key {
+            let snapshot = docdb::DbClusterSnapshotRecord {
+                identifier: snapshot_identifier.clone(),
+                cluster_identifier: record.identifier.clone(),
+                region: record.region.clone(),
+                snapshot_create_time: docdb::now(),
+                cluster_create_time: record.cluster_create_time,
+                engine: record.engine.clone(),
+                engine_version: record.engine_version.clone(),
+                master_username: record.master_username.clone(),
+                port: record.port,
+                availability_zones: record.availability_zones.clone(),
+                storage_encrypted: record.storage_encrypted,
+                kms_key_id: record.kms_key_id.clone(),
+                storage_type: record.storage_type.clone(),
+                snapshot_type: docdb::SNAPSHOT_TYPE_MANUAL.to_string(),
+            };
+            store.snapshots.insert(snapshot_identifier, snapshot);
+        }
+
+        record.status = docdb::STATUS_DELETING.to_string();
+        record.available_at = None;
+        Ok(DeleteDBClusterOutput {
+            db_cluster: Some(docdb::cluster_to_shape(&record, &store.instances)),
+        })
     }
 }

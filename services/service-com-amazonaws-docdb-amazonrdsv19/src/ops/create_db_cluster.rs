@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation inserts a cluster record into this service's state, keyed
+//! by the lowercased `DBClusterIdentifier`, and answers with the stored record. A new
+//! cluster is born `creating`; the clock owes it `available`, which the next call that
+//! reports the cluster materialises (see `crate::state::PROVISIONING_DELAY`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -276,18 +273,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBCluster"))
+        use crate::state as docdb;
+
+        // The model constrains none of these members, so the rules their own
+        // documentation states are enforced here; each helper cites the member doc.
+        docdb::validate_identifier("DBClusterIdentifier", &input.db_cluster_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::validate_engine(&input.engine).map_err(crate::scaffolded::Scaffolded::validation)?;
+        if let Some(username) = &input.master_username {
+            docdb::validate_master_username(username)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        if let Some(password) = &input.master_user_password {
+            docdb::validate_master_user_password(password)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        if let Some(period) = input.backup_retention_period {
+            docdb::validate_backup_retention_period(period)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // Nothing caller-sized reaches the store unchecked; see the "Store bounds" block
+        // in `src/state.rs` for where each cap comes from.
+        docdb::bound_tags(input.tags.as_ref()).map_err(crate::scaffolded::Scaffolded::validation)?;
+        for (member, values) in [
+            ("AvailabilityZones", input.availability_zones.as_ref()),
+            ("VpcSecurityGroupIds", input.vpc_security_group_ids.as_ref()),
+            (
+                "EnableCloudwatchLogsExports",
+                input.enable_cloudwatch_logs_exports.as_ref(),
+            ),
+        ] {
+            docdb::bound_string_list(member, values)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        for (member, value) in [
+            ("EngineVersion", input.engine_version.as_ref()),
+            ("KmsKeyId", input.kms_key_id.as_ref()),
+            ("NetworkType", input.network_type.as_ref()),
+            ("StorageType", input.storage_type.as_ref()),
+            ("DBSubnetGroupName", input.db_subnet_group_name.as_ref()),
+            (
+                "DBClusterParameterGroupName",
+                input.db_cluster_parameter_group_name.as_ref(),
+            ),
+            (
+                "PreferredBackupWindow",
+                input.preferred_backup_window.as_ref(),
+            ),
+            (
+                "PreferredMaintenanceWindow",
+                input.preferred_maintenance_window.as_ref(),
+            ),
+            (
+                "MasterUserSecretKmsKeyId",
+                input.master_user_secret_kms_key_id.as_ref(),
+            ),
+        ] {
+            docdb::bound_optional_string(member, value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // `ManageMasterUserPassword` has Amazon DocumentDB mint and own the master
+        // password in Amazon Web Services Secrets Manager and report it back as
+        // `MasterUserSecret`. This emulator has no Secrets Manager integration to do that
+        // with, and must not invent an ARN for a secret that does not exist, so that
+        // request is answered as not implemented rather than served wrongly.
+        if input.manage_master_user_password == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDBCluster with ManageMasterUserPassword",
+            ));
+        }
+
+        let region = docdb::request_region(ctx);
+        // `DBClusterIdentifier`: "This parameter is stored as a lowercase string."
+        let identifier = input.db_cluster_identifier.to_ascii_lowercase();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        store.settle_clock();
+
+        if store.clusters.contains_key(&identifier) {
+            return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
+                DBClusterAlreadyExistsFault {
+                    message: Some(format!("DB cluster already exists: {identifier}")),
+                },
+            )
+            .into());
+        }
+
+        // A global cluster can only come from `CreateGlobalCluster`, which is still
+        // scaffolded, so there is no global cluster in state for this id to name.
+        if let Some(global) = &input.global_cluster_identifier {
+            return Err(CreateDBClusterErrorModeled::GlobalClusterNotFoundFault(
+                GlobalClusterNotFoundFault {
+                    message: Some(format!("GlobalCluster not found: {global}")),
+                },
+            )
+            .into());
+        }
+
+        // The store's own cap: an over-quota create is refused, never stored.
+        if store.clusters.len() >= docdb::MAX_DB_CLUSTERS {
+            return Err(CreateDBClusterErrorModeled::DBClusterQuotaExceededFault(
+                DBClusterQuotaExceededFault {
+                    message: Some(format!(
+                        "Cannot create more than {} clusters in this Region",
+                        docdb::MAX_DB_CLUSTERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let ordinal = store.next_resource_ordinal();
+        let token = docdb::resource_token(ordinal);
+        let availability_zones = input
+            .availability_zones
+            .filter(|zones| !zones.is_empty())
+            .unwrap_or_else(|| docdb::default_availability_zones(&region));
+        // `StorageType`: "The storage type isn't returned when you set it to standard."
+        let storage_type = input
+            .storage_type
+            .filter(|value| !value.eq_ignore_ascii_case(docdb::DEFAULT_STORAGE_TYPE));
+        let serverless_v2_scaling =
+            input
+                .serverless_v2_scaling_configuration
+                .and_then(|config| match (config.min_capacity, config.max_capacity) {
+                    (Some(min), Some(max)) => Some((min, max)),
+                    _ => None,
+                });
+
+        let record = docdb::DbClusterRecord {
+            identifier: identifier.clone(),
+            resource_id: format!("cluster-{token}"),
+            endpoint_suffix: format!(
+                "{}.{region}.docdb.amazonaws.com",
+                token.to_ascii_lowercase()
+            ),
+            region,
+            status: docdb::STATUS_CREATING.to_string(),
+            available_at: Some(::std::time::Instant::now() + docdb::PROVISIONING_DELAY),
+            engine: input.engine.to_ascii_lowercase(),
+            engine_version: input
+                .engine_version
+                .unwrap_or_else(|| docdb::DEFAULT_ENGINE_VERSION.to_string()),
+            port: input.port.unwrap_or(docdb::DEFAULT_PORT),
+            master_username: input.master_username,
+            cluster_create_time: docdb::now(),
+            backup_retention_period: input
+                .backup_retention_period
+                .unwrap_or(docdb::DEFAULT_BACKUP_RETENTION_PERIOD),
+            preferred_backup_window: input
+                .preferred_backup_window
+                .unwrap_or_else(|| docdb::default_backup_window(ordinal)),
+            preferred_maintenance_window: input
+                .preferred_maintenance_window
+                .unwrap_or_else(|| docdb::default_maintenance_window(ordinal)),
+            storage_encrypted: input.storage_encrypted.unwrap_or(false),
+            kms_key_id: input.kms_key_id,
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            availability_zones,
+            vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+            db_subnet_group: input.db_subnet_group_name,
+            db_cluster_parameter_group: input.db_cluster_parameter_group_name,
+            enabled_cloudwatch_logs_exports: input
+                .enable_cloudwatch_logs_exports
+                .unwrap_or_default(),
+            storage_type,
+            network_type: input.network_type,
+            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+            serverless_v2_scaling,
+            members: Vec::new(),
+            tags: docdb::tag_pairs(input.tags),
+        };
+
+        store.clusters.insert(identifier.clone(), record);
+
+        let stored = store
+            .clusters
+            .get(&identifier)
+            .expect("the cluster was inserted on the line above");
+        Ok(CreateDBClusterOutput {
+            db_cluster: Some(docdb::cluster_to_shape(stored, &store.instances)),
+        })
     }
 }
