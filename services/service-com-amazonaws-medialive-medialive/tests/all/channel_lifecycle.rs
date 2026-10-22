@@ -27,7 +27,7 @@ async fn create(router: &MultiServiceRouter, body: Value) -> Value {
     response["channel"].clone()
 }
 
-async fn describe(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn describe(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/prod/channels/{id}"), None).await
 }
 

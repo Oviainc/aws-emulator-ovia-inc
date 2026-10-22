@@ -352,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let domain_validations = names
             .iter()
             .map(|name| {
-                domain_validation_record(
+                crate::state::domain_validation_record(
                     &certificate_id,
                     name,
                     &validation_method,
@@ -505,65 +505,6 @@ fn validation_domains(
         mapped.insert(covered.clone(), option.validation_domain.clone());
     }
     Ok(mapped)
-}
-
-/// The validation ACM is waiting on for one domain name.
-///
-/// DNS validation publishes a CNAME, email validation names the mailboxes ACM wrote
-/// to, and HTTP validation names the URL the CA fetches; the method the request chose
-/// decides which. Each value is derived from the certificate's own id, so a later
-/// `DescribeCertificate` reports exactly the same record.
-fn domain_validation_record(
-    certificate_id: &str,
-    domain_name: &str,
-    validation_method: &str,
-    validation_domain: Option<&str>,
-) -> crate::state::DomainValidationRecord {
-    let target = crate::state::validation_target(domain_name);
-    let mut record = crate::state::DomainValidationRecord {
-        domain_name: domain_name.to_string(),
-        validation_status: crate::state::DOMAIN_STATUS_PENDING_VALIDATION.to_string(),
-        validation_method: validation_method.to_string(),
-        validation_domain: None,
-        validation_emails: Vec::new(),
-        resource_record: None,
-        http_redirect: None,
-    };
-    match validation_method {
-        "DNS" => {
-            let name = crate::state::validation_label(certificate_id, domain_name, "dns-name");
-            let value = crate::state::validation_label(certificate_id, domain_name, "dns-value");
-            record.resource_record = Some(ResourceRecord {
-                name: format!("_{name}.{target}."),
-                r#type: crate::state::RECORD_TYPE_CNAME.to_string(),
-                value: format!("_{value}.{}.", crate::state::ACM_VALIDATIONS_ZONE),
-            });
-        }
-        "HTTP" => {
-            let token = crate::state::validation_label(certificate_id, domain_name, "http-token");
-            let path = crate::state::HTTP_VALIDATION_PATH;
-            record.http_redirect = Some(HttpRedirect {
-                redirect_from: Some(format!("http://{target}{path}{token}.txt")),
-                redirect_to: Some(format!(
-                    "http://{token}.{}{path}{token}.txt",
-                    crate::state::ACM_VALIDATIONS_ZONE
-                )),
-            });
-        }
-        // EMAIL, and the default when the request named no method.
-        _ => {
-            // The validation domain is the SUFFIX of the mailboxes ACM writes to, and
-            // a mail suffix carries no wildcard label: a request that validates
-            // `*.example.com` through itself is mailed at `example.com`, the domain
-            // ACM proves control of.
-            let mailed = validation_domain
-                .map(crate::state::validation_target)
-                .unwrap_or(target);
-            record.validation_domain = Some(mailed.to_string());
-            record.validation_emails = crate::state::validation_mailboxes(mailed);
-        }
-    }
-    record
 }
 
 /// What a request's certificate is built from beyond the request members themselves:

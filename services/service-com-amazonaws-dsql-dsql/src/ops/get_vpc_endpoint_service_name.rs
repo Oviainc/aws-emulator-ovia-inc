@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVpcEndpointServiceName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVpcEndpointServiceName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVpcEndpointServiceName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the VPC endpoint service that fronts the persisted cluster named by the
+//! `@httpLabel` `identifier`, together with that cluster's VPC connection endpoint, or
+//! the modelled `ResourceNotFoundException` (404) when this service holds no such
+//! cluster. `@readonly`: the only write it performs is settling a status change the
+//! clock already owed at this instant.
+//!
+//! Both reported values are DERIVED from the persisted cluster — its region and its
+//! identifier — through [`crate::state::vpc_endpoint_service_name`] and the endpoint
+//! `CreateCluster` stored, so two reads of one cluster agree and a read invents
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +149,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVpcEndpointServiceName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVpcEndpointServiceNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVpcEndpointServiceName"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetVpcEndpointServiceNameErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the dsql cluster store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut state = state.lock();
+        // A reporting operation, so the only write is the transition the clock already
+        // owed at this instant — exactly what `GetCluster` settles.
+        state.settle(std::time::SystemTime::now());
+
+        // The region the request itself is scoped to: what the modelled
+        // `ResourceNotFoundException` names the absent cluster's ARN in, exactly as
+        // `GetCluster` does.
+        let request_region = crate::state::request_region(ctx);
+
+        let Some(cluster) = state.clusters.get(&input.identifier) else {
+            return Err(
+                GetVpcEndpointServiceNameErrorModeled::ResourceNotFoundException(
+                    crate::state::cluster_not_found(&request_region, &input.identifier),
+                )
+                .into(),
+            );
+        };
+
+        // The endpoint service lives in the CLUSTER's region, which is the region of
+        // the ARN the cluster was minted with, so a request signed for another region
+        // that reads this cluster still gets the cluster's own. Every stored cluster
+        // carries a well-formed ARN, so the request's region is only a fallback.
+        let region =
+            crate::state::arn_region(&cluster.arn).unwrap_or_else(|| request_region.clone());
+
+        Ok(GetVpcEndpointServiceNameOutput {
+            service_name: crate::state::vpc_endpoint_service_name(&region, &cluster.identifier),
+            cluster_vpc_endpoint: cluster.endpoint.clone(),
+        })
     }
 }

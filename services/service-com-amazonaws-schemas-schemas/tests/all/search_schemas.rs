@@ -238,11 +238,10 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
 
 /// The epoch seconds a timestamp member carries.
 ///
-/// The WIRE form is the framework's: this service's model targets
-/// `__timestampIso8601` here and a plain timestamp on `DescribeSchema`, and the
-/// generated codec may render either as epoch seconds or as an ISO-8601 string. What
-/// this service owns is the VALUE — fixed at write time and stable across reads —
-/// which is why both forms are reduced to seconds before comparing.
+/// What these cases own is the VALUE — fixed at write time and stable across reads —
+/// not its rendering, so both the `date-time` string the model requires (pinned in
+/// `tests/all/iso8601_timestamps.rs`) and a bare number of seconds are reduced to
+/// seconds before comparing.
 fn timestamp_secs(value: &Value, case: &str) -> i64 {
     match value {
         Value::String(rendered) => aws_smithy_types::DateTime::from_str(

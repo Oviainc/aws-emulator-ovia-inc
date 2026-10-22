@@ -487,6 +487,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name,
             performance_mode,
             throughput_mode,
+            // No throughput change has been applied to a file system that was just
+            // created, so `UpdateFileSystem`'s 24-hour restriction does not bind yet.
+            last_restricted_throughput_change: None,
             provisioned_throughput_in_mibps: input.provisioned_throughput_in_mibps,
             encrypted: input.encrypted,
             kms_key_id,

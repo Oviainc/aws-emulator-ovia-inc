@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Accessor, Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
+    Accessor, AccessorSummary, Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
     MemberLogPublishingConfiguration, MemberSummary, Network, NetworkEthereumAttributes,
     NetworkFabricAttributes, NetworkFrameworkAttributes, NetworkSummary, Node,
     NodeEthereumAttributes, NodeFabricAttributes, NodeFrameworkAttributes,
@@ -243,6 +243,10 @@ pub const MEMBER_MAX_RESULTS: i32 = 20;
 /// `ListInvitations`'s `MaxResults` upper bound, from its `@range(1, 100)`. Also the page
 /// size used when a caller names none.
 pub const INVITATION_MAX_RESULTS: i32 = 100;
+
+/// `ListAccessors`'s `MaxResults` upper bound, from `AccessorListMaxResults`'s
+/// `@range(1, 50)`. Also the page size used when a caller names none.
+pub const ACCESSOR_MAX_RESULTS: i32 = 50;
 
 /// How many networks this emulator will hold.
 ///
@@ -775,6 +779,23 @@ impl StoredAccessor {
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
             arn: Some(self.arn.clone()),
             tags: Some(map_out(&self.tags)),
+            network_type: Some(self.network_type.clone()),
+        }
+    }
+
+    /// The modelled `AccessorSummary` for this record, as `ListAccessors` reports it.
+    ///
+    /// Projected from the SAME stored record [`Self::to_accessor`] answers from, so a
+    /// listing and a `GetAccessor` never disagree; `AccessorSummary` declares no
+    /// `BillingToken` or `Tags`, so the summary carries the members the model lists and
+    /// no more.
+    pub fn to_summary(&self) -> AccessorSummary {
+        AccessorSummary {
+            id: Some(self.id.clone()),
+            r#type: Some(self.accessor_type.clone()),
+            status: Some(self.status.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            arn: Some(self.arn.clone()),
             network_type: Some(self.network_type.clone()),
         }
     }

@@ -23,6 +23,8 @@ mod certificate_lifecycle;
 mod certificate_list_filters;
 #[path = "all/certificate_not_found_message.rs"]
 mod certificate_not_found_message;
+#[path = "all/certificate_options_update.rs"]
+mod certificate_options_update;
 #[path = "all/certificate_revocation.rs"]
 mod certificate_revocation;
 #[path = "all/certificate_search.rs"]

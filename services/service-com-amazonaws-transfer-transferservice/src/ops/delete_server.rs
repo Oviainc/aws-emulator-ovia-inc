@@ -186,6 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .users
             .retain(|(server_id, _), _| server_id != &input.server_id);
 
+        // The server's accesses belong to it on the same terms, so `DescribeAccess`
+        // cannot answer for a deleted server either.
+        guard
+            .accesses
+            .retain(|(server_id, _), _| server_id != &input.server_id);
+
         // The server's host keys go the same way, for the same reason: a host key is
         // addressed by `(ServerId, HostKeyId)`, so one left behind would make
         // `DescribeHostKey` answer for a server that no longer exists.

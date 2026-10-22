@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SwapEnvironmentCNAMEs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SwapEnvironmentCNAMEs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SwapEnvironmentCNAMEs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: exchanges the stored `CNAME` of the two environments the request names
+//! and answers with this operation's empty result. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SwapEnvironmentCNAMEs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SwapEnvironmentCNAMEsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SwapEnvironmentCNAMEs"))
+        // Nothing here is region-derived: the swap moves CNAMEs that are already
+        // stored, so the request's credential scope is not read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SwapEnvironmentCNAMEsError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // A status change the clock already owed — a launch that completed, a
+        // termination that finished — must be visible before this call decides
+        // whether an environment can take part in a swap.
+        store.materialize_due_transitions();
+
+        let source = Selector {
+            side: "Source",
+            environment_id: input.source_environment_id.as_deref(),
+            environment_name: input.source_environment_name.as_deref(),
+        };
+        let destination = Selector {
+            side: "Destination",
+            environment_id: input.destination_environment_id.as_deref(),
+            environment_name: input.destination_environment_name.as_deref(),
+        };
+
+        // "You must specify at least the SourceEnvironmentID or the
+        // SourceEnvironmentName", and the same for the destination: an unnamed
+        // side cannot be resolved at all.
+        for selector in [&source, &destination] {
+            if selector.environment_id.is_none() && selector.environment_name.is_none() {
+                return Err(SwapEnvironmentCNAMEsError::missing_required_parameter(
+                    format!(
+                        "Must specify either {side}EnvironmentId or {side}EnvironmentName.",
+                        side = selector.side
+                    ),
+                ));
+            }
+        }
+        // "If you specify the SourceEnvironmentId, you must specify the
+        // DestinationEnvironmentId" and "You must specify the
+        // SourceEnvironmentName with the DestinationEnvironmentName": the two
+        // sides must share at least one way of naming an environment, so the
+        // pair is selected by the same member. A side that supplies both members
+        // satisfies this through either one.
+        let paired_by_id = source.environment_id.is_some() && destination.environment_id.is_some();
+        let paired_by_name =
+            source.environment_name.is_some() && destination.environment_name.is_some();
+        if !paired_by_id && !paired_by_name {
+            return Err(SwapEnvironmentCNAMEsError::missing_required_parameter(
+                "Must specify SourceEnvironmentId with DestinationEnvironmentId, \
+                 or SourceEnvironmentName with DestinationEnvironmentName."
+                    .to_string(),
+            ));
+        }
+
+        let source_id = resolve(&store, &source)?;
+        let destination_id = resolve(&store, &destination)?;
+
+        // Read both CNAMEs (and refuse an environment that cannot take part)
+        // before writing either, so a refusal leaves the store untouched.
+        let source_cname = swappable_cname(&store, &source, &source_id)?;
+        let destination_cname = swappable_cname(&store, &destination, &destination_id)?;
+
+        // The swap itself: each environment takes the other's CNAME. Naming one
+        // environment on both sides would exchange a record's CNAME with itself,
+        // which leaves it exactly as it was — the real service documents no
+        // refusal for it, and there is nothing to write.
+        if source_id == destination_id {
+            return Ok(SwapEnvironmentCNAMEsOutput);
+        }
+        let at = crate::state::now();
+        for (environment_id, cname) in [
+            (&source_id, destination_cname),
+            (&destination_id, source_cname),
+        ] {
+            let environment = store
+                .environments
+                .get_mut(environment_id)
+                .expect("resolved from the store above");
+            environment.cname = cname;
+            environment.date_updated = at;
+        }
+
+        // The model binds `Unit` as this operation's output: an empty result
+        // envelope, with the store holding everything the call changed.
+        Ok(SwapEnvironmentCNAMEsOutput)
     }
+}
+
+/// One side of the swap: which side it is, and the two members the caller may
+/// name that side's environment with.
+///
+/// Both sides are selected the same way, so the checks and the lookup are written
+/// once and the side is the parameter — and an error message names the member the
+/// caller actually sent.
+struct Selector<'a> {
+    /// `Source` or `Destination`, the prefix this side's input members carry.
+    side: &'static str,
+    environment_id: Option<&'a str>,
+    environment_name: Option<&'a str>,
+}
+
+/// The id of the environment this side names, or `InvalidParameterValue` naming
+/// the member that matched nothing.
+fn resolve(
+    store: &crate::state::ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    selector: &Selector<'_>,
+) -> Result<String, SwapEnvironmentCNAMEsError> {
+    store
+        .resolve_environment_id(selector.environment_id, selector.environment_name)
+        .ok_or_else(|| {
+            let side = selector.side;
+            SwapEnvironmentCNAMEsError::invalid_parameter_value(
+                match (selector.environment_id, selector.environment_name) {
+                    (Some(id), _) => {
+                        format!("No Environment found for {side}EnvironmentId = '{id}'.")
+                    }
+                    (None, Some(name)) => {
+                        format!("No Environment found for {side}EnvironmentName = '{name}'.")
+                    }
+                    (None, None) => unreachable!("refused above"),
+                },
+            )
+        })
+}
+
+/// The CNAME of the stored environment `environment_id`, if that environment can
+/// take part in a swap.
+///
+/// "Ready: Environment is available to have an action performed on it, such as
+/// update or terminate" — an environment still launching, shutting down or
+/// already gone is in no state to hand its CNAME over, so the swap is refused
+/// rather than half-applied. The model says this of `EnvironmentStatus` for the
+/// service as a whole rather than of this operation, so the refusal is the
+/// general rule applied here, not a condition quoted for the swap.
+fn swappable_cname(
+    store: &crate::state::ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    selector: &Selector<'_>,
+    environment_id: &str,
+) -> Result<String, SwapEnvironmentCNAMEsError> {
+    // Defensive: `resolve` took this id from the store under the same lock, so
+    // the record is there. The branch keeps the lookup honest rather than
+    // asserting, and reports the side whose selector produced the id.
+    let environment = store.environments.get(environment_id).ok_or_else(|| {
+        SwapEnvironmentCNAMEsError::invalid_parameter_value(format!(
+            "No Environment found for {}EnvironmentId = '{environment_id}'.",
+            selector.side
+        ))
+    })?;
+    if environment.status != crate::state::STATUS_READY {
+        return Err(SwapEnvironmentCNAMEsError::invalid_parameter_value(format!(
+            "Environment {} is in status {} and is not in a state from which its CNAME can be swapped.",
+            environment.environment_name, environment.status
+        )));
+    }
+    Ok(environment.cname.clone())
 }

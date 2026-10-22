@@ -125,6 +125,28 @@ use super::types::*;
 /// string the service constrains itself.
 const CLUSTER_SETTING_VALUES: [&str; 3] = ["enhanced", "enabled", "disabled"];
 
+/// The member `clusterCount` is written under, beside the modelled `cluster`.
+///
+/// RECORDED behaviour: `CreateClusterResponse` declares the single member `cluster`
+/// (`smithy_query(query="operation", operation="CreateCluster")`), so there is no
+/// generated field for `clusterCount` and this schema is what names it on the wire.
+/// Index 1 is the first free member index after `cluster` (index 0). See
+/// [`crate::state::ClusterCountEnvelope`].
+const CLUSTER_COUNT_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.ecs#CreateClusterResponse$clusterCount",
+        "com.amazonaws.ecs",
+        "clusterCount",
+    ),
+    ::aws_smithy_schema::ShapeType::Integer,
+    "clusterCount",
+    1,
+);
+
+/// What `CreateCluster` answers: the modelled `CreateClusterResponse` plus the recorded
+/// top-level `clusterCount`.
+pub type CreateClusterResponse = crate::state::ClusterCountEnvelope<CreateClusterOutput>;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -184,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for CreateCluster<Eng>
 {
     type Input = CreateClusterInput;
-    type Output = CreateClusterOutput;
+    type Output = CreateClusterResponse;
     type Error = CreateClusterError;
 
     const NAME: &'static str = "CreateCluster";
@@ -243,9 +265,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A cluster name identifies the cluster, so creating one that already exists is
         // not a second cluster: the stored record is reported back unchanged.
         if let Some(existing) = guard.clusters.get(&name) {
-            let view = guard.cluster_view(existing, crate::state::ClusterFields::all());
-            return Ok(CreateClusterOutput {
-                cluster: Some(view),
+            // `CreateCluster`'s input shape models `tags`, so its answer materialises
+            // the cluster's tag set (see `cluster_mutation_view`).
+            let view = guard.cluster_mutation_view(existing, true);
+            return Ok(CreateClusterResponse {
+                payload: CreateClusterOutput {
+                    cluster: Some(view),
+                },
+                cluster_count: guard.cluster_count(),
+                member: &CLUSTER_COUNT_MEMBER,
             });
         }
 
@@ -273,11 +301,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_default(),
         };
-        let view = guard.cluster_view(&record, crate::state::ClusterFields::all());
+        let view = guard.cluster_mutation_view(&record, true);
         guard.clusters.insert(name, record);
 
-        Ok(CreateClusterOutput {
-            cluster: Some(view),
+        // `clusterCount` is read AFTER the create landed, so it counts the cluster this
+        // call just added.
+        Ok(CreateClusterResponse {
+            payload: CreateClusterOutput {
+                cluster: Some(view),
+            },
+            cluster_count: guard.cluster_count(),
+            member: &CLUSTER_COUNT_MEMBER,
         })
     }
 }

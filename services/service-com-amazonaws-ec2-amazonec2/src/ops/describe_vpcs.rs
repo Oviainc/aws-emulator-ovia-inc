@@ -4,7 +4,9 @@
 //!
 //! Reports the account's VPCs out of [`crate::state`]: the whole store by default, or the
 //! subset the request's `VpcIds` and `Filters` select, one `MaxResults`-sized page at a
-//! time. A reporting operation only — it writes nothing.
+//! time. A reporting operation — the only write it makes is to materialise the state
+//! transitions the clock has ALREADY made due (a VPC's `pending` -> `available`), which
+//! were owed at the same instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -186,7 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call the
+        // instance describes make: a VPC `CreateVpc` answered as `pending` is `available`
+        // once its due instant has passed, whether or not anybody called, so applying it
+        // here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
 
         // "The IDs of the VPCs" (`DescribeVpcsRequest$VpcIds`): an id that names no VPC of
         // the account is an error, not an absent row.

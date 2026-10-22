@@ -38,6 +38,46 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// gone from the store.)
 pub const DOMAIN_STATUS_ACTIVE: &str = "Active";
 
+/// The only status an external connection this emulator holds can be in.
+/// `ExternalConnectionStatus` models exactly one value, `Available`, and the
+/// `RepositoryExternalConnectionInfo.status` doc says so ("There is one valid value,
+/// `Available`"), so an associated connection is reported available from the first read.
+pub const EXTERNAL_CONNECTION_STATUS_AVAILABLE: &str = "Available";
+
+/// The public registries CodeArtifact can connect a repository to, each paired with the
+/// `PackageFormat` its packages carry.
+///
+/// Source: the `externalConnection` member doc of `AssociateExternalConnectionRequest`
+/// ("The following values are supported: public:npmjs - for the npm public repository
+/// …"), read with
+/// `smithy_query(query="doc",shape="AssociateExternalConnectionRequest",member="externalConnection")`;
+/// the format of each is the registry's own package format from `PackageFormat`. The
+/// member is modelled as a free `ExternalConnectionName` string rather than an enum, so
+/// this catalog is what distinguishes a supported connection from an arbitrary one.
+pub const EXTERNAL_CONNECTIONS: &[(&str, &str)] = &[
+    ("public:npmjs", "npm"),
+    ("public:nuget-org", "nuget"),
+    ("public:pypi", "pypi"),
+    ("public:maven-central", "maven"),
+    ("public:maven-googleandroid", "maven"),
+    ("public:maven-gradleplugins", "maven"),
+    ("public:maven-commonsware", "maven"),
+    ("public:maven-clojars", "maven"),
+    ("public:ruby-gems-org", "ruby"),
+    ("public:crates-io", "cargo"),
+];
+
+/// The `PackageFormat` of the packages a named external connection serves, or `None` when
+/// the name is not a connection CodeArtifact supports — which the caller answers as an
+/// invalid parameter value rather than storing a connection to a registry that does not
+/// exist.
+pub fn external_connection_package_format(name: &str) -> Option<&'static str> {
+    EXTERNAL_CONNECTIONS
+        .iter()
+        .find(|(connection, _)| *connection == name)
+        .map(|(_, format)| *format)
+}
+
 // ---------------------------------------------------------------------------
 // Store bounds
 //
@@ -60,6 +100,12 @@ pub const MAX_REPOSITORIES_PER_DOMAIN: usize = 1_000;
 /// repository" quota). `UpstreamRepositoryList` carries NO modelled length, so the
 /// boundary validator cannot cap it and `CreateRepository` must.
 pub const MAX_UPSTREAMS_PER_REPOSITORY: usize = 10;
+
+/// Maximum external connections one repository may hold. `AssociateExternalConnection`'s
+/// own documentation states the limit — "One external connection is allowed per
+/// repository" — and it is why that operation models
+/// `ServiceQuotaExceededException` (402).
+pub const MAX_EXTERNAL_CONNECTIONS_PER_REPOSITORY: usize = 1;
 
 /// Per-service state for com-amazonaws-codeartifact-codeartifactcontrolplaneservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]

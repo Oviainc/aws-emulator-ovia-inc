@@ -214,7 +214,9 @@ pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
 /// refuses requests with codes its clients branch on: `InvalidInstanceID.NotFound`
 /// for an instance that does not exist, `IncorrectInstanceState` for a transition the
 /// current state does not admit, `InvalidParameterValue` for a value it cannot
-/// accept, `DryRunOperation` for a `DryRun` request that would have succeeded. This
+/// accept, `MissingParameter` for one the request left out,
+/// `InvalidParameterCombination` for members that cannot hold together,
+/// `DryRunOperation` for a `DryRun` request that would have succeeded. This
 /// is how a handler answers with THAT code and status instead of flattening every
 /// such refusal into `ValidationException`, which no EC2 client matches on, or into a
 /// 501, which would claim the operation is unwritten. Reach it through one of the
