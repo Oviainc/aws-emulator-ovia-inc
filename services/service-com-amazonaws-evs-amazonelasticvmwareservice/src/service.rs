@@ -98,15 +98,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service states such a refusal as the AWS validation envelope — the
+        // clause naming the member path and the requirement it failed, without
+        // quoting the rejected value back — which is a different rule from the
+        // framework's default wording; `crate::state::constraint_violation_message`
+        // is the one renderer behind every operation of this service and owns that
+        // rule. The STATUS and the CODE are already the framework's and are what the
+        // model declares (`ValidationException`, `@error(client)`, `@httpError(400)`),
+        // so the code is restated unchanged alongside the reworded message: a message
+        // without its matching code is worse than leaving both alone.
+        //
+        // An authentication refusal is left to the framework: it is not a
+        // modelled-input failure and this service does not restate it.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        Some(Refused {
+            code: "ValidationException".to_string(),
+            message: crate::state::constraint_violation_message(violations)?,
+        })
     }
 
     fn override_routing_error(

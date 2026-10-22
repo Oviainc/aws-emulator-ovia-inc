@@ -21,3 +21,5 @@ mod error_wire_status;
 mod state_roundtrip;
 #[path = "all/tagging_not_found.rs"]
 mod tagging_not_found;
+#[path = "all/validation_message_rendering.rs"]
+mod validation_message_rendering;

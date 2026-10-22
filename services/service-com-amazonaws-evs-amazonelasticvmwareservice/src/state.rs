@@ -14,6 +14,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use smithy_server_runtime::{Violation, ViolationKind};
+
 use crate::ops::types::{
     Check, ConnectivityInfo, EipAssociation, Environment, EnvironmentSummary, LicenseInfo,
     ResourceNotFoundException, ServiceAccessSecurityGroups, ValidationException, VcfHostnames, Vlan,
@@ -679,4 +681,156 @@ pub fn invalid_next_token(error: PageTokenError) -> ValidationException {
             PageTokenError::Expired => "has expired; pagination tokens are valid for 24 hours",
         },
     )
+}
+
+// =============================================================================
+// How this service STATES a request its modelled constraints refuse
+// =============================================================================
+
+/// The segment the framework appends for the step from a collection into one of its
+/// elements (`constraints::path::element` / `path::entry` both end in it).
+const COLLECTION_STEP: &str = "member";
+
+/// The fixed text the framework puts between a clause's member half and the requirement
+/// it failed, in [`Violation::message`].
+const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
+
+/// What this service's envelope joins several clauses with: a bare comma, no space.
+const CLAUSE_JOINER: &str = ",";
+
+/// The `ValidationException` message this service states for a request the boundary
+/// validator refused against the model's own constraints — the ONE renderer behind every
+/// operation of this service, reached from `Service::override_refusal`.
+///
+/// The envelope: `1 validation error detected: <clause>` for a single violation and
+/// `<n> validation error(s) detected: <clause>,<clause>` for several, with the clauses
+/// ordered by the member path they are reported against (never by the order the members
+/// appear in the request) and joined by [`CLAUSE_JOINER`]. A clause is
+/// `Value at '<member path>' failed to satisfy constraint: <requirement>`, with the
+/// rejected value never quoted back and only an ABSENT member keeping
+/// `Value null at '<path>' …`, because absence is the fact that clause states.
+///
+/// Returns `None` when there is nothing to state, so the caller keeps the framework's
+/// default wording.
+///
+/// This is deliberately not the framework's default envelope renderer
+/// (`aws_smithy_schema_server::envelope`): that one echoes the value, prints a `@pattern`
+/// with the anchors the model wrote it with, says `errors` rather than `error(s)`, joins
+/// with `"; "`, keeps the request's own member order, and reports a collection element at
+/// its indexed path. Other emulated services word these refusals differently again
+/// (`artifact` joins with `"; "` and prints a `@pattern` WITH its anchors), so each
+/// service states its own envelope, as the other service crates carrying this helper do.
+pub fn constraint_violation_message(violations: &[Violation]) -> Option<String> {
+    let mut clauses: Vec<(String, String)> = violations.iter().map(clause).collect();
+    // Ordered by the member path the clause names, compared byte-wise. `sort_by` is
+    // stable, so two violations of ONE member keep the order the walk found them in.
+    clauses.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let rendered: Vec<String> = clauses.into_iter().map(|(_, clause)| clause).collect();
+    match rendered.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", rendered[0])),
+        n => Some(format!(
+            "{n} validation error(s) detected: {}",
+            rendered.join(CLAUSE_JOINER)
+        )),
+    }
+}
+
+/// One violation as this service states it: the member path it is reported AGAINST
+/// (which is what the clauses are ordered by), and the clause itself.
+fn clause(violation: &Violation) -> (String, String) {
+    let requirement = requirement_of(violation);
+    // A violation of a collection ELEMENT is reported against the collection member
+    // that holds it, with the element's requirement bundled inside the outer
+    // constraint — a caller is told which member of the request to fix, and that the
+    // requirement applies to the member's elements rather than to the member itself.
+    let (path, requirement) = match collection_holding(&violation.path) {
+        Some(collection) => (
+            collection.to_string(),
+            format!("Member must satisfy constraint: [{requirement}]"),
+        ),
+        None => (violation.path.clone(), requirement),
+    };
+    // A present-but-invalid value is NOT quoted back at the caller; an absent member
+    // keeps the framework's `Value null at …`, because absence IS what it states.
+    let subject = if violation.value.is_some() {
+        "Value at"
+    } else {
+        "Value null at"
+    };
+    let clause = format!("{subject} '{path}'{CONSTRAINT_MARKER}{requirement}");
+    (path, clause)
+}
+
+/// The requirement half of a violation's clause: what the value had to satisfy.
+///
+/// Every constraint keeps the framework's own requirement wording, so a constraint kind
+/// it learns to check is reported rather than dropped — but it is read off a clause the
+/// framework builds for this SAME violation with NO value attached, at the LAST marker in
+/// that clause. Both halves of the framework's clause can carry text the CALLER chose:
+/// the value it rejected, and — for a map entry, whose path segment is the key as sent —
+/// the member path. A requirement never contains the marker, so the last occurrence is
+/// the real separator whatever either half spells, while the first could fall inside
+/// caller text and copy the rest of it into the message.
+///
+/// A `@pattern` is the one requirement reworded here: its anchors are the model's way of
+/// saying "the whole value", not part of the expression (see [`unanchored`]).
+fn requirement_of(violation: &Violation) -> String {
+    if let ViolationKind::Pattern(pattern) = &violation.kind {
+        return format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        );
+    }
+    let valueless = Violation {
+        value: None,
+        ..violation.clone()
+    };
+    let rendered = valueless.message();
+    match rendered.rsplit_once(CONSTRAINT_MARKER) {
+        Some((_member_half, requirement)) => requirement.to_string(),
+        // A wording with no requirement half: keep what the framework rendered.
+        None => rendered,
+    }
+}
+
+/// `pattern` without the anchors bracketing it: a leading `^` and a trailing `$` the
+/// expression itself has not escaped.
+///
+/// A Smithy `@pattern` is an unanchored regular-expression SEARCH, so a model that wants
+/// the whole value to match writes the anchors in; they say "all of it" and are not part
+/// of the expression a caller has to satisfy.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        // An ODD number of trailing backslashes escapes the `$`, making it a literal
+        // dollar the value must carry rather than an anchor.
+        Some(head) if trailing_backslashes(head).is_multiple_of(2) => head,
+        _ => body,
+    }
+}
+
+/// How many `\` characters `text` ends with.
+fn trailing_backslashes(text: &str) -> usize {
+    text.chars().rev().take_while(|c| *c == '\\').count()
+}
+
+/// The collection member path a violation of a collection ELEMENT is reported against,
+/// or `None` when the offending value is not an element of a collection.
+///
+/// The framework names an element by the step it took to reach it — `<1-based index>`
+/// for a list element, the key for a map entry, each followed by [`COLLECTION_STEP`] —
+/// so a path ENDING in that step is the element ITSELF and belongs to the collection
+/// holding it. A path that merely passes THROUGH a collection to reach a member inside
+/// an element (`settings.1.member.value`) keeps every segment: what failed there is that
+/// member, not the element.
+///
+/// A map value that fails a constraint of its own shape is the one case this cannot
+/// place: the framework names it by its key alone (`tags.someKey`), with no collection
+/// step to tell it apart from a member of a structure, so it keeps the path the framework
+/// built.
+fn collection_holding(path: &str) -> Option<&str> {
+    let through_step = path.strip_suffix(COLLECTION_STEP)?.strip_suffix('.')?;
+    let (collection, _element) = through_step.rsplit_once('.')?;
+    Some(collection)
 }
