@@ -21,6 +21,8 @@ mod input_validation;
 mod performance_analysis_reports;
 #[path = "all/pi_harness.rs"]
 mod pi_harness;
+#[path = "all/resource_dimensions.rs"]
+mod resource_dimensions;
 #[path = "all/resource_metrics.rs"]
 mod resource_metrics;
 #[path = "all/state_roundtrip.rs"]

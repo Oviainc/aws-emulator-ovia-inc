@@ -9,9 +9,11 @@
 //!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
 //! value that is not a resource ARN of this service's vendor names nothing this API
-//! can address, so it is the modelled `ValidationException` (400) naming the member,
-//! raised before the store is consulted at all. An ARN that IS one of this service's
-//! and names no stored record is a 404 carrying this service's own
+//! can address, so it is refused as a bad request (HTTP 400, error code
+//! `BadRequestException` — `crate::scaffolded::BAD_REQUEST_CODE`, the tagging
+//! front-end's own identity rather than the modelled `ValidationException` shape
+//! name), raised before the store is consulted at all. An ARN that IS one of this
+//! service's and names no stored record is a 404 carrying this service's own
 //! `NotFoundException` code (`crate::state::parameter_not_found`), which is the code
 //! its recorded responses use rather than the modelled `ResourceNotFoundException`
 //! shape name.
@@ -150,11 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // Input before lookup: an ARN of another vendor is a bad request, not a
-        // missing resource.
-        if let Err(invalid) = crate::state::validate_resource_arn(&input.resource_arn) {
-            return Err(UntagResourceErrorModeled::ValidationException(invalid).into());
-        }
+        // Input before lookup: a value that is not a resource ARN this API addresses is
+        // a bad request, not a missing resource.
+        crate::state::validate_resource_arn(&input.resource_arn)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {

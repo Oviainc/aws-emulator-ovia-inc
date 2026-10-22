@@ -21,46 +21,52 @@
 //!    across any page size, and omits `nextToken` on the last page.
 //! 5. A domain's `repositoryCount` is the number of repositories it holds, at every point
 //!    in the lifecycle.
+//!
+//! The `Answer`/`emulator`/`call` harness below is `pub(crate)`, so a sibling suite
+//! (`repository_endpoint.rs`) drives the same front door rather than rebuilding one.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header in the shape the router's routing key reader parses:
-/// its credential scope is what names the target service AND the region every minted ARN
-/// carries. The signature itself is never checked here (the harness turns request
-/// authentication off), so it is a placeholder.
-const AUTH: &str =
-    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/codeartifact/aws4_request, \
-     SignedHeaders=host, Signature=0";
+/// A SigV4 `Authorization` header for `region`, in the shape the router's routing key
+/// reader parses: its credential scope is what names the target service AND the region
+/// every minted ARN carries. The signature itself is never checked here (the harness
+/// turns request authentication off), so it is a placeholder.
+pub(crate) fn auth_for(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/codeartifact/aws4_request, \
+         SignedHeaders=host, Signature=0"
+    )
+}
 
 /// The account id every generated emulator presents, and therefore the `owner`,
 /// `domainOwner` and `administratorAccount` of every resource here.
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// The region in [`AUTH`]'s credential scope; every ARN below is regional on it.
-const REGION: &str = "us-east-1";
+/// The region every request below is signed for; every ARN here is regional on it.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// One HTTP answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// `x-amzn-errortype`, which is how restJson1 names the error shape.
-    error_type: Option<String>,
-    body: Value,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The `__type`/`x-amzn-errortype` error code, or `""` on a success.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         self.error_type.clone().unwrap_or_default()
     }
 }
 
 /// The emulator under test: the production router with this one service mounted on a
 /// single shared engine, exactly as `core/router` assembles it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the ambient `--auth` setting: these requests carry an
@@ -75,9 +81,20 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// Send one request and reduce the response to an [`Answer`].
-async fn call(
+/// Send one request signed for [`REGION`] and reduce the response to an [`Answer`].
+pub(crate) async fn call(
     router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
+    call_in_region(router, REGION, method, uri, body).await
+}
+
+/// [`call`], signed for (and addressed to) an arbitrary `region`.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     uri: &str,
     body: Option<Value>,
@@ -89,8 +106,8 @@ async fn call(
     let request = http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", "codeartifact.us-east-1.amazonaws.com")
-        .header("authorization", AUTH)
+        .header("host", format!("codeartifact.{region}.amazonaws.com"))
+        .header("authorization", auth_for(region))
         .header("content-type", "application/json")
         .body(payload)
         .expect("build request");
@@ -116,7 +133,11 @@ async fn call(
     }
 }
 
-async fn create_domain(router: &MultiServiceRouter, domain: &str, key: Option<&str>) -> Answer {
+pub(crate) async fn create_domain(
+    router: &MultiServiceRouter,
+    domain: &str,
+    key: Option<&str>,
+) -> Answer {
     let body = match key {
         Some(key) => json!({ "encryptionKey": key }),
         None => json!({}),
@@ -148,7 +169,7 @@ async fn list_domains(router: &MultiServiceRouter, body: Value) -> Answer {
     call(router, "POST", "/v1/domains", Some(body)).await
 }
 
-async fn create_repository(
+pub(crate) async fn create_repository(
     router: &MultiServiceRouter,
     domain: &str,
     repository: &str,
@@ -176,7 +197,7 @@ async fn create_repository(
     .await
 }
 
-async fn describe_repository(
+pub(crate) async fn describe_repository(
     router: &MultiServiceRouter,
     domain: &str,
     repository: &str,

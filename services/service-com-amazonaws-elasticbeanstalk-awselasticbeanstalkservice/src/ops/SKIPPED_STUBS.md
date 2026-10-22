@@ -21,3 +21,11 @@ handler returns an error, so it never has to construct a value.
 // SKIPPED: CreateStorageLocation — unsupported shape construct: operation 'CreateStorageLocation' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: DescribeAccountAttributes — unsupported shape construct: operation 'DescribeAccountAttributes' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: ListAvailableSolutionStacks — unsupported shape construct: operation 'ListAvailableSolutionStacks' has a Unit/absent input, which the generator does not emit yet
+
+## Since hand-authored
+
+`ListAvailableSolutionStacks` is now hand-authored in
+`src/ops/list_available_solution_stacks.rs`: its empty input is declared there as
+`smithy.api#Unit`, and `build.rs` wires the operation in from that file's
+`//! @op ListAvailableSolutionStacks` header like any other. The decline line above
+records only that the GENERATOR did not emit it.

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRepositoryEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRepositoryEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRepositoryEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the URL a repository serves ONE package format on. The endpoint is a pure
+//! projection of the repository's identity: the domain and its owning account name the
+//! host, the request's region names the regional endpoint, and the format and the
+//! repository name are its two path segments. It is computed by
+//! [`crate::state::repository_endpoint`] from the STORED repository, so a domain or a
+//! repository this service does not hold is answered with `ResourceNotFoundException`
+//! rather than with a URL. Reporting only: this operation writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRepositoryEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRepositoryEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRepositoryEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRepositoryEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `format` and `endpointType` are modelled enums, so the boundary validator has
+        // already refused any value outside either set before this handler runs. Both
+        // are carried as plain strings, so the sets are re-checked here against the
+        // model's own generated catalogues: a request is refused as invalid rather than
+        // answered with an endpoint built from a format or an endpoint type this service
+        // does not serve.
+        if !PACKAGE_FORMAT_VALUES.contains(&input.format.as_str()) {
+            return Err(GetRepositoryEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "format {} is not a supported package format; supported formats are {}.",
+                        input.format,
+                        PACKAGE_FORMAT_VALUES.join(", ")
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                },
+            )
+            .into());
+        }
+        let endpoint_type = input
+            .endpoint_type
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_ENDPOINT_TYPE);
+        if !ENDPOINT_TYPE_VALUES.contains(&endpoint_type) {
+            return Err(GetRepositoryEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "endpointType {endpoint_type} is not a supported endpoint type; \
+                         supported endpoint types are {}.",
+                        ENDPOINT_TYPE_VALUES.join(", ")
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The region the endpoint names is a property of the REQUEST — the regional
+        // endpoint the caller signed for — read the same way every ARN this service
+        // mints reads it.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(GetRepositoryEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Domain {} not found.", input.domain),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(repository) = domain.repositories.get(&input.repository) else {
+            return Err(GetRepositoryEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Repository {} not found in domain {}.",
+                        input.repository, input.domain
+                    ),
+                    resource_id: Some(input.repository.clone()),
+                    resource_type: Some("repository".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Built from the STORED repository's own identity — its domain, that domain's
+        // owning account and its own name — so a repository's endpoint cannot drift from
+        // the record the repository operations report.
+        Ok(GetRepositoryEndpointOutput {
+            repository_endpoint: Some(crate::state::repository_endpoint(
+                &region,
+                &repository.domain_name,
+                &repository.domain_owner,
+                &input.format,
+                &repository.name,
+                endpoint_type,
+            )),
+        })
     }
 }
+

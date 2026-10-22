@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAvailableResourceDimensions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAvailableResourceDimensions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the dimension groups, and the dimensions within each
+//! group, that the requested metric types can be queried by on the addressed data
+//! source — the service CAPABILITY catalog the model documents, not telemetry, so
+//! this read persists nothing and repeating it answers identically.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAvailableResourceDimensions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalog is derived from this model's own documentation (see
+//! [`DIMENSION_GROUP_CATALOG`]) and is filtered by the request's `ServiceType`,
+//! because the model states for each group which engines it is available on, and
+//! `DOCDB` and `RDS` are disjoint sets of engines. A metric type the service
+//! publishes no dimension groups for is refused with the modelled
+//! `InvalidArgumentException`; a request that addresses no data source this
+//! account may see is refused with the modelled `NotAuthorizedException`, the
+//! uniform answer every operation in this crate gives (see
+//! [`crate::state::is_data_source_identifier`]).
+//!
+//! `AuthorizedActions` narrows the answer to the dimensions the CALLER may read
+//! through each named action. This emulator evaluates no IAM policy — the router
+//! verifies the signature and nothing else — so every Performance Insights action
+//! is authorized for the caller and the intersection over any subset of them is
+//! the full catalog, which is exactly what the member documents for a request
+//! that names no action at all. Nothing is invented for it and nothing is
+//! silently dropped.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +178,332 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAvailableResourceDimensions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAvailableResourceDimensionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAvailableResourceDimensions"))
+        let _ = (ctx, &self.engine);
+
+        // Nothing about the data source is answered until the request is
+        // authorized for it: a caller asking which dimensions a data source this
+        // account does not monitor can be queried by gets the modelled refusal,
+        // not an authoritative-looking catalog. The gate comes FIRST because the
+        // catalog below is a property of the addressed data source — the same
+        // order `GetResourceMetrics` uses for what it cannot compute.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
+        // One entry per requested metric TYPE. `MetricDimensions` is keyed by the
+        // metric type, so a repeated type is answered once: two entries under one
+        // key would leave a client to guess which is authoritative.
+        let mut metric_types: Vec<&str> = Vec::with_capacity(input.metrics.len());
+        for metric in &input.metrics {
+            if !DIMENSIONED_METRIC_TYPES.contains(&metric.as_str()) {
+                return Err(invalid_argument(format!(
+                    "Metrics must name metric types this service publishes dimensions for ({}); \
+                     got {metric}.",
+                    DIMENSIONED_METRIC_TYPES.join(", ")
+                )));
+            }
+            if !metric_types.contains(&metric.as_str()) {
+                metric_types.push(metric.as_str());
+            }
+        }
+
+        // The records this response pages over: one per (metric type, dimension
+        // group) pair, in the order the request named the metric types and the
+        // catalog lists the groups. `MaxResults` tops out at 25 while `Metrics`
+        // holds at most 5 entries, so the GROUP is the record a page is measured
+        // in — paging per metric type could never fill a page.
+        let records: Vec<(&str, &DimensionGroupSpec)> = metric_types
+            .iter()
+            .flat_map(|metric| {
+                DIMENSION_GROUP_CATALOG
+                    .iter()
+                    .filter(|spec| spec.is_available_for(&input.service_type))
+                    .map(move |spec| (*metric, spec))
+            })
+            .collect();
+
+        // A page size of zero could never advance a cursor, so 0 reads as "no
+        // caller-imposed page size" — the same reading `GetResourceMetrics` gives
+        // this member.
+        let page_size = match input.max_results {
+            Some(max) if max > 0 => max as usize,
+            _ => records.len(),
+        };
+        // The result set a cursor is handed out for: the data source and the
+        // metric types whose groups the page sequence enumerates.
+        // `AuthorizedActions` is deliberately NOT part of it — every Performance
+        // Insights action is authorized for the caller here, so naming more or
+        // fewer of them selects the same records and a cursor stays valid across
+        // the change.
+        let mut scope_parts: Vec<&str> = vec![&input.service_type, &input.identifier];
+        scope_parts.extend_from_slice(&metric_types);
+        let scope = crate::state::page_scope(&scope_parts);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(token, &scope) {
+                // A cursor is only ever handed out for a position this request's
+                // records still hold, so one naming a position past them did not
+                // come from this service either, however well its scope digests.
+                Some(offset) if offset < records.len() => offset,
+                _ => {
+                    return Err(invalid_argument(
+                        "The NextToken was not issued for this request's resource, service type \
+                         and metric types.",
+                    ))
+                }
+            },
+        };
+
+        // Collapse the page's records back into one `MetricDimensionGroups` per
+        // metric type, so a page that straddles two metric types reports each
+        // type once with the groups of that type the page holds.
+        let mut metric_dimensions: Vec<MetricDimensionGroups> = Vec::new();
+        let mut page_len = 0usize;
+        for (metric, spec) in records.iter().skip(offset).take(page_size) {
+            page_len += 1;
+            let detail = DimensionGroupDetail {
+                group: Some(spec.group.to_string()),
+                dimensions: Some(
+                    spec.dimensions
+                        .iter()
+                        .map(|dimension| DimensionDetail {
+                            identifier: Some((*dimension).to_string()),
+                        })
+                        .collect(),
+                ),
+            };
+            match metric_dimensions
+                .last_mut()
+                .filter(|entry| entry.metric.as_deref() == Some(*metric))
+            {
+                Some(entry) => entry.groups.get_or_insert_with(Vec::new).push(detail),
+                None => metric_dimensions.push(MetricDimensionGroups {
+                    metric: Some((*metric).to_string()),
+                    groups: Some(vec![detail]),
+                }),
+            }
+        }
+
+        let resumed_at = offset.saturating_add(page_len);
+        let next_token = (resumed_at < records.len())
+            .then(|| crate::state::encode_page_token(&scope, resumed_at));
+
+        Ok(ListAvailableResourceDimensionsOutput {
+            metric_dimensions: Some(metric_dimensions),
+            next_token,
+        })
     }
 }
+
+/// The metric types this service publishes dimension groups for.
+///
+/// `Metrics` documents "The types of metrics for which to retrieve dimensions.
+/// Valid values include db.load." — the DB LOAD metric, the one Performance
+/// Insights measures per database session and can therefore break down by
+/// session dimension. `DescribeDimensionKeys`' `Metric` member documents the two
+/// forms that load is reported in: "db.load.avg - A scaled representation of the
+/// number of active sessions for the database engine" and "db.sampledload.avg -
+/// The raw number of active sessions", so `db.sampledload` is the same
+/// per-session measurement and carries the same dimensions. A metric type that is
+/// not one of these — an OS counter, a per-SQL statistic, or a value that names
+/// no metric type at all — has no session dimensions to report, and is refused
+/// with the modelled `InvalidArgumentException` rather than answered with an
+/// empty catalog that would read as "this metric has no dimensions".
+const DIMENSIONED_METRIC_TYPES: &[&str] = &["db.load", "db.sampledload"];
+
+/// Which `ServiceType` values a dimension group is available for.
+///
+/// The model documents availability per ENGINE; a request names only a
+/// `ServiceType`, and the engine behind a `DbiResourceId` is not part of it, so
+/// `RDS` means "available on some engine other than Amazon DocumentDB" and
+/// `DOCDB` means "available on Amazon DocumentDB".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Availability {
+    /// Documented for Amazon DocumentDB as well as for other engines, or
+    /// documented with no engine restriction at all.
+    EveryServiceType,
+    /// Documented as "all engines except Amazon DocumentDB", or for a named
+    /// Aurora/RDS engine.
+    RdsOnly,
+    /// Documented as "only Amazon DocumentDB".
+    DocDbOnly,
+}
+
+/// One dimension group of the published catalog, with the dimensions it holds.
+#[derive(Debug)]
+struct DimensionGroupSpec {
+    /// The group name, as `DimensionGroup.Group` documents it.
+    group: &'static str,
+    /// The engines, as a `ServiceType`, this group is documented for.
+    availability: Availability,
+    /// The group's dimensions, as `DimensionGroup.Dimensions` documents them,
+    /// in lexicographic order.
+    dimensions: &'static [&'static str],
+}
+
+impl DimensionGroupSpec {
+    /// Whether this group is available for a request's `ServiceType`. An
+    /// unmodelled service type reaches neither arm: the validation stage refuses
+    /// a value outside the `ServiceType` enum before this handler runs.
+    fn is_available_for(&self, service_type: &str) -> bool {
+        match self.availability {
+            Availability::EveryServiceType => true,
+            Availability::RdsOnly => service_type == "RDS",
+            Availability::DocDbOnly => service_type == "DOCDB",
+        }
+    }
+}
+
+/// The dimension groups Performance Insights publishes for a DB load metric, and
+/// the dimensions within each.
+///
+/// SOURCE: this service's own model documentation, both halves of it —
+///
+/// ```text
+/// smithy_query(query="doc",shape="DimensionGroup",member="Group")
+/// smithy_query(query="doc",shape="DimensionGroup",member="Dimensions")
+/// ```
+///
+/// — the first naming every group and the engines it is permitted on, the second
+/// naming every dimension. A group is listed here with the dimensions that
+/// documentation gives it, and with the availability its own entry states:
+/// "only Amazon DocumentDB" is [`Availability::DocDbOnly`], "all engines except
+/// Amazon DocumentDB" and an entry naming only Aurora/RDS engines is
+/// [`Availability::RdsOnly`], and an entry that names Amazon DocumentDB among
+/// others or restricts nothing ("all engines") is
+/// [`Availability::EveryServiceType`].
+///
+/// Two consequences of reading the documentation rather than guessing around it:
+///
+/// * `db.plans` is NOT here. The group is documented, but the `Dimensions` list
+///   gives it no dimension, so the emulator has nothing to report within it and
+///   says nothing about it rather than publishing an empty group.
+/// * `db.session_type` is `RDS`, from its group entry ("only Aurora PostgreSQL
+///   and RDS PostgreSQL"), even though its dimension entry
+///   (`db.session_type.name`) says "only Amazon DocumentDB". The two sentences
+///   disagree in AWS's own model; group availability is decided by the group's
+///   entry, which is what this operation reports.
+///
+/// Held in lexicographic order by group name, so a paged answer visits each
+/// (metric type, group) pair exactly once and a cursor's offset keeps its
+/// meaning across pages.
+const DIMENSION_GROUP_CATALOG: &[DimensionGroupSpec] = &[
+    DimensionGroupSpec {
+        group: "db",
+        availability: Availability::EveryServiceType,
+        dimensions: &["db.name"],
+    },
+    DimensionGroupSpec {
+        group: "db.application",
+        availability: Availability::EveryServiceType,
+        dimensions: &["db.application.name"],
+    },
+    DimensionGroupSpec {
+        group: "db.blocking_object",
+        availability: Availability::EveryServiceType,
+        dimensions: &[
+            "db.blocking_object.id",
+            "db.blocking_object.type",
+            "db.blocking_object.value",
+        ],
+    },
+    DimensionGroupSpec {
+        group: "db.blocking_session",
+        availability: Availability::EveryServiceType,
+        dimensions: &["db.blocking_session.id"],
+    },
+    DimensionGroupSpec {
+        group: "db.blocking_sql",
+        availability: Availability::EveryServiceType,
+        dimensions: &["db.blocking_sql.id", "db.blocking_sql.sql"],
+    },
+    DimensionGroupSpec {
+        group: "db.host",
+        availability: Availability::EveryServiceType,
+        dimensions: &["db.host.id", "db.host.name"],
+    },
+    DimensionGroupSpec {
+        group: "db.query",
+        availability: Availability::DocDbOnly,
+        dimensions: &[
+            "db.query.db_id",
+            "db.query.id",
+            "db.query.statement",
+            "db.query.tokenized_id",
+        ],
+    },
+    DimensionGroupSpec {
+        group: "db.query_tokenized",
+        availability: Availability::DocDbOnly,
+        dimensions: &[
+            "db.query.tokenized.db_id",
+            "db.query.tokenized.id",
+            "db.query.tokenized.statement",
+        ],
+    },
+    DimensionGroupSpec {
+        group: "db.session_type",
+        availability: Availability::RdsOnly,
+        dimensions: &["db.session_type.name"],
+    },
+    DimensionGroupSpec {
+        group: "db.sql",
+        availability: Availability::RdsOnly,
+        dimensions: &[
+            "db.sql.db_id",
+            "db.sql.id",
+            "db.sql.statement",
+            "db.sql.tokenized_id",
+        ],
+    },
+    DimensionGroupSpec {
+        group: "db.sql_tokenized",
+        availability: Availability::RdsOnly,
+        dimensions: &[
+            "db.sql_tokenized.db_id",
+            "db.sql_tokenized.id",
+            "db.sql_tokenized.statement",
+        ],
+    },
+    DimensionGroupSpec {
+        group: "db.user",
+        availability: Availability::RdsOnly,
+        dimensions: &["db.user.id", "db.user.name"],
+    },
+    DimensionGroupSpec {
+        group: "db.wait_event",
+        availability: Availability::RdsOnly,
+        dimensions: &["db.wait_event.name", "db.wait_event.type"],
+    },
+    DimensionGroupSpec {
+        group: "db.wait_event_type",
+        availability: Availability::RdsOnly,
+        dimensions: &["db.wait_event_type.name"],
+    },
+    DimensionGroupSpec {
+        group: "db.wait_state",
+        availability: Availability::DocDbOnly,
+        dimensions: &["db.wait_state.name"],
+    },
+];
+
+/// `InvalidArgumentException` (HTTP 400), this operation's modelled refusal for a
+/// request whose values do not hold together.
+fn invalid_argument(message: impl Into<String>) -> ListAvailableResourceDimensionsError {
+    ListAvailableResourceDimensionsErrorModeled::InvalidArgumentException(
+        InvalidArgumentException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal for a request that
+/// addresses a data source this account may not read.
+fn not_authorized() -> ListAvailableResourceDimensionsError {
+    ListAvailableResourceDimensionsErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
+}
+

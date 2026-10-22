@@ -230,6 +230,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_string: input.access_string,
             authentication_type,
             password_count,
+            // Nothing is owed on a user that is already `active`.
+            settles_at: None,
             arn: arn.clone(),
         };
 

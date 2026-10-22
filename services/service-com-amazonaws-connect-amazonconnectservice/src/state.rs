@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ContactFlow, ContactFlowSummary, Instance, InstanceSummary, OutboundCallerConfig,
-    OutboundEmailConfig, Queue, QueueSummary,
+    ContactFlow, ContactFlowSummary, HoursOfOperationConfig, HoursOfOperationTimeSlice, Instance,
+    InstanceSummary, OutboundCallerConfig, OutboundEmailConfig, Queue, QueueSummary,
 };
 
 /// The region an unsigned request is served in. The emulator's own shared AWS config
@@ -95,6 +95,113 @@ pub const CONTACT_FLOW_SAVED_ALIAS: &str = "$SAVED";
 /// reason [`INSTANCE_QUOTA`] gives; released by deleting the instance.
 pub const CONTACT_FLOWS_PER_INSTANCE_QUOTA: usize = 1_000;
 
+/// One entry of the default inventory a new instance is provisioned with: a flow's
+/// name and the modelled `ContactFlowType` it carries.
+#[derive(Debug, Clone, Copy)]
+pub struct DefaultContactFlow {
+    pub name: &'static str,
+    pub flow_type: &'static str,
+}
+
+/// The contact flows every new Connect instance is born with.
+///
+/// AWS stands a new instance up as a complete contact center: it ships with a sample
+/// inbound flow plus one default flow for each of the hold/whisper/queue/transfer
+/// roles, which is why `ListContactFlows` answers non-empty on an instance nobody has
+/// created a flow in (Amazon Connect Administrator Guide, "Sample flows" / "Default
+/// flows"). The Smithy model states the operations but not the inventory, so the
+/// requirement this encodes is the non-empty default set and the TYPES it covers; the
+/// names below are this emulator's rendering of that documented set, not a claim about
+/// any particular flow's id. Every `flow_type` is a member of
+/// `com.amazonaws.connect#ContactFlowType`.
+pub const DEFAULT_CONTACT_FLOWS: [DefaultContactFlow; 9] = [
+    DefaultContactFlow {
+        name: "Sample inbound flow (first contact experience)",
+        flow_type: "CONTACT_FLOW",
+    },
+    DefaultContactFlow {
+        name: "Default agent hold",
+        flow_type: "AGENT_HOLD",
+    },
+    DefaultContactFlow {
+        name: "Default agent whisper",
+        flow_type: "AGENT_WHISPER",
+    },
+    DefaultContactFlow {
+        name: "Default customer hold",
+        flow_type: "CUSTOMER_HOLD",
+    },
+    DefaultContactFlow {
+        name: "Default customer queue",
+        flow_type: "CUSTOMER_QUEUE",
+    },
+    DefaultContactFlow {
+        name: "Default customer whisper",
+        flow_type: "CUSTOMER_WHISPER",
+    },
+    DefaultContactFlow {
+        name: "Default outbound whisper",
+        flow_type: "OUTBOUND_WHISPER",
+    },
+    DefaultContactFlow {
+        name: "Default agent transfer",
+        flow_type: "AGENT_TRANSFER",
+    },
+    DefaultContactFlow {
+        name: "Default queue transfer",
+        flow_type: "QUEUE_TRANSFER",
+    },
+];
+
+/// The content each default flow carries: a flow-language document of the form
+/// `ContactFlowContent` documents ("The JSON string that represents the content of the
+/// flow"), holding the one action that ends the contact. It is the emulator's own
+/// default content — AWS publishes no flow document for its samples — and, like any
+/// stored content, it is what `DescribeContactFlow` reports and what
+/// `FlowContentSha256` is computed from.
+pub const DEFAULT_CONTACT_FLOW_CONTENT: &str = concat!(
+    r#"{"Version":"2019-10-30","StartAction":"default","Actions":["#,
+    r#"{"Identifier":"default","Type":"DisconnectParticipant","Parameters":{}}]}"#
+);
+
+/// The names of the queues every new Connect instance is born with: AWS provisions a
+/// new instance with one default `STANDARD` queue, documented as `BasicQueue`, so
+/// `ListQueues(QueueTypes=["STANDARD"])` answers non-empty on an instance nobody has
+/// created a queue in. As with the flows, the requirement is the non-empty default
+/// set, not this id.
+pub const DEFAULT_QUEUE_NAMES: [&str; 1] = ["BasicQueue"];
+
+/// What the default queue reports as its `Description`.
+pub const DEFAULT_QUEUE_DESCRIPTION: &str =
+    "The default queue created with the Amazon Connect instance.";
+
+/// The name of the hours of operation every new instance is born with, which the
+/// default queue is attached to: AWS provisions a new instance with a default hours of
+/// operation documented as `BasicHours`.
+pub const DEFAULT_HOURS_OF_OPERATION_NAME: &str = "BasicHours";
+
+/// What the default hours of operation reports as its `Description`.
+pub const DEFAULT_HOURS_OF_OPERATION_DESCRIPTION: &str =
+    "The default hours of operation created with the Amazon Connect instance.";
+
+/// The `TimeZone` the default hours of operation carries. `com.amazonaws.connect#TimeZone`
+/// is an unconstrained string and no AWS document states the default instance's zone
+/// (it follows the console's selection, which this emulator does not model), so this is
+/// the emulator's own choice of a zone every stored timestamp is already in.
+pub const DEFAULT_HOURS_OF_OPERATION_TIME_ZONE: &str = "UTC";
+
+/// The days the default hours of operation covers, from
+/// `com.amazonaws.connect#HoursOfOperationDays`.
+const DEFAULT_HOURS_OF_OPERATION_DAYS: [&str; 7] = [
+    "SUNDAY",
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+];
+
 /// Per-service state for com-amazonaws-connect-amazonconnectservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConnectAmazonconnectserviceState {
@@ -159,6 +266,10 @@ pub struct InstanceRecord {
     /// This instance's flows, keyed by flow id. Bounded by
     /// [`CONTACT_FLOWS_PER_INSTANCE_QUOTA`].
     pub contact_flows: BTreeMap<String, ContactFlowRecord>,
+    /// This instance's hours of operation, keyed by hours-of-operation id. The queues
+    /// of the instance name one of these through their `HoursOfOperationId`, which is
+    /// why the default queue's hours live here rather than beside it.
+    pub hours_of_operations: BTreeMap<String, HoursOfOperationRecord>,
 }
 
 impl InstanceRecord {
@@ -300,6 +411,21 @@ impl QueueRecord {
     }
 }
 
+/// One stored hours of operation, inside its instance.
+#[derive(Debug, Clone)]
+pub struct HoursOfOperationRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub time_zone: String,
+    /// The modelled `HoursOfOperationConfigList`: one entry per covered day.
+    pub config: Vec<HoursOfOperationConfig>,
+    pub tags: BTreeMap<String, String>,
+    pub last_modified_time: SystemTime,
+    pub last_modified_region: String,
+}
+
 /// One stored flow, inside its instance.
 #[derive(Debug, Clone)]
 pub struct ContactFlowRecord {
@@ -356,6 +482,120 @@ impl ContactFlowRecord {
             last_modified_region: Some(self.last_modified_region.clone()),
         }
     }
+}
+
+/// Provision the resources a new instance is born with, into the instance `instance_id`
+/// of `store`: the default contact flows ([`DEFAULT_CONTACT_FLOWS`]), the default
+/// `STANDARD` queue(s) ([`DEFAULT_QUEUE_NAMES`]) and the default hours of operation
+/// ([`DEFAULT_HOURS_OF_OPERATION_NAME`]) those queues are attached to.
+///
+/// Every default resource is minted and stored exactly like a client-created one — a
+/// fresh id, the instance-scoped ARN built from it, `now` as its modification instant —
+/// so `DescribeQueue`, `ListQueues`, `DescribeContactFlow` and `ListContactFlows` all
+/// answer for them from storage, and deleting any of them (or the instance) drops them.
+/// Called only by `CreateInstance`: a read never provisions anything.
+pub fn seed_instance_defaults(
+    store: &mut ComAmazonawsConnectAmazonconnectserviceState,
+    instance_id: &str,
+    now: SystemTime,
+) {
+    // Every identifier is minted before the instance is borrowed, so the borrow below
+    // is the only one.
+    let hours_id = store.mint_resource_id();
+    let queue_ids: Vec<String> = DEFAULT_QUEUE_NAMES
+        .iter()
+        .map(|_| store.mint_resource_id())
+        .collect();
+    let flow_ids: Vec<String> = DEFAULT_CONTACT_FLOWS
+        .iter()
+        .map(|_| store.mint_resource_id())
+        .collect();
+
+    let Some(instance) = store.instances.get_mut(instance_id) else {
+        return;
+    };
+    let instance_arn = instance.arn.clone();
+    let region = instance.region.clone();
+
+    instance.hours_of_operations.insert(
+        hours_id.clone(),
+        HoursOfOperationRecord {
+            id: hours_id.clone(),
+            arn: format!("{instance_arn}/operating-hours/{hours_id}"),
+            name: DEFAULT_HOURS_OF_OPERATION_NAME.to_string(),
+            description: Some(DEFAULT_HOURS_OF_OPERATION_DESCRIPTION.to_string()),
+            time_zone: DEFAULT_HOURS_OF_OPERATION_TIME_ZONE.to_string(),
+            config: default_hours_of_operation_config(),
+            tags: BTreeMap::new(),
+            last_modified_time: now,
+            last_modified_region: region.clone(),
+        },
+    );
+
+    for (name, id) in DEFAULT_QUEUE_NAMES.iter().zip(&queue_ids) {
+        instance.queues.insert(
+            id.clone(),
+            QueueRecord {
+                id: id.clone(),
+                arn: format!("{instance_arn}/queue/{id}"),
+                name: (*name).to_string(),
+                description: Some(DEFAULT_QUEUE_DESCRIPTION.to_string()),
+                hours_of_operation_id: hours_id.clone(),
+                max_contacts: None,
+                outbound_caller_config: None,
+                outbound_email_config: None,
+                quick_connect_ids: Vec::new(),
+                queue_type: QUEUE_TYPE_STANDARD.to_string(),
+                status: QUEUE_STATUS_ENABLED.to_string(),
+                tags: BTreeMap::new(),
+                last_modified_time: now,
+                last_modified_region: region.clone(),
+            },
+        );
+    }
+
+    for (default, id) in DEFAULT_CONTACT_FLOWS.iter().zip(&flow_ids) {
+        instance.contact_flows.insert(
+            id.clone(),
+            ContactFlowRecord {
+                id: id.clone(),
+                arn: format!("{instance_arn}/contact-flow/{id}"),
+                name: default.name.to_string(),
+                description: None,
+                flow_type: default.flow_type.to_string(),
+                // A default flow is one a contact can already be routed to, which is
+                // what ACTIVE/PUBLISHED mean.
+                state: CONTACT_FLOW_STATE_ACTIVE.to_string(),
+                status: CONTACT_FLOW_STATUS_PUBLISHED.to_string(),
+                content: DEFAULT_CONTACT_FLOW_CONTENT.to_string(),
+                tags: BTreeMap::new(),
+                last_modified_time: now,
+                last_modified_region: region.clone(),
+            },
+        );
+    }
+}
+
+/// The modelled `HoursOfOperationConfigList` the default hours of operation carries:
+/// every day of the week, around the clock. The published default's own schedule is not
+/// in the model, so the coverage is the emulator's choice; what matters is that the
+/// default queue names hours of operation that exist.
+fn default_hours_of_operation_config() -> Vec<HoursOfOperationConfig> {
+    DEFAULT_HOURS_OF_OPERATION_DAYS
+        .iter()
+        .map(|day| HoursOfOperationConfig {
+            day: (*day).to_string(),
+            // Hours24Format range 0..23, MinutesLimit60 range 0..59.
+            start_time: HoursOfOperationTimeSlice {
+                hours: 0,
+                minutes: 0,
+            },
+            end_time: HoursOfOperationTimeSlice {
+                hours: 23,
+                minutes: 59,
+            },
+        })
+        .collect()
 }
 
 /// The checksum Connect reports for a flow's content: the SHA-256 of the content

@@ -206,6 +206,31 @@ pub const AWS_OWNED_KMS_KEY: &str = "AWS Owned KMS Key";
 /// [`STATUS_AVAILABLE`] carries, which is why it is defined in terms of it.
 pub const ACCESSOR_STATUS_AVAILABLE: &str = STATUS_AVAILABLE;
 
+/// The status a deleted accessor is reported in until its deletion finishes.
+///
+/// `DeleteAccessor` documents it: "After an accessor is deleted, the status of the
+/// accessor changes from AVAILABLE to PENDING_DELETION. An accessor in the
+/// PENDING_DELETION state can't be used for new WebSocket requests or HTTP requests."
+/// It is one of `AccessorStatus`'s three values.
+pub const ACCESSOR_STATUS_PENDING_DELETION: &str = "PENDING_DELETION";
+
+/// The terminal `AccessorStatus`: the accessor's deletion has finished, so neither it
+/// nor its billing token can be used any more.
+pub const ACCESSOR_STATUS_DELETED: &str = "DELETED";
+
+/// How long a deleted accessor stays `PENDING_DELETION` before the clock owes it
+/// `DELETED`.
+///
+/// `PENDING_DELETION` is a non-terminal status `DeleteAccessor` puts the accessor in, so
+/// reaching `DELETED` is a transition the clock owes. No AWS documentation fixes how long
+/// it takes (the "up to 2 hours" in `DeleteAccessor`'s prose is how long WebSocket
+/// connections opened earlier stay open, not how long the status takes to settle), so the
+/// span is this emulator's own choice — the same one [`TRANSITION_SPAN`] makes, and
+/// likewise deliberately non-zero, so a caller reading the accessor straight after the
+/// delete still observes `PENDING_DELETION`. The instant it comes due is stored on the
+/// record and materialised by [`StoredAccessor::settle`] — nothing sleeps.
+pub const ACCESSOR_DELETION_SPAN: Duration = TRANSITION_SPAN;
+
 /// The `AccessorNetworkType` an accessor takes when the create names none.
 ///
 /// `CreateAccessor$NetworkType` is optional, and AWS's `CreateAccessor` reference states
@@ -766,9 +791,40 @@ pub struct StoredAccessor {
     /// An `AccessorNetworkType` value: what the create named, or
     /// [`DEFAULT_ACCESSOR_NETWORK_TYPE`] when it named none.
     pub network_type: String,
+    /// When `PENDING_DELETION` -> `DELETED` falls due. `None` until `DeleteAccessor`
+    /// starts the deletion. See [`ACCESSOR_DELETION_SPAN`].
+    pub deleted_at: Option<SystemTime>,
 }
 
 impl StoredAccessor {
+    /// Start this accessor's deletion, as `DeleteAccessor` does: "the status of the
+    /// accessor changes from AVAILABLE to PENDING_DELETION", and `DELETED` falls due
+    /// [`ACCESSOR_DELETION_SPAN`] later.
+    ///
+    /// An accessor already `PENDING_DELETION` or `DELETED` has nothing left to start, so
+    /// a repeated delete leaves the status and the due instant exactly as the first one
+    /// set them.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.status != ACCESSOR_STATUS_AVAILABLE {
+            return;
+        }
+        self.status = ACCESSOR_STATUS_PENDING_DELETION.to_string();
+        self.deleted_at = Some(now + ACCESSOR_DELETION_SPAN);
+    }
+
+    /// Materialise the status transition the clock already owes this accessor: a deletion
+    /// that has run its course reports `DELETED`.
+    ///
+    /// Like [`StoredNetwork::settle`] this is the only write a reporting operation makes:
+    /// the change was owed at this instant whether or not anybody called.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == ACCESSOR_STATUS_PENDING_DELETION
+            && self.deleted_at.is_some_and(|deleted_at| now >= deleted_at)
+        {
+            self.status = ACCESSOR_STATUS_DELETED.to_string();
+        }
+    }
+
     /// The modelled `Accessor` for this record, as `GetAccessor` returns it.
     pub fn to_accessor(&self) -> Accessor {
         Accessor {
@@ -961,6 +1017,11 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         // due at that instant whether or not anybody calls.
         for invitation in self.invitations.values_mut() {
             invitation.settle(now);
+        }
+        // An accessor whose deletion has run its course is `DELETED` — again a
+        // transition the CLOCK owes, due at that instant whether or not anybody calls.
+        for accessor in self.accessors.values_mut() {
+            accessor.settle(now);
         }
     }
 

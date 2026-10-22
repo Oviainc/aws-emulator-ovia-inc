@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a PATCH of the stored user in [`crate::state`]. Each member the request
+//! supplies replaces the stored one (`AccessString`, and the authentication type and
+//! password count derived from `AuthenticationMode` by the same
+//! [`crate::state::authentication_from_mode`] `CreateUser` uses, so both refuse the same
+//! values); an absent member leaves the stored value alone, and a request carrying
+//! neither asks for no change at all. The accepted update leaves the user `modifying`
+//! until the clock owes it `active` again, so `DescribeUsers` reports exactly what this
+//! operation persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +147,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUser"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than reporting an update nothing applied.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::Instant::now();
+        let mut state = state.lock();
+        state.settle(now);
+        // The users the account ALREADY HAD before any call (MemoryDB's built-in
+        // `default` user) are materialised on first touch, exactly as `DescribeUsers`
+        // does, so an update naming one of them finds it instead of reporting it absent.
+        state.ensure_builtin_users(&region);
+
+        // WHICH USER FIRST, then what the request asks of it: a request naming a user
+        // state does not hold is answered not-found whatever else it carries, rather
+        // than reporting a parameter problem for a resource that does not exist.
+        let Some(stored) = state.users.get(&input.user_name) else {
+            return Err(UpdateUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(format!("User {} not found.", input.user_name)),
+            })
+            .into());
+        };
+        // Only a SETTLED user can take another change: one still `modifying` from an
+        // earlier update, or on its way out, is not in a valid state for this request.
+        if stored.status != crate::state::user_status::ACTIVE {
+            return Err(UpdateUserErrorModeled::InvalidUserStateFault(
+                InvalidUserStateFault {
+                    message: Some(format!(
+                        "User {} is in status {} and must be {} to be updated.",
+                        stored.name,
+                        stored.status,
+                        crate::state::user_status::ACTIVE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The members this operation can change — `AccessString` and
+        // `AuthenticationMode`, the two the model declares beside the required name.
+        // A request carrying NEITHER asks for no change at all, which is a parameter
+        // combination this operation cannot act on; it is refused HERE, before the
+        // stored user is reached mutably at all, so "a refused update writes nothing" is
+        // structural rather than a property of the order of the branches below.
+        if input.access_string.is_none() && input.authentication_mode.is_none() {
+            return Err(
+                UpdateUserErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "No modifications were requested. Supply AccessString or \
+                             AuthenticationMode to update a user."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The authentication rules are checked BEFORE anything is persisted, so a
+        // refused request leaves the user untouched. The helper is the one `CreateUser`
+        // uses, so a value one operation refuses the other refuses too.
+        let authentication = match input.authentication_mode.as_ref() {
+            None => None,
+            Some(mode) => match crate::state::authentication_from_mode(mode) {
+                Ok(authentication) => Some(authentication),
+                Err(crate::state::AuthenticationModeRejection::Value(message)) => {
+                    return Err(UpdateUserErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
+                Err(crate::state::AuthenticationModeRejection::Combination(message)) => {
+                    return Err(
+                        UpdateUserErrorModeled::InvalidParameterCombinationException(
+                            InvalidParameterCombinationException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // `ACLNames` is DERIVED from the ACLs listing this user, exactly as
+        // `DescribeUsers` derives it; it is read before the mutable borrow below, so an
+        // update reports the membership state already holds rather than storing a
+        // second copy of it.
+        let acl_names = state
+            .user_membership()
+            .remove(input.user_name.as_str())
+            .unwrap_or_default();
+        let user = state
+            .users
+            .get_mut(&input.user_name)
+            .expect("the user was just resolved under the same lock");
+
+        // Each supplied member replaces the stored one; an absent member leaves the
+        // stored value alone, so an update is a patch and never a re-create. Every
+        // refusal is already behind us, so from here the update is applied in full.
+        if let Some(access_string) = input.access_string {
+            user.access_string = access_string;
+        }
+        if let Some((authentication_type, password_count)) = authentication {
+            // Only the password COUNT is kept: the passwords themselves are secrets
+            // this emulator never stores or returns, exactly as on the create path.
+            user.authentication_type = authentication_type;
+            user.password_count = password_count;
+        }
+
+        // The update is accepted but not finished: the user reports `modifying` until
+        // the clock owes it `active` again, which whichever later call observes it
+        // materialises (`ComAmazonawsMemorydbAmazonmemorydbState::settle`).
+        user.status = crate::state::user_status::MODIFYING.to_string();
+        user.settles_at = Some(now + crate::state::SETTLE_AFTER);
+        Ok(UpdateUserOutput {
+            user: Some(user.to_api(acl_names)),
+        })
     }
 }

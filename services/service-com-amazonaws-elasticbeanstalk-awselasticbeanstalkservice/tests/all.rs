@@ -23,8 +23,12 @@ mod environment_operations;
 mod harness;
 #[path = "all/lifecycle.rs"]
 mod lifecycle;
+#[path = "all/operations_role.rs"]
+mod operations_role;
 #[path = "all/platform_branches.rs"]
 mod platform_branches;
+#[path = "all/solution_stacks.rs"]
+mod solution_stacks;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/swap_environment_cnames.rs"]

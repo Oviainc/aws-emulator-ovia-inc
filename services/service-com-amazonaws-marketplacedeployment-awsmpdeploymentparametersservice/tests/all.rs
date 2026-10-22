@@ -21,6 +21,8 @@ mod front_door_forbidden;
 mod not_found_error_code;
 #[path = "all/put_deployment_parameter_target.rs"]
 mod put_deployment_parameter_target;
+#[path = "all/resource_arn_classification.rs"]
+mod resource_arn_classification;
 #[path = "all/resource_arn_validation.rs"]
 mod resource_arn_validation;
 #[path = "all/state_roundtrip.rs"]

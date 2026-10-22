@@ -23,5 +23,7 @@ mod state_roundtrip;
 mod user_deletion;
 #[path = "all/user_lifecycle.rs"]
 mod user_lifecycle;
+#[path = "all/user_updates.rs"]
+mod user_updates;
 #[path = "all/users.rs"]
 mod users;

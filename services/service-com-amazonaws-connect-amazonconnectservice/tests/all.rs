@@ -17,6 +17,8 @@ mod contact_flow_catalog;
 mod contact_flow_lifecycle;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/instance_default_resources.rs"]
+mod instance_default_resources;
 #[path = "all/instance_queue_lifecycle.rs"]
 mod instance_queue_lifecycle;
 #[path = "all/state_roundtrip.rs"]

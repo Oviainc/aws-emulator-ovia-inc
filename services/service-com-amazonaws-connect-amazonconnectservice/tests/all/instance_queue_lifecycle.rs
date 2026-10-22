@@ -14,7 +14,7 @@ use std::time::Duration;
 use engine::EMULATOR_ACCOUNT_ID;
 use serde_json::{json, Value};
 use service_com_amazonaws_connect_amazonconnectservice::state::{
-    INSTANCE_ACTIVATION_DELAY, INSTANCE_QUOTA, QUEUES_PER_INSTANCE_QUOTA,
+    DEFAULT_QUEUE_NAMES, INSTANCE_ACTIVATION_DELAY, INSTANCE_QUOTA, QUEUES_PER_INSTANCE_QUOTA,
 };
 
 // The emulator fixture and the helpers the contact-flow suites share with this one.
@@ -74,6 +74,23 @@ impl Connect {
 /// A minimal valid `CreateQueue` body.
 fn queue_named(name: &str) -> Value {
     json!({ "Name": name, "HoursOfOperationId": "hop-1" })
+}
+
+/// Every queue id the instance owns before this suite creates one: the default queues
+/// `CreateInstance` provisions, which a list rule has to account for because they are
+/// stored queues of the instance like any other.
+async fn default_queue_ids(connect: &Connect, instance_id: &str) -> BTreeSet<String> {
+    let (status, listed) = connect.list_queues(instance_id, None, None, &[]).await;
+    assert_eq!(status, 200, "ListQueues of the defaults got {listed}");
+    let ids: BTreeSet<String> = ids_of(&listed["QueueSummaryList"], "Id")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        ids.len(),
+        DEFAULT_QUEUE_NAMES.len(),
+        "a new instance owns the default queues, got {listed}"
+    );
+    ids
 }
 
 /// RULE: every member `CreateInstance` accepts is persisted and reported verbatim by
@@ -314,6 +331,7 @@ async fn create_instance_is_idempotent_per_client_token() {
 async fn unknown_and_deleted_resources_answer_404() {
     let connect = Connect::new();
     let (instance_id, _) = connect.create_instance(connect_managed("myorg")).await;
+    let defaults = default_queue_ids(&connect, &instance_id).await;
     let (_, queue) = connect.create_queue(&instance_id, queue_named("support")).await;
     let queue_id = queue["QueueId"].as_str().expect("QueueId").to_string();
 
@@ -370,9 +388,12 @@ async fn unknown_and_deleted_resources_answer_404() {
     );
     let (_, listed) = connect.list_queues(&instance_id, None, None, &[]).await;
     assert_eq!(
-        ids_of(&listed["QueueSummaryList"], "Id"),
-        Vec::<String>::new(),
-        "a deleted queue is gone from ListQueues, got {listed}"
+        ids_of(&listed["QueueSummaryList"], "Id")
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        defaults,
+        "a deleted queue is gone from ListQueues, which keeps the instance's defaults, \
+         got {listed}"
     );
     assert_eq!(
         connect.delete_queue(&instance_id, &queue_id).await,
@@ -409,6 +430,7 @@ async fn unknown_and_deleted_resources_answer_404() {
 async fn created_queue_members_are_what_every_later_read_reports() {
     let connect = Connect::new();
     let (instance_id, instance_arn) = connect.create_instance(connect_managed("myorg")).await;
+    let defaults = default_queue_ids(&connect, &instance_id).await;
 
     let cases: Vec<(&str, Value)> = vec![
         ("name and hours only", queue_named("support")),
@@ -519,8 +541,9 @@ async fn created_queue_members_are_what_every_later_read_reports() {
             .iter()
             .map(|summary| summary["Id"].as_str().expect("Id").to_string())
             .collect::<BTreeSet<_>>(),
-        minted,
-        "ListQueues must report every created queue exactly once, got {listed}"
+        minted.union(&defaults).cloned().collect::<BTreeSet<_>>(),
+        "ListQueues must report every created queue exactly once, beside the instance's \
+         defaults, got {listed}"
     );
     for summary in summaries {
         assert_eq!(
@@ -590,12 +613,14 @@ async fn list_queues_filters_on_the_requested_queue_types() {
     }
 
     // `QueueType` members, from com.amazonaws.connect#QueueType: STANDARD | AGENT.
-    // CreateQueue mints STANDARD queues, so only a filter admitting STANDARD matches.
+    // CreateQueue mints STANDARD queues and the instance's own default queues are
+    // STANDARD too, so only a filter admitting STANDARD matches.
+    let standard = 3 + DEFAULT_QUEUE_NAMES.len();
     let cases: Vec<(&str, Vec<&str>, usize)> = vec![
-        ("no filter", vec![], 3),
-        ("STANDARD only", vec!["STANDARD"], 3),
+        ("no filter", vec![], standard),
+        ("STANDARD only", vec!["STANDARD"], standard),
         ("AGENT only", vec!["AGENT"], 0),
-        ("both members", vec!["STANDARD", "AGENT"], 3),
+        ("both members", vec!["STANDARD", "AGENT"], standard),
     ];
     for (case, filter, expected) in cases {
         let (status, listed) = connect
@@ -656,9 +681,10 @@ async fn list_pages_cover_every_item_exactly_once() {
             "case {case:?}: expected {expected_pages} pages, got {pages}"
         );
 
-        // The same rule over queues inside one instance.
+        // The same rule over queues inside one instance, whose stored queues are the
+        // ones created here beside the defaults the instance was provisioned with.
         let (instance_id, _) = connect.create_instance(connect_managed("queueorg")).await;
-        let mut queues: BTreeSet<String> = BTreeSet::new();
+        let mut queues: BTreeSet<String> = default_queue_ids(&connect, &instance_id).await;
         for index in 0..population {
             let (status, created) = connect
                 .create_queue(&instance_id, queue_named(&format!("queue{index}")))
@@ -666,15 +692,17 @@ async fn list_pages_cover_every_item_exactly_once() {
             assert_eq!(status, 200, "case {case:?}: CreateQueue got {created}");
             queues.insert(created["QueueId"].as_str().expect("QueueId").to_string());
         }
+        let expected_queue_pages =
+            page_size.map_or(1, |size| queues.len().div_ceil(size as usize).max(1));
         let (seen, pages) = walk_queues(&connect, &instance_id, page_size).await;
         assert_eq!(
             seen.iter().cloned().collect::<BTreeSet<_>>(),
             queues,
-            "case {case:?}: the queue pages must cover exactly the created queues, got {seen:?}"
+            "case {case:?}: the queue pages must cover exactly the instance's queues, got {seen:?}"
         );
         assert_eq!(
-            pages, expected_pages,
-            "case {case:?}: expected {expected_pages} queue pages, got {pages}"
+            pages, expected_queue_pages,
+            "case {case:?}: expected {expected_queue_pages} queue pages, got {pages}"
         );
     }
 }
@@ -833,10 +861,12 @@ async fn every_store_is_bounded_by_its_quota() {
         instance_ids.len()
     );
 
-    // And the per-instance queue map, on an instance of its own.
+    // And the per-instance queue map, on an instance of its own. The instance is
+    // provisioned with its default queues, so the quota is reached that many creates
+    // earlier.
     let fresh = Connect::new();
     let (instance_id, _) = fresh.create_instance(connect_managed("org")).await;
-    for index in 0..QUEUES_PER_INSTANCE_QUOTA {
+    for index in 0..(QUEUES_PER_INSTANCE_QUOTA - DEFAULT_QUEUE_NAMES.len()) {
         let (status, body) = fresh
             .create_queue(&instance_id, queue_named(&format!("queue-{index}")))
             .await;

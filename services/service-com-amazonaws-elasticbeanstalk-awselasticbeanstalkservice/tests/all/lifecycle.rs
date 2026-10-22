@@ -29,6 +29,11 @@
 //! a document this service generated (no CDATA, no comments), allowing the
 //! `xmlns` attribute the first member of a list repeats and counting nested
 //! tags of the same name so a `<member>` inside a `<member>` is read whole.
+//!
+//! This module also OWNS that harness for the suites beside it: `Emulator`,
+//! `Answer` and the element reader are `pub(crate)`, so `all/operations_role.rs`
+//! and `all/solution_stacks.rs` drive the same router over the same wire rather
+//! than each repeating one.
 
 use std::sync::Arc;
 use std::time::Duration;

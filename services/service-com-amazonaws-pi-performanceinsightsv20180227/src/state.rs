@@ -359,6 +359,25 @@ pub fn report_arn(
     )
 }
 
+/// The SCOPE a pagination cursor is bound to, as a digest of the request members
+/// that fix the result set.
+///
+/// ONE helper for the whole service: hashing keeps a token far inside the
+/// modelled `NextToken` length bound however long those members are, and the
+/// `NUL` separator keeps the digest unambiguous — no member of a Performance
+/// Insights request may contain that byte, so two different member lists cannot
+/// hash the same bytes. Pass each member as text, in a fixed order.
+pub fn page_scope(parts: &[&str]) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Encode an opaque pagination cursor: the offset the next page resumes at,
 /// bound to the `scope` (the request members that fix the result set) it was
 /// handed out for.

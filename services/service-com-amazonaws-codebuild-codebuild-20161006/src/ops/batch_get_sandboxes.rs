@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetSandboxes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetSandboxes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetSandboxes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored sandboxes a request names, by id or by ARN: this is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +129,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetSandboxes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetSandboxesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetSandboxes"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "BatchGetSandboxes (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        // Refused BEFORE any record is copied, because `SandboxIds` carries no
+        // `@length`: the entry count is the caller's alone, and the answer's size is a
+        // multiple of it. The ceiling is this emulator's own — see
+        // `crate::state::MAX_BATCH_GET_SANDBOXES_IDS`.
+        if input.ids.len() > crate::state::MAX_BATCH_GET_SANDBOXES_IDS {
+            return Err(BatchGetSandboxesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Value at 'ids' failed to satisfy constraint: Member must have \
+                         length less than or equal to {}",
+                        crate::state::MAX_BATCH_GET_SANDBOXES_IDS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        let mut sandboxes = Vec::new();
+        let mut not_found = Vec::new();
+        for entry in &input.ids {
+            // One short critical section per entry rather than one around the whole
+            // batch, so a request asking for many sandboxes never holds the lock every
+            // other CodeBuild request shares for the length of its own answer.
+            let mut guard = state.lock();
+            // The only write a read makes: a sandbox whose transition out of `QUEUED`
+            // fell due before now is materialised here, because it was owed at that
+            // instant whether or not anybody called.
+            match guard.settled_sandbox(stored_id(entry), now) {
+                Some(stored) => sandboxes.push(stored.sandbox.clone()),
+                // Echoed as the caller wrote it, ARN and all, so a client can match
+                // the entry it sent against this list.
+                None => not_found.push(entry.clone()),
+            }
+        }
+
+        Ok(BatchGetSandboxesOutput {
+            // Neither `Sandboxes` nor `SandboxIds` carries a `@length`, so an empty one
+            // is representable and is serialized as `[]` — unlike `BatchGetBuilds`,
+            // whose `buildsNotFound` targets a list bounded at 1..100 entries and is
+            // therefore left absent when nothing is missing.
+            sandboxes: Some(sandboxes),
+            sandboxes_not_found: Some(not_found),
+        })
     }
+}
+
+/// The store key for one requested entry.
+///
+/// The model documents `ids` as "A comma separated list of sandboxIds or
+/// sandboxArns", so an ARN names the same sandbox its id does: everything up to and
+/// including the `sandbox/` resource segment is dropped. Only a value in ARN form is
+/// rewritten, so a project literally named `sandbox` (whose sandbox ids read
+/// `sandbox:<uuid>`) is still looked up as it stands.
+fn stored_id(entry: &str) -> &str {
+    if !entry.starts_with("arn:") {
+        return entry;
+    }
+    entry
+        .rsplit_once(":sandbox/")
+        .map_or(entry, |(_, id)| id)
 }

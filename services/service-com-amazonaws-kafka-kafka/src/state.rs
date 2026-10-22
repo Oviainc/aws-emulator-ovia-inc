@@ -14,14 +14,15 @@
 //! the one rendering `ListReplicators` reports it through.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BrokerNodeGroupInfo, BrokerSoftwareInfo, ClientAuthentication, ClusterInfo, ConfigurationInfo,
     CreateClusterInput, EncryptionAtRest, EncryptionInTransit, EncryptionInfo, JmxExporter,
-    KafkaCluster, KafkaClusterSummary, LoggingInfo, NodeExporter, OpenMonitoring,
-    OpenMonitoringInfo, Prometheus, Rebalancing, ReplicationInfo, ReplicationInfoSummary,
-    ReplicatorSummary,
+    JmxExporterInfo, KafkaCluster, KafkaClusterSummary, LoggingInfo, NodeExporter,
+    NodeExporterInfo, OpenMonitoring, OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned,
+    Rebalancing, ReplicationInfo, ReplicationInfoSummary, ReplicatorSummary,
 };
 
 /// How long after `CreateCluster` a new cluster becomes `ACTIVE`.
@@ -97,6 +98,23 @@ pub const DEFAULT_STORAGE_MODE: &str = "LOCAL";
 /// documentation ("By default, a cluster uses the IPv4 network type").
 pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
 
+/// The `ClusterType` of a cluster whose brokers this emulator provisions — one of
+/// the two values the model's `ClusterType` enum names. It is STORED on the record
+/// (see [`Cluster::cluster_type`]) rather than assumed by a reader, so a listing's
+/// `ClusterTypeFilter` tests what each cluster IS; the serverless create path
+/// (`CreateClusterV2` with a `Serverless` body) is still a scaffold, so no record
+/// carries `SERVERLESS` yet.
+pub const CLUSTER_TYPE_PROVISIONED: &str = "PROVISIONED";
+
+/// The largest page a cluster listing may report, from the `range` on the
+/// `MaxResults` shape (1..100) that `ListClusters` and `ListClustersV2` both bind.
+/// Also the page size used when a request names none.
+pub const MAX_RESULTS_LIMIT: i32 = 100;
+
+/// Marker that prefixes a cluster page token's plaintext, so a token minted for
+/// some other list cannot be mistaken for one of these.
+const CLUSTER_PAGE_TOKEN_PREFIX: &str = "kafka:clusters:";
+
 /// One broker node of a provisioned cluster, and the DNS name clients reach it on.
 /// `GetBootstrapBrokers` renders every bootstrap string from these hosts.
 #[derive(Debug, Clone)]
@@ -118,6 +136,10 @@ pub struct Cluster {
     /// created it, and the region segment of its ARN and endpoints. A cluster name
     /// is unique per account and region, so this is half of its registry key.
     pub region: String,
+    /// A `ClusterType` value — which of the model's two cluster kinds this record
+    /// is, so a listing's `ClusterTypeFilter` and the `Cluster` shape's
+    /// `clusterType` both read it off the record instead of assuming one.
+    pub cluster_type: String,
     pub kafka_version: String,
     pub current_version: String,
     pub creation_time: SystemTime,
@@ -143,6 +165,40 @@ pub struct Cluster {
     pub zookeeper_connect_string: String,
     pub zookeeper_connect_string_tls: String,
     pub brokers: Vec<BrokerNode>,
+}
+
+/// Which clusters a cluster listing keeps, on top of the endpoint's own region.
+/// A `None` member filters nothing, which is how an absent request member behaves.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClusterFilter<'a> {
+    /// Keep the clusters whose name starts with this prefix
+    /// (`ClusterNameFilter`).
+    pub name_prefix: Option<&'a str>,
+    /// Keep the clusters whose `ClusterType` equals this (`ClusterTypeFilter`).
+    pub cluster_type: Option<&'a str>,
+}
+
+impl ClusterFilter<'_> {
+    /// Whether `cluster` passes every member this filter carries.
+    fn keeps(&self, cluster: &Cluster) -> bool {
+        self.name_prefix
+            .is_none_or(|prefix| cluster.name.starts_with(prefix))
+            && self
+                .cluster_type
+                .is_none_or(|kind| cluster.cluster_type == kind)
+    }
+}
+
+/// One page of a cluster listing: the registry keys it reports, and the token the
+/// next page resumes from.
+#[derive(Debug, Default)]
+pub struct ClusterPage {
+    /// The ARNs this page reports, in the registry's own order.
+    pub keys: Vec<String>,
+    /// The token a caller passes back to get the next page, absent on the last
+    /// page — minted from the registry KEY the resume comparison uses, so a full
+    /// page can never be mistaken for the last one.
+    pub next_token: Option<String>,
 }
 
 /// How long after `CreateReplicator` a new replicator reaches `RUNNING`.
@@ -467,6 +523,69 @@ impl ComAmazonawsKafkaKafkaState {
         cluster.settle(now);
         Some(cluster)
     }
+
+    /// Choose one page of this endpoint's clusters: the keys a listing reports,
+    /// plus its `NextToken`.
+    ///
+    /// Every cluster listing is a REGIONAL api, so only the clusters `region`
+    /// holds are considered — the same set the ARN readers resolve against. The
+    /// registry is ordered by ARN, so a token resumes by SEEKING to its position
+    /// rather than walking the keys already returned; the scan from there stops as
+    /// soon as the page is full, and only entries that fail the region or the
+    /// filter are skipped past. `page_size` is clamped into the `MaxResults` range
+    /// the model declares, so no caller of this module can size the page from an
+    /// unchecked value.
+    pub fn cluster_page(
+        &self,
+        region: &str,
+        filter: ClusterFilter<'_>,
+        resume_after: Option<&str>,
+        page_size: usize,
+    ) -> ClusterPage {
+        let page_size = page_size.clamp(1, MAX_RESULTS_LIMIT as usize);
+        let mut keys: Vec<String> = Vec::with_capacity(page_size);
+        let mut more_remain = false;
+        let resume_from = match resume_after {
+            Some(last) => Bound::Excluded(last),
+            None => Bound::Unbounded,
+        };
+        for (arn, cluster) in self.clusters.range::<str, _>((resume_from, Bound::Unbounded)) {
+            if cluster.region != region || !filter.keeps(cluster) {
+                continue;
+            }
+            if keys.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            keys.push(arn.clone());
+        }
+        let next_token = if more_remain {
+            keys.last().map(|last| encode_cluster_page_token(last))
+        } else {
+            None
+        };
+        ClusterPage { keys, next_token }
+    }
+}
+
+/// Encode the ARN a page stopped at as a token. Base64 of a marked plaintext:
+/// the token is ENCODED, not authenticated, so a caller could decode it or mint
+/// one. That is harmless here — the ARN inside is only used as a `>` comparison
+/// against the keys of the caller's own registry, so a forged resume point can
+/// only skip or repeat entries the caller may already list.
+pub fn encode_cluster_page_token(last_arn: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{CLUSTER_PAGE_TOKEN_PREFIX}{last_arn}"))
+}
+
+/// The ARN a token resumes after, or `None` when the token is not one a cluster
+/// listing minted — which every listing refuses as a bad request rather than
+/// serving as a first page.
+pub fn decode_cluster_page_token(token: &str) -> Option<String> {
+    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded
+        .strip_prefix(CLUSTER_PAGE_TOKEN_PREFIX)
+        .map(ToString::to_string)
 }
 
 impl Cluster {
@@ -536,6 +655,7 @@ impl Cluster {
             arn,
             name: input.cluster_name,
             region: region.to_string(),
+            cluster_type: CLUSTER_TYPE_PROVISIONED.to_string(),
             kafka_version: input.kafka_version,
             creation_time: now,
             active_due: now + CLUSTER_ACTIVATION_DELAY,
@@ -589,11 +709,7 @@ impl Cluster {
             cluster_arn: Some(self.arn.clone()),
             cluster_name: Some(self.name.clone()),
             creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            current_broker_software_info: Some(BrokerSoftwareInfo {
-                configuration_arn: self.configuration_info.as_ref().map(|c| c.arn.clone()),
-                configuration_revision: self.configuration_info.as_ref().map(|c| c.revision),
-                kafka_version: Some(self.kafka_version.clone()),
-            }),
+            current_broker_software_info: Some(self.broker_software_info()),
             current_version: Some(self.current_version.clone()),
             encryption_info: Some(self.encryption_info.clone()),
             enhanced_monitoring: Some(self.enhanced_monitoring.clone()),
@@ -608,6 +724,65 @@ impl Cluster {
             storage_mode: Some(self.storage_mode.clone()),
             // No customer action is pending on a cluster this emulator provisions.
             customer_action_status: Some("NONE".to_string()),
+        }
+    }
+
+    /// The cluster as the `Cluster` shape, which is what the V2 readers
+    /// (`DescribeClusterV2`, `ListClustersV2`) report: the identity members every
+    /// cluster kind shares, plus the one per-kind member its `ClusterType` names.
+    ///
+    /// The per-kind member is derived from the SAME stored record `ClusterInfo` is
+    /// built from, so the V1 and V2 views of one cluster cannot disagree.
+    pub fn to_cluster_v2(&self) -> crate::ops::types::Cluster {
+        crate::ops::types::Cluster {
+            active_operation_arn: None,
+            cluster_type: Some(self.cluster_type.clone()),
+            cluster_arn: Some(self.arn.clone()),
+            cluster_name: Some(self.name.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            current_version: Some(self.current_version.clone()),
+            state: Some(self.state.clone()),
+            state_info: None,
+            tags: Some(self.tags.clone().into_iter().collect()),
+            // Exactly one of the per-kind members is reported, the one this
+            // cluster's `ClusterType` names. Only the provisioned create path is
+            // implemented, so a record of any other kind would carry neither
+            // rather than being reported as provisioned.
+            provisioned: (self.cluster_type == CLUSTER_TYPE_PROVISIONED)
+                .then(|| self.to_provisioned()),
+            serverless: None,
+        }
+    }
+
+    /// The provisioned-cluster detail of the `Cluster` shape: the brokers, the
+    /// software, the encryption, monitoring and logging settings, and the
+    /// ZooKeeper connect strings — the same values `ClusterInfo` carries inline.
+    fn to_provisioned(&self) -> Provisioned {
+        Provisioned {
+            broker_node_group_info: self.broker_node_group_info.clone(),
+            rebalancing: self.rebalancing.clone(),
+            current_broker_software_info: Some(self.broker_software_info()),
+            client_authentication: self.client_authentication.clone(),
+            encryption_info: Some(self.encryption_info.clone()),
+            enhanced_monitoring: Some(self.enhanced_monitoring.clone()),
+            open_monitoring: Some(open_monitoring_effective(&self.open_monitoring)),
+            logging_info: self.logging_info.clone(),
+            number_of_broker_nodes: self.number_of_broker_nodes,
+            zookeeper_connect_string: Some(self.zookeeper_connect_string.clone()),
+            zookeeper_connect_string_tls: Some(self.zookeeper_connect_string_tls.clone()),
+            storage_mode: Some(self.storage_mode.clone()),
+            // No customer action is pending on a cluster this emulator provisions.
+            customer_action_status: Some("NONE".to_string()),
+        }
+    }
+
+    /// The Apache Kafka version deployed on the brokers, and the configuration
+    /// revision they run, as the `BrokerSoftwareInfo` every reader reports.
+    fn broker_software_info(&self) -> BrokerSoftwareInfo {
+        BrokerSoftwareInfo {
+            configuration_arn: self.configuration_info.as_ref().map(|c| c.arn.clone()),
+            configuration_revision: self.configuration_info.as_ref().map(|c| c.revision),
+            kafka_version: Some(self.kafka_version.clone()),
         }
     }
 
@@ -778,6 +953,32 @@ fn open_monitoring_report(info: &OpenMonitoringInfo) -> OpenMonitoring {
                     .is_some_and(|e| e.enabled_in_broker),
             }),
             node_exporter: Some(NodeExporter {
+                enabled_in_broker: info
+                    .prometheus
+                    .node_exporter
+                    .as_ref()
+                    .is_some_and(|e| e.enabled_in_broker),
+            }),
+        },
+    }
+}
+
+/// The stored `OpenMonitoringInfo` with every exporter switch resolved, which is
+/// the shape the `Provisioned` detail reports. Same normalisation as
+/// [`open_monitoring_report`] in the shape a request submits: an exporter nobody
+/// asked for is reported off rather than absent, so a reader never leaves the
+/// caller guessing which default applied.
+fn open_monitoring_effective(info: &OpenMonitoringInfo) -> OpenMonitoringInfo {
+    OpenMonitoringInfo {
+        prometheus: PrometheusInfo {
+            jmx_exporter: Some(JmxExporterInfo {
+                enabled_in_broker: info
+                    .prometheus
+                    .jmx_exporter
+                    .as_ref()
+                    .is_some_and(|e| e.enabled_in_broker),
+            }),
+            node_exporter: Some(NodeExporterInfo {
                 enabled_in_broker: info
                     .prometheus
                     .node_exporter

@@ -16,9 +16,9 @@
 //! * `TagResource` merges onto, and `UntagResource` removes from, that record's
 //!   tag map, and `ListTagsForResource` reports exactly what those writes left;
 //! * an ARN of this service's vendor naming no stored record is a 404 carrying this
-//!   service's own `NotFoundException` code, an ARN of another vendor a 400
-//!   `ValidationException` (the `resource_arn_validation` suite owns that rule), and
-//!   a request outside the modelled constraints a `ValidationException`.
+//!   service's own `NotFoundException` code, a value this API cannot address at all a
+//!   400 `BadRequestException` (the `resource_arn_validation` suite owns that rule),
+//!   and a request outside the modelled constraints a `ValidationException`.
 //!
 //! The harness below (the router, the signed request, and the per-operation
 //! callers) is `pub(crate)` because the sibling suites in this target —
@@ -593,8 +593,8 @@ async fn an_arn_that_names_no_record_is_not_found_on_every_tag_operation() {
     // `resourceArn` on the tagging operations targets a plain `String` with no
     // pattern, so each of these reaches the handler. Every row is an ARN of THIS
     // service's vendor, so what it observes is the store's answer about the ARN; a
-    // value of another vendor is refused one step earlier, on the input, which the
-    // `resource_arn_validation` suite owns.
+    // value this API cannot address is refused one step earlier as a bad request,
+    // which the `resource_arn_validation` suite owns.
     let unknown = vec![
         (
             "a well-formed ARN of an id that was never minted",

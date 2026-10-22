@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSandbox
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSandbox`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a sandbox for a stored project and persists it: this is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSandbox::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The record is the project's own settings, queued, with the transition out of
+//! `QUEUED` owed by the clock and materialised on the next read
+//! ([`crate::state::StoredSandbox::settle`]). Nothing in this emulator starts a
+//! sandbox container, so that transition ends the sandbox's session in `FAULT` with a
+//! phase context saying why — see `crate::state::SANDBOX_NOT_PROVISIONED_MESSAGE`.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSandbox` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSandboxErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSandbox"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartSandbox (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+
+        // `projectName` carries no `@required` in the model, so the boundary walk lets
+        // a request without it through — but a sandbox IS a sandbox of a project (every
+        // setting it reports is the project's), so there is nothing to start without
+        // one. Refused with the modelled client error naming the member.
+        let Some(project_name) = input.project_name.clone() else {
+            return Err(StartSandboxErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "Invalid input: projectName must be specified to start a sandbox"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A client token makes the request idempotent: the key is the project and the
+        // token, which together cover every member of this request.
+        let token_key = input
+            .idempotency_token
+            .clone()
+            .map(|token| (project_name.clone(), token));
+
+        // READ PASS: hold the shared lock only long enough to copy the project and
+        // settle the idempotency question, then release it so the resolution below does
+        // not run inside the critical section every other CodeBuild request shares.
+        // Both are re-asserted in the WRITE PASS, so a concurrent delete or a
+        // concurrent request carrying the same token cannot slip through the gap.
+        let project = {
+            let mut guard = state.lock();
+            let Some(project) = guard
+                .projects
+                .get(&project_name)
+                .map(|stored| stored.project.clone())
+            else {
+                return Err(project_not_found(&region, &project_name));
+            };
+            if let Some(sandbox) = resolve_idempotency_token(&mut guard, token_key.as_ref(), now) {
+                return Ok(StartSandboxOutput {
+                    sandbox: Some(sandbox),
+                });
+            }
+            project
+        };
+
+        // Every member below is read off the stored project — a sandbox models no
+        // overrides, so nothing here is echoed from the request but the project name.
+        let mut sandbox = Sandbox {
+            // id, arn and the session are filled in by the WRITE PASS below: the
+            // sequence number is allocated there, and the id is derived from it.
+            id: None,
+            arn: None,
+            project_name: Some(project_name.clone()),
+            request_time: Some(crate::state::datetime(now)),
+            // The sandbox has not left the queue yet, so it has neither started nor
+            // ended; both instants are set by the transition the clock owes it.
+            start_time: None,
+            end_time: None,
+            status: Some(crate::state::SANDBOX_STATUS_QUEUED.to_string()),
+            source: project.source,
+            source_version: project.source_version,
+            secondary_sources: project.secondary_sources,
+            secondary_source_versions: project.secondary_source_versions,
+            environment: project.environment,
+            file_system_locations: project.file_system_locations,
+            timeout_in_minutes: project.timeout_in_minutes,
+            queued_timeout_in_minutes: project.queued_timeout_in_minutes,
+            vpc_config: project.vpc_config,
+            log_config: project.logs_config,
+            encryption_key: project.encryption_key,
+            service_role: project.service_role,
+            current_session: None,
+        };
+
+        // WRITE PASS: one critical section that re-asserts what the read pass saw and
+        // then does every write together, so allocating the sequence number, inserting
+        // the sandbox and recording the token are atomic with respect to each other.
+        let mut guard = state.lock();
+        if !guard.projects.contains_key(&project_name) {
+            // The project was deleted while this request was resolving: no sandbox is
+            // persisted for a project that no longer exists.
+            return Err(project_not_found(&region, &project_name));
+        }
+        // A concurrent request carrying the same token may have won the race; it is the
+        // same request, so it resolves to the sandbox that one started.
+        if let Some(sandbox) = resolve_idempotency_token(&mut guard, token_key.as_ref(), now) {
+            return Ok(StartSandboxOutput {
+                sandbox: Some(sandbox),
+            });
+        }
+        let sandbox_number = guard.allocate_sandbox_number(&project_name);
+        let id = format!(
+            "{project_name}:{}",
+            crate::state::sandbox_uuid(&project_name, sandbox_number, now)
+        );
+        sandbox.current_session = Some(crate::state::queued_sandbox_session(
+            // The sandbox's first session. A sandbox gets another session only by
+            // being started again, which mints a new sandbox here, so this is 1.
+            crate::state::sandbox_session_uuid(&id, FIRST_SESSION_NUMBER, now),
+            now,
+        ));
+        sandbox.id = Some(id.clone());
+        sandbox.arn = Some(crate::state::sandbox_arn(&region, &id));
+        guard.insert_sandbox(
+            id.clone(),
+            crate::state::StoredSandbox {
+                sandbox: sandbox.clone(),
+                request_millis: now,
+                settle_due_millis: now + crate::state::SANDBOX_SETTLE_MILLIS,
+            },
+        );
+        if let Some(key) = token_key {
+            guard.record_start_sandbox_token(
+                key,
+                crate::state::StartSandboxToken {
+                    sandbox_id: id,
+                    issued_millis: now,
+                },
+                now,
+            );
+        }
+
+        Ok(StartSandboxOutput {
+            sandbox: Some(sandbox),
+        })
     }
+}
+
+/// The session number of the session a sandbox is created with.
+const FIRST_SESSION_NUMBER: i64 = 1;
+
+/// The modelled refusal for a `projectName` no project of this account answers to.
+fn project_not_found(region: &str, project_name: &str) -> StartSandboxError {
+    StartSandboxErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "Project cannot be found: {}",
+            crate::state::project_arn(region, project_name)
+        )),
+    })
+    .into()
+}
+
+/// The sandbox an idempotency token already in force resolves to, or `None` when this
+/// request has to start one.
+///
+/// A repeat of the same request inside the token's lifetime resolves to the sandbox
+/// the first one started rather than starting a second, which is what a client token
+/// is for. The sandbox is read through `settled_sandbox`, so the repeat sees the
+/// transition the clock has owed it since, exactly as a reporting call would.
+fn resolve_idempotency_token(
+    state: &mut crate::state::ComAmazonawsCodebuildCodebuild20161006State,
+    token_key: Option<&(String, String)>,
+    now: i64,
+) -> Option<Sandbox> {
+    let key = token_key?;
+    let issued = state
+        .start_sandbox_tokens
+        .get(key)
+        .filter(|issued| {
+            now - issued.issued_millis < crate::state::SANDBOX_IDEMPOTENCY_TOKEN_TTL_MILLIS
+        })
+        .cloned()?;
+    state
+        .settled_sandbox(&issued.sandbox_id, now)
+        .map(|stored| stored.sandbox.clone())
 }

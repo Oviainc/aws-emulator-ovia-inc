@@ -21,12 +21,13 @@
 //! * the listing pages over its whole set in name order for any `MaxResults`;
 //! * a describe is a REPORT: two identical calls answer identically.
 //!
-//! `CreateUser` cannot produce a user in `modifying` or `deleting` status (only
-//! `UpdateUser`/`DeleteUser`, still scaffolds, move a user off `active`), so the rows
-//! covering the whole `User$Status` and `AuthenticationType` catalogs are written
-//! straight into the same store the handler reads. That is SETUP only: every assertion
-//! below is made on a response that came back over the wire, and the create path itself
-//! is driven end-to-end in `tests/all/user_lifecycle.rs`.
+//! `CreateUser` cannot produce a user in `modifying` or `deleting` status (`UpdateUser`
+//! produces `modifying`, and only for the half-second the clock owes it; `DeleteUser` is
+//! still a scaffold), so the rows covering the whole `User$Status` and
+//! `AuthenticationType` catalogs are written straight into the same store the handler
+//! reads. That is SETUP only: every assertion below is made on a response that came back
+//! over the wire, the create path is driven end-to-end in `tests/all/user_lifecycle.rs`,
+//! and the update path in `tests/all/user_updates.rs`.
 
 use std::sync::Arc;
 
@@ -122,6 +123,9 @@ impl Harness {
                     access_string: user.access_string.to_string(),
                     authentication_type: user.authentication_type.to_string(),
                     password_count: user.password_count,
+                    // Seeded users are written already in the status the row names, so
+                    // the clock owes none of them a transition.
+                    settles_at: None,
                     arn: user_arn(REGION, user.name),
                 },
             );

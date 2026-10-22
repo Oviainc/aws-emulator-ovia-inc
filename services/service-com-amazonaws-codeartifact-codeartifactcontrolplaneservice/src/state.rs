@@ -290,6 +290,43 @@ pub fn repository_arn(region: &str, domain: &str, repository: &str) -> String {
     )
 }
 
+/// The `EndpointType` a request that names none is served: AWS documents the IPv4
+/// endpoint as a repository's default, with `dualstack` the opt-in alternative
+/// (`EndpointType` models exactly `dualstack | ipv4`).
+pub const DEFAULT_ENDPOINT_TYPE: &str = "ipv4";
+
+/// The `EndpointType` value that selects the dual-stack (IPv4/IPv6) host.
+pub const ENDPOINT_TYPE_DUALSTACK: &str = "dualstack";
+
+/// The endpoint a repository serves one package format on.
+///
+/// CodeArtifact gives a repository ONE endpoint per package format, and its URL is built
+/// entirely from the repository's identity — the domain and its owning account name the
+/// host, the region names the regional endpoint the request was addressed to, and the
+/// format and repository name are the two path segments (AWS CodeArtifact user guide,
+/// e.g. the npm endpoint
+/// `https://my_domain-111122223333.d.codeartifact.us-west-2.amazonaws.com/npm/my_repo/`).
+/// A dual-stack endpoint is that same URL on the `on.aws` suffix
+/// (`…d.codeartifact.us-west-2.on.aws/npm/my_repo/`), which is what `endpointType`
+/// selects. The trailing slash is part of the documented endpoint.
+pub fn repository_endpoint(
+    region: &str,
+    domain: &str,
+    domain_owner: &str,
+    format: &str,
+    repository: &str,
+    endpoint_type: &str,
+) -> String {
+    let suffix = if endpoint_type == ENDPOINT_TYPE_DUALSTACK {
+        "on.aws"
+    } else {
+        "amazonaws.com"
+    };
+    format!(
+        "https://{domain}-{domain_owner}.d.codeartifact.{region}.{suffix}/{format}/{repository}/"
+    )
+}
+
 /// The ARN of the S3 bucket a domain stores its assets in.
 ///
 /// CodeArtifact names this bucket `assets-<account>-<region>-<suffix>`. An S3 ARN carries
