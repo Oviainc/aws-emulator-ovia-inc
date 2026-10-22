@@ -17,25 +17,27 @@ use service_com_amazonaws_billing_awsbilling::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// The ARN of the `PRIMARY` billing view every account owns by default, in the
 /// modeled `BillingViewArn` form.
-const PRIMARY_ARN: &str = "arn:aws:billing::000000000000:billingview/primary";
+pub(crate) const PRIMARY_ARN: &str = "arn:aws:billing::000000000000:billingview/primary";
 
 /// A billing-view ARN that is pattern-valid but names no view this emulator
 /// created.
-const ABSENT_ARN: &str = "arn:aws:billing::000000000000:billingview/does-not-exist";
+pub(crate) const ABSENT_ARN: &str = "arn:aws:billing::000000000000:billingview/does-not-exist";
 
 /// One router over ONE shared engine — what `core/router` builds in production,
 /// so every call in a test observes the same state.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
-/// The same router, plus the engine it was built over, for the one test that
-/// asserts a store's resident size rather than an API answer.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+/// A router over the service's DEFAULT state, plus its engine: the emulated
+/// account as it stands up, a standalone account that is nobody's management
+/// account.
+pub(crate) fn standalone_emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
+{
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -43,11 +45,33 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
+/// The same router, plus the engine it was built over, for the one test that
+/// asserts a store's resident size rather than an API answer.
+///
+/// `CreateBillingView` is an organization-management-account action, so this
+/// harness models the caller as the management account of an organization
+/// (`organization_management_account_id`) — the world in which the billing
+/// view lifecycle these tests are about is reachable at all. The refusal a
+/// caller that is NOT the management account gets is asserted in
+/// `tests/all/rejection_fidelity.rs`, over the default state.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = standalone_emulator_with_engine();
+    engine
+        .state::<service_com_amazonaws_billing_awsbilling::ComAmazonawsBillingAwsbillingState>()
+        .lock()
+        .organization_management_account_id = Some(ACCOUNT_ID.to_string());
+    (router, engine)
+}
+
 /// Send one awsJson1_0 call and return its HTTP status and decoded body.
 ///
 /// The `Authorization` credential scope names `billing`, which is how the router
 /// picks this service (`resolve_route_key`); `X-Amz-Target` names the operation.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -75,7 +99,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The `__type` an awsJson error body carries, without its namespace prefix.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -703,26 +727,38 @@ async fn a_deleted_view_is_gone_for_the_next_caller() {
 #[tokio::test]
 async fn deleting_a_source_view_needs_force() {
     let router = emulator();
-    // The first row sources the PRIMARY view, so PRIMARY now has a derived view.
-    let (status, created) =
+    // A CUSTOM view, and a second CUSTOM view that draws from it: the first now
+    // has a derived view, so deleting it needs `force`. (The account's PRIMARY
+    // view cannot stand in for the source here — no caller may delete it.)
+    let (status, source) =
         call(&router, "CreateBillingView", &view_rows()[0].create_body("c-0")).await;
-    assert_eq!(status, 200, "case \"create\": got {status} {created:?}");
+    assert_eq!(status, 200, "case \"create source\": got {status} {source:?}");
+    let source_arn = source["arn"].as_str().unwrap_or_default().to_string();
 
-    let (status, refused) = call(&router, "DeleteBillingView", &json!({ "arn": PRIMARY_ARN })).await;
+    let (status, derived) = call(
+        &router,
+        "CreateBillingView",
+        &json!({ "name": "derived-view", "sourceViews": [source_arn], "clientToken": "c-1" }),
+    )
+    .await;
+    assert_eq!(status, 200, "case \"create derived\": got {status} {derived:?}");
+
+    let (status, refused) =
+        call(&router, "DeleteBillingView", &json!({ "arn": source_arn })).await;
     assert_eq!(
         (status, error_code(&refused).as_str()),
         (409, "ConflictException"),
         "case \"force absent\": a view another view sources is a conflict, got {status} {refused:?}"
     );
     let (status, still_there) =
-        call(&router, "GetBillingView", &json!({ "arn": PRIMARY_ARN })).await;
+        call(&router, "GetBillingView", &json!({ "arn": source_arn })).await;
     assert_eq!(
         status, 200,
         "case \"force absent\": the refused delete must not remove the view, got {still_there:?}"
     );
 
     let (status, refused) =
-        call(&router, "DeleteBillingView", &json!({ "arn": PRIMARY_ARN, "force": false })).await;
+        call(&router, "DeleteBillingView", &json!({ "arn": source_arn, "force": false })).await;
     assert_eq!(
         (status, error_code(&refused).as_str()),
         (409, "ConflictException"),
@@ -730,12 +766,12 @@ async fn deleting_a_source_view_needs_force() {
     );
 
     let (status, forced) =
-        call(&router, "DeleteBillingView", &json!({ "arn": PRIMARY_ARN, "force": true })).await;
+        call(&router, "DeleteBillingView", &json!({ "arn": source_arn, "force": true })).await;
     assert_eq!(
         status, 200,
         "case \"force=true\": expected the delete to go through, got {status} {forced:?}"
     );
-    let (status, gone) = call(&router, "GetBillingView", &json!({ "arn": PRIMARY_ARN })).await;
+    let (status, gone) = call(&router, "GetBillingView", &json!({ "arn": source_arn })).await;
     assert_eq!(
         (status, error_code(&gone).as_str()),
         (404, "ResourceNotFoundException"),
@@ -757,11 +793,14 @@ async fn an_arn_no_view_was_stored_under_is_refused_with_the_modeled_error() {
             "ResourceNotFoundException",
         ),
         (
+            // Only a CUSTOM view may be edited, and eligibility is decided
+            // before existence, so an absent ARN is the same 400 as the
+            // account's PRIMARY view.
             "update an absent view",
             "UpdateBillingView",
             json!({ "arn": ABSENT_ARN, "name": "whatever" }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "delete an absent view",
@@ -771,11 +810,13 @@ async fn an_arn_no_view_was_stored_under_is_refused_with_the_modeled_error() {
             "ValidationException",
         ),
         (
+            // The account boundary is enforced before any existence lookup, so
+            // a foreign-account ARN never reveals whether a view exists there.
             "get a view in another account",
             "GetBillingView",
             json!({ "arn": "arn:aws:billing::123456789012:billingview/primary" }),
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         ),
     ];
 
@@ -954,6 +995,10 @@ async fn the_view_store_is_bounded_and_a_delete_reclaims_its_tokens() {
             let mut filler = template.clone();
             filler.arn = arn.clone();
             filler.name = format!("filler-{}", state.billing_views.len());
+            // The fillers stand in for views a caller created, so they are
+            // CUSTOM: only a CUSTOM view may be deleted, and the last step of
+            // this test frees one to prove the cap is a bound, not a latch.
+            filler.billing_view_type = "CUSTOM".to_string();
             state.billing_views.insert(arn.clone(), filler);
             last = arn;
         }

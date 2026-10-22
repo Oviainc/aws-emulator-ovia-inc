@@ -4,7 +4,9 @@
 //! Mints a `CUSTOM` billing view, persists it in this service's state keyed by the
 //! ARN it mints, and answers with that ARN and the record's `createdAt`.
 //! `clientToken` makes the call idempotent: a replay returns the ARN the first
-//! call minted and creates no second view.
+//! call minted and creates no second view. A caller that is not the management
+//! account of a consolidated billing family is refused with
+//! `ValidationException` (400) before anything is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -179,6 +181,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
+
+        // Creating a `CUSTOM` billing view is an organization-management-account
+        // action: a caller that is not the management account of a consolidated
+        // billing family is refused with the modeled `ValidationException`
+        // (400), deterministically and before any state is touched, so
+        // concurrent attempts all get the same answer and none of them leaves a
+        // view behind. See `organization_management_account_id` for why the
+        // emulated standalone account is not one.
+        let caller = crate::state::caller_account_id();
+        if !state.is_organization_management_account(caller) {
+            return Err(CreateBillingViewErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Account {caller} is not the management account of an organization. \
+                     Only the management account can create a billing view."
+                ),
+                reason: crate::state::VALIDATION_REASON_OTHER.to_string(),
+                field_list: None,
+            })
+            .into());
+        }
 
         // `clientToken` is modeled `@httpHeader("X-Amzn-Client-Token")`, but this
         // service speaks awsJson1_0, where HTTP bindings are inert and the member

@@ -5,6 +5,9 @@
 //! `billingViewTypes`, `names`, `ownerAccountId`, `sourceAccountId` and
 //! `activeTimeRange`, ordered by ARN, and paginated with `maxResults` and an
 //! opaque `nextToken` that resumes after the last ARN the previous page returned.
+//! The `arns` filter names resources, so each entry is resolved first: one
+//! outside the caller's account is an `AccessDeniedException` (403) and one this
+//! account stores no view under is a `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -139,13 +142,48 @@ pub struct ListBillingViews<Eng> {
 fn invalid_field(member: &str, why: &str) -> ListBillingViewsError {
     ListBillingViewsErrorModeled::ValidationException(ValidationException {
         message: format!("{member}: {why}"),
-        reason: "fieldValidationFailed".to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
         field_list: Some(vec![ValidationExceptionField {
             name: member.to_string(),
             message: why.to_string(),
         }]),
     })
     .into()
+}
+
+/// Resolve every entry of the `arns` filter against the store, refusing the
+/// whole request on the first one that names no billing view this caller can
+/// resolve.
+///
+/// A filter that selects resources by identifier VALIDATES each identifier: an
+/// entry outside the caller's account is refused on the account boundary
+/// (403), and one in the caller's account that no view is stored under makes
+/// the request invalid (400), rather than returning a page that silently omits
+/// it — which a caller cannot tell from "it exists but matched another filter".
+fn resolve_arns_filter(
+    arns: &[String],
+    state: &crate::state::ComAmazonawsBillingAwsbillingState,
+) -> Result<(), ListBillingViewsError> {
+    for arn in arns {
+        if !crate::state::is_caller_account_arn(arn) {
+            return Err(ListBillingViewsErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied("ListBillingViews", arn),
+            )
+            .into());
+        }
+        if !state.billing_views.contains_key(arn) {
+            return Err(ListBillingViewsErrorModeled::ValidationException(ValidationException {
+                message: format!("[{arn}] is an invalid billing view arn"),
+                reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "arns".to_string(),
+                    message: format!("{arn} is not a billing view of this account."),
+                }]),
+            })
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// The opaque `nextToken` for a page that ended at `arn`.
@@ -276,6 +314,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "activeAfterInclusive must not be later than activeBeforeInclusive",
                 ));
             }
+        }
+
+        // The `arns` filter names resources, so every entry is resolved before
+        // any page is built: an unknown one refuses the request instead of
+        // disappearing from the result set. An empty list names nothing, so it
+        // filters nothing out and has nothing to resolve.
+        if let Some(arns) = &input.arns {
+            resolve_arns_filter(arns, &state)?;
         }
 
         // The page resumes strictly after the last ARN the previous page

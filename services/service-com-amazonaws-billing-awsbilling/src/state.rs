@@ -14,7 +14,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::Expression;
+use crate::ops::types::{
+    AccessDeniedException, Expression, ValidationException, ValidationExceptionField,
+};
 
 /// `CUSTOM`, the `BillingViewType` a view created through `CreateBillingView`
 /// carries (one of `BILLING_VIEW_TYPE_VALUES` in `ops::types`).
@@ -60,6 +62,15 @@ pub const BILLING_SERVICE_CODE: &str = "billing";
 /// The `quotaCode` the modeled `ServiceQuotaExceededException` reports for the
 /// billing-view count.
 pub const BILLING_VIEWS_QUOTA_CODE: &str = "BillingViewsPerAccount";
+
+/// The `ValidationExceptionReason` a refusal that names the offending member
+/// carries (one of `unknownOperation | cannotParse | fieldValidationFailed |
+/// other`).
+pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
+
+/// The `ValidationExceptionReason` a refusal that is about the caller rather
+/// than about one request member carries.
+pub const VALIDATION_REASON_OTHER: &str = "other";
 
 /// The most credits this emulator keeps resident for the whole billing family.
 ///
@@ -187,6 +198,24 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// Source of the next `billingview/custom-<n>` resource id. Used ONLY to
     /// build an ARN that is then stored in `billing_views`.
     pub next_view_id: u64,
+    /// The management account of the AWS Organizations organization this
+    /// emulated account belongs to, when it belongs to one.
+    ///
+    /// Creating a `CUSTOM` billing view is an organization-management-account
+    /// action (see the `UpdateBillingPreferences` doc for the same split:
+    /// sharing keys "may only be set by the management account of a
+    /// consolidated billing family"), so `CreateBillingView` consults this
+    /// before it mutates anything.
+    ///
+    /// `None` by default: an organization is established through AWS
+    /// Organizations, which this emulator models in its own service and whose
+    /// state holds no organization until one is created — so the emulated
+    /// account is a standalone account and is nobody's organization management
+    /// account. That is NOT the same as being the payer account of its own
+    /// consolidated billing family, which a standalone account is (see
+    /// [`Self::credits_for_period`]). Set this to the caller's account id to
+    /// model the management account of an organization.
+    pub organization_management_account_id: Option<String>,
     /// Every credit held by an account of this emulator's consolidated billing
     /// family, keyed and ordered by `creditId`, so `GetCredits` answers in a
     /// deterministic order. Bounded by [`MAX_CREDITS`].
@@ -219,6 +248,7 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             billing_views,
             idempotency_tokens: HashMap::new(),
             next_view_id: 1,
+            organization_management_account_id: None,
             // A fresh account holds no credits: the modeled `GetCredits`
             // response "returns an empty list when no credits exist".
             credits: BTreeMap::new(),
@@ -268,6 +298,33 @@ impl ComAmazonawsBillingAwsbillingState {
             && (!writes_token || self.idempotency_tokens.len() < MAX_IDEMPOTENCY_TOKENS)
     }
 
+    /// Whether `account_id` is the management account of the organization this
+    /// account belongs to — see [`Self::organization_management_account_id`]
+    /// for why a standalone account is not.
+    pub fn is_organization_management_account(&self, account_id: &str) -> bool {
+        self.organization_management_account_id.as_deref() == Some(account_id)
+    }
+
+    /// The stored view `arn` names when it is one this account may edit or
+    /// delete: an existing `CUSTOM` view.
+    ///
+    /// `None` covers both inputs AWS collapses into one refusal — an ARN no
+    /// view is stored under, and one naming a view that is not `CUSTOM` (the
+    /// account's `PRIMARY` view) — so eligibility is decided without revealing
+    /// which of the two it was.
+    pub fn custom_view(&self, arn: &str) -> Option<&BillingView> {
+        self.billing_views
+            .get(arn)
+            .filter(|view| view.billing_view_type == BILLING_VIEW_TYPE_CUSTOM)
+    }
+
+    /// [`Self::custom_view`], for a caller that goes on to change the record.
+    pub fn custom_view_mut(&mut self, arn: &str) -> Option<&mut BillingView> {
+        self.billing_views
+            .get_mut(arn)
+            .filter(|view| view.billing_view_type == BILLING_VIEW_TYPE_CUSTOM)
+    }
+
     /// Store `credit` under its `creditId`, replacing any credit already held
     /// under that id. Answers `false` — storing nothing — when the store is
     /// already at [`MAX_CREDITS`], so a caller can refuse with a quota error
@@ -285,9 +342,10 @@ impl ComAmazonawsBillingAwsbillingState {
     /// `account_id` selects the owning account. `whole_family` widens the
     /// selection to every account of the consolidated billing family — every
     /// account this store knows, since the emulator's own account
-    /// (`engine::emulator_account_id`) is the family's management account.
-    /// Both bounds of the requested period are inclusive, on [`epoch_secs`]'
-    /// scale, and a credit is reported when its own life overlaps it.
+    /// (`engine::emulator_account_id`) is the payer account of its own
+    /// consolidated billing family. Both bounds of the requested period are
+    /// inclusive, on [`epoch_secs`]' scale, and a credit is reported when its
+    /// own life overlaps it.
     ///
     /// A pure read: it answers from the store and changes nothing in it.
     pub fn credits_for_period(
@@ -303,6 +361,69 @@ impl ComAmazonawsBillingAwsbillingState {
             .filter(|credit| credit.overlaps_period(start_secs, end_secs))
             .cloned()
             .collect()
+    }
+}
+
+/// The account every caller of this emulator authenticates as: every request
+/// is signed with the emulator's own credentials, so the caller's account is
+/// [`engine::emulator_account_id`].
+pub fn caller_account_id() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// The account id an ARN embeds (its fifth colon-separated segment), when it
+/// has one.
+pub fn arn_account_id(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4)
+}
+
+/// Whether `arn` is scoped to the caller's own account.
+///
+/// Every operation that identifies a billing view by ARN checks this BEFORE it
+/// looks the ARN up, so the answer to a foreign-account ARN never depends on
+/// whether a view exists there.
+pub fn is_caller_account_arn(arn: &str) -> bool {
+    arn_account_id(arn) == Some(caller_account_id())
+}
+
+/// The `AccessDeniedException` payload for an ARN outside the caller's
+/// account: the account boundary is enforced before any existence lookup, so
+/// the refusal is built from the caller's identity and the requested ARN and
+/// says nothing about the resource.
+pub fn cross_account_access_denied(operation: &str, arn: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: format!(
+            "User: {} is not authorized to perform: {BILLING_SERVICE_CODE}:{operation} on \
+             resource: {arn} because no resource-based policy allows the \
+             {BILLING_SERVICE_CODE}:{operation} action",
+            caller_identity_arn()
+        ),
+    }
+}
+
+/// The ARN of the identity this emulator's callers authenticate as, for the
+/// `AccessDeniedException` message.
+fn caller_identity_arn() -> String {
+    ::engine::emulator_arn("iam", "", "root")
+}
+
+/// The `ValidationException` payload for an ARN that names no `CUSTOM` billing
+/// view of this account — see [`ComAmazonawsBillingAwsbillingState::custom_view`].
+///
+/// `action` is the past participle of what the refused request would have done
+/// to the view (`"edited"`, `"deleted"`), so the sentence names the action the
+/// caller asked for rather than a fixed one.
+pub fn not_a_custom_view(arn: &str, action: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "The Billing View ARN does not correspond to a Custom Billing View. \
+             Only Custom Billing Views may be {action}."
+        ),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "arn".to_string(),
+            message: format!("{arn} does not correspond to a Custom Billing View."),
+        }]),
     }
 }
 
