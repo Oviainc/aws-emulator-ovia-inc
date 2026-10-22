@@ -190,11 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ledger(&requested.network)
             .and_then(|ledger| ledger.contract(&requested.contract_address))
             .ok_or_else(|| {
+                // This service keeps its not-found message generic
+                // (`crate::state::RESOURCE_NOT_FOUND_MESSAGE`) and reports the identity
+                // in `resourceId`/`resourceType`.
                 GetAssetContractErrorModeled::ResourceNotFoundException(crate::state::not_found(
                     requested.contract_address.clone(),
-                    // This service keeps its not-found message generic and reports the
-                    // identity in `resourceId`/`resourceType`.
-                    "The requested resource was not found.",
                 ))
             })?;
 

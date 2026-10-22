@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the request's tags to the stored MediaPackage resource, so every later read of
+//! that resource reports them.
 //!
 //! ## Shape of an operation
 //!
@@ -92,9 +85,28 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediapackage#TagResource")]
+//
+// `TagResource` lists no errors of its own, so three errors this SERVICE models are
+// widened in through `extra_errors`: a `ResourceArn` that is not a MediaPackage resource
+// ARN is an invalid parameter (422 `UnprocessableEntityException`), one naming a resource
+// this service does not hold has nothing to tag (404 `NotFoundException`), and a service
+// mounted on an engine that holds no state is a server fault (500
+// `InternalServerErrorException`). All three are shapes the service models and other
+// operations declare, so a client deserializes them into a modeled type — which the
+// synthetic 400 `ValidationException` of `crate::scaffolded` is not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediapackage#TagResource",
+    extra_errors = [
+        "InternalServerErrorException",
+        "NotFoundException",
+        "UnprocessableEntityException"
+    ]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
+    UnprocessableEntityException(UnprocessableEntityException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,18 +160,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Tagging needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the mediapackage state store is unavailable".into()),
+            })
+        })?;
+
+        // The ARN is parsed BEFORE the store is read: "that is not a MediaPackage
+        // resource ARN" is a different failure from "no such resource", and only the
+        // first can be decided without a lookup.
+        let Some(target) = crate::state::parse_tag_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!(
+                        "ResourceArn \"{}\" is not a MediaPackage channel or origin endpoint ARN.",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        let Some(tags) = state.tags_mut(&target) else {
+            return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "{} with ID \"{}\" not found.",
+                    target.label(),
+                    target.id()
+                )),
+            })
+            .into());
+        };
+
+        // What the resource would be LEFT holding is what the tag limits judge, and they
+        // judge it BEFORE anything is written: a tag set grows by one entry per distinct
+        // caller-chosen key and shrinks only on an explicit `UntagResource`, so the
+        // ceiling is what keeps its size from being decided by how many requests arrive.
+        let mut merged = tags.clone();
+        merged.extend(
+            input
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        if let Err(message) =
+            crate::state::bound_tag_entries(merged.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        {
+            return Err(TagResourceErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Assigning a tag whose key the resource already carries replaces that tag's
+        // value and leaves every other tag alone.
+        *tags = merged;
+        Ok(TagResourceOutput)
     }
 }

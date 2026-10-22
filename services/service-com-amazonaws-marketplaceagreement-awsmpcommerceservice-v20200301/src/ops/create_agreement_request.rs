@@ -268,7 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateAgreementRequestErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        request_id: None,
+                        // "The unique identifier associated with the error":
+                        // every exception shape this service models carries it
+                        // (`crate::state::next_request_id`).
+                        request_id: Some(crate::state::next_request_id()),
                         message: Some(format!(
                             "this account already holds the maximum of {} agreement requests",
                             crate::state::AGREEMENT_REQUEST_QUOTA

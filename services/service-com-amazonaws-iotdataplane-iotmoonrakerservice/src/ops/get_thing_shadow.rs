@@ -5,6 +5,10 @@
 //! `state.reported`, the `state.delta` derived from them, `metadata`, `version` and
 //! `timestamp`. A thing or shadow name with no stored document is a 404.
 //!
+//! The document is the whole response body (the `@httpPayload` `JsonDocument` blob)
+//! and is announced `content-type: application/json` — see the media-type note in
+//! `crate::service`, which decides that for every operation that answers with one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

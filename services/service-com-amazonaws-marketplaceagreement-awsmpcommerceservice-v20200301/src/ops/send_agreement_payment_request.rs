@@ -219,14 +219,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The agreement must be active and have a `VariablePaymentTerm` to
         // support payment requests."
+        //
+        // This operation validates the agreement it is asked to charge under as
+        // INPUT: its contract routes an agreement that cannot support the
+        // payment request to `ValidationException` ("A `ValidationException` is
+        // returned … if the agreement doesn't have an active
+        // `VariablePaymentTerm`, or if the `termId` is invalid"), and
+        // `ValidationExceptionReason` carries a value for each way the
+        // `agreementId` member can be unusable — `INVALID_AGREEMENT_ID` for an
+        // id that names no agreement this account can charge under, and
+        // `INACTIVE_AGREEMENT` for one whose agreement is no longer active. So
+        // both are answered as the modelled input fault naming the member, at
+        // the modelled 400, rather than as a missing resource: a caller reading
+        // `ResourceNotFoundException` would take the create/retry path for a
+        // request that can never succeed, and would be told nothing about WHICH
+        // member to repair. The recorded AWS response for this operation with an
+        // unusable `agreementId` is exactly that `ValidationException`.
         let Some(agreement) = store.agreements.get(&input.agreement_id).cloned() else {
-            // The lookup found nothing: the modelled not-found body, at the
-            // status this service answers it with (`state::NOT_FOUND_STATUS`).
-            return Err(crate::state::not_found(
-                SendAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
-                    crate::state::agreement_not_found(&input.agreement_id),
-                ),
-            ));
+            return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
+                crate::state::validation_exception("INVALID_AGREEMENT_ID", "agreementId"),
+            )
+            .into());
         };
         if agreement.status != crate::state::STATUS_ACTIVE {
             // "The agreement must be active": `ValidationExceptionReason` models
@@ -271,7 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.payment_requests.len() >= crate::state::PAYMENT_REQUEST_QUOTA {
             return Err(SendAgreementPaymentRequestErrorModeled::ThrottlingException(
                 ThrottlingException {
-                    request_id: None,
+                    // "The unique identifier associated with the error": every
+                    // exception shape this service models carries it
+                    // (`crate::state::next_request_id`).
+                    request_id: Some(crate::state::next_request_id()),
                     message: Some(format!(
                         "this account already holds the maximum of {} payment requests",
                         crate::state::PAYMENT_REQUEST_QUOTA

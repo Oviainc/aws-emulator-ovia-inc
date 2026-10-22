@@ -63,7 +63,13 @@ fn scaffolded_operations(network: &str, address: &str) -> Vec<(&'static str, Val
         (
             "/list-filtered-transaction-events",
             json!({
-                "network": network,
+                // This operation serves only the Bitcoin networks
+                // (`ListFilteredTransactionEventsInput$network`: "Valid Values:
+                // BITCOIN_MAINNET | BITCOIN_TESTNET"), so the row names one of them
+                // whatever ledger the caller of this helper is walking: any other value
+                // is refused with a 400 before the scaffold's 501 is reached, which
+                // `tests/all/error_contract.rs` covers.
+                "network": "BITCOIN_MAINNET",
                 "addressIdentifierFilter": {"transactionEventToAddress": [address]},
             }),
         ),
@@ -72,6 +78,9 @@ fn scaffolded_operations(network: &str, address: &str) -> Vec<(&'static str, Val
 
 /// A router with only this service mounted — one emulator "session" — plus the engine
 /// it was built on, so a test can read the ledger it serves.
+///
+/// `pub(crate)` because the sibling suites in this target drive the emulator through the
+/// same seam rather than each standing one up their own way.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     pub(crate) engine: Arc<engine::InMemoryEngine>,
@@ -132,7 +141,7 @@ impl Emulator {
 
     /// The seeded ledger of every network, read out of the engine the router serves
     /// from — the same store the handlers read.
-    fn fixture(&self) -> Vec<NetworkFixture> {
+    pub(crate) fn fixture(&self) -> Vec<NetworkFixture> {
         let state = self.engine.state::<Ledgers>();
         let state = state.lock();
         state
@@ -152,12 +161,12 @@ impl Emulator {
 }
 
 /// One network's seeded ledger, as a test reads it.
-struct NetworkFixture {
-    network: String,
+pub(crate) struct NetworkFixture {
+    pub(crate) network: String,
     /// In ledger (chain) order.
-    transactions: Vec<StoredTransaction>,
+    pub(crate) transactions: Vec<StoredTransaction>,
     /// In the ledger's own key order.
-    holdings: Vec<(HoldingKey, StoredHolding)>,
+    pub(crate) holdings: Vec<(HoldingKey, StoredHolding)>,
 }
 
 impl NetworkFixture {

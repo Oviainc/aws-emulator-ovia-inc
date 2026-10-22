@@ -86,6 +86,26 @@ pub fn unsupported_catalog() -> ValidationException {
 /// to resolve by.
 pub const ARN_RESOURCE_PREFIX: &str = "deployment-parameter/";
 
+/// The input member every tagging operation names its target resource with.
+///
+/// `ListTagsForResource`, `TagResource` and `UntagResource` all bind
+/// `/tags/{resourceArn}` with `resourceArn` as a required `@httpLabel`
+/// (`smithy_query(query="operation",operation="ListTagsForResource,TagResource,UntagResource")`),
+/// and it is the one input whose value this service reads as its own resource ARN.
+/// Spelled the way the request carries it (lowerCamel), which is how the modelled
+/// `ValidationException$fieldName` names a member.
+pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
+
+/// Longest resource ARN this service addresses — the modelled `ResourceArn`
+/// `length 1..2048` (`smithy_query(query="shape",shape="ResourceArn")`).
+pub const RESOURCE_ARN_MAX_LEN: usize = 2048;
+
+/// The characters a resource ARN of this service may hold: the expression the
+/// modelled `ResourceArn` `@pattern` states, WITHOUT the `^` / `$` the model spells
+/// it with — for the reason [`TAG_CHARACTER_CLASS`] gives. The model's own form is
+/// `^[a-zA-Z0-9:*/-]+$`.
+pub const RESOURCE_ARN_CHARACTER_CLASS: &str = "[a-zA-Z0-9:*/-]+";
+
 /// The number of tags one deployment parameter holds.
 ///
 /// MODELLED, not chosen: `PutDeploymentParameterRequest$tags` and
@@ -469,6 +489,52 @@ pub fn merge_tags(
         });
     }
     Ok(merged)
+}
+
+/// Whether `byte` is one of the characters [`RESOURCE_ARN_CHARACTER_CLASS`] admits.
+fn is_resource_arn_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'*' | b'/' | b'-')
+}
+
+/// Read `candidate` as a resource ARN of THIS service, or say why it is not one.
+///
+/// A caller-supplied resource ARN is judged on the INPUT, before any resource is
+/// looked up: an ARN of another vendor, or a value that is not a resource ARN at
+/// all, names nothing in this service's namespace however the store happens to be
+/// populated, so it is the modelled `ValidationException` (HTTP 400) naming the
+/// member — never the not-found a missing resource gets, which would tell a caller
+/// with a permanent input bug to retry or to create. Both refusals name
+/// [`RESOURCE_ARN_MEMBER`] in `fieldName`, which is the member the caller has to fix.
+///
+/// Two conditions, in the order the service applies them:
+///
+/// 1. the value is inside the SYNTAX this service's own resource ARNs take — the
+///    modelled `ResourceArn` `length 1..2048` and [`RESOURCE_ARN_CHARACTER_CLASS`];
+/// 2. it parses as a resource ARN whose vendor field is this service's
+///    [`ARN_NAMESPACE`] — the one ARN parse, [`::service_common::arn`].
+///
+/// Everything that passes both is a resource ARN this API can address, and whether
+/// it names a stored record is then the store's question
+/// ([`parameter_not_found`]).
+pub fn validate_resource_arn(candidate: &str) -> Result<(), ValidationException> {
+    if !(1..=RESOURCE_ARN_MAX_LEN).contains(&candidate.len())
+        || !candidate.bytes().all(is_resource_arn_byte)
+    {
+        return Err(ValidationException {
+            message: format!(
+                "Invalid input resource arn: {RESOURCE_ARN_MEMBER} must be \
+                 1..{RESOURCE_ARN_MAX_LEN} characters of {RESOURCE_ARN_CHARACTER_CLASS}"
+            ),
+            field_name: RESOURCE_ARN_MEMBER.to_string(),
+        });
+    }
+    if !::service_common::arn::is_resource_arn_of(candidate, ARN_NAMESPACE) {
+        return Err(ValidationException {
+            message: format!("Invalid input resource arn: expected vendor {ARN_NAMESPACE}"),
+            field_name: RESOURCE_ARN_MEMBER.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The not-found failure for an ARN that names no stored deployment parameter:

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOriginEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOriginEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOriginEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges an OriginEndpoint's updated configuration into the stored record — including
+//! the playback URL it re-derives — so every later read renders the update.
 //!
 //! ## Shape of an operation
 //!
@@ -195,21 +188,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOriginEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOriginEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOriginEndpoint"))
+        // Nothing about an update depends on the request beyond its deserialized input:
+        // the endpoint's ARN, region, channel and CreatedAt were decided when it was
+        // created.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateOriginEndpointErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the mediapackage state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // The id is moved out of the input first, so every other member can be MOVED into
+        // the record below rather than cloned into it.
+        let id = std::mem::take(&mut input.id);
+
+        // An update changes an endpoint this service holds; there is nothing to update
+        // for an id it does not, so the target is resolved before the request is judged.
+        let Some(record) = state.origin_endpoints.get_mut(&id) else {
+            return Err(UpdateOriginEndpointErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("OriginEndpoint with ID \"{id}\" not found.")),
+            })
+            .into());
+        };
+
+        // Bound what the caller may make this record cost, before anything is written,
+        // with the same function the create bounds its request with: an update must not
+        // be able to grow a record past what a create of it would have refused.
+        let refuse = |message: String| {
+            UpdateOriginEndpointError::from(
+                UpdateOriginEndpointErrorModeled::UnprocessableEntityException(
+                    UnprocessableEntityException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+        crate::state::bound_origin_endpoint_members(
+            input.description.as_deref(),
+            input.manifest_name.as_deref(),
+            input.whitelist.as_deref(),
+            input.cmaf_package.as_ref(),
+        )
+        .map_err(refuse)?;
+
+        // An endpoint packages its channel in exactly ONE format, so a request naming
+        // several cannot be stored — the same rule, decided by the same function, as on
+        // the create.
+        let requested_kind = match crate::state::sole_packaging_kind(
+            input.hls_package.is_some(),
+            input.dash_package.is_some(),
+            input.cmaf_package.is_some(),
+            input.mss_package.is_some(),
+        ) {
+            Ok(kind) => kind,
+            Err(supplied) => return Err(refuse(crate::state::packaging_refusal(&supplied))),
+        };
+
+        // Values the SERVICE derives are re-derived from the endpoint's own region and
+        // channel, never from the region this particular request was signed for, so an
+        // update cannot move a stored endpoint's URLs to another region.
+        let region = crate::state::arn_region(&record.arn)
+            .unwrap_or(crate::state::DEFAULT_REGION)
+            .to_string();
+        let channel_id = record.channel_id.clone();
+
+        // `PUT /origin_endpoints/{Id}` carries the endpoint's updatable configuration:
+        // each member it binds becomes what the request sent, and one the request omits
+        // is left unset — except the two the service supplies a value for, handled below.
+        // `ChannelId`, the ARN, `CreatedAt` and the tags are not this operation's input,
+        // so they stay exactly as stored.
+        let kind = match requested_kind {
+            // Exactly one packaging configuration is stored at a time, so the one the
+            // request names REPLACES the stored set rather than merging into it. The CMAF
+            // parameter shape is materialised by the same function the create uses, so an
+            // updated CMAF package carries the derived child-manifest URLs and the
+            // documented `SegmentPrefix` default.
+            Some(kind) => {
+                record.hls_package = input.hls_package.take();
+                record.dash_package = input.dash_package.take();
+                record.mss_package = input.mss_package.take();
+                record.cmaf_package = input.cmaf_package.as_ref().map(|params| {
+                    crate::state::stored_cmaf_package(params, &region, &channel_id, &id)
+                });
+                kind
+            }
+            // An endpoint always packages its channel in exactly one format, so a request
+            // that names no packaging configuration leaves the stored one in place: no
+            // request can leave an endpoint with nothing to package.
+            None => match record.packaging_kind() {
+                Some(kind) => kind,
+                // Unreachable: a create stores exactly one packaging configuration.
+                // Reporting the modelled server fault is the honest answer — guessing a
+                // manifest format would mint a playback URL for a format nothing serves.
+                None => {
+                    return Err(UpdateOriginEndpointErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            message: Some(format!(
+                                "the stored origin endpoint \"{id}\" carries no packaging \
+                                 configuration"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        record.description = input.description.take();
+        record.authorization = input.authorization.take();
+        record.origination = input.origination.take();
+        record.startover_window_seconds = input.startover_window_seconds;
+        record.time_delay_seconds = input.time_delay_seconds;
+        record.whitelist = input.whitelist.take().unwrap_or_default();
+        // `ManifestName` is "a short string appended to the end of the Endpoint URL", so
+        // the playback URL is re-derived whenever it or the packaging format changes, and
+        // an absent one takes the same documented default the create applies.
+        let manifest_name = input
+            .manifest_name
+            .take()
+            .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
+        record.url = crate::state::playback_url(&region, &channel_id, &id, &manifest_name, kind);
+        record.manifest_name = Some(manifest_name);
+
+        // An update is a write of the endpoint, so it is server-filled exactly as a create
+        // is: every optional configuration member this request left unset takes that
+        // member's default BEFORE the record is read back, so an updated endpoint carries
+        // the same member set as a created one and no projection of it can differ.
+        crate::state::apply_origin_endpoint_defaults(record);
+
+        // Rendered from the STORED record, so this response and every later
+        // DescribeOriginEndpoint/ListOriginEndpoints are the same bytes.
+        let endpoint = record.to_origin_endpoint();
+        Ok(UpdateOriginEndpointOutput {
+            arn: endpoint.arn,
+            authorization: endpoint.authorization,
+            channel_id: endpoint.channel_id,
+            cmaf_package: endpoint.cmaf_package,
+            created_at: endpoint.created_at,
+            dash_package: endpoint.dash_package,
+            description: endpoint.description,
+            hls_package: endpoint.hls_package,
+            id: endpoint.id,
+            manifest_name: endpoint.manifest_name,
+            mss_package: endpoint.mss_package,
+            origination: endpoint.origination,
+            startover_window_seconds: endpoint.startover_window_seconds,
+            tags: endpoint.tags,
+            time_delay_seconds: endpoint.time_delay_seconds,
+            url: endpoint.url,
+            whitelist: endpoint.whitelist,
+        })
     }
 }

@@ -6,6 +6,10 @@
 //! `state.delta`, the per-leaf `metadata`, the incremented `version` and the accepted
 //! `timestamp`. Never the request echoed back.
 //!
+//! The document is the whole response body (the `@httpPayload` `JsonDocument` blob)
+//! and is announced `content-type: application/json` — see the media-type note in
+//! `crate::service`, which decides that for every operation that answers with one.
+//!
 //! Every failure here answers in the data plane's `{message, traceId}` envelope, with
 //! the service's own fixed text for the condition — see `crate::state` for the
 //! catalog and `super::types::shared_types` for the envelope.

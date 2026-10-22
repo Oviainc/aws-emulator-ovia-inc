@@ -39,11 +39,87 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Why this file validates input
+//!
+//! `com.amazonaws.billingconductor#ValidationException` (`@error("client")`,
+//! `@httpError(400)`) is a COMMON error of every operation of this service, and its
+//! `Message` member is `@required` — so the 400 a caller gets for a value that breaks a
+//! rule the model declares always carries `$.Message`, and an SDK surfaces that text as
+//! the exception's message.
+//!
+//! The framework's pre-dispatch envelope cannot answer with a modelled shape: at that
+//! point the refusal is a protocol-level fact rather than one of this service's error
+//! SHAPES, and the only seam over it ([`Service::override_refusal`]) chooses an error
+//! code and a sentence, not a body — so the sentence goes out under the JSON
+//! protocols' generic lowercase `message` key and the modelled, required `Message` is
+//! absent from the body entirely. A client that logs `err.message` then gets an empty
+//! string and cannot tell which constrained member it got wrong — a bad ARN from a bad
+//! account id.
+//!
+//! [`ModelledValidation`] closes that gap: `override_operation` routes every modelled
+//! operation through it, it asks the framework's OWN boundary walk — read the request
+//! into the operation's input shape, then run the model's constraint traits over what
+//! was read (`aws_smithy_schema_server::constraints::validate`, the same call the
+//! centralized sequence makes) — what the request violates, and renders the violations
+//! as the modelled `ValidationException`. The rules enforced are therefore exactly the
+//! model's; only the WORDS and the envelope are this service's. A request the model
+//! accepts is delegated, untouched, to the generated operation in the routing table, so
+//! each handler, its state and its 501 are exactly as before.
+//!
+//! The message itself is built from the request, the way AWS builds it:
+//! `<N> validation error(s) detected: ` over one clause per failing member, joined with
+//! `; ` — see [`refusal_message`].
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use std::collections::{BTreeMap, HashMap};
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
+use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
+use smithy_server_runtime::{
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
+    Refused, ServerHttpProtocol, Service,
+};
+
+/// The wire error code (`__type` / `x-amzn-errortype`) of this service's
+/// input-validation refusal: the shape the model lists as a COMMON error of every
+/// operation for "The input doesn't match with the constraints specified by Amazon Web
+/// Services services", and the same name a handler-returned `ValidationException`
+/// carries.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The status an input-validation refusal is served on:
+/// `ValidationException`'s own `@httpError(400)`.
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The lowerCamel member names this service's model targets at a `@sensitive` shape, so
+/// a clause about one of them states the constraint WITHOUT echoing the value back.
+///
+/// Source (`smithy_query` query="shape"): `BillingGroupName`, `CustomLineItemName`,
+/// `PricingPlanName`, `PricingRuleName`, `BillingGroupDescription`,
+/// `CustomLineItemDescription`, `PricingPlanDescription` and `PricingRuleDescription`
+/// all carry `sensitive: true`, and every input member that targets one of them (or a
+/// list of one — `ListCustomLineItemsFilter$Names` targets `CustomLineItemNameList`) is
+/// named `Name`, `Names` or `Description`. The two `@sensitive` shapes that are NOT
+/// listed here, `AccountName` and `AccountEmail`, carry no constraint and appear only in
+/// output, so no violation can ever name them.
+///
+/// Matched on the deepest NAMED segment of the violation path, which is why
+/// `ListBillingGroupsFilter$Names` — a list of `StringSearch`, whose constrained member
+/// is the non-sensitive `SearchValue` — correctly keeps its value: that path ends at
+/// `searchValue`, not at `names`.
+const SENSITIVE_MEMBERS: &[&str] = &["name", "names", "description"];
+
+/// Ceiling on a value rendered INTO a message, in bytes.
+///
+/// The same reason the framework elides the value it stores on a [`Violation`]: a caller
+/// controls the length of what it sends, and a clause interpolates it, so an unelided
+/// list of 30 multi-kilobyte strings would amplify one request into an arbitrarily long
+/// 400 body.
+const MAX_ECHOED_VALUE: usize = 256;
 
 /// The `com-amazonaws-billingconductor-awsbillingconductor` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +128,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// One [`ModelledValidation`] per modelled operation, keyed by the routing key the
+    /// model names that operation by ([`Operation::NAME`], the same key the generated
+    /// routing table uses). Built once here, never per request; each entry is
+    /// zero-sized, so this is a table of names, not a second set of operations.
+    refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,8 +142,69 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            refusals: modelled_validation_table::<Eng>(),
         }
     }
+}
+
+/// The modelled-refusal wrapper for EVERY operation this service serves.
+///
+/// A constraint is a property of the INPUT SHAPE and `ValidationException` is a common
+/// error of every operation of this service, so the wrapper goes in front of all of
+/// them — implemented or still scaffolded. A stub answers 501 for a request it could
+/// serve and the modelled 400 for one no operation could, which is the order the real
+/// service evaluates them in.
+fn modelled_validation_table<Eng: Send + Sync + 'static>(
+) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
+    let mut refusals: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+    macro_rules! register {
+        ($($module:ident :: $operation:ident),+ $(,)?) => {
+            $(
+                refusals.insert(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(ModelledValidation::<crate::ops::$module::$operation<Eng>>::new())
+                        as Box<dyn ErasedOperation>,
+                );
+            )+
+        };
+    }
+    register!(
+        associate_accounts::AssociateAccounts,
+        associate_pricing_rules::AssociatePricingRules,
+        batch_associate_resources_to_custom_line_item::BatchAssociateResourcesToCustomLineItem,
+        batch_disassociate_resources_from_custom_line_item::BatchDisassociateResourcesFromCustomLineItem,
+        create_billing_group::CreateBillingGroup,
+        create_custom_line_item::CreateCustomLineItem,
+        create_pricing_plan::CreatePricingPlan,
+        create_pricing_rule::CreatePricingRule,
+        delete_billing_group::DeleteBillingGroup,
+        delete_custom_line_item::DeleteCustomLineItem,
+        delete_pricing_plan::DeletePricingPlan,
+        delete_pricing_rule::DeletePricingRule,
+        disassociate_accounts::DisassociateAccounts,
+        disassociate_pricing_rules::DisassociatePricingRules,
+        get_billing_group_cost_report::GetBillingGroupCostReport,
+        get_billing_transfer_preference::GetBillingTransferPreference,
+        list_account_associations::ListAccountAssociations,
+        list_billing_group_cost_reports::ListBillingGroupCostReports,
+        list_billing_groups::ListBillingGroups,
+        list_custom_line_item_versions::ListCustomLineItemVersions,
+        list_custom_line_items::ListCustomLineItems,
+        list_pricing_plans::ListPricingPlans,
+        list_pricing_plans_associated_with_pricing_rule::ListPricingPlansAssociatedWithPricingRule,
+        list_pricing_rules::ListPricingRules,
+        list_pricing_rules_associated_to_pricing_plan::ListPricingRulesAssociatedToPricingPlan,
+        list_resources_associated_to_custom_line_item::ListResourcesAssociatedToCustomLineItem,
+        list_tags_for_resource::ListTagsForResource,
+        tag_resource::TagResource,
+        untag_resource::UntagResource,
+        update_billing_group::UpdateBillingGroup,
+        update_billing_transfer_preference::UpdateBillingTransferPreference,
+        update_custom_line_item::UpdateCustomLineItem,
+        update_pricing_plan::UpdatePricingPlan,
+        update_pricing_rule::UpdatePricingRule,
+    );
+    refusals
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -87,26 +229,36 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve every modelled operation through its [`ModelledValidation`] wrapper, so
+        // a request refused before the handler runs is stated in this service's OWN
+        // modelled `ValidationException` — whose `@required Message` member is what puts
+        // `$.Message` in the body — instead of the framework's generic envelope. The
+        // wrapper delegates a request the model accepts to the generated operation in
+        // the routing table, which stays the only thing that serves it.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The FALLBACK path: a refusal of a request that named a modelled operation is
+        // answered by [`ModelledValidation`] above, in the modelled shape. What still
+        // arrives here is a refusal with no modelled operation to read the request
+        // against — a body the codec could not read at all, say. It is still this
+        // service's `ValidationException` (HTTP 400) and still carries the clause that
+        // names the member and the rule it broke; only the generic envelope's lowercase
+        // `message` key is left, which is all this seam can choose.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: refusal_message(violations, &HashMap::new())?,
+            }),
+            // `Refusal` is `#[non_exhaustive]`: a refusal this service has no name of
+            // its own for keeps the framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -135,5 +287,510 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// One modelled operation, wrapped so a request this service refuses BEFORE the handler
+/// runs is answered in its own modelled `ValidationException` rather than the
+/// framework's generic envelope.
+///
+/// Zero-sized: the wrapper holds no engine and no operation. It carries the operation
+/// TYPE, which is all it needs — the input shape to read the request into and the input
+/// `Schema` to validate it against — and delegates a request the model accepts to the
+/// one operation instance the generated routing table built from the shared engine.
+/// There is therefore no second instance of any operation and no second store.
+struct ModelledValidation<Op> {
+    operation: PhantomData<fn() -> Op>,
+}
+
+impl<Op> ModelledValidation<Op> {
+    const fn new() -> Self {
+        Self {
+            operation: PhantomData,
+        }
+    }
+}
+
+impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let protocol = svc.definition().protocol();
+            if let Some(exception) = modelled_refusal::<Op>(protocol, req) {
+                // Serialized through the service's own protocol, exactly as a
+                // handler-returned `ValidationException` is: the same body member name
+                // (`Message`), the same `__type`, and the status the model declares for
+                // it.
+                match protocol.serialize_error(
+                    &exception,
+                    &crate::ops::types::SCHEMA_VALIDATION_EXCEPTION,
+                    VALIDATION_EXCEPTION,
+                    VALIDATION_EXCEPTION_STATUS,
+                ) {
+                    Ok(response) => {
+                        record_refusal::<Op>(ctx, started.elapsed());
+                        return response;
+                    }
+                    // A modelled error that will not serialize leaves the request to
+                    // the framework, which refuses it in the generic envelope — the
+                    // very divergence this wrapper removes, so it is logged rather
+                    // than passed over silently.
+                    Err(error) => tracing::warn!(
+                        operation = Op::NAME,
+                        %error,
+                        "the modelled ValidationException would not serialize; this \
+                         refusal falls back to the framework's generic envelope"
+                    ),
+                }
+            }
+            // Nothing to reword: the request is served by the generated operation,
+            // which runs the whole framework sequence (deserialize, validate, handle,
+            // serialize) over the same bytes.
+            match svc.definition().routing_table().get(Op::NAME) {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable in practice: this wrapper is only reachable under the key
+                // the generated table registered. Answer the framework's own
+                // no-such-operation response rather than inventing one.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // The wrapper is not an operation of its own: the request is signed (or not) as
+        // the MODEL says for the operation it names, so authentication is decided by the
+        // modelled operation this wrapper stands in front of.
+        None
+    }
+}
+
+/// Record the refusal answered above as the operation row the framework sequence would
+/// have recorded, so a refused request is not a hole in the telemetry series: the same
+/// classification (from this response's status and error shape), the same folded handle
+/// (this service's signing name and the operation's own name), and the same already
+/// sanitized request metadata. Everything is gated on a client collecting, exactly as
+/// the framework gates it.
+fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+    if !emulator_telemetry::recording_active() {
+        return;
+    }
+    let handle =
+        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), Op::NAME);
+    emulator_telemetry::record_generated_operation_with_handle(
+        &handle,
+        latency,
+        Some(emulator_telemetry::OperationFailure::classify(
+            VALIDATION_EXCEPTION_STATUS,
+            VALIDATION_EXCEPTION,
+        )),
+        smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
+    );
+}
+
+/// How this service states the request `Op` cannot be served from, or `None` when it has
+/// nothing of its own to say — in which case the request goes on to the generated
+/// operation and the framework answers as it always did.
+///
+/// This is the boundary walk the framework runs, in the framework's order and with the
+/// framework's own code: read the request into the operation's input shape, then run
+/// constraint-trait validation over what was read. Only the WORDS and the envelope are
+/// this service's.
+fn modelled_refusal<Op: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<crate::ops::types::ValidationException> {
+    let input = {
+        let mut deserializer = protocol.deserialize_input(req, Op::INPUT_SCHEMA).ok()?;
+        match <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
+            Ok(input) => input,
+            // A member the shape requires is absent. It is found while READING the
+            // request rather than by walking what was read, but to a caller it is the
+            // same refusal — so it is stated the same way, naming the member and the
+            // rule it broke.
+            Err(SerdeError::MissingMember { member_name }) => {
+                let absent = Violation {
+                    // The validating walk spells a member's path in lowerCamel; the
+                    // codec hands over the Smithy name, so it is cased here to the one
+                    // spelling the clause builder uses.
+                    path: constraints::path::member(&member_name),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                };
+                // Nothing was read, so there is no list value to render.
+                return refusal_message(&[absent], &HashMap::new()).map(validation_exception);
+            }
+            // Any other codec failure is not a refusal this service rewords.
+            Err(_) => return None,
+        }
+    };
+    let violations = constraints::validate(&input, Op::INPUT_SCHEMA);
+    if violations.is_empty() {
+        return None;
+    }
+    refusal_message(&violations, &list_values(&input, Op::INPUT_SCHEMA)).map(validation_exception)
+}
+
+/// This service's modelled refusal carrying `message` — the one place the boundary's
+/// `ValidationException` is built from a sentence.
+///
+/// `Reason` and `Fields` are left absent: the model marks only `Message` required, and a
+/// refusal the MODEL's constraints produced has no `ValidationExceptionReason` to name —
+/// the enumerated reasons are the service's own semantic refusals, which the handlers
+/// state through [`crate::state::validation_exception`].
+fn validation_exception(message: String) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message,
+        reason: None,
+        fields: None,
+    }
+}
+
+/// The `Message` for a set of constraint violations, as AWS builds it from the request:
+/// the count, then one clause per failing member.
+///
+/// `<N> validation error(s) detected: ` — singular for one — over
+/// `<subject> at '<member path>' failed to satisfy constraint: <requirement>` clauses
+/// joined with `; `, ordered by the member path so one request always states them in one
+/// order. A violation found on a list ELEMENT is reported at the LIST member, with the
+/// element's requirement nested (`Member must satisfy constraint: [<requirement>]`) and
+/// the list rendered as the value that member holds, which is why two bad elements of
+/// one list are ONE error rather than two.
+///
+/// `lists` carries the rendering of every list member of the request (see
+/// [`list_values`]); it may be empty, in which case the value the framework stored on
+/// the violation is used.
+///
+/// `None` declines the whole refusal — a violation class this service has no wording for
+/// ([`ViolationKind`] is `#[non_exhaustive]`) keeps the framework's own.
+fn refusal_message(violations: &[Violation], lists: &HashMap<String, Vec<String>>) -> Option<String> {
+    let mut clauses: BTreeMap<(String, String), String> = BTreeMap::new();
+    for violation in violations {
+        let (path, element) = match list_element_path(&violation.path) {
+            Some(list) => (list.to_string(), true),
+            None => (violation.path.clone(), false),
+        };
+        let requirement = match requirement_of(&violation.kind) {
+            Some(requirement) if element => {
+                format!("Member must satisfy constraint: [{requirement}]")
+            }
+            Some(requirement) => requirement,
+            None => return None,
+        };
+        let subject = subject(&path, violation, lists);
+        let clause = format!("{subject} at '{path}' failed to satisfy constraint: {requirement}");
+        clauses.insert((path, requirement), clause);
+    }
+    let count = clauses.len();
+    let joined = clauses
+        .into_values()
+        .collect::<Vec<_>>()
+        .join("; ");
+    match count {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {joined}")),
+        n => Some(format!("{n} validation errors detected: {joined}")),
+    }
+}
+
+/// The rule half of a clause: what the member had to satisfy.
+///
+/// `None` for a violation class this service has no wording for.
+fn requirement_of(kind: &ViolationKind) -> Option<String> {
+    let requirement = match kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        // The requirement reported is the expression itself, without the `^` / `$` the
+        // model spells it with: the service states the pattern a value must satisfy, not
+        // the anchoring Smithy uses to make the match total, so a client that
+        // re-validates locally with the pattern it read out of the message uses the one
+        // AWS documents.
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    };
+    Some(requirement)
+}
+
+/// The value half of a clause: what the member held.
+///
+/// * an ABSENT member has no value at all and is reported as the null it was;
+/// * a `@sensitive` member names no value — the constraint it broke is the whole of what
+///   a caller needs, and the value belongs in nobody's logs;
+/// * a LIST member is reported as the list the caller sent, bracketed;
+/// * everything else echoes the value the framework stored, already elided.
+fn subject(path: &str, violation: &Violation, lists: &HashMap<String, Vec<String>>) -> String {
+    if violation.value.is_none() {
+        return "Value null".to_string();
+    }
+    if is_sensitive(path) {
+        return "Value".to_string();
+    }
+    if let Some(elements) = lists.get(path) {
+        return format!("Value '{}'", elided(&format!("[{}]", elements.join(", "))));
+    }
+    match &violation.value {
+        Some(shown) => format!("Value '{shown}'"),
+        None => "Value null".to_string(),
+    }
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
+/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
+/// it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The list member a violation found on one of its ELEMENTS belongs to: the path with
+/// the trailing `<1-based index>.member` step the validating walk adds removed, or
+/// `None` when the path does not end in one (so it names the member itself).
+fn list_element_path(path: &str) -> Option<&str> {
+    let head = path.strip_suffix(".member")?;
+    let (list, index) = head.rsplit_once('.')?;
+    let indexed = !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit());
+    indexed.then_some(list)
+}
+
+/// Does `path` name a member this service's model targets at a `@sensitive` shape?
+///
+/// Read off the deepest NAMED segment — the index and collection steps a path carries
+/// (`1`, `member`) name a position, not a member.
+fn is_sensitive(path: &str) -> bool {
+    path.split('.')
+        .rfind(|segment| {
+            *segment != "member" && !segment.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .is_some_and(|segment| SENSITIVE_MEMBERS.contains(&segment))
+}
+
+/// `value` as it should appear in a message: itself when short, a character-boundary-safe
+/// prefix with an elision when not. See [`MAX_ECHOED_VALUE`].
+fn elided(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
+}
+
+/// Every LIST member of a request, keyed by the lowerCamel member path the validating
+/// walk reports it under, and rendered element by element.
+///
+/// A constraint on a list's element shape is violated by ONE element, and the framework
+/// reports it at that element (`accountIds.1.member`); AWS reports it at the list member
+/// and states the value that member holds — the whole list, not the element. That value
+/// is not on the violation, so it is read off the request here, through the same
+/// `SerializableStruct` walk the validator uses.
+fn list_values(input: &dyn SerializableStruct, schema: &Schema) -> HashMap<String, Vec<String>> {
+    let mut capture = ListValues::default();
+    // Rendering only: a walk that cannot be completed yields the paths it reached, and a
+    // path it did not reach simply falls back to the violation's own value.
+    let _ = capture.write_struct(schema, input);
+    capture.values
+}
+
+/// Where in the value tree [`ListValues`] currently is. Only a LIST collects: a struct
+/// or a map is opaque, so a leaf written inside one is not an element of the list that
+/// encloses it.
+#[derive(Debug)]
+enum Frame {
+    List(Vec<String>),
+    Opaque,
+}
+
+/// A [`ShapeSerializer`] that accumulates the rendering of each list member instead of
+/// producing output — the read half of [`list_values`].
+///
+/// It walks the same `serialize_members` tree the validator walks and spells a member
+/// path the same way (`constraints::path::member`), so the keys it produces are the
+/// paths a [`Violation`] carries.
+#[derive(Debug, Default)]
+struct ListValues {
+    /// Member-name segments from the root to the value being written.
+    path: Vec<String>,
+    /// Open frames, innermost last.
+    frames: Vec<Frame>,
+    /// The rendered elements of every list member reached so far.
+    values: HashMap<String, Vec<String>>,
+}
+
+impl ListValues {
+    /// Push `schema`'s member-name segment, if it has one. The root input struct and a
+    /// collection element carry no member name, so they contribute no segment.
+    fn push_segment(&mut self, schema: &Schema) -> bool {
+        match schema.member_name() {
+            Some(name) => {
+                self.path.push(constraints::path::member(name));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn pop_segment(&mut self, pushed: bool) {
+        if pushed {
+            self.path.pop();
+        }
+    }
+
+    /// Record one rendered leaf, when it is an element of the innermost list.
+    fn record(&mut self, rendered: &str) {
+        if let Some(Frame::List(elements)) = self.frames.last_mut() {
+            elements.push(rendered.to_string());
+        }
+    }
+}
+
+impl ShapeSerializer for ListValues {
+    fn write_struct(
+        &mut self,
+        schema: &Schema,
+        value: &dyn SerializableStruct,
+    ) -> Result<(), SerdeError> {
+        let pushed = self.push_segment(schema);
+        self.frames.push(Frame::Opaque);
+        let out = value.serialize_members(self);
+        self.frames.pop();
+        self.pop_segment(pushed);
+        out
+    }
+
+    fn write_list(
+        &mut self,
+        schema: &Schema,
+        write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        let pushed = self.push_segment(schema);
+        self.frames.push(Frame::List(Vec::new()));
+        let out = write_elements(self);
+        if let Some(Frame::List(elements)) = self.frames.pop() {
+            self.values.insert(self.path.join("."), elements);
+        }
+        self.pop_segment(pushed);
+        out
+    }
+
+    fn write_map(
+        &mut self,
+        schema: &Schema,
+        write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        let pushed = self.push_segment(schema);
+        // A map's keys and values are not list elements, and AWS states a violation
+        // inside one at the entry rather than at the map, so nothing here collects.
+        self.frames.push(Frame::Opaque);
+        let out = write_entries(self);
+        self.frames.pop();
+        self.pop_segment(pushed);
+        out
+    }
+
+    fn write_boolean(&mut self, _schema: &Schema, value: bool) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_byte(&mut self, _schema: &Schema, value: i8) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_short(&mut self, _schema: &Schema, value: i16) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_integer(&mut self, _schema: &Schema, value: i32) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_long(&mut self, _schema: &Schema, value: i64) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_float(&mut self, _schema: &Schema, value: f32) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_double(&mut self, _schema: &Schema, value: f64) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_big_integer(&mut self, _schema: &Schema, value: &BigInteger) -> Result<(), SerdeError> {
+        let rendered: &str = value.as_ref();
+        self.record(rendered);
+        Ok(())
+    }
+
+    fn write_big_decimal(&mut self, _schema: &Schema, value: &BigDecimal) -> Result<(), SerdeError> {
+        let rendered: &str = value.as_ref();
+        self.record(rendered);
+        Ok(())
+    }
+
+    fn write_string(&mut self, _schema: &Schema, value: &str) -> Result<(), SerdeError> {
+        self.record(value);
+        Ok(())
+    }
+
+    fn write_blob(&mut self, _schema: &Schema, value: &[u8]) -> Result<(), SerdeError> {
+        // The bytes themselves are not a rendering a message can carry; the framework's
+        // own validator states a blob leaf the same way.
+        self.record(&format!("{} bytes", value.len()));
+        Ok(())
+    }
+
+    fn write_timestamp(&mut self, _schema: &Schema, value: &DateTime) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_document(&mut self, _schema: &Schema, _value: &Document) -> Result<(), SerdeError> {
+        self.record("<document>");
+        Ok(())
+    }
+
+    fn write_null(&mut self, _schema: &Schema) -> Result<(), SerdeError> {
+        Ok(())
     }
 }

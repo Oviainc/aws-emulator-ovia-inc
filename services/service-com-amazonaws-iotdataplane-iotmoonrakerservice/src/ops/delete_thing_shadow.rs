@@ -5,6 +5,10 @@
 //! acknowledgement: the `version` the document had when it was deleted, and the
 //! `timestamp` of the deletion. Deleting a shadow that is not stored is a 404.
 //!
+//! The acknowledgement is the whole response body (the `@httpPayload` `JsonDocument`
+//! blob) and is announced `content-type: application/json` — see the media-type note
+//! in `crate::service`, which decides that for every operation that answers with one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

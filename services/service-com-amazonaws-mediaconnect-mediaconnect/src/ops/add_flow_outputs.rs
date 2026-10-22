@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddFlowOutputs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddFlowOutputs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddFlowOutputs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds outputs to a flow that ALREADY EXISTS and persists them in [`crate::state`]:
+//! the response is the stored records, so DescribeFlow reports exactly what this
+//! operation appended.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +81,31 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+
+use crate::state::StoredOutput;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error".
+fn bad_request(message: impl Into<String>) -> AddFlowOutputsError {
+    AddFlowOutputsErrorModeled::BadRequestException(BadRequestException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// Refuse the request with `AddFlowOutputs420Exception` (HTTP 420), the error the model
+/// declares for an output this service will not add — here because the flow is at its
+/// documented output ceiling (see [`crate::state::MAX_FLOW_OUTPUTS`]). The 420 is
+/// declared on AddFlowOutputs alone, so the refusal belongs to the add rather than being
+/// reported as a throttle or an outage.
+fn cannot_add(message: impl Into<String>) -> AddFlowOutputsError {
+    AddFlowOutputsErrorModeled::AddFlowOutputs420Exception(AddFlowOutputs420Exception {
+        message: message.into(),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +180,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddFlowOutputs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddFlowOutputsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddFlowOutputs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddFlowOutputsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect flow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "A list of outputs that you want to add to the flow": a request that adds no
+        // output has nothing to do, which is a semantic error rather than a no-op.
+        if input.outputs.is_empty() {
+            return Err(bad_request(
+                "An add flow outputs request must include at least one output.",
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The status change the clock already owes this flow is materialised before the
+        // flow is read, exactly as the reporting operations do it.
+        store.settle_due_transitions(now);
+
+        // This operation adds outputs to "an existing flow", addressed by its own ARN.
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
+            return Err(AddFlowOutputsErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: format!("Flow with ARN {} was not found.", input.flow_arn),
+                },
+            )
+            .into());
+        };
+
+        // "You can create up to 50 outputs per flow": the ceiling is on the flow, so it
+        // counts the outputs already stored plus the ones this call would add.
+        let held = flow.outputs.len();
+        if held + input.outputs.len() > crate::state::MAX_FLOW_OUTPUTS {
+            return Err(cannot_add(format!(
+                "A flow can hold at most {} outputs; flow {} already has {held} and this \
+                 request adds {}.",
+                crate::state::MAX_FLOW_OUTPUTS,
+                input.flow_arn,
+                input.outputs.len()
+            )));
+        }
+
+        // An output's name is unique within its flow, so each new output is named
+        // against the flow's existing outputs AND against the ones earlier in this
+        // request.
+        let held_names: BTreeSet<String> = flow.output_names();
+        let mut taken = held_names.clone();
+        let mut names = Vec::with_capacity(input.outputs.len());
+        for request in &input.outputs {
+            let Some(name) = crate::state::resolve_output_name(request.name.as_deref(), &taken)
+            else {
+                let requested = request.name.clone().unwrap_or_default();
+                return Err(bad_request(if held_names.contains(&requested) {
+                    format!(
+                        "Flow {} already has an output named {requested:?}. An output name \
+                         must be unique within its flow.",
+                        input.flow_arn
+                    )
+                } else {
+                    format!(
+                        "This request adds more than one output named {requested:?}. An \
+                         output name must be unique within its flow."
+                    )
+                }));
+            };
+            taken.insert(name.clone());
+            names.push(name);
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the flow exactly as
+        // it was. From here the whole batch is stored: the validation above borrowed the
+        // flow to read it, and the append takes it again mutably, both under the one
+        // store lock this call holds.
+        let mut added = Vec::with_capacity(input.outputs.len());
+        for (request, name) in input.outputs.iter().zip(names) {
+            let suffix = store.next_suffix();
+            added.push(StoredOutput::from_add_request(
+                request, name, &region, suffix,
+            ));
+        }
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(AddFlowOutputsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the flow could not be read back while adding its outputs"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let first_added = flow.outputs.len();
+        flow.outputs.extend(added);
+
+        // "The details of the newly added outputs" — read back out of the STORED flow,
+        // not from the request, and only the outputs this call appended.
+        let outputs: Vec<Output> = flow.outputs[first_added..]
+            .iter()
+            .map(StoredOutput::to_output)
+            .collect();
+        Ok(AddFlowOutputsOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            outputs: Some(outputs),
+        })
     }
 }

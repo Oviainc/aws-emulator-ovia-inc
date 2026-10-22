@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. THIS SERVICE REWORDS IT: a constraint violation is
+//!   stated in AWS's validation-framework form, with a `@pattern` quoted
+//!   unanchored. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -41,9 +42,146 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers a refused request with: the modelled
+/// `ValidationException` (`@httpError 400`), which every operation of this service
+/// declares. Restated here because `override_refusal` replaces the code and the message
+/// together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// A `@pattern` expression without the anchors the model spells it with.
+///
+/// The requirement a message states is the expression a value must satisfy, not the
+/// anchoring the model uses to make the match total, so a client that re-validates
+/// locally with the pattern it read out of the message uses the one AWS reports. A `$`
+/// escaped by a backslash is a literal dollar sign inside the expression, not the end
+/// anchor, so it stays.
+///
+/// NOTE (the note `services/common/src/validation.rs` asks every new copy to leave):
+/// this helper, [`requirement`] and [`constraint_clause`] inline the three
+/// service-independent rules that module stages, as ~24 sibling service crates already
+/// do (`grep -rln 'fn unanchored' services/*/src`). They are inlined here rather than
+/// shared because that module is declared nowhere and so compiles nowhere; the fix that
+/// owns the migration declares it, moves these rules there and calls them from here.
+/// What is NOT service-independent — and so would stay in this file either way — is the
+/// envelope dialect and this service's choice to quote a submitted scalar value, which
+/// its recordings pin.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The constraint half of a clause: what the value failed, as AWS's validation framework
+/// words it.
+///
+/// `None` for a violation class this service has no wording for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
+/// class can be added upstream).
+fn requirement(kind: &ViolationKind) -> Option<String> {
+    Some(match kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    })
+}
+
+/// Whether this violation's value is the framework's stand-in for a COLLECTION's size
+/// rather than something the caller sent.
+///
+/// A `@length` failure on a list or a map carries `"<n> items"` / `"<n> entries"` as its
+/// value, because the collection itself is not rendered. That is not a value any caller
+/// submitted, so a clause states the member without it rather than quoting a phrase the
+/// request never contained. Only a `@length` failure can carry it, so no other
+/// violation's value is second-guessed.
+fn is_collection_size(violation: &Violation) -> bool {
+    if !matches!(
+        violation.kind,
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    ) {
+        return false;
+    }
+    let Some(value) = violation.value.as_deref() else {
+        return false;
+    };
+    let Some((count, unit)) = value.split_once(' ') else {
+        return false;
+    };
+    matches!(unit, "items" | "entries")
+        && !count.is_empty()
+        && count.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Render one constraint violation the way AWS's validation framework states it: the
+/// submitted value, the member's dotted path, and the constraint it failed.
+fn constraint_clause(violation: &Violation) -> Option<String> {
+    let requirement = requirement(&violation.kind)?;
+    let path = &violation.path;
+    if is_collection_size(violation) {
+        return Some(format!(
+            "Value at '{path}' failed to satisfy constraint: {requirement}"
+        ));
+    }
+    Some(match &violation.value {
+        // An absent member has no submitted value at all, so it is reported as the null
+        // it was.
+        None => format!("Value null at '{path}' failed to satisfy constraint: {requirement}"),
+        Some(value) => {
+            format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
+        }
+    })
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation.
+///
+/// `None` declines the whole refusal — see [`constraint_clause`].
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-managedblockchainquery-tietonchainqueryservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +235,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // Every operation of this service models `ValidationException` (HTTP 400) for a
+        // request it refuses, and that is the code the framework would have answered
+        // too; what changes here is only the wording, which this service states in the
+        // AWS validation-framework form — one clause per violation, naming the submitted
+        // value, the member path and the constraint, with a `@pattern` quoted as the
+        // expression itself rather than as the model's anchored spelling.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

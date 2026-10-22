@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from the stored MediaPackage resource, so every later read
+//! of that resource no longer reports them.
 //!
 //! ## Shape of an operation
 //!
@@ -92,9 +85,23 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediapackage#UntagResource")]
+// `UntagResource` lists no errors of its own, so three errors this SERVICE models are
+// widened in through `extra_errors`, for the same reasons as on `TagResource`: an invalid
+// `ResourceArn` (422), an ARN naming a resource this service does not hold (404), and a
+// service mounted on an engine that holds no state (500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediapackage#UntagResource",
+    extra_errors = [
+        "InternalServerErrorException",
+        "NotFoundException",
+        "UnprocessableEntityException"
+    ]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
+    InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
+    UnprocessableEntityException(UnprocessableEntityException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,18 +155,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Untagging needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the mediapackage state store is unavailable".into()),
+            })
+        })?;
+
+        // Parsed before the store is read, exactly as on `TagResource`: a `ResourceArn`
+        // that names no MediaPackage resource type is a malformed request, not a missing
+        // resource.
+        let Some(target) = crate::state::parse_tag_arn(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!(
+                        "ResourceArn \"{}\" is not a MediaPackage channel or origin endpoint ARN.",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        let Some(tags) = state.tags_mut(&target) else {
+            return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "{} with ID \"{}\" not found.",
+                    target.label(),
+                    target.id()
+                )),
+            })
+            .into());
+        };
+
+        // The request's effect is that the named keys are gone, so a key the resource
+        // does not carry is no error: that effect already holds for it. Every other tag
+        // is left alone.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+        Ok(UntagResourceOutput)
     }
 }

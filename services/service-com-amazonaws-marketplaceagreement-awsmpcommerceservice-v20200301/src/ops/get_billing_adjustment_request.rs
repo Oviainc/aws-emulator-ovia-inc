@@ -181,6 +181,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // made due before this call.
         store.settle_billing_adjustments(now);
 
+        // A billing adjustment request is a child of the agreement it was
+        // submitted against, and this call names both. Resolution goes
+        // PARENT-FIRST, so `ResourceNotFoundException`'s `resourceType` and
+        // `resourceId` — the machine-readable half of the refusal, which is how
+        // a caller decides what to repair — name the OUTERMOST resource that
+        // failed to resolve: an `agreementId` that names no agreement is
+        // reported as the missing `Agreement`, not as a missing child under an
+        // agreement that does not exist. `ResourceType` models both values
+        // (`smithy_query(query="shape", shape="ResourceType")`), and the
+        // recorded AWS response for this operation with an unknown agreement
+        // names `Agreement` with the request's `agreementId`.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                GetBillingAdjustmentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        // The agreement resolved, so the child is what this call looks for.
         // Both ids are required and both select: a request of another agreement
         // is not the one this call names.
         let found = store
@@ -188,8 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.billing_adjustment_request_id)
             .filter(|request| request.agreement_id == input.agreement_id);
         let Some(request) = found else {
-            // The lookup found nothing: the modelled not-found body, at the
-            // status this service answers it with (`state::NOT_FOUND_STATUS`).
             return Err(crate::state::not_found(
                 GetBillingAdjustmentRequestErrorModeled::ResourceNotFoundException(
                     crate::state::billing_adjustment_not_found(

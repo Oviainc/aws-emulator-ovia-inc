@@ -173,19 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ledger = state.ledger(&input.network).ok_or_else(|| {
             GetTransactionErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 input.network.clone(),
-                format!("No ledger is held for network {}", input.network),
             ))
         })?;
 
         let transaction = selector.resolve(ledger).ok_or_else(|| {
             GetTransactionErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 selector.identifier(),
-                format!(
-                    "No transaction with {} {} exists on network {}",
-                    selector.member(),
-                    selector.identifier(),
-                    input.network
-                ),
             ))
         })?;
 

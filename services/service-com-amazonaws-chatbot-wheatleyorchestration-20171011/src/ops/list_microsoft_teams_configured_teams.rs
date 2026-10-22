@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMicrosoftTeamsConfiguredTeams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMicrosoftTeamsConfiguredTeams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: answers the Microsoft Teams teams AUTHORIZED with this account, read out
+//! of [`crate::state`] in `TeamId` order and projected through
+//! [`crate::state::MicrosoftTeamsConfiguredTeamRecord::view`], one bounded page at a
+//! time. A read only — the model marks this operation `@readonly` — so it writes
+//! nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMicrosoftTeamsConfiguredTeams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A team is authorized by the one-time Microsoft Teams client handshake, which no
+//! operation in this model performs; see
+//! [`crate::state::seed_microsoft_teams_configured_teams`] for how one reaches the
+//! registry this reads.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +85,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `TeamId` a page resumes after, encoded so a caller cannot read a position out of
+/// it and the token satisfies the model's `PaginationToken` pattern.
+fn encode_next_token(team_id: &str) -> String {
+    ::aws_smithy_types::base64::encode(team_id)
+}
+
+/// The `TeamId` a `NextToken` resumes after, or `None` when the token is not one this
+/// service issued: a cursor is always a `TeamId`, so anything that does not decode to
+/// one — unparseable, not UTF-8, or a string a caller made up — names no position in the
+/// scan.
+fn decode_next_token(token: &str) -> Option<String> {
+    let cursor = String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()?;
+    // The model's `UUID` (`ConfiguredTeam$TeamId`): `length 36..36`,
+    // `pattern ^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$`.
+    const HEX_RUNS: [usize; 5] = [8, 4, 4, 4, 12];
+    let groups: Vec<&str> = cursor.split('-').collect();
+    let shaped = groups.len() == HEX_RUNS.len()
+        && groups.iter().zip(HEX_RUNS).all(|(group, run)| {
+            group.chars().count() == run && group.chars().all(|c| c.is_ascii_hexdigit())
+        });
+    shaped.then_some(cursor)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,20 +176,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMicrosoftTeamsConfiguredTeams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMicrosoftTeamsConfiguredTeamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMicrosoftTeamsConfiguredTeams"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMicrosoftTeamsConfiguredTeamsErrorModeled::ListMicrosoftTeamsConfiguredTeamsException(
+                ListMicrosoftTeamsConfiguredTeamsException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A team authorization is account-wide, not regional, so this listing is the
+        // same whichever region the request is signed for.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+                ListMicrosoftTeamsConfiguredTeamsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "NextToken is not a pagination token issued by this service"
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?),
+            None => None,
+        };
+        // A caller that names no page size still gets a bounded page: the response can
+        // never carry the whole registry.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        let matching = store
+            .microsoft_teams_configured_teams()
+            // The scan resumes strictly after the cursor, so no team is returned on two
+            // pages.
+            .filter(|team| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| team.team_id.as_str() > cursor)
+            });
+
+        // One past the page: whether that extra record exists is exactly whether the
+        // caller needs a token to come back for more.
+        let mut page: Vec<_> = matching.take(page_size + 1).collect();
+        let next_token = if page.len() > page_size {
+            page.pop();
+            page.last().map(|team| encode_next_token(&team.team_id))
+        } else {
+            None
+        };
+
+        Ok(ListMicrosoftTeamsConfiguredTeamsOutput {
+            configured_teams: Some(page.into_iter().map(|team| team.view()).collect()),
+            next_token,
+        })
     }
 }
