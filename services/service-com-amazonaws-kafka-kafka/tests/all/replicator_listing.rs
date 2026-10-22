@@ -231,6 +231,15 @@ fn replicator(region: &str, name: &str, ordinal: u32) -> Replicator {
         is_replicator_reference: false,
         kafka_clusters: Vec::new(),
         replication_info: Vec::new(),
+        // Only reported by `DescribeReplicator`, which this suite does not drive:
+        // a `ReplicatorSummary` carries none of them.
+        description: None,
+        service_execution_role_arn: format!(
+            "arn:aws:iam::{}:role/service-role/MskReplicator-{ordinal}",
+            engine::emulator_account_id()
+        ),
+        log_delivery: None,
+        tags: std::collections::BTreeMap::new(),
     }
 }
 
