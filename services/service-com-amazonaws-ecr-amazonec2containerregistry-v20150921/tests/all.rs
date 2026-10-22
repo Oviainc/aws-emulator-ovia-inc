@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/layer_availability.rs"]
 mod layer_availability;
+#[path = "all/pull_time_update_exclusion_removal.rs"]
+mod pull_time_update_exclusion_removal;
 #[path = "all/pull_time_update_exclusions.rs"]
 mod pull_time_update_exclusions;
 #[path = "all/registry_policy.rs"]

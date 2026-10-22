@@ -7,7 +7,7 @@
 //! already excludes that principal, is refused with `ExclusionAlreadyExistsException`.
 //! The list lives in `crate::state`'s `pull_time_update_exclusions`, where
 //! `ListPullTimeUpdateExclusions` reads it back and `DeregisterPullTimeUpdateExclusion`
-//! (still a stub) will remove from it.
+//! removes from it.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
