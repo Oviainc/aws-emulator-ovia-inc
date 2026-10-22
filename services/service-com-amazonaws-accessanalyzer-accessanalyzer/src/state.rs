@@ -795,6 +795,10 @@ pub fn validation_reason_wire(discriminator: &str) -> Option<&'static str> {
         .map(|(_, wire)| *wire)
 }
 
+/// The `ValidationExceptionReason` for a well-formed request asking for something this
+/// resource does not support, from the same `VALIDATION_EXCEPTION_REASON_VALUES` list.
+pub const VALIDATION_REASON_NOT_SUPPORTED: &str = "notSupported";
+
 /// A `ValidationException` about ONE request member: the reason the model lists for a
 /// member that failed validation, and a `fieldList` naming it.
 ///
@@ -812,6 +816,31 @@ pub fn field_validation_exception(member: &str, message: impl Into<String>) -> V
             message,
         }]),
     }
+}
+
+/// The identity that made this request, as an ARN.
+///
+/// Derived from the request's own SigV4 access key id, so an operation that reports or
+/// refuses a caller names the caller it actually had rather than a fabricated one. The
+/// access key id is caller-controlled text, so it is first reduced to the characters an
+/// access key id can hold.
+///
+/// Every request this emulator serves is signed with a caller's own access key, so the
+/// identity is always an IAM identity of the emulator's account — never an Amazon Web
+/// Services service principal.
+pub fn caller_identity_arn(parts: &::http::request::Parts) -> String {
+    let raw = ::engine::extract_akid(&parts.headers);
+    let filtered: String = raw
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(128)
+        .collect();
+    let akid = if filtered.is_empty() {
+        "default"
+    } else {
+        filtered.as_str()
+    };
+    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
 }
 
 /// A `ValidationException` for a well-formed request the action does not support against
@@ -992,6 +1021,106 @@ fn decode_page_token(token: &str) -> Option<String> {
 
 /// Marks a continuation token as this service's, and at which version it was issued.
 const PAGE_TOKEN_PREFIX: &str = "accessanalyzer:v1:";
+
+/// Emit the structured access record for one call to this service.
+///
+/// Every operation that creates, replaces or refuses something calls this on the branch
+/// it returns from, so a reader of the emulator's log can attribute each call — above
+/// all the state-changing ones, whose effect on the store is otherwise invisible after
+/// the fact. The record carries the operation, the identity the request PRESENTED (the
+/// SigV4 access key id, which is an identifier and not a secret), the request target it
+/// named, and the outcome; the subscriber supplies the timestamp.
+///
+/// There is no network peer in the record because a Smithy handler is not given one:
+/// `OperationContext::parts()` carries the request's method, URI, headers and
+/// extensions, and nothing in this framework puts a peer address in them. The presented
+/// credential is therefore what identifies the caller.
+///
+/// Every interpolated value is request-derived, so each is bounded and stripped of the
+/// control characters that would otherwise let one request forge a second log line:
+/// [`audit_field`] does both.
+///
+/// Deliberately metadata only: no policy document, configuration, tag or client token is
+/// logged, so a caller's own data never reaches the log.
+pub fn audit(
+    operation: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: AuditOutcome,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation,
+        access_key_id = %audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target = %audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        outcome = outcome.as_str(),
+        "access-analyzer api call"
+    );
+}
+
+/// Longest request-derived value one audit field carries.
+///
+/// A SigV4 access key id and a request path are both caller-controlled, so an unbounded
+/// echo would let one request emit an arbitrarily long log line.
+const MAX_AUDIT_FIELD: usize = 128;
+
+/// A request-derived value as it may appear in an audit record: control characters
+/// (above all CR and LF, which would forge a second record) replaced, and the whole
+/// thing bounded by [`MAX_AUDIT_FIELD`] on a character boundary.
+fn audit_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .take(MAX_AUDIT_FIELD)
+        .collect()
+}
+
+/// What a call answered, as the one closed set [`audit`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// An analyzer was created and stored.
+    AnalyzerCreated,
+    /// A stored analyzer's configuration was replaced.
+    AnalyzerUpdated,
+    /// An `@idempotent` call changed nothing and replayed what it already held.
+    NoChange,
+    /// A policy check ran and answered a result.
+    CheckEvaluated,
+    /// The request was refused as invalid (400).
+    ValidationRefused,
+    /// The caller may not perform the operation (403).
+    AccessDenied,
+    /// The named resource does not exist (404).
+    NotFound,
+    /// The request conflicts with a resource that already exists (409).
+    Conflict,
+    /// A quota — the service's or this emulator's own ceiling — was met (402).
+    QuotaExceeded,
+    /// The service's own store was unreachable (500).
+    StoreUnavailable,
+    /// The work could not be run to completion (500).
+    EvaluationFailed,
+}
+
+impl AuditOutcome {
+    /// The stable token this outcome is logged as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AnalyzerCreated => "analyzer-created",
+            Self::AnalyzerUpdated => "analyzer-updated",
+            Self::NoChange => "no-change",
+            Self::CheckEvaluated => "check-evaluated",
+            Self::ValidationRefused => "validation-refused",
+            Self::AccessDenied => "access-denied",
+            Self::NotFound => "not-found",
+            Self::Conflict => "conflict",
+            Self::QuotaExceeded => "quota-exceeded",
+            Self::StoreUnavailable => "store-unavailable",
+            Self::EvaluationFailed => "evaluation-failed",
+        }
+    }
+}
 
 /// The modelled server error every handler answers with when [`service_state`] finds
 /// no store (this service mounted on an engine that holds none). The payload is shared;

@@ -158,9 +158,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateAnalyzerErrorModeled::InternalServerException(crate::state::store_unavailable())
-        })?;
+        // Every branch below records the call; the error values themselves are built by
+        // side-effect-free code.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::StoreUnavailable);
+            return Err(CreateAnalyzerErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
         let mut state = state.lock();
 
         // Bounds the model documents for a configuration member but does not express as
@@ -192,12 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|token| state.create_analyzer_tokens.get(token))
             .filter(|recorded| recorded.analyzer_name == input.analyzer_name)
         {
-            return Ok(CreateAnalyzerOutput {
-                arn: Some(recorded.arn.clone()),
-            });
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NoChange);
+            let arn = recorded.arn.clone();
+            drop(state);
+            return Ok(CreateAnalyzerOutput { arn: Some(arn) });
         }
 
         if state.analyzers.contains_key(&input.analyzer_name) {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::Conflict);
             // A duplicate name is refused with a FIXED text; the name travels in the
             // modelled `resourceId`/`resourceType` members.
             return Err(CreateAnalyzerErrorModeled::ConflictException(
@@ -209,6 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.analyzers.len() >= crate::state::MAX_ANALYZERS {
             // The emulator's own store ceiling, expressed with the quota error this
             // operation models (HTTP 402) rather than by growing without bound.
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::QuotaExceeded);
             return Err(CreateAnalyzerErrorModeled::ServiceQuotaExceededException(
                 crate::state::analyzer_quota_exceeded(&input.analyzer_name),
             )
@@ -277,6 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The store guard is released before the call is recorded, so the lock is held
+        // for the create alone.
+        drop(state);
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::AnalyzerCreated);
         Ok(CreateAnalyzerOutput { arn: Some(arn) })
     }
 }

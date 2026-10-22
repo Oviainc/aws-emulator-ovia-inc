@@ -292,7 +292,11 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
             None,
             None,
             404,
-            "ResourceNotFoundException",
+            // Marketplace Deployment answers an ARN it holds no record for with its
+            // own recorded code `NotFoundException`, not the modelled
+            // `ResourceNotFoundException` shape name — so this code, too, is
+            // answered by exactly one service of the family.
+            "NotFoundException",
         ),
         (
             "discovery: a listing that does not exist",
