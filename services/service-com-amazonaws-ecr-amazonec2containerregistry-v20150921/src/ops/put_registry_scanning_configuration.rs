@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRegistryScanningConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRegistryScanningConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRegistryScanningConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates this registry's scanning configuration: the stored configuration
+//! becomes exactly the `scanType` and `rules` this request carries, and
+//! `GetRegistryScanningConfiguration` reports it from then on.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +113,20 @@ impl From<PutRegistryScanningConfigurationErrorModeled> for PutRegistryScanningC
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors. Only
+/// [`crate::state::Fault::InvalidParameter`] can arise here — this operation reads no
+/// repository and no image — and `InvalidParameterException` is the error ECR models for
+/// a parameter the service cannot honour.
+fn invalid_parameter(
+    fault: crate::state::Fault,
+) -> PutRegistryScanningConfigurationErrorModeled {
+    PutRegistryScanningConfigurationErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(fault.message().to_string()),
+        },
+    )
+}
+
 /// The `PutRegistryScanningConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +163,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRegistryScanningConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRegistryScanningConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRegistryScanningConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRegistryScanningConfigurationErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // This emulator serves exactly one registry, the one its own account owns, and
+        // the request names no other; nothing in `ctx` selects what is configured.
+        let _ = ctx;
+
+        // The put REPLACES the configuration: what it carries is the whole of it, so a
+        // request that omits `rules` leaves the registry with none and one that omits
+        // `scanType` leaves it on the default scan type.
+        let configuration =
+            crate::state::scanning_configuration_from_request(input.scan_type, input.rules)
+                .map_err(invalid_parameter)?;
+
+        let mut store = state.lock();
+        store.registry_scanning = Some(configuration.clone());
+
+        Ok(PutRegistryScanningConfigurationOutput {
+            registry_scanning_configuration: Some(configuration),
+        })
     }
 }
