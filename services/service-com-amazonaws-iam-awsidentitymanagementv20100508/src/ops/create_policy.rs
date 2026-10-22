@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a managed policy created here is persisted in this service's state
+//! (`crate::state`), with its first version (`v1`) holding the document the request
+//! carried, and read back by `GetPolicy`.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +186,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePolicy"))
+        // `ctx` carries request metadata only; nothing in `CreatePolicy` depends on it —
+        // IAM is global, so not even the ARN's region segment comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "The request was rejected because the policy document was malformed" — the
+        // content of a managed policy must be an IAM JSON policy, not merely a
+        // non-empty string, which is all `policyDocumentType`'s own pattern asks for.
+        // The rule is the shared one every operation taking a policy document applies.
+        if !crate::state::is_policy_document(&input.policy_document) {
+            return Err(CreatePolicyErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(
+                        "Syntax errors in policy: PolicyDocument must be a JSON object \
+                         carrying a Statement element"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A managed policy's document is bounded well below `policyDocumentType`'s own
+        // 131072-character ceiling, so a document past the quota is refused rather
+        // than stored.
+        let characters = crate::state::managed_policy_characters(&input.policy_document);
+        if characters > crate::state::MAX_MANAGED_POLICY_CHARACTERS {
+            return Err(CreatePolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Maximum policy size of {} characters exceeded for policy {}",
+                        crate::state::MAX_MANAGED_POLICY_CHARACTERS,
+                        input.policy_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter".
+        let tags = input.tags.filter(|tags| !tags.is_empty());
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(tags.iter().flatten().map(|tag| tag.key.as_str()))
+        {
+            return Err(CreatePolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not distinguished
+        // by case", so the case-folded name is the identity: a second create under
+        // any casing of a held name is a conflict rather than a second policy.
+        let key = crate::state::name_key(&input.policy_name);
+        if store.policies.contains_key(&key) {
+            return Err(CreatePolicyErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some(format!(
+                        "A policy called {} already exists. Duplicate names are not allowed.",
+                        input.policy_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An account holds a bounded number of customer managed policies, so a caller
+        // cannot grow the account without limit; past the quota IAM refuses the create.
+        if store.policies.len() >= crate::state::MAX_POLICIES_PER_ACCOUNT {
+            return Err(CreatePolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for PoliciesPerAccount: {}",
+                        crate::state::MAX_POLICIES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let path = input
+            .path
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // One instant for the policy and for the version it creates: they are created
+        // by this one call, and `Policy$UpdateDate`'s documentation says that "when a
+        // policy has only one version, this field contains the date and time when the
+        // policy was created".
+        let created = crate::state::now();
+        let policy = Policy {
+            arn: Some(crate::state::policy_arn(&path, &input.policy_name)),
+            policy_id: Some(store.next_policy_id()),
+            policy_name: Some(input.policy_name),
+            path: Some(path),
+            // "This operation creates a policy version with a version identifier of
+            // v1 and sets v1 as the policy's default version."
+            default_version_id: Some(crate::state::FIRST_POLICY_VERSION_ID.to_string()),
+            // A policy is created attached to nothing and used as nobody's
+            // permissions boundary; the counts are what the attach and
+            // permissions-boundary operations move.
+            attachment_count: Some(0),
+            permissions_boundary_usage_count: Some(0),
+            // A customer managed policy can be attached to a user, group or role —
+            // that is what makes the ARN usable as a role's permissions boundary.
+            is_attachable: true,
+            description: input.description,
+            create_date: Some(created),
+            update_date: Some(created),
+            // An empty `Tags` list is the same as none: report the member only when
+            // the policy actually carries tags.
+            tags,
+        };
+
+        let version = PolicyVersion {
+            // Held as the plain JSON text the request carried, which is how this crate
+            // holds every policy document, and handed back verbatim by the readers.
+            document: Some(input.policy_document),
+            version_id: Some(crate::state::FIRST_POLICY_VERSION_ID.to_string()),
+            is_default_version: true,
+            create_date: Some(created),
+        };
+
+        store.policies.insert(
+            key,
+            crate::state::ManagedPolicy {
+                policy: policy.clone(),
+                versions: [(crate::state::FIRST_POLICY_VERSION_ID.to_string(), version)]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        // The response is the record that was stored, so a caller sees exactly what a
+        // later `GetPolicy` reports.
+        Ok(CreatePolicyOutput {
+            policy: Some(policy),
+        })
     }
 }

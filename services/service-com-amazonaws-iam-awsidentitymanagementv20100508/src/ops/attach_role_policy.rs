@@ -245,9 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not account state and is taken as present: this emulator does not carry
         // AWS's catalog of managed policies, and a per-request entry invented for one
         // would not be knowledge it has. A customer-managed policy, by contrast,
-        // exists exactly when this account holds it.
+        // exists exactly when this account holds it — which is what the policy store
+        // `CreatePolicy` writes records.
         let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
-        if !aws_managed && !store.customer_managed_policies.contains(&input.policy_arn) {
+        if !aws_managed && store.policy_by_arn(&input.policy_arn).is_none() {
             return Err(AttachRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

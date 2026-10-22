@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is the reporting half of `CreatePolicy` — it reports the managed
+//! policy the request's ARN names, as this service's state (`crate::state`) holds it,
+//! and writes nothing.
+//!
+//! An AWS-managed policy's ARN (`arn:aws:iam::aws:policy/...`) names no policy this
+//! emulator holds: it carries none of AWS's catalog, so such a read answers the
+//! modelled `NoSuchEntityException` rather than an invented `Policy` record. That is
+//! deliberately NOT what `AttachRolePolicy` does with one — an attach records the ARN
+//! the caller named without claiming to know the catalog, while a read would have to
+//! fabricate the policy's id, dates and counts to answer at all.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +156,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPolicy"))
+        // `ctx` carries request metadata only; a read addressed by ARN depends on
+        // none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A value that is not a managed-policy ARN at all is an invalid input
+        // parameter, which is a different refusal from an ARN the account does not
+        // hold: `arnType` constrains only the length, so the form is checked here,
+        // through the one definition of the ARN grammar this crate holds.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(GetPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // A read: it reports the stored record and writes nothing.
+        let store = state.lock();
+        match store.policy_by_arn(&input.policy_arn) {
+            Some(held) => Ok(GetPolicyOutput {
+                policy: Some(held.policy.clone()),
+            }),
+            None => Err(GetPolicyErrorModeled::NoSuchEntityException(NoSuchEntityException {
+                message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+            })
+            .into()),
+        }
     }
 }

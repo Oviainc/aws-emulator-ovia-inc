@@ -28,7 +28,7 @@ const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Al
 /// The same emulator as [`router`], over an engine the caller keeps, so a suite can
 /// seed the store directly instead of driving thousands of wire calls to reach a
 /// quota. Everything else about the router is identical.
-fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -39,7 +39,7 @@ fn router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 
 /// The text of the `<tag>` element the body carries, or `None` when the response
 /// omits that member — which is how an optional member is asserted absent.
-fn optional(body: &str, tag: &str) -> Option<String> {
+pub(crate) fn optional(body: &str, tag: &str) -> Option<String> {
     let found = elements(body, tag);
     assert!(
         found.len() <= 1,
@@ -50,19 +50,19 @@ fn optional(body: &str, tag: &str) -> Option<String> {
 }
 
 /// Borrow an owned parameter list as the harness takes it.
-fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
     params
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect()
 }
 
-fn param(name: &str, value: &str) -> (String, String) {
+pub(crate) fn param(name: &str, value: &str) -> (String, String) {
     (name.to_string(), value.to_string())
 }
 
 /// The `<Key>`/`<Value>` pairs of a `Tags` list, as a map.
-fn reported_tags(body: &str) -> BTreeMap<String, String> {
+pub(crate) fn reported_tags(body: &str) -> BTreeMap<String, String> {
     elements(body, "Key")
         .into_iter()
         .zip(elements(body, "Value"))

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_keys.rs"]
 mod access_keys;
+#[path = "all/managed_policies.rs"]
+mod managed_policies;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
 #[path = "all/role_inline_policies.rs"]

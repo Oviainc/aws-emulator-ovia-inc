@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ops::types::{Role, ServiceSpecificCredentialMetadata, User};
+use crate::ops::types::{Policy, PolicyVersion, Role, ServiceSpecificCredentialMetadata, User};
 
 /// IAM's default entity path: every entity whose request omits `Path` is created
 /// directly under the account root. The model's `pathType` documentation states
@@ -37,6 +37,16 @@ const USER_ID_PREFIX: &str = "AIDA";
 /// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
 const ROLE_ID_PREFIX: &str = "AROA";
 
+/// The prefix AWS gives a managed policy's unique id. `Policy$PolicyId` is
+/// modelled as `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
+/// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
+const POLICY_ID_PREFIX: &str = "ANPA";
+
+/// The version identifier the first version of a managed policy carries.
+/// `CreatePolicy`'s documentation: "This operation creates a policy version with a
+/// version identifier of v1 and sets v1 as the policy's default version."
+pub const FIRST_POLICY_VERSION_ID: &str = "v1";
+
 /// How many characters an IAM role name may carry: `Role$RoleName` is modelled as
 /// `roleNameType` with length 1..64
 /// (`smithy_query(query="shape", shape="Role")`), so a name a service-linked role
@@ -54,6 +64,20 @@ pub const MAX_ROLES_PER_ACCOUNT: usize = 1_000;
 /// value for this setting, the default value of one hour is applied", and
 /// `roleMaxSessionDurationType`'s range (3600..43200) puts one hour at its floor.
 pub const DEFAULT_MAX_SESSION_DURATION_SECONDS: i32 = 3_600;
+
+/// How many customer managed policies one account may hold. AWS's "IAM and STS
+/// quotas" page gives the quota "Customer managed policies in an account: 1,500",
+/// and a create past it is refused with `LimitExceededException`, whose
+/// documentation says "the error message describes the limit exceeded". It is also
+/// what stops the policy map growing without end.
+pub const MAX_POLICIES_PER_ACCOUNT: usize = 1_500;
+
+/// The size, in non-whitespace characters, of one managed policy document. AWS's
+/// "IAM and STS character quotas" page gives "Managed policy size: 6,144
+/// characters" and states that IAM "doesn't count whitespace when calculating the
+/// size of a policy against this limitation", so the measure
+/// ([`managed_policy_characters`]) skips whitespace too.
+pub const MAX_MANAGED_POLICY_CHARACTERS: usize = 6_144;
 
 /// How many IAM users one account may hold. AWS's "IAM and STS quotas" page gives
 /// the quota "Users in an account: 5,000", and a create past it is refused with
@@ -318,6 +342,19 @@ pub struct InlinePolicy {
     pub policy_document: String,
 }
 
+/// One managed policy the account holds.
+///
+/// The modelled [`Policy`] is kept exactly as every reader reports it, beside the
+/// policy's versions — the `Policy` shape carries no document, so the document a
+/// create or an update supplied lives in the version it created.
+#[derive(Debug, Clone)]
+pub struct ManagedPolicy {
+    /// The policy as `CreatePolicy` returned it and `GetPolicy` reports it.
+    pub policy: Policy,
+    /// The policy's versions, keyed by `PolicyVersion$VersionId` (`v1`, `v2`, …).
+    pub versions: BTreeMap<String, PolicyVersion>,
+}
+
 /// One access key an IAM user holds, keyed in [`ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`]
 /// by the access key id.
 ///
@@ -387,23 +424,30 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// be recovered later"
     /// (`CreateServiceSpecificCredential$ServiceSpecificCredential`).
     pub service_specific_credentials: BTreeMap<String, ServiceSpecificCredentialMetadata>,
+    /// The persisted customer managed policies, keyed by [`name_key`] of the
+    /// policy name, for the same reason users and roles are: the model's
+    /// `CreatePolicy$PolicyName` documentation says "IAM user, group, role, and
+    /// policy names must be unique within the account. Names are not
+    /// distinguished by case."
+    ///
+    /// This is also the ONE record of which customer-managed policies the account
+    /// holds, which is what makes such a policy attachable: an ARN naming a policy
+    /// this map does not carry refers to no entity (see [`Self::policy_by_arn`]).
+    /// AWS-managed policies (`arn:aws:iam::aws:policy/...`) are NOT in here — they
+    /// are owned by AWS, not by the account ([`AWS_MANAGED_POLICY_ACCOUNT`]).
+    pub policies: BTreeMap<String, ManagedPolicy>,
     /// The managed policies attached to each role: [`name_key`] of the role name
     /// -> the attached policies' ARNs. A `BTreeSet` because a policy is attached
     /// to a role at most once (a repeat attach is the same attachment) and
     /// because the total ARN order is what lets
     /// `ListAttachedRolePolicies` hand out a resumable marker.
     pub role_attached_policies: BTreeMap<String, BTreeSet<String>>,
-    /// The ARNs of the customer-managed policies this account holds, which is
-    /// what makes such a policy attachable: an ARN naming a policy the account
-    /// does not hold refers to no entity. AWS-managed policies
-    /// (`arn:aws:iam::aws:policy/...`) are NOT in here — they are owned by AWS,
-    /// not by the account ([`AWS_MANAGED_POLICY_ACCOUNT`]). `CreatePolicy` (still
-    /// a stub) is what will populate it.
-    pub customer_managed_policies: BTreeSet<String>,
     /// Monotonic counter feeding [`next_user_id`](Self::next_user_id).
     pub user_id_seq: u64,
     /// Monotonic counter feeding [`next_role_id`](Self::next_role_id).
     pub role_id_seq: u64,
+    /// Monotonic counter feeding [`next_policy_id`](Self::next_policy_id).
+    pub policy_id_seq: u64,
 }
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -477,6 +521,30 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .count()
     }
 
+    /// Mint the next managed policy's `PolicyId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id)
+    /// is: the counter is bijectively mixed into the suffix, and the id is minted
+    /// once and then stored with the policy.
+    pub fn next_policy_id(&mut self) -> String {
+        self.policy_id_seq += 1;
+        unique_id(POLICY_ID_PREFIX, self.policy_id_seq)
+    }
+
+    /// The managed policy `arn` names, if the account holds it.
+    ///
+    /// Every modelled read of a managed policy addresses it by ARN while the map
+    /// is keyed by the name (the identity IAM enforces uniqueness on), so the ARN
+    /// is parsed ([`parse_policy_arn`]) for the name to look up, and the held
+    /// policy answers only when its own ARN is the one asked for — so an ARN that
+    /// carries another path, another account or another casing of the name names no
+    /// policy.
+    pub fn policy_by_arn(&self, arn: &str) -> Option<&ManagedPolicy> {
+        let parsed = parse_policy_arn(arn)?;
+        let held = self.policies.get(&name_key(&parsed.policy_name))?;
+        (held.policy.arn.as_deref() == Some(arn)).then_some(held)
+    }
+
     /// The aggregate size, in characters, of the inline policies embedded in the
     /// user keyed by `user_key`, counting every policy except the one keyed by
     /// `replacing` (a put of an existing name replaces that document rather than
@@ -536,6 +604,13 @@ pub fn name_key(name: &str) -> String {
 /// a global service, so the region segment is empty.
 pub fn user_arn(path: &str, user_name: &str) -> String {
     ::engine::emulator_arn("iam", "", &format!("user{path}{user_name}"))
+}
+
+/// The ARN of an IAM managed policy: `arn:aws:iam::<account>:policy<path><name>`.
+///
+/// Built the same way [`user_arn`] is, from the `policy` resource type.
+pub fn policy_arn(path: &str, policy_name: &str) -> String {
+    ::engine::emulator_arn("iam", "", &format!("policy{path}{policy_name}"))
 }
 
 /// The ARN of an IAM role: `arn:aws:iam::<account>:role<path><name>`.
@@ -748,3 +823,12 @@ pub fn is_policy_document(document: &str) -> bool {
             .is_some_and(|document| document.contains_key("Statement"))
     })
 }
+
+/// The size a managed policy document is measured at against
+/// [`MAX_MANAGED_POLICY_CHARACTERS`]: its characters except whitespace, because
+/// AWS "doesn't count whitespace when calculating the size of a policy against
+/// this limitation".
+pub fn managed_policy_characters(document: &str) -> usize {
+    document.chars().filter(|c| !c.is_whitespace()).count()
+}
+
