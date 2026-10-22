@@ -17,6 +17,8 @@ mod access_keys;
 mod managed_policies;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
+#[path = "all/role_deletion.rs"]
+mod role_deletion;
 #[path = "all/role_inline_policies.rs"]
 mod role_inline_policies;
 #[path = "all/role_lifecycle.rs"]

@@ -23,5 +23,7 @@ mod server_config_and_state;
 mod server_user_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/user_properties_and_keys.rs"]
+mod user_properties_and_keys;
 #[path = "all/user_state_persistence.rs"]
 mod user_state_persistence;
