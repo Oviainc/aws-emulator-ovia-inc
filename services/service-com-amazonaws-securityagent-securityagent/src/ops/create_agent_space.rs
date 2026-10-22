@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgentSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgentSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgentSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a new agent space: mints the agent space's identity and timestamps, stores
+//! a record carrying every supplied input, and answers from that stored record, so a
+//! later read of the store reports exactly what the caller was told.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `CreateAgentSpace::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
@@ -93,12 +88,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CreateAgentSpaceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#CreateAgentSpace")]
+// here — hence the `CreateAgentSpaceError` alias below.
+//
+// `CreateAgentSpace` lists no errors of its own, so the three service-wide shapes this
+// handler needs are widened in with `extra_errors`: `ValidationException` (HTTP 400,
+// "The input fails to satisfy the constraints specified by the service", carrying the
+// `fieldList` a real client reads), `ServiceQuotaExceededException` (HTTP 402, "The
+// request exceeds a service quota") and `InternalServerException` (HTTP 500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#CreateAgentSpace",
+    extra_errors = [
+        "InternalServerException",
+        "ServiceQuotaExceededException",
+        "ValidationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum CreateAgentSpaceErrorModeled {
+    InternalServerException(InternalServerException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +161,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgentSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgentSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgentSpace"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAgentSpaceErrorModeled::InternalServerException(InternalServerException {
+                message: "the agent space store is unavailable".to_string(),
+            })
+        })?;
+
+        // `name` is required but carries no `@length` in the model, so the boundary
+        // validator lets a blank one through. A resource whose name is only whitespace
+        // has no name, so it is refused here with the service's own client-input error
+        // naming the member — never with a 501, and never by storing it.
+        if input.name.trim().is_empty() {
+            return Err(CreateAgentSpaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: "1 validation error detected: value for 'name' failed to \
+                              satisfy constraint: member must not be blank"
+                        .to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "name".to_string(),
+                        message: "member must not be blank".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+
+        // Every agent space is a stored record, so the number of them a caller can
+        // create is bounded, as it is on the real service: past the quota this
+        // operation answers the service's own `ServiceQuotaExceededException` (HTTP 402)
+        // instead of growing the store without end.
+        if state.agent_spaces.len() >= crate::state::MAX_AGENT_SPACES {
+            return Err(CreateAgentSpaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of agent spaces ({}) \
+                         for this account",
+                        crate::state::MAX_AGENT_SPACES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A fresh identity per call: the id is the service's to choose, so two calls
+        // are two distinct agent spaces whatever they were called with. `createdAt` and
+        // `updatedAt` are the same instant on a record nothing has updated yet.
+        let agent_space_id = state.mint_agent_space_id();
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::AgentSpaceRecord {
+            agent_space_id,
+            name: input.name,
+            description: input.description,
+            aws_resources: input.aws_resources,
+            target_domain_ids: input.target_domain_ids,
+            code_review_settings: input.code_review_settings,
+            kms_key_id: input.kms_key_id,
+            // Persisted at create time so the tagging operations have state to read;
+            // `tags` is a member of no agent space response, so it is not answered here.
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // The response is projected from the record that was just persisted, so what
+        // the caller is told is exactly what a later read of the store reports.
+        let output = CreateAgentSpaceOutput {
+            agent_space_id: record.agent_space_id.clone(),
+            name: record.name.clone(),
+            description: record.description.clone(),
+            aws_resources: record.aws_resources.clone(),
+            target_domain_ids: record.target_domain_ids.clone(),
+            code_review_settings: record.code_review_settings.clone(),
+            kms_key_id: record.kms_key_id.clone(),
+            created_at: Some(crate::state::timestamp(record.created_at)),
+            updated_at: Some(crate::state::timestamp(record.updated_at)),
+        };
+        state
+            .agent_spaces
+            .insert(record.agent_space_id.clone(), record);
+
+        Ok(output)
     }
 }

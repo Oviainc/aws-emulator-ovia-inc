@@ -25,6 +25,8 @@ mod scalable_target_lifecycle;
 mod scalable_target_resolution;
 #[path = "all/scaling_activities.rs"]
 mod scaling_activities;
+#[path = "all/scheduled_action_deletion.rs"]
+mod scheduled_action_deletion;
 #[path = "all/scheduled_action_lifecycle.rs"]
 mod scheduled_action_lifecycle;
 #[path = "all/scheduled_actions.rs"]

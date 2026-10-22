@@ -35,6 +35,9 @@ mod form_update;
 #[path = "all/metadata_flags.rs"]
 mod metadata_flags;
 
+#[path = "all/resource_error_messages.rs"]
+mod resource_error_messages;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

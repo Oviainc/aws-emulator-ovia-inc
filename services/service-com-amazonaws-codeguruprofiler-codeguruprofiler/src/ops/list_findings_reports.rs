@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFindingsReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFindingsReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFindingsReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a `@readonly` listing of the recommendation (findings) reports RECORDED
+//! against one profiling group, answered from this service's store — the group's own
+//! report records, filtered to the requested time range and (when asked) to daily
+//! reports, in a stable order, paged by this service's own cursor. The emulator runs no
+//! recommendation analysis of profiles, so a group only holds reports that were recorded
+//! against it (`crate::state::ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_findings_report`);
+//! a group with none is reported as the empty list rather than with invented findings.
+//! Nothing here writes: a listing must not change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +171,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFindingsReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFindingsReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFindingsReports"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListFindingsReportsErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // `startTime`/`endTime` are the range to report about, so a range that ends
+        // before it starts names no period at all: the operation's own modelled
+        // `ValidationException` ("The parameter is not valid") refuses it, naming the
+        // members, rather than reporting an empty page for an unanswerable request.
+        if input.start_time.as_secs_f64() > input.end_time.as_secs_f64() {
+            return Err(ListFindingsReportsErrorModeled::ValidationException(
+                ValidationException {
+                    message: "endTime must not be earlier than startTime".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The page token is this service's own opaque cursor: the index into the
+        // group's stable report order at which the next page starts. It satisfies the
+        // modelled `PaginationToken` constraints (len 1..64, `^[\w-]+$`) for any number
+        // of reports.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                ListFindingsReportsErrorModeled::ValidationException(ValidationException {
+                    message: format!("nextToken is not a token this service issued: {token}"),
+                })
+            })?,
+        };
+
+        let guard = state.lock();
+        let Some(group) = guard.groups.get(&input.profiling_group_name) else {
+            return Err(ListFindingsReportsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no profiling group named {}",
+                        input.profiling_group_name
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `dailyReportsOnly` restricts the listing to reports over daily profiles when
+        // it is set; absent (or false) it restricts nothing, so analysis over the
+        // smaller aggregation windows is listed too.
+        let reports = group.findings_reports_in(
+            input.start_time,
+            input.end_time,
+            input.daily_reports_only.unwrap_or(false),
+        );
+
+        // A token that points past the end of the listing is one this service never
+        // issued: it is refused rather than answered with an empty page.
+        if start > reports.len() {
+            return Err(ListFindingsReportsErrorModeled::ValidationException(
+                ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                },
+            )
+            .into());
+        }
+        // Without `maxResults` the page is this service's default size, so one
+        // unparameterised request cannot materialise a response that grows with the
+        // number of stored reports.
+        let limit = input
+            .max_results
+            .map_or(crate::state::DEFAULT_LIST_PAGE_SIZE, |max| {
+                usize::try_from(max).unwrap_or(0)
+            });
+        let end = start.saturating_add(limit).min(reports.len());
+        let page = reports.get(start..end).unwrap_or_default();
+
+        Ok(ListFindingsReportsOutput {
+            // The group name reported is the STORED group's, not the request's.
+            findings_report_summaries: page
+                .iter()
+                .map(|report| report.summary(&group.name))
+                .collect(),
+            next_token: (end < reports.len()).then(|| end.to_string()),
+        })
     }
 }

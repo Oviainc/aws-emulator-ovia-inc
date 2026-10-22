@@ -24,8 +24,7 @@ use crate::ops::types::{
     ClusterTimeline, Configuration, Ec2InstanceAttributes, HadoopStepConfig,
     JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy, MonitoringConfiguration,
     OSRelease, PlacementGroupConfig, PortRange, SimplifiedApplication, Step, StepConfig,
-    StepStatus,
-    StepSummary, StepTimeline, Tag,
+    StepStatus, StepSummary, StepTimeline, SupportedInstanceType, Tag,
 };
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
@@ -1442,6 +1441,351 @@ impl AuditOutcome {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The instance-type catalog
+//
+// The release catalog above ([`RELEASE_LINES`], [`catalog_release`]) says WHICH
+// releases this emulator offers; this one says which Amazon EC2 instance types each of
+// those releases supports. It is service data in the same way: no operation creates,
+// changes or deletes an instance type, so `ListSupportedInstanceTypes` projects the
+// table below and writes nothing. Two emulators built from this source answer the same
+// catalog, and reading it changes nothing.
+// ---------------------------------------------------------------------------
+
+/// `com.amazonaws.emr#SupportedInstanceType$Architecture`: "The CPU architecture, for
+/// example `X86_64` or `AARCH64`."
+pub mod architecture {
+    pub const X86_64: &str = "X86_64";
+    pub const AARCH64: &str = "AARCH64";
+}
+
+/// One family of the instance-type catalog: an EC2 instance family, the sizes it is
+/// offered in, and the facts every size of it shares.
+///
+/// This is how the catalog is DECLARED. An instance type name is `<family>.<size>`,
+/// and within a family vCPUs and memory scale with the size
+/// ([`vcpu_for_size`], [`InstanceFamilySpec::memory_gb_per_vcpu`]), so one row per
+/// family with its published EC2 size ladder states the whole catalog without hiding
+/// a sample behind a hand-picked list of names.
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceFamilySpec {
+    /// The family part of the name, which is also EMR's
+    /// `SupportedInstanceType$InstanceFamilyId` ("The Amazon EC2 family and
+    /// generation"): `m5`, `c6g`, `r7g`.
+    pub family: &'static str,
+    /// The size part of every name in this family: its published EC2 size ladder.
+    pub sizes: &'static [&'static str],
+    /// GiB of memory per vCPU — the constant that makes this family general purpose
+    /// (4), compute optimised (2) or memory optimised (8).
+    pub memory_gb_per_vcpu: f32,
+    /// The `architecture::` value of this family's processors.
+    pub architecture: &'static str,
+    /// Whether EBS optimization is on by default for this family, rather than merely
+    /// available (`SupportedInstanceType$EbsOptimizedByDefault`).
+    pub ebs_optimized_by_default: bool,
+    /// The FIRST release of each major series that supports this family, as a
+    /// `(major, minor, patch)` triple, oldest major first. One entry per major series
+    /// the introduction point differs in: Graviton reached `emr-5.31.0` and
+    /// `emr-6.1.0`, so it carries both, and a family a major series never offered
+    /// simply has no entry for it. See [`InstanceFamilySpec::supported_by`].
+    pub introduced_in: &'static [(u32, u32, u32)],
+}
+
+impl InstanceFamilySpec {
+    /// Whether the release `release` — a `(major, minor, patch)` triple, as
+    /// [`catalog_release`] resolves a label to — supports this family.
+    ///
+    /// Support is carried forward: the first release of a major series that offers a
+    /// family is the point it becomes supported in that series, and every later major
+    /// series keeps it unless it declares a later introduction point of its own.
+    pub fn supported_by(&self, release: (u32, u32, u32)) -> bool {
+        let mut carried = false;
+        for introduced in self.introduced_in {
+            if introduced.0 == release.0 {
+                return release >= *introduced;
+            }
+            if introduced.0 < release.0 {
+                carried = true;
+            }
+        }
+        carried
+    }
+
+    /// This family's rows: one [`SupportedInstanceType`] per size on its ladder,
+    /// smallest first.
+    pub fn instance_types(&self) -> Vec<SupportedInstanceType> {
+        self.sizes
+            .iter()
+            .filter_map(|size| {
+                let scaled = vcpu_for_size(size);
+                // A ladder entry this catalog cannot scale would silently shrink a
+                // release's list, so a typo in the table fails the tests rather than
+                // quietly dropping a row.
+                debug_assert!(
+                    scaled.is_some(),
+                    "catalog size {size:?} of family {} must scale",
+                    self.family
+                );
+                let vcpu = scaled?;
+                Some(SupportedInstanceType {
+                    r#type: Some(format!("{}.{size}", self.family)),
+                    memory_gb: Some(vcpu as f32 * self.memory_gb_per_vcpu),
+                    // "StorageGB represents the storage capacity … This value is 0
+                    // for Amazon EBS-only instance types." Every family in this
+                    // catalog is EBS-only, so is every row.
+                    storage_gb: Some(0),
+                    vcpu: Some(vcpu),
+                    // Every family here runs a 64-bit processor only.
+                    is64_bits_only: Some(true),
+                    instance_family_id: Some(self.family.to_string()),
+                    ebs_optimized_available: Some(true),
+                    ebs_optimized_by_default: Some(self.ebs_optimized_by_default),
+                    // "Number of disks … This value is 0 for Amazon EBS-only
+                    // instance types."
+                    number_of_disks: Some(0),
+                    ebs_storage_only: Some(true),
+                    architecture: Some(self.architecture.to_string()),
+                })
+            })
+            .collect()
+    }
+}
+
+/// GiB of memory per vCPU of a general-purpose (`m`) family.
+const MEMORY_GENERAL_PURPOSE: f32 = 4.0;
+/// GiB of memory per vCPU of a compute-optimised (`c`) family.
+const MEMORY_COMPUTE_OPTIMIZED: f32 = 2.0;
+/// GiB of memory per vCPU of a memory-optimised (`r`) family.
+const MEMORY_MEMORY_OPTIMIZED: f32 = 8.0;
+
+/// The size ladder of the fifth-generation Intel families (`m5`, `r5`) and the AMD
+/// ones (`m5a`, `r5a`).
+const SIZES_5TH_GENERATION: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+];
+/// The `c5` ladder, which steps through `9xlarge` and `18xlarge`.
+const SIZES_C5: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "9xlarge", "12xlarge", "18xlarge", "24xlarge",
+];
+/// The sixth- and seventh-generation Intel ladder (`m6i`, `c6i`, `r6i`), which adds
+/// `32xlarge`.
+const SIZES_6TH_GENERATION_INTEL: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+    "32xlarge",
+];
+/// The sixth-generation AMD ladder (`m6a`, `c6a`, `r6a`), which goes up to `48xlarge`.
+const SIZES_6TH_GENERATION_AMD: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+    "32xlarge", "48xlarge",
+];
+/// The seventh-generation Intel ladder (`m7i`, `c7i`, `r7i`), which steps from
+/// `24xlarge` to `48xlarge`.
+const SIZES_7TH_GENERATION_INTEL: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+    "48xlarge",
+];
+/// The Graviton ladder (`m6g`, `c6g`, `r6g`, `m7g`, `c7g`, `r7g`) from `large` up.
+/// The sub-`large` `medium` size each of these families also comes in is outside this
+/// catalog: EMR runs no cluster node smaller than `large`.
+const SIZES_GRAVITON: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+
+/// The instance families this emulator's EMR catalog publishes, each with the sizes
+/// it is offered in, its memory ratio, its architecture and the release it became
+/// supported in.
+///
+/// SOURCE: the Amazon EMR Management Guide's "Supported instance types" table (which
+/// instance types each release supports) crossed with each family's published EC2
+/// size ladder above. Membership and the introduction points are catalog data, not
+/// modelled facts: the model enumerates no instance type at all. Refresh them from
+/// that page.
+///
+/// What is deliberately OUTSIDE it: instance-store families (`m5d`, `i3`, `d3`, `z1d`
+/// …) and the GPU/accelerator families, because this catalog publishes no per-size
+/// instance-store disk table and would have to invent `StorageGB`/`NumberOfDisks` for
+/// them; burstable (`t`) families and sizes below `large`, which EMR does not run
+/// cluster nodes on; previous-generation families (`m1`…`m4`, `c1`…`c4`, `r3`, `r4`);
+/// and bare-metal sizes.
+pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
+    // General purpose, x86-64.
+    InstanceFamilySpec {
+        family: "m5",
+        sizes: SIZES_5TH_GENERATION,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 13, 0)],
+    },
+    InstanceFamilySpec {
+        family: "m5a",
+        sizes: SIZES_5TH_GENERATION,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 20, 0)],
+    },
+    InstanceFamilySpec {
+        family: "m6i",
+        sizes: SIZES_6TH_GENERATION_INTEL,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 5, 0)],
+    },
+    InstanceFamilySpec {
+        family: "m6a",
+        sizes: SIZES_6TH_GENERATION_AMD,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 6, 0)],
+    },
+    InstanceFamilySpec {
+        family: "m7i",
+        sizes: SIZES_7TH_GENERATION_INTEL,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 15, 0)],
+    },
+    // General purpose, Graviton.
+    InstanceFamilySpec {
+        family: "m6g",
+        sizes: SIZES_GRAVITON,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        architecture: architecture::AARCH64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 31, 0), (6, 1, 0)],
+    },
+    InstanceFamilySpec {
+        family: "m7g",
+        sizes: SIZES_GRAVITON,
+        memory_gb_per_vcpu: MEMORY_GENERAL_PURPOSE,
+        architecture: architecture::AARCH64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 15, 0)],
+    },
+    // Compute optimised.
+    InstanceFamilySpec {
+        family: "c5",
+        sizes: SIZES_C5,
+        memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 13, 0)],
+    },
+    InstanceFamilySpec {
+        family: "c6i",
+        sizes: SIZES_6TH_GENERATION_INTEL,
+        memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 5, 0)],
+    },
+    InstanceFamilySpec {
+        family: "c7i",
+        sizes: SIZES_7TH_GENERATION_INTEL,
+        memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 15, 0)],
+    },
+    InstanceFamilySpec {
+        family: "c6g",
+        sizes: SIZES_GRAVITON,
+        memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        architecture: architecture::AARCH64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 31, 0), (6, 1, 0)],
+    },
+    InstanceFamilySpec {
+        family: "c7g",
+        sizes: SIZES_GRAVITON,
+        memory_gb_per_vcpu: MEMORY_COMPUTE_OPTIMIZED,
+        architecture: architecture::AARCH64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 15, 0)],
+    },
+    // Memory optimised.
+    InstanceFamilySpec {
+        family: "r5",
+        sizes: SIZES_5TH_GENERATION,
+        memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 20, 0)],
+    },
+    InstanceFamilySpec {
+        family: "r6i",
+        sizes: SIZES_6TH_GENERATION_INTEL,
+        memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        architecture: architecture::X86_64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 5, 0)],
+    },
+    InstanceFamilySpec {
+        family: "r6g",
+        sizes: SIZES_GRAVITON,
+        memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        architecture: architecture::AARCH64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(5, 31, 0), (6, 1, 0)],
+    },
+    InstanceFamilySpec {
+        family: "r7g",
+        sizes: SIZES_GRAVITON,
+        memory_gb_per_vcpu: MEMORY_MEMORY_OPTIMIZED,
+        architecture: architecture::AARCH64,
+        ebs_optimized_by_default: true,
+        introduced_in: &[(6, 15, 0)],
+    },
+];
+
+/// The vCPU count of the size `size` on an EC2 size ladder, or `None` for a size this
+/// catalog does not scale (`medium`, `metal`).
+///
+/// EC2 sizes a family in units of two vCPUs: `large` is 2, `xlarge` is 4, and
+/// `<n>xlarge` is `4 × n` — `m5.24xlarge`'s 96 vCPUs, say.
+pub fn vcpu_for_size(size: &str) -> Option<i32> {
+    const VCPU_PER_XLARGE: i32 = 4;
+    match size {
+        "large" => Some(VCPU_PER_XLARGE / 2),
+        "xlarge" => Some(VCPU_PER_XLARGE),
+        _ => {
+            let multiple = size.strip_suffix("xlarge")?;
+            if multiple.is_empty() || !multiple.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            multiple
+                .parse::<i32>()
+                .ok()
+                // A multiple no EC2 ladder reaches is refused rather than wrapped:
+                // the size is not one this catalog can scale.
+                .and_then(|multiple| multiple.checked_mul(VCPU_PER_XLARGE))
+        }
+    }
+}
+
+/// The instance types the release `release` — a `(major, minor, patch)` triple, as
+/// [`catalog_release`] resolves a label to — supports, in catalog order: by family as
+/// [`INSTANCE_FAMILIES`] declares them, and within a family smallest size first.
+pub fn supported_instance_types(release: (u32, u32, u32)) -> Vec<SupportedInstanceType> {
+    INSTANCE_FAMILIES
+        .iter()
+        .filter(|family| family.supported_by(release))
+        .flat_map(InstanceFamilySpec::instance_types)
+        .collect()
+}
+
+/// `ListSupportedInstanceTypes` page size.
+///
+/// CHOSEN, not documented: the operation is paginated on `Marker` but AWS publishes no
+/// page size for it. 100 matches the maximum page the service's other paginated
+/// catalog reader models (`MaxResultsNumber`, `range 1..100`), so a caller that
+/// follows the marker walks the whole catalog in pages of a familiar size.
+pub const LIST_SUPPORTED_INSTANCE_TYPES_PAGE_SIZE: usize = 100;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

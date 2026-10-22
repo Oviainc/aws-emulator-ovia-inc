@@ -176,6 +176,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into())
             }
+            // One statement of a batch is not a query that runs on its own, so
+            // there is no such query to stop: the batch is what a caller
+            // cancels, and it is named here so the caller can.
+            Cancellation::BatchMember(batch_id) => {
+                Err(CancelStatementErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Query {} is one SQL statement of the batch query {batch_id}, which is \
+                         what can be cancelled",
+                        input.id,
+                    )),
+                })
+                .into())
+            }
             Cancellation::Unknown => Err(CancelStatementErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("Query does not exist: {}", input.id),

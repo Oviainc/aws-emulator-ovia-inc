@@ -260,20 +260,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if store.component_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
                 return Err(UpdateComponentErrorModeled::InvalidParameterException(
-                    crate::state::component_wrong_scope(
-                        &input.app_id,
-                        &input.environment_name,
-                        &input.id,
-                    ),
+                    crate::state::item_wrong_scope(),
                 )
                 .into());
             }
             return Err(UpdateComponentErrorModeled::ResourceNotFoundException(
-                crate::state::component_not_found(
-                    &input.app_id,
-                    &input.environment_name,
-                    &input.id,
-                ),
+                crate::state::item_not_found(),
             )
             .into());
         }
@@ -290,11 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .is_some_and(|holder| holder.id != input.id)
             {
                 return Err(UpdateComponentErrorModeled::ResourceConflictException(
-                    crate::state::duplicate_component_name(
-                        &input.app_id,
-                        &input.environment_name,
-                        name,
-                    ),
+                    crate::state::duplicate_item_name(),
                 )
                 .into());
             }
@@ -305,11 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // Unreachable: the lookup above found this id under the same lock.
             return Err(UpdateComponentErrorModeled::ResourceNotFoundException(
-                crate::state::component_not_found(
-                    &input.app_id,
-                    &input.environment_name,
-                    &input.id,
-                ),
+                crate::state::item_not_found(),
             )
             .into());
         };
