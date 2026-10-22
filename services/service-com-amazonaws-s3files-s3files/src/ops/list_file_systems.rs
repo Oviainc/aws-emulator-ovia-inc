@@ -161,7 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let page = crate::state::page_of(ordered, after, input.max_results);
+        let page = crate::state::page_of(
+            ordered,
+            after,
+            input.max_results,
+            crate::state::MAX_RESULTS_LIMIT,
+        );
         Ok(ListFileSystemsOutput {
             next_token: page.next_token,
             file_systems: page.items,
