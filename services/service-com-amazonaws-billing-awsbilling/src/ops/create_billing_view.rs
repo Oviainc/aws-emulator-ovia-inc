@@ -268,6 +268,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .map(|tag| (tag.key, tag.value.unwrap_or_default()))
                 .collect(),
+            // No operation in this service's model attaches a resource-based
+            // policy, so a new view carries none: see `BillingView::resource_policy`.
+            resource_policy: None,
         };
         state.billing_views.insert(arn.clone(), view);
         if let Some(token) = client_token {

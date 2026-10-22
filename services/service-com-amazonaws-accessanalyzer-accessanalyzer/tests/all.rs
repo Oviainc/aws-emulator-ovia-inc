@@ -23,6 +23,8 @@ mod check_no_public_access;
 mod error_payloads;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/modeled_rejections.rs"]
+mod modeled_rejections;
 #[path = "all/modelled_wire_shape.rs"]
 mod modelled_wire_shape;
 #[path = "all/policy_access_check.rs"]

@@ -150,70 +150,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::StoreUnavailable);
             UpdateAnalyzerErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
-        let mut state = state.lock();
 
-        // The analyzer has to exist: this operation modifies one, it never creates one.
-        // Fixed text, the name the caller asked for in the modelled `resourceId`: every
-        // resource-scoped refusal in this service goes through `crate::state`'s
-        // constructors.
-        let analyzer = state.analyzers.get_mut(&input.analyzer_name).ok_or_else(|| {
-            UpdateAnalyzerErrorModeled::ResourceNotFoundException(
-                crate::state::analyzer_not_found(&input.analyzer_name),
-            )
-        })?;
+        // What the update did (or why it was refused) is decided while the store guard is
+        // held: the write and the refusals are inside the block below, and the success
+        // path records the call after the guard is released. A refusal records it while
+        // the guard is still held — it returns from inside the block — which costs one
+        // log line's worth of lock time and keeps the refusal attributable.
+        let outcome = {
+            let mut state = state.lock();
 
-        // "This action is not supported for external access analyzers" — an `ACCOUNT` or
-        // `ORGANIZATION` analyzer has no `AnalyzerConfiguration` to modify, so the
-        // request is refused rather than silently storing one. The refusal is about the
-        // analyzer the path names rather than about one malformed member, so it carries
-        // no `fieldList` — and its reason is the field-validation discriminator AWS
-        // answers with, not the modelled `notSupported`; see
-        // [`crate::state::unsupported_action_exception`].
-        let configured_access = analyzer.configured_access().ok_or_else(|| {
-            UpdateAnalyzerErrorModeled::ValidationException(crate::state::unsupported_action_exception(
-                format!(
-                    "UpdateAnalyzer is not supported for an analyzer of type {}",
-                    analyzer.r#type
-                ),
-            ))
-        })?;
-
-        if let Some(configuration) = input.configuration {
-            // An analyzer configures exactly ONE union member — the one its `type`
-            // names — so a configuration for the other family cannot be stored on it.
-            if !configured_access.matches(&configuration) {
-                return Err(UpdateAnalyzerErrorModeled::ValidationException(
-                    crate::state::field_validation_exception(
-                        "configuration",
-                        format!(
-                            "an analyzer of type {} is configured by `{}`, so `configuration` must carry that member",
-                            analyzer.r#type,
-                            configured_access.member_name()
-                        ),
-                    ),
+            // The analyzer has to exist: this operation modifies one, it never creates
+            // one. Fixed text, the name the caller asked for in the modelled
+            // `resourceId`: every resource-scoped refusal in this service goes through
+            // `crate::state`'s constructors.
+            let Some(analyzer) = state.analyzers.get_mut(&input.analyzer_name) else {
+                crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
+                return Err(UpdateAnalyzerErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_name),
                 )
                 .into());
-            }
+            };
 
-            // Bounds the model documents but does not express as constraints, so the
-            // boundary validator let them through; shared with `CreateAnalyzer`.
-            crate::state::validate_configuration(&configuration)
-                .map_err(UpdateAnalyzerErrorModeled::ValidationException)?;
+            // "This action is not supported for external access analyzers" — an `ACCOUNT`
+            // or `ORGANIZATION` analyzer has no `AnalyzerConfiguration` to modify, so the
+            // request is refused rather than silently storing one. The refusal is about
+            // the analyzer the path names rather than about one malformed member, so it
+            // carries no `fieldList` — and its reason is the field-validation
+            // discriminator AWS answers with, not the modelled `notSupported`; see
+            // [`crate::state::unsupported_action_exception`].
+            let Some(configured_access) = analyzer.configured_access() else {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                );
+                return Err(UpdateAnalyzerErrorModeled::ValidationException(
+                    crate::state::unsupported_action_exception(format!(
+                        "UpdateAnalyzer is not supported for an analyzer of type {}",
+                        analyzer.r#type
+                    )),
+                )
+                .into());
+            };
 
-            // The configuration is REPLACED, not merged: the union holds one member and
-            // the request carries the whole of it.
-            analyzer.configuration = Some(configuration);
-        }
+            let recorded = match input.configuration {
+                Some(configuration) => {
+                    // An analyzer configures exactly ONE union member — the one its
+                    // `type` names — so a configuration for the other family cannot be
+                    // stored on it.
+                    if !configured_access.matches(&configuration) {
+                        crate::state::audit(
+                            Self::NAME,
+                            ctx,
+                            crate::state::AuditOutcome::ValidationRefused,
+                        );
+                        return Err(UpdateAnalyzerErrorModeled::ValidationException(
+                            crate::state::field_validation_exception(
+                                "configuration",
+                                format!(
+                                    "an analyzer of type {} is configured by `{}`, so `configuration` must carry that member",
+                                    analyzer.r#type,
+                                    configured_access.member_name()
+                                ),
+                            ),
+                        )
+                        .into());
+                    }
 
-        // A request carrying no `configuration` asks for no change, so the stored
-        // configuration stands — and either way the response is what is now stored,
-        // which is what a later `GetAnalyzer` reports.
-        Ok(UpdateAnalyzerOutput {
-            configuration: analyzer.configuration.clone(),
-        })
+                    // Bounds the model documents but does not express as constraints, so
+                    // the boundary validator let them through; shared with
+                    // `CreateAnalyzer`.
+                    if let Err(refusal) = crate::state::validate_configuration(&configuration) {
+                        crate::state::audit(
+                            Self::NAME,
+                            ctx,
+                            crate::state::AuditOutcome::ValidationRefused,
+                        );
+                        return Err(
+                            UpdateAnalyzerErrorModeled::ValidationException(refusal).into()
+                        );
+                    }
+
+                    // The configuration is REPLACED, not merged: the union holds one
+                    // member and the request carries the whole of it.
+                    analyzer.configuration = Some(configuration);
+                    crate::state::AuditOutcome::AnalyzerUpdated
+                }
+                // A request carrying no `configuration` asks for no change, so the stored
+                // configuration stands.
+                None => crate::state::AuditOutcome::NoChange,
+            };
+            (recorded, analyzer.configuration.clone())
+        };
+        let (recorded, configuration) = outcome;
+
+        crate::state::audit(Self::NAME, ctx, recorded);
+        // Either way the response is what is now stored, which is what a later
+        // `GetAnalyzer` reports.
+        Ok(UpdateAnalyzerOutput { configuration })
     }
 }

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCanary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCanary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCanary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one canary back out of this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +64,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::STORE_UNAVAILABLE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -84,10 +79,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-synthetics-synthetics.j
 // here — hence the `GetCanaryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.synthetics#GetCanary")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.synthetics#GetCanary",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetCanaryErrorModeled {
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
 
@@ -142,18 +141,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCanary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCanaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCanary"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCanaryError::from(GetCanaryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(STORE_UNAVAILABLE.to_string()),
+                },
+            ))
+        })?;
+
+        if input.dry_run_id.is_some() {
+            // A dry run is a canary execution, which this emulator cannot perform, so
+            // there is no dry-run snapshot of the canary to report.
+            return Err(GetCanaryErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "DryRunId is not supported: this emulator does not execute canary dry runs"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+        // Materialise only what the clock already owed at this instant (a canary that
+        // finished provisioning, a run whose outcome came due); reading changes nothing
+        // else about what a later caller sees.
+        guard.settle(SystemTime::now());
+        let canary = guard
+            .canaries
+            .get(&input.name)
+            .ok_or_else(|| {
+                GetCanaryError::from(GetCanaryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Canary {} not found", input.name)),
+                    },
+                ))
+            })?
+            .to_canary();
+        Ok(GetCanaryOutput {
+            canary: Some(canary),
+        })
     }
 }

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceLinkedAnalyzer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceLinkedAnalyzer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceLinkedAnalyzer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The authorization gate of a service-principal-only operation: the model's own doc
+//! records that this operation "can only be invoked by authorized Amazon Web Services
+//! services" and that "Direct customer invocation returns AccessDeniedException", so a
+//! call made with a caller's own credentials is refused with the modelled
+//! `AccessDeniedException` (HTTP 403) and NO analyzer is created.
+//!
+//! Every request this emulator serves is signed with a caller's own SigV4 access key
+//! (see [`crate::state::caller_identity_arn`]) — an IAM identity of the emulator's
+//! account, never an Amazon Web Services service principal, because the emulator vends
+//! no service-principal credentials and no emulated service manages analyzers. So every
+//! call that can reach this handler is a direct customer invocation, which is exactly
+//! the case the operation answers with `AccessDeniedException`; the refusal is the
+//! operation's documented behaviour for this caller class, not a scaffold 501, and it
+//! writes nothing. The service-linked analyzers an authorized service would own are
+//! therefore never minted here, which is also why
+//! [`crate::state::Analyzer::summary`] reports no `managedBy`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +169,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceLinkedAnalyzer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceLinkedAnalyzerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceLinkedAnalyzer"))
+        // Nothing about the request can authorize it: the gate is on WHO called, and the
+        // request body is read only to say so (the input is not stored, and no analyzer
+        // is created, whatever `type`, `configuration` or `archiveRules` it carried).
+        let _ = (&input, &self.engine);
+        // Name the caller that was refused, taken from the request's own SigV4 identity
+        // rather than invented, so a client can see WHICH principal the service declined.
+        // The identity is reduced to the characters an access key id can hold before it
+        // is rendered, so no caller-controlled text reaches the message unbounded.
+        let caller = crate::state::caller_identity_arn(ctx.parts());
+        // The denial is attributable: who was refused, on what target, is recorded.
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::AccessDenied);
+        Err(
+            CreateServiceLinkedAnalyzerErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: format!(
+                    "{caller} is not an authorized Amazon Web Services service principal: \
+                     CreateServiceLinkedAnalyzer can only be invoked by the service that \
+                     manages the analyzer, and a direct invocation by a customer is denied"
+                ),
+            })
+            .into(),
+        )
     }
 }

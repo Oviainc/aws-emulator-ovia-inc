@@ -30,11 +30,14 @@ const REGION: &str = "eu-west-1";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One response, reduced to what a client branches on.
-struct Reply {
-    status: u16,
+///
+/// `pub(crate)` so the suites beside this one (`device_capabilities`) drive the
+/// service through the same harness rather than standing up a second one.
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The wire error code (`x-amzn-errortype`, else the body's `__type`), if any.
-    error: Option<String>,
-    body: Value,
+    pub(crate) error: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -49,7 +52,7 @@ impl Reply {
 }
 
 /// A Braket emulator behind the production router.
-struct Braket {
+pub(crate) struct Braket {
     router: MultiServiceRouter,
     /// The one shared engine the service was built over. Held so a test can SEED the
     /// store (never to assert through it: every assertion goes over HTTP).
@@ -57,7 +60,7 @@ struct Braket {
 }
 
 impl Braket {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(service_com_amazonaws_braket_braket::EmulatedService::new(
@@ -115,7 +118,7 @@ impl Braket {
         self.call("POST", "/devices", Some(body)).await
     }
 
-    async fn get_device(&self, device_arn: &str) -> Reply {
+    pub(crate) async fn get_device(&self, device_arn: &str) -> Reply {
         self.call("GET", &format!("/device/{}", encode(device_arn)), None)
             .await
     }
@@ -155,7 +158,7 @@ impl Braket {
     }
 
     /// The whole seeded inventory, as `SearchDevices` with no filter returns it.
-    async fn inventory(&self) -> Vec<Value> {
+    pub(crate) async fn inventory(&self) -> Vec<Value> {
         let reply = self
             .search_devices(json!({ "filters": [], "maxResults": 100 }))
             .await;
@@ -205,7 +208,7 @@ fn encode(value: &str) -> String {
 }
 
 /// The named string member of a JSON object.
-fn member<'v>(value: &'v Value, name: &str) -> &'v str {
+pub(crate) fn member<'v>(value: &'v Value, name: &str) -> &'v str {
     value
         .get(name)
         .and_then(Value::as_str)

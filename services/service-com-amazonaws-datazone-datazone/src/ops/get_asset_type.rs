@@ -189,14 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .live_domain(&input.domain_identifier)
             .ok_or_else(|| {
                 GetAssetTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Domain {} was not found", input.domain_identifier),
+                    message: crate::state::ResourceKind::Domain.not_found_message(),
                 })
             })?
             .asset_types
             .get(&input.identifier)
             .ok_or_else(|| {
                 GetAssetTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Asset type {} was not found", input.identifier),
+                    message: crate::state::ResourceKind::AssetType.not_found_message(),
                 })
             })?;
         // `revision` selects WHICH revision to report; the only one stored is the one the
@@ -205,10 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if requested != asset_type.revision {
                 return Err(GetAssetTypeErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Asset type {} revision {requested} was not found",
-                            input.identifier
-                        ),
+                        // Both misses collapse to the one kind-only message: it names
+                        // the resource kind and never a value the request supplied,
+                        // the requested revision included.
+                        message: crate::state::ResourceKind::AssetType.not_found_message(),
                     },
                 )
                 .into());
