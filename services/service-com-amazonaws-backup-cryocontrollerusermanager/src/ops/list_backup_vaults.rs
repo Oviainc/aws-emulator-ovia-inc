@@ -156,6 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A page size outside the model's `@range` is this service's own
+        // `InvalidParameterValueException`, answered before anything is read so
+        // the body is the modelled shape carrying `Code` and `Message`.
+        if let Some(refusal) = crate::state::rejected_max_results(input.max_results) {
+            return Err(
+                ListBackupVaultsErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListBackupVaultsErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the backup vault store is unavailable".to_string()),
@@ -205,10 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 position
             }
         };
-        // No `MaxResults` means one page: the model's own maximum. The model's
-        // `@range(1..1000)` is refused by the framework before this handler
-        // runs; the clamp keeps the page size inside that range even so, because
-        // a zero page size would vend a cursor that never advances.
+        // No `MaxResults` means one page: the model's own maximum. A page size
+        // the model's `@range(1..1000)` refuses was answered above, so the
+        // clamp here only applies the default.
         let page_size = input
             .max_results
             .and_then(|max| usize::try_from(max).ok())
