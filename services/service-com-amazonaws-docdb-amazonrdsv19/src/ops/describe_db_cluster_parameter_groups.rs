@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterParameterGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterParameterGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the cluster parameter groups that exist — today the
+//! default group of each engine-version family, which AWS provides in every account and
+//! Region without a create (`crate::state::default_parameter_groups`) — or the one
+//! `DBClusterParameterGroupName` names, which is the modelled 404 when there is no such
+//! group. A caller-created group will come from `CreateDBClusterParameterGroup`, which is
+//! still scaffolded; when it lands, its stored records are read here beside the defaults.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterParameterGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +150,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterParameterGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterParameterGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterParameterGroups"))
+        use crate::state as docdb;
+
+        let _ = &self.engine;
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `Filters`: "This parameter is not currently supported", so a request that carries
+        // one is refused rather than served as though the filter had been applied.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters is not currently supported by DescribeDBClusterParameterGroups",
+            ));
+        }
+
+        // The groups sit in the region the caller signed for, which is where their ARNs are.
+        let region = docdb::request_region(ctx);
+        let groups = docdb::default_parameter_groups(&region);
+
+        // "If a DBClusterParameterGroupName parameter is specified, the list contains only
+        // the description of the specified cluster parameter group" — and "If provided, must
+        // match the name of an existing DBClusterParameterGroup", so a name that matches
+        // none is the modelled 404 rather than an empty page.
+        let selected: Vec<DBClusterParameterGroup> = match &input.db_cluster_parameter_group_name
+        {
+            Some(requested) => {
+                let Some(group) = docdb::resolve_parameter_group(requested, &region) else {
+                    return Err(
+                        DescribeDBClusterParameterGroupsErrorModeled::DBParameterGroupNotFoundFault(
+                            DBParameterGroupNotFoundFault {
+                                message: Some(format!(
+                                    "DBClusterParameterGroup not found: {requested}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                vec![group]
+            }
+            None => groups,
+        };
+
+        // One ordered page, by the same marker rule every describe here uses: the keys are
+        // the group names, which are unique and stable.
+        let names: Vec<String> = selected
+            .iter()
+            .filter_map(|group| group.db_cluster_parameter_group_name.clone())
+            .collect();
+        let (page, marker) = docdb::paginate(&names, input.marker.as_deref(), page_size);
+        let db_cluster_parameter_groups = selected
+            .into_iter()
+            .filter(|group| {
+                group
+                    .db_cluster_parameter_group_name
+                    .as_ref()
+                    .is_some_and(|name| page.contains(name))
+            })
+            .collect();
+
+        Ok(DescribeDBClusterParameterGroupsOutput {
+            marker,
+            db_cluster_parameter_groups: Some(db_cluster_parameter_groups),
+        })
     }
 }
