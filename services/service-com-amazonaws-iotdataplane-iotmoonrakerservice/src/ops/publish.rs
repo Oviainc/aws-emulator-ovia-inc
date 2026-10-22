@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Publish
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Publish`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Publish::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes an MQTT message. The emulator has no MQTT subscribers, so a plain
+//! publish is accepted and leaves no trace — exactly what a broker does for a topic
+//! nobody is subscribed to. A publish with `retain=true` IS persistent state: it
+//! stores the message as the topic's retained message, and an empty retained payload
+//! clears it, which is how MQTT deletes a retained message.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +193,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Publish` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Publish"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PublishErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the retained-message store is unavailable".to_string()),
+            })
+        })?;
+
+        // MQTT forbids the single-level (`+`) and multi-level (`#`) wildcards in a
+        // PUBLISH topic: they are subscription syntax.
+        if let Some(wildcard) = input.topic.chars().find(|c| *c == '+' || *c == '#') {
+            return Err(PublishErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(format!(
+                    "the topic '{}' contains the MQTT wildcard '{wildcard}', which a publish \
+                     topic may not use",
+                    input.topic
+                )),
+            })
+            .into());
+        }
+
+        let payload = input.payload.unwrap_or_default();
+        if payload.len() > crate::state::MAX_PUBLISH_PAYLOAD_BYTES {
+            return Err(PublishErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(format!(
+                    "the payload is {} bytes; the maximum message payload size is {} bytes",
+                    payload.len(),
+                    crate::state::MAX_PUBLISH_PAYLOAD_BYTES
+                )),
+            })
+            .into());
+        }
+
+        if input.retain {
+            let mut guard = state.lock();
+            if payload.is_empty() {
+                // A retained publish with an empty payload is how MQTT clears a
+                // topic's retained message.
+                guard.retained_messages.remove(&input.topic);
+            } else {
+                if !guard.retained_messages.contains_key(&input.topic)
+                    && guard.retained_messages.len() >= crate::state::MAX_RETAINED_TOPICS
+                {
+                    return Err(PublishErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "this emulator retains messages for at most {} topics; clear a \
+                                 retained message before retaining another",
+                                crate::state::MAX_RETAINED_TOPICS
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                guard.retained_messages.insert(
+                    input.topic.clone(),
+                    crate::state::RetainedMessage {
+                        topic: input.topic.clone(),
+                        payload,
+                        qos: input.qos,
+                        last_modified_time_millis: crate::state::now_millis(),
+                        user_properties: input
+                            .user_properties
+                            .as_ref()
+                            .map(|properties| properties.as_bytes().to_vec()),
+                    },
+                );
+            }
+        }
+
+        Ok(PublishOutput)
     }
 }
