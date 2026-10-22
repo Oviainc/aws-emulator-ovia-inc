@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/data_lake_and_subscriber_lifecycle.rs"]
 mod data_lake_and_subscriber_lifecycle;
+#[path = "all/front_door_authorization.rs"]
+mod front_door_authorization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscriber_calls_require_enablement.rs"]
