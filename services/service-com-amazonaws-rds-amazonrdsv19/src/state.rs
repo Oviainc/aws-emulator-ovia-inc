@@ -31,8 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    DBInstance, DBParameterGroupStatus, DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint,
-    OptionGroup, Tag, VpcSecurityGroupMembership,
+    Certificate, DBInstance, DBParameterGroupStatus, DBSnapshot, DBSubnetGroup, DomainMembership,
+    Endpoint, EventCategoriesMap, OptionGroup, Tag, VpcSecurityGroupMembership,
 };
 
 /// How long after the call that starts it a status transition this service owes
@@ -855,3 +855,206 @@ pub fn paginate<T>(
         .collect();
     Page { items, next_marker }
 }
+
+// ---------------------------------------------------------------------------
+// The reference catalogs this front door reports
+//
+// `DescribeCertificates` and `DescribeEventCategories` report what the service
+// PUBLISHES rather than what a caller created, so their source is a catalog rather than
+// the store above. Each catalog below names where its values come from, and every
+// handler projects them through one of the `to_wire` functions here, so no two handlers
+// can disagree about a CA certificate or an event category. (The DB engine version
+// catalogue is the same kind of reference data and lives in
+// `crate::ops::describe_db_engine_versions`, which owns it and lends it to
+// `DescribeOrderableDBInstanceOptions`.)
+//
+// This front door serves the RDS, Amazon DocumentDB and Amazon Neptune control planes —
+// the three models that share its endpoint prefix, signing name, protocol and API
+// version (see `src/service.rs`) — so the catalogs cover all three, as AWS's own `rds`
+// endpoint does.
+// ---------------------------------------------------------------------------
+
+/// One CA certificate the service publishes for a DB instance's TLS endpoint.
+///
+/// Source: the certificate authorities Amazon RDS publishes in "Using SSL/TLS to
+/// encrypt a connection to a DB instance" (Amazon RDS User Guide) and reports through
+/// `DescribeCertificates`. AWS publishes a validity DATE for each, not a time of day, so
+/// the instants below are that date at midnight UTC. `Thumbprint` is deliberately absent
+/// rather than invented: it is the fingerprint of a certificate this emulator does not
+/// hold.
+#[derive(Debug, Clone, Copy)]
+pub struct CaCertificate {
+    /// `Certificate$CertificateIdentifier` — "The unique key that identifies a
+    /// certificate."
+    pub identifier: &'static str,
+    /// `Certificate$CertificateType` — the type AWS reports for every published CA.
+    pub certificate_type: &'static str,
+    /// `Certificate$ValidFrom`, as an ISO-8601 instant.
+    pub valid_from: &'static str,
+    /// `Certificate$ValidTill`, as an ISO-8601 instant.
+    pub valid_till: &'static str,
+}
+
+impl CaCertificate {
+    /// This catalog entry as the modelled `Certificate`, with the ARN scoped to the
+    /// region the request was signed for.
+    pub fn to_wire(&self, region: &str) -> Certificate {
+        Certificate {
+            certificate_identifier: Some(self.identifier.to_string()),
+            certificate_type: Some(self.certificate_type.to_string()),
+            thumbprint: None,
+            valid_from: catalog_instant(self.valid_from),
+            valid_till: catalog_instant(self.valid_till),
+            certificate_arn: Some(emulator_server::emulator_arn(
+                ARN_NAMESPACE,
+                region,
+                &format!("cert:{}", self.identifier),
+            )),
+            // No account-level override is set: this emulator has no
+            // `ModifyCertificates` call behind it, so the default is the published one.
+            customer_override: Some(false),
+            customer_override_valid_till: None,
+        }
+    }
+}
+
+/// Every CA certificate `DescribeCertificates` reports. See [`CaCertificate`] for the
+/// source; the expired `rds-ca-2019` is included because AWS still reports it.
+pub const CA_CERTIFICATES: &[CaCertificate] = &[
+    CaCertificate {
+        identifier: "rds-ca-2019",
+        certificate_type: "CA",
+        valid_from: "2019-08-22T00:00:00Z",
+        valid_till: "2024-08-22T00:00:00Z",
+    },
+    CaCertificate {
+        identifier: "rds-ca-ecc384-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-25T00:00:00Z",
+        valid_till: "2121-05-25T00:00:00Z",
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa2048-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-25T00:00:00Z",
+        valid_till: "2061-05-25T00:00:00Z",
+    },
+    CaCertificate {
+        identifier: "rds-ca-rsa4096-g1",
+        certificate_type: "CA",
+        valid_from: "2021-05-25T00:00:00Z",
+        valid_till: "2121-05-25T00:00:00Z",
+    },
+];
+
+/// The certificate a DB instance created without one gets:
+/// `CertificateMessage$DefaultCertificateForNewLaunches` — "The default root CA for new
+/// DB instances", which Amazon RDS publishes as `rds-ca-rsa2048-g1`.
+pub const DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES: &str = "rds-ca-rsa2048-g1";
+
+/// One of the catalogs' fixed ISO-8601 instants as the modelled timestamp shapes carry
+/// it.
+///
+/// The input is a literal in this file, never caller data, so a value that is not an
+/// instant is a typo in the catalog above: it panics at the first read rather than
+/// silently dropping `ValidFrom`/`ValidTill` from the response.
+fn catalog_instant(iso: &str) -> Option<::aws_smithy_types::DateTime> {
+    Some(
+        ::aws_smithy_types::DateTime::from_str(iso, ::aws_smithy_types::date_time::Format::DateTime)
+            .expect("every catalog instant in this file is an ISO-8601 literal"),
+    )
+}
+
+/// The event source types and their categories, as `DescribeEventCategories` reports
+/// them.
+///
+/// The source types are the valid values documented on
+/// `DescribeEventCategoriesMessage$SourceType` ("`db-instance` | `db-cluster` |
+/// `db-parameter-group` | `db-security-group` | `db-snapshot` | `db-cluster-snapshot` |
+/// `db-proxy`"), in that order; the categories of each are the ones published in "Amazon
+/// RDS event categories and event messages" (Amazon RDS User Guide).
+///
+/// The model's `SourceType` enum (`smithy_query(query="shape",shape="SourceType")`)
+/// carries four further values — `custom-engine-version`, `blue-green-deployment`,
+/// `db-shard-group` and `zero-etl` — which this member's own documentation does not list
+/// and whose published categories this emulator does not have. It publishes no map for
+/// them rather than an invented one, and a request naming one is refused with the code a
+/// value this parameter does not accept gets, naming the set it is not in.
+pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
+    (
+        "db-instance",
+        &[
+            "availability",
+            "backup",
+            "configuration change",
+            "creation",
+            "deletion",
+            "failover",
+            "failure",
+            "low storage",
+            "maintenance",
+            "notification",
+            "read replica",
+            "recovery",
+            "restoration",
+            "security patching",
+        ],
+    ),
+    (
+        "db-cluster",
+        &[
+            "configuration change",
+            "creation",
+            "deletion",
+            "failover",
+            "failure",
+            "global-failover",
+            "maintenance",
+            "notification",
+        ],
+    ),
+    ("db-parameter-group", &["configuration change"]),
+    ("db-security-group", &["configuration change", "failure"]),
+    (
+        "db-snapshot",
+        &["creation", "deletion", "notification", "restoration"],
+    ),
+    ("db-cluster-snapshot", &["backup"]),
+    (
+        "db-proxy",
+        &["configuration change", "creation", "deletion", "failure"],
+    ),
+];
+
+/// The event categories of `source_type`, or `None` when it names no published source
+/// type. Matching is exact: the documented values are all lowercase.
+pub fn event_categories_of(source_type: &str) -> Option<&'static [&'static str]> {
+    EVENT_CATEGORIES
+        .iter()
+        .find(|(published, _)| *published == source_type)
+        .map(|(_, categories)| *categories)
+}
+
+/// The published event source types, comma-separated — what a refusal names as the set a
+/// rejected `SourceType` is not in.
+pub fn event_source_types() -> String {
+    EVENT_CATEGORIES
+        .iter()
+        .map(|(source_type, _)| *source_type)
+        .collect::<Vec<&str>>()
+        .join(", ")
+}
+
+/// One source type's categories as the modelled `EventCategoriesMap`.
+pub fn event_categories_to_wire(source_type: &str, categories: &[&str]) -> EventCategoriesMap {
+    EventCategoriesMap {
+        source_type: Some(source_type.to_string()),
+        event_categories: Some(
+            categories
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
+        ),
+    }
+}
+

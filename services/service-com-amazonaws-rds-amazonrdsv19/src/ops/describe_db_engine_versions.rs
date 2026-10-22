@@ -196,6 +196,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })
             .collect();
+        // `DefaultOnly` reports "only the default version of the specified engine or the
+        // engine and major version combination" — so there has to BE a specified engine
+        // whose default to report, and this service has to publish a default for it. A
+        // request that names no engine at all, or one this service publishes no default
+        // version for, resolves to no default: it is refused as the parameter
+        // combination it is, rather than answered with an arbitrary version or with an
+        // empty list that would read as "this engine has no default".
+        if input.default_only == Some(true) {
+            let engine_named = input.engine.is_some()
+                || input.db_parameter_group_family.is_some()
+                || filters.iter().any(|filter| {
+                    matches!(filter.name.as_str(), "engine" | "db-parameter-group-family")
+                });
+            if !engine_named || matching.is_empty() {
+                return Err(
+                    DescribeDBEngineVersionsError::invalid_parameter_combination(format!(
+                        "RDS can't find a default engine version for {}",
+                        requested_engine(&input, &filters)
+                    )),
+                );
+            }
+        }
         // `paginate` resumes at the first key at or past the `Marker`, so the report is
         // cut from ONE total order over `(Engine, EngineVersion)`: a page boundary
         // cannot drift between calls.
@@ -238,6 +260,33 @@ fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
 /// An engine version that can be ordered. The `status` filter's member documents
 /// exactly two valid statuses, "`available`" and "`deprecated`".
 pub(crate) const STATUS_AVAILABLE: &str = "available";
+
+/// How the request named the engine whose DEFAULT version it asked for — what the
+/// refusal of an unresolvable `DefaultOnly` request quotes back, so the caller can see
+/// which combination resolved to no default version.
+fn requested_engine(input: &DescribeDBEngineVersionsInput, filters: &[Filter]) -> String {
+    let mut named: Vec<String> = Vec::new();
+    if let Some(engine) = &input.engine {
+        named.push(format!("Engine={engine}"));
+    }
+    if let Some(version) = &input.engine_version {
+        named.push(format!("EngineVersion={version}"));
+    }
+    if let Some(family) = &input.db_parameter_group_family {
+        named.push(format!("DBParameterGroupFamily={family}"));
+    }
+    for filter in filters {
+        named.push(format!(
+            "Filters[{}]={}",
+            filter.name,
+            filter.values.join(",")
+        ));
+    }
+    if named.is_empty() {
+        return "a request naming no engine".to_string();
+    }
+    named.join(", ")
+}
 
 /// An engine version AWS no longer offers for a new instance. `IncludeAll` is what asks
 /// for these: "Specifies whether to also list the engine versions that aren't available.
@@ -341,6 +390,10 @@ const SQLSERVER_LOG_TYPES: &[&str] = &["agent", "error"];
 /// The log types a Db2 engine can export to CloudWatch Logs.
 const DB2_LOG_TYPES: &[&str] = &["diag.log", "notify.log"];
 
+/// The log types an Amazon DocumentDB engine can export to CloudWatch Logs
+/// (`EnableCloudwatchLogsExports` in the DocumentDB model: the audit and profiler logs).
+const DOCDB_LOG_TYPES: &[&str] = &["audit", "profiler"];
+
 /// Every DB engine this service reports versions for.
 ///
 /// The engine names are exactly the `Engine` member's published "Valid Values"
@@ -353,6 +406,14 @@ const DB2_LOG_TYPES: &[&str] = &["diag.log", "notify.log"];
 /// Babelfish support, exportable log types, character sets and time zones) are this
 /// emulator's published reference data for those engines, as the RDS engine feature
 /// matrix states them. They are the same for every caller and no request changes them.
+///
+/// `docdb` and `neptune` are here as well, and they are NOT values this model's `Engine`
+/// member lists: this Query front door also serves the Amazon DocumentDB and Amazon
+/// Neptune control planes (`src/service.rs` — all three models publish this endpoint
+/// prefix, signing name, protocol and API version), and `aws docdb
+/// describe-db-engine-versions` is this same action on this same endpoint. Their engine
+/// names are the valid values documented on `CreateDBClusterMessage$Engine` in those two
+/// models (`docdb`: "Valid values: docdb"; `neptune`: "Valid values: neptune").
 pub(crate) const ENGINES: &[EngineFacts] = &[
     EngineFacts {
         engine: "aurora-mysql",
@@ -420,6 +481,22 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         timezones: &[],
     },
     EngineFacts {
+        engine: "docdb",
+        product: "Amazon DocumentDB",
+        description: "Amazon DocumentDB (with MongoDB compatibility)",
+        // A DocumentDB instance is a cluster member, provisioned like an Aurora one;
+        // the engine publishes no serverless mode of its own.
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        // A DocumentDB global cluster, which `CreateGlobalCluster` creates in that model.
+        supports_global_databases: true,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: DOCDB_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
         engine: "mariadb",
         product: "MariaDB",
         description: "MariaDB Community Edition",
@@ -442,6 +519,20 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         supports_parallel_query: false,
         supports_babelfish: false,
         exportable_log_types: MYSQL_LOG_TYPES,
+        character_sets: &[],
+        timezones: &[],
+    },
+    EngineFacts {
+        engine: "neptune",
+        product: "Amazon Neptune",
+        description: "Amazon Neptune",
+        engine_modes: PROVISIONED_ONLY,
+        supports_read_replica: true,
+        // A Neptune global database, which `CreateGlobalCluster` creates in that model.
+        supports_global_databases: true,
+        supports_parallel_query: false,
+        supports_babelfish: false,
+        exportable_log_types: &["audit"],
         character_sets: &[],
         timezones: &[],
     },
@@ -682,6 +773,34 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
     ),
+    // The Amazon DocumentDB engine versions this front door publishes: 3.6, 4.0 and
+    // 5.0 are DocumentDB's major versions, and 5.0 is the one a cluster created without
+    // an `EngineVersion` gets (`CreateDBClusterMessage$EngineVersion` in that model: "The
+    // --engine-version will default to the latest major engine version").
+    row(
+        "docdb",
+        "3.6.0",
+        "3.6",
+        "docdb3.6",
+        STATUS_DEPRECATED,
+        DefaultLevel::Major,
+    ),
+    row(
+        "docdb",
+        "4.0.0",
+        "4.0",
+        "docdb4.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "docdb",
+        "5.0.0",
+        "5.0",
+        "docdb5.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+    ),
     row(
         "mariadb",
         "10.11.9",
@@ -729,6 +848,23 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "mysql8.4",
         STATUS_AVAILABLE,
         DefaultLevel::Major,
+    ),
+    // The Amazon Neptune engine versions this front door publishes.
+    row(
+        "neptune",
+        "1.2.1.0",
+        "1.2",
+        "neptune1.2",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+    ),
+    row(
+        "neptune",
+        "1.3.2.0",
+        "1.3",
+        "neptune1.3",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
     ),
     row(
         "oracle-ee",
@@ -1050,3 +1186,4 @@ fn to_wire(
         ..Default::default()
     }
 }
+

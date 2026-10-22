@@ -13305,6 +13305,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -13316,6 +13317,7 @@ version = "0.1.0"
 dependencies = [
  "aws-emulator-server",
  "http",
+ "sha2 0.10.9",
 ]
 
 [[package]]

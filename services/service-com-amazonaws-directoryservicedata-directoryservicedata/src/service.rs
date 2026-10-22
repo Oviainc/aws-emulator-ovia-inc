@@ -753,10 +753,17 @@ fn fits_integral(number: &serde_json::Number, min: i64, max: i64) -> bool {
     number.as_i64().is_some_and(|held| (min..=max).contains(&held))
 }
 
-/// The message a failed coercion states: the CLASS of value the request sent and
-/// the modelled type it could not be read as, which are the two facts a caller
+/// The message a failed coercion states: the CLASS of value the request sent
+/// and the modelled type it could not be read as, which are the two facts a caller
 /// has to reconcile. The type is named by its Smithy shape type (`Integer`,
 /// `Long`, `Boolean`, …); the article is grammatical.
+///
+/// CROSS-REFERENCE:
+/// `services/service-com-amazonaws-xray-awsxray/src/service/request_layer.rs`
+/// states the same sentence for its own request layer, reached a different way
+/// (it runs the framework's deserializer rather than walking the body). If a
+/// third service needs it, hoist this function and [`json_value_class`] into
+/// `services/common` and have all three read it instead of copying it again.
 fn coercion_message(value: &Value, target: ShapeType) -> String {
     let named = format!("{target:?}");
     let article = if named.starts_with(['A', 'E', 'I', 'O', 'U']) {

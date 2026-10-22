@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsOfResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsOfResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tag set stored on the DynamoDB resource its `ResourceArn` names — what
+//! `CreateTable` seeded and every later `TagResource`/`UntagResource` left there.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsOfResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A READ: it reports the stored set and writes nothing of its own, beyond finishing
+//! the status transition the clock has already made due (a table whose `DeleteTable`
+//! span has elapsed is gone whether or not anybody called).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +146,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsOfResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsOfResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsOfResource"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // The ARN is this operation's whole selector, and it names the region the
+        // table lives in as well as the table.
+        let resource = crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+
+        // A resource carries at most `MAX_TAGS_PER_TABLE` tags, so its whole set fits
+        // in one page and this operation never mints a `NextToken`. A token it never
+        // minted resumes no page it cut, so it is refused rather than ignored —
+        // ignoring it would serve the FIRST page to a caller asking for a later one.
+        if input.next_token.as_deref().is_some_and(|token| !token.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Invalid NextToken: ListTagsOfResource reports a resource's whole tag set in \
+                 one page and issues no pagination token",
+            ));
+        }
+
+        let mut store = state.lock();
+        // Finish any transition the clock already made due before reporting: a table
+        // whose DeleteTable span has elapsed is gone, and this is a read, so that is
+        // the only write it makes.
+        store.apply_due_transitions(now);
+        let table = store
+            .table(&resource.region, &resource.table)
+            .map_err(lift)?;
+
+        Ok(ListTagsOfResourceOutput {
+            tags: Some(crate::state::tag_list(&table.tags)),
+            next_token: None,
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ListTagsOfResourceError {
+    ListTagsOfResourceErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> ListTagsOfResourceError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            ListTagsOfResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

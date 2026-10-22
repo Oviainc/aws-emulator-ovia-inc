@@ -3,8 +3,8 @@
 //! `UpdateGroup`, end to end over the wire.
 //!
 //! Every case drives the same front door the production router does (the
-//! `Xray` harness in [`super::trace_ingest_and_groups`]), so the assertions
-//! below are about HTTP responses, not about internal state.
+//! `Xray` harness in [`super::xray_wire`]), so the assertions below are about
+//! HTTP responses, not about internal state.
 //!
 //! The rule under test: `UpdateGroup` selects a stored group by either
 //! `GroupName` or `GroupARN`, each member the request SUPPLIES replaces the
@@ -25,7 +25,8 @@
 
 use serde_json::{json, Value};
 
-use super::trace_ingest_and_groups::{assert_group_arn_shape, Xray};
+use super::trace_ingest_and_groups::assert_group_arn_shape;
+use super::xray_wire::Xray;
 
 /// A group's configurable state: the two members `UpdateGroup` can change.
 /// `None` means "not present".
