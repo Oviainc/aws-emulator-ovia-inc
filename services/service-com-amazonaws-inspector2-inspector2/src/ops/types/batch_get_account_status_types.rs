@@ -32,12 +32,23 @@ pub struct AccountState {
     pub resource_state: ResourceState,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.inspector2#State")]
+// `State` is rendered with its `status` only.
+//
+// The model marks `errorCode` and `errorMessage` `@required`, but they carry WHY an
+// account failed to enable Amazon Inspector, and a state that did not fail has neither:
+// `ErrorCode`'s enum (smithy_query query=shape shape=ErrorCode) has no "no error" token,
+// and `errorMessage` targets `NonEmptyString` (length min 1), so a healthy state has no
+// value it could legally carry — the real service omits both rather than inventing one.
+// Nothing this emulator enables can fail, so no `State` it produces ever has an error to
+// report; the two members are declared unsupported so they are left off the wire instead
+// of being filled with a token that would misreport a working account as broken.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.inspector2#State",
+    unsupported = ["errorCode", "errorMessage"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct State {
     pub status: String,
-    pub error_code: String,
-    pub error_message: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.inspector2#ResourceState")]

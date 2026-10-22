@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Enable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Enable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Enable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records per-account Amazon Inspector enablement in this service's
+//! shared state and renders the requested accounts back from what it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Enable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Enable"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            EnableErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector account state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // `accountIds` is optional, and the operation then acts on the calling account,
+        // exactly as the real service does for a standalone account enabling itself. An
+        // explicitly empty list means the same thing: no account was named. The list
+        // needs no de-duplication: `AccountIdSet` is `@uniqueItems`, so the boundary
+        // validator already refused a repeated id before this handler ran.
+        let requested: Vec<String> = match input.account_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => vec![::engine::emulator_account_id().to_string()],
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // The account map grows by one entry per distinct account id a caller names, and
+        // no implemented operation removes an entry, so the number of accounts this
+        // emulator will track is capped. The count is exact because `@uniqueItems` on
+        // `AccountIdSet` means no id can appear twice. Checked BEFORE any write, so a
+        // refused request leaves the store exactly as it found it.
+        let new_accounts = requested
+            .iter()
+            .filter(|account_id| !guard.accounts.contains_key(*account_id))
+            .count();
+        if guard.accounts.len() + new_accounts > crate::state::MAX_ENABLED_ACCOUNTS {
+            return Err(EnableErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Amazon Inspector can be enabled for at most {} accounts.",
+                    crate::state::MAX_ENABLED_ACCOUNTS
+                ),
+                reason: "FIELD_VALIDATION_FAILED".to_string(),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "accountIds".to_string(),
+                    message: format!(
+                        "must not take the number of enabled accounts past {}",
+                        crate::state::MAX_ENABLED_ACCOUNTS
+                    ),
+                }]),
+            })
+            .into());
+        }
+
+        let mut accounts = Vec::with_capacity(requested.len());
+        for account_id in requested {
+            let enablement = guard.accounts.entry(account_id.clone()).or_default();
+
+            // `clientToken` is an `@idempotencyToken`: a retry carrying a token this
+            // account was already enabled with is a REPLAY, so it reports the stored
+            // enablement instead of writing over it.
+            let replay = input
+                .client_token
+                .as_deref()
+                .is_some_and(|token| enablement.has_token(token));
+            if !replay {
+                enablement.status = Some(crate::state::STATUS_ENABLED.to_string());
+                for resource_type in &input.resource_types {
+                    enablement.resource_status.insert(
+                        resource_type.clone(),
+                        crate::state::STATUS_ENABLED.to_string(),
+                    );
+                }
+                // A scan type this call did not name keeps whatever it had, and a type
+                // never enabled at all is recorded as off rather than left absent.
+                for resource_type in crate::state::RESOURCE_SCAN_TYPES {
+                    enablement
+                        .resource_status
+                        .entry(resource_type.to_string())
+                        .or_insert_with(|| crate::state::STATUS_DISABLED.to_string());
+                }
+                enablement.enabled_at.get_or_insert(now);
+                if let Some(token) = input.client_token.clone() {
+                    enablement.remember_token(token);
+                }
+            }
+
+            accounts.push(Account {
+                account_id,
+                status: enablement.account_status().to_string(),
+                resource_status: ResourceStatus {
+                    ec2: enablement.status_of("EC2").to_string(),
+                    ecr: enablement.status_of("ECR").to_string(),
+                    lambda: Some(enablement.status_of("LAMBDA").to_string()),
+                    lambda_code: Some(enablement.status_of("LAMBDA_CODE").to_string()),
+                    code_repository: Some(enablement.status_of("CODE_REPOSITORY").to_string()),
+                },
+            });
+        }
+
+        Ok(EnableOutput {
+            accounts,
+            // `failedAccounts` reports accounts that could NOT be enabled; every account
+            // named here was, so the member is absent rather than an empty list.
+            failed_accounts: None,
+        })
     }
 }
