@@ -277,9 +277,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored as a lowercase string".
         let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
 
-        // Cache security groups and parameter groups other than an engine
-        // family's default cannot exist here (both creators are scaffolded
-        // 501s), so a request naming one is refused rather than recorded.
+        // A cache security group cannot exist here (its creator is a scaffolded
+        // 501), so a request naming one is refused rather than recorded.
         if let Some(name) = input
             .cache_security_group_names
             .as_deref()
@@ -293,21 +292,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if let Some(name) = input.cache_parameter_group_name.as_deref() {
-            if !crate::state::is_known_parameter_group(name) {
-                return Err(
-                    ModifyCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(
-                        CacheParameterGroupNotFoundFault {
-                            message: Some(format!("CacheParameterGroup {name} not found.")),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
-
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // The parameter group the cluster moves to has to be one this account
+        // holds, resolved through the one stored map of groups, and the STORED
+        // name is what the cluster carries afterwards.
+        let requested_parameter_group = match input.cache_parameter_group_name.as_deref() {
+            Some(name) => match store.parameter_group(name) {
+                Some(group) => Some(group.name.clone()),
+                None => {
+                    return Err(
+                        ModifyCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(
+                            CacheParameterGroupNotFoundFault {
+                                message: Some(format!("CacheParameterGroup {name} not found.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
         let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
             return Err(ModifyCacheClusterErrorModeled::CacheClusterNotFoundFault(
                 CacheClusterNotFoundFault {
@@ -542,7 +549,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(upgrade) = input.auto_minor_version_upgrade {
             cluster.auto_minor_version_upgrade = Some(upgrade);
         }
-        if let Some(name) = input.cache_parameter_group_name {
+        if let Some(name) = requested_parameter_group {
             cluster.cache_parameter_group_name = name;
         }
         if let Some(ids) = input.security_group_ids {

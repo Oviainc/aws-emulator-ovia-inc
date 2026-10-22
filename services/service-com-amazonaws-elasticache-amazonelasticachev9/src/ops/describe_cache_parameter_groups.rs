@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCacheParameterGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCacheParameterGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCacheParameterGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation answers from this service's state. The SCAFFOLDED
+//! marker line is gone, which is what records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below
+//! are the scaffold's notes on how an operation of this service is wired.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCacheParameterGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCacheParameterGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCacheParameterGroups"))
+        // "Returns a list of cache parameter group descriptions": a pure read.
+        // A parameter group has no lifecycle the clock drives, so this handler
+        // writes nothing at all.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxRecords` carries no modelled `@range` and a `Marker` carries no
+        // modelled format, so the documented "minimum 20; maximum 100" window
+        // and a token this service did not mint are refused here, through the
+        // same helpers every paginated describe in this service shares. This
+        // operation models `InvalidParameterValueException` for exactly a value
+        // a parameter may not take.
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => {
+                return Err(
+                    DescribeCacheParameterGroupsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(
+                        DescribeCacheParameterGroupsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(format!("Invalid value {marker} for Marker.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // A group AWS provides exists in every Region, so its ARN names the
+        // Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // "If a cache parameter group name is specified, the list contains only
+        // the descriptions for that group" — or the modelled not-found when the
+        // account holds no such group. Pagination does not apply to a
+        // single-resource lookup.
+        if let Some(name) = input.cache_parameter_group_name.as_deref() {
+            let Some(group) = store.parameter_group(name) else {
+                return Err(
+                    DescribeCacheParameterGroupsErrorModeled::CacheParameterGroupNotFoundFault(
+                        CacheParameterGroupNotFoundFault {
+                            message: Some(format!("CacheParameterGroup {name} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            return Ok(DescribeCacheParameterGroupsOutput {
+                marker: None,
+                cache_parameter_groups: Some(vec![group.to_modeled(&region)]),
+            });
+        }
+
+        let mut page: Vec<CacheParameterGroup> = Vec::new();
+        let mut marker = None;
+        // A `Marker` carries the inclusive start key of its page, so the page
+        // is a RANGE of the stored order rather than a scan of all of it.
+        let start = match resume_from.as_deref() {
+            Some(key) => ::std::ops::Bound::Included(key),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        for (key, group) in store
+            .cache_parameter_groups
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(group.to_modeled(&region));
+        }
+
+        Ok(DescribeCacheParameterGroupsOutput {
+            marker,
+            cache_parameter_groups: Some(page),
+        })
     }
 }

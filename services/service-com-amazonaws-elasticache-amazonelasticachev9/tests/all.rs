@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/cache_cluster_lifecycle.rs"]
 mod cache_cluster_lifecycle;
+#[path = "all/cache_parameter_groups.rs"]
+mod cache_parameter_groups;
 #[path = "all/reserved_cache_nodes_offerings.rs"]
 mod reserved_cache_nodes_offerings;
 #[path = "all/service_updates.rs"]
