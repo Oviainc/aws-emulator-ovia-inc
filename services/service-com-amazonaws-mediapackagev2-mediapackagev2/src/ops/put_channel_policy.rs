@@ -7,7 +7,9 @@
 //! The policy document is validated before anything is stored (a document that is not an
 //! IAM policy is a 400 `ValidationException` with `ValidationExceptionType`
 //! `INVALID_POLICY`), and the parent chain is resolved first (404
-//! `ResourceNotFoundException`), so a refused request leaves the store untouched.
+//! `ResourceNotFoundException`), so a refused request leaves the store untouched. A
+//! multiview channel carries no policy of its own, which the model's
+//! `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type names.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +101,14 @@ const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because
 const INVALID_POLICY_MESSAGE: &str = "Validation error encountered at request.policy: \
     The policy you provided isn't a valid policy document. Provide a JSON policy \
     document with a Statement and then try again";
+
+/// Why a policy was refused on a multiview channel. A multiview channel composites the
+/// channels it lists as sources and is reached through their access, so it takes no
+/// resource policy of its own — the case the model's `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED`
+/// validation type names. Fixed, like the sentences above: it echoes no identifier.
+const MULTIVIEW_POLICY_NOT_ALLOWED_MESSAGE: &str = "Validation error encountered at \
+    request.policy: You can't attach a policy to a multiview channel. Attach the policy \
+    to the source channels instead and then try again";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -216,6 +226,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A multiview channel takes no resource policy of its own — it is served through
+        // the channels it composites — which is the case the model's
+        // `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type names.
+        // `MultiviewConfiguration` is present exactly when `InputType` is `MULTIVIEW`
+        // (its own doc says so), so it is what identifies such a channel.
+        if channel.multiview_configuration.is_some() {
+            return Err(PutChannelPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(MULTIVIEW_POLICY_NOT_ALLOWED_MESSAGE.to_string()),
+                    validation_exception_type: Some(
+                        "MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
 
         // One policy per channel: the operation attaches exactly one, so a second call
         // REPLACES the first rather than accumulating. The channel's own members are

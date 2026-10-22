@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a deployment exactly as `CreateDeployment` recorded it, including whether
+//! it is still the latest for its target.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +167,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeployment"))
+        let _ = ctx;
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(GetDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(entry) = store.deployments.get(&input.deployment_id) else {
+            return Err(GetDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("The deployment {} does not exist.", input.deployment_id),
+                    resource_id: input.deployment_id.clone(),
+                    resource_type: "DEPLOYMENT".to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetDeploymentOutput {
+            target_arn: Some(entry.target_arn.clone()),
+            revision_id: Some(entry.revision_id.clone()),
+            deployment_id: Some(entry.deployment_id.clone()),
+            deployment_name: entry.deployment_name.clone(),
+            deployment_status: Some(entry.deployment_status.clone()),
+            iot_job_id: Some(entry.iot_job_id.clone()),
+            iot_job_arn: Some(entry.iot_job_arn.clone()),
+            components: (!entry.components.is_empty()).then(|| {
+                entry
+                    .components
+                    .iter()
+                    .map(|(name, spec)| (name.clone(), spec.clone()))
+                    .collect()
+            }),
+            deployment_policies: entry.deployment_policies.clone(),
+            iot_job_configuration: entry.iot_job_configuration.clone(),
+            creation_timestamp: Some(st::to_datetime(entry.creation_timestamp)),
+            is_latest_for_target: entry.is_latest_for_target,
+            parent_target_arn: entry.parent_target_arn.clone(),
+            tags: st::tags_out(&entry.tags),
+        })
     }
 }
