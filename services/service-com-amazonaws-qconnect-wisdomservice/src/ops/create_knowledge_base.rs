@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKnowledgeBase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKnowledgeBase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKnowledgeBase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a knowledge base, stores it, and answers out of the STORED record, so what this
+//! call reports is what every later `GetKnowledgeBase` reports. A replayed `clientToken`
+//! answers with the knowledge base that token already created; a second live knowledge
+//! base under one name is the conflict `ConflictException` describes.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +175,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKnowledgeBase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKnowledgeBaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKnowledgeBase"))
+        // Modeled constraints (`name`'s length and pattern, `knowledgeBaseType`'s enum)
+        // are already refused BEFORE this handler runs, so reaching here means the input
+        // satisfies every one of them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateKnowledgeBase")
+        })?;
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut store = state.lock();
+
+        // A replayed `@idempotencyToken` answers with the knowledge base it already
+        // created rather than creating a second one. The token is scoped to this
+        // operation, so the same token on another create is another resource.
+        let replay_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key("CreateKnowledgeBase", token));
+        if let Some(created) = replay_key
+            .as_ref()
+            .and_then(|key| store.idempotency.get(key).cloned())
+        {
+            if let Some(knowledge_base) = store.knowledge_base(&created) {
+                return Ok(CreateKnowledgeBaseOutput {
+                    knowledge_base: Some(knowledge_base.to_knowledge_base_data()),
+                });
+            }
+        }
+
+        // A knowledge base's name identifies it, so a create under a name this account
+        // already holds is the modelled conflict (HTTP 409) rather than a second record.
+        if store.knowledge_base_id_with_name(&input.name).is_some() {
+            return Err(CreateKnowledgeBaseErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::MESSAGE_NAME_IN_USE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The account's knowledge-base quota: a create beyond it is refused, which is
+        // also what keeps the store finite.
+        if store.knowledge_bases.len() >= crate::state::MAX_KNOWLEDGE_BASES {
+            return Err(CreateKnowledgeBaseErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} knowledge bases.",
+                        crate::state::MAX_KNOWLEDGE_BASES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(knowledge_base_id) = store.mint_knowledge_base_id() else {
+            return Err(CreateKnowledgeBaseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "could not mint a unique knowledgeBaseId; retry the request".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let knowledge_base = crate::state::KnowledgeBase {
+            knowledge_base_arn: crate::state::knowledge_base_arn(&region, &knowledge_base_id),
+            knowledge_base_id: knowledge_base_id.clone(),
+            name: input.name.clone(),
+            knowledge_base_type: input.knowledge_base_type.clone(),
+            // The service answers a create with the knowledge base already ACTIVE, so
+            // there is no transition the clock owes it afterwards.
+            status: crate::state::KNOWLEDGE_BASE_STATUS_ACTIVE.to_string(),
+            description: input.description.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            source_configuration: input.source_configuration.clone(),
+            rendering_configuration: input.rendering_configuration.clone(),
+            vector_ingestion_configuration: input.vector_ingestion_configuration.clone(),
+            server_side_encryption_configuration: input
+                .server_side_encryption_configuration
+                .clone(),
+            created_at: ::std::time::SystemTime::now(),
+        };
+        store.insert_knowledge_base(knowledge_base);
+        if let Some(key) = replay_key {
+            store.idempotency.insert(key, knowledge_base_id.clone());
+        }
+
+        // Render out of the INSERTED record rather than out of the request: what this
+        // call answers is what a later read of the knowledge base answers.
+        let Some(stored) = store.knowledge_base(&knowledge_base_id) else {
+            // Unreachable: the insert above put this id in the map while the lock is
+            // held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateKnowledgeBase",
+            ));
+        };
+        Ok(CreateKnowledgeBaseOutput {
+            knowledge_base: Some(stored.to_knowledge_base_data()),
+        })
     }
 }

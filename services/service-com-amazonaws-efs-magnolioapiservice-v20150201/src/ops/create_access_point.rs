@@ -316,11 +316,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("access-point/{access_point_id}"),
         );
-        // "The name of the access point. This is the value of the Name tag."
-        let name = tags
-            .iter()
-            .find(|tag| tag.key == "Name")
-            .map(|tag| tag.value.clone());
+        // "The name of the access point. This is the value of the Name tag." The one
+        // construction every operation that stores a tag set derives it through.
+        let name = efs::name_tag(&tags);
 
         let access_point = efs::AccessPoint {
             ordinal,

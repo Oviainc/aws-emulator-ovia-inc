@@ -8,37 +8,39 @@
 //! writes is what the next request reads.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use crate::ops::types::{
-    AIAgentConfigurationData, AssistantData, AssistantSummary, ServerSideEncryptionConfiguration,
-    SessionData, TagFilter,
+    AIAgentConfigurationData, AssistantCapabilityConfiguration, AssistantData,
+    AssistantIntegrationConfiguration, AssistantSummary, KnowledgeBaseData,
+    OrchestratorConfigurationEntry, RenderingConfiguration, ServerSideEncryptionConfiguration,
+    SessionData, SourceConfiguration, TagFilter, VectorIngestionConfiguration,
 };
 
 /// The only `AssistantType` the model declares
 /// (`smithy_query(query="shape",shape="AssistantType")`).
 pub const ASSISTANT_TYPE_AGENT: &str = "AGENT";
 
-/// The `AssistantStatus` a freshly created assistant carries: creation is asynchronous,
-/// which is why the modelled enum has a `CREATE_IN_PROGRESS` member at all
-/// (`smithy_query(query="shape",shape="AssistantStatus")`).
-pub const ASSISTANT_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
-
-/// The terminal `AssistantStatus` of a usable assistant.
+/// The terminal `AssistantStatus` of a usable assistant, and the one a create answers
+/// with: the service reports the assistant ready in the response to the call that made
+/// it, so no later status change is owed and every read reports the same value
+/// (`smithy_query(query="shape",shape="AssistantStatus")` also declares
+/// `CREATE_IN_PROGRESS`, `CREATE_FAILED`, `DELETE_IN_PROGRESS`, `DELETE_FAILED` and
+/// `DELETED`, which this emulator reaches for no assistant it holds: a delete removes
+/// the record outright).
 pub const ASSISTANT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `AssistantCapabilityType` an assistant created through the Amazon Q in Connect
+/// API carries (`smithy_query(query="shape",shape="AssistantCapabilityType")` declares
+/// `V1` and `V2`): `V1` is the legacy Amazon Connect Wisdom capability, `V2` the one
+/// this model's AI agent, AI prompt and AI guardrail surface needs. `CreateAssistant`
+/// takes no capability member, so the service chooses it.
+pub const ASSISTANT_CAPABILITY_V2: &str = "V2";
 
 /// The `Origin` of a session created through the `CreateSession` API — the model's own
 /// wording: "`SYSTEM` for a default Session created by Amazon Q in Connect or
 /// `CUSTOMER` for a Session created by calling CreateSession API".
 pub const SESSION_ORIGIN_CUSTOMER: &str = "CUSTOMER";
-
-/// How long a freshly created assistant stays `CREATE_IN_PROGRESS` before the clock
-/// owes it `ACTIVE`.
-///
-/// CHOSEN, not documented: AWS publishes no provisioning duration for an assistant. The
-/// span is deliberately non-zero, so a caller reading straight after the create still
-/// observes the transient status and only a later read sees the assistant settled.
-pub const CREATE_TRANSITION: Duration = Duration::from_millis(500);
 
 /// The page size `ListAssistants` serves when a call names no `maxResults`: the
 /// modelled maximum of the `maxResults` range (1..100).
@@ -56,6 +58,101 @@ pub const MAX_ASSISTANTS: usize = 100;
 /// [`MAX_ASSISTANTS`]. `CreateSession` models no quota error, so a create beyond this
 /// bound is refused with its modelled `ValidationException` (HTTP 400).
 pub const MAX_SESSIONS_PER_ASSISTANT: usize = 200;
+
+/// The `KnowledgeBaseStatus` a knowledge base this service holds carries
+/// (`smithy_query(query="shape",shape="KnowledgeBaseStatus")` also declares
+/// `CREATE_IN_PROGRESS`, `CREATE_FAILED`, `DELETE_IN_PROGRESS`, `DELETE_FAILED` and
+/// `DELETED`).
+///
+/// A `CreateKnowledgeBase` answer is recorded with `status` ACTIVE, so the create owes no
+/// later transition: a resource the service returns ready stays ready. The assistant
+/// above is recorded the same way — see [`ASSISTANT_STATUS_ACTIVE`].
+pub const KNOWLEDGE_BASE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The sentence this service answers a request addressed to an assistant this account
+/// does not hold with.
+///
+/// Every message constant below is a FIXED service text: it is the same sentence for
+/// every request that meets the condition and it quotes nothing from the request. The
+/// recorded wire responses show exactly that — the not-found answer to a request for an
+/// assistant id names no id — so a message built by interpolating the requested
+/// identifier is a message this service never sends. The requested label still travels,
+/// in `ResourceNotFoundException`'s own `resourceName` member, which the model provides
+/// for naming it.
+pub const MESSAGE_ASSISTANT_NOT_FOUND: &str = "Assistant does not exist.";
+
+/// The fixed text for a request addressed to a knowledge base this account does not
+/// hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
+
+/// The fixed text for a request addressed to a session its named assistant does not
+/// hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_SESSION_NOT_FOUND: &str = "Session does not exist.";
+
+/// The fixed text of the modelled `ConflictException` a create whose `name` a live
+/// resource already holds is refused with. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_NAME_IN_USE: &str = "Name is already in use";
+
+/// The fixed text of the modelled `UnauthorizedException`. See
+/// [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_UNAUTHORIZED: &str = "Unauthorized";
+
+/// The `Origin` of an AI agent the service created for an assistant itself, as the
+/// model words it: "`SYSTEM` for a default AI Agent created by Q in Connect or
+/// `CUSTOMER` for an AI Agent created by calling AI Agent creation APIs"
+/// (`smithy_query(query="shape",shape="AIAgentData")`, member `origin`).
+pub const AI_AGENT_ORIGIN_SYSTEM: &str = "SYSTEM";
+
+/// The `VisibilityStatus` of a default AI agent: it is in service for the assistant the
+/// moment the assistant exists, which is what `PUBLISHED` means
+/// (`smithy_query(query="shape",shape="VisibilityStatus")` declares `SAVED` and
+/// `PUBLISHED`).
+pub const AI_AGENT_VISIBILITY_PUBLISHED: &str = "PUBLISHED";
+
+/// The terminal `Status` of an AI agent in service
+/// (`smithy_query(query="shape",shape="Status")`).
+pub const AI_AGENT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The one AI agent type whose binding can be turned off, which is why its binding is
+/// the one that reports `enabled`: the model's `AIAgentConfigurationData$enabled` doc
+/// says "Setting this value to false is currently supported only for the
+/// `ANSWER_RECOMMENDATION` AI Agent type".
+///
+/// Its default binding is reported DISABLED, which is what the recorded wire answer for
+/// a fresh assistant shows (and what the model's wording describes as "the AI Agent ID
+/// is retained but no AI Agent runs for the AI Agent type"): answer recommendation runs
+/// against knowledge-base content, and a fresh assistant is associated with none yet.
+/// Every other type's binding reports no `enabled` at all, since no other type's can be
+/// turned off.
+pub const AI_AGENT_TYPE_ANSWER_RECOMMENDATION: &str = "ANSWER_RECOMMENDATION";
+
+/// The AI agent types an assistant gets a default `SYSTEM` AI agent for when the service
+/// creates it, which is what a fresh assistant's `aiAgentConfiguration` reports a
+/// binding for.
+///
+/// Every `AIAgentType` the model declares
+/// (`smithy_query(query="shape",shape="AIAgentType")`) except `ORCHESTRATION`, which has
+/// no default agent: the recorded wire answer for a fresh assistant carries a binding
+/// for each of the eight below and none for `ORCHESTRATION`. Sorted, so the list reads
+/// as the set it is.
+pub const DEFAULT_AI_AGENT_TYPES: [&str; 8] = [
+    "ANSWER_RECOMMENDATION",
+    "CASE_SUMMARIZATION",
+    "EMAIL_GENERATIVE_ANSWER",
+    "EMAIL_OVERVIEW",
+    "EMAIL_RESPONSE",
+    "MANUAL_SEARCH",
+    "NOTE_TAKING",
+    "SELF_SERVICE",
+];
+
+/// The most knowledge bases one account may hold at a time, with the same contract as
+/// [`MAX_ASSISTANTS`]: a create beyond it is refused with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402), which is also what keeps this store
+/// finite.
+///
+/// CHOSEN: AWS quotas knowledge bases per account but does not publish the figure.
+pub const MAX_KNOWLEDGE_BASES: usize = 100;
 
 /// How many ids a mint tries before giving up, so no request can spin here. Each
 /// candidate comes from the store's own sequence, so the first one is free unless the
@@ -91,6 +188,16 @@ pub fn assistant_arn(region: &str, assistant_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("assistant/{assistant_id}"))
 }
 
+/// This service's ARN for a knowledge base:
+/// `arn:aws:wisdom:<region>:<account>:knowledge-base/<knowledgeBaseId>`.
+pub fn knowledge_base_arn(region: &str, knowledge_base_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("knowledge-base/{knowledge_base_id}"),
+    )
+}
+
 /// This service's ARN for a session, which names its parent assistant too:
 /// `arn:aws:wisdom:<region>:<account>:session/<assistantId>/<sessionId>`.
 pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String {
@@ -98,6 +205,29 @@ pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String
         ARN_NAMESPACE,
         region,
         &format!("session/{assistant_id}/{session_id}"),
+    )
+}
+
+/// This service's ARN for an AI agent, which names its parent assistant too:
+/// `arn:aws:wisdom:<region>:<account>:ai-agent/<assistantId>/<aiAgentId>`.
+pub fn ai_agent_arn(region: &str, assistant_id: &str, ai_agent_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("ai-agent/{assistant_id}/{ai_agent_id}"),
+    )
+}
+
+/// The ARN of the SNS topic an assistant streams chat messages through, which the
+/// service provisions with the assistant: an Amazon SNS topic ARN
+/// (`arn:aws:sns:<region>:<account>:<topic>`), named after the assistant it belongs to,
+/// so one assistant's topic is never another's and a read reports the same ARN every
+/// time.
+pub fn topic_integration_arn(region: &str, assistant_id: &str) -> String {
+    ::engine::emulator_arn(
+        "sns",
+        region,
+        &format!("qconnect-assistant-{assistant_id}"),
     )
 }
 
@@ -158,10 +288,23 @@ pub fn resolve_id(label: &str) -> &str {
     }
 }
 
-/// A map field rendered as the modelled map shape, or `None` when it is empty: an
-/// untagged resource reports no `tags` member rather than an empty object.
+/// A non-tag map field rendered as the modelled map shape, or `None` when it is empty:
+/// a resource with nothing to report under it reports no member rather than an empty
+/// object. The `tags` member follows the opposite rule — see [`tags_out`], which is what
+/// the recorded responses show for it.
 fn map_out<V: Clone>(map: &HashMap<String, V>) -> Option<HashMap<String, V>> {
     (!map.is_empty()).then(|| map.clone())
+}
+
+/// The `tags` member of a resource this service reports: ALWAYS present, and an empty
+/// object when the resource carries no tag.
+///
+/// This is what the service answers on the wire — a recorded create of an untagged
+/// resource carries the `tags` member all the same — so a client reading
+/// `response["tags"]` finds a map for every resource rather than having to tell an
+/// untagged resource's absent member from a tagged one's map.
+fn tags_out(tags: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    Some(tags.clone())
 }
 
 /// One session of an assistant, as this emulator persists it.
@@ -190,7 +333,7 @@ impl Session {
             session_id: self.session_id.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
-            tags: map_out(&self.tags),
+            tags: tags_out(&self.tags),
             // The emulator integrates a session with no external topic, so the
             // integration configuration has nothing to report.
             integration_configuration: None,
@@ -200,6 +343,27 @@ impl Session {
             orchestrator_configuration_list: None,
         }
     }
+}
+
+/// One AI agent of an assistant, as this emulator persists it.
+///
+/// The default agents the service creates with the assistant are `SYSTEM`-origin
+/// records; an agent a caller creates through `CreateAIAgent` is `CUSTOMER`-origin and
+/// carries the configuration the caller gave. Nothing reports these yet — `GetAIAgent`
+/// and `ListAIAgents` are still scaffolded — but the assistant's
+/// `aiAgentConfiguration` names them, so the ids it reports are the ids of records this
+/// store holds rather than numbers with nothing behind them.
+#[derive(Debug, Clone)]
+pub struct AiAgent {
+    pub ai_agent_id: String,
+    pub ai_agent_arn: String,
+    pub assistant_id: String,
+    pub name: String,
+    pub r#type: String,
+    pub origin: String,
+    pub visibility_status: String,
+    pub status: String,
+    pub created_at: SystemTime,
 }
 
 /// One Amazon Q in Connect assistant, as this emulator persists it.
@@ -214,21 +378,45 @@ pub struct Assistant {
     pub tags: HashMap<String, String>,
     pub server_side_encryption_configuration: Option<ServerSideEncryptionConfiguration>,
     pub created_at: SystemTime,
-    /// The instant the `CREATE_IN_PROGRESS` -> `ACTIVE` transition falls due.
-    pub active_due_at: Instant,
+    /// The `AssistantCapabilityType` this assistant was provisioned with. Chosen by the
+    /// service — `CreateAssistant` models no capability member — so it is stored once
+    /// and reported unchanged.
+    pub capability_type: String,
+    /// The ARN of the SNS topic this assistant streams chat messages through. The
+    /// service provisions one with the assistant — see [`topic_integration_arn`] — so
+    /// every read of the assistant reports the same topic.
+    pub topic_integration_arn: Option<String>,
+    /// The AI agent bound to this assistant per `AIAgentType`, which is what
+    /// `UpdateAssistantAIAgent`/`RemoveAssistantAIAgent` write. Every entry names an
+    /// agent in [`Self::ai_agents`].
+    pub ai_agent_configuration: HashMap<String, AIAgentConfigurationData>,
+    /// The AI agents this assistant holds, keyed by `aiAgentId`: the default `SYSTEM`
+    /// ones the create provisions, and any a caller adds later. An AI agent is
+    /// reachable only through its assistant, as a session is.
+    pub ai_agents: HashMap<String, AiAgent>,
+    /// This assistant's orchestrator configurations, with the same contract as
+    /// [`Self::ai_agent_configuration`].
+    pub orchestrator_configuration_list: Vec<OrchestratorConfigurationEntry>,
     /// This assistant's sessions, keyed by `sessionId`. A session is reachable only
     /// through its parent, so a session id does not resolve under another assistant.
     pub sessions: HashMap<String, Session>,
 }
 
 impl Assistant {
-    /// Materialise the status change the clock already owes this assistant. A read
-    /// calls this because the transition was due at that instant whether or not
-    /// anybody asked.
-    fn settle(&mut self, now: Instant) {
-        if self.status == ASSISTANT_STATUS_CREATE_IN_PROGRESS && now >= self.active_due_at {
-            self.status = ASSISTANT_STATUS_ACTIVE.to_string();
-        }
+    /// The assistant's integration configuration, as every operation that reports this
+    /// assistant renders it: the member is always present, and carries a
+    /// `topicIntegrationArn` only once a topic is integrated with the assistant.
+    fn integration_configuration(&self) -> Option<AssistantIntegrationConfiguration> {
+        Some(AssistantIntegrationConfiguration {
+            topic_integration_arn: self.topic_integration_arn.clone(),
+        })
+    }
+
+    /// The assistant's capability configuration, rendered from the stored capability.
+    fn capability_configuration(&self) -> Option<AssistantCapabilityConfiguration> {
+        Some(AssistantCapabilityConfiguration {
+            r#type: Some(self.capability_type.clone()),
+        })
     }
 
     /// The `AssistantData` every operation that reports this assistant answers with.
@@ -240,17 +428,19 @@ impl Assistant {
             r#type: self.r#type.clone(),
             status: self.status.clone(),
             description: self.description.clone(),
-            tags: map_out(&self.tags),
+            tags: tags_out(&self.tags),
             server_side_encryption_configuration: self
                 .server_side_encryption_configuration
                 .clone(),
-            // No topic integration, no capability override and no AI agent is bound to
-            // an assistant by the operations implemented so far, so each of these
-            // reports nothing rather than an invented value.
-            integration_configuration: None,
-            capability_configuration: None,
-            ai_agent_configuration: None,
-            orchestrator_configuration_list: None,
+            // Every configuration member of the stored record is reported, each out of
+            // what the record holds: the capability the assistant was provisioned with,
+            // the topic it streams through, the AI agent bound per `AIAgentType` and its
+            // orchestrator configurations — the last reported empty, not omitted, the
+            // way `tags` is.
+            integration_configuration: self.integration_configuration(),
+            capability_configuration: self.capability_configuration(),
+            ai_agent_configuration: Some(self.ai_agent_configuration.clone()),
+            orchestrator_configuration_list: Some(self.orchestrator_configuration_list.clone()),
         }
     }
 
@@ -264,14 +454,16 @@ impl Assistant {
             r#type: self.r#type.clone(),
             status: self.status.clone(),
             description: self.description.clone(),
-            tags: map_out(&self.tags),
+            tags: tags_out(&self.tags),
             server_side_encryption_configuration: self
                 .server_side_encryption_configuration
                 .clone(),
-            integration_configuration: None,
-            capability_configuration: None,
-            ai_agent_configuration: None,
-            orchestrator_configuration_list: None,
+            // The same record, rendered the same way: a summary reports what
+            // `GetAssistant` reports for the assistant it summarises.
+            integration_configuration: self.integration_configuration(),
+            capability_configuration: self.capability_configuration(),
+            ai_agent_configuration: Some(self.ai_agent_configuration.clone()),
+            orchestrator_configuration_list: Some(self.orchestrator_configuration_list.clone()),
         }
     }
 
@@ -284,11 +476,70 @@ impl Assistant {
     }
 }
 
+/// One knowledge base, as this emulator persists it.
+///
+/// The knowledge base is the root of the content/quick-response/message-template side of
+/// the service, the way [`Assistant`] is the root of the session side.
+#[derive(Debug, Clone)]
+pub struct KnowledgeBase {
+    pub knowledge_base_id: String,
+    pub knowledge_base_arn: String,
+    pub name: String,
+    pub knowledge_base_type: String,
+    pub status: String,
+    pub description: Option<String>,
+    pub tags: HashMap<String, String>,
+    pub source_configuration: Option<SourceConfiguration>,
+    pub rendering_configuration: Option<RenderingConfiguration>,
+    pub vector_ingestion_configuration: Option<VectorIngestionConfiguration>,
+    pub server_side_encryption_configuration: Option<ServerSideEncryptionConfiguration>,
+    /// When the create that minted this record ran, as [`Assistant`] and [`Session`]
+    /// keep it too. `KnowledgeBaseData` models no creation-time member, so nothing
+    /// reports it yet; it is the record's own age, not a reported value.
+    pub created_at: SystemTime,
+}
+
+impl KnowledgeBase {
+    /// The `KnowledgeBaseData` every operation that reports this knowledge base answers
+    /// with.
+    pub fn to_knowledge_base_data(&self) -> KnowledgeBaseData {
+        KnowledgeBaseData {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            name: self.name.clone(),
+            knowledge_base_type: self.knowledge_base_type.clone(),
+            status: self.status.clone(),
+            description: self.description.clone(),
+            tags: tags_out(&self.tags),
+            source_configuration: self.source_configuration.clone(),
+            rendering_configuration: self.rendering_configuration.clone(),
+            vector_ingestion_configuration: self.vector_ingestion_configuration.clone(),
+            server_side_encryption_configuration: self
+                .server_side_encryption_configuration
+                .clone(),
+            // The model's own wording: "If no content exists in a knowledge base, this
+            // value is unset". No content operation is implemented yet, so no knowledge
+            // base this service holds has content to have modified.
+            last_content_modification_time: None,
+            // Ingestion runs against a data source, and nothing in this emulator ingests
+            // one, so there is no sync status or failure to report rather than an
+            // invented one.
+            ingestion_status: None,
+            ingestion_failure_reasons: None,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-qconnect-wisdomservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsQconnectWisdomserviceState {
     /// Every live assistant, keyed by its `assistantId` — the service's primary index.
     pub assistants: HashMap<String, Assistant>,
+    /// Every live knowledge base, keyed by its `knowledgeBaseId`.
+    pub knowledge_bases: HashMap<String, KnowledgeBase>,
+    /// `name` -> `knowledgeBaseId`: a knowledge base's name identifies it, so a second
+    /// create under a live name is the conflict `ConflictException` describes.
+    pub knowledge_base_name_index: HashMap<String, String>,
     /// `name` -> `assistantId`: an assistant's name identifies it, so a second create
     /// under a live name is the conflict `ConflictException` describes.
     pub assistant_name_index: HashMap<String, String>,
@@ -319,6 +570,102 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .find(|candidate| !self.assistants.contains_key(candidate))
     }
 
+    /// The default AI agents an assistant comes with, and the bindings that name them:
+    /// one `SYSTEM`-origin agent per [`DEFAULT_AI_AGENT_TYPES`] entry, which is what the
+    /// service provisions when it creates an assistant. Returned rather than stored, so
+    /// the create puts them on the record it inserts.
+    pub fn default_ai_agents(
+        &mut self,
+        region: &str,
+        assistant_id: &str,
+    ) -> (
+        HashMap<String, AiAgent>,
+        HashMap<String, AIAgentConfigurationData>,
+    ) {
+        let created_at = SystemTime::now();
+        let mut agents: HashMap<String, AiAgent> = HashMap::new();
+        let mut bindings: HashMap<String, AIAgentConfigurationData> = HashMap::new();
+        for agent_type in DEFAULT_AI_AGENT_TYPES {
+            let seq = self.next_seq();
+            let Some(ai_agent_id) = (0..MINT_ATTEMPTS as u64)
+                .map(|attempt| mint_candidate(seq, attempt))
+                .find(|candidate| !agents.contains_key(candidate))
+            else {
+                // Every candidate of this block was taken by an agent minted a moment
+                // ago: the assistant gets no default agent of this type rather than a
+                // second record under one id.
+                continue;
+            };
+            agents.insert(
+                ai_agent_id.clone(),
+                AiAgent {
+                    ai_agent_arn: ai_agent_arn(region, assistant_id, &ai_agent_id),
+                    ai_agent_id: ai_agent_id.clone(),
+                    assistant_id: assistant_id.to_string(),
+                    name: agent_type.to_string(),
+                    r#type: agent_type.to_string(),
+                    origin: AI_AGENT_ORIGIN_SYSTEM.to_string(),
+                    visibility_status: AI_AGENT_VISIBILITY_PUBLISHED.to_string(),
+                    status: AI_AGENT_STATUS_ACTIVE.to_string(),
+                    created_at,
+                },
+            );
+            bindings.insert(
+                agent_type.to_string(),
+                AIAgentConfigurationData {
+                    // The binding names the stored agent by its id — the model's own
+                    // wording for the member is "The ID of the AI Agent to be
+                    // configured" — so the id this assistant reports is the id of a
+                    // record this store holds.
+                    ai_agent_id,
+                    // The model's own wording: "Indicates whether the AI Agent
+                    // configured for this AI Agent type is enabled … Setting this value
+                    // to false is currently supported only for the
+                    // `ANSWER_RECOMMENDATION` AI Agent type" — see
+                    // [`AI_AGENT_TYPE_ANSWER_RECOMMENDATION`] for why that one default
+                    // is bound disabled and why no other type reports the member.
+                    enabled: (agent_type == AI_AGENT_TYPE_ANSWER_RECOMMENDATION)
+                        .then_some(false),
+                },
+            );
+        }
+        (agents, bindings)
+    }
+
+    /// A knowledge-base id no stored knowledge base holds, or `None` when
+    /// [`MINT_ATTEMPTS`] candidates of this sequence number's block were all taken.
+    pub fn mint_knowledge_base_id(&mut self) -> Option<String> {
+        let seq = self.next_seq();
+        (0..MINT_ATTEMPTS as u64)
+            .map(|attempt| mint_candidate(seq, attempt))
+            .find(|candidate| !self.knowledge_bases.contains_key(candidate))
+    }
+
+    /// Store a knowledge base and index it by name.
+    pub fn insert_knowledge_base(&mut self, knowledge_base: KnowledgeBase) {
+        self.knowledge_base_name_index.insert(
+            knowledge_base.name.clone(),
+            knowledge_base.knowledge_base_id.clone(),
+        );
+        self.knowledge_bases
+            .insert(knowledge_base.knowledge_base_id.clone(), knowledge_base);
+    }
+
+    /// The knowledge base a `UuidOrArn` label names, or `None` when this account holds
+    /// none under that label — including an ARN this emulator could not have minted,
+    /// which names nothing.
+    pub fn knowledge_base(&self, label: &str) -> Option<&KnowledgeBase> {
+        self.knowledge_bases.get(resolve_id(label))
+    }
+
+    /// The id of the live knowledge base already using this name, if any.
+    pub fn knowledge_base_id_with_name(&self, name: &str) -> Option<&str> {
+        self.knowledge_base_name_index
+            .get(name)
+            .map(String::as_str)
+            .filter(|id| self.knowledge_bases.contains_key(*id))
+    }
+
     /// Store an assistant and index it by name.
     pub fn insert_assistant(&mut self, assistant: Assistant) {
         self.assistant_name_index
@@ -327,18 +674,16 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .insert(assistant.assistant_id.clone(), assistant);
     }
 
-    /// The assistant a `UuidOrArn` label names, with any clock-owed status change
-    /// materialised.
-    pub fn assistant(&mut self, label: &str) -> Option<&Assistant> {
-        self.assistant_mut(label).map(|assistant| &*assistant)
+    /// The assistant a `UuidOrArn` label names, or `None` when this account holds none
+    /// under that label — including an ARN this emulator could not have minted, which
+    /// names nothing.
+    pub fn assistant(&self, label: &str) -> Option<&Assistant> {
+        self.assistants.get(resolve_id(label))
     }
 
-    /// The assistant a `UuidOrArn` label names, for mutation, with any clock-owed
-    /// status change materialised first.
+    /// The assistant a `UuidOrArn` label names, for mutation.
     pub fn assistant_mut(&mut self, label: &str) -> Option<&mut Assistant> {
-        let assistant = self.assistants.get_mut(resolve_id(label))?;
-        assistant.settle(Instant::now());
-        Some(assistant)
+        self.assistants.get_mut(resolve_id(label))
     }
 
     /// Forget an assistant, its sessions and every index entry that named them, as
@@ -370,19 +715,11 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|id| self.assistants.contains_key(*id))
     }
 
-    /// Every stored assistant's id, settled and in `assistantId` order — the stable
-    /// order `ListAssistants` pages over. Ids only, so a list call projects just the
-    /// page it answers with instead of cloning every record (and its sessions).
-    pub fn assistant_ids_in_order(&mut self) -> Vec<String> {
-        let now = Instant::now();
-        let mut ids: Vec<String> = self
-            .assistants
-            .values_mut()
-            .map(|assistant| {
-                assistant.settle(now);
-                assistant.assistant_id.clone()
-            })
-            .collect();
+    /// Every stored assistant's id, in `assistantId` order — the stable order
+    /// `ListAssistants` pages over. Ids only, so a list call projects just the page it
+    /// answers with instead of cloning every record (and its sessions).
+    pub fn assistant_ids_in_order(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.assistants.keys().cloned().collect();
         ids.sort();
         ids
     }

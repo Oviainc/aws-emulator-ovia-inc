@@ -19,6 +19,8 @@ mod as2_profile_listing;
 mod connector_configuration;
 #[path = "all/connector_listing.rs"]
 mod connector_listing;
+#[path = "all/connector_updates.rs"]
+mod connector_updates;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
 // `workflow_step_contract` is declared HERE rather than in its alphabetical place at the

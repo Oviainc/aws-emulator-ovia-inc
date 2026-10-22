@@ -19,5 +19,7 @@ mod profiling_group_lifecycle;
 mod recommendations_analysis;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/update_profiling_group.rs"]
 mod update_profiling_group;

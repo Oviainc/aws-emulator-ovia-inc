@@ -148,10 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.remove_assistant(&input.assistant_id).is_none() {
             return Err(DeleteAssistantErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No assistant {} exists in this account.",
-                        input.assistant_id
-                    )),
+                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
                     resource_name: Some(input.assistant_id.clone()),
                 },
             )

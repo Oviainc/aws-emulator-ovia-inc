@@ -839,7 +839,10 @@ async fn string_filters_select_findings_by_the_documented_comparisons() {
 #[tokio::test]
 async fn date_filters_select_findings_inside_the_window_they_name() {
     // Two findings a known distance apart, so an absolute window and a relative one
-    // can each pick out exactly one of them.
+    // can each pick out exactly one of them. The recent one's timestamps are taken
+    // from the CLOCK rather than written down: a `DateRange` is "measured back from
+    // now", so a fixed instant would stop being inside a one-day window as soon as
+    // the day it was written passed.
     let mut old = base_finding("date-old");
     old["CreatedAt"] = json!("2020-01-01T00:00:00Z");
     old["UpdatedAt"] = json!("2020-01-02T00:00:00Z");

@@ -7,7 +7,11 @@
 //! it. A rule owns an ordered list of targets. `PutRule` creates or replaces a
 //! rule, `PutTargets`/`RemoveTargets` upsert and remove its targets by `Id`,
 //! `DescribeRule`/`ListRules`/`ListTargetsByRule` report them, and `DeleteRule`
-//! removes one. `PutEvents` is the data plane: it routes a published event to
+//! removes one. A bus also carries its own mutable configuration, which
+//! `CreateEventBus` and `UpdateEventBus` write and `DescribeEventBus` reports,
+//! and its resource policy ([`BusPolicy`]): the statements `PutPermission`
+//! installs and `RemovePermission` revokes. `PutEvents` is the data plane: it
+//! routes a published event to
 //! every enabled rule on the entry's bus whose `EventPattern` matches, and
 //! appends what it routed to [`ComAmazonawsEventbridgeAwseventsState::delivered`]
 //! so the delivery is observable state rather than a discarded side effect.
@@ -38,6 +42,10 @@ pub const FALLBACK_REGION: &str = "us-east-1";
 /// This service's ARN namespace (`OPERATIONS.md`, "Wire protocol").
 pub const ARN_NAMESPACE: &str = "events";
 
+/// The ARN namespace of the Key Management Service, whose keys an event bus is
+/// encrypted with ([`kms_key_identifier`]).
+pub const KMS_ARN_NAMESPACE: &str = "kms";
+
 /// The `RuleState` a rule takes when `PutRule` omits `State`: "Rules are
 /// enabled by default, or based on value of the state" (`PutRule`).
 pub const DEFAULT_RULE_STATE: &str = "ENABLED";
@@ -45,6 +53,13 @@ pub const DEFAULT_RULE_STATE: &str = "ENABLED";
 /// What a handler reports when the engine it was built on carries no store for
 /// this service — a server fault, never a bad request.
 pub const STORE_UNAVAILABLE: &str = "the eventbridge state store is unavailable";
+
+/// What `RemovePermission` reports for a `StatementId` the bus's resource policy
+/// carries no statement for.
+///
+/// EventBridge's own wording for that refusal, which names no statement id: the
+/// id is in the request the caller sent.
+pub const NO_SUCH_POLICY_STATEMENT: &str = "Statement with the provided id does not exist.";
 
 /// Largest page a list operation returns, and the page size it uses when the
 /// request names no `Limit`.
@@ -124,6 +139,28 @@ pub const MAX_DELIVERED_BYTES: usize = 8_000_000;
 /// exhausts it is REFUSED with a message saying so rather than silently
 /// reported as matching nothing.
 pub const MAX_MATCH_BYTES_PER_ENTRY: u64 = 32_000_000;
+
+/// The `Version` an event-bus resource policy document carries.
+///
+/// IAM's current policy language version, which is what EventBridge assembles a
+/// bus policy under; a policy document supplied whole by a caller keeps its own
+/// `Version` ([`EventBus::install_policy_document`]).
+pub const POLICY_VERSION: &str = "2012-10-17";
+
+/// The `Effect` a permission grant installs.
+///
+/// `PutPermission` "permits the specified Amazon Web Services account or Amazon
+/// Web Services organization to put events to the specified event bus" — a
+/// grant, so the statement it installs allows.
+pub const POLICY_EFFECT_ALLOW: &str = "Allow";
+
+/// Largest an event bus's resource policy may be, in bytes.
+///
+/// "The permission policy on the event bus cannot exceed 10 KB in size"
+/// (`PutPermission`'s own documentation), so a statement that would push the
+/// assembled document past it is refused with the modelled
+/// `PolicyLengthExceededException` instead of being stored.
+pub const MAX_POLICY_BYTES: usize = 10 * 1024;
 
 /// The size AWS documents for one `PutEvents` entry ("Calculating PutEvents
 /// event entry size"): 14 bytes when `Time` is set, plus the UTF-8 length of
@@ -222,6 +259,23 @@ impl RuleRecord {
     }
 }
 
+/// One statement of an event bus's resource policy.
+///
+/// `body` is the statement as it will be serialized into the policy document
+/// `DescribeEventBus` reports, so the document is assembled by concatenation and
+/// no statement is re-rendered on a read. `sid` is the statement's `Sid`, which
+/// is what `PutPermission` and `RemovePermission` address a statement by ("If
+/// you later want to revoke the permission for this external account, specify
+/// this StatementId when you run RemovePermission. Each StatementId must be
+/// unique") — `None` for a statement that arrived inside a whole policy document
+/// carrying no `Sid`, which is therefore addressable only by replacing the
+/// document.
+#[derive(Debug, Clone)]
+pub struct PolicyStatement {
+    pub sid: Option<String>,
+    pub body: String,
+}
+
 /// An event bus and the rules bound to it.
 ///
 /// The bus's ARN is NOT stored: an ARN's region segment comes from the request
@@ -237,10 +291,11 @@ pub struct EventBus {
     /// operation that changes the bus runs, so `LastModifiedTime` is never
     /// earlier than `CreationTime`.
     pub last_modified: SystemTime,
-    /// The KMS key `CreateEventBus` was given, if any: "If you do not specify a
-    /// customer managed key identifier, EventBridge uses an Amazon Web Services
-    /// owned key" (`CreateEventBus`'s `KmsKeyIdentifier`), and an owned key is
-    /// not reported back, so an absent member stays absent.
+    /// The customer managed key this bus encrypts events with, as the ARN of the
+    /// KMS resource the write named ([`kms_key_identifier`]). "If you do not
+    /// specify a customer managed key identifier, EventBridge uses an Amazon Web
+    /// Services owned key" (`CreateEventBus`'s `KmsKeyIdentifier`), and an owned
+    /// key is not reported back, so an absent member stays absent.
     pub kms_key_identifier: Option<String>,
     /// The dead-letter queue configuration, as it was stored.
     pub dead_letter_config: Option<DeadLetterConfig>,
@@ -253,6 +308,10 @@ pub struct EventBus {
     /// The tags `CreateEventBus` was given, in the order they arrived, so the
     /// tagging operations report back exactly what was stored.
     pub tags: Vec<Tag>,
+    /// This bus's resource policy, as `PutPermission` installed it. Empty for a
+    /// bus nothing has granted a permission on, which is why `DescribeEventBus`
+    /// reports no `Policy` for one.
+    pub policy: BusPolicy,
     /// Rules by name, so enumeration is deterministic and `ListRules` can
     /// resume after a page token.
     pub rules: BTreeMap<String, RuleRecord>,
@@ -272,9 +331,199 @@ impl EventBus {
             log_config: None,
             event_source_name: None,
             tags: Vec::new(),
+            policy: BusPolicy::default(),
             rules: BTreeMap::new(),
         }
     }
+}
+
+/// An event bus's resource policy.
+///
+/// Two shapes of the same policy, because `PutPermission` installs one in two
+/// ways: a grant it describes member by member (`StatementId`, `Action`,
+/// `Principal`, `Condition`), which this service assembles into a statement, or
+/// a whole `Policy` document the caller wrote. A document a caller wrote is
+/// reported back BYTE FOR BYTE as it was installed — re-rendering it would hand
+/// a read-modify-write client back a document it did not write — while a policy
+/// assembled from grants is rendered from the statements
+/// ([`Self::document`]).
+#[derive(Debug, Clone, Default)]
+pub struct BusPolicy {
+    /// The statements of this policy, in the order they were installed. Also
+    /// filled in from a document a caller supplied whole, so a later grant
+    /// addressing a `Sid` of that document finds it.
+    pub statements: Vec<PolicyStatement>,
+    /// The document as the caller supplied it, when the whole policy arrived as
+    /// one; `None` once a grant has changed the policy, because the stored
+    /// statements are then no longer the ones that text describes.
+    pub supplied: Option<String>,
+    /// The policy language `Version`, from a supplied document or
+    /// [`POLICY_VERSION`] for a policy assembled from grants.
+    pub version: Option<String>,
+}
+
+impl BusPolicy {
+    /// This policy as the JSON document `DescribeEventBus` reports in `Policy`,
+    /// or `None` when nothing has been installed.
+    ///
+    /// "The policy that enables the external account to send events to your
+    /// account" (`DescribeEventBus`'s `Policy`) is an IAM resource policy: a
+    /// `Version` and the statements installed on the bus. A bus with no
+    /// statement has no policy at all, so the member stays ABSENT rather than
+    /// reporting an empty document.
+    pub fn document(&self) -> Option<String> {
+        if let Some(supplied) = &self.supplied {
+            return Some(supplied.clone());
+        }
+        if self.statements.is_empty() {
+            return None;
+        }
+        let body = self
+            .statements
+            .iter()
+            .map(|statement| statement.body.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!(
+            "{{\"Version\":{},\"Statement\":[{body}]}}",
+            json_text(self.version.as_deref().unwrap_or(POLICY_VERSION))
+        ))
+    }
+
+    /// Add `statement` to this policy, REPLACING the one carrying the same `Sid`
+    /// in place when there is one.
+    ///
+    /// A `StatementId` identifies the grant ("Each StatementId must be
+    /// unique"), so granting again under an id already installed changes that
+    /// one grant and leaves every other statement, and their order, alone.
+    pub fn install_statement(&mut self, statement: PolicyStatement) {
+        let existing = statement.sid.as_deref().and_then(|sid| {
+            self.statements
+                .iter()
+                .position(|held| held.sid.as_deref() == Some(sid))
+        });
+        match existing {
+            Some(at) => self.statements[at] = statement,
+            None => self.statements.push(statement),
+        }
+        // The supplied text no longer describes these statements.
+        self.supplied = None;
+    }
+
+    /// Remove the statement carrying `sid`, reporting whether one was held.
+    ///
+    /// A statement that arrived inside a document a caller supplied whole is
+    /// removable too, by the `Sid` that document gave it; the remaining
+    /// statements are then reported as this service renders them, because the
+    /// supplied text no longer describes the policy.
+    pub fn remove_statement(&mut self, sid: &str) -> bool {
+        let before = self.statements.len();
+        self.statements
+            .retain(|held| held.sid.as_deref() != Some(sid));
+        let removed = self.statements.len() != before;
+        if removed {
+            self.supplied = None;
+        }
+        removed
+    }
+}
+
+/// `value` as a JSON string literal, escaped.
+///
+/// The policy document is assembled member by member rather than through a
+/// `serde_json` object, because a policy statement's members have a published
+/// ORDER (`Sid`, `Effect`, `Principal`, `Action`, `Resource`, `Condition`) and
+/// this crate's `serde_json` orders an object's keys alphabetically. Every value
+/// that goes into it still passes through `serde_json`, so escaping is never
+/// hand-rolled.
+fn json_text(value: &str) -> String {
+    ::serde_json::Value::String(value.to_string()).to_string()
+}
+
+/// The policy statement a permission grant installs on an event bus.
+///
+/// `PutPermission` grants `action` on the bus `resource` names to `principal`,
+/// so the statement is that grant written in the IAM policy language: the
+/// request's `StatementId` as the `Sid`, [`POLICY_EFFECT_ALLOW`], the principal
+/// under `Principal.AWS`, the action and the bus ARN as the `Resource`, in that
+/// member order. The principal is written AS THE REQUEST GAVE IT — "the
+/// 12-digit Amazon Web Services account ID that you are permitting to put events
+/// to your default event bus. Specify "*" to permit any account" — so an account
+/// id stays an account id (the policy language also admits that account's
+/// root-user ARN, but EventBridge installs what it was given) and `*` stays the
+/// wildcard. `condition` is `Condition`'s `Type`, `Key` and `Value`, which "must
+/// contain Type, Key, and Value fields" and render as the IAM condition block
+/// `{<Type>: {<Key>: <Value>}}`.
+pub fn permission_statement(
+    sid: &str,
+    action: &str,
+    principal: &str,
+    resource: &str,
+    condition: Option<(&str, &str, &str)>,
+) -> PolicyStatement {
+    let mut body = format!(
+        "{{\"Sid\":{},\"Effect\":{},\"Principal\":{{\"AWS\":{}}},\"Action\":{},\"Resource\":{}",
+        json_text(sid),
+        json_text(POLICY_EFFECT_ALLOW),
+        json_text(principal),
+        json_text(action),
+        json_text(resource),
+    );
+    if let Some((kind, key, value)) = condition {
+        body.push_str(&format!(
+            ",\"Condition\":{{{}:{{{}:{}}}}}",
+            json_text(kind),
+            json_text(key),
+            json_text(value),
+        ));
+    }
+    body.push('}');
+    PolicyStatement {
+        sid: Some(sid.to_string()),
+        body,
+    }
+}
+
+/// The policy a caller supplied as one whole document, or why it is not a
+/// policy document.
+///
+/// A policy document is an object carrying `Statement`, either one statement
+/// object or a list of them. The TEXT is kept as it arrived, so
+/// `DescribeEventBus` reports back exactly the document that was installed;
+/// each statement is also kept beside it, with its own `Sid`, so a later grant
+/// naming that id addresses it.
+pub fn parse_policy_document(document: &str) -> Result<BusPolicy, String> {
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
+        .map_err(|error| format!("it is not a JSON document ({error})"))?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| "a policy document is a JSON object".to_string())?;
+    let statements = match object.get("Statement") {
+        Some(::serde_json::Value::Array(items)) => items.clone(),
+        Some(item @ ::serde_json::Value::Object(_)) => vec![item.clone()],
+        _ => return Err("a policy document carries a Statement member".to_string()),
+    };
+    let mut parsed_statements = Vec::with_capacity(statements.len());
+    for statement in statements {
+        if !statement.is_object() {
+            return Err("every statement of a policy document is a JSON object".to_string());
+        }
+        parsed_statements.push(PolicyStatement {
+            sid: statement
+                .get("Sid")
+                .and_then(::serde_json::Value::as_str)
+                .map(str::to_string),
+            body: statement.to_string(),
+        });
+    }
+    Ok(BusPolicy {
+        statements: parsed_statements,
+        supplied: Some(document.to_string()),
+        version: object
+            .get("Version")
+            .and_then(::serde_json::Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 /// One published event and where it was routed: the routing log `PutEvents`
@@ -501,7 +750,7 @@ pub fn is_rule_state(value: &str) -> bool {
 /// validator does not narrow an enum-typed string to its values, so a value the
 /// enum does not admit is refused here rather than stored and later reported
 /// back as if EventBridge had accepted it. Written once, so `CreateEventBus` and
-/// (later) `UpdateEventBus` refuse the same values.
+/// `UpdateEventBus` refuse the same values.
 pub fn log_config_violation(config: &LogConfig) -> Option<String> {
     for (member, value, admitted) in [
         ("IncludeDetail", config.include_detail.as_deref(), INCLUDE_DETAIL_VALUES),
@@ -561,6 +810,28 @@ pub fn is_arn(value: &str) -> bool {
         return false;
     };
     !partition.is_empty() && !service.is_empty() && !resource.is_empty()
+}
+
+/// The identifier an event bus's customer managed key is reported back under:
+/// the ARN of the KMS resource the identifier names.
+///
+/// "The identifier can be the key Amazon Resource Name (ARN), KeyId, key alias,
+/// or key alias ARN" (`CreateEventBus`'s `KmsKeyIdentifier`) — four spellings of
+/// one key, of which only the ARN says which account and region the key is in.
+/// EventBridge reports the key it stored, so an identifier that is not already
+/// an ARN is completed into one in the caller's region and this account, and an
+/// identifier that IS an ARN is reported as it stands. A bare alias (`alias/x`)
+/// already names its KMS resource type; anything else is a key id.
+pub fn kms_key_identifier(region: &str, identifier: &str) -> String {
+    if identifier.is_empty() || identifier.starts_with("arn:") {
+        return identifier.to_string();
+    }
+    let resource = if identifier.starts_with("alias/") {
+        identifier.to_string()
+    } else {
+        format!("key/{identifier}")
+    };
+    ::engine::emulator_arn(KMS_ARN_NAMESPACE, region, &resource)
 }
 
 /// A server clock reading as the wire `DateTime` a timestamp member carries.

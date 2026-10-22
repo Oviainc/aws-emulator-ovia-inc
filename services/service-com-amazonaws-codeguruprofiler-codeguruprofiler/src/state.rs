@@ -350,6 +350,19 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         names
     }
 
+    /// The stored group an ARN identifies, or `None` when this store holds no resource
+    /// with that ARN. An ARN identifies ONE resource, so the stored ARN must match the
+    /// one asked about in full: a group of the same name in another region, partition or
+    /// account is a different resource and is not found here.
+    ///
+    /// Pair it with [`profiling_group_name_from_arn`], which separates "not a
+    /// profiling-group ARN at all" (a bad request) from "no such profiling group"
+    /// (a 404).
+    pub fn group_by_arn_mut(&mut self, arn: &str) -> Option<&mut ProfilingGroup> {
+        let group = self.groups.get_mut(profiling_group_name_from_arn(arn)?)?;
+        (group.arn == arn).then_some(group)
+    }
+
     /// Store a posted agent profile, honouring `profile_token` as an idempotency token
     /// and every retention bound: the per-group count and byte caps, and the
     /// store-wide [`MAX_RETAINED_PROFILE_BYTES`] budget, which evicts the oldest
@@ -438,6 +451,37 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         }
         oldest.map(|(name, index, _)| (name, index))
     }
+}
+
+/// The resource-type prefix a profiling-group ARN carries in its resource field, as
+/// [`profiling_group_arn`] mints it: `profilingGroup/<name>`.
+pub const PROFILING_GROUP_RESOURCE_PREFIX: &str = "profilingGroup/";
+
+/// The profiling-group name a `ProfilingGroupArn` names, or `None` when the string is
+/// not a profiling-group ARN of this service.
+///
+/// `ProfilingGroupArn` carries an `aws.api#arnReference` to
+/// `AWS::CodeGuruProfiler::ProfilingGroup` and no length or pattern constraint, so the
+/// boundary validator accepts any string and the SHAPE of the ARN is the handler's to
+/// check. What an ARN IS — the six fields, the literal `arn`, the non-empty partition,
+/// vendor and resource — is read by the tree's one parse,
+/// [`service_common::arn::parse_of`], narrowed to this service's
+/// [`ARN_NAMESPACE`]; only the part that is specific to this service is decided here:
+/// its resources are the profiling groups, so a resource field that is not a
+/// `profilingGroup/<name>` names nothing a tagging operation can act on.
+pub fn profiling_group_name_from_arn(arn: &str) -> Option<&str> {
+    let parsed = ::service_common::arn::parse_of(arn, ARN_NAMESPACE)?;
+    let name = parsed
+        .resource
+        .strip_prefix(PROFILING_GROUP_RESOURCE_PREFIX)?;
+    // A profiling-group name is one path segment (the modelled `ProfilingGroupName`
+    // pattern is `^[\w-]+$`), so an empty name or a further `/` is not one of this
+    // service's resources. `parse_of` keeps the resource field's own colons, so this
+    // check is on the name as the ARN carries it.
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name)
 }
 
 /// One instant as an EXACTLY comparable key: whole seconds and sub-second nanoseconds.

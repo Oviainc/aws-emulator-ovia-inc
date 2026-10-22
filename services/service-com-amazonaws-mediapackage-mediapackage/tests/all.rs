@@ -21,5 +21,7 @@ mod ingest_credentials;
 mod mutation_persistence;
 #[path = "all/origin_endpoint_defaults.rs"]
 mod origin_endpoint_defaults;
+#[path = "all/rotate_channel_credentials.rs"]
+mod rotate_channel_credentials;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

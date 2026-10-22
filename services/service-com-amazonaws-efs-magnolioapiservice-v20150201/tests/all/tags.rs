@@ -30,7 +30,7 @@ async fn describe_tags(efs: &Emulator, file_system_id: &str, query: &str) -> Rep
 }
 
 /// A `(Key, Value)` table as the modelled `Tags` list.
-fn tags_json(tags: &[(String, String)]) -> Value {
+pub(crate) fn tags_json(tags: &[(String, String)]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
@@ -39,7 +39,7 @@ fn tags_json(tags: &[(String, String)]) -> Value {
 }
 
 /// The `Tags` of a reply as `(Key, Value)` pairs, in the order the service reported.
-fn reported(reply: &Reply) -> Vec<(String, String)> {
+pub(crate) fn reported(reply: &Reply) -> Vec<(String, String)> {
     reply
         .get("Tags")
         .as_array()
@@ -58,14 +58,14 @@ fn reported(reply: &Reply) -> Vec<(String, String)> {
 /// The same pairs ordered by key, so a set is compared against a set: "The order of tags
 /// returned in the response of one DescribeTags call … is unspecified", so no assertion
 /// about the whole set may depend on that order.
-fn as_set(pairs: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn as_set(pairs: &[(String, String)]) -> Vec<(String, String)> {
     let mut sorted = pairs.to_vec();
     sorted.sort();
     sorted
 }
 
 /// `index` distinct tags, which is what the size-varying rows are built from.
-fn numbered_tags(count: usize) -> Vec<(String, String)> {
+pub(crate) fn numbered_tags(count: usize) -> Vec<(String, String)> {
     (0..count)
         .map(|index| (format!("key-{index:02}"), format!("value-{index}")))
         .collect()

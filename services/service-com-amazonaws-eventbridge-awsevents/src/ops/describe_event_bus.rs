@@ -169,9 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_identifier: bus.kms_key_identifier.clone(),
             dead_letter_config: bus.dead_letter_config.clone(),
             // "The policy that enables the external account to send events to
-            // your account" — set by `PutPermission`, which no stored bus has
-            // been through, so there is no policy to report.
-            policy: None,
+            // your account": the document assembled from the statements
+            // `PutPermission` installed on this bus, and absent while no
+            // statement is installed.
+            policy: bus.policy.document(),
             log_config: bus.log_config.clone(),
             creation_time: Some(crate::state::to_wire_timestamp(bus.created)),
             last_modified_time: Some(crate::state::to_wire_timestamp(bus.last_modified)),

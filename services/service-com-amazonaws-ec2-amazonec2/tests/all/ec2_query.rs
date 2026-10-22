@@ -45,6 +45,9 @@ fn form_value(value: &str) -> String {
             '%' => "%25".to_string(),
             ' ' => "%20".to_string(),
             '\\' => "%5C".to_string(),
+            // Historically accepted as a field separator beside `&`, so a value carrying
+            // one is encoded rather than left to the parser's reading of it.
+            ';' => "%3B".to_string(),
             other => other.to_string(),
         })
         .collect()

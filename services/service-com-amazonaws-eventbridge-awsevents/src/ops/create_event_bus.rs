@@ -243,7 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut bus = crate::state::EventBus::new(&input.name, created);
         bus.description = input.description;
-        bus.kms_key_identifier = input.kms_key_identifier;
+        // An identifier that is not already an ARN names a key in this account
+        // and region; the bus reports back the key it stored.
+        bus.kms_key_identifier = input
+            .kms_key_identifier
+            .as_deref()
+            .map(|identifier| crate::state::kms_key_identifier(&region, identifier));
         bus.dead_letter_config = input.dead_letter_config;
         bus.log_config = input.log_config;
         bus.tags = input.tags.unwrap_or_default();

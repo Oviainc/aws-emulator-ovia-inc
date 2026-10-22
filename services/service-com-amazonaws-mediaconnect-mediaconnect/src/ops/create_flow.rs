@@ -174,11 +174,18 @@ fn materialise_source(
         sender_ip_address: request.sender_ip_address.clone(),
         sender_control_port: request.sender_control_port,
         decryption: request.decryption.clone(),
+        // What the request asked for; the state the source REPORTS is resolved by
+        // `crate::state::reported_router_integration_state`, which gives a source whose
+        // request never mentioned router integration the disabled state.
+        router_integration_state: request.router_integration_state.clone(),
+        router_integration_transit_decryption: request
+            .router_integration_transit_decryption
+            .clone(),
         // `Transport.Protocol` is required, so a source that names no protocol (an
         // entitled one, say) carries no transport rather than an empty one.
         transport: request.protocol.clone().map(|protocol| Transport {
+            max_bitrate: crate::state::assigned_source_max_bitrate(&protocol, request.max_bitrate),
             protocol,
-            max_bitrate: request.max_bitrate,
             max_latency: request.max_latency,
             max_sync_buffer: request.max_sync_buffer,
             min_latency: request.min_latency,
@@ -493,7 +500,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 maintenance_deadline: None,
                 maintenance_scheduled_date: None,
             }),
-            source_failover_config: input.source_failover_config.clone(),
+            source_failover_config: input
+                .source_failover_config
+                .clone()
+                .map(crate::state::resolved_failover_config),
             source_monitoring_config: input.source_monitoring_config.clone(),
             ndi_config: input.ndi_config.clone(),
             encoding_config: input.encoding_config.clone(),

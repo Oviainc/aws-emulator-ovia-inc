@@ -150,11 +150,39 @@ fn name_of_length(len: usize) -> String {
     "b".repeat(len)
 }
 
+/// The identifier a bus reports its customer managed key under: the ARN of the
+/// KMS resource the request's identifier names.
+///
+/// `KmsKeyIdentifier` admits four spellings of one key — "the key Amazon
+/// Resource Name (ARN), KeyId, key alias, or key alias ARN"
+/// (`smithy_query(query="doc", shape="CreateEventBusRequest",
+/// member="KmsKeyIdentifier")`) — and EventBridge reports the key it stored as an
+/// ARN, so a spelling that is not already an ARN is completed into one in the
+/// caller's region and account. Written here independently of the
+/// implementation.
+fn expected_kms_identifier(requested: &str) -> Value {
+    if requested.is_empty() || requested.starts_with("arn:") {
+        return json!(requested);
+    }
+    let resource = if requested.starts_with("alias/") {
+        requested.to_string()
+    } else {
+        format!("key/{requested}")
+    };
+    json!(format!("arn:aws:kms:{REGION}:{}:{resource}", account()))
+}
+
 /// Every member of `request` that `CreateEventBus` echoes, compared against
 /// `reported` — an absent member must stay absent, never become a default.
 fn assert_echoes_request(case: &str, source: &str, request: &Value, reported: &Value) {
     for member in ECHOED_MEMBERS {
-        let expected = request.get(member).cloned().unwrap_or(Value::Null);
+        let requested = request.get(member).cloned().unwrap_or(Value::Null);
+        // The one member that is not echoed verbatim: a key identifier is
+        // reported as the ARN of the KMS resource it names.
+        let expected = match (member, requested.as_str()) {
+            ("KmsKeyIdentifier", Some(identifier)) => expected_kms_identifier(identifier),
+            _ => requested,
+        };
         let actual = reported.get(member).cloned().unwrap_or(Value::Null);
         assert_eq!(
             actual, expected,

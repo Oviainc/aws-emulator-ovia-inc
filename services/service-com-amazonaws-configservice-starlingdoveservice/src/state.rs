@@ -15,11 +15,12 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AccountAggregationSource, AggregatorFilters, ComplianceContributorCount, ComplianceSummary,
-    ConfigRule, ConfigSnapshotDeliveryProperties, ConfigurationAggregator, ConfigurationRecorder,
+    ConfigExportDeliveryInfo, ConfigRule, ConfigSnapshotDeliveryProperties,
+    ConfigStreamDeliveryInfo, ConfigurationAggregator, ConfigurationRecorder,
     ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
-    EvaluationModeConfiguration,
-    ExclusionByResourceTypes, OrganizationAggregationSource, PendingAggregationRequest,
-    RecordingGroup, RecordingMode, RecordingStrategy, Scope, Source, Tag,
+    DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
+    OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup, RecordingMode,
+    RecordingStrategy, Scope, Source, Tag,
 };
 
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
@@ -120,6 +121,49 @@ pub const COMPLIANCE_SUMMARY_RULE_CAP: i32 = 25;
 
 /// `Owner` value for a Custom Policy rule (`com.amazonaws.configservice#Owner`).
 pub const OWNER_CUSTOM_POLICY: &str = "CUSTOM_POLICY";
+
+/// `DeliveryStatus` values (`com.amazonaws.configservice#DeliveryStatus`, whose
+/// members are `Success`, `Failure` and `Not_Applicable`).
+pub const DELIVERY_STATUS_SUCCESS: &str = "Success";
+/// See [`DELIVERY_STATUS_SUCCESS`]. `ConfigStreamDeliveryInfo$lastStatus` documents
+/// when this value applies: "Providing an SNS topic on a DeliveryChannel for Config
+/// is optional. If the SNS delivery is turned off, the last status will be
+/// Not_Applicable."
+pub const DELIVERY_STATUS_NOT_APPLICABLE: &str = "Not_Applicable";
+
+/// The `deliveryFrequency` a delivery channel delivers configuration snapshots at
+/// when its `ConfigSnapshotDeliveryProperties` names none.
+///
+/// The model declares no default for `ConfigSnapshotDeliveryProperties$deliveryFrequency`,
+/// so this is CHOSEN: the least frequent published `MaximumExecutionFrequency` value
+/// (`com.amazonaws.configservice#MaximumExecutionFrequency`), which is also the
+/// snapshot frequency Config offers by default when a channel is set up without one.
+pub const DEFAULT_SNAPSHOT_DELIVERY_FREQUENCY: &str = "TwentyFour_Hours";
+
+/// How often a delivery channel delivers a configuration history file.
+///
+/// AWS Config Developer Guide, *Delivering configuration items*: "Config sends a new
+/// configuration history file to your Amazon S3 bucket every six hours." The history
+/// schedule is fixed, so it is independent of the snapshot `deliveryFrequency`.
+pub const CONFIG_HISTORY_DELIVERY_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// The interval a `MaximumExecutionFrequency` value names, or `None` for a value this
+/// enum does not publish.
+///
+/// The five values (`One_Hour`, `Three_Hours`, `Six_Hours`, `Twelve_Hours`,
+/// `TwentyFour_Hours`) come from `com.amazonaws.configservice#MaximumExecutionFrequency`
+/// and each spells the number of hours between two deliveries.
+pub fn delivery_frequency_interval(frequency: &str) -> Option<Duration> {
+    let hours: u64 = match frequency {
+        "One_Hour" => 1,
+        "Three_Hours" => 3,
+        "Six_Hours" => 6,
+        "Twelve_Hours" => 12,
+        "TwentyFour_Hours" => 24,
+        _ => return None,
+    };
+    Some(Duration::from_secs(hours * 3600))
+}
 
 /// How long after `StartConfigurationRecorder` the recorder's `Pending` recording
 /// event resolves to `Success`.
@@ -287,7 +331,7 @@ impl RecorderStatusEntry {
 }
 
 /// One persisted delivery channel.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DeliveryChannelEntry {
     pub name: String,
     pub s3_bucket_name: Option<String>,
@@ -295,6 +339,11 @@ pub struct DeliveryChannelEntry {
     pub s3_kms_key_arn: Option<String>,
     pub sns_topic_arn: Option<String>,
     pub config_snapshot_delivery_properties: Option<ConfigSnapshotDeliveryProperties>,
+    /// When this channel was created. It anchors the channel's periodic delivery
+    /// schedule, so the first delivery of each kind falls one interval after it and
+    /// `DescribeDeliveryChannelStatus` derives every reported instant from it. An
+    /// update keeps the instant the channel was first created.
+    pub created_at: SystemTime,
 }
 
 impl DeliveryChannelEntry {
@@ -308,6 +357,91 @@ impl DeliveryChannelEntry {
             sns_topic_arn: self.sns_topic_arn.clone(),
             config_snapshot_delivery_properties: self.config_snapshot_delivery_properties.clone(),
         }
+    }
+
+    /// The `deliveryFrequency` this channel delivers configuration snapshots at: the
+    /// one its `ConfigSnapshotDeliveryProperties` names, else
+    /// [`DEFAULT_SNAPSHOT_DELIVERY_FREQUENCY`].
+    pub fn snapshot_delivery_frequency(&self) -> &str {
+        self.config_snapshot_delivery_properties
+            .as_ref()
+            .and_then(|properties| properties.delivery_frequency.as_deref())
+            .unwrap_or(DEFAULT_SNAPSHOT_DELIVERY_FREQUENCY)
+    }
+
+    /// The interval between two configuration-snapshot deliveries of this channel.
+    ///
+    /// A `deliveryFrequency` outside the published enum cannot reach state — the
+    /// modelled constraint refuses it before a handler runs — so the default interval
+    /// stands in for it rather than this returning no schedule at all.
+    pub fn snapshot_delivery_interval(&self) -> Duration {
+        delivery_frequency_interval(self.snapshot_delivery_frequency()).unwrap_or_else(|| {
+            delivery_frequency_interval(DEFAULT_SNAPSHOT_DELIVERY_FREQUENCY)
+                .expect("the default snapshot delivery frequency is a published value")
+        })
+    }
+
+    /// The status of this channel as of `now`, DERIVED from the delivery schedule its
+    /// creation instant anchors: nothing here is stored at write time and reading it
+    /// changes no state, so two callers reading at the same instant see the same thing.
+    pub fn status_at(&self, now: SystemTime) -> DeliveryChannelStatus {
+        DeliveryChannelStatus {
+            name: Some(self.name.clone()),
+            config_snapshot_delivery_info: Some(
+                self.export_delivery_info(now, self.snapshot_delivery_interval()),
+            ),
+            config_history_delivery_info: Some(
+                self.export_delivery_info(now, CONFIG_HISTORY_DELIVERY_INTERVAL),
+            ),
+            config_stream_delivery_info: self.stream_delivery_info(),
+        }
+    }
+
+    /// The delivery info of one periodic export (the snapshot or the configuration
+    /// history) as of `now`, for a schedule that delivers every `interval`.
+    ///
+    /// Exactly `floor((now - created_at) / interval)` deliveries are behind us, so the
+    /// next one falls one interval after the last of them — strictly after `now`, and
+    /// never more than one interval after it. Before the first delivery there is no
+    /// attempt to report, so only `nextDeliveryTime` carries a value.
+    fn export_delivery_info(&self, now: SystemTime, interval: Duration) -> ConfigExportDeliveryInfo {
+        let interval_secs = interval.as_secs().max(1);
+        let elapsed = now
+            .duration_since(self.created_at)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let delivered = elapsed / interval_secs;
+        let last_delivery = (delivered > 0)
+            .then(|| self.created_at + Duration::from_secs(delivered * interval_secs));
+        let next_delivery = self.created_at + Duration::from_secs((delivered + 1) * interval_secs);
+
+        ConfigExportDeliveryInfo {
+            last_status: last_delivery.map(|_| DELIVERY_STATUS_SUCCESS.to_string()),
+            last_error_code: None,
+            last_error_message: None,
+            last_attempt_time: last_delivery.map(timestamp),
+            last_successful_time: last_delivery.map(timestamp),
+            next_delivery_time: Some(timestamp(next_delivery)),
+        }
+    }
+
+    /// The configuration-stream delivery info of this channel.
+    ///
+    /// A channel carrying no `snsTopicARN` has SNS delivery turned off, which
+    /// `ConfigStreamDeliveryInfo$lastStatus` documents as `Not_Applicable`; that status
+    /// was reached when the channel was created without a topic. With a topic
+    /// configured the status is the one of the last notification Config streamed, and
+    /// this emulator has streamed none, so there is nothing to report.
+    fn stream_delivery_info(&self) -> Option<ConfigStreamDeliveryInfo> {
+        if self.sns_topic_arn.is_some() {
+            return None;
+        }
+        Some(ConfigStreamDeliveryInfo {
+            last_status: Some(DELIVERY_STATUS_NOT_APPLICABLE.to_string()),
+            last_error_code: None,
+            last_error_message: None,
+            last_status_change_time: Some(timestamp(self.created_at)),
+        })
     }
 }
 

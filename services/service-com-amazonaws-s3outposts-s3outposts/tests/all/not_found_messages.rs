@@ -35,7 +35,7 @@ const OUTPOST_MISSING: &str =
 /// Every branch of `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$`, with the Message its
 /// form selects. Source of the catalogue:
 /// `smithy_query(query="shape", shape="OutpostId")`. None of these ids is in the store:
-/// the seeded Outposts are discovered through the API by the cases below.
+/// the provisioned Outposts are discovered through the API by the cases below.
 ///
 /// Rows differ along what the rule generalises over — the branch of the pattern, and
 /// within a branch the actual characters, including the `ec2` branch the issue did not
@@ -198,7 +198,7 @@ async fn an_unresolvable_endpoint_under_a_resolvable_outpost_carries_the_same_te
     for outpost_id in owned.iter().chain(std::iter::once(&shared)) {
         assert!(
             outpost_id.starts_with("op-"),
-            "case {outpost_id:?}: this case assumes a seeded Outpost in the op- branch"
+            "case {outpost_id:?}: this case assumes a provisioned Outpost in the op- branch"
         );
     }
 

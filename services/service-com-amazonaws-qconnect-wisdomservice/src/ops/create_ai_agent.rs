@@ -5,6 +5,14 @@
 //! asserts NOTHING about `CreateAIAgent`'s real behaviour. Implement it here — this is
 //! the ONLY file to touch for this operation.
 //!
+//! ONE request it does NOT answer 501 for: a create whose `assistantId` names no
+//! assistant this account holds. An AI agent is created inside an assistant, so a parent
+//! that is not there is a CLIENT error the model names — `ResourceNotFoundException`
+//! (HTTP 404) — and that is the recorded wire answer for such a request. An unwritten
+//! success path must not report a client's bad request as a server fault, so the parent
+//! is resolved first and refused with the modelled error; everything past that
+//! resolution is still unwritten and still answers 501.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateAIAgent::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -171,18 +179,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAIAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAIAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateAIAgent")
+        })?;
+
+        // The parent assistant is resolved before anything else: an AI agent lives
+        // inside an assistant, so a create naming one this account does not hold is the
+        // modelled `ResourceNotFoundException` (HTTP 404) — a client error, which a 501
+        // would misreport as a server fault.
+        if state.lock().assistant(&input.assistant_id).is_none() {
+            return Err(CreateAIAgentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
+                    resource_name: Some(input.assistant_id.clone()),
+                },
+            )
+            .into());
+        }
+
+        // The parent exists, so this is a request the operation would have to SERVE, and
+        // minting an AI agent is not written yet: 501 says "nobody has written it yet".
+        // Implement it here (and delete the SCAFFOLDED marker at the top of this file)
+        // by storing an AI agent under its assistant and answering out of the stored
+        // record, the way `CreateSession` does. Return modeled failures as
+        // `Err(CreateAIAgentErrorModeled::Variant(..).into())` — the `From` impl above
+        // lifts it; refuse a bad request this operation models no error for with
+        // `Err(crate::scaffolded::Scaffolded::validation(".."))`, never with a 501.
         Err(crate::scaffolded::Scaffolded::not_implemented("CreateAIAgent"))
     }
 }

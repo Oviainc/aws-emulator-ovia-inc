@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the connector the request names, in this service's own state: every member
+//! the request names replaces the stored one, a member it leaves out is left alone, and
+//! the configuration the connector would HAVE after the update must satisfy the same
+//! documented cross-member requirements `CreateConnector` enforces — so the invariant
+//! belongs to the stored connector rather than to one write path. A `ConnectorId` the
+//! store does not hold answers the service's not-found error, and nothing is written for
+//! a request that is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +183,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnector"))
+        use crate::state as st;
+
+        // This operation reads no request metadata (a connector's ARN was built from the
+        // signed region when it was created); the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConnectorErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        let Some(stored) = guard.connectors.get_mut(&input.connector_id) else {
+            return Err(st::not_found(
+                UpdateConnectorErrorModeled::ResourceNotFoundException(st::unknown_connector(
+                    &input.connector_id,
+                )),
+            ));
+        };
+
+        // The configuration the connector would HAVE after this update, built from "what
+        // the request names, else what the connector has", and refused BEFORE anything is
+        // written. `EgressType` is create-and-read — no update member names it — and
+        // `EgressConfig` here MODIFIES the settings a VPC Lattice connector already has.
+        let next_url = match input.url.as_deref() {
+            // A blank `Url` names no endpoint, the reading `connector_url` gives the
+            // member everywhere else, so it leaves the connector with none.
+            Some(url) => st::connector_url(Some(url)),
+            None => stored.url.clone(),
+        };
+        let next_as2_config = input
+            .as2_config
+            .clone()
+            .or_else(|| stored.as2_config.clone());
+        // Resolved HERE, as at create time, so the stored settings stay fully
+        // materialised and the requirements below are judged against what a reader
+        // reports.
+        let next_sftp_config = input
+            .sftp_config
+            .clone()
+            .map(st::resolve_sftp_connector_config)
+            .or_else(|| stored.sftp_config.clone());
+        let next_egress_config = match input.egress_config.clone() {
+            Some(requested) => {
+                match st::merge_connector_egress_config(stored.egress_config.as_ref(), requested) {
+                    Ok(config) => Some(config),
+                    Err(message) => {
+                        return Err(UpdateConnectorErrorModeled::InvalidRequestException(
+                            InvalidRequestException { message },
+                        )
+                        .into())
+                    }
+                }
+            }
+            None => stored.egress_config.clone(),
+        };
+
+        let violation = st::ConnectorConfig {
+            url: next_url.as_deref(),
+            as2_config: next_as2_config.as_ref(),
+            sftp_config: next_sftp_config.as_ref(),
+            egress_type: &stored.egress_type,
+        }
+        .cross_member_violation();
+        if let Some(message) = violation {
+            return Err(
+                UpdateConnectorErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        // Nothing can be refused past here, so the post-update configuration is what the
+        // connector becomes. Each `next_*` above is the STORED value when the request
+        // named no replacement for it, so assigning it changes nothing.
+        stored.url = next_url;
+        stored.as2_config = next_as2_config;
+        stored.sftp_config = next_sftp_config;
+        stored.egress_config = next_egress_config;
+        if let Some(access_role) = input.access_role {
+            stored.access_role = access_role;
+        }
+        // `LoggingRole` targets `Role`, whose pattern `^arn:.*role/\S+$` does NOT admit
+        // the empty string, so an update can only set this role, never clear it — unlike
+        // `UpdateServer`'s, which targets `NullableRole`.
+        if let Some(logging_role) = input.logging_role {
+            stored.logging_role = Some(logging_role);
+        }
+        if let Some(security_policy_name) = input.security_policy_name {
+            stored.security_policy_name = Some(security_policy_name);
+        }
+        if let Some(ip_address_type) = input.ip_address_type {
+            stored.ip_address_type = Some(ip_address_type);
+        }
+
+        let connector_id = stored.connector_id.clone();
+        drop(guard);
+
+        Ok(UpdateConnectorOutput { connector_id })
     }
 }

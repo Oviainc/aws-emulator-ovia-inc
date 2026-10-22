@@ -5,14 +5,14 @@
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`], `StartBuild` writes a
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
-//! `StartSandbox` writes a [`StoredSandbox`],
+//! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
 //! `CreateReportGroup` writes a [`StoredReportGroup`],
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetSandboxes`, `BatchGetReportGroups`, `ListProjects`,
-//! `ListBuildsForProject`, `ListSandboxes`, `ListSourceCredentials`) only read
-//! them.
+//! `ListBuildsForProject`, `ListSandboxes`, `ListSandboxesForProject`,
+//! `ListSourceCredentials`) only read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -52,7 +52,8 @@ pub const DEFAULT_BUILD_TIMEOUT_MINUTES: i32 = 60;
 /// stop it. The due instant is stored, never slept on.
 pub const BUILD_SETTLE_MILLIS: i64 = 750;
 
-/// How long after `StartSandbox` the clock owes a sandbox's move out of `QUEUED`.
+/// How long after `StartSandbox` the clock owes a sandbox's move out of `QUEUED`
+/// into [`SANDBOX_STATUS_RUNNING`] — the span its environment is provisioned in.
 ///
 /// AWS documents no provisioning time for a sandbox, so this span is CHOSEN, inside
 /// the 250-750 ms band this project fixes for an emulated transition. It is
@@ -209,26 +210,53 @@ pub const BATCH_SPEC_NOT_DOWNLOADED_MESSAGE: &str = "this emulator does not run 
     build containers, so the batch build specification could not be downloaded and no build \
     of the batch was started";
 
-/// Why an emulated sandbox never becomes connectable.
-///
-/// A sandbox IS a running container a caller attaches a Session Manager session to
-/// and runs commands in; nothing in this emulator starts one, so the sandbox cannot
-/// report a live session for an environment that was never provisioned. Its session
-/// ends instead in CodeBuild's own build-system failure status, `FAULT` (which the
-/// model documents on `SandboxSessionPhase$phaseStatus` as "The sandbox phase
-/// faulted"), carrying this explanation as the failing phase's context.
-pub const SANDBOX_NOT_PROVISIONED_MESSAGE: &str = "this emulator does not run CodeBuild sandbox \
-    containers, so the sandbox could not be provisioned and no session was established";
 
 /// The status a sandbox and its session report between `StartSandbox` and the
 /// transition the clock owes them: CodeBuild queues a sandbox request the same way it
 /// queues a build.
 pub const SANDBOX_STATUS_QUEUED: &str = "QUEUED";
 
-/// The terminal status an emulated sandbox and its session reach, for the reason
-/// [`SANDBOX_NOT_PROVISIONED_MESSAGE`] gives. `FAULT` is a `StatusType` value, which
-/// is the enum the model puts on a sandbox session's phase status.
-pub const SANDBOX_STATUS_FAULT: &str = "FAULT";
+/// The status a provisioned sandbox and its live session report.
+///
+/// A sandbox is a LIVE, long-lived session rather than a job that runs to an outcome:
+/// `Sandbox$timeoutInMinutes` is "How long, in minutes, from 5 to 2160 (36 hours), for
+/// CodeBuild to wait before timing out this sandbox if it does not get marked as
+/// completed". So once it leaves the queue it reaches this NON-TERMINAL status and
+/// stays in it until it is stopped or that timeout elapses — which is what gives the
+/// command-execution and connection operations a session to act on.
+pub const SANDBOX_STATUS_RUNNING: &str = "RUNNING";
+
+/// The terminal status a sandbox nobody stopped reaches once the
+/// `timeoutInMinutes` it carries has elapsed. `TIMED_OUT` is a `StatusType` value,
+/// which is the enum the model puts on a sandbox session's phase status.
+pub const SANDBOX_STATUS_TIMED_OUT: &str = "TIMED_OUT";
+
+/// The terminal status a sandbox `StopSandbox` ended reaches. `STOPPED` is a
+/// `StatusType` value, like [`SANDBOX_STATUS_TIMED_OUT`].
+pub const SANDBOX_STATUS_STOPPED: &str = "STOPPED";
+
+/// The outcome of a phase that ran to completion, from `StatusType`.
+const PHASE_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The session phase a sandbox request is first recorded in.
+const PHASE_SUBMITTED: &str = "SUBMITTED";
+
+/// The session phase a sandbox waits in until it is provisioned.
+const PHASE_QUEUED: &str = "QUEUED";
+
+/// The session phase a sandbox's environment is prepared in.
+const PHASE_PROVISIONING: &str = "PROVISIONING";
+
+/// The session phase a live sandbox sits in for as long as it is usable, and the
+/// `currentSession.currentPhase` CodeBuild reports for a `RUNNING` sandbox (as the
+/// recorded responses this emulator is checked against show).
+pub const SANDBOX_PHASE_RUN_SANDBOX: &str = "RUN_SANDBOX";
+
+/// The final marker phase of a session that has ended, the way a build reports it.
+const PHASE_COMPLETED: &str = "COMPLETED";
+
+/// Milliseconds in one minute — what a documented `timeoutInMinutes` is converted by.
+const MILLIS_PER_MINUTE: i64 = 60_000;
 
 /// Per-service state for com-amazonaws-codebuild-codebuild-20161006. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -752,11 +780,12 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         );
     }
 
-    /// Read a sandbox, first materialising the transition the clock already owes
+    /// Read a sandbox, first materialising the transitions the clock already owes
     /// it — the sandbox counterpart of [`Self::settled_build`], and the only write a
     /// reporting operation makes: the move out of `QUEUED` was due at
-    /// `settle_due_millis` whether or not anybody called, and it is computed from the
-    /// stored instants, so repeating it changes nothing.
+    /// `settle_due_millis`, and the timeout at
+    /// [`StoredSandbox::timeout_due_millis`], whether or not anybody called, and both
+    /// are computed from the stored instants, so repeating them changes nothing.
     pub fn settled_sandbox(&mut self, id: &str, now_millis: i64) -> Option<&StoredSandbox> {
         let stored = self.sandboxes.get_mut(id)?;
         stored.settle(now_millis);
@@ -861,26 +890,89 @@ impl StoredSandbox {
         self.sandbox.end_time.is_some()
     }
 
-    /// Materialise this sandbox's terminal state once its due instant has passed.
+    /// The minutes this sandbox waits before timing out, from the modelled member it
+    /// carries: `Sandbox$timeoutInMinutes` is "How long, in minutes, from 5 to 2160 (36
+    /// hours), for CodeBuild to wait before timing out this sandbox if it does not get
+    /// marked as completed". A record that carries none falls back to the build default
+    /// AWS documents for a project, [`DEFAULT_BUILD_TIMEOUT_MINUTES`], which is the
+    /// value `CreateProject` stores when the caller omits one.
+    pub fn timeout_minutes(&self) -> i32 {
+        self.sandbox
+            .timeout_in_minutes
+            .unwrap_or(DEFAULT_BUILD_TIMEOUT_MINUTES)
+    }
+
+    /// Epoch millis at which an un-stopped sandbox times out: its documented
+    /// `timeoutInMinutes` measured from the instant the session went live, since that
+    /// is the wait "before timing out this sandbox if it does not get marked as
+    /// completed".
+    pub fn timeout_due_millis(&self) -> i64 {
+        self.settle_due_millis
+            .saturating_add(i64::from(self.timeout_minutes()).saturating_mul(MILLIS_PER_MINUTE))
+    }
+
+    /// Materialise the transitions the clock already owes this sandbox.
     ///
-    /// Idempotent and purely a function of the stored instants: a sandbox that has
-    /// already stopped, or whose span has not elapsed, is left alone. The sandbox
-    /// leaves the queue at the due instant and its session faults there, because no
-    /// container was provisioned — see [`SANDBOX_NOT_PROVISIONED_MESSAGE`].
+    /// Idempotent and purely a function of the stored instants, so repeating it (or
+    /// skipping a read entirely) changes nothing:
+    ///
+    /// * before `settle_due_millis` the sandbox is still `QUEUED`;
+    /// * from `settle_due_millis` it has been provisioned and its session is live —
+    ///   [`SANDBOX_STATUS_RUNNING`], sitting in the [`SANDBOX_PHASE_RUN_SANDBOX`]
+    ///   phase, which is where it STAYS, because a sandbox is a live session rather
+    ///   than a job with an outcome;
+    /// * from [`Self::timeout_due_millis`] it has run past its own
+    ///   `timeoutInMinutes` without being marked completed, so it times out.
+    ///
+    /// A sandbox a caller already stopped is terminal and is left alone.
     pub fn settle(&mut self, now_millis: i64) {
         if self.is_terminal() || now_millis < self.settle_due_millis {
             return;
         }
+        self.run();
+        let timed_out_at = self.timeout_due_millis();
+        if now_millis >= timed_out_at {
+            self.end(SANDBOX_STATUS_TIMED_OUT, timed_out_at);
+        }
+    }
+
+    /// Move this sandbox to the live state its provisioning span ended in.
+    fn run(&mut self) {
         let requested = self.request_millis;
-        let due = self.settle_due_millis;
-        self.sandbox.status = Some(SANDBOX_STATUS_FAULT.to_string());
-        self.sandbox.start_time = Some(datetime(due));
-        self.sandbox.end_time = Some(datetime(due));
+        let started = self.settle_due_millis;
+        self.sandbox.status = Some(SANDBOX_STATUS_RUNNING.to_string());
+        self.sandbox.start_time = Some(datetime(started));
         if let Some(session) = self.sandbox.current_session.as_mut() {
-            session.status = Some(SANDBOX_STATUS_FAULT.to_string());
-            session.current_phase = Some("COMPLETED".to_string());
-            session.end_time = Some(datetime(due));
-            session.phases = Some(terminal_session_phases(requested, due));
+            session.status = Some(SANDBOX_STATUS_RUNNING.to_string());
+            session.current_phase = Some(SANDBOX_PHASE_RUN_SANDBOX.to_string());
+            session.end_time = None;
+            session.phases = Some(running_session_phases(requested, started));
+        }
+    }
+
+    /// End this sandbox at `ended_millis` with the terminal `status` the session's
+    /// open phase took — `TIMED_OUT` for the timeout the clock owed it, `STOPPED` for
+    /// a `StopSandbox`. The phase that takes the status is whichever one the sandbox
+    /// was sitting in: the queue if it never got provisioned, the live session if it
+    /// did.
+    pub fn end(&mut self, status: &str, ended_millis: i64) {
+        if self.is_terminal() {
+            return;
+        }
+        let requested = self.request_millis;
+        let started = self.settle_due_millis;
+        let was_running = ended_millis >= started;
+        self.sandbox.status = Some(status.to_string());
+        self.sandbox.end_time = Some(datetime(ended_millis));
+        if let Some(session) = self.sandbox.current_session.as_mut() {
+            session.status = Some(status.to_string());
+            session.current_phase = Some(PHASE_COMPLETED.to_string());
+            session.end_time = Some(datetime(ended_millis));
+            session.phases = Some(if was_running {
+                ended_session_phases(requested, started, ended_millis, status)
+            } else {
+                left_the_queue_session_phases(requested, ended_millis, status)
+            });
         }
     }
 }
@@ -1144,7 +1236,7 @@ pub fn queued_sandbox_session(id: String, requested_millis: i64) -> SandboxSessi
         status: Some(SANDBOX_STATUS_QUEUED.to_string()),
         start_time: Some(datetime(requested_millis)),
         end_time: None,
-        current_phase: Some("QUEUED".to_string()),
+        current_phase: Some(PHASE_QUEUED.to_string()),
         phases: Some(queued_session_phases(requested_millis)),
         resolved_source_version: None,
         logs: None,
@@ -1157,40 +1249,86 @@ pub fn queued_sandbox_session(id: String, requested_millis: i64) -> SandboxSessi
 fn queued_session_phases(requested_millis: i64) -> Vec<SandboxSessionPhase> {
     vec![
         finished_session_phase(
-            "SUBMITTED",
-            "SUCCEEDED",
+            PHASE_SUBMITTED,
+            PHASE_SUCCEEDED,
             requested_millis,
             requested_millis,
             None,
         ),
-        open_session_phase("QUEUED", requested_millis),
+        open_session_phase(PHASE_QUEUED, requested_millis),
     ]
 }
 
-/// The phases of a sandbox session that has reached its terminal state:
-/// provisioning is where an emulated sandbox stops, because there is no container to
-/// provision.
-fn terminal_session_phases(requested_millis: i64, due_millis: i64) -> Vec<SandboxSessionPhase> {
+/// The phases of a sandbox session that is LIVE: it was submitted, it waited in the
+/// queue, its environment was provisioned, and it now sits in the `RUN_SANDBOX` phase
+/// — the open phase it stays in until the sandbox is stopped or times out.
+fn running_session_phases(requested_millis: i64, started_millis: i64) -> Vec<SandboxSessionPhase> {
     vec![
         finished_session_phase(
-            "SUBMITTED",
-            "SUCCEEDED",
+            PHASE_SUBMITTED,
+            PHASE_SUCCEEDED,
             requested_millis,
             requested_millis,
             None,
         ),
-        finished_session_phase("QUEUED", "SUCCEEDED", requested_millis, due_millis, None),
         finished_session_phase(
-            "PROVISIONING",
-            SANDBOX_STATUS_FAULT,
-            due_millis,
-            due_millis,
-            Some(vec![PhaseContext {
-                status_code: None,
-                message: Some(SANDBOX_NOT_PROVISIONED_MESSAGE.to_string()),
-            }]),
+            PHASE_QUEUED,
+            PHASE_SUCCEEDED,
+            requested_millis,
+            started_millis,
+            None,
         ),
-        open_session_phase("COMPLETED", due_millis),
+        finished_session_phase(
+            PHASE_PROVISIONING,
+            PHASE_SUCCEEDED,
+            started_millis,
+            started_millis,
+            None,
+        ),
+        open_session_phase(SANDBOX_PHASE_RUN_SANDBOX, started_millis),
+    ]
+}
+
+/// The phases of a sandbox session that was live and has ended: the `RUN_SANDBOX`
+/// phase closes with the status the session ended in (`TIMED_OUT` or `STOPPED`), and
+/// the terminal `COMPLETED` marker opens at that instant.
+fn ended_session_phases(
+    requested_millis: i64,
+    started_millis: i64,
+    ended_millis: i64,
+    status: &str,
+) -> Vec<SandboxSessionPhase> {
+    let mut phases = running_session_phases(requested_millis, started_millis);
+    phases.pop();
+    phases.push(finished_session_phase(
+        SANDBOX_PHASE_RUN_SANDBOX,
+        status,
+        started_millis,
+        ended_millis,
+        None,
+    ));
+    phases.push(open_session_phase(PHASE_COMPLETED, ended_millis));
+    phases
+}
+
+/// The phases of a sandbox session that ended before it was ever provisioned: the
+/// queue is the phase that takes the ending status, exactly as [`stopped_phases`]
+/// reports it for a build stopped while queued.
+fn left_the_queue_session_phases(
+    requested_millis: i64,
+    ended_millis: i64,
+    status: &str,
+) -> Vec<SandboxSessionPhase> {
+    vec![
+        finished_session_phase(
+            PHASE_SUBMITTED,
+            PHASE_SUCCEEDED,
+            requested_millis,
+            requested_millis,
+            None,
+        ),
+        finished_session_phase(PHASE_QUEUED, status, requested_millis, ended_millis, None),
+        open_session_phase(PHASE_COMPLETED, ended_millis),
     ]
 }
 

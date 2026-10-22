@@ -4,11 +4,12 @@
 //! Starts a sandbox for a stored project and persists it: this is the ONLY file to
 //! touch for this operation.
 //!
-//! The record is the project's own settings, queued, with the transition out of
-//! `QUEUED` owed by the clock and materialised on the next read
-//! ([`crate::state::StoredSandbox::settle`]). Nothing in this emulator starts a
-//! sandbox container, so that transition ends the sandbox's session in `FAULT` with a
-//! phase context saying why — see `crate::state::SANDBOX_NOT_PROVISIONED_MESSAGE`.
+//! The record is the project's own settings, queued, with the move out of `QUEUED`
+//! owed by the clock and materialised on the next read
+//! ([`crate::state::StoredSandbox::settle`]): the sandbox is provisioned and its
+//! session goes LIVE — `RUNNING`, in the `RUN_SANDBOX` phase — and STAYS there, since
+//! a sandbox is a live session rather than a job with an outcome. It leaves that state
+//! only when `StopSandbox` ends it or the `timeoutInMinutes` it carries elapses.
 //!
 //! ## Shape of an operation
 //!

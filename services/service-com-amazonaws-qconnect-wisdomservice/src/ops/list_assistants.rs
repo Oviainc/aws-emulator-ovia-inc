@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // hands it to every service.
             crate::scaffolded::Scaffolded::not_implemented("ListAssistants")
         })?;
-        let mut store = state.lock();
+        let store = state.lock();
 
         // A token this service did not mint names no position, so it is refused rather
         // than silently read as "from the beginning".

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tags named by `TagKeys` from the tag set the resource named by
+//! `ResourceId` holds in this service's state — a file system or an access point, as a
+//! bare id or as its ARN. A key the resource does not carry leaves the set as it is, so a
+//! repeated removal is idempotent, and the reported `Name` is re-derived from what is
+//! left.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+
+        let mut state = state.lock();
+
+        // "Specifies the EFS resource that you want to remove tags from": the member's
+        // pattern accepts a file system or an access point, as a bare id or as its ARN,
+        // and the store is keyed by the id.
+        let resource = efs::tagged_resource(&input.resource_id);
+        let Some(mut record) = state.tagged_record_mut(resource) else {
+            return Err(does_not_exist(resource));
+        };
+
+        // "The keys of the key-value tag pairs that you want to remove from the specified
+        // EFS resource." `remove` both drops them and re-derives the `Name` the
+        // description reports from the `Name` tag, so the two cannot disagree.
+        record.remove(&input.tag_keys);
+        Ok(UntagResourceOutput)
     }
+}
+
+/// The modelled 404 for a `ResourceId` that names no stored resource: `FileSystemNotFound`
+/// ("the specified FileSystemId value doesn't exist in the requester's Amazon Web
+/// Services account") for a file system, `AccessPointNotFound` for an access point — the
+/// two resources this endpoint addresses, each with its own modelled error.
+fn does_not_exist(resource: crate::state::TaggedResource<'_>) -> UntagResourceError {
+    match resource {
+        crate::state::TaggedResource::FileSystem(id) => {
+            UntagResourceErrorModeled::FileSystemNotFound(FileSystemNotFound {
+                error_code: "FileSystemNotFound".to_string(),
+                message: Some(crate::state::file_system_not_found_message(id)),
+            })
+        }
+        crate::state::TaggedResource::AccessPoint(id) => {
+            UntagResourceErrorModeled::AccessPointNotFound(AccessPointNotFound {
+                error_code: "AccessPointNotFound".to_string(),
+                message: Some(crate::state::access_point_not_found_message(id)),
+            })
+        }
+    }
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> UntagResourceError {
+    UntagResourceErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

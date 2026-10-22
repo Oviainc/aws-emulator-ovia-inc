@@ -109,18 +109,22 @@ pub struct Session {
     pub created_at: SystemTime,
 }
 
-/// Tags render as absent rather than as an empty map: the real service omits
-/// the member for a resource created without tags.
+/// The `tags` member of a resource this service reports: ALWAYS present, and an
+/// empty object when the resource carries no tag.
+///
+/// This is what the endpoint answers on the wire — a recorded create of an
+/// untagged resource carries the member all the same — so a client reading
+/// `response["tags"]` finds a map for every resource instead of telling an
+/// untagged resource's absent member from a tagged one's map. The Amazon Q in
+/// Connect model of this same service states the rule in the same way (that
+/// crate's `state::tags_out`), so the two mounted models of one endpoint cannot
+/// answer this member differently.
 fn wire_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
-    if tags.is_empty() {
-        None
-    } else {
-        Some(
-            tags.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<_, _>>(),
-        )
-    }
+    Some(
+        tags.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<HashMap<_, _>>(),
+    )
 }
 
 impl Assistant {

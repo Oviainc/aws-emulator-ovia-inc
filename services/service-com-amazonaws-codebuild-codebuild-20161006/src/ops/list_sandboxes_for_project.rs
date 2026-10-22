@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSandboxesForProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSandboxesForProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the ids of the sandboxes a stored project holds, one page at a time: this
+//! is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSandboxesForProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation — it pages over the per-project index `StartSandbox` keeps in
+//! start order and writes nothing. A `projectName` no project of the account answers
+//! to is refused with the modelled `ResourceNotFoundException`, the same refusal
+//! `ListBuildsForProject` and `StartSandbox` give for an unknown project.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +142,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSandboxesForProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSandboxesForProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSandboxesForProject"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListSandboxesForProject (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let guard = state.lock();
+        // A project the account does not hold is a plain not-found condition, which
+        // this operation models: `ResourceNotFoundException` (HTTP 400), naming the
+        // project ARN the request resolves to.
+        if !guard.projects.contains_key(&input.project_name) {
+            return Err(
+                ListSandboxesForProjectErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "The provided project {} does not exist.",
+                            crate::state::project_arn(&region, &input.project_name)
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Held in start order, which is the order a caller that started them observes.
+        // The model documents no default for `sortOrder` ("The order in which sandbox
+        // records should be retrieved"), so the stored order is what an unspecified
+        // request gets and `DESCENDING` reverses it.
+        let mut ids: Vec<String> = guard
+            .sandboxes_by_project
+            .get(&input.project_name)
+            .cloned()
+            .unwrap_or_default();
+        if input.sort_order.as_deref() == Some("DESCENDING") {
+            ids.reverse();
+        }
+
+        // `maxResults` is "The maximum number of sandbox records to be retrieved",
+        // bounded by the model's `PageSize` at 1..100; absent, a page holds as many
+        // entries as this service pages at once.
+        let Some((page, next_token)) =
+            crate::state::page_limited(&ids, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListSandboxesForProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListSandboxesForProjectOutput {
+            // `SandboxIds` carries no `@length`, so a project with no sandboxes
+            // answers with an empty list rather than an absent member — the way
+            // `BatchGetSandboxes` reports its own unbounded lists.
+            ids: Some(page),
+            next_token,
+        })
     }
 }

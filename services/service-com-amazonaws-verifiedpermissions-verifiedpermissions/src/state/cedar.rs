@@ -599,10 +599,10 @@ impl PreparedPolicies {
 ///
 /// The store's schema, when it holds one, is what gives the request's entity
 /// types, action and context their types, so when one is present the entity
-/// store and the request are parsed AGAINST it: an entity or a context attribute
-/// that does not type-check is refused rather than evaluated, which is the only
-/// way a `context` whose attribute has the wrong type can be told apart from a
-/// deny.
+/// store and the request are parsed AGAINST it where it types them
+/// ([`build_entities`], [`evaluate`]) — and evaluated untyped where it does not,
+/// because a value the schema cannot type is still evaluated and reported on
+/// through the response's `errors` rather than refused.
 ///
 /// The per-call step budget is enforced here, at the point of work: the total
 /// Cedar text one call parses is capped at
@@ -748,13 +748,31 @@ pub fn load_policies(store: &super::PolicyStore) -> Result<PreparedPolicies, Ref
 }
 
 /// Build the Cedar entity store one API call evaluates against, from the Cedar
-/// JSON [`entities_to_cedar_json`] already bounded, type-checked against the
-/// store's schema when it holds one. The refusal names the `entities` member.
+/// JSON [`entities_to_cedar_json`] already bounded, typed by the store's schema
+/// when the schema types it. The refusal names the `entities` member.
+///
+/// A schema is what gives a schema-declared action its entity and an extension
+/// attribute its type, so the slice is parsed AGAINST the schema first. But
+/// conformance to the store's schema is NOT part of this request's input
+/// contract: the schema constrains the policies a store accepts (see
+/// [`validate_static_policy`], applied per the store's validation mode), not the
+/// values an authorization request carries. So a slice the schema cannot type is
+/// still parsed, untyped, and evaluated — whatever the evaluation then raises
+/// about it is reported in-band in the response's `errors`. Only a payload that
+/// is no Cedar entity store at all (a duplicate uid, an unparseable entity type)
+/// is refused as a bad request.
 pub fn build_entities(
     entities: serde_json::Value,
     schema: Option<&cedar_policy::Schema>,
 ) -> Result<cedar_policy::Entities, InvalidInput> {
-    cedar_policy::Entities::from_json_value(entities, schema).map_err(|e| {
+    if let Some(schema) = schema {
+        if let Ok(typed) =
+            cedar_policy::Entities::from_json_value(entities.clone(), Some(schema))
+        {
+            return Ok(typed);
+        }
+    }
+    cedar_policy::Entities::from_json_value(entities, None).map_err(|e| {
         InvalidInput::new(
             paths::ENTITIES,
             format!("the entities are not a valid Cedar entity store: {e}"),
@@ -778,9 +796,13 @@ pub struct RequestContext<'a> {
 ///
 /// `principal`, `action` and `resource` are the request's triple and `context` is
 /// its Cedar JSON context, already bounded by [`context_to_cedar_json`]. The
-/// request itself is built against the store's schema when it holds one, so an
-/// entity type, action or context attribute the schema does not declare is
-/// refused rather than evaluated.
+/// request is built against the store's schema when the schema types it, and
+/// evaluated UNTYPED when it does not: schema conformance is not part of this
+/// request's input contract, so a context value whose type the schema does not
+/// sanction is still evaluated, and the type error a policy reading it raises is
+/// reported in the verdict's `errors` with that policy excluded from the
+/// determining ones — the decision fails closed rather than the call being
+/// refused.
 ///
 /// `context_path` is where the call's `context` came from ([`context_path`]), so
 /// a refusal about it names the union arm the client actually sent.
@@ -796,30 +818,54 @@ pub fn evaluate(
     let action_uid = entity_uid(action, paths::ACTION)?;
     let resource_uid = entity_uid(resource, paths::RESOURCE)?;
 
-    let context = cedar_policy::Context::from_json_value(context.json, None).map_err(|e| {
-        InvalidInput::new(
-            context.path,
-            format!("the context is not a valid Cedar context: {e}"),
+    let context_path = context.path;
+    let context_json = context.json;
+    // The context is parsed as Cedar values; a payload that is no Cedar context
+    // at all is the one thing refused about it, and that IS part of the input
+    // contract.
+    let cedar_context = |json: serde_json::Value| {
+        cedar_policy::Context::from_json_value(json, None).map_err(|e| {
+            InvalidInput::new(
+                context_path,
+                format!("the context is not a valid Cedar context: {e}"),
+            )
+        })
+    };
+    // Building the request against the schema is what lets the evaluation use
+    // the types the schema declares. A request the schema does not sanction —
+    // a context attribute at another type, an absent or undeclared attribute, an
+    // action whose `appliesTo` does not cover the triple — is NOT refused: it is
+    // built untyped and evaluated, and the evaluation reports whatever it raises
+    // in `errors`.
+    let request = match prepared.schema() {
+        Some(schema) => cedar_policy::Request::new(
+            principal_uid.clone(),
+            action_uid.clone(),
+            resource_uid.clone(),
+            cedar_context(context_json.clone())?,
+            Some(schema),
         )
-    })?;
-
-    let request = cedar_policy::Request::new(
-        principal_uid,
-        action_uid,
-        resource_uid,
-        context,
-        prepared.schema(),
-    )
-    .map_err(|e| {
-        // A request is checked against the schema's declaration for the ACTION:
-        // `appliesTo` is what says which principal and resource types that
-        // action accepts and what its context record holds, so the action is the
-        // member a refusal here names.
-        InvalidInput::new(
-            paths::ACTION,
-            format!("the authorization request does not match the schema: {e}"),
+        .ok(),
+        None => None,
+    };
+    let request = match request {
+        Some(request) => request,
+        None => cedar_policy::Request::new(
+            principal_uid,
+            action_uid,
+            resource_uid,
+            cedar_context(context_json)?,
+            None,
         )
-    })?;
+        .map_err(|e| {
+            // Unreachable with no schema to validate against, but a caller still
+            // gets the member rather than a panic.
+            InvalidInput::new(
+                paths::ACTION,
+                format!("the authorization request could not be built: {e}"),
+            )
+        })?,
+    };
 
     let response = cedar_policy::Authorizer::new().is_authorized(&request, &prepared.set, entities);
 

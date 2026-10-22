@@ -666,9 +666,13 @@ async fn a_strict_store_validates_static_policies_against_its_schema() {
     );
 }
 
-/// When a store holds a schema, that schema types an authorization request: a
-/// `context` or an entity whose value does not have the type the schema declares
-/// is refused as invalid rather than evaluated into a decision.
+/// When a store holds a schema, that schema types an authorization request where
+/// it types it — and a `context` or an entity value it does NOT type is still
+/// evaluated, because the schema constrains the policies a store accepts rather
+/// than the values a request carries. The type error a policy reading such a
+/// value raises is reported in the 200 response's `errors` with the decision
+/// failing closed, never as a refusal; the whole contract is tabulated in
+/// [`crate::evaluation_errors`].
 #[tokio::test]
 async fn an_authorization_request_is_typed_against_the_stores_schema() {
     let router = router();
@@ -705,56 +709,58 @@ async fn an_authorization_request_is_typed_against_the_stores_schema() {
 
     // Rows differ along the TYPE and the presence of the context attribute the
     // schema declares as a boolean, over both context forms the model offers.
-    // The third column is the expected HTTP status; the fourth, the decision a
-    // request that does type-check must be evaluated into.
-    let cases: &[(&str, Value, u16, &str)] = &[
+    // The third column is the decision the request must be evaluated into; the
+    // fourth, whether evaluating the stored policy against it raises an error
+    // that the response reports in `errors`. Every row is answered with a
+    // decision: a value the schema cannot type is evaluated, not refused.
+    let cases: &[(&str, Value, &str, bool)] = &[
         (
             "the declared boolean, true",
             json!({ "contextMap": { "authenticated": { "boolean": true } } }),
-            200,
             "ALLOW",
+            false,
         ),
         (
             "the declared boolean, false",
             json!({ "contextMap": { "authenticated": { "boolean": false } } }),
-            200,
             "DENY",
+            false,
         ),
         (
             "the declared boolean as cedarJson",
             json!({ "cedarJson": "{\"authenticated\": true}" }),
-            200,
             "ALLOW",
+            false,
         ),
         (
             "a string where the schema declares a boolean",
             json!({ "contextMap": { "authenticated": { "string": "true" } } }),
-            400,
-            "",
+            "DENY",
+            true,
         ),
         (
             "a long where the schema declares a boolean",
             json!({ "contextMap": { "authenticated": { "long": 1 } } }),
-            400,
-            "",
+            "DENY",
+            true,
         ),
         (
             "a set where the schema declares a boolean",
             json!({ "contextMap": { "authenticated": { "set": [{ "boolean": true }] } } }),
-            400,
-            "",
+            "DENY",
+            true,
         ),
         (
             "a record where the schema declares a boolean",
             json!({ "contextMap": { "authenticated": { "record": { "k": { "boolean": true } } } } }),
-            400,
-            "",
+            "DENY",
+            true,
         ),
         (
             "the wrong type through cedarJson",
             json!({ "cedarJson": "{\"authenticated\": \"true\"}" }),
-            400,
-            "",
+            "DENY",
+            true,
         ),
         (
             "an attribute the schema does not declare",
@@ -762,56 +768,54 @@ async fn an_authorization_request_is_typed_against_the_stores_schema() {
                 "authenticated": { "boolean": true },
                 "mfa": { "boolean": true },
             } }),
-            400,
-            "",
+            "ALLOW",
+            false,
         ),
         (
             "the declared attribute absent",
             json!({ "contextMap": {} }),
-            400,
-            "",
+            "DENY",
+            true,
         ),
     ];
 
-    for (case, context, expected, decision) in cases {
+    for (case, context, decision, errors) in cases {
         let mut request = base.clone();
         request["context"] = context.clone();
         let (status, body) = call(&router, "IsAuthorized", &request).await;
         assert_eq!(
-            status, *expected,
-            "case {case:?}: expected HTTP {expected}, got {status} {body}"
+            status, 200,
+            "case {case:?}: an evaluation failure is reported in-band, so the call must \
+             answer 200, got {status} {body}"
         );
-        if *expected == 200 {
-            assert_eq!(
-                body["decision"].as_str(),
-                Some(*decision),
-                "case {case:?}: expected decision {decision}, got {body}"
-            );
-        } else {
-            assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {case:?}: expected a ValidationException, got {body}"
-            );
-        }
+        assert_eq!(
+            body["decision"].as_str(),
+            Some(*decision),
+            "case {case:?}: expected decision {decision}, got {body}"
+        );
+        let reported = body["errors"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            !reported.is_empty(),
+            *errors,
+            "case {case:?}: expected errors non-empty = {errors}, got {body}"
+        );
     }
 
-    // The same schema types the request's ENTITIES: rows differ along whether the
+    // The same schema types the request's ENTITIES where it types them, and a
+    // slice it does not type is evaluated too: rows differ along whether the
     // entity's type, and then its attributes, are what the schema declares.
-    let entity_cases: &[(&str, Value, u16)] = &[
+    let entity_cases: &[(&str, Value)] = &[
         (
             "an entity of a declared type",
             json!({ "entityList": [{
                 "identifier": { "entityType": "PhotoApp::User", "entityId": "alice" },
             }] }),
-            200,
         ),
         (
             "an entity of a type the schema does not declare",
             json!({ "entityList": [{
                 "identifier": { "entityType": "PhotoApp::Admin", "entityId": "root" },
             }] }),
-            400,
         ),
         (
             "an entity attribute the schema does not declare",
@@ -819,25 +823,23 @@ async fn an_authorization_request_is_typed_against_the_stores_schema() {
                 "identifier": { "entityType": "PhotoApp::User", "entityId": "alice" },
                 "attributes": { "age": { "long": 31 } },
             }] }),
-            400,
         ),
     ];
 
-    for (case, entities, expected) in entity_cases {
+    for (case, entities) in entity_cases {
         let mut request = base.clone();
         request["context"] = json!({ "contextMap": { "authenticated": { "boolean": true } } });
         request["entities"] = entities.clone();
         let (status, body) = call(&router, "IsAuthorized", &request).await;
         assert_eq!(
-            status, *expected,
-            "case {case:?}: expected HTTP {expected}, got {status} {body}"
+            status, 200,
+            "case {case:?}: a slice the schema cannot type is evaluated, not refused, \
+             got {status} {body}"
         );
-        if *expected == 400 {
-            assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {case:?}: expected a ValidationException, got {body}"
-            );
-        }
+        assert_eq!(
+            body["decision"].as_str(),
+            Some("ALLOW"),
+            "case {case:?}: the stored policy still decides the request, got {body}"
+        );
     }
 }

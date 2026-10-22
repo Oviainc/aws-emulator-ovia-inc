@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/availability_zones.rs"]
 mod availability_zones;
+#[path = "all/create_security_group.rs"]
+mod create_security_group;
 #[path = "all/default_network.rs"]
 mod default_network;
 #[path = "all/describe_images.rs"]

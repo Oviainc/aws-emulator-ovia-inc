@@ -3,11 +3,11 @@
 //! @op CreateAssistant
 //!
 //! Mints an assistant, stores it, and answers out of the STORED record, so what this
-//! call reports is what every later `GetAssistant`/`ListAssistants` reports. A fresh
-//! assistant is `CREATE_IN_PROGRESS` and the clock owes it `ACTIVE`
-//! ([`crate::state::CREATE_TRANSITION`]); a replayed `clientToken` answers with the
-//! assistant that token already created; a second live assistant under one name is the
-//! conflict `ConflictException` describes.
+//! call reports is what every later `GetAssistant`/`ListAssistants` reports. The service
+//! answers the create with the assistant already `ACTIVE`, so no status change is owed
+//! afterwards; a replayed `clientToken` answers with the assistant that token already
+//! created; a second live assistant under one name is the conflict `ConflictException`
+//! describes.
 //!
 //! ## Shape of an operation
 //!
@@ -196,13 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        if let Some(existing) = store.assistant_id_with_name(&input.name) {
-            let existing = existing.to_string();
+        // An assistant's name identifies it, so a create under a name this account
+        // already holds is the modelled conflict (HTTP 409) rather than a second record.
+        if store.assistant_id_with_name(&input.name).is_some() {
             return Err(CreateAssistantErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "An assistant named {} already exists ({existing}).",
-                    input.name
-                )),
+                message: Some(crate::state::MESSAGE_NAME_IN_USE.to_string()),
             })
             .into());
         }
@@ -231,22 +229,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let now = ::std::time::Instant::now();
+        // The service provisions the assistant's streaming topic and its default SYSTEM
+        // AI agents with the assistant itself, so the create's own answer already
+        // reports them.
+        let (ai_agents, ai_agent_configuration) =
+            store.default_ai_agents(&region, &assistant_id);
         let assistant = crate::state::Assistant {
             assistant_arn: crate::state::assistant_arn(&region, &assistant_id),
             assistant_id: assistant_id.clone(),
             name: input.name.clone(),
             r#type: input.r#type.clone(),
-            // Creation is asynchronous: the assistant reports the transient status until
-            // the transition the clock owes it falls due.
-            status: crate::state::ASSISTANT_STATUS_CREATE_IN_PROGRESS.to_string(),
+            // The service answers the create with the assistant ready, so it stays
+            // ready: there is no later status change for the clock to owe it.
+            status: crate::state::ASSISTANT_STATUS_ACTIVE.to_string(),
             description: input.description.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             server_side_encryption_configuration: input
                 .server_side_encryption_configuration
                 .clone(),
             created_at: ::std::time::SystemTime::now(),
-            active_due_at: now + crate::state::CREATE_TRANSITION,
+            capability_type: crate::state::ASSISTANT_CAPABILITY_V2.to_string(),
+            topic_integration_arn: Some(crate::state::topic_integration_arn(
+                &region,
+                &assistant_id,
+            )),
+            ai_agent_configuration,
+            ai_agents,
+            orchestrator_configuration_list: Vec::new(),
             sessions: ::std::collections::HashMap::new(),
         };
         store.insert_assistant(assistant);

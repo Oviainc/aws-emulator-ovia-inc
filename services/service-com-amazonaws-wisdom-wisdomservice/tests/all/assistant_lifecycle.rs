@@ -40,8 +40,15 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// One request, signed the way an SDK `wisdom` client signs: the credential
-/// scope is what routes it to this service and names its region.
+/// The routing key this service answers under (`src/service.rs`'s
+/// `OWN_REGISTRATION_KEY`): the shared `wisdom` endpoint identity this model and the
+/// Amazon Q in Connect model BOTH publish is served by the QConnect crate — the
+/// endpoint's current API, whose routes are a superset of this model's — so this legacy
+/// model is addressed by its own registration key and contends for nothing.
+const ROUTE_KEY: &str = "com-amazonaws-wisdom-wisdomservice";
+
+/// One request, signed the way a client addressed at THIS registered model signs: the
+/// credential scope is what routes it to this service and names its region.
 fn request(method: &str, path: &str, body: Option<&Value>) -> http::Request<Bytes> {
     let builder = http::Request::builder()
         .method(method)
@@ -50,7 +57,7 @@ fn request(method: &str, path: &str, body: Option<&Value>) -> http::Request<Byte
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/wisdom/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{ROUTE_KEY}/aws4_request, \
                  SignedHeaders=host, Signature=not-verified-in-this-suite"
             ),
         );
@@ -156,15 +163,15 @@ impl AssistantCase {
         body
     }
 
+    /// The `tags` member the service reports for this case: ALWAYS present, and an
+    /// empty object when the row carries no tag (`state::wire_tags`).
     fn expected_tags(&self) -> Option<Value> {
-        (!self.tags.is_empty()).then(|| {
-            Value::Object(
-                self.tags
-                    .iter()
-                    .map(|(k, v)| ((*k).to_string(), json!(v)))
-                    .collect(),
-            )
-        })
+        Some(Value::Object(
+            self.tags
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), json!(v)))
+                .collect(),
+        ))
     }
 }
 

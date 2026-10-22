@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set the resource named by `ResourceId` holds in this service's state
+//! — a file system or an access point, as a bare id or as its ARN — paginated by
+//! `MaxResults`, with `NextToken` continuing where a previous call left off. A pure
+//! read: it writes nothing to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+
+        // "Lists all tags for a top-level EFS resource" — a report, so this handler only
+        // reads the store and writes nothing to it.
+        let state = state.lock();
+
+        // "Specifies the EFS resource you want to retrieve tags for. You can retrieve
+        // tags for EFS file systems and access points using this API endpoint": the
+        // member's pattern accepts either resource as a bare id or as its ARN, and the
+        // store is keyed by the id.
+        let resource = efs::tagged_resource(&input.resource_id);
+        let Some(tags) = state.tags_of(resource) else {
+            return Err(does_not_exist(resource));
+        };
+
+        // "(Optional) You can use NextToken in a subsequent request to fetch the next
+        // page … if the response payload was paginated." As in this service's other
+        // paginated reads, the token is the key of the entry the next page starts at; one
+        // naming no entry of this tag set cannot have come from a previous call, so it is
+        // refused rather than silently answered from the top.
+        let start = match input.next_token.as_deref() {
+            Some(token) => tags
+                .iter()
+                .position(|tag| tag.key == token)
+                .ok_or_else(|| {
+                    bad_request(format!(
+                        "NextToken {} does not name a tag of resource {}",
+                        efs::quoted(token),
+                        efs::quoted(&input.resource_id)
+                    ))
+                })?,
+            None => 0,
+        };
+
+        // "(Optional) Specifies the maximum number of tag objects to return in the
+        // response. The default value is 100."
+        let page_size = efs::page_size(input.max_results, efs::DEFAULT_TAG_PAGE_SIZE);
+        let page: Vec<Tag> = tags[start..].iter().take(page_size).cloned().collect();
+        // "NextToken is present if the response payload is paginated": the entry that
+        // follows this page, absent when the page ended the set. A tag key is a
+        // well-formed `Token` — both are 1..128 characters.
+        let next_token = tags.get(start + page.len()).map(|tag| tag.key.clone());
+
+        Ok(ListTagsForResourceOutput {
+            tags: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The modelled 404 for a `ResourceId` that names no stored resource: `FileSystemNotFound`
+/// ("the specified FileSystemId value doesn't exist in the requester's Amazon Web
+/// Services account") for a file system, `AccessPointNotFound` for an access point — the
+/// two resources this endpoint addresses, each with its own modelled error.
+fn does_not_exist(resource: crate::state::TaggedResource<'_>) -> ListTagsForResourceError {
+    match resource {
+        crate::state::TaggedResource::FileSystem(id) => {
+            ListTagsForResourceErrorModeled::FileSystemNotFound(FileSystemNotFound {
+                error_code: "FileSystemNotFound".to_string(),
+                message: Some(crate::state::file_system_not_found_message(id)),
+            })
+        }
+        crate::state::TaggedResource::AccessPoint(id) => {
+            ListTagsForResourceErrorModeled::AccessPointNotFound(AccessPointNotFound {
+                error_code: "AccessPointNotFound".to_string(),
+                message: Some(crate::state::access_point_not_found_message(id)),
+            })
+        }
+    }
+    .into()
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

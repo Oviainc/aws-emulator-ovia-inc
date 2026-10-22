@@ -44,7 +44,8 @@ use crate::ops::types::{
     DescribedWebAppIdentityProviderDetails, EndpointDetails, HomeDirectoryMapEntry,
     IdentityProviderDetails, InvalidRequestException, PosixProfile, ProtocolDetails, ProxyConfig,
     ResourceExistsException, ResourceNotFoundException, S3StorageOptions, SftpConnectorConfig,
-    SftpPortWithOptions, Tag, WebAppUnits, WorkflowDetails, WorkflowStep,
+    SftpPortWithOptions, Tag, UpdateConnectorEgressConfig, WebAppUnits, WorkflowDetails,
+    WorkflowStep,
 };
 
 /// The region used for an ARN when the request carries no SigV4 credential scope to
@@ -1620,6 +1621,43 @@ pub fn resolve_connector_egress_config(
             ..config
         },
     }
+}
+
+/// Apply the `UpdateConnectorEgressConfig` an update NAMES onto the egress settings the
+/// connector already has — `Err(message)` when the connector has none.
+///
+/// `UpdateConnectorVpcLatticeEgressConfig` makes EVERY member optional where
+/// `ConnectorVpcLatticeEgressConfig` requires the Resource Configuration ARN, so an
+/// update MODIFIES an existing egress configuration member by member ("Updates the
+/// egress configuration for the connector, allowing you to modify how traffic is
+/// routed") — the same rule [`merge_protocol_details`] follows for a server, and the
+/// create-time resolution runs over the result so the stored settings stay fully
+/// materialised.
+///
+/// A connector with no egress configuration is a `SERVICE_MANAGED` one, and nothing in
+/// the model names `EgressType` as an updatable member, so such a request has no egress
+/// configuration to modify: it is refused with the condition the member is settable
+/// under, the same reading [`ConnectorConfig::cross_member_violation`] gives
+/// `EgressConfig` at create time.
+pub fn merge_connector_egress_config(
+    stored: Option<&ConnectorVpcLatticeEgressConfig>,
+    requested: UpdateConnectorEgressConfig,
+) -> Result<ConnectorVpcLatticeEgressConfig, String> {
+    let UpdateConnectorEgressConfig::VpcLattice(requested) = requested;
+    let Some(stored) = stored else {
+        return Err(settable_only_when(
+            "EgressConfig",
+            &format!("EgressType is {CONNECTOR_EGRESS_TYPE_VPC_LATTICE}"),
+        ));
+    };
+    Ok(resolve_connector_egress_config(
+        ConnectorEgressConfig::VpcLattice(ConnectorVpcLatticeEgressConfig {
+            resource_configuration_arn: requested
+                .resource_configuration_arn
+                .unwrap_or_else(|| stored.resource_configuration_arn.clone()),
+            port_number: requested.port_number.or(stored.port_number),
+        }),
+    ))
 }
 
 /// What a state-changing server call does, given the server's current `State`.

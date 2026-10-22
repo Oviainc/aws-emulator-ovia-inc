@@ -587,10 +587,10 @@ async fn start_sandbox_refuses_a_project_the_account_does_not_hold() {
     );
 }
 
-/// RULE: the transition out of `QUEUED` is owed by the CLOCK, so it is materialised
-/// from the stored instants when the sandbox is read — once, and identically on every
-/// later read. Nothing here runs a sandbox container, so the session ends in
-/// CodeBuild's build-system failure status with a phase context saying why.
+/// RULE: the move out of `QUEUED` is owed by the CLOCK, so it is materialised from the
+/// stored instants when the sandbox is read — once, and identically on every later
+/// read. A sandbox that leaves the queue is a LIVE session: it reports `RUNNING`, sits
+/// in the `RUN_SANDBOX` phase, and has not ended.
 #[tokio::test]
 async fn a_sandbox_settles_once_from_stored_state_and_never_changes_again() {
     let router = emulator();
@@ -610,36 +610,37 @@ async fn a_sandbox_settles_once_from_stored_state_and_never_changes_again() {
     let settled = batch_get_sandboxes(&router, std::slice::from_ref(&id)).await;
     let record = settled["sandboxes"][0].clone();
     assert_eq!(
-        record["status"], "FAULT",
-        "a sandbox no container was provisioned for must end in FAULT, got {record}"
+        record["status"], "RUNNING",
+        "a provisioned sandbox is a live session, got {record}"
     );
     assert!(
-        record["startTime"].is_number() && record["endTime"].is_number(),
-        "a settled sandbox reports when it started and ended, got {record}"
+        record["startTime"].is_number() && record["endTime"].is_null(),
+        "a live sandbox reports when it started and has not ended, got {record}"
     );
     let session = record["currentSession"].clone();
     assert_eq!(
-        session["status"], "FAULT",
-        "the session faults with the sandbox, got {session}"
+        session["status"], "RUNNING",
+        "the session runs with the sandbox, got {session}"
     );
     assert_eq!(
-        session["currentPhase"], "COMPLETED",
-        "a settled session sits in COMPLETED, got {session}"
+        session["currentPhase"], state::SANDBOX_PHASE_RUN_SANDBOX,
+        "a live session sits in the RUN_SANDBOX phase, got {session}"
     );
     let phases = session["phases"].as_array().expect("the phases").clone();
-    let faulted = phases
+    let reported: Vec<(String, String)> = phases
         .iter()
-        .find(|phase| phase["phaseStatus"] == "FAULT")
-        .cloned()
-        .unwrap_or(Value::Null);
+        .map(|phase| (text(phase, "phaseType"), text(phase, "phaseStatus")))
+        .collect();
     assert_eq!(
-        faulted["phaseType"], "PROVISIONING",
-        "provisioning is where an emulated sandbox stops, got {session}"
-    );
-    assert_eq!(
-        faulted["contexts"][0]["message"],
-        json!(state::SANDBOX_NOT_PROVISIONED_MESSAGE),
-        "the failing phase must say why, got {faulted}"
+        reported,
+        vec![
+            ("SUBMITTED".to_string(), "SUCCEEDED".to_string()),
+            ("QUEUED".to_string(), "SUCCEEDED".to_string()),
+            ("PROVISIONING".to_string(), "SUCCEEDED".to_string()),
+            ("RUN_SANDBOX".to_string(), String::new()),
+        ],
+        "the session must have been submitted, queued, provisioned and now be running, \
+         got {session}"
     );
 
     // Read again: identical, because it was computed once from the stored instants.

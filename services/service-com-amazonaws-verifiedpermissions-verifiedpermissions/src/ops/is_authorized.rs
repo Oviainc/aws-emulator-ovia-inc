@@ -9,6 +9,15 @@
 //! matching policy default-denies, a `Forbid` beats a `Permit`, and nothing here
 //! is canned. It writes nothing.
 //!
+//! A failure raised while EVALUATING is reported in-band, not as a 4xx: the
+//! modelled output requires an `errors` list, so a policy that errors (a context
+//! or entity attribute that is absent, or at another type than the policy reads
+//! it at) is dropped from the decision — it determines nothing, so the decision
+//! fails closed — and its description is reported in `errors` on the 200.
+//! `ValidationException` is for a request that breaks this operation's own input
+//! contract: an absent member of the triple, or a `context`/`entities` payload
+//! that is unparseable or past a bound.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -196,10 +205,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entities,
         )
         .map_err(|refusal| match refusal {
-            // A request member the caller can fix is the modelled
-            // `ValidationException`; service-side state it cannot — a stored
-            // schema that will not parse, a store holding more Cedar than one
-            // request evaluates — is a server fault, not a bad request.
+            // A request member the caller can fix — a payload that is no Cedar
+            // value, or one past a bound — is the modelled `ValidationException`;
+            // service-side state it cannot — a stored schema that will not
+            // parse, a store holding more Cedar than one request evaluates — is
+            // a server fault, not a bad request. A policy that errors while
+            // evaluating is neither, and never reaches here: it is reported in
+            // the verdict's `errors`.
             crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
             crate::state::cedar::Refusal::ServiceFault(message) => {
                 IsAuthorizedErrorModeled::InternalServerException(InternalServerException {

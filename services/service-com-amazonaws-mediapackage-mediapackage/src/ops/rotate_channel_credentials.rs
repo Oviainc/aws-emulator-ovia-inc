@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RotateChannelCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RotateChannelCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RotateChannelCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rotates the credentials of the channel's FIRST HLS ingest endpoint: that endpoint's
+//! `Username` and `Password` are replaced with freshly minted system-generated values and
+//! stored on the channel record, while its `Id` and `Url`, every other ingest endpoint and
+//! every other member of the channel stay exactly as stored. The response is rendered from
+//! the stored record, so the next `DescribeChannel`/`ListChannels` returns the same bytes.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RotateChannelCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RotateChannelCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RotateChannelCredentials"))
+        // Nothing about a rotation depends on the request beyond its deserialized input:
+        // the channel's ARN, region, `CreatedAt` and its ingest endpoints' ids and URLs
+        // were decided when it was created, and the new credentials are system-generated.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RotateChannelCredentialsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the mediapackage state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // Ingest credentials are a property OF a channel, so there is nothing to rotate
+        // for an id this service does not hold: the target is resolved before anything is
+        // minted or written.
+        if !state.channels.contains_key(&input.id) {
+            return Err(crate::state::channel_not_found(&input.id).into());
+        }
+
+        // Minted through the store — its mint counter is part of every generated value's
+        // seed — so the pair is taken before the record is borrowed out of that same
+        // store, and it can never repeat the pair it replaces.
+        let (username, password) = state.mint_ingest_credentials();
+
+        let record = state
+            .channels
+            .get_mut(&input.id)
+            .expect("the channel resolved above, under this one hold of the lock");
+
+        // `PUT /channels/{Id}/credentials` rotates the FIRST ingest endpoint's credentials
+        // and nothing else ("Changes the Channel's first IngestEndpoint's username and
+        // password"): that endpoint keeps its id and its ingest URL, the channel's other
+        // endpoint keeps the credentials it was provisioned with, and the description, the
+        // log subscriptions and the tags are not this operation's input, so they stay as
+        // stored. A channel holding no ingest endpoint has no first one to rotate, so such
+        // a record is answered unchanged rather than grown an endpoint by a rotation.
+        if let Some(first) = record.ingest_endpoints.first_mut() {
+            first.username = Some(username);
+            first.password = Some(password);
+        }
+
+        // Rendered from the STORED record, so this response and every later
+        // DescribeChannel/ListChannels are the same bytes.
+        let channel = record.to_channel();
+        Ok(RotateChannelCredentialsOutput {
+            arn: channel.arn,
+            created_at: channel.created_at,
+            description: channel.description,
+            egress_access_logs: channel.egress_access_logs,
+            hls_ingest: channel.hls_ingest,
+            id: channel.id,
+            ingress_access_logs: channel.ingress_access_logs,
+            tags: channel.tags,
+        })
     }
 }

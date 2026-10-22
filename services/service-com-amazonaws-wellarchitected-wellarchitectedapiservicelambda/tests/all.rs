@@ -23,6 +23,9 @@ mod lookup_error_envelopes;
 #[path = "all/milestone_listing.rs"]
 mod milestone_listing;
 
+#[path = "all/review_template_answers.rs"]
+mod review_template_answers;
+
 #[path = "all/review_template_lifecycle.rs"]
 mod review_template_lifecycle;
 

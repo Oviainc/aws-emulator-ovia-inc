@@ -192,6 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outposts.push(outpost.to_outpost(&region));
         }
 
+        // An account with no S3 on Outposts capacity provisioned holds no
+        // Outpost records, so the page above is empty — and `next_token` is set
+        // only where the loop found a record BEYOND the page it served, so the
+        // last page of any listing, an empty one included, carries no token at
+        // all.
         Ok(ListOutpostsWithS3Output {
             outposts: Some(outposts),
             next_token,

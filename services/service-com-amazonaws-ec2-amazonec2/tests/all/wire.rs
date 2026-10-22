@@ -28,19 +28,22 @@ const NESTED_SETS: [&str; 3] = [
 ];
 
 /// The response as a document, or a panic naming the case.
-fn document<'a>(case: &str, body: &'a str) -> roxmltree::Document<'a> {
+pub fn document<'a>(case: &str, body: &'a str) -> roxmltree::Document<'a> {
     roxmltree::Document::parse(body)
         .unwrap_or_else(|error| panic!("case {case:?}: the body must be XML ({error}): {body}"))
 }
 
 /// The first child element of `node` named `name`.
-fn child<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
+pub fn child<'a, 'i>(
+    node: roxmltree::Node<'a, 'i>,
+    name: &str,
+) -> Option<roxmltree::Node<'a, 'i>> {
     node.children()
         .find(|inner| inner.is_element() && inner.tag_name().name() == name)
 }
 
 /// The text of the first child element of `node` named `name`.
-fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
+pub fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
     child(node, name).map(|inner| inner.text().unwrap_or_default().to_string())
 }
 
