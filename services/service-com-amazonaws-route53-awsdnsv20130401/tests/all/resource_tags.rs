@@ -95,7 +95,10 @@ async fn list_tags(router: &MultiServiceRouter, resource_type: &str, resource_id
 /// Parsed from the raw body rather than read out of `Reply::doc`, because the
 /// shared flattener drops an element carrying no text and a tag value may
 /// legitimately be the empty string.
-fn element_text(block: &str, name: &str) -> Option<String> {
+///
+/// `pub(crate)` so a sibling suite in this test target reads an element that
+/// may be empty through the SAME reader rather than growing a second copy.
+pub(crate) fn element_text(block: &str, name: &str) -> Option<String> {
     if block.contains(&format!("<{name}/>")) {
         return Some(String::new());
     }
@@ -104,6 +107,12 @@ fn element_text(block: &str, name: &str) -> Option<String> {
     let start = block.find(&open)? + open.len();
     let end = block[start..].find(&close)? + start;
     Some(unescape_xml(&block[start..end]))
+}
+
+/// Whether a reply carries a `Tags` container at all, empty or not. `<Tags/>`,
+/// `<Tags></Tags>` and a container with children all count.
+fn carries_tags_container(reply: &Reply) -> bool {
+    reply.body.contains("<Tags/>") || reply.body.contains("<Tags>")
 }
 
 /// The `(Key, Value)` pairs of every `<Tag>` in a reply, in document order.
@@ -297,16 +306,70 @@ async fn tag_batches_add_edit_and_delete_tags_and_read_back() {
             row.case,
             listed.body
         );
-        // `ResourceTagSet$Tags` is `len 1..10`, so an untagged resource reports
-        // the member absent rather than as an empty list.
+        // A tag read reports the `ResourceTagSet/Tags` container
+        // unconditionally, so a resource that carries no tags answers with an
+        // EMPTY container rather than with no element at all: a client walking
+        // it reads an empty collection instead of a missing node. (`TagList`'s
+        // `@length min 1` bounds what a REQUEST may send.)
+        assert!(
+            carries_tags_container(&listed),
+            "case {:?}: the tag set must carry a Tags container; body {}",
+            row.case,
+            listed.body
+        );
         if row.expected.is_empty() {
             assert!(
-                !listed.body.contains("<Tags>"),
-                "case {:?}: an untagged resource must omit Tags; body {}",
+                !listed.body.contains("<Tag>"),
+                "case {:?}: an untagged resource's Tags container must be empty; body {}",
                 row.case,
                 listed.body
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn an_untagged_resource_reports_an_empty_tags_container() {
+    // The rule, on the two ways a resource comes to carry no tags: it was never
+    // tagged, and it was tagged and then emptied. Both report the container.
+    let router = router();
+    let never_tagged = create_zone_ok(&router, "never.example.com", "never-tagged").await;
+    let emptied = create_zone_ok(&router, "emptied.example.com", "emptied-tags").await;
+
+    let changed = change_tags(&router, "hostedzone", &emptied, &[("Owner", "dns-team")], &[]).await;
+    assert_eq!(
+        changed.status, 200,
+        "tagging {emptied}: expected 200, got {} with body {}",
+        changed.status, changed.body
+    );
+    let changed = change_tags(&router, "hostedzone", &emptied, &[], &["Owner"]).await;
+    assert_eq!(
+        changed.status, 200,
+        "untagging {emptied}: expected 200, got {} with body {}",
+        changed.status, changed.body
+    );
+
+    for (case, zone) in [
+        ("a zone that was never tagged", &never_tagged),
+        ("a zone whose every tag was removed", &emptied),
+    ] {
+        let listed = list_tags(&router, "hostedzone", zone).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: expected 200 from ListTagsForResource, got {} with body {}",
+            listed.status, listed.body
+        );
+        assert!(
+            carries_tags_container(&listed),
+            "case {case:?}: an untagged resource must still carry a Tags container; body {}",
+            listed.body
+        );
+        assert_eq!(
+            tag_pairs(&listed),
+            Vec::<(String, String)>::new(),
+            "case {case:?}: the container must be empty; body {}",
+            listed.body
+        );
     }
 }
 

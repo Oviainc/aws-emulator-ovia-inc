@@ -231,17 +231,31 @@ pub struct StoredZone {
     /// the zone takes its tags with it and no second map can disagree about
     /// them. Bounded by [`MAX_TAGS_PER_RESOURCE`].
     pub tags: BTreeMap<String, String>,
+    /// Whether deletion protection is enabled for this zone, as a hosted-zone
+    /// read reports it.
+    ///
+    /// A zone is created WITHOUT deletion protection, and this API version
+    /// (2013-04-01) carries no operation that turns it on, so every zone this
+    /// store holds reports it off — exactly as Route 53 reports a zone created
+    /// without it. It is held on the zone rather than answered as a constant by
+    /// the read, so the day an operation can set it, the read already reports
+    /// what was set.
+    pub deletion_protection_enabled: bool,
 }
 
 impl StoredZone {
     /// The modelled `HostedZone`, with a LIVE `ResourceRecordSetCount`.
     ///
-    /// `Config` is omitted when the zone carries neither a comment nor the
-    /// private flag, per the `HostedZone$Config` documentation: "If you omitted
-    /// the HostedZoneConfig and Comment elements from the request, the Config
-    /// and Comment elements don't appear in the response."
+    /// `Config` is ALWAYS present: `HostedZoneConfig$PrivateZone` is a boolean
+    /// with `@default false`, so the zone's private flag always has a value to
+    /// report, and Route 53 answers every hosted-zone read with the `Config`
+    /// container carrying it — including for a public zone created with no
+    /// `HostedZoneConfig` at all. `Comment`, which has no default, is reported
+    /// only when the zone holds one; that is the member the `HostedZone$Config`
+    /// documentation ("the Config and Comment elements don't appear in the
+    /// response") is about.
     pub fn to_hosted_zone(&self) -> HostedZone {
-        let config = (self.comment.is_some() || self.private_zone).then(|| HostedZoneConfig {
+        let config = Some(HostedZoneConfig {
             comment: self.comment.clone(),
             private_zone: self.private_zone,
         });
@@ -270,7 +284,7 @@ impl StoredZone {
 
     /// This zone's tag set as `ResourceTagSet$Tags` carries it; see
     /// [`tags_to_list`].
-    pub fn to_tag_list(&self) -> Option<Vec<Tag>> {
+    pub fn to_tag_list(&self) -> Vec<Tag> {
         tags_to_list(&self.tags)
     }
 
@@ -442,18 +456,19 @@ pub fn name_is_in_zone(name: &str, zone_name: &str) -> bool {
 
 /// A resource's tag set as the wire carries it, in tag-key order.
 ///
-/// `ResourceTagSet$Tags` is a list of at least one member, so a resource with no
-/// tags reports the member ABSENT rather than as an empty list — the same rule
-/// `GetHostedZone` applies to `VPCs`.
-pub fn tags_to_list(tags: &BTreeMap<String, String>) -> Option<Vec<Tag>> {
-    (!tags.is_empty()).then(|| {
-        tags.iter()
-            .map(|(key, value)| Tag {
-                key: Some(key.clone()),
-                value: Some(value.clone()),
-            })
-            .collect()
-    })
+/// The list is the resource's WHOLE tag set, and it is empty when the resource
+/// carries no tags: a tag read reports the `Tags` container unconditionally, so
+/// a client walking `ResourceTagSet/Tags` to enumerate tags finds an empty
+/// collection rather than a missing node once every tag has been removed. (The
+/// `@length min 1` on `TagList` bounds what a REQUEST may send — the modelled
+/// constraints are enforced on input only — not what a tag set may hold.)
+pub fn tags_to_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: Some(key.clone()),
+            value: Some(value.clone()),
+        })
+        .collect()
 }
 
 /// Apply one `ChangeTagsForResource` batch to a resource's tag set.

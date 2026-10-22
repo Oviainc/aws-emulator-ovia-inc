@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/hosted_zone_config.rs"]
+mod hosted_zone_config;
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
 #[path = "all/resource_tags.rs"]

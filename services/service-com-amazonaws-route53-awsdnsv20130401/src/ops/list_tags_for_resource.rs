@@ -176,7 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // The resource's own id, so the answer names what was
                         // read rather than echoing however it was addressed.
                         resource_id: Some(zone.id.clone()),
-                        tags: zone.to_tag_list(),
+                        // The `Tags` container is always reported, empty when
+                        // the resource carries no tags, so a client walking it
+                        // reads an empty collection rather than a missing node.
+                        tags: Some(zone.to_tag_list()),
                     },
                 })
             }

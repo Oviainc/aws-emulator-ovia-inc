@@ -436,6 +436,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CreateHostedZone takes no tags; a zone is tagged afterwards,
             // through ChangeTagsForResource.
             tags: BTreeMap::new(),
+            // A zone is created without deletion protection; nothing in this
+            // API version turns it on.
+            deletion_protection_enabled: false,
         };
 
         let change = store.submit_change(None);

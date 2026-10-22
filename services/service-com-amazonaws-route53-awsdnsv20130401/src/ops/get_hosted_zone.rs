@@ -56,6 +56,8 @@
 //!   servers for the specified hosted zone.
 //! * `HostedZone` (HostedZone) **required** — A complex type that contains general
 //!   information about the specified hosted zone.
+//! * `HostedZoneDeletionProtectionEnabled` (Boolean) — Whether deletion protection is
+//!   enabled for the hosted zone.
 //! * `VPCs` (VPCs, len 1..) — A complex type that contains information about the VPCs that
 //!   are associated with the specified hosted zone.
 //!
@@ -157,6 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetHostedZoneOutput {
             hosted_zone: zone.to_hosted_zone(),
             delegation_set: Some(zone.to_delegation_set()),
+            // Read off the zone, so a zone whose deletion protection is on
+            // would report it on.
+            hosted_zone_deletion_protection_enabled: Some(zone.deletion_protection_enabled),
             // `VPCs` is a list of at least one member, so a zone with no
             // association reports the member absent rather than an empty list.
             vp_cs: (!zone.vpcs.is_empty()).then(|| zone.vpcs.clone()),

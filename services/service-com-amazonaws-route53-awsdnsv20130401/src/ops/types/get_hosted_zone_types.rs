@@ -20,6 +20,7 @@ pub struct GetHostedZoneInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.route53#GetHostedZoneResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct GetHostedZoneOutput {
+    pub hosted_zone_deletion_protection_enabled: Option<bool>,
     pub hosted_zone: HostedZone,
     pub delegation_set: Option<DelegationSet>,
     pub vp_cs: Option<Vec<VPC>>,
