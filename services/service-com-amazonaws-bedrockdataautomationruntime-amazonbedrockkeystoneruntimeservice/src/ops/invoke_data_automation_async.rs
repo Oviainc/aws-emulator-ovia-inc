@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeDataAutomationAsync
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeDataAutomationAsync`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeDataAutomationAsync::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts a data-automation submission: it MINTS an invocation, persists it in
+//! [`crate::state`], and returns that record's own `invocationArn`. The operation is
+//! `@idempotent`, so a `clientToken` this service has already accepted replays the ARN
+//! of the job it minted then instead of minting a second one.
+//!
+//! ## Authorization and referenced ARNs
+//!
+//! Caller-identity authorization is deliberately NOT emulated by this service. The
+//! emulator verifies every request signature centrally and holds no
+//! principal-to-resource policy, and the `dataAutomationProfileArn` /
+//! `dataAutomationProjectArn` a submission names belong to the data-automation CONTROL
+//! plane, which is a different service and is not emulated here — so they are checked
+//! against the modelled `@pattern`/`@length` by the framework walk and then recorded,
+//! not resolved. The modelled `AccessDeniedException` is therefore unreachable from this
+//! handler: a submission that succeeds here is evidence that the request was well formed
+//! and was persisted, NOT that AWS IAM would have allowed it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +169,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeDataAutomationAsync` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeDataAutomationAsyncErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeDataAutomationAsync"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(InvokeDataAutomationAsyncErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the data automation runtime store is unavailable on this engine".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `@idempotent` + `@idempotencyToken`: the token identifies the submission, so a
+        // token this service has already accepted answers with the ARN it minted then —
+        // no second job, and no second ARN. A token whose job is no longer retained is
+        // not replayed (and is dropped), so a replay never names a record a reader
+        // cannot resolve.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(invocation_arn) = store.replay_for_client_token(token) {
+                return Ok(InvokeDataAutomationAsyncOutput { invocation_arn });
+            }
+        }
+
+        // The resource id is minted by the store from its own monotonic mint count and
+        // the submission instant, never derived from the request: two submissions of the
+        // identical payload under different tokens are two jobs with two ids.
+        let invocation_id = store.mint_invocation_id(now);
+        let invocation_arn = crate::state::invocation_arn(&region, &invocation_id);
+
+        let mut invocation = crate::state::Invocation::new(
+            invocation_arn.clone(),
+            invocation_id,
+            input.input_configuration.s3_uri.clone(),
+            input.output_configuration.s3_uri.clone(),
+            input.data_automation_profile_arn.clone(),
+            now,
+        );
+        if let Some(configuration) = input.data_automation_configuration {
+            invocation.data_automation_project_arn =
+                Some(configuration.data_automation_project_arn);
+            invocation.stage = configuration.stage;
+        }
+        invocation.blueprints = input.blueprints.unwrap_or_default();
+        invocation.encryption_configuration = input.encryption_configuration;
+        invocation.notification_configuration = input.notification_configuration;
+        invocation.client_token = input.client_token;
+        for tag in input.tags.unwrap_or_default() {
+            invocation.tags.insert(tag.key, tag.value);
+        }
+
+        // The store is bounded, and the record and its `clientToken` are admitted
+        // TOGETHER by this one call: it frees a slot first, so neither the invocation
+        // map nor the token map can grow past `MAX_INVOCATIONS` on this
+        // request-reachable path. `false` means every retained job is still running, so
+        // the submission is refused rather than displacing work somebody is waiting on —
+        // and nothing was inserted.
+        if !store.admit_invocation(invocation, now) {
+            return Err(InvokeDataAutomationAsyncErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Cannot have more than {} data automation invocations in progress",
+                        crate::state::MAX_INVOCATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        Ok(InvokeDataAutomationAsyncOutput { invocation_arn })
     }
 }
