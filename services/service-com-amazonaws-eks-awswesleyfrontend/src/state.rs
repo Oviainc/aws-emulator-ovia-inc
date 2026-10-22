@@ -124,6 +124,49 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// natural default.
 pub const DEFAULT_LIST_PAGE_SIZE: i32 = 100;
 
+/// The access policies Amazon EKS publishes, sorted by name.
+///
+/// These are NOT per-account resources: "An access policy includes permissions
+/// that allow Amazon EKS to authorize an IAM principal to work with Kubernetes
+/// objects on your cluster. The policies are managed by Amazon EKS, but they're
+/// not IAM policies" (`AccessPolicy`). No API creates, updates or deletes one, so
+/// the catalogue is identical for every account and Region and is held here, as
+/// the service's own data, rather than in the per-account store — and it is the
+/// single source of truth for every operation that names a policy
+/// (`ListAccessPolicies` reports it; `AssociateAccessPolicy` and
+/// `DisassociateAccessPolicy`, still scaffolded, will check a `policyArn` against
+/// it).
+///
+/// Source for the rows: the EKS "Access policy permissions" reference, whose table
+/// of Amazon EKS access policies lists the cluster- and namespace-scoped policies
+/// below — the ones whose permissions mirror the Kubernetes `cluster-admin`,
+/// `admin`, `edit` and `view` cluster roles that `AccessPolicy`'s own
+/// documentation points at. Sorted, so a page token can name the entry to resume
+/// after.
+pub const ACCESS_POLICY_NAMES: &[&str] = &[
+    "AmazonEKSAdminPolicy",
+    "AmazonEKSAdminViewPolicy",
+    "AmazonEKSClusterAdminPolicy",
+    "AmazonEKSEditPolicy",
+    "AmazonEKSViewPolicy",
+];
+
+/// The prefix every access-policy ARN carries.
+///
+/// An access policy is owned by the SERVICE, not by the caller's account: its ARN
+/// is `arn:aws:eks::aws:cluster-access-policy/<name>` — no Region, and the literal
+/// `aws` where an account-owned resource carries an account id. That is why these
+/// ARNs are not built through [`::engine::emulator_arn`], which always stamps the
+/// emulator's account ([`::engine::emulator_account_id`]) and a Region: an account
+/// id in one of these would name a resource no account owns, and the ARN is the
+/// value `AssociateAccessPolicy` takes back from a caller.
+pub const ACCESS_POLICY_ARN_PREFIX: &str = "arn:aws:eks::aws:cluster-access-policy/";
+
+/// The ARN of the access policy named `name`. See [`ACCESS_POLICY_ARN_PREFIX`].
+pub fn access_policy_arn(name: &str) -> String {
+    format!("{ACCESS_POLICY_ARN_PREFIX}{name}")
+}
+
 /// One cluster, as this service stores it.
 ///
 /// Everything a `Cluster` reports is held here — including the server-generated
@@ -360,7 +403,17 @@ pub fn derive_certificate_authority_data(resource_id: &str) -> String {
 /// pagination tokens do).
 pub const PAGE_TOKEN_TAG_LEN: usize = 4;
 
-/// Encode a `ListClusters` page token that resumes AFTER `last_returned`.
+/// The listing a page token belongs to, mixed into its provenance tag so a token
+/// one listing minted is not resumed from by another.
+///
+/// `ListClusters` pages the cluster names and is the listing whose tokens are
+/// computed with the EMPTY scope, which is what [`encode_page_token`] passes — so
+/// its tokens are exactly what they were before the scope was introduced.
+pub const CLUSTERS_LISTING: &str = "";
+/// The scope `ListAccessPolicies`'s tokens carry. See [`CLUSTERS_LISTING`].
+pub const ACCESS_POLICIES_LISTING: &str = "access-policies";
+
+/// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///
 /// Derived from the last key returned, not from an index into a transient list,
 /// so a token stays valid across creates and deletes. Hex rather than base64
@@ -368,28 +421,52 @@ pub const PAGE_TOKEN_TAG_LEN: usize = 4;
 /// standard base64 alphabet contains `+` and `/`, which a query parser may read
 /// as a space and a separator.
 ///
-/// The name is prefixed with [`PAGE_TOKEN_TAG_LEN`] bytes of its digest, so only
-/// a token this service minted is honoured: an arbitrary hex string — including
-/// a well-formed encoding of some other listing's key — fails the check and is
-/// refused rather than silently resumed from.
-pub fn encode_page_token(last_returned: &str) -> String {
-    let digest = Sha256::digest(last_returned.as_bytes());
+/// The name is prefixed with [`PAGE_TOKEN_TAG_LEN`] bytes of the digest of
+/// `listing` and the name together, so only a token THIS listing minted is
+/// honoured: an arbitrary hex string — including a well-formed token another
+/// listing issued — fails the check and is refused rather than silently resumed
+/// from.
+pub fn encode_scoped_page_token(listing: &str, last_returned: &str) -> String {
     let mut token = Vec::with_capacity(PAGE_TOKEN_TAG_LEN + last_returned.len());
-    token.extend_from_slice(&digest[..PAGE_TOKEN_TAG_LEN]);
+    token.extend_from_slice(&page_token_tag(listing, last_returned));
     token.extend_from_slice(last_returned.as_bytes());
     hex::encode(token)
 }
 
-/// The cluster name a page token resumes after, or `None` when the token is not
-/// one this service issued.
-pub fn decode_page_token(token: &str) -> Option<String> {
+/// The provenance tag a `listing`'s token carries for `last_returned`: the first
+/// [`PAGE_TOKEN_TAG_LEN`] bytes of the digest of the two together.
+fn page_token_tag(listing: &str, last_returned: &str) -> [u8; PAGE_TOKEN_TAG_LEN] {
+    let mut digest = Sha256::new();
+    digest.update(listing.as_bytes());
+    digest.update(last_returned.as_bytes());
+    let digest = digest.finalize();
+    let mut tag = [0u8; PAGE_TOKEN_TAG_LEN];
+    tag.copy_from_slice(&digest[..PAGE_TOKEN_TAG_LEN]);
+    tag
+}
+
+/// The name a `listing`'s page token resumes after, or `None` when the token is
+/// not one that listing issued.
+pub fn decode_scoped_page_token(listing: &str, token: &str) -> Option<String> {
     let bytes = hex::decode(token).ok()?;
     if bytes.len() <= PAGE_TOKEN_TAG_LEN {
         return None;
     }
     let (tag, name) = bytes.split_at(PAGE_TOKEN_TAG_LEN);
     let name = String::from_utf8(name.to_vec()).ok()?;
-    (Sha256::digest(name.as_bytes())[..PAGE_TOKEN_TAG_LEN] == *tag).then_some(name)
+    (page_token_tag(listing, &name) == *tag).then_some(name)
+}
+
+/// Encode a `ListClusters` page token: [`encode_scoped_page_token`] in the
+/// [`CLUSTERS_LISTING`] scope.
+pub fn encode_page_token(last_returned: &str) -> String {
+    encode_scoped_page_token(CLUSTERS_LISTING, last_returned)
+}
+
+/// The cluster name a page token resumes after, or `None` when the token is not
+/// one `ListClusters` issued.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    decode_scoped_page_token(CLUSTERS_LISTING, token)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
