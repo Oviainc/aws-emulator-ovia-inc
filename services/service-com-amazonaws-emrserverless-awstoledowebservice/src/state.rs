@@ -5,7 +5,8 @@
 //! The application is the primary resource of the EMR Serverless control plane, and a
 //! job run lives inside one application. [`ApplicationRecord`] is the ONE copy of an
 //! application every handler reads and writes: `CreateApplication` mints it,
-//! `GetApplication` / `ListApplications` report it, `StartApplication` /
+//! `GetApplication` / `ListApplications` report it, `UpdateApplication` applies the
+//! members a request names to it, `StartApplication` /
 //! `StopApplication` move its state, `DeleteApplication` terminates it (the record is
 //! retained in the terminal `TERMINATED` state rather than dropped, so a client reading
 //! the application back after a delete observes that state), and
@@ -167,6 +168,13 @@ pub const TERMINAL_JOB_RUN_STATES: &[&str] = &["SUCCESS", "FAILED", "CANCELLED"]
 /// Source: the operation's own documentation — "An application has to be in a stopped
 /// or created state in order to be deleted."
 pub const DELETABLE_APPLICATION_STATES: &[&str] = &["CREATED", "STOPPED"];
+
+/// The `ApplicationState` values `UpdateApplication` admits, judged against the state
+/// the application has SETTLED on ([`ApplicationRecord::settled_state`]).
+///
+/// Source: that operation's own documentation — "An application has to be in a stopped
+/// or created state in order to be updated."
+pub const UPDATABLE_APPLICATION_STATES: &[&str] = &["CREATED", "STOPPED"];
 
 /// The prefix a pagination cursor carries, so a token this service did not mint is
 /// refused rather than read as a resume point.

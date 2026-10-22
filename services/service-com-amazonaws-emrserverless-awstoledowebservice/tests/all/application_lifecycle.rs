@@ -1834,12 +1834,6 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
 
     for (case, method, uri, body) in [
         (
-            "UpdateApplication",
-            "PATCH",
-            format!("/applications/{application_id}"),
-            Some(json!({ "clientToken": "upd-1" })),
-        ),
-        (
             "StartSession",
             "POST",
             format!("/applications/{application_id}/sessions"),

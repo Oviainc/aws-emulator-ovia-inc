@@ -19,3 +19,5 @@ mod application_projection;
 mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_application.rs"]
+mod update_application;

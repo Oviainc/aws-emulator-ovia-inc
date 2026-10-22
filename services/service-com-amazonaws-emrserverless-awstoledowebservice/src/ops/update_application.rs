@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +181,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                UpdateApplicationErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(),
+                )
+            })?;
+
+        // The operation documents its precondition: "An application has to be in a
+        // stopped or created state in order to be updated." As everywhere in this
+        // service it is judged against the state the application has SETTLED on, so a
+        // transition the clock still owes it never refuses an update the settled
+        // application admits. This operation models no conflict error, so the refusal is
+        // its modelled `ValidationException`.
+        let application_state = record.settled_state().to_string();
+        if !crate::state::UPDATABLE_APPLICATION_STATES.contains(&application_state.as_str()) {
+            return Err(UpdateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Application is in {application_state} state; an application has to \
+                         be in CREATED or STOPPED state in order to be updated"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A release label the application's engine type is not served at is refused on
+        // the same rule `CreateApplication` applies to that pair: the engine the
+        // application carries has to exist at the release the update moves it to.
+        if let Some(release_label) = input.release_label.as_deref() {
+            if crate::state::supported_engine_type(&record.application.r#type, release_label)
+                .is_none()
+            {
+                return Err(UpdateApplicationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::unsupported_engine_type_message(
+                            &record.application.r#type,
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The update is a PATCH over the stored application: every member the request
+        // NAMES is applied to the record and every member it omits is left exactly as
+        // stored, so a later read reports what the create and each update together put
+        // there. A configuration block the request names REPLACES the stored one (it is
+        // one member, not a tree to merge), with the defaults the model documents filled
+        // in by the same `adopt_*` helpers the create uses — so an application reads back
+        // the same way however it came to carry that block.
+        let application = &mut record.application;
+        if let Some(release_label) = input.release_label {
+            application.release_label = release_label;
+        }
+        if let Some(architecture) = input.architecture {
+            application.architecture = Some(architecture);
+        }
+        if let Some(initial_capacity) = input.initial_capacity {
+            application.initial_capacity = Some(initial_capacity);
+        }
+        if let Some(maximum_capacity) = input.maximum_capacity {
+            application.maximum_capacity = Some(maximum_capacity);
+        }
+        if let Some(network_configuration) = input.network_configuration {
+            application.network_configuration = Some(network_configuration);
+        }
+        if let Some(runtime_configuration) = input.runtime_configuration {
+            application.runtime_configuration = Some(runtime_configuration);
+        }
+        if let Some(interactive_configuration) = input.interactive_configuration {
+            application.interactive_configuration = Some(interactive_configuration);
+        }
+        if let Some(scheduler_configuration) = input.scheduler_configuration {
+            application.scheduler_configuration = Some(scheduler_configuration);
+        }
+        if let Some(disk_encryption_configuration) = input.disk_encryption_configuration {
+            application.disk_encryption_configuration = Some(disk_encryption_configuration);
+        }
+        if input.auto_start_configuration.is_some() {
+            application.auto_start_configuration =
+                crate::state::adopt_auto_start(input.auto_start_configuration);
+        }
+        if input.auto_stop_configuration.is_some() {
+            application.auto_stop_configuration =
+                crate::state::adopt_auto_stop(input.auto_stop_configuration);
+        }
+        if input.monitoring_configuration.is_some() {
+            application.monitoring_configuration =
+                crate::state::adopt_monitoring(input.monitoring_configuration);
+        }
+        if input.job_level_cost_allocation_configuration.is_some() {
+            application.job_level_cost_allocation_configuration =
+                crate::state::adopt_job_level_cost_allocation(
+                    input.job_level_cost_allocation_configuration,
+                );
+        }
+        if input.identity_center_configuration.is_some() {
+            application.identity_center_configuration =
+                crate::state::adopt_identity_center_configuration(
+                    input.identity_center_configuration,
+                );
+        }
+        // `ImageConfiguration$imageUri` is required, so an `imageConfiguration` naming no
+        // image clears the custom image rather than storing half a shape.
+        if input.image_configuration.is_some() {
+            application.image_configuration =
+                crate::state::adopt_image_configuration(input.image_configuration);
+        }
+        if input.worker_type_specifications.is_some() {
+            application.worker_type_specifications =
+                crate::state::adopt_worker_type_specifications(input.worker_type_specifications);
+        }
+        application.updated_at = crate::state::now_timestamp(now);
+
+        Ok(UpdateApplicationOutput {
+            application: application.clone(),
+        })
     }
 }
