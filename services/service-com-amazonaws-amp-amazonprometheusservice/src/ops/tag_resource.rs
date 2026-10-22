@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: merges tags into the stored workspace the `resourceArn` names — a new
+//! key is appended, an existing key's value replaced.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // "Keys must not begin with aws:" (`TagResource$tags`) — a rule the model
+        // cannot express, so it is refused here as a 400 ValidationException.
+        if let Some(reserved) = crate::state::reserved_tag_key(input.tags.keys()) {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX,
+                    ),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "tags".to_string(),
+                        message: format!(
+                            "keys must not begin with {}",
+                            crate::state::RESERVED_TAG_KEY_PREFIX
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+
+        let resolved = store.workspace_id_of_arn(&input.resource_arn);
+        let Some(workspace) = resolved.and_then(|workspace_id| store.workspaces.get_mut(&workspace_id))
+        else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Resource not found: {}", input.resource_arn),
+                    resource_id: input.resource_arn.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The ACCUMULATED tag map is bounded by `TAGS_PER_RESOURCE_LIMIT`: a merge that
+        // would carry the resource past it is refused rather than growing the stored map.
+        // `TagResource` models no tag-limit error, so the refusal is the modelled
+        // `ValidationException` naming the member and its bound.
+        let resulting_tags = input
+            .tags
+            .keys()
+            .chain(workspace.tags.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if resulting_tags > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "a resource holds at most {} tags; this request would leave it with {resulting_tags}",
+                        crate::state::TAGS_PER_RESOURCE_LIMIT,
+                    ),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "tags".to_string(),
+                        message: format!(
+                            "a resource holds at most {} tags",
+                            crate::state::TAGS_PER_RESOURCE_LIMIT
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // "If you specify a new tag key for the resource, this tag is appended to the
+        // list of tags associated with the resource. If you specify a tag key that is
+        // already associated with the resource, the new tag value that you specify
+        // replaces the previous value for that tag."
+        for (key, value) in input.tags {
+            workspace.tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
