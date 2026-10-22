@@ -4,8 +4,9 @@
 //! plus the small helpers every handler of this crate shares.
 //!
 //! The pipeline definition lifecycle (`CreatePipeline` / `GetPipeline` /
-//! `ListPipelines` / `DeletePipeline`), the execution records
-//! `StartPipelineExecution` mints and the stage-transition states
+//! `ListPipelines` / `DeletePipeline`), the custom action types
+//! `CreateCustomActionType` mints and `ListActionTypes` reports, the execution
+//! records `StartPipelineExecution` mints and the stage-transition states
 //! `DisableStageTransition` / `EnableStageTransition` change all live in the one
 //! store reached through [`service_state`], so every handler computes its answer
 //! from persisted state rather than from the request it is answering.
@@ -151,6 +152,20 @@ pub const MAX_ACTION_TYPES_PER_ACCOUNT: usize = 1000;
 /// both caps in force every map is bounded by
 /// `MAX_PIPELINES_PER_ACCOUNT * MAX_EXECUTION_HISTORY_PER_PIPELINE`.
 pub const MAX_EXECUTION_HISTORY_PER_PIPELINE: usize = 1000;
+
+/// The `ActionOwner` a custom action type carries, from the model's enum
+/// (`smithy_query query="shape" shape="ActionOwner"` -> `AWS`, `ThirdParty`,
+/// `Custom`). `ActionTypeId$owner` documents the three values and
+/// `CreateCustomActionType` "creates a new custom action", so an action type this
+/// service mints is owned by `Custom`.
+pub const ACTION_OWNER_CUSTOM: &str = "Custom";
+
+/// The most tags one resource of this service holds.
+///
+/// AWS's resource-tagging limit of 50 tags per resource, which is what the modelled
+/// `TooManyTagsException` ("The tags limit for a resource has been exceeded")
+/// reports when a request would carry a resource past it.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// Per-service state for com-amazonaws-codepipeline-codepipeline-20150709. A handler reaches it through [`service_state`].
 ///
@@ -478,6 +493,12 @@ pub struct ActionTypeRecord {
     /// offers in every Region. `ListActionTypes$regionFilter` ("The Region to filter
     /// on for the list of action types") is what reads it.
     pub region: Option<String>,
+    /// The tags applied to this action type, as `CreateCustomActionType` stored
+    /// them. Empty for an action type the service provides itself, which no caller
+    /// tagged. `ActionType` carries no `tags` member, so only an operation that
+    /// reports a resource's tags reads it: `CreateCustomActionType`'s own answer
+    /// today, and `ListTagsForResource` once that stub is written.
+    pub tags: Vec<Tag>,
 }
 
 impl ActionTypeRecord {
@@ -549,6 +570,8 @@ impl BuiltInActionType {
                 maximum_count: self.output_artifacts.1,
             },
             region: None,
+            // Nobody tagged an action type the service provides itself.
+            tags: Vec::new(),
         }
     }
 }
@@ -970,6 +993,100 @@ impl Pipeline {
     }
 }
 
+/// A tag set this service refuses, and the modelled error shape that states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagProblem {
+    /// Refused as `TooManyTagsException`: the request carries more tags than a
+    /// resource may hold.
+    TooMany(String),
+    /// Refused as `InvalidTagsException`: the tag set itself is not well formed.
+    Invalid(String),
+}
+
+impl TagProblem {
+    /// Why the tags were refused. Built from the request, so the caller can fix the
+    /// request from this text alone.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::TooMany(message) | Self::Invalid(message) => message,
+        }
+    }
+}
+
+/// Refuse a tag set no resource of this service can carry.
+///
+/// Neither rule is expressible as a Smithy constraint (`TagList` carries no length
+/// bound and a list cannot require distinct keys):
+///
+/// * at most [`MAX_TAGS_PER_RESOURCE`] tags on one resource;
+/// * one key at most once — a map from key to value cannot hold a key twice, so a
+///   list naming one key twice does not describe a tag set.
+pub fn validate_tags(tags: &[Tag]) -> Result<(), TagProblem> {
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(TagProblem::TooMany(format!(
+            "tags must hold at most {MAX_TAGS_PER_RESOURCE} entries, but this request carries {}",
+            tags.len()
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for tag in tags {
+        if !seen.insert(tag.key.as_str()) {
+            return Err(TagProblem::Invalid(format!(
+                "tags names the key {} more than once",
+                tag.key
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an action type's `configurationProperties` list that the service's own
+/// documented rules rule out, reporting why. `Ok(())` means the list is storable.
+///
+/// Neither rule is a Smithy constraint, and they differ in how directly the model
+/// states them:
+///
+/// * STATED by `ActionConfigurationProperty$queryable`: "When creating a custom
+///   action, an action can have up to one queryable property. If it has one, that
+///   property must be both required and not secret."
+/// * INFERRED from `CreateCustomActionTypeInput$configurationProperties`: "You can
+///   refer to a name in the configuration properties of the custom action within the
+///   URL templates by following the format of {Config:name}" — a reference by name
+///   only resolves when each name appears once, so a list naming one twice does not
+///   describe a usable action type. The model does not say this in so many words.
+pub fn validate_configuration_properties(
+    properties: &[ActionConfigurationProperty],
+) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for property in properties {
+        if !seen.insert(property.name.as_str()) {
+            return Err(format!(
+                "configurationProperties names the property {} more than once",
+                property.name
+            ));
+        }
+    }
+    let queryable: Vec<&ActionConfigurationProperty> = properties
+        .iter()
+        .filter(|property| property.queryable)
+        .collect();
+    if queryable.len() > 1 {
+        return Err(format!(
+            "configurationProperties may declare at most one queryable property, but {} are queryable",
+            queryable.len()
+        ));
+    }
+    if let Some(property) = queryable.first() {
+        if !property.required || property.secret {
+            return Err(format!(
+                "the queryable configuration property {} must be required and not secret",
+                property.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What the service states when the caller is not whitelisted for an action type: the
 /// four identifying fields of the action type the REQUEST asked about, in the order
 /// `ActionTypeId` declares them, each quoted.
@@ -1278,14 +1395,14 @@ pub const CURSOR_ACTION_TYPE: &str = "actionType";
 /// issued; neither a `PipelineName` nor a `PipelineExecutionId` can contain `:`,
 /// so the prefix is unambiguous.
 ///
-/// Both listings apply ONE rule to a cursor: the page resumes at the first item
+/// Every listing applies ONE rule to a cursor: the page resumes at the first item
 /// still in the listing's order at or after the key, and the token is refused with
 /// `InvalidNextTokenException` only when it is not a cursor that listing issued or
-/// no such position exists. The two differ only in what their order makes possible:
-/// `ListPipelines` is ordered BY the key, so a pipeline deleted between pages still
-/// has a position (the next name) and paging continues; `ListPipelineExecutions` is
-/// ordered by when each execution started, so an id that is no longer retained has
-/// no position at all and its cursor is refused.
+/// no such position exists. They differ only in what their order makes possible:
+/// `ListPipelines` and `ListActionTypes` are ordered BY the key, so an item deleted
+/// between pages still has a position (the next key) and paging continues;
+/// `ListPipelineExecutions` is ordered by when each execution started, so an id that
+/// is no longer retained has no position at all and its cursor is refused.
 pub fn encode_page_token(kind: &str, key: &str) -> String {
     ::aws_smithy_types::base64::encode(format!("{kind}:{key}"))
 }

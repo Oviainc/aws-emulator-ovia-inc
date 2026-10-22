@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/action_type_catalog.rs"]
 mod action_type_catalog;
+#[path = "all/custom_action_types.rs"]
+mod custom_action_types;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
 #[path = "all/stage_transitions.rs"]

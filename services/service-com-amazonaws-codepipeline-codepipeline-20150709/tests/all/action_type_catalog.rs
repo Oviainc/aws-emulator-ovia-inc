@@ -34,12 +34,11 @@ const TARGET_PREFIX: &str = "CodePipeline_20150709";
 /// One emulator: the shared engine, the service mounted on it, and the router that
 /// dispatches to it — exactly how `core/router` assembles the production emulator.
 ///
-/// This suite keeps the engine handle (the pipeline-lifecycle suite's harness does
-/// not expose one) because an account's own action types are registered by
-/// `CreateCustomActionType`, which is still a scaffold stub
-/// (`issues/things-that-do-not-work/20261022T173520Z-codepipeline-createcustomactiontype-stub.md`):
-/// until it is written, the only way to put a registration in the SHARED store the
-/// handler reads is the engine itself, which is what a handler writes through too.
+/// This suite keeps the engine handle because it registers action types directly in
+/// the SHARED store the handler reads, which is what a handler writes through too —
+/// so these cases pin the listing on its own, independently of
+/// `CreateCustomActionType` (whose own round-trip cases live in
+/// `custom_action_types.rs`).
 struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
@@ -113,8 +112,8 @@ impl Emulator {
     }
 
     /// Register one action type in this account's store, the way
-    /// `CreateCustomActionType` will once it is implemented — through the gate that
-    /// enforces `MAX_ACTION_TYPES_PER_ACCOUNT`.
+    /// `CreateCustomActionType` does — through the gate that enforces
+    /// `MAX_ACTION_TYPES_PER_ACCOUNT`.
     fn register(&self, key: ActionTypeKey, record: ActionTypeRecord) {
         let accepted = self
             .engine
@@ -149,6 +148,7 @@ fn custom(category: &str, provider: &str, version: &str, region: &str) -> (Actio
                 maximum_count: 1,
             },
             region: Some(region.to_string()),
+            tags: Vec::new(),
         },
     )
 }
@@ -367,6 +367,7 @@ async fn a_registered_action_type_is_reported_from_the_store() {
             maximum_count: 2,
         },
         region: Some("us-east-1".to_string()),
+        tags: Vec::new(),
     };
     emulator.register(key, record);
 
