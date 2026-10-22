@@ -29,9 +29,22 @@
 //!   or replayed request depends on, and the reason a bare "nothing to do" is not
 //!   treated as a failure here.
 //!
-//! This is also the pairing the bootstrap issue's plan prescribes. Revisit the
-//! branch when `DisassociateAdminAccount` lands, since that is the operation the
-//! replacement path goes through.
+//! This is also the pairing the bootstrap issue's plan prescribes.
+//!
+//! ### The administrator slot while a disassociation is in flight
+//!
+//! `DisassociateAdminAccount` does not tear the association down instantly: it
+//! moves it to `PENDING_DELETION` and the clock completes it (see that handler
+//! and [`crate::state::ComAmazonawsFmsAwsfms20180101State::settle_admin_account`]).
+//! So this handler settles what the clock owes FIRST and then decides against the
+//! association that is still ACTIVE:
+//!
+//! * a completed disassociation leaves the slot free, so a fresh association — of
+//!   that same account or of another one — is written as a new `READY` record;
+//! * while a disassociation is still pending, the account is on its way out and
+//!   its role is being deleted, so there is no association to make and no
+//!   existing one to be idempotent about: that is the "wasn't possible" case of
+//!   `InvalidOperationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -209,29 +222,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        match &store.admin_account {
+        // `active_admin_account` settles what the clock owes before it answers, so a
+        // disassociation already completed frees the administrator slot for this
+        // request rather than blocking it.
+        let current = store
+            .active_admin_account()
+            .map(|admin| (admin.account_id.clone(), admin.removal_pending()));
+        match current {
             // Idempotent re-association: this account already IS the default
             // administrator, so there is nothing to change.
-            Some(existing) if existing.account_id == input.admin_account => {
+            Some((existing, false)) if existing == input.admin_account => {
                 Ok(AssociateAdminAccountOutput)
             }
+            // This account is still the administrator, but its role is being
+            // deleted on the way out of the organisation, so the association the
+            // caller asks for cannot be made (not even for the same account: the
+            // record is not one a retry can be answered from).
+            Some((existing, true)) => Err(
+                AssociateAdminAccountErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(format!(
+                            "the Firewall Manager administrator association for account \
+                             {existing} is pending deletion"
+                        )),
+                    },
+                )
+                .into(),
+            ),
             // A different account is already associated. An organisation has one
             // default administrator, so there is no second association to make —
             // which is what `InvalidOperationException` reports.
-            Some(existing) => Err(AssociateAdminAccountErrorModeled::InvalidOperationException(
-                InvalidOperationException {
-                    message: Some(format!(
-                        "account {} is already set as the Firewall Manager administrator",
-                        existing.account_id
-                    )),
-                },
-            )
-            .into()),
+            Some((existing, false)) => Err(
+                AssociateAdminAccountErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(format!(
+                            "account {existing} is already set as the Firewall Manager \
+                             administrator"
+                        )),
+                    },
+                )
+                .into(),
+            ),
             None => {
                 store.admin_account = Some(crate::state::AdminAccountRecord {
                     account_id: input.admin_account.clone(),
                     role_status: crate::state::ROLE_STATUS_READY.to_string(),
                     associated_at: ::std::time::SystemTime::now(),
+                    removal_due: None,
                 });
                 Ok(AssociateAdminAccountOutput)
             }
