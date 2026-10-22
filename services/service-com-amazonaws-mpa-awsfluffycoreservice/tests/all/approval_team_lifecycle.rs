@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// Region the test signs with, so the minted ARN's region segment is observable and is
 /// NOT the `DEFAULT_REGION` fallback.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// Slack over [`state::INVITATION_RESPONSE_DELAY`] before a clock-owed invitation
 /// response is expected to have been materialised.
@@ -114,13 +114,26 @@ fn team_cases() -> Vec<TeamCase> {
 }
 
 /// The service mounted in a router, plus the engine its store lives in.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    /// The harness these lifecycle tables use: the caller's own account recorded as
+    /// the organization's management account, the only state in which
+    /// `CreateApprovalTeam` is permitted. These tables are about what the lifecycle
+    /// operations DO once the caller may create a team; the gate itself is tested in
+    /// `authorization_gate.rs`.
+    pub(crate) fn new() -> Self {
+        let harness = Self::without_organization();
+        harness.record_management_account(engine::emulator_account_id());
+        harness
+    }
+
+    /// The service mounted in a router with the store left as it starts: no
+    /// organization, and therefore no management account.
+    pub(crate) fn without_organization() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's, not this service's; these requests
@@ -130,8 +143,16 @@ impl Harness {
         Self { router, engine }
     }
 
+    /// Record `account_id` as the management account of the organization the store
+    /// describes. No MPA operation records it, so a test that needs a created team
+    /// sets it directly, as [`Harness::expire_deletion_window`] sets a due instant.
+    pub(crate) fn record_management_account(&self, account_id: &str) {
+        let store = state::service_state(&*self.engine).expect("the service store");
+        store.lock().organization_management_account_id = Some(account_id.to_string());
+    }
+
     /// Dispatch one request and return `(status, parsed JSON body)`.
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
         let bytes = match &body {
             None => Bytes::new(),
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize the body")),
@@ -161,16 +182,16 @@ impl Harness {
         (status, parsed)
     }
 
-    async fn create(&self, body: &Value) -> (u16, Value) {
+    pub(crate) async fn create(&self, body: &Value) -> (u16, Value) {
         self.call("POST", "/approval-teams", Some(body.clone())).await
     }
 
-    async fn get(&self, arn: &str) -> (u16, Value) {
+    pub(crate) async fn get(&self, arn: &str) -> (u16, Value) {
         self.call("GET", &format!("/approval-teams/{}", encode_label(arn)), None)
             .await
     }
 
-    async fn update(&self, arn: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn update(&self, arn: &str, body: &Value) -> (u16, Value) {
         self.call(
             "PATCH",
             &format!("/approval-teams/{}", encode_label(arn)),
@@ -179,7 +200,7 @@ impl Harness {
         .await
     }
 
-    async fn start_deletion(&self, arn: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn start_deletion(&self, arn: &str, body: Option<Value>) -> (u16, Value) {
         self.call(
             "POST",
             &format!("/approval-teams/{}?Delete", encode_label(arn)),
@@ -188,7 +209,7 @@ impl Harness {
         .await
     }
 
-    async fn list(&self, query: &str) -> (u16, Value) {
+    pub(crate) async fn list(&self, query: &str) -> (u16, Value) {
         let uri = if query.is_empty() {
             "/approval-teams/?List".to_string()
         } else {
@@ -223,7 +244,7 @@ impl Harness {
 }
 
 /// Percent-encode an ARN for a non-greedy `@httpLabel`, which binds ONE path segment.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {
@@ -265,7 +286,7 @@ fn create_body(case: &TeamCase, client_token: Option<&str>) -> Value {
     body
 }
 
-fn text(body: &Value, member: &str) -> String {
+pub(crate) fn text(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -273,7 +294,7 @@ fn text(body: &Value, member: &str) -> String {
 }
 
 /// The error code a `restJson1` error envelope carries in `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     text(body, "__type")
 }
 
@@ -292,7 +313,7 @@ fn instant(body: &Value, member: &str) -> f64 {
 }
 
 /// The team ARN this service must mint for `name` in `REGION`.
-fn expected_arn(name: &str) -> String {
+pub(crate) fn expected_arn(name: &str) -> String {
     format!(
         "arn:aws:mpa:{REGION}:{}:approval-team/{name}",
         engine::emulator_account_id()

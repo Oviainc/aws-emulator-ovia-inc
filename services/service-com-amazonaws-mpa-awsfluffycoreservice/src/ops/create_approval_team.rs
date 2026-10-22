@@ -7,6 +7,11 @@
 //!
 //! Three rules this handler enforces beyond the modelled constraints:
 //!
+//! * Setting an organization's approval teams up is restricted to its MANAGEMENT
+//!   account, so a caller that is not it earns `AccessDeniedException` (403) before any
+//!   state is written. The store records the management account (none, until something
+//!   records one — this emulator runs no Organizations control plane), so the gate reads
+//!   state rather than deciding per request; see [`crate::state`].
 //! * `ClientToken` (`@idempotencyToken`) replay returns the team the first call minted —
 //!   same `Arn`, same `VersionId`, no second team.
 //! * A `Name` a live team already holds earns `ConflictException` (409).
@@ -195,6 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         let now = ::std::time::SystemTime::now();
         state.materialize_due(now);
+
+        // Setting an organization's approval teams up is restricted to its MANAGEMENT
+        // account: a call from any other account is refused before state is touched,
+        // so a caller that is not entitled to create a team never records one. This
+        // emulator runs no Organizations control plane and so records no management
+        // account (see `state::ComAmazonawsMpaAwsfluffycoreserviceState::
+        // organization_management_account_id`), which makes every caller a standalone
+        // account and this the answer to every call until one is recorded.
+        if !state.is_management_account(crate::state::caller_account_id()) {
+            return Err(CreateApprovalTeamErrorModeled::AccessDeniedException(
+                crate::state::not_management_account(),
+            )
+            .into());
+        }
 
         // `@idempotencyToken` replay: the same token answers with the team the first
         // call minted, rather than minting a second one.

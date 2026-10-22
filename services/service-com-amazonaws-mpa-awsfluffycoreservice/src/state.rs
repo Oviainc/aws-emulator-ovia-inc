@@ -20,13 +20,37 @@
 //! * The end of a pending deletion window ([`DEFAULT_PENDING_WINDOW_DAYS`]). Once it
 //!   elapses the team is gone, so `GetApprovalTeam` answers 404 and
 //!   `ListApprovalTeams` omits it.
+//!
+//! # Authorization
+//!
+//! This module also owns this service's authorization rules, so every handler states
+//! them the same way and decides them BEFORE it resolves a resource:
+//!
+//! * [`authorize_resource_arn`] — an operation that identifies its resource by ARN is
+//!   refused with `AccessDeniedException` (403) when that ARN is outside the caller's
+//!   own account, whatever is stored under it.
+//! * [`ComAmazonawsMpaAwsfluffycoreserviceState::is_management_account`] /
+//!   [`not_management_account`] — an operation an organization restricts to its
+//!   management account is refused the same way for any other caller.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use crate::ops::types::AccessDeniedException;
+
 /// Region stamped into a minted ARN when the request carries no SigV4 credential
 /// scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The IAM action namespace every MPA action carries, from this service's
+/// `arnNamespace` / `sigv4Name` (`smithy_query(query="service_info")`: both `mpa`).
+/// It is what an authorization refusal names the attempted action with
+/// (`mpa:GetApprovalTeam`).
+pub const SERVICE_ACTION_PREFIX: &str = "mpa";
+
+/// Longest `AccessDeniedException$Message` this service emits, from that member's
+/// modelled `@length(max: 1000)`.
+const MAX_ACCESS_DENIED_MESSAGE: usize = 1000;
 
 /// How long after an approver is invited the emulator reports their invitation
 /// response (and therefore how long a new team stays `PENDING`).
@@ -288,6 +312,19 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     pub name_index: BTreeMap<String, String>,
     /// `ClientToken` -> ARN. Backs the idempotent replay of `CreateApprovalTeam`.
     pub idempotency_tokens: BTreeMap<String, String>,
+    /// The account that is the MANAGEMENT account of the organization this store
+    /// records, if any.
+    ///
+    /// Multi-party approval is an AWS Organizations feature, and the operations
+    /// that set an organization's approval teams up are restricted to its
+    /// management account — a call from a member or standalone account is refused
+    /// with `AccessDeniedException` (403). This emulator presents a single account
+    /// ([`caller_account_id`]) and runs no Organizations control plane, so there is
+    /// no organization and no management account to record: the field is `None` and
+    /// every caller is a standalone account. Read it through
+    /// [`ComAmazonawsMpaAwsfluffycoreserviceState::is_management_account`], which
+    /// therefore answers `false` for every caller until something records one.
+    pub organization_management_account_id: Option<String>,
     /// Source of [`ApprovalTeam::seq`].
     next_team_seq: u64,
     /// Source of [`Approver::approver_id`].
@@ -295,6 +332,15 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
 }
 
 impl ComAmazonawsMpaAwsfluffycoreserviceState {
+    /// Whether `account_id` is the management account of the organization this store
+    /// records. False whenever no management account is recorded, which is the only
+    /// state this emulator reaches on its own: an organization-only operation is then
+    /// available to nobody.
+    #[must_use]
+    pub fn is_management_account(&self, account_id: &str) -> bool {
+        self.organization_management_account_id.as_deref() == Some(account_id)
+    }
+
     /// Apply every change the clock already owes at `now`, so each handler reads a
     /// store that is current. Idempotent, and a no-op when nothing is due.
     ///
@@ -437,6 +483,93 @@ where
 #[must_use]
 pub fn team_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("mpa", region, &format!("approval-team/{name}"))
+}
+
+/// The account every caller of this emulator authenticates as: every request is
+/// signed with the emulator's own credentials, so the caller's account is
+/// [`::engine::emulator_account_id`].
+#[must_use]
+pub fn caller_account_id() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// The ARN of the identity this emulator's callers authenticate as, as an
+/// authorization refusal names the principal it refused.
+#[must_use]
+pub fn caller_identity_arn() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// The account id an ARN embeds: its fifth colon-separated field, as every ARN
+/// grammar places it (`arn:<partition>:<service>:<region>:<account>:<resource>`).
+#[must_use]
+pub fn arn_account_id(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4)
+}
+
+/// Whether `arn` names a resource in the caller's own account.
+#[must_use]
+pub fn is_caller_account_arn(arn: &str) -> bool {
+    arn_account_id(arn) == Some(caller_account_id())
+}
+
+/// Authorize a request that identifies a resource by ARN: a resource outside the
+/// caller's own account is not one the caller can act on, so the request is refused
+/// BEFORE the resource is resolved — the answer to a foreign-account ARN never
+/// depends on whether anything is stored under it.
+///
+/// `action` is the operation's name (`Self::NAME` in a handler), which the refusal
+/// names as the IAM action `mpa:<action>`.
+pub fn authorize_resource_arn(action: &str, arn: &str) -> Result<(), AccessDeniedException> {
+    if is_caller_account_arn(arn) {
+        return Ok(());
+    }
+    Err(cross_account_access_denied(action, arn))
+}
+
+/// The `AccessDeniedException` payload for a resource ARN outside the caller's
+/// account. It is built from the request — the caller principal, the attempted
+/// action and the ARN asked for — and says nothing about the resource, which is
+/// never looked up.
+#[must_use]
+pub fn cross_account_access_denied(action: &str, arn: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: bounded_message(format!(
+            "User: {} is not authorized to perform: {SERVICE_ACTION_PREFIX}:{action} on \
+             resource: {arn} because no resource-based policy allows the \
+             {SERVICE_ACTION_PREFIX}:{action} action",
+            caller_identity_arn()
+        )),
+    }
+}
+
+/// The `AccessDeniedException` payload for an operation an organization restricts to
+/// its management account, called by an account that is not it.
+///
+/// The sentence is the one AWS answers this condition with; the requirement is the
+/// 403 and the `AccessDeniedException` code, and the refusal names no value from the
+/// request because the decision does not depend on one.
+#[must_use]
+pub fn not_management_account() -> AccessDeniedException {
+    AccessDeniedException {
+        message: "Action can only be performed by an organization\u{2019}s management account."
+            .to_string(),
+    }
+}
+
+/// `message` cut to the `AccessDeniedException$Message` bound
+/// ([`MAX_ACCESS_DENIED_MESSAGE`]) on a character boundary, so a long resource ARN
+/// (`ApprovalTeamArn` is `length(20..2048)`) cannot push the refusal past the length
+/// its own member declares.
+fn bounded_message(message: String) -> String {
+    if message.len() <= MAX_ACCESS_DENIED_MESSAGE {
+        return message;
+    }
+    let mut end = MAX_ACCESS_DENIED_MESSAGE;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_string()
 }
 
 /// The region to stamp into a minted ARN: the one this request's SigV4 credential
