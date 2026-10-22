@@ -196,7 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_monitor(&input.monitor_name, now);
         let monitor = store.monitors.get(&input.monitor_name).ok_or_else(|| {
             GetMonitorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                message: Some(crate::state::monitor_not_found_message(
+                    &input.monitor_name,
+                )),
             })
         })?;
 

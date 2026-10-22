@@ -10,8 +10,10 @@
 //!   reads back the same period, ARN, name, state and tags;
 //! * the requested period must be one of the values the model documents for
 //!   `aggregationPeriod` ("Valid values are either `30` or `60`"); any other
-//!   value is refused with 400 `ValidationException` and the stored period is
-//!   left as it was;
+//!   value is refused — with 400 `ValidationException` when it is inside the
+//!   shape's own `@range(min: 30)`, and with the front door's 400
+//!   `BadRequestException` when the BODY value is outside that range — and the
+//!   stored period is left as it was;
 //! * a `monitorName` no monitor is stored under is refused with 404
 //!   `ResourceNotFoundException`, and the update creates nothing;
 //! * the operation is `@idempotent`: repeating the same update answers the same
@@ -187,8 +189,8 @@ async fn an_update_replaces_the_stored_aggregation_period() {
         );
         assert_eq!(
             string_at(&updated, "state"),
-            "PENDING",
-            "case {case:?}: a monitor with no probes stays PENDING, got {updated:?}"
+            "INACTIVE",
+            "case {case:?}: a monitor with no probes stays INACTIVE, got {updated:?}"
         );
         assert_eq!(
             updated.get("tags"),
@@ -239,24 +241,28 @@ async fn an_update_replaces_the_stored_aggregation_period() {
 ///
 /// The table carries both published values, each published bound of the shape's
 /// own `@range(min: 30)` and one past it (`30` and `29`), and values between and
-/// above the documented pair.
+/// above the documented pair. It also pins WHICH refusal each row gets: a body
+/// value outside the shape's own `@range` is refused by the service's front door
+/// with `BadRequestException`, while one inside the range but outside the
+/// documented value list reaches the handler and is refused with the modelled
+/// `ValidationException`.
 #[tokio::test]
 async fn an_update_accepts_only_the_documented_aggregation_periods() {
-    // (case, requested period, expected status)
-    let cases: &[(&str, i64, u16)] = &[
-        ("the documented floor, which is the range's bound", 30, 200),
-        ("the documented default", 60, 200),
-        ("one below the modelled range bound", 29, 400),
-        ("between the two documented values", 45, 400),
-        ("one past the upper documented value", 61, 400),
-        ("above both documented values", 90, 400),
-        ("far above", 3600, 400),
-        ("zero", 0, 400),
-        ("negative", -30, 400),
+    // (case, requested period, expected status, expected error code)
+    let cases: &[(&str, i64, u16, &str)] = &[
+        ("the documented floor, which is the range's bound", 30, 200, ""),
+        ("the documented default", 60, 200, ""),
+        ("one below the modelled range bound", 29, 400, "BadRequestException"),
+        ("between the two documented values", 45, 400, "ValidationException"),
+        ("one past the upper documented value", 61, 400, "ValidationException"),
+        ("above both documented values", 90, 400, "ValidationException"),
+        ("far above", 3600, 400, "ValidationException"),
+        ("zero", 0, 400, "BadRequestException"),
+        ("negative", -30, 400, "BadRequestException"),
     ];
 
     let router = router();
-    for (index, (case, requested, expected_status)) in cases.iter().enumerate() {
+    for (index, (case, requested, expected_status, expected_code)) in cases.iter().enumerate() {
         let name = format!("period-rule-{index}");
         // Every row starts from the SAME stored period, so a refused update is
         // visible as "nothing changed".
@@ -281,8 +287,8 @@ async fn an_update_accepts_only_the_documented_aggregation_periods() {
         if *expected_status != 200 {
             assert_eq!(
                 error_code(&answered),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {answered:?}"
+                *expected_code,
+                "case {case:?}: expected {expected_code}, got {answered:?}"
             );
         }
         let (_, got) = get_monitor(&router, &name).await;
