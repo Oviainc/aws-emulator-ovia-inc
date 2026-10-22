@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSpeechSynthesisTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSpeechSynthesisTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSpeechSynthesisTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this service's speech synthesis tasks, ordered by creation date and
+//! optionally filtered by status. A REPORT, not a mutation: the only state it writes
+//! is [`crate::state::settle_task_status`], which materialises a status transition the
+//! clock had ALREADY made due — the same thing `GetSpeechSynthesisTask` does, and
+//! nothing a caller could not have observed by waiting instead of calling.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +110,69 @@ impl From<ListSpeechSynthesisTasksErrorModeled> for ListSpeechSynthesisTasksErro
     }
 }
 
+/// How many tasks one `ListSpeechSynthesisTasks` page carries when the request names
+/// no `MaxResults`.
+///
+/// CHOSEN: Amazon Polly documents `MaxResults` (1..100) but no default page size, so
+/// this is the emulator's own. It is small enough that the paging path is the normal
+/// path rather than one only a huge store reaches.
+pub const SYNTHESIS_TASK_PAGE_SIZE: usize = 20;
+
+/// The largest page the model allows: the `max` of `MaxResults`'s range
+/// (`smithy_query(query="operation", operation="ListSpeechSynthesisTasks")`). The
+/// boundary validator already refuses anything outside that range, so this only
+/// bounds the window the handler builds.
+const MAX_RESULTS_CEILING: i32 = 100;
+
+/// The field separator inside a page cursor. An ASCII unit separator, so it cannot
+/// occur in a `TaskId` (`^[a-zA-Z0-9_-]{1,100}$`) or in a `TaskStatus` value.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// Encode the cursor a `NextToken` carries: the position in the task order the page
+/// ended at, AND the `Status` filter it was reached under.
+///
+/// The position is the ORDER KEY of the last task on the page, not an index into the
+/// list, so a task created between two pages cannot shift the window and make the
+/// next page skip or repeat a task. The filter travels with it because a position
+/// under one filter means nothing under another; [`decode_task_cursor`] refuses such
+/// a token rather than serving a silently wrong page.
+fn encode_task_cursor(created_millis: i64, task_id: &str, status: Option<&str>) -> String {
+    crate::state::encode_page_token(&format!(
+        "{created_millis}{CURSOR_SEPARATOR}{task_id}{CURSOR_SEPARATOR}{}",
+        status.unwrap_or_default()
+    ))
+}
+
+/// The order key a `NextToken` resumes after, or `None` if this service did not mint
+/// the token or minted it for a different `Status` filter.
+fn decode_task_cursor(token: &str, status: Option<&str>) -> Option<(i64, String)> {
+    let cursor = crate::state::decode_page_token(token)?;
+    let mut fields = cursor.split(CURSOR_SEPARATOR);
+    let created_millis = fields.next()?.parse::<i64>().ok()?;
+    let task_id = fields.next()?.to_string();
+    let minted_for = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    (minted_for == status.unwrap_or_default()).then_some((created_millis, task_id))
+}
+
+/// The total order the report pages in.
+///
+/// "Returns a list of SpeechSynthesisTask objects ordered by their creation date" —
+/// oldest first, with the `TaskId` breaking a tie so the order is TOTAL and a page
+/// token can resume it exactly. The date is taken at millisecond precision, the
+/// precision the cursor carries, so sorting and resuming cannot disagree.
+fn order_key(task: &crate::state::StoredSynthesisTask) -> (i64, &str) {
+    let created_millis = task
+        .creation_time
+        .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |since_epoch| {
+            i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+        });
+    (created_millis, task.task_id.as_str())
+}
+
 /// The `ListSpeechSynthesisTasks` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,20 +207,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSpeechSynthesisTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSpeechSynthesisTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSpeechSynthesisTasks"))
+        // A token must be one this service minted, for this request's filter; anything
+        // else is refused before any state is read, so a garbage or foreign token can
+        // never read as "first page". The message is the service's fixed one for this
+        // code, so it says nothing about the token the caller sent.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                decode_task_cursor(token, input.status.as_deref()).ok_or_else(|| {
+                    ListSpeechSynthesisTasksErrorModeled::InvalidNextTokenException(
+                        crate::service::errors::invalid_next_token(),
+                    )
+                })?,
+            ),
+            None => None,
+        };
+
+        let page_size = match input.max_results {
+            // The boundary validator already refused anything outside the modeled
+            // 1..100 range, so the clamp only restates that invariant and the
+            // converted value cannot be out of a `usize`'s reach.
+            Some(max_results) => usize::try_from(max_results.clamp(1, MAX_RESULTS_CEILING))
+                .expect("a value clamped to 1..=100 fits a usize"),
+            None => SYNTHESIS_TASK_PAGE_SIZE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSpeechSynthesisTasksErrorModeled::ServiceFailureException(
+                crate::service::errors::service_failure(),
+            )
+        })?;
+
+        // ONE clock reading for the whole call, so the status this call settles, the
+        // status it filters on and the status it reports are the same one.
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // Each task's status as of NOW, exactly as `GetSpeechSynthesisTask` reads it: a
+        // transition the clock ALREADY owed the task is materialised, and one not yet
+        // due is left alone. That is the only write a report makes, and it changes
+        // nothing a caller could not have seen by waiting instead of calling.
+        for task in guard.synthesis_tasks.values_mut() {
+            crate::state::settle_task_status(task, now);
+        }
+
+        let mut matching: Vec<&crate::state::StoredSynthesisTask> = guard
+            .synthesis_tasks
+            .values()
+            // "Status of the speech synthesis tasks returned in a List operation".
+            .filter(|task| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| task.task_status == status)
+            })
+            // Resume strictly after the order key the token carries.
+            .filter(|task| {
+                after
+                    .as_ref()
+                    .is_none_or(|(millis, task_id)| order_key(task) > (*millis, task_id.as_str()))
+            })
+            .collect();
+        matching.sort_by(|left, right| order_key(left).cmp(&order_key(right)));
+
+        // One task past the page is enough to know whether a further page exists.
+        let has_further_page = matching.len() > page_size;
+        matching.truncate(page_size);
+        let next_token = if has_further_page {
+            matching.last().map(|last| {
+                let (created_millis, task_id) = order_key(last);
+                encode_task_cursor(created_millis, task_id, input.status.as_deref())
+            })
+        } else {
+            None
+        };
+
+        Ok(ListSpeechSynthesisTasksOutput {
+            synthesis_tasks: Some(
+                matching
+                    .iter()
+                    .map(|task| crate::state::synthesis_task(task))
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cursor round-trips, and a token this operation did not mint for THIS filter
+    /// is rejected rather than read as "start from the beginning".
+    #[test]
+    fn task_cursors_round_trip_and_reject_foreign_tokens() {
+        for (millis, task_id, status) in [
+            (0_i64, "a", None),
+            (1_761_000_000_000, "task-1", None),
+            (1_761_000_000_001, "TASK_2", Some("completed")),
+            (i64::MAX, "z", Some("inProgress")),
+        ] {
+            let token = encode_task_cursor(millis, task_id, status);
+            assert_eq!(
+                decode_task_cursor(&token, status),
+                Some((millis, task_id.to_string())),
+                "cursor ({millis}, {task_id:?}, {status:?}): token {token:?} did not round-trip"
+            );
+            // The same position under a different filter is not the same cursor.
+            let other = Some("failed");
+            assert_eq!(
+                decode_task_cursor(&token, other),
+                None,
+                "cursor ({millis}, {task_id:?}, {status:?}): must not resume filter {other:?}"
+            );
+        }
+
+        for garbage in ["not-hex", "abc", "ff", "fffe", &::hex::encode("1")] {
+            assert_eq!(
+                decode_task_cursor(garbage, None),
+                None,
+                "garbage token {garbage:?}: expected no cursor"
+            );
+        }
     }
 }
