@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops the tags the request's `TagKeys` name from the schedule group its
+//! `ResourceArn` identifies, in [`crate::state`]. Modelled `@idempotent`: a key
+//! the group does not carry is removed without error.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the scheduler state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A reserved key cannot be removed any more than it can be set: AWS owns
+        // the `aws:` namespace, so a request naming one is refused before the
+        // resource is looked up.
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}.",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group_name) = store.group_name_for_arn(&input.resource_arn, &region) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Resource not found: {}", input.resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // Nothing to remove is nothing to write: a group that holds no tags is
+        // left exactly as it is, so a no-op call never materialises a row for the
+        // built-in `default` group.
+        if !store.group_tags(&group_name).is_empty() {
+            let group = store.group_for_write(&group_name, &region);
+            if group.remove_tags(input.tag_keys.iter().map(String::as_str)) {
+                // Untagging modifies the group, so its last-modification reading
+                // moves only when a tag really went away.
+                group.last_modification_date = now;
+            }
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

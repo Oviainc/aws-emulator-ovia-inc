@@ -7,7 +7,7 @@
 //! here, keyed so the ordered maps enumerate deterministically — which is what
 //! lets `ListSchedules` resume from an opaque page token.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{FlexibleTimeWindow, Tag, Target};
@@ -57,6 +57,51 @@ pub const MAX_SCHEDULES: usize = 1_000_000;
 /// `MaxResults` means one call can never serialize more than this many records.
 pub const MAX_LIST_SCHEDULES_PAGE: usize = 100;
 
+/// The tag-key prefix AWS keeps for itself.
+///
+/// "You cannot edit or delete tag keys or values with this prefix. Tags with
+/// this prefix do not count against your tags per resource limit" — the AWS
+/// tagging restrictions every tagging API shares, so a request that supplies
+/// such a key is refused.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Largest number of tags one schedule group holds.
+///
+/// `TagList` (what `TagResource$Tags` sends and `ListTagsForResourceOutput$Tags`
+/// answers) is modelled `length 0..200`, so a group that held more could not be
+/// reported: a merge past the bound is refused instead.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The ARN infix that separates a schedule group's ARN prefix from its name.
+const SCHEDULE_GROUP_ARN_INFIX: &str = ":schedule-group/";
+
+/// The name of the schedule group `arn` identifies.
+///
+/// `TagResourceArn` is modelled `^arn:aws(-[a-z]+)?:scheduler:[a-z0-9\-]+:\d{12}:schedule-group\/[0-9a-zA-Z-_.]+$`,
+/// so the name is everything after the resource type — the boundary validator has
+/// already refused an ARN of any other shape (a schedule's, say) by the time a
+/// handler runs.
+pub fn schedule_group_name_from_arn(arn: &str) -> Option<&str> {
+    arn.split_once(SCHEDULE_GROUP_ARN_INFIX)
+        .map(|(_, name)| name)
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+}
+
+/// The reserved tag key among `keys`, if any — the lowest one, so the refusal
+/// names the same key however the request ordered its tags. The comparison is
+/// case-insensitive on the prefix: `AWS:` is reserved exactly as `aws:` is.
+///
+/// See [`RESERVED_TAG_KEY_PREFIX`].
+pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> Option<&'a str> {
+    let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
+    keys.into_iter()
+        .filter(|key| {
+            let key = key.as_bytes();
+            key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
+        })
+        .min()
+}
+
 /// A `ScheduleGroup` as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct ScheduleGroupRecord {
@@ -68,6 +113,54 @@ pub struct ScheduleGroupRecord {
     pub last_modification_date: SystemTime,
     /// Carried for `TagResource`/`UntagResource`/`ListTagsForResource`.
     pub tags: Vec<Tag>,
+}
+
+impl ScheduleGroupRecord {
+    /// Merge `tags` into the group's tag set and answer whether anything changed.
+    ///
+    /// A key the group does not carry is appended; a key it does carry keeps its
+    /// position and takes the new value — tagging a resource with a key already
+    /// on it replaces that key's value rather than adding a second pair, which is
+    /// what makes a tag set a map keyed by tag key.
+    pub fn merge_tags(&mut self, tags: impl IntoIterator<Item = Tag>) -> bool {
+        let mut changed = false;
+        for tag in tags {
+            match self.tags.iter_mut().find(|held| held.key == tag.key) {
+                Some(held) => {
+                    if held.value != tag.value {
+                        held.value = tag.value;
+                        changed = true;
+                    }
+                }
+                None => {
+                    self.tags.push(tag);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Drop every tag whose key is in `keys` and answer whether anything changed.
+    ///
+    /// A key the group does not carry is not an error: `UntagResource` is modelled
+    /// `@idempotent`, so removing a key twice has the same effect as removing it
+    /// once.
+    pub fn remove_tags<'a>(&mut self, keys: impl IntoIterator<Item = &'a str>) -> bool {
+        let keys: BTreeSet<&str> = keys.into_iter().collect();
+        let before = self.tags.len();
+        self.tags.retain(|tag| !keys.contains(tag.key.as_str()));
+        self.tags.len() != before
+    }
+}
+
+/// The distinct keys a resource holding `held` would carry once `incoming` were
+/// merged in — what [`MAX_TAGS_PER_RESOURCE`] bounds.
+pub fn tag_keys_after<'a>(held: &'a [Tag], incoming: &'a [Tag]) -> BTreeSet<&'a str> {
+    held.iter()
+        .chain(incoming.iter())
+        .map(|tag| tag.key.as_str())
+        .collect()
 }
 
 /// A `Schedule` as this emulator persists it.
@@ -100,9 +193,11 @@ pub struct ScheduleRecord {
 /// Per-service state for com-amazonaws-scheduler-awschronosservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsSchedulerAwschronosserviceState {
-    /// Client-created groups, by name. The implicit `default` group is NOT
-    /// stored: it exists for every account, so membership is answered by
-    /// [`Self::group_exists`] rather than by seeding a row on first read.
+    /// Groups by name. The implicit `default` group is not seeded: it exists for
+    /// every account, so membership is answered by [`Self::group_exists`] rather
+    /// than by a row, and a row for it appears only once a request has to STORE
+    /// something on it (its tags). An operation that enumerates groups therefore
+    /// reports `default` whether or not this map holds a row for it.
     pub groups: BTreeMap<String, ScheduleGroupRecord>,
     /// Schedules by `(group name, schedule name)` — the pair that identifies a
     /// schedule, and an ordering `ListSchedules` pages through.
@@ -155,6 +250,52 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
             });
         }
         None
+    }
+
+    /// The name of the schedule group `arn` identifies in this account and
+    /// Region, or `None` when no group there answers to that ARN.
+    ///
+    /// An ARN is a resource's identity, so it matches only the group whose own
+    /// ARN it equals: a well-formed ARN naming another partition, Region or
+    /// account addresses no group reachable from this endpoint. Resolution goes
+    /// through [`Self::group_record`], so the account's built-in `default` group
+    /// answers to its ARN with no row stored for it.
+    pub fn group_name_for_arn(&self, arn: &str, region: &str) -> Option<String> {
+        let name = schedule_group_name_from_arn(arn)?;
+        let record = self.group_record(region, name)?;
+        (record.arn == arn).then(|| name.to_string())
+    }
+
+    /// The tags held by `name`, which is empty for a group that carries none.
+    pub fn group_tags(&self, name: &str) -> &[Tag] {
+        self.groups
+            .get(name)
+            .map_or(&[][..], |record| record.tags.as_slice())
+    }
+
+    /// The record tags are stored on for the group `name`, materialising the row
+    /// the account's built-in `default` group needs on its first write.
+    ///
+    /// Only a caller that already resolved `name` through [`Self::group_name_for_arn`]
+    /// reaches this, so the group exists — and every group a create call minted
+    /// already has a row, so the one row this can add is the `default` group's.
+    /// Its dates come from [`Self::origin`], the same reading
+    /// [`Self::group_record`] reports for it, so storing its tags never moves the
+    /// creation date a reader sees.
+    pub fn group_for_write(&mut self, name: &str, region: &str) -> &mut ScheduleGroupRecord {
+        let origin = self.origin;
+        self.groups
+            .entry(name.to_string())
+            .or_insert_with(|| ScheduleGroupRecord {
+                name: name.to_string(),
+                arn: schedule_group_arn(region, name),
+                // The built-in group AWS creates with the account is ACTIVE; this
+                // row only starts holding its tags.
+                state: SCHEDULE_GROUP_STATE_ACTIVE.to_string(),
+                creation_date: origin,
+                last_modification_date: origin,
+                tags: Vec::new(),
+            })
     }
 }
 

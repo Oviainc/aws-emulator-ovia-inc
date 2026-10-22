@@ -159,6 +159,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // The reserved-prefix rule holds wherever this service takes tags, not
+        // only in TagResource: AWS owns the `aws:` key namespace.
+        let tags = input.tags.unwrap_or_default();
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(CreateScheduleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}.",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    ),
+                },
+            )
+            .into());
+        }
+
         if store.group_exists(&input.name) {
             return Err(CreateScheduleGroupErrorModeled::ConflictException(
                 ConflictException {
@@ -184,19 +201,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let arn = crate::state::schedule_group_arn(&region, &input.name);
-        store.groups.insert(
-            input.name.clone(),
-            crate::state::ScheduleGroupRecord {
-                name: input.name.clone(),
-                arn: arn.clone(),
-                // A group AWS creates is returned ACTIVE; only DeleteScheduleGroup
-                // moves it to DELETING, so no clock-owed transition starts here.
-                state: "ACTIVE".to_string(),
-                creation_date: now,
-                last_modification_date: now,
-                tags: input.tags.unwrap_or_default(),
-            },
-        );
+        let mut record = crate::state::ScheduleGroupRecord {
+            name: input.name.clone(),
+            arn: arn.clone(),
+            // A group AWS creates is returned ACTIVE; only DeleteScheduleGroup
+            // moves it to DELETING, so no clock-owed transition starts here.
+            state: "ACTIVE".to_string(),
+            creation_date: now,
+            last_modification_date: now,
+            tags: Vec::new(),
+        };
+        // Merged rather than stored verbatim, so a tag set is a map keyed by tag
+        // key here exactly as it is after TagResource.
+        record.merge_tags(tags);
+        store.groups.insert(input.name.clone(), record);
 
         Ok(CreateScheduleGroupOutput {
             schedule_group_arn: arn,
