@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUserPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUserPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUserPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +159,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUserPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUserPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteUserPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let key = crate::state::name_key(&input.user_name);
+        let not_found = |what: String| -> DeleteUserPolicyError {
+            DeleteUserPolicyErrorModeled::NoSuchEntityException(NoSuchEntityException {
+                message: Some(what),
+            })
+            .into()
+        };
+        if !store.users.contains_key(&key) {
+            return Err(not_found(format!(
+                "The user with name {} cannot be found.",
+                input.user_name
+            )));
+        }
+
+        let policy_key = crate::state::name_key(&input.policy_name);
+        let Some(policies) = store.user_inline_policies.get_mut(&key) else {
+            return Err(not_found(format!(
+                "The user policy with name {} cannot be found.",
+                input.policy_name
+            )));
+        };
+        if policies.remove(&policy_key).is_none() {
+            return Err(not_found(format!(
+                "The user policy with name {} cannot be found.",
+                input.policy_name
+            )));
+        }
+        if policies.is_empty() {
+            store.user_inline_policies.remove(&key);
+        }
+        Ok(DeleteUserPolicyOutput)
     }
 }
