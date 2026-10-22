@@ -206,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 namespace: crate::state::FIELD_NAMESPACE_CUSTOM.to_string(),
                 description: input.description,
                 attributes: input.attributes,
+                options: ::std::collections::BTreeMap::new(),
                 deleted: false,
                 tags: ::std::collections::HashMap::new(),
                 created_time: now,
