@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePreset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePreset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePreset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies one preset the account already holds: the members the request carries
+//! replace the stored ones, every member it leaves out keeps the value some earlier call
+//! persisted, and the response is the stored record projected through
+//! [`crate::state::PresetRecord::view`] — the same projection `GetPreset` reads, so an
+//! update is visible to every later read.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePreset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePresetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePreset"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePresetErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // `{Name}` addresses the preset; the stored key is the name exactly as
+        // `CreatePreset` persisted it, so it is read as sent rather than normalised.
+        let name = input.name;
+        let mut state = state.lock();
+
+        let Some(record) = state.presets.get_mut(&name) else {
+            return Err(UpdatePresetErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("name")),
+            })
+            .into());
+        };
+        // `Type`: "A preset can be of two types: system or custom", and a built-in one is
+        // not the caller's to change — the same refusal `UpdateJobTemplate` gives for a
+        // `SYSTEM` template.
+        if record.preset_type == crate::state::TYPE_SYSTEM {
+            return Err(UpdatePresetErrorModeled::ForbiddenException(ForbiddenException {
+                message: Some(crate::state::system_resource_modify_message("name")),
+            })
+            .into());
+        }
+
+        // Each optional member is "the new <member> for the preset, if you are changing
+        // it": a member the caller sent replaces the stored one, a member it left out
+        // leaves the stored one exactly as it was. `Category` and `Description` are free
+        // text, where — as on `CreatePreset` — an empty value carries no more information
+        // than absence, so sending a blank one clears the member rather than storing a
+        // value a later read would echo back blank.
+        if let Some(category) = input.category {
+            record.category = Some(category).filter(|value| !value.trim().is_empty());
+        }
+        if let Some(description) = input.description {
+            record.description = Some(description).filter(|value| !value.trim().is_empty());
+        }
+        // `Settings` is "Settings for preset": the whole encoder-settings graph, replaced
+        // as a unit when it is sent, since the API models no partial-settings patch.
+        if let Some(settings) = input.settings {
+            record.settings = settings;
+        }
+        // `Preset$LastUpdated`: "The timestamp in epoch seconds when the preset was last
+        // updated." This call is that update, so it moves; `CreatedAt` never does.
+        record.last_updated = now;
+
+        Ok(UpdatePresetOutput {
+            preset: Some(record.view(&region)),
+        })
     }
 }

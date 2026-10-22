@@ -23,6 +23,8 @@ mod job_templates;
 mod policy_lifecycle;
 #[path = "all/preset_lifecycle.rs"]
 mod preset_lifecycle;
+#[path = "all/preset_update.rs"]
+mod preset_update;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
 #[path = "all/resource_tagging.rs"]
