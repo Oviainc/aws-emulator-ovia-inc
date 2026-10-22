@@ -395,7 +395,10 @@ async fn schema_operations_report_what_is_missing() {
                 "policyStoreId": "policy-store-alias/nope",
                 "definition": { "cedarJson": schema },
             }),
-            "POLICY_STORE",
+            // The reference named an ALIAS, so that is the resource reported
+            // missing — `ResourceNotFoundException$resourceType` is "the resource
+            // type of the resource referenced in the failed request".
+            "POLICY_STORE_ALIAS",
         ),
         (
             "GetSchema on an unknown store id",
@@ -407,7 +410,10 @@ async fn schema_operations_report_what_is_missing() {
             "GetSchema through an unknown alias",
             "GetSchema",
             json!({ "policyStoreId": "policy-store-alias/nope" }),
-            "POLICY_STORE",
+            // The reference named an ALIAS, so that is the resource reported
+            // missing — `ResourceNotFoundException$resourceType` is "the resource
+            // type of the resource referenced in the failed request".
+            "POLICY_STORE_ALIAS",
         ),
     ];
 

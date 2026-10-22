@@ -126,10 +126,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let not_found = || {
-            PutSchemaErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
-                &input.policy_store_id,
-                "POLICY_STORE",
-            ))
+            PutSchemaErrorModeled::ResourceNotFoundException(
+                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
+            )
         };
         let unavailable = || {
             PutSchemaErrorModeled::InternalServerException(InternalServerException {
@@ -163,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::cedar::MAX_SCHEMA_BYTES
                     ),
                     resource_id: Some(store_id.clone()),
-                    resource_type: "SCHEMA".to_string(),
+                    resource_type: crate::state::RESOURCE_TYPE_SCHEMA.to_string(),
                     // `serviceCode`/`quotaCode` name a quota registered with the
                     // Service Quotas service. This bound is the emulator's own,
                     // not a registered quota, so there is no code to report and
