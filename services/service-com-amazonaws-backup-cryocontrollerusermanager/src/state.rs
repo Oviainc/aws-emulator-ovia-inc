@@ -7,13 +7,16 @@
 //! resource:
 //!
 //! * [`BackupVault`] — what `CreateBackupVault` inserts and `DeleteBackupVault`
-//!   removes.
+//!   removes, carrying the [`VaultLock`] `PutBackupVaultLockConfiguration`
+//!   applies to it.
 //! * [`RecoveryPoint`] — what `StartBackupJob` stores inside the named vault.
 //! * [`BackupJob`] — the job that produced that recovery point.
 //!
 //! `recovery_points_by_vault` is the ONLY per-vault list: both
 //! `ListRecoveryPointsByBackupVault`'s page and `DescribeBackupVault`'s
 //! `NumberOfRecoveryPoints` are derived from it, so the two can never disagree.
+//! [`VaultView`] is likewise the ONLY vault read projection: `DescribeBackupVault`
+//! and `ListBackupVaults` both answer from it.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,12 +33,33 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// `VaultType` for an ordinary backup vault (model enum `VaultType`).
 pub const VAULT_TYPE_BACKUP_VAULT: &str = "BACKUP_VAULT";
-/// `VaultState` of a vault that is ready to receive backups (model enum `VaultState`).
-pub const VAULT_STATE_AVAILABLE: &str = "AVAILABLE";
 /// `EncryptionKeyType` when the caller supplied no `EncryptionKeyArn`.
 pub const ENCRYPTION_KEY_TYPE_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
 /// `EncryptionKeyType` when the caller supplied an `EncryptionKeyArn`.
 pub const ENCRYPTION_KEY_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED_KMS_KEY";
+
+/// The ARN namespace of the KMS keys a vault is encrypted with.
+const KMS_ARN_NAMESPACE: &str = "kms";
+
+/// The least `ChangeableForDays` accepts, as the model documents it: "Backup
+/// enforces a 72-hour cooling-off period before Vault Lock takes effect and
+/// becomes immutable. Therefore, you must set `ChangeableForDays` to 3 or
+/// greater."
+pub const MIN_CHANGEABLE_FOR_DAYS: i64 = 3;
+
+/// The most `ChangeableForDays` accepts, as the model documents it: "The maximum
+/// value you can specify is 36,500 days (approximately 100 years)."
+pub const MAX_CHANGEABLE_FOR_DAYS: i64 = 36_500;
+
+/// The least a vault-lock retention bound accepts, as the model documents for
+/// `MinRetentionDays`: "The shortest minimum retention period you can specify is
+/// 1 day."
+pub const MIN_LOCK_RETENTION_DAYS: i64 = 1;
+
+/// The most a vault-lock retention bound accepts, as the model documents for
+/// `MaxRetentionDays`: "The longest maximum retention period you can specify is
+/// 36500 days (approximately 100 years)."
+pub const MAX_LOCK_RETENTION_DAYS: i64 = 36_500;
 
 /// `BackupJobState` a freshly started job is in (model enum `BackupJobState`).
 pub const BACKUP_JOB_STATE_CREATED: &str = "CREATED";
@@ -91,11 +115,21 @@ pub const MAX_RECOVERY_POINTS: usize = 10_000;
 pub const MAX_BACKUP_JOBS: usize = 10_000;
 
 /// The most `IdempotencyToken` records this emulator keeps. An EMULATOR-CHOSEN
-/// ceiling: the key is a string the CALLER picks, so this is the one store a
-/// caller controls the keys of. Past the ceiling the oldest record is dropped —
-/// a dropped token simply stops replaying, which is the same answer a caller
-/// gets for a token it never sent.
+/// ceiling: the key is a string the CALLER picks, so this is one of the two
+/// stores whose keys a caller controls (the other is
+/// [`MAX_DEFAULT_ENCRYPTION_KEYS`]'s). Past the ceiling the oldest record is
+/// dropped — a dropped token simply stops replaying, which is the same answer a
+/// caller gets for a token it never sent.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 1_000;
+
+/// The most default encryption keys this emulator keeps: one per region the
+/// requests it has served have named. An EMULATOR-CHOSEN ceiling for the reason
+/// given on [`MAX_VAULTS`] — the region comes from the caller's credential
+/// scope, so this store's keys are caller-chosen too. Past the ceiling another
+/// region's key is dropped; every vault keeps the key ARN recorded ON it, so a
+/// drop only means the next vault created in that region is encrypted by a
+/// newly created default key.
+pub const MAX_DEFAULT_ENCRYPTION_KEYS: usize = 64;
 
 /// How long a recorded `IdempotencyToken` stays replayable. An
 /// EMULATOR-CHOSEN span: AWS documents no lifetime for Backup's idempotency
@@ -122,6 +156,11 @@ pub fn backup_vault_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("backup-vault:{name}"))
 }
 
+/// The ARN of a KMS key: `arn:aws:kms:<region>:<account>:key/<key id>`.
+pub fn kms_key_arn(region: &str, key_id: &str) -> String {
+    ::engine::emulator_arn(KMS_ARN_NAMESPACE, region, &format!("key/{key_id}"))
+}
+
 /// The ARN of a recovery point: `arn:aws:backup:<region>:<account>:recovery-point:<id>`.
 pub fn recovery_point_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("recovery-point:{id}"))
@@ -129,11 +168,27 @@ pub fn recovery_point_arn(region: &str, id: &str) -> String {
 
 /// The region this request's ARNs carry: the one the caller signed for, from the
 /// SigV4 credential scope, falling back to [`DEFAULT_REGION`] for an unsigned
-/// request.
+/// request — or for a credential scope whose region field is not shaped like a
+/// region name, which names no region this service can mint an ARN for.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_like(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `value` is shaped like an AWS Region name: 1 to 32 lowercase
+/// letters, digits and hyphens, which is the form every published region name
+/// takes (`us-east-1`, `ap-southeast-4`, `us-gov-west-1`).
+///
+/// The region reaches this service as a free-form field of the caller's SigV4
+/// credential scope, so it is checked before it is stitched into an ARN or used
+/// as a key of this service's own state.
+fn is_region_like(value: &str) -> bool {
+    (1..=32).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Encode a pagination cursor: the key of the first item of the NEXT page.
@@ -254,6 +309,32 @@ pub fn resource_type_of(resource_arn: &str) -> Option<String> {
     is_modelled_resource_type(resource_type).then(|| resource_type.to_string())
 }
 
+/// The Backup Vault Lock configuration applied to a vault by
+/// `PutBackupVaultLockConfiguration`.
+///
+/// Its PRESENCE is what the vault read projections report as `Locked`, so a
+/// vault can never report retention bounds it is not locked by, nor a lock with
+/// no bounds behind it.
+#[derive(Debug, Clone)]
+pub struct VaultLock {
+    pub min_retention_days: Option<i64>,
+    pub max_retention_days: Option<i64>,
+    /// When the configuration becomes immutable — set only when the request
+    /// named `ChangeableForDays`, since the model documents that "if this
+    /// parameter is not specified, you can delete Vault Lock from the vault
+    /// [...] or change the Vault Lock configuration [...] at any time".
+    pub lock_date: Option<SystemTime>,
+}
+
+impl VaultLock {
+    /// Whether this configuration can no longer be changed or deleted: the
+    /// model documents that "on and after the lock date, the Vault Lock becomes
+    /// immutable and cannot be changed or deleted".
+    pub fn is_immutable_at(&self, now: SystemTime) -> bool {
+        self.lock_date.is_some_and(|lock_date| now >= lock_date)
+    }
+}
+
 /// The resource types this service supports, which is what
 /// `GetSupportedResourceTypes` reports and what every other operation that
 /// names a `ResourceType` is measured against.
@@ -307,29 +388,62 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
 pub struct BackupVault {
     pub name: String,
     pub arn: String,
-    pub encryption_key_arn: Option<String>,
+    /// The KMS key this vault is encrypted with. ALWAYS set: the model
+    /// documents that "if you do not specify a key, Backup creates a KMS key
+    /// for you by default", so a vault always has one to report.
+    pub encryption_key_arn: String,
+    /// Whether [`Self::encryption_key_arn`] is the key the create request
+    /// named, rather than the one this service created for the account by
+    /// default ([`ComAmazonawsBackupCryocontrollerusermanagerState::default_encryption_key_arn`]).
+    pub customer_managed_key: bool,
+    /// `EncryptionKeyType`, as this vault's type reports it. `None` for a
+    /// standard `BACKUP_VAULT`: AWS leaves the member unset for one, and a read
+    /// projects what is stored rather than defaulting an enum nobody set.
+    pub encryption_key_type: Option<String>,
     pub creator_request_id: Option<String>,
     pub creation_date: SystemTime,
     /// Always [`VAULT_TYPE_BACKUP_VAULT`] for a vault made by `CreateBackupVault`;
     /// the other `VaultType` values belong to operations still at 501.
     pub vault_type: String,
-    pub vault_state: String,
+    /// `VaultState`, as this vault's type reports it. `None` for a standard
+    /// `BACKUP_VAULT`, for the reason given on [`Self::encryption_key_type`];
+    /// the vault types that do carry a state are created by operations still at
+    /// 501.
+    pub vault_state: Option<String>,
     pub tags: BTreeMap<String, String>,
-    pub locked: bool,
-    pub min_retention_days: Option<i64>,
-    pub max_retention_days: Option<i64>,
+    /// The vault-lock configuration, once one has been applied.
+    pub lock: Option<VaultLock>,
 }
 
 impl BackupVault {
-    /// The `EncryptionKeyType` this vault reports: customer-managed exactly when
-    /// the create request named a key.
-    pub fn encryption_key_type(&self) -> &'static str {
-        if self.encryption_key_arn.is_some() {
-            ENCRYPTION_KEY_TYPE_CUSTOMER_MANAGED
-        } else {
-            ENCRYPTION_KEY_TYPE_AWS_OWNED
-        }
+    /// The `EncryptionKeyArn` the create request NAMED, as opposed to the key
+    /// this service created for a request that named none — what a repeat
+    /// create is compared against to decide whether it replays the original.
+    pub fn named_encryption_key_arn(&self) -> Option<&str> {
+        self.customer_managed_key
+            .then_some(self.encryption_key_arn.as_str())
     }
+}
+
+/// The members a vault read projects, computed ONCE from the stored vault so
+/// `DescribeBackupVault` and `ListBackupVaults` can never disagree about the
+/// same vault. A member the stored vault does not carry stays `None` here, and
+/// so is absent from both responses.
+#[derive(Debug, Clone)]
+pub struct VaultView {
+    pub name: String,
+    pub arn: String,
+    pub vault_type: String,
+    pub vault_state: Option<String>,
+    pub encryption_key_arn: String,
+    pub encryption_key_type: Option<String>,
+    pub creation_date: SystemTime,
+    pub creator_request_id: Option<String>,
+    pub number_of_recovery_points: i64,
+    pub locked: bool,
+    pub min_retention_days: Option<i64>,
+    pub max_retention_days: Option<i64>,
+    pub lock_date: Option<SystemTime>,
 }
 
 /// A recovery point stored inside a vault by `StartBackupJob`.
@@ -448,6 +562,11 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// `StartBackupJob`'s `IdempotencyToken` -> what it replays. Bounded by
     /// [`MAX_IDEMPOTENCY_TOKENS`] and [`IDEMPOTENCY_TOKEN_TTL`].
     pub idempotency_tokens: BTreeMap<String, IdempotencyRecord>,
+    /// The KMS key this service created for the account per region, for vaults
+    /// whose create request named none. One key per region, minted on first
+    /// use, so every default-key vault in a region reports the same key on
+    /// every read. Bounded by [`MAX_DEFAULT_ENCRYPTION_KEYS`].
+    pub default_encryption_keys: BTreeMap<String, String>,
     /// Monotonic counter behind [`Self::next_id`]; never reused within a run.
     id_seq: u64,
 }
@@ -476,6 +595,58 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             ((seq >> 48) & 0xffff) as u16,
             seq & 0xffff_ffff_ffff,
         )
+    }
+
+    /// The KMS key this service encrypts a vault with when the create request
+    /// named none: "if you do not specify a key, Backup creates a KMS key for
+    /// you by default" (model doc for `EncryptionKeyArn`).
+    ///
+    /// Created on first use and then kept, so it is one key per region for the
+    /// account — stable across reads and across vaults, as an account's default
+    /// key is. The store is bounded by [`MAX_DEFAULT_ENCRYPTION_KEYS`]: the
+    /// region is a field of the caller's credential scope, so the keys of this
+    /// map are caller-chosen and it is pruned rather than left to grow.
+    pub fn default_encryption_key_arn(&mut self, region: &str, now: SystemTime) -> String {
+        if let Some(arn) = self.default_encryption_keys.get(region) {
+            return arn.clone();
+        }
+        let arn = kms_key_arn(region, &self.next_id(now));
+        self.default_encryption_keys
+            .insert(region.to_string(), arn.clone());
+        while self.default_encryption_keys.len() > MAX_DEFAULT_ENCRYPTION_KEYS {
+            // Never the key just created: it is the one this request answers
+            // with, and the vault being created records it.
+            let evictable = self
+                .default_encryption_keys
+                .keys()
+                .find(|key| key.as_str() != region)
+                .cloned();
+            let Some(evictable) = evictable else { break };
+            self.default_encryption_keys.remove(&evictable);
+        }
+        arn
+    }
+
+    /// Project one stored vault for a read. The ONE place a vault's wire view
+    /// is computed; both vault read operations go through it.
+    pub fn vault_view(&self, vault: &BackupVault) -> VaultView {
+        VaultView {
+            name: vault.name.clone(),
+            arn: vault.arn.clone(),
+            vault_type: vault.vault_type.clone(),
+            vault_state: vault.vault_state.clone(),
+            encryption_key_arn: vault.encryption_key_arn.clone(),
+            encryption_key_type: vault.encryption_key_type.clone(),
+            creation_date: vault.creation_date,
+            creator_request_id: vault.creator_request_id.clone(),
+            number_of_recovery_points: self.recovery_point_count(&vault.name),
+            // A vault reports itself locked exactly while it holds a vault-lock
+            // configuration, and reports that configuration's bounds.
+            locked: vault.lock.is_some(),
+            min_retention_days: vault.lock.as_ref().and_then(|lock| lock.min_retention_days),
+            max_retention_days: vault.lock.as_ref().and_then(|lock| lock.max_retention_days),
+            lock_date: vault.lock.as_ref().and_then(|lock| lock.lock_date),
+        }
     }
 
     /// How many recovery points the named vault holds, derived from the index.
@@ -534,7 +705,8 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// Forget every `IdempotencyToken` record past [`IDEMPOTENCY_TOKEN_TTL`],
     /// then the oldest records beyond [`MAX_IDEMPOTENCY_TOKENS`].
     ///
-    /// This is the one store whose KEYS the caller chooses, so it is pruned on
+    /// This is one of the two stores whose KEYS the caller chooses, so it is
+    /// pruned on
     /// every `StartBackupJob` rather than left to grow with the request count.
     pub fn prune_idempotency_tokens(&mut self, now: SystemTime) {
         self.idempotency_tokens.retain(|_, record| {

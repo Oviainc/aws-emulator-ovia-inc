@@ -2,145 +2,26 @@
 
 //! The ECS cluster / task-definition / task lifecycle, driven end to end over HTTP.
 //!
-//! Every case here goes through the same front door a client uses: `POST /` with
-//! `X-Amz-Target: AmazonEC2ContainerServiceV20141113.<Operation>` and an `awsJson1_1`
-//! body, dispatched by the multi-service router. Nothing reaches into the state struct,
-//! so a response that is not computed from persisted state cannot pass.
+//! Every case here goes through the shared wire harness in [`crate::ecs_wire`], the same
+//! front door a client uses, so nothing reaches into the state struct and a response
+//! that is not computed from persisted state cannot pass.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request in this suite signs for. Deliberately NOT the emulator's
-/// default, so an ARN that carries it proves the region came from the request's SigV4
-/// credential scope.
-const SIGNED_REGION: &str = "us-west-2";
-
-/// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+use crate::ecs_wire::{
+    count, create_cluster, list, ok, refused, service, string, ACCOUNT, SIGNED_REGION,
+};
 
 /// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms)
 /// to fall due, with margin for a loaded test machine.
 const ONE_SPAN: Duration = Duration::from_millis(900);
 
-/// A router with just this service mounted on a fresh engine.
-pub(crate) fn service() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header(
-            "x-amz-target",
-            format!("AmazonEC2ContainerServiceV20141113.{operation}"),
-        )
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
-                 /ecs/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = response.into_body();
-    let parsed = if payload.is_empty() {
-        json!({})
-    } else {
-        serde_json::from_slice(&payload)
-            .unwrap_or_else(|_| json!({ "__unparsed": String::from_utf8_lossy(&payload) }))
-    };
-    (status, parsed)
-}
-
-/// A call that must succeed, returning its body.
-pub(crate) async fn ok(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-    case: &str,
-) -> Value {
-    let (status, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected {operation} to answer 200, got {status} with {parsed}"
-    );
-    parsed
-}
-
-/// A call that must be refused with HTTP 400 and the named modelled error code.
-async fn refused(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-    expected_code: &str,
-    case: &str,
-) {
-    let (status, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        status, 400,
-        "case {case:?}: expected {operation} to answer 400, got {status} with {parsed}"
-    );
-    let wire_type = parsed["__type"].as_str().unwrap_or_default();
-    assert!(
-        wire_type.contains(expected_code),
-        "case {case:?}: expected a {expected_code} from {operation}, got {parsed}"
-    );
-}
-
-/// A required string member of a response body.
-fn string(body: &Value, member: &str, case: &str) -> String {
-    body[member]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
-        .to_string()
-}
-
-/// An integer member whose modelled default is `0`, so an absent member reads as zero.
-fn count(body: &Value, member: &str, case: &str) -> i64 {
-    match &body[member] {
-        Value::Null => 0,
-        value => value
-            .as_i64()
-            .unwrap_or_else(|| panic!("case {case:?}: expected an integer {member}, got {body}")),
-    }
-}
-
-/// A list member of a response body, absent reading as empty.
-fn list(body: &Value, member: &str, case: &str) -> Vec<Value> {
-    match &body[member] {
-        Value::Null => Vec::new(),
-        Value::Array(items) => items.clone(),
-        other => panic!("case {case:?}: expected a list {member}, got {other}"),
-    }
-}
-
 /// A minimal, valid container definition.
 pub(crate) fn container(name: &str, image: &str) -> Value {
     json!({ "name": name, "image": image, "memory": 128 })
-}
-
-/// Create a cluster and return its ARN.
-async fn create_cluster(router: &MultiServiceRouter, name: &str, case: &str) -> String {
-    let body = ok(router, "CreateCluster", json!({ "clusterName": name }), case).await;
-    string(&body["cluster"], "clusterArn", case)
 }
 
 /// Register one revision of `family` with a single container and return
@@ -1506,8 +1387,8 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
         );
     }
 
-    // Services and container instances cannot exist yet, so a filter naming one is
-    // naming something absent.
+    // A service cannot exist yet, and an id that names no registered container
+    // instance names nothing in the cluster.
     refused(
         &router,
         "ListTasks",

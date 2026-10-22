@@ -2,11 +2,12 @@
 
 //! Engine state for the com-amazonaws-ecs-amazonec2containerservicev20141113 service.
 //!
-//! The ECS task lifecycle, held in one place: clusters, task-definition revisions and
-//! tasks. Every handler computes its response from what is stored here — the cluster
-//! counters (`runningTasksCount`, `pendingTasksCount`) are DERIVED from the task map
-//! rather than being bumped by whoever happened to call, so they cannot drift from the
-//! tasks that actually exist.
+//! The ECS task lifecycle, held in one place: clusters, container instances,
+//! task-definition revisions and tasks. Every handler computes its response from what is
+//! stored here — the cluster counters (`runningTasksCount`, `pendingTasksCount`,
+//! `registeredContainerInstancesCount`) are DERIVED from the task and container-instance
+//! maps rather than being bumped by whoever happened to call, so they cannot drift from
+//! the records that actually exist.
 //!
 //! Resource ids are minted from monotonic counters held here, so every ARN this
 //! service emits is both unique and recorded against the record it names.
@@ -29,10 +30,10 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterSetting, Container,
-    ContainerDefinition, EphemeralStorage, Failure, KeyValuePair, ProxyConfiguration,
-    RuntimePlatform, Tag, Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride,
-    Volume,
+    Attribute, CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterSetting,
+    Container, ContainerDefinition, ContainerInstance, EphemeralStorage, Failure, KeyValuePair,
+    PlatformDevice, ProxyConfiguration, Resource, RuntimePlatform, Tag, Task, TaskDefinition,
+    TaskDefinitionPlacementConstraint, TaskOverride, VersionInfo, Volume,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -59,12 +60,13 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 /// specify up to 10 tasks for each call."
 pub const MAX_RUN_TASK_COUNT: i32 = 10;
 
-/// `ListTasks` page size when the caller gives no `maxResults`. The member's doc: "This
-/// value can be between 1 and 100. If this parameter isn't used, then ListTasks returns
-/// up to 100 results".
+/// A list operation's page size when the caller gives no `maxResults`. The
+/// `ListTasks$maxResults` and `ListContainerInstances$maxResults` docs both say: "This
+/// value can be between 1 and 100. If this parameter isn't used, then
+/// <operation> returns up to 100 results".
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 
-/// The largest `maxResults` `ListTasks` accepts, from the same doc sentence.
+/// The largest `maxResults` a list operation accepts, from the same doc sentence.
 pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
 /// How many containers one task definition may describe. The Amazon ECS service quota
@@ -74,7 +76,8 @@ pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 pub const MAX_CONTAINER_DEFINITIONS: usize = 10;
 
 /// How many ids one describe request may name. Amazon ECS accepts at most 100 per
-/// `DescribeClusters`/`DescribeTasks` call, and the cap is also what bounds the work
+/// `DescribeClusters`/`DescribeTasks`/`DescribeContainerInstances` call, and the cap is
+/// also what bounds the work
 /// and the response bytes ONE request can ask this emulator for while it holds the
 /// store lock: without it a caller could repeat a single id until the request-body cap
 /// and multiply it into an arbitrarily large response.
@@ -118,6 +121,21 @@ pub const CLUSTER_ACTIVE: &str = "ACTIVE";
 /// `Cluster$status` for a deleted cluster: "The cluster has been deleted."
 pub const CLUSTER_INACTIVE: &str = "INACTIVE";
 
+/// `ContainerInstance$status` for a registered instance: the member's doc, "The `ACTIVE`
+/// status indicates that the container instance can accept tasks."
+pub const CONTAINER_INSTANCE_ACTIVE: &str = "ACTIVE";
+/// `ContainerInstance$status` for an instance taken out of service: "The `DRAINING`
+/// indicates that new tasks aren't placed on the container instance".
+pub const CONTAINER_INSTANCE_DRAINING: &str = "DRAINING";
+/// `ContainerInstance$status` for a deregistered instance: "The instance then
+/// transitions to an `INACTIVE` status." The status
+/// `ListContainerInstances$status`'s doc excludes by default.
+pub const CONTAINER_INSTANCE_INACTIVE: &str = "INACTIVE";
+
+/// How many container instances this emulator holds, across every cluster.
+/// EMULATOR-CHOSEN, for the same reason as [`MAX_CLUSTERS`].
+pub const MAX_CONTAINER_INSTANCES: usize = 512;
+
 /// `TaskDefinition$status` for a registered revision.
 pub const TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
 
@@ -150,6 +168,117 @@ pub struct ClusterRecord {
     pub configuration: Option<ClusterConfiguration>,
     pub capacity_providers: Vec<String>,
     pub default_capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
+}
+
+/// A container instance, as `RegisterContainerInstance` left it: the EC2 or external
+/// instance that runs the ECS agent and offers the cluster its capacity.
+#[derive(Debug, Clone)]
+pub struct ContainerInstanceRecord {
+    pub arn: String,
+    /// The container-instance id: the last ARN segment, and what a caller may name
+    /// instead of the ARN.
+    pub instance_id: String,
+    pub cluster_name: String,
+    pub ec2_instance_id: String,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub agent_connected: bool,
+    pub version_info: Option<VersionInfo>,
+    /// `totalResources`, as the agent reported it at registration —
+    /// `ContainerInstance$registeredResources` is "the amount of each resource that was
+    /// available on the container instance when the container agent registered it".
+    pub registered_resources: Vec<Resource>,
+    pub attributes: Vec<Attribute>,
+    /// The GPU and Neuron devices the agent reported. Recorded because registration is
+    /// what reports them; `ContainerInstance` models no member for them, so nothing
+    /// renders them back.
+    pub platform_devices: Vec<PlatformDevice>,
+    pub tags: Vec<Tag>,
+    pub registered_at: DateTime,
+    pub version: i64,
+}
+
+impl ContainerInstanceRecord {
+    /// The `ContainerInstance` every container-instance operation reports, built from
+    /// what is stored.
+    ///
+    /// `remainingResources` is "the remaining CPU and memory that wasn't already
+    /// allocated to tasks": no task in this emulator is placed on a container instance
+    /// (a `TaskRecord` records no instance), so nothing is allocated out of the
+    /// registered set and the remainder equals it — for the same reason
+    /// `runningTasksCount` and `pendingTasksCount` are a true zero rather than an
+    /// invented number.
+    ///
+    /// `healthStatus` stays absent: nothing runs an agent health check here, so there is
+    /// no check result to report, and `agentUpdateStatus` likewise ("If an update wasn't
+    /// ever requested, this value is NULL").
+    pub fn view(&self, fields: ContainerInstanceFields) -> ContainerInstance {
+        ContainerInstance {
+            container_instance_arn: Some(self.arn.clone()),
+            ec2_instance_id: Some(self.ec2_instance_id.clone()),
+            capacity_provider_name: None,
+            version: self.version,
+            version_info: self.version_info.clone(),
+            remaining_resources: Some(self.registered_resources.clone()),
+            registered_resources: Some(self.registered_resources.clone()),
+            status: Some(self.status.clone()),
+            status_reason: self.status_reason.clone(),
+            agent_connected: self.agent_connected,
+            running_tasks_count: 0,
+            pending_tasks_count: 0,
+            agent_update_status: None,
+            attributes: Some(self.attributes.clone()),
+            registered_at: Some(self.registered_at),
+            // Attachments are created for a trunk elastic network interface, which this
+            // emulator never provisions, so a registered instance has none.
+            attachments: Some(Vec::new()),
+            tags: if fields.tags {
+                Some(self.tags.clone())
+            } else {
+                None
+            },
+            health_status: None,
+        }
+    }
+
+    /// Whether this instance counts towards the cluster's registered capacity.
+    /// `Cluster$registeredContainerInstancesCount`: "This includes container instances
+    /// in both ACTIVE and DRAINING status."
+    pub fn is_registered(&self) -> bool {
+        self.status == CONTAINER_INSTANCE_ACTIVE || self.status == CONTAINER_INSTANCE_DRAINING
+    }
+}
+
+/// Which optional container-instance fields a response carries, as
+/// `DescribeContainerInstances$include` (the `ContainerInstanceField` enum: `TAGS`,
+/// `CONTAINER_INSTANCE_HEALTH`) selects them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContainerInstanceFields {
+    pub tags: bool,
+}
+
+impl ContainerInstanceFields {
+    /// Every optional field — what the operation that REGISTERED the instance returns,
+    /// since the caller just supplied them and `RegisterContainerInstance` has no
+    /// `include` member to narrow them with.
+    pub fn all() -> Self {
+        Self { tags: true }
+    }
+
+    /// The fields the `include` list of a describe request asks for. Unknown entries
+    /// cannot reach here: `include` targets the closed `ContainerInstanceField` enum.
+    ///
+    /// `CONTAINER_INSTANCE_HEALTH` selects nothing: no health check runs in this
+    /// emulator, so `ContainerInstance$healthStatus` has no result to carry.
+    pub fn from_include(include: Option<&Vec<String>>) -> Self {
+        let mut fields = Self::default();
+        for field in include.into_iter().flatten() {
+            if field == "TAGS" {
+                fields.tags = true;
+            }
+        }
+        fields
+    }
 }
 
 /// One container of a task, derived from the container definition the task's
@@ -277,8 +406,10 @@ impl TaskDefinitionRecord {
             volumes: Some(self.volumes.clone()),
             status: Some(self.status.clone()),
             // `requiresAttributes` reports the container-instance attributes a task
-            // needs. Container-instance registration is not implemented in this slice,
-            // so there is no attribute set to report and it stays absent.
+            // needs. They are derived from what the containers of the revision require
+            // (a Docker volume driver, a logging driver, an agent version), which this
+            // emulator does not infer, so there is no attribute set to report and it
+            // stays absent.
             requires_attributes: None,
             placement_constraints: Some(self.placement_constraints.clone()),
             compatibilities: Some(self.compatibilities()),
@@ -399,10 +530,15 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub next_revision: HashMap<String, i32>,
     /// `taskArn` -> the task.
     pub tasks: HashMap<String, TaskRecord>,
+    /// `containerInstanceArn` -> the registered container instance.
+    pub container_instances: HashMap<String, ContainerInstanceRecord>,
     /// Monotonic source of task ids, so every task ARN is distinct.
     next_task_seq: u64,
     /// Monotonic source of container ids, so every container ARN is distinct.
     next_container_seq: u64,
+    /// Monotonic source of container-instance ids, so every container-instance ARN and
+    /// every minted instance id is distinct.
+    next_container_instance_seq: u64,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -453,6 +589,30 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         format!("{:032x}", self.next_container_seq)
     }
 
+    /// Mint the next container-instance id (32 lowercase hex digits, the shape of an ECS
+    /// container-instance id).
+    pub fn next_container_instance_id(&mut self) -> String {
+        self.next_container_instance_seq += 1;
+        format!("{:032x}", self.next_container_instance_seq)
+    }
+
+    /// Mint the managed-instance id an instance registered WITHOUT an EC2 instance
+    /// identity document reports. `ContainerInstance$ec2InstanceId`: "For external
+    /// instances, this value is the Amazon Web Services Systems Manager managed instance
+    /// ID", which Systems Manager writes as `mi-` followed by 17 hex digits.
+    pub fn next_managed_instance_id(&mut self) -> String {
+        self.next_container_instance_seq += 1;
+        format!("mi-{:017x}", self.next_container_instance_seq)
+    }
+
+    /// How many container instances `cluster_name` holds in a registered status.
+    pub fn registered_container_instances(&self, cluster_name: &str) -> usize {
+        self.container_instances
+            .values()
+            .filter(|instance| instance.cluster_name == cluster_name && instance.is_registered())
+            .count()
+    }
+
     /// The latest `ACTIVE` revision registered for `family`, if any.
     pub fn latest_active_revision(&self, family: &str) -> Option<&TaskDefinitionRecord> {
         self.task_definitions
@@ -501,9 +661,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// The counters are COMPUTED from the task map, so they always agree with the tasks
     /// that exist: `runningTasksCount` is "the number of tasks in the cluster that are
-    /// in the RUNNING state" and `pendingTasksCount` the same for `PENDING`. Container
-    /// instances and services are not part of this slice — nothing registers one — so
-    /// their counts are a true zero rather than an invented number.
+    /// in the RUNNING state" and `pendingTasksCount` the same for `PENDING`. Services
+    /// are not part of this slice — nothing creates one — so their count is a true zero
+    /// rather than an invented number.
+    ///
+    /// `registeredContainerInstancesCount` is counted off the container-instance map the
+    /// same way: "the number of container instances registered into the cluster. This
+    /// includes container instances in both ACTIVE and DRAINING status."
     ///
     /// `fields` follows `DescribeClusters$include`: "Determines whether to include
     /// additional information about the clusters in the response. If this field is
@@ -514,7 +678,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             cluster_arn: Some(cluster.arn.clone()),
             cluster_name: Some(cluster.name.clone()),
             status: Some(cluster.status.clone()),
-            registered_container_instances_count: 0,
+            registered_container_instances_count: i32::try_from(
+                self.registered_container_instances(&cluster.name),
+            )
+            .unwrap_or(i32::MAX),
             running_tasks_count: i32::try_from(tally.running).unwrap_or(i32::MAX),
             pending_tasks_count: i32::try_from(tally.pending).unwrap_or(i32::MAX),
             active_services_count: 0,
@@ -685,6 +852,32 @@ pub fn task_definition_arn(region: &str, family: &str, revision: i32) -> String 
         region,
         &format!("task-definition/{family}:{revision}"),
     )
+}
+
+/// The ARN of a container instance:
+/// `arn:aws:ecs:<region>:<account>:container-instance/<cluster>/<id>`.
+pub fn container_instance_arn(region: &str, cluster_name: &str, instance_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("container-instance/{cluster_name}/{instance_id}"),
+    )
+}
+
+/// The container-instance ARN a `containerInstance`/`containerInstances` entry refers
+/// to: the value as given when it is already an ARN, otherwise the ARN an instance of
+/// that id in `cluster_name` would carry. Every such member's doc: "The container
+/// instance ID or full ARN of the container instance".
+pub fn container_instance_arn_from_reference(
+    region: &str,
+    cluster_name: &str,
+    reference: &str,
+) -> String {
+    if reference.starts_with("arn:") {
+        reference.to_string()
+    } else {
+        container_instance_arn(region, cluster_name, reference)
+    }
 }
 
 /// The ARN of a task: `arn:aws:ecs:<region>:<account>:task/<cluster>/<id>`.
