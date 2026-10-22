@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSlackChannelConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSlackChannelConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: mutates the stored configuration named by `ChatConfigurationArn` in
+//! place, writing only the members the request carries, and answers with the updated
+//! record. An ARN the store does not hold is a 404 `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSlackChannelConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A later `DescribeSlackChannelConfigurations` reports the mutated record.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSlackChannelConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSlackChannelConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSlackChannelConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSlackChannelConfigurationErrorModeled::UpdateSlackChannelConfigurationException(
+                UpdateSlackChannelConfigurationException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // An ARN fully qualifies the configuration, its region included (see
+        // `crate::state::slack_channel_configuration_arn`), so the lookup is by ARN
+        // alone and the signing region does not enter into it.
+        let record = store
+            .slack_channel_configurations
+            .get_mut(&input.chat_configuration_arn)
+            .ok_or_else(|| {
+                UpdateSlackChannelConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no chat configuration with ARN {}",
+                            input.chat_configuration_arn
+                        )),
+                    },
+                )
+            })?;
+
+        // `SlackChannelId` is required, so it is always written; every other member is
+        // written only when the request carries it, leaving the stored value otherwise.
+        record.slack_channel_id = input.slack_channel_id;
+        if let Some(slack_channel_name) = input.slack_channel_name {
+            record.slack_channel_name = slack_channel_name;
+        }
+        if let Some(sns_topic_arns) = input.sns_topic_arns {
+            record.sns_topic_arns = sns_topic_arns;
+        }
+        if let Some(iam_role_arn) = input.iam_role_arn {
+            record.iam_role_arn = iam_role_arn;
+        }
+        if let Some(logging_level) = input.logging_level {
+            record.logging_level = Some(logging_level);
+        }
+        if let Some(guardrail_policy_arns) = input.guardrail_policy_arns {
+            record.guardrail_policy_arns = guardrail_policy_arns;
+        }
+        if let Some(user_authorization_required) = input.user_authorization_required {
+            record.user_authorization_required = Some(user_authorization_required);
+        }
+
+        Ok(UpdateSlackChannelConfigurationOutput {
+            channel_configuration: Some(record.view()),
+        })
     }
 }
