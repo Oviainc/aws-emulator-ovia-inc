@@ -465,14 +465,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|expected| expected != &endpoint.etag)
         {
             return Err(UpdateOriginEndpointErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(
-                        "The ETag in the request does not match the origin endpoint's \
-                         current ETag. Read the endpoint again and retry the update"
-                            .to_string(),
-                    ),
-                    conflict_exception_type: Some("CONFLICTING_OPERATION".to_string()),
-                },
+                // One sentence for the whole stale-entity-tag class, so this operation
+                // words the refusal exactly as the other conditional updates do.
+                crate::state::conflicting_operation(),
             )
             .into());
         }
