@@ -219,14 +219,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         Some(thing.provisioning_status.as_str()),
                         input.provisioning_status_filter.as_ref(),
                     )
-                    // No operation in this slice associates a managed thing with a
-                    // parent controller, a connector policy, a connector destination
-                    // or a connector device, so a record carries none of them and a
-                    // filter on one selects nothing.
-                    && matches(None, input.parent_controller_identifier_filter.as_ref())
-                    && matches(None, input.connector_policy_id_filter.as_ref())
-                    && matches(None, input.connector_destination_id_filter.as_ref())
-                    && matches(None, input.connector_device_id_filter.as_ref())
+                    // The device attributes a record carries in its `MetaData` or its
+                    // bar-code fields (see `crate::state::DeviceAttribute`) are
+                    // filterable on the same stored value a summary reports, so a filter
+                    // selects exactly the records whose summary would show that value.
+                    && matches(
+                        crate::state::PARENT_CONTROLLER_ID.of(thing).as_deref(),
+                        input.parent_controller_identifier_filter.as_ref(),
+                    )
+                    && matches(
+                        crate::state::CONNECTOR_POLICY_ID.of(thing).as_deref(),
+                        input.connector_policy_id_filter.as_ref(),
+                    )
+                    && matches(
+                        crate::state::CONNECTOR_DESTINATION_ID.of(thing).as_deref(),
+                        input.connector_destination_id_filter.as_ref(),
+                    )
+                    && matches(
+                        crate::state::CONNECTOR_DEVICE_ID.of(thing).as_deref(),
+                        input.connector_device_id_filter.as_ref(),
+                    )
             })
             .collect();
 
@@ -248,19 +260,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|thing| ManagedThingSummary {
                 id: Some(thing.id.clone()),
                 arn: Some(thing.arn.clone()),
-                // Members no operation in this slice writes stay absent rather than
-                // carrying a value nothing set.
-                advertised_product_id: None,
+                // The attributes the model exposes on the read side only: the record
+                // carries each one in its `MetaData`, or in the fields of the device bar
+                // code the create call supplied, under that member's own name. See
+                // `crate::state::DeviceAttribute`.
+                advertised_product_id: crate::state::ADVERTISED_PRODUCT_ID.of(thing),
                 brand: thing.brand.clone(),
                 classification: thing.classification.clone(),
-                connector_device_id: None,
-                connector_policy_id: None,
-                connector_destination_id: None,
+                connector_device_id: crate::state::CONNECTOR_DEVICE_ID.of(thing),
+                connector_policy_id: crate::state::CONNECTOR_POLICY_ID.of(thing),
+                connector_destination_id: crate::state::CONNECTOR_DESTINATION_ID.of(thing),
                 model: thing.model.clone(),
                 name: thing.name.clone(),
                 owner: thing.owner.clone(),
                 credential_locker_id: thing.credential_locker_id.clone(),
-                parent_controller_id: None,
+                parent_controller_id: crate::state::PARENT_CONTROLLER_ID.of(thing),
                 provisioning_status: Some(thing.provisioning_status.clone()),
                 role: Some(thing.role.clone()),
                 serial_number: thing.serial_number.clone(),

@@ -62,6 +62,12 @@ pub struct ManagedThing {
     pub hub_network_mode: Option<String>,
     pub wifi_simple_setup_configuration: Option<WiFiSimpleSetupConfiguration>,
     pub meta_data: HashMap<String, String>,
+    /// The named fields of the device bar code the create call supplied as
+    /// `AuthenticationMaterial`, as [`bar_code_fields`] read them. A record's device
+    /// attributes are projected from here when its `MetaData` names none — see
+    /// [`DeviceAttribute`]. The material itself stays in
+    /// [`Self::authentication_material`] and is never returned.
+    pub bar_code_fields: HashMap<String, String>,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -169,6 +175,287 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 None => break,
             }
         }
+    }
+}
+
+/// One device attribute of a managed thing: the output member that reports it, and the
+/// names a request may carry it under.
+///
+/// A managed thing's device attributes are what its onboarding inputs name. Most of them
+/// are members of `GetManagedThingResponse` (and some of `ManagedThingSummary`) that NO
+/// request shape declares, because the real service learns them from the physical device.
+/// This emulator has no device, so a record learns them from the two name/value channels
+/// an onboarding request does carry:
+///
+/// * the `MetaData` pairs, the model's own free-form attribute channel, and
+/// * the fields of the device bar code the create call supplies as
+///   `AuthenticationMaterial` (see [`bar_code_fields`]).
+///
+/// Projecting `MetaData` onto these members is an EMULATOR CONVENTION, not modelled AWS
+/// behaviour: the real service reads the device, and a metadata entry named `MacAddress`
+/// would not surface on that member there. It is the only channel a caller of this
+/// emulator has for a member no request shape declares.
+///
+/// A value is projected onto the member only when the member's OWN generated schema
+/// admits it — [`Self::admits_value`] runs the framework's constraint walk over that
+/// member's `@length` and `@pattern`, so nothing here holds a second copy of the model's
+/// bounds. A value the member does not admit stays an ordinary metadata or bar-code
+/// field, so a response never carries a value outside its shape's constraints.
+#[derive(Debug)]
+pub struct DeviceAttribute {
+    /// The output member this attribute fills, which is also the primary name a request
+    /// carries it under.
+    pub member: &'static str,
+    /// The standard abbreviations of the same attribute, which a product bar code labels
+    /// its fields with (`UPC` for a universal product code, `EAN` for an international
+    /// article number, `SN` for a serial number, `MAC` for a MAC address, `DSK` for a
+    /// Z-Wave device-specific key). Matched by the same rule as [`Self::member`].
+    pub aliases: &'static [&'static str],
+}
+
+impl DeviceAttribute {
+    /// This attribute's value on `thing`: the `MetaData` entry that names it, else the
+    /// bar-code field that names it, when that value satisfies the member's modelled
+    /// constraints. `MetaData` wins because the caller set it on this resource
+    /// explicitly, while a bar-code field describes the device the resource was made from.
+    pub fn of(&self, thing: &ManagedThing) -> Option<String> {
+        self.in_fields(&thing.meta_data)
+            .or_else(|| self.in_fields(&thing.bar_code_fields))
+    }
+
+    /// This attribute's value among `fields`: the entry whose key names this member or one
+    /// of its abbreviations — compared on alphanumerics only and case-insensitively, so
+    /// `UniversalProductCode`, `universalProductCode` and `universal_product_code` all
+    /// name it — when that value satisfies the member's modelled constraints.
+    pub fn in_fields(&self, fields: &HashMap<String, String>) -> Option<String> {
+        let wanted: Vec<String> = ::std::iter::once(self.member)
+            .chain(self.aliases.iter().copied())
+            .map(normalized_member_key)
+            .collect();
+        fields
+            .iter()
+            .find(|(key, _)| wanted.contains(&normalized_member_key(key)))
+            .map(|(_, value)| value)
+            .filter(|value| self.admits_value(value))
+            .cloned()
+    }
+
+    /// This member's generated schema on `GetManagedThingResponse` — the one place its
+    /// `@length` and `@pattern` live, captured from the model by codegen.
+    ///
+    /// `None` only if this entry names a member that shape does not declare, which
+    /// `the_device_attribute_table_names_modelled_members` refuses. At runtime that
+    /// fails CLOSED: [`Self::admits_value`] admits nothing, so the member stays absent
+    /// rather than reporting an unvalidated value.
+    pub fn schema(&self) -> Option<&'static ::aws_smithy_schema::Schema> {
+        crate::ops::types::GET_MANAGED_THING_OUTPUT_SCHEMA
+            .members()
+            .iter()
+            .copied()
+            .find(|member| member.member_name() == Some(self.member))
+    }
+
+    /// Whether this member's own schema admits `value`, judged by the framework's
+    /// constraint walk (`@length`, `@pattern`) rather than by a transcription of it.
+    pub fn admits_value(&self, value: &str) -> bool {
+        let Some(schema) = self.schema() else {
+            return false;
+        };
+        ::aws_smithy_schema_server::constraints::validate(
+            &OneMemberValue { schema, value },
+            crate::ops::types::GET_MANAGED_THING_OUTPUT_SCHEMA,
+        )
+        .is_empty()
+    }
+
+    /// The member's modelled `@length` bounds, in characters, as its generated schema
+    /// records them: `(0, usize::MAX)` for a member the model leaves unbounded.
+    ///
+    /// Read from the schema, never transcribed. Exposed so a caller that must generate a
+    /// value of a legal — or deliberately illegal — length for this member asks the model
+    /// for the bounds.
+    pub fn length_bounds(&self) -> (usize, usize) {
+        let length = self
+            .schema()
+            .and_then(::aws_smithy_schema::Schema::traits)
+            .and_then(|traits| {
+                traits.get(&::aws_smithy_schema_server::constraints::LengthTrait::TRAIT_ID)
+            })
+            .and_then(|found| {
+                ::aws_smithy_schema::Trait::as_any(found)
+                    .downcast_ref::<::aws_smithy_schema_server::constraints::LengthTrait>()
+            });
+        let clamp = |bound: Option<i64>, fallback: usize| {
+            bound
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(fallback)
+        };
+        match length {
+            Some(length) => (clamp(length.min, 0), clamp(length.max, usize::MAX)),
+            None => (0, usize::MAX),
+        }
+    }
+}
+
+/// One string member's value, serialized ALONE so the framework's constraint walk judges
+/// it against that member's own schema. The walk only ever sees what `serialize_members`
+/// writes, so writing one member checks exactly that member.
+struct OneMemberValue<'a> {
+    schema: &'static ::aws_smithy_schema::Schema,
+    value: &'a str,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for OneMemberValue<'_> {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(self.schema, self.value)
+    }
+}
+
+/// An attribute key reduced to what naming a member means: its alphanumerics, lowercased.
+/// Separators (`-`, `_`, spaces) and letter case carry no meaning in a member name, so
+/// they are dropped before the comparison.
+fn normalized_member_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The named fields of a device bar code.
+///
+/// `AuthenticationMaterial` is the bar code read off the device, and
+/// `AuthenticationMaterialType` says which kind. Two bar-code payload shapes carry NAMED
+/// fields — a JSON object, and `Name:value` fields separated by `;` — and the modelled
+/// `AuthMaterialString` pattern admits exactly the punctuation those two need (`{`, `}`,
+/// `"`, `:`, `,`, `;`, `\`, `/`, space). Where the material is one of them, this is the
+/// map it names. Any other payload — a digit-only Z-Wave SmartStart code, a base64 DPP
+/// key — names no field, so this answers an empty map and no attribute is projected from
+/// it.
+pub fn bar_code_fields(material: &str) -> HashMap<String, String> {
+    let material = material.trim();
+    if material.starts_with('{') {
+        return match ::serde_json::from_str::<::serde_json::Value>(material) {
+            Ok(::serde_json::Value::Object(object)) => object
+                .into_iter()
+                .filter_map(|(key, value)| scalar_text(&value).map(|text| (key, text)))
+                .collect(),
+            _ => HashMap::new(),
+        };
+    }
+    material
+        .split(';')
+        .filter_map(|field| field.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .collect()
+}
+
+/// The text of a JSON scalar, or `None` for a composite: a bar-code field names one
+/// value, so an object or array under a name is not an attribute value.
+fn scalar_text(value: &::serde_json::Value) -> Option<String> {
+    match value {
+        ::serde_json::Value::String(text) => Some(text.clone()),
+        ::serde_json::Value::Number(number) => Some(number.to_string()),
+        ::serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+/// `AdvertisedProductId`.
+pub static ADVERTISED_PRODUCT_ID: DeviceAttribute = DeviceAttribute {
+    member: "AdvertisedProductId",
+    aliases: &[],
+};
+
+/// `UniversalProductCode`.
+pub static UNIVERSAL_PRODUCT_CODE: DeviceAttribute = DeviceAttribute {
+    member: "UniversalProductCode",
+    aliases: &["UPC"],
+};
+
+/// `InternationalArticleNumber`.
+pub static INTERNATIONAL_ARTICLE_NUMBER: DeviceAttribute = DeviceAttribute {
+    member: "InternationalArticleNumber",
+    aliases: &["EAN", "IAN"],
+};
+
+/// `ConnectorPolicyId`.
+pub static CONNECTOR_POLICY_ID: DeviceAttribute = DeviceAttribute {
+    member: "ConnectorPolicyId",
+    aliases: &[],
+};
+
+/// `ConnectorDestinationId`.
+pub static CONNECTOR_DESTINATION_ID: DeviceAttribute = DeviceAttribute {
+    member: "ConnectorDestinationId",
+    aliases: &[],
+};
+
+/// `ConnectorDeviceId`.
+pub static CONNECTOR_DEVICE_ID: DeviceAttribute = DeviceAttribute {
+    member: "ConnectorDeviceId",
+    aliases: &[],
+};
+
+/// `DeviceSpecificKey`.
+pub static DEVICE_SPECIFIC_KEY: DeviceAttribute = DeviceAttribute {
+    member: "DeviceSpecificKey",
+    aliases: &["DSK"],
+};
+
+/// `MacAddress`.
+pub static MAC_ADDRESS: DeviceAttribute = DeviceAttribute {
+    member: "MacAddress",
+    aliases: &["MAC"],
+};
+
+/// `ParentControllerId`.
+pub static PARENT_CONTROLLER_ID: DeviceAttribute = DeviceAttribute {
+    member: "ParentControllerId",
+    aliases: &[],
+};
+
+/// `SerialNumber`.
+///
+/// Unlike every other entry this member IS declared by the create and update requests, so
+/// what the caller named there wins; this entry is how a record still learns the serial
+/// number when only the device bar code carries it.
+pub static SERIAL_NUMBER: DeviceAttribute = DeviceAttribute {
+    member: "SerialNumber",
+    aliases: &["SN"],
+};
+
+/// Every attribute the model reports on the read side only, so a caller that must cover
+/// the whole class — a test, or a projection over all of them — enumerates it instead of
+/// repeating the list. `SerialNumber` is not here: it has its own modelled request member.
+pub static READ_SIDE_ATTRIBUTES: &[&DeviceAttribute] = &[
+    &ADVERTISED_PRODUCT_ID,
+    &UNIVERSAL_PRODUCT_CODE,
+    &INTERNATIONAL_ARTICLE_NUMBER,
+    &CONNECTOR_POLICY_ID,
+    &CONNECTOR_DESTINATION_ID,
+    &CONNECTOR_DEVICE_ID,
+    &DEVICE_SPECIFIC_KEY,
+    &MAC_ADDRESS,
+    &PARENT_CONTROLLER_ID,
+];
+
+/// The Wi-Fi Simple Setup configuration a managed thing carries when no call has set
+/// one: neither provisioning role enabled.
+///
+/// `WiFiSimpleSetupConfiguration` states which WSS provisioning roles the thing may
+/// play, so every managed thing HAS one — a thing nobody configured plays neither role
+/// — and a create stores that configuration rather than leaving the resource without
+/// any. `TimeoutInMinutes` stays absent: the model publishes no default for it (modelled
+/// range 5..15), so the emulator invents none.
+pub fn default_wifi_simple_setup_configuration() -> WiFiSimpleSetupConfiguration {
+    WiFiSimpleSetupConfiguration {
+        enable_as_provisioner: Some(false),
+        enable_as_provisionee: Some(false),
+        timeout_in_minutes: None,
     }
 }
 

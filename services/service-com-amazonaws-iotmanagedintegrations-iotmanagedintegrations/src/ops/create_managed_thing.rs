@@ -268,6 +268,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = crate::state::opaque_id(sequence);
         let arn = crate::state::managed_thing_arn(&region, &id);
 
+        // The device bar code's named fields, read once at create time: they are what the
+        // record knows about the physical device, and the device attributes the model
+        // reports on the read side only are projected from them.
+        let bar_code_fields = crate::state::bar_code_fields(&input.authentication_material);
+        // A serial number the request names wins; a record still learns one the bar code
+        // carries on its own.
+        let serial_number = input
+            .serial_number
+            .or_else(|| crate::state::SERIAL_NUMBER.in_fields(&bar_code_fields));
+
         let thing = crate::state::ManagedThing {
             id: id.clone(),
             arn: arn.clone(),
@@ -278,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             authentication_material_type: input.authentication_material_type,
             owner: input.owner,
             credential_locker_id: input.credential_locker_id,
-            serial_number: input.serial_number,
+            serial_number,
             brand: input.brand,
             model: input.model,
             name: input.name,
@@ -288,8 +298,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capability_schemas: input.capability_schemas.unwrap_or_default(),
             // Only `UpdateManagedThing` carries `HubNetworkMode`.
             hub_network_mode: None,
-            wifi_simple_setup_configuration: input.wi_fi_simple_setup_configuration,
+            // Every managed thing has a Wi-Fi Simple Setup configuration; a create that
+            // names none stores the default one (neither provisioning role enabled)
+            // rather than leaving the resource without any.
+            wifi_simple_setup_configuration: Some(
+                input
+                    .wi_fi_simple_setup_configuration
+                    .unwrap_or_else(crate::state::default_wifi_simple_setup_configuration),
+            ),
             meta_data: input.meta_data.unwrap_or_default(),
+            bar_code_fields,
             tags: input.tags.unwrap_or_default(),
             created_at,
             updated_at: created_at,

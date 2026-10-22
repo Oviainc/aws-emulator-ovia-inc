@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/managed_thing_lifecycle.rs"]
 mod managed_thing_lifecycle;
+#[path = "all/managed_thing_read_side_attributes.rs"]
+mod managed_thing_read_side_attributes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_error_messages.rs"]

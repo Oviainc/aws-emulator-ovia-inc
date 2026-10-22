@@ -226,23 +226,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(thing.arn.clone()),
             owner: thing.owner.clone(),
             credential_locker_id: thing.credential_locker_id.clone(),
-            // Members no operation in this slice writes stay absent rather than
-            // carrying a value nothing set.
-            advertised_product_id: None,
             role: Some(thing.role.clone()),
             provisioning_status: Some(thing.provisioning_status.clone()),
             name: thing.name.clone(),
             model: thing.model.clone(),
             brand: thing.brand.clone(),
             serial_number: thing.serial_number.clone(),
-            universal_product_code: None,
-            international_article_number: None,
-            connector_policy_id: None,
-            connector_destination_id: None,
-            connector_device_id: None,
-            device_specific_key: None,
-            mac_address: None,
-            parent_controller_id: None,
+            // The attributes the model exposes on the read side only: the record carries
+            // each one in its `MetaData`, or in the fields of the device bar code the
+            // create call supplied, under that member's own name. See
+            // `crate::state::DeviceAttribute`.
+            advertised_product_id: crate::state::ADVERTISED_PRODUCT_ID.of(thing),
+            universal_product_code: crate::state::UNIVERSAL_PRODUCT_CODE.of(thing),
+            international_article_number: crate::state::INTERNATIONAL_ARTICLE_NUMBER.of(thing),
+            connector_policy_id: crate::state::CONNECTOR_POLICY_ID.of(thing),
+            connector_destination_id: crate::state::CONNECTOR_DESTINATION_ID.of(thing),
+            connector_device_id: crate::state::CONNECTOR_DEVICE_ID.of(thing),
+            device_specific_key: crate::state::DEVICE_SPECIFIC_KEY.of(thing),
+            mac_address: crate::state::MAC_ADDRESS.of(thing),
+            parent_controller_id: crate::state::PARENT_CONTROLLER_ID.of(thing),
             classification: thing.classification.clone(),
             created_at: Some(crate::state::timestamp(thing.created_at)),
             updated_at: Some(crate::state::timestamp(thing.updated_at)),
