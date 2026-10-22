@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a role created here is persisted in this service's state
+//! (`crate::state`) and read back by `GetRole`.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +197,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRole"))
+        // `ctx` carries request metadata only; nothing in `CreateRole` depends on it —
+        // IAM is global, so not even the ARN's region segment comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRoleErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "The request was rejected because the policy document was malformed" — a
+        // trust policy must be an IAM JSON policy, not merely a non-empty string, which
+        // is all `policyDocumentType`'s own pattern asks for. The rule is the shared
+        // one every operation taking a policy document applies.
+        if !crate::state::is_policy_document(&input.assume_role_policy_document) {
+            return Err(CreateRoleErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(
+                        "Syntax errors in policy: AssumeRolePolicyDocument must be a JSON \
+                         object carrying a Statement element"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter".
+        let tags = input.tags.filter(|tags| !tags.is_empty());
+        if let Some(reserved) = crate::state::reserved_tag_key(
+            tags.iter().flatten().map(|tag| tag.key.as_str()),
+        ) {
+            return Err(CreateRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not distinguished
+        // by case", so the case-folded name is the identity: a second create under
+        // any casing of a held name is a conflict rather than a second role.
+        let key = crate::state::name_key(&input.role_name);
+        if store.roles.contains_key(&key) {
+            return Err(CreateRoleErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some(format!("Role with name {} already exists.", input.role_name)),
+                },
+            )
+            .into());
+        }
+
+        // An account holds a bounded number of roles, so a caller cannot grow the
+        // account without limit; past the quota IAM refuses the create.
+        if store.roles.len() >= crate::state::MAX_ROLES_PER_ACCOUNT {
+            return Err(CreateRoleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for RoleLimit: {}",
+                        crate::state::MAX_ROLES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let path = input
+            .path
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        let role = Role {
+            arn: crate::state::role_arn(&path, &input.role_name),
+            path,
+            role_id: store.next_role_id(),
+            create_date: crate::state::now(),
+            // Held as the plain JSON text the request carried, which is how this
+            // crate holds every policy document: `CreateServiceLinkedRole` stores a
+            // role's trust policy that way and `PutUserPolicy` an inline policy, and
+            // the readers hand a stored document back verbatim — so one form is
+            // stored and one form is reported, whichever operation wrote the role.
+            assume_role_policy_document: Some(input.assume_role_policy_document),
+            description: input.description,
+            // "If you do not specify a value for this setting, the default value of
+            // one hour is applied."
+            max_session_duration: Some(
+                input
+                    .max_session_duration
+                    .unwrap_or(crate::state::DEFAULT_MAX_SESSION_DURATION_SECONDS),
+            ),
+            permissions_boundary: input.permissions_boundary.map(|arn| {
+                AttachedPermissionsBoundary {
+                    permissions_boundary_type: Some(
+                        crate::state::PERMISSIONS_BOUNDARY_TYPE.to_string(),
+                    ),
+                    permissions_boundary_arn: Some(arn),
+                }
+            }),
+            // An empty `Tags` list is the same as none: report the member only when
+            // the role actually carries tags.
+            tags,
+            // `Role$RoleLastUsed` reports role USAGE, which this emulator does not
+            // record, so the member is absent rather than carrying an invented date.
+            role_last_used: None,
+            // "This member is present only for roles created with AcquireRole"
+            // (`Role$SourceRoleTemplate`), which is not this path.
+            source_role_template: None,
+            role_name: input.role_name,
+        };
+
+        // The response is the record that was stored, so a caller sees exactly what a
+        // later `GetRole` reports.
+        store.roles.insert(key, role.clone());
+        Ok(CreateRoleOutput { role })
     }
 }

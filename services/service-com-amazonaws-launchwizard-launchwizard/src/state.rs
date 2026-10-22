@@ -12,6 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
+use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+
 use crate::ops::types::*;
 
 /// The region an ARN carries when the request is unsigned and therefore names no
@@ -99,6 +101,16 @@ pub const MAX_DEPLOYMENTS: usize = 200;
 /// never carries more than that whether the caller asked for a size or not, and the
 /// rest is reached through `nextToken`.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The `ValidationException` message every unusable `nextToken` is refused with.
+///
+/// A pagination token is OPAQUE — the caller may only hand back a token a previous
+/// page gave it — so the refusal is one fixed sentence (recorded behaviour) that
+/// states neither the rejected token nor which way it was unusable: a token this
+/// service never issued and a token that no longer names a position in the result set
+/// are the same refusal to a caller, and echoing the token back would put
+/// caller-supplied input in the error channel.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "NextToken is not valid.";
 
 /// A workload in the seeded, read-only catalogue `CreateDeployment` resolves against.
 ///
@@ -511,9 +523,9 @@ fn decode_token(token: &str) -> Option<String> {
 ///
 /// `cursor_of` names an item's stable cursor, so a page resumes exactly where the
 /// previous one ended rather than at a remembered offset. The error is the message for
-/// the operation's own `ValidationException`; a token this service did not issue, or
-/// one naming an item the result set no longer holds, is a client error rather than a
-/// silent restart from the top.
+/// the operation's own `ValidationException` ([`INVALID_NEXT_TOKEN_MESSAGE`]); a token
+/// this service did not issue, or one naming an item the result set no longer holds, is
+/// a client error rather than a silent restart from the top.
 pub fn paginate<T>(
     items: Vec<T>,
     max_results: Option<i32>,
@@ -524,12 +536,14 @@ pub fn paginate<T>(
     let start = match next_token {
         None => 0,
         Some(token) => {
-            let cursor = decode_token(token)
-                .ok_or_else(|| format!("nextToken '{token}' is not a valid pagination token."))?;
+            // A token is opaque, so a refusal says only that it is not valid: neither
+            // which of the two ways it is unusable, nor the token itself.
+            let cursor =
+                decode_token(token).ok_or_else(|| INVALID_NEXT_TOKEN_MESSAGE.to_string())?;
             let found = items.iter().position(|item| cursor_of(item) == cursor);
-            found.map(|index| index + 1).ok_or_else(|| {
-                format!("nextToken '{token}' does not name a position in these results.")
-            })?
+            found
+                .map(|index| index + 1)
+                .ok_or_else(|| INVALID_NEXT_TOKEN_MESSAGE.to_string())?
         }
     };
     // `maxResults` is `@range(min: 1, max: 100)`, so the boundary validator has already
@@ -543,6 +557,250 @@ pub fn paginate<T>(
         None
     };
     Ok((page, next))
+}
+
+// =============================================================================
+// The `ValidationException` message a refused request carries
+// =============================================================================
+
+/// The text separating the member clause of a validation clause from the requirement
+/// it failed, in the framework's own wording.
+const CONSTRAINT_MARKER: &str = "failed to satisfy constraint: ";
+
+/// How AWS states that a member's requirement is a COMPOSITION of several
+/// constraints: the composed list follows this, bracketed.
+const COMPOSED_MARKER: &str = "Member must satisfy constraint: ";
+
+/// AWS's standard validation report for the modelled constraints a request failed at
+/// the protocol boundary, as `src/service.rs` words this service's refusal with.
+///
+/// The report opens with HOW MANY members failed, then states one clause per failing
+/// member: the member's dotted path and the requirement it failed. It does NOT echo
+/// the rejected value — caller-supplied input is not replayed into the error channel —
+/// and reports a `@pattern` as the expression itself, without the `^`/`$` the model
+/// spells "whole value" with.
+pub fn validation_report(violations: &[Violation]) -> String {
+    let mut clauses: Vec<String> = Vec::new();
+    for violation in violations {
+        let clause = validation_clause(violation);
+        // AWS reports one error per failing MEMBER. Two violations of the same
+        // collection member render the same clause (the composed constraint set of its
+        // elements), so the second is not a second error.
+        if !clauses.contains(&clause) {
+            clauses.push(clause);
+        }
+    }
+    let count = clauses.len();
+    let noun = if count == 1 { "error" } else { "errors" };
+    format!("{count} validation {noun} detected: {}", clauses.join("; "))
+}
+
+/// One clause of [`validation_report`].
+///
+/// A violation found on a scalar ELEMENT of a list is reported at the COLLECTION
+/// member, because the rule the element failed belongs to the collection's declared
+/// element constraints; anything else is reported at the member itself.
+fn validation_clause(violation: &Violation) -> String {
+    collection_element_clause(violation).unwrap_or_else(|| scalar_clause(violation))
+}
+
+/// The clause for a member that failed one of its own constraints: the member and what
+/// it failed, with no value echoed. An ABSENT member is still reported as the null it
+/// was, which is the one "value" AWS states.
+fn scalar_clause(violation: &Violation) -> String {
+    let subject = if violation.value.is_none() {
+        "Value null"
+    } else {
+        "Value"
+    };
+    format!(
+        "{subject} at '{}' {CONSTRAINT_MARKER}{}",
+        violation.path,
+        requirement(violation)
+    )
+}
+
+/// The clause for a scalar element of a list, or `None` when `violation` is not one.
+///
+/// It is reported at the collection member's path — never the element's position —
+/// with the element shape's COMPLETE declared constraint set composed into one
+/// requirement, whichever member of that set the element actually failed.
+fn collection_element_clause(violation: &Violation) -> Option<String> {
+    let collection = collection_of_element(&violation.path)?;
+    Some(format!(
+        "Value at '{collection}' {CONSTRAINT_MARKER}{COMPOSED_MARKER}[{}]",
+        composed_requirements(collection, violation).join(", ")
+    ))
+}
+
+/// The collection path a violation path's last segment is an element of, or `None`
+/// when the path does not end in a collection step.
+///
+/// The validating walk spells a step from a list into its element
+/// `<1-based-index>.member` (`aws_smithy_schema_server::constraints::path`), so
+/// `filters.1.member.values.1.member` is an element of `filters.1.member.values`.
+fn collection_of_element(path: &str) -> Option<&str> {
+    let without_step = path.strip_suffix(".member")?;
+    let (collection, index) = without_step.rsplit_once('.')?;
+    let indexed = !index.is_empty() && index.chars().all(|c| c.is_ascii_digit());
+    indexed.then_some(collection)
+}
+
+/// The composed constraint list AWS states for an element of `collection`: the element
+/// shape's own constraints, in the order AWS lists them (length ceiling, then length
+/// floor, then pattern).
+///
+/// A list this service's inputs declare no element constraints for falls back to the
+/// one requirement the walk found, stated in the same composed form, so a constraint
+/// kind the framework adds later is reported rather than dropped.
+fn composed_requirements(collection: &str, violation: &Violation) -> Vec<String> {
+    match element_constraints(collection) {
+        Some(constraints) => {
+            let mut requirements = Vec::new();
+            if let Some(max) = constraints.max_length {
+                requirements.push(framework_requirement(&ViolationKind::MaxLength(max)));
+            }
+            if let Some(min) = constraints.min_length {
+                requirements.push(framework_requirement(&ViolationKind::MinLength(min)));
+            }
+            if let Some(pattern) = constraints.pattern {
+                requirements.push(pattern_requirement(&composed_pattern(pattern)));
+            }
+            requirements
+        }
+        None => vec![match &violation.kind {
+            ViolationKind::Pattern(pattern) => pattern_requirement(&composed_pattern(pattern)),
+            kind => framework_requirement(kind),
+        }],
+    }
+}
+
+/// The requirement a violation states, for a member reported on its own.
+///
+/// A `@pattern` is reported UNANCHORED, because the requirement is the expression a
+/// value must match and the `^`/`$` are how the model spells "the whole value". Every
+/// other constraint keeps the framework's own wording, read off the clause it builds
+/// for this same violation, so a constraint kind added to the framework later is
+/// reported rather than dropped.
+fn requirement(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => pattern_requirement(unanchored(pattern)),
+        kind => framework_requirement(kind),
+    }
+}
+
+/// How a `@pattern` requirement is worded, whatever rendering of the expression it
+/// states.
+fn pattern_requirement(pattern: &str) -> String {
+    format!("Member must satisfy regular expression pattern: {pattern}")
+}
+
+/// `pattern` as a composed collection constraint states it: VERBATIM, anchors and all,
+/// bracketed by `.*` on each side — the composition is the expression the collection's
+/// own rendering has to satisfy, so the element's expression is embedded in it
+/// (recorded behaviour).
+fn composed_pattern(pattern: &str) -> String {
+    format!(".*{pattern}.*")
+}
+
+/// `pattern` without its `^` prefix and `$` suffix.
+fn unanchored(pattern: &str) -> &str {
+    let without_caret = pattern.strip_prefix('^').unwrap_or(pattern);
+    without_caret.strip_suffix('$').unwrap_or(without_caret)
+}
+
+/// The framework's own wording for `kind`'s requirement.
+///
+/// Read off a clause the framework builds for a violation of that kind with NO value
+/// attached: a clause carrying the value would put caller-controlled text before the
+/// marker, so a value containing the marker itself would split inside the value and
+/// copy the rest of it into the report.
+fn framework_requirement(kind: &ViolationKind) -> String {
+    let clause = Violation {
+        path: String::new(),
+        kind: kind.clone(),
+        value: None,
+    }
+    .message();
+    match clause.split_once(CONSTRAINT_MARKER) {
+        Some((_, requirement)) => requirement.to_string(),
+        None => clause,
+    }
+}
+
+/// The own constraints of the scalar ELEMENT of a constrained list, as AWS's composed
+/// collection-constraint list states them.
+#[derive(Debug, Clone, Copy)]
+struct ElementConstraints {
+    /// The element shape's `@length` maximum, if it declares one.
+    max_length: Option<i64>,
+    /// The element shape's `@length` minimum, if it declares one.
+    min_length: Option<i64>,
+    /// The element shape's `@pattern`, verbatim as the model spells it.
+    pattern: Option<&'static str>,
+}
+
+/// Every list in this service's INPUTS whose element shape carries its own
+/// constraints, keyed by the list member's dotted path with the collection steps
+/// stripped ([`member_trail`]), so one entry covers that member however deeply it is
+/// nested.
+///
+/// Source: `smithy_query(query="closure",operation="ListDeployments,UntagResource",
+/// model_path="services/service-com-amazonaws-launchwizard-launchwizard/smithy-model/\
+/// com-amazonaws-launchwizard-launchwizard.json")`. Those two operations hold the only
+/// input lists in the model whose element shape is constrained; every other input list
+/// (`DeploymentFilterList`) carries a structure element whose own members are reported
+/// under their own names.
+const LIST_ELEMENT_CONSTRAINTS: &[(&str, ElementConstraints)] = &[
+    // `DeploymentFilter$values` -> `DeploymentFilterValues`, element
+    // `DeploymentFilterValue`: @length 1..100, @pattern `(^(([A-Za-z])+([0-9A-Za-z\-\_])+)$)`.
+    (
+        "filters.values",
+        ElementConstraints {
+            max_length: Some(100),
+            min_length: Some(1),
+            pattern: Some(r"(^(([A-Za-z])+([0-9A-Za-z\-\_])+)$)"),
+        },
+    ),
+    // `UntagResourceInput$tagKeys` -> `TagKeyList`, element `TagKey`: @length 1..128,
+    // @pattern `^[a-zA-Z0-9 _.:/=+@-]+$`.
+    (
+        "tagKeys",
+        ElementConstraints {
+            max_length: Some(128),
+            min_length: Some(1),
+            pattern: Some(r"^[a-zA-Z0-9 _.:/=+@-]+$"),
+        },
+    ),
+];
+
+/// The declared element constraints of the list at `collection_path`, if the model
+/// gives its elements any.
+fn element_constraints(collection_path: &str) -> Option<ElementConstraints> {
+    let trail = member_trail(collection_path);
+    LIST_ELEMENT_CONSTRAINTS
+        .iter()
+        .find(|(member, _)| *member == trail)
+        .map(|(_, constraints)| *constraints)
+}
+
+/// `path` with every collection step removed, leaving the trail of MEMBER names:
+/// `filters.1.member.values` -> `filters.values`.
+fn member_trail(path: &str) -> String {
+    let mut members: Vec<&str> = Vec::new();
+    let mut after_index = false;
+    for segment in path.split('.') {
+        if !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()) {
+            after_index = true;
+            continue;
+        }
+        let collection_step = after_index && segment == "member";
+        after_index = false;
+        if !collection_step {
+            members.push(segment);
+        }
+    }
+    members.join(".")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
