@@ -65,6 +65,8 @@ mod user_properties_and_keys;
 mod user_state_persistence;
 #[path = "all/web_app_customization.rs"]
 mod web_app_customization;
+#[path = "all/web_app_deletion.rs"]
+mod web_app_deletion;
 #[path = "all/web_app_lifecycle.rs"]
 mod web_app_lifecycle;
 #[path = "all/web_app_listing.rs"]
