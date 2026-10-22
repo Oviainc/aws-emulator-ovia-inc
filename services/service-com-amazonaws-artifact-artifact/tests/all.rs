@@ -27,6 +27,12 @@ mod compliance_inquiry_queries;
 mod customer_agreements;
 #[path = "all/front_door_errors.rs"]
 mod front_door_errors;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/pagination_token_opacity.rs"]
+mod pagination_token_opacity;
+#[path = "all/report_projection.rs"]
+mod report_projection;
 #[path = "all/report_workflow.rs"]
 mod report_workflow;
 #[path = "all/resource_tag_writes.rs"]
