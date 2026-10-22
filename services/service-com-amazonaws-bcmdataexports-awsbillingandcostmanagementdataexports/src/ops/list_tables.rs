@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the data-export table catalog ([`crate::state::TABLE_CATALOG`]) one page at a
+//! time: the tables a `DataQuery.QueryStatement` may select from, each with the table
+//! properties that query may set for it. A pure read — the catalog is service-owned and
+//! no operation this service models changes it, so this handler writes nothing.
+//!
+//! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
+//! reaching this service's state and the modelled contract still apply.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +144,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTables"))
+        // The catalog is the same for every caller and every request, so nothing here
+        // reads the per-caller store and nothing is written: a listing of it leaves what
+        // every later caller sees untouched.
+        let _ = (ctx, &self.engine);
+        let entries = catalog_entries();
+
+        let (tables, next_token) = crate::state::page(
+            crate::state::PageTokenKind::Tables,
+            &entries,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            ListTablesErrorModeled::ValidationException(ValidationException {
+                message: "NextToken is not a pagination token issued by this service."
+                    .to_string(),
+                reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "NextToken".to_string(),
+                    message: "The token must be one returned by a previous ListTables call."
+                        .to_string(),
+                }]),
+            })
+        })?;
+
+        Ok(ListTablesOutput {
+            tables: Some(tables),
+            next_token,
+        })
+    }
+}
+
+/// The catalog as `(table name, Table)` pairs in name order: what
+/// [`crate::state::page`] pages over for this listing.
+///
+/// Built from the one catalog in [`crate::state::TABLE_CATALOG`], which `GetTable`
+/// describes an entry of, so a table this listing advertises is a table that reader
+/// knows. Sorted by name here as well, so the page keys are ordered whatever order the
+/// catalog is declared in.
+fn catalog_entries() -> Vec<(String, Table)> {
+    let mut entries: Vec<(String, Table)> = crate::state::TABLE_CATALOG
+        .iter()
+        .map(|spec| (spec.name.to_string(), listed_table(spec)))
+        .collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries
+}
+
+/// One catalog entry as the modelled `Table`: its name, what it holds, and a
+/// `TablePropertyDescription` per table property it publishes — the property's name,
+/// every value it accepts, the value it assumes when a request does not name it, and
+/// what it does. A table the catalog publishes no properties for reports an empty list
+/// ("Tables are not required to have any TableProperties" — smithy_query shape
+/// `GetTableRequest`, member `TableProperties`).
+fn listed_table(spec: &crate::state::TableSpec) -> Table {
+    Table {
+        table_name: Some(spec.name.to_string()),
+        description: Some(spec.description.to_string()),
+        table_properties: Some(
+            spec.properties
+                .iter()
+                .map(|property| TablePropertyDescription {
+                    name: Some(property.name.to_string()),
+                    valid_values: Some(
+                        property
+                            .valid_values
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect(),
+                    ),
+                    default_value: Some(property.default_value.to_string()),
+                    description: Some(property.description.to_string()),
+                })
+                .collect(),
+        ),
     }
 }
