@@ -30,6 +30,9 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Tests forge a pagination token with the same encoding `state::encode_token` issues
+# one with, rather than hand-rolling hex beside it.
+hex = { workspace = true }
 
 [lints]
 workspace = true

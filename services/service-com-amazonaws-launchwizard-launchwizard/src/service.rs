@@ -97,16 +97,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) before any handler
+        // runs. This service's model declares `ValidationException` (HTTP 400) on
+        // every operation that takes constrained input, which is also the code the
+        // framework names by default — so the code is restated here deliberately,
+        // because the message is replaced and a client branches on the pair.
+        //
+        // The message is this service's validation report (see
+        // `crate::state::validation_report`): how many members failed, then one clause
+        // per member naming the member's path and the requirement it failed, with no
+        // rejected value echoed back, a `@pattern` unanchored, and a failing list
+        // element reported at its collection with that collection's composed element
+        // constraints. Authentication refusals, and a refusal that names no violation
+        // at all, keep the framework's wording (`None`).
+        match refusal {
+            Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
+                code: "ValidationException".to_string(),
+                message: crate::state::validation_report(violations),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
