@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBackupVaultLockConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBackupVaultLockConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBackupVaultLockConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the Backup Vault Lock configuration onto the stored vault
+//! ([`crate::state::VaultLock`]), so every later vault read reports `Locked`
+//! with the configured retention bounds and, when the request named
+//! `ChangeableForDays`, the lock date it makes due.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +103,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Seconds per day, for turning `ChangeableForDays` into the instant the lock
+/// configuration becomes immutable.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -203,18 +203,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBackupVaultLockConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBackupVaultLockConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBackupVaultLockConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutBackupVaultLockConfigurationErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // `ChangeableForDays`, `MinRetentionDays` and `MaxRetentionDays` target
+        // `Long` with no `@range`, so the framework cannot refuse a value
+        // outside the span the model documents for each; AWS does, with
+        // `InvalidParameterValueException`.
+        let out_of_range = |member: &str, value: i64, min: i64, max: i64| {
+            PutBackupVaultLockConfigurationErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "{member} must be between {min} and {max} days, got {value}"
+                    )),
+                    ..Default::default()
+                },
+            )
+        };
+        if let Some(days) = input.changeable_for_days {
+            if !(crate::state::MIN_CHANGEABLE_FOR_DAYS..=crate::state::MAX_CHANGEABLE_FOR_DAYS)
+                .contains(&days)
+            {
+                return Err(out_of_range(
+                    "ChangeableForDays",
+                    days,
+                    crate::state::MIN_CHANGEABLE_FOR_DAYS,
+                    crate::state::MAX_CHANGEABLE_FOR_DAYS,
+                )
+                .into());
+            }
+        }
+        for (member, value) in [
+            ("MinRetentionDays", input.min_retention_days),
+            ("MaxRetentionDays", input.max_retention_days),
+        ] {
+            let Some(days) = value else { continue };
+            if !(crate::state::MIN_LOCK_RETENTION_DAYS..=crate::state::MAX_LOCK_RETENTION_DAYS)
+                .contains(&days)
+            {
+                return Err(out_of_range(
+                    member,
+                    days,
+                    crate::state::MIN_LOCK_RETENTION_DAYS,
+                    crate::state::MAX_LOCK_RETENTION_DAYS,
+                )
+                .into());
+            }
+        }
+        // A vault cannot enforce a minimum retention longer than the maximum it
+        // also enforces: no backup could satisfy both, so the configuration is
+        // refused rather than stored.
+        if let (Some(min), Some(max)) = (input.min_retention_days, input.max_retention_days) {
+            if min > max {
+                return Err(
+                    PutBackupVaultLockConfigurationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!(
+                                "MinRetentionDays ({min}) must not exceed MaxRetentionDays ({max})"
+                            )),
+                            ..Default::default()
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(vault) = store.vaults.get_mut(&input.backup_vault_name) else {
+            return Err(
+                PutBackupVaultLockConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Backup vault {} not found",
+                            input.backup_vault_name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "On and after the lock date, the Vault Lock becomes immutable and
+        // cannot be changed or deleted" (model doc for `ChangeableForDays`), so
+        // a vault whose lock date has passed refuses a new configuration. The
+        // instant comes from the stored lock date, so the refusal is owed by the
+        // clock rather than by this call.
+        if vault
+            .lock
+            .as_ref()
+            .is_some_and(|lock| lock.is_immutable_at(now))
+        {
+            return Err(
+                PutBackupVaultLockConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Backup vault {} has an immutable Vault Lock configuration",
+                            input.backup_vault_name
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `ChangeableForDays` is the caller's own cooling-off span, so the lock
+        // date keeps the value the caller asked for: "setting ChangeableForDays
+        // to 30 on Jan. 1, 2022 at 8pm UTC will set the lock date to Jan. 31,
+        // 2022 at 8pm UTC". Without it the configuration stays changeable at
+        // any time, so there is no lock date to report.
+        let lock_date = input
+            .changeable_for_days
+            .and_then(|days| u64::try_from(days).ok())
+            .and_then(|days| days.checked_mul(SECONDS_PER_DAY))
+            .and_then(|seconds| now.checked_add(::std::time::Duration::from_secs(seconds)));
+        vault.lock = Some(crate::state::VaultLock {
+            min_retention_days: input.min_retention_days,
+            max_retention_days: input.max_retention_days,
+            lock_date,
+        });
+
+        Ok(PutBackupVaultLockConfigurationOutput)
     }
 }

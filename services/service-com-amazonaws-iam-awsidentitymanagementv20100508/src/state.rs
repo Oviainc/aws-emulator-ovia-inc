@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::User;
+use crate::ops::types::{Role, User};
 
 /// IAM's default entity path: every entity whose request omits `Path` is created
 /// directly under the account root. The model's `pathType` documentation states
@@ -31,6 +31,29 @@ pub const PERMISSIONS_BOUNDARY_TYPE: &str = "PermissionsBoundaryPolicy";
 /// `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
 /// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
 const USER_ID_PREFIX: &str = "AIDA";
+
+/// The prefix AWS gives an IAM role's unique id. `Role$RoleId` is modelled as
+/// `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
+/// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
+const ROLE_ID_PREFIX: &str = "AROA";
+
+/// How many characters an IAM role name may carry: `Role$RoleName` is modelled as
+/// `roleNameType` with length 1..64
+/// (`smithy_query(query="shape", shape="Role")`), so a name a service-linked role
+/// create would derive past that bound cannot name a role at all.
+pub const MAX_ROLE_NAME_CHARACTERS: usize = 64;
+
+/// How many IAM roles one account may hold. AWS's "IAM and STS quotas" page gives
+/// the quota "Roles in an account: 1,000", and a create past it is refused with
+/// `LimitExceededException`, whose documentation says "the error message describes
+/// the limit exceeded".
+pub const MAX_ROLES_PER_ACCOUNT: usize = 1_000;
+
+/// The maximum session duration, in seconds, a role created without one carries.
+/// `CreateRole$MaxSessionDuration`'s documentation states "if you do not specify a
+/// value for this setting, the default value of one hour is applied", and
+/// `roleMaxSessionDurationType`'s range (3600..43200) puts one hour at its floor.
+pub const DEFAULT_MAX_SESSION_DURATION_SECONDS: i32 = 3_600;
 
 /// How many IAM users one account may hold. AWS's "IAM and STS quotas" page gives
 /// the quota "Users in an account: 5,000", and a create past it is refused with
@@ -81,6 +104,11 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// the key is the case-folded name while `User::user_name` keeps the case the
     /// creator chose.
     pub users: BTreeMap<String, User>,
+    /// The persisted IAM roles, keyed by [`name_key`] of the role name, for the
+    /// same reason users are: IAM entity names are unique within the account and
+    /// "are not distinguished by case", while `Role::role_name` keeps the case the
+    /// name was minted with.
+    pub roles: BTreeMap<String, Role>,
     /// Inline user policies: [`name_key`] of the user name -> [`name_key`] of the
     /// policy name -> the policy. Policy names are case-folded for the same reason
     /// user names are: the model's `CreateUser$UserName` documentation says "user,
@@ -93,6 +121,8 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub access_keys: BTreeMap<String, String>,
     /// Monotonic counter feeding [`next_user_id`](Self::next_user_id).
     pub user_id_seq: u64,
+    /// Monotonic counter feeding [`next_role_id`](Self::next_role_id).
+    pub role_id_seq: u64,
 }
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -105,6 +135,16 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_user_id(&mut self) -> String {
         self.user_id_seq += 1;
         unique_id(USER_ID_PREFIX, self.user_id_seq)
+    }
+
+    /// Mint the next role's `RoleId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id)
+    /// is: the counter is bijectively mixed into the suffix, and the id is minted
+    /// once and then stored with the role.
+    pub fn next_role_id(&mut self) -> String {
+        self.role_id_seq += 1;
+        unique_id(ROLE_ID_PREFIX, self.role_id_seq)
     }
 
     /// The aggregate size, in characters, of the inline policies embedded in the
@@ -144,6 +184,15 @@ pub fn name_key(name: &str) -> String {
 /// a global service, so the region segment is empty.
 pub fn user_arn(path: &str, user_name: &str) -> String {
     ::engine::emulator_arn("iam", "", &format!("user{path}{user_name}"))
+}
+
+/// The ARN of an IAM role: `arn:aws:iam::<account>:role<path><name>`.
+///
+/// Built the same way [`user_arn`] is, from the `role` resource type: `path`
+/// already begins and ends with `/`, and IAM is a global service, so the region
+/// segment is empty.
+pub fn role_arn(path: &str, role_name: &str) -> String {
+    ::engine::emulator_arn("iam", "", &format!("role{path}{role_name}"))
 }
 
 /// The wall-clock instant a resource was created or last changed, in the

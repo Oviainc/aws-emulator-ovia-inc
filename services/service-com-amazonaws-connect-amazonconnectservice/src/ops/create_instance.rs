@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an instance: a fresh v4 UUID id, the
+//! `arn:aws:connect:<region>:<account>:instance/<id>` ARN built from it, and the whole
+//! record persisted in [`crate::state`] so every later read answers from storage. A
+//! repeated `ClientToken` returns the instance that token already minted rather than a
+//! second one.
+//!
+//! The model marks only `IdentityManagementType` and the two call flags required, and
+//! states no conditional rule tying `InstanceAlias` or `DirectoryId` to a chosen
+//! identity-management type, so this handler refuses neither combination: a rule the
+//! model does not carry is out of this slice's scope, and the instance access url is
+//! derived from the id when no alias was given.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +169,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstance"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateInstanceErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Amazon Connect store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // Idempotency: the same ClientToken names the instance it already created.
+        let client_token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if let Some(token) = client_token.as_deref() {
+            if let Some(existing) = store
+                .client_tokens
+                .get(token)
+                .and_then(|id| store.instances.get(id))
+            {
+                return Ok(CreateInstanceOutput {
+                    id: Some(existing.id.clone()),
+                    arn: Some(existing.arn.clone()),
+                });
+            }
+        }
+
+        // The store is bounded: the emulator keeps it for the life of the process and
+        // refuses a create that would grow it past the quota.
+        if store.instances.len() >= crate::state::INSTANCE_QUOTA
+            || store.client_tokens.len() >= crate::state::INSTANCE_QUOTA
+        {
+            return Err(CreateInstanceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The maximum number of instances ({}) has been reached; \
+                         delete an instance before creating another",
+                        crate::state::INSTANCE_QUOTA
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let id = store.mint_resource_id();
+        let arn = crate::state::instance_arn(&region, &id);
+        let record = crate::state::InstanceRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            region,
+            identity_management_type: input.identity_management_type,
+            instance_alias: input.instance_alias.clone(),
+            directory_id: input.directory_id,
+            inbound_calls_enabled: input.inbound_calls_enabled,
+            outbound_calls_enabled: input.outbound_calls_enabled,
+            service_role: crate::state::instance_service_role(&id),
+            instance_access_url: crate::state::instance_access_url(
+                input.instance_alias.as_deref(),
+                &id,
+            ),
+            created_time: now,
+            active_at: now + crate::state::INSTANCE_ACTIVATION_DELAY,
+            tags: crate::state::tags_in(input.tags),
+            queues: ::std::collections::BTreeMap::new(),
+        };
+
+        store.instances.insert(id.clone(), record);
+        if let Some(token) = client_token {
+            store.client_tokens.insert(token, id.clone());
+        }
+
+        Ok(CreateInstanceOutput {
+            id: Some(id),
+            arn: Some(arn),
+        })
     }
 }

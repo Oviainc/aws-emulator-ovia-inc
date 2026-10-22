@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRegistry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRegistry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRegistry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a registry id and ARN, persists the whole request in
+//! [`crate::state`] and answers the ARN. Creation is asynchronous, so the registry is
+//! stored `CREATING` with the clock owing it `READY`.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +170,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRegistry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRegistryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRegistry"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRegistryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        // `clientToken` is an @idempotencyToken: "If this token matches a previous
+        // request, the service ignores the request, but does not return an error" — so a
+        // replay answers with the ARN the first call minted and creates nothing. The
+        // registry it named is looked up, so once that registry has been deleted the
+        // token names nothing and this call falls through to a fresh create.
+        if let Some(token) = input.client_token.as_deref().filter(|t| !t.is_empty()) {
+            if let Some(arn) = state
+                .idempotent_answer(Self::NAME, token)
+                .map(str::to_string)
+            {
+                if state
+                    .registries
+                    .values()
+                    .any(|registry| registry.registry_arn == arn)
+                {
+                    return Ok(CreateRegistryOutput { registry_arn: arn });
+                }
+            }
+        }
+
+        // The account's registry quota: a caller-driven store cannot grow for ever.
+        if state.registries.len() >= crate::state::MAX_REGISTRIES {
+            return Err(CreateRegistryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} registries",
+                        crate::state::MAX_REGISTRIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A registry's name identifies it within the account, so a second registry
+        // cannot take a name a live registry already holds.
+        if state.registry_name_index.contains_key(&input.name) {
+            return Err(CreateRegistryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a registry named {} already exists in this account",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        let registry_id = state.mint_registry_id();
+        let registry_arn = crate::state::registry_arn(&region, &registry_id);
+        let created_at = crate::state::now();
+        // Creation is asynchronous: the model documents the registry beginning in
+        // CREATING and becoming usable once it reaches READY.
+        let pending = crate::state::DueTransition::after_async_span(
+            crate::state::RegistryTransition::Ready,
+        );
+        state.arm_transition(pending.due_at);
+        // `AutoDetection` reports the configuration the caller asked for together with
+        // whether it is running; `AutoDetectionStatus` is ACTIVE | INACTIVE.
+        let auto_detection = input
+            .auto_detection_configuration
+            .map(|configuration| AutoDetection {
+                status: if configuration.enabled {
+                    "ACTIVE".to_string()
+                } else {
+                    "INACTIVE".to_string()
+                },
+                configuration,
+                status_reason: None,
+            });
+        let registry = crate::state::Registry {
+            registry_id: registry_id.clone(),
+            registry_arn: registry_arn.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            encryption_configuration: input.encryption_configuration,
+            discovery_configuration: input.discovery_configuration,
+            approval_configuration: input.approval_configuration,
+            custom_metadata_schema_configuration: input.custom_metadata_schema_configuration,
+            auto_detection,
+            status: crate::state::REGISTRY_CREATING.to_string(),
+            status_reason: None,
+            created_at,
+            updated_at: created_at,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            records: ::std::collections::BTreeMap::new(),
+            pending: Some(pending),
+        };
+
+        state
+            .registry_name_index
+            .insert(input.name, registry_id.clone());
+        state.registries.insert(registry_id, registry);
+        if let Some(token) = input.client_token.filter(|t| !t.is_empty()) {
+            state.remember_idempotent_answer(Self::NAME, &token, &registry_arn);
+        }
+
+        Ok(CreateRegistryOutput { registry_arn })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSnapshotBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSnapshotBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSnapshotBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the `BlockToken` to a stored block and returns the persisted
+//! bytes verbatim, with the length and checksum derived from those bytes.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +91,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{checksum_base64_sha256, CHECKSUM_ALGORITHM_SHA256};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +168,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSnapshotBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSnapshotBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSnapshotBlock"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read performs: materialising a `Timeout` the clock had
+        // already made due, which was owed whether or not anybody read.
+        store.expire_due_snapshots(now);
+
+        let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
+            return Err(not_found(format!(
+                "snapshot {} does not exist",
+                input.snapshot_id
+            )));
+        };
+        let Some(entry) = snapshot.blocks.get(&input.block_index) else {
+            // `ResourceNotFoundExceptionReason` carries no block-specific value, so the
+            // closest modeled reason is used for a block of a snapshot that does exist.
+            return Err(not_found(format!(
+                "snapshot {} has no block at index {}",
+                input.snapshot_id, input.block_index
+            )));
+        };
+
+        // The token is resolved against the stored block itself — the request already
+        // carries the `SnapshotId` and `BlockIndex` the token names — so a token that was
+        // superseded or whose block expired simply stops resolving, with no side table of
+        // live tokens to keep in step.
+        if entry.block_token != input.block_token {
+            return Err(validation(
+                "INVALID_BLOCK_TOKEN",
+                format!(
+                    "BlockToken does not name block {} of snapshot {}",
+                    input.block_index, input.snapshot_id
+                ),
+            ));
+        }
+
+        // Everything on the wire is derived from the persisted bytes.
+        let data = entry.data.clone();
+        let data_length = i32::try_from(data.len()).unwrap_or(i32::MAX);
+        Ok(GetSnapshotBlockOutput {
+            data_length: Some(data_length),
+            checksum: Some(checksum_base64_sha256(&data)),
+            checksum_algorithm: Some(CHECKSUM_ALGORITHM_SHA256.to_string()),
+            block_data: data,
+        })
     }
+}
+
+/// The modelled server error for an engine that holds no state for this service.
+fn no_state() -> GetSnapshotBlockError {
+    GetSnapshotBlockErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the com-amazonaws-ebs-ebs service is mounted on an engine that holds no state"
+                .to_string(),
+        ),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400) with one of `ValidationExceptionReason`'s
+/// values.
+fn validation(reason: &str, message: String) -> GetSnapshotBlockError {
+    GetSnapshotBlockErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an absent snapshot or block.
+fn not_found(message: String) -> GetSnapshotBlockError {
+    GetSnapshotBlockErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        reason: Some("SNAPSHOT_NOT_FOUND".to_string()),
+    })
+    .into()
 }
