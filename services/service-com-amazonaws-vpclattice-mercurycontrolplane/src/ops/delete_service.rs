@@ -191,13 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "A service can't be deleted if it's associated with a service network" (the
         // operation's own documentation).
+        //
+        // Same reporting rule as the service-network guard: the refusal names the kind of
+        // dependent that still exists over the resolved identifier, and reports no count.
         let associated = store.associated_network_count(&id);
         if associated > 0 {
             return Err(DeleteServiceErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "service {id} is still associated with {associated} service network(s) and cannot be deleted"
-                    ),
+                    message: format!("Service {id} has one or more associated service networks."),
                     resource_id: id.clone(),
                     resource_type: crate::state::KIND_SERVICE.to_string(),
                 },

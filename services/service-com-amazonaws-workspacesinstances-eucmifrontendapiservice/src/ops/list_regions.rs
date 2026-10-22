@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Region catalog this emulator supports,
+//! [`crate::state::SUPPORTED_REGIONS`], WHOLE in one response: the recorded corpus
+//! unit `workspaces-instances.list-regions-returns-supported-regions` shows the real
+//! service answering a `MaxResults: 1` call with the entire catalog, so `MaxResults`
+//! does not truncate it and no `NextToken` is minted. `@readonly`: nothing here
+//! writes, and two calls answer the same list.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegions"))
+        // The Region catalog is a service fact, so neither the request metadata nor
+        // the account's stored instances can change the answer. The engine is still
+        // reached the one legal way, so a request served without this service's store
+        // answers its modelled `InternalServerException` rather than a list from
+        // nowhere. The handle is not a lock, so binding it holds nothing, and a
+        // reporting operation writes nothing.
+        let _ = ctx;
+        let Some(_state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRegionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The `NextToken` member is modelled and the operation carries `@paginated`,
+        // but the real service does not split this list: the recorded corpus unit
+        // `workspaces-instances.list-regions-returns-supported-regions` shows a call
+        // carrying `MaxResults: 1` answering the WHOLE supported-Region catalog, so
+        // `MaxResults` does not truncate the answer and no `NextToken` is ever minted.
+        // Nothing a caller can hold is therefore a token this service issued, and a
+        // request that carries one is a bad request — a 400, never a guessed-at page.
+        if input.next_token.is_some() {
+            const WHY: &str = "NextToken is not a token this service issued: ListRegions \
+                               reports every supported Region in one response and returns \
+                               no pagination token";
+            return Err(ListRegionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: WHY.to_string(),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "NextToken".to_string(),
+                        reason: "FIELD_VALIDATION_FAILED".to_string(),
+                        message: WHY.to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // `MaxResults` is modelled `range 1..25` and the boundary validator has already
+        // refused anything outside it; past that it bounds nothing here, per the
+        // recorded behaviour above.
+        let _ = input.max_results;
+
+        Ok(ListRegionsOutput {
+            regions: crate::state::SUPPORTED_REGIONS
+                .iter()
+                .map(|region| Region {
+                    region_name: Some((*region).to_string()),
+                })
+                .collect(),
+            next_token: None,
+        })
     }
 }

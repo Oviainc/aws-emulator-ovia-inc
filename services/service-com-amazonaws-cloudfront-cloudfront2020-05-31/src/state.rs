@@ -15,7 +15,9 @@
 //! * a distribution CloudFront has just created or reconfigured is `InProgress` until
 //!   its configuration has propagated, and is `Deployed` after
 //!   ([`PROPAGATION_DELAY`]);
-//! * an invalidation is `InProgress` until its batch finishes, and `Completed` after.
+//! * an invalidation is `InProgress` until its batch finishes, and `Completed` after;
+//! * a key value store CloudFront has just created is `PROVISIONING` until it has been
+//!   provisioned, and `READY` after ([`KVS_PROVISIONING_DELAY`]).
 //!
 //! Both are materialised by [`ComAmazonawsCloudfrontCloudfront20200531State::settle`],
 //! which every handler calls before it reads: the transition was owed at the same
@@ -27,9 +29,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AllowedMethods, CacheBehavior, CacheBehaviors, CustomErrorResponses, DefaultCacheBehavior,
-    Distribution, DistributionConfig, DistributionSummary, ForwardedValues, FunctionAssociations,
-    GeoRestriction, Invalidation, InvalidationBatch, LambdaFunctionAssociations,
-    NoSuchDistribution, NoSuchInvalidation, Paths, Restrictions, TrustedKeyGroups, TrustedSigners,
+    Distribution, DistributionConfig, DistributionSummary, EntityAlreadyExists, EntityNotFound,
+    ForwardedValues, FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch,
+    KeyValueStore, LambdaFunctionAssociations, NoSuchDistribution, NoSuchInvalidation, Paths,
+    Restrictions, Tags, TrustedKeyGroups, TrustedSigners,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -98,6 +101,38 @@ pub const MAX_INVALIDATIONS_PER_DISTRIBUTION: usize = 1_000;
 /// well. Over it, the refusal is the modelled `BatchTooLarge` (HTTP 413): "Invalidation
 /// batch specified is too large."
 pub const MAX_INVALIDATION_PATHS: usize = 3_000;
+
+/// `KeyValueStore$Status` while CloudFront is still provisioning a key value store.
+///
+/// A store CloudFront has just accepted is not yet usable by a CloudFront function, so
+/// the create answers this non-terminal status and the clock — not a later call — owes
+/// the store [`KVS_STATUS_READY`].
+pub const KVS_STATUS_PROVISIONING: &str = "PROVISIONING";
+
+/// `KeyValueStore$Status` once provisioning has finished: the status a store has to be
+/// in before its data plane (`cloudfront-keyvaluestore`, which serves a store in exactly
+/// this terminal status) can serve a key.
+pub const KVS_STATUS_READY: &str = "READY";
+
+/// How long after the call that creates it a key value store is owed
+/// [`KVS_STATUS_READY`].
+///
+/// CloudFront publishes no provisioning deadline, so — like [`PROPAGATION_DELAY`] — this
+/// span is the EMULATOR's choice rather than a claim about the service: long enough that
+/// a caller describing the store straight after the create still observes
+/// [`KVS_STATUS_PROVISIONING`], short enough that a caller that waits observes the
+/// terminal one. The instant is stored on the record; nothing ever sleeps for it.
+pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
+
+/// The most key value stores this emulator holds.
+///
+/// CHOSEN by this emulator, for the same reason as [`MAX_DISTRIBUTIONS`]: a store record
+/// is what `DescribeKeyValueStore` answers from, so it cannot be evicted, and the create
+/// path is refused at this entry count with the modelled `EntityLimitExceeded` ("The
+/// entity limit has been exceeded") instead of growing further. It matches the data
+/// plane's own ceiling on distinct stores, so a store this service accepts is one that
+/// service can also hold.
+pub const MAX_KEY_VALUE_STORES: usize = 1_000;
 
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
@@ -324,6 +359,66 @@ impl StoredDistribution {
     }
 }
 
+/// One CloudFront key value store, as this emulator persists it.
+///
+/// The record is the single source of truth for the store's id, ARN, comment, status and
+/// `LastModifiedTime`, so the create, a later describe and a later mutation all answer
+/// from it rather than from the request being served.
+#[derive(Debug, Clone)]
+pub struct StoredKeyValueStore {
+    /// `KeyValueStore$Name` — "The name of the key value store." Unique per account, so
+    /// it is also the key this store is held under.
+    pub name: String,
+    /// `KeyValueStore$Id` — "The unique Id for the key value store": the UUID minted at
+    /// creation, which is also the resource part of [`StoredKeyValueStore::arn`].
+    pub id: String,
+    /// `KeyValueStore$ARN`. CloudFront is a global service, so the ARN carries no region.
+    pub arn: String,
+    /// `KeyValueStore$Comment`, as submitted. The member is required on the wire, so a
+    /// create that named none reports the empty comment.
+    pub comment: String,
+    /// [`KVS_STATUS_PROVISIONING`] until [`StoredKeyValueStore::ready_due`], then
+    /// [`KVS_STATUS_READY`].
+    pub status: String,
+    /// The instant this store is owed [`KVS_STATUS_READY`]. Stored rather than slept for.
+    pub ready_due: SystemTime,
+    /// `KeyValueStore$LastModifiedTime` — "The last-modified time of the key value
+    /// store": when the resource last changed.
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this store.
+    pub etag: String,
+    /// The tags submitted with the create, held verbatim so a tagging operation reads
+    /// what was stored rather than re-deriving it.
+    pub tags: Option<Tags>,
+}
+
+impl StoredKeyValueStore {
+    /// Apply the provisioning transition the clock owes at `now`.
+    ///
+    /// Idempotent and monotonic: it only ever moves the non-terminal status to the
+    /// terminal one, and only once the deadline has passed, so a read that calls it
+    /// cannot change what a later caller sees.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == KVS_STATUS_PROVISIONING && now >= self.ready_due {
+            self.status = KVS_STATUS_READY.to_string();
+        }
+    }
+
+    /// The `KeyValueStore` projection every key value store operation returns, read from
+    /// the one stored record.
+    pub fn to_key_value_store(&self) -> KeyValueStore {
+        KeyValueStore {
+            name: self.name.clone(),
+            id: self.id.clone(),
+            comment: self.comment.clone(),
+            arn: self.arn.clone(),
+            status: Some(self.status.clone()),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudfrontCloudfront20200531State {
@@ -336,6 +431,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// The counter every generated id, domain name and version token is minted from, so
     /// no two mints collide and each mutation yields a FRESH `ETag`.
     pub next_token_seq: u64,
+    /// Every key value store this emulator holds, keyed by its name — "In your account,
+    /// the key value store names must be unique", which is what makes the name the key
+    /// and a repeated name an `EntityAlreadyExists`. A `BTreeMap` for the same reason as
+    /// `distributions`: one stable total order for a listing to page through.
+    pub key_value_stores: BTreeMap<String, StoredKeyValueStore>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -344,6 +444,14 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         for distribution in self.distributions.values_mut() {
             distribution.settle(now);
         }
+        for key_value_store in self.key_value_stores.values_mut() {
+            key_value_store.settle(now);
+        }
+    }
+
+    /// The key value store `name` names, or `None` when the store holds none.
+    pub fn key_value_store(&self, name: &str) -> Option<&StoredKeyValueStore> {
+        self.key_value_stores.get(name)
     }
 
     /// The distribution `id` names, or `None` when the store holds none.
@@ -356,8 +464,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The scramble is a bijection on `u64` and 36^13 exceeds 2^64, so distinct counter
     /// values always render as distinct tokens — the mint never repeats itself.
     fn mint(&mut self, len: usize) -> String {
+        render_token(self.mint_u64(), len)
+    }
+
+    /// One fresh scrambled counter value — the single draw every mint is rendered from.
+    fn mint_u64(&mut self) -> u64 {
         self.next_token_seq = self.next_token_seq.wrapping_add(1);
-        render_token(scramble(self.next_token_seq), len)
+        scramble(self.next_token_seq)
     }
 
     /// Allocate a distribution id no stored distribution holds: `E` + 13 uppercase
@@ -366,6 +479,37 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = format!("E{}", self.mint(ID_BODY_LEN));
             if !self.distributions.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a key value store id no stored key value store holds.
+    ///
+    /// `KeyValueStore$Id` is "The unique Id for the key value store", and the identifier
+    /// CloudFront mints for one is a UUID — the id that forms the resource part of the
+    /// store's ARN, `arn:aws:cloudfront::<account>:key-value-store/<uuid>`, which is how
+    /// the key value store DATA plane addresses the store. So this renders two draws of
+    /// the mint (128 bits) as the 8-4-4-4-12 lowercase hex a UUID takes; distinct draws
+    /// render distinctly, so the mint never repeats an id.
+    pub fn allocate_key_value_store_id(&mut self) -> String {
+        loop {
+            let high = self.mint_u64();
+            let low = self.mint_u64();
+            let hex = format!("{high:016x}{low:016x}");
+            let candidate = format!(
+                "{}-{}-{}-{}-{}",
+                &hex[..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
+            );
+            if !self
+                .key_value_stores
+                .values()
+                .any(|store| store.id == candidate)
+            {
                 break candidate;
             }
         }
@@ -471,6 +615,20 @@ pub fn distribution_path(id: &str) -> String {
 /// The path of one invalidation of one distribution.
 pub fn invalidation_path(distribution_id: &str, invalidation_id: &str) -> String {
     format!("/2020-05-31/distribution/{distribution_id}/invalidation/{invalidation_id}")
+}
+
+/// The ARN of a key value store. CloudFront is a GLOBAL service, so the ARN's region
+/// segment is empty: `arn:aws:cloudfront::<account>:key-value-store/<Id>`. This is the
+/// identifier the key value store DATA plane (`cloudfront-keyvaluestore`) addresses the
+/// store by, so the resource part is the store's minted UUID id.
+pub fn key_value_store_arn(id: &str) -> String {
+    ::engine::emulator_arn("cloudfront", "", &format!("key-value-store/{id}"))
+}
+
+/// The path of a key value store resource under this service's API version. The
+/// resource is addressed by NAME, as `DescribeKeyValueStore`'s `{Name}` label is.
+pub fn key_value_store_path(name: &str) -> String {
+    format!("/2020-05-31/key-value-store/{name}")
 }
 
 /// The fully qualified URI a `Location` header reports for `path`, built from the host
@@ -853,6 +1011,26 @@ pub fn no_such_invalidation(id: &str) -> NoSuchInvalidation {
     }
 }
 
+/// The modelled `EntityNotFound` (HTTP 404) for a key value store name the store does
+/// not hold — "The entity was not found."
+pub fn key_value_store_not_found(name: &str) -> EntityNotFound {
+    EntityNotFound {
+        message: Some(format!(
+            "The specified key value store does not exist: {name}"
+        )),
+    }
+}
+
+/// The modelled `EntityAlreadyExists` (HTTP 409) for a key value store name that is
+/// already taken — "The entity already exists. You must provide a unique entity."
+pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
+    EntityAlreadyExists {
+        message: Some(format!(
+            "A key value store with the name {name} already exists in this account"
+        )),
+    }
+}
+
 /// Mix a counter so consecutive values render as unrelated tokens.
 ///
 /// This is SplitMix64's finaliser applied to the counter times the 64-bit golden ratio.
@@ -903,6 +1081,29 @@ mod tests {
                 "case next_etag: expected an `E`+13 version token, got {etag:?}"
             );
             assert!(seen.insert(etag.clone()), "case {etag:?}: the mint repeated a token");
+        }
+    }
+
+    /// A minted key value store id is a UUID and never repeats: the id is the resource
+    /// part of the store's ARN, which is how the data plane addresses one store.
+    #[test]
+    fn minted_key_value_store_ids_are_distinct_uuids() {
+        let mut state = ComAmazonawsCloudfrontCloudfront20200531State::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..1_000 {
+            let id = state.allocate_key_value_store_id();
+            let widths: Vec<usize> = id.split('-').map(str::len).collect();
+            assert_eq!(
+                widths,
+                vec![8, 4, 4, 4, 12],
+                "case allocate_key_value_store_id: expected 8-4-4-4-12 groups, got {id:?}"
+            );
+            assert!(
+                id.bytes()
+                    .all(|b| b == b'-' || (b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+                "case allocate_key_value_store_id: expected lowercase hex, got {id:?}"
+            );
+            assert!(seen.insert(id.clone()), "case {id:?}: the mint repeated an id");
         }
     }
 
