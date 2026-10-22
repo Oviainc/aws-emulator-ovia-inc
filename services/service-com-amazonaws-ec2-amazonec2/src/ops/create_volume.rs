@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an EBS volume, persists it in [`crate::state`] and answers with the
+//! STORED record. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -240,18 +233,347 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVolume"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            availability_zones_in_region, request_region, require_service_state,
+            system_time_to_date_time, tag_list, unresolvable_snapshot_id, validate_tag_size,
+            volume_iops_range, volume_limit_exceeded, volume_payload_bytes, volume_size_range,
+            VolumeRecord, VolumeView, DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT,
+            DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE, MAX_CLIENT_TOKEN_CHARS,
+            MAX_KMS_KEY_ID_CHARS, MAX_STORED_BYTES, MAX_STORED_VOLUMES, MAX_TAGS_PER_RESOURCE,
+            PROVISIONED_IOPS_VOLUME_TYPES, THROUGHPUT_VOLUME_TYPE, TRANSITION_DELAY,
+            VOLUME_TAGGABLE_RESOURCE,
+        };
+
+        let region = request_region(ctx.parts());
+
+        // "Either AvailabilityZone or AvailabilityZoneId must be specified, but not
+        // both" (`CreateVolumeRequest$AvailabilityZone`), and the zone must be one the
+        // Region has — the naming rule for those zones lives in one place,
+        // `availability_zones_in_region`.
+        let zones = availability_zones_in_region(&region);
+        let zone = match (
+            input.availability_zone.as_deref(),
+            input.availability_zone_id.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "Either availabilityZone or availabilityZoneId may be specified, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Either availabilityZone or availabilityZoneId must be specified",
+                ));
+            }
+            (Some(zone_name), None) => zones
+                .iter()
+                .find(|zone| zone.zone_name == zone_name)
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{zone_name}' for availabilityZone. \
+                         Region '{region}' has no such Availability Zone"
+                    ))
+                })?,
+            (None, Some(zone_id)) => zones
+                .iter()
+                .find(|zone| zone.zone_id == zone_id)
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{zone_id}' for availabilityZoneId. \
+                         Region '{region}' has no such Availability Zone"
+                    ))
+                })?,
+        };
+
+        // "Default: gp2" (`CreateVolumeRequest$VolumeType`). The modelled enum has
+        // already refused any other spelling, so a type with no published size range
+        // here can only be one this table has yet to learn.
+        let volume_type = input
+            .volume_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_VOLUME_TYPE.to_string());
+        let Some((size_min, size_max)) = volume_size_range(&volume_type) else {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{volume_type}' for volumeType"
+            )));
+        };
+
+        // "You must specify either a snapshot ID or a volume size"
+        // (`CreateVolumeRequest$Size`). This emulator stores no snapshots — every EBS
+        // snapshot operation is still a stub — so an id a caller names here can only be
+        // one no snapshot of the account has, which is the answer EC2 gives for it; an id
+        // that is not shaped like a snapshot id is answered as malformed first.
+        if let Some(snapshot_id) = input.snapshot_id.as_deref() {
+            return Err(unresolvable_snapshot_id(snapshot_id));
+        }
+        let Some(size) = input.size else {
+            return Err(Scaffolded::missing_parameter(
+                "Either size or snapshotId must be specified",
+            ));
+        };
+        if size < size_min || size > size_max {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{size}' for size. \
+                 A {volume_type} volume holds from {size_min} to {size_max} GiB"
+            )));
+        }
+
+        // "Required for io1 and io2 volumes. Optional for gp3 volumes. Omit for all
+        // other volume types" (`CreateVolumeRequest$Iops`), with the per-type ranges
+        // this crate keeps beside that sentence.
+        let iops_range = volume_iops_range(&volume_type);
+        let iops = match (input.iops, iops_range) {
+            (Some(iops), Some((min, max))) if iops < min || iops > max => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{iops}' for iops. \
+                     A {volume_type} volume provisions from {min} to {max} IOPS"
+                )));
+            }
+            (Some(iops), Some(_)) => Some(iops),
+            (Some(iops), None) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{iops}' for iops. \
+                     A {volume_type} volume does not provision IOPS"
+                )));
+            }
+            (None, _) if PROVISIONED_IOPS_VOLUME_TYPES.contains(&volume_type.as_str()) => {
+                return Err(Scaffolded::missing_parameter(format!(
+                    "iops is required for a {volume_type} volume"
+                )));
+            }
+            // "gp3: 3,000 (default)"; every other type provisions none.
+            (None, Some(_)) => Some(DEFAULT_GP3_IOPS),
+            (None, None) => None,
+        };
+
+        // "Supported for gp3 volumes only. Omit for all other volume types. Valid
+        // Range: 125 - 2000 MiB/s" (`CreateVolumeRequest$Throughput`).
+        let (throughput_min, throughput_max) = GP3_THROUGHPUT_RANGE;
+        let throughput = match input.throughput {
+            Some(_) if volume_type != THROUGHPUT_VOLUME_TYPE => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "throughput is supported for {THROUGHPUT_VOLUME_TYPE} volumes only, \
+                     not for a {volume_type} volume"
+                )));
+            }
+            Some(throughput) if throughput < throughput_min || throughput > throughput_max => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{throughput}' for throughput. \
+                     A {THROUGHPUT_VOLUME_TYPE} volume provisions from {throughput_min} to \
+                     {throughput_max} MiB/s"
+                )));
+            }
+            Some(throughput) => Some(throughput),
+            None if volume_type == THROUGHPUT_VOLUME_TYPE => Some(DEFAULT_GP3_THROUGHPUT),
+            None => None,
+        };
+
+        // "This parameter is supported with io1 and io2 volumes only"
+        // (`CreateVolumeRequest$MultiAttachEnabled`).
+        let multi_attach_enabled = input.multi_attach_enabled.unwrap_or(false);
+        if multi_attach_enabled && !PROVISIONED_IOPS_VOLUME_TYPES.contains(&volume_type.as_str()) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "multiAttachEnabled is supported with {} volumes only, \
+                 not with a {volume_type} volume",
+                PROVISIONED_IOPS_VOLUME_TYPES.join(" and ")
+            )));
+        }
+
+        // "If KmsKeyId is specified, the encrypted state must be true"
+        // (`CreateVolumeRequest$KmsKeyId`).
+        let encrypted = input.encrypted.unwrap_or(false);
+        if input.kms_key_id.is_some() && !encrypted {
+            return Err(Scaffolded::invalid_parameter_value(
+                "kmsKeyId may be specified only when encrypted is true",
+            ));
+        }
+
+        // "The tags to apply to the volume during creation"
+        // (`CreateVolumeRequest$TagSpecifications`): the volume is the only resource
+        // this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded.
+        let mut tags: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(VOLUME_TAGGABLE_RESOURCE) | None => {}
+                Some(resource_type) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{resource_type}' for resourceType. \
+                         CreateVolume tags the '{VOLUME_TAGGABLE_RESOURCE}' it creates"
+                    )));
+                }
+            }
+            for tag in specification.tags.iter().flatten() {
+                let key = tag.key.clone().unwrap_or_default();
+                let value = tag.value.clone().unwrap_or_default();
+                validate_tag_size(&key, &value)?;
+                tags.insert(key, value);
+            }
+        }
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "A volume carries at most {MAX_TAGS_PER_RESOURCE} tags, not {}",
+                tags.len()
+            )));
+        }
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+        // The model declares no `@length` on `KmsKeyId`, so the handler is the only place
+        // the bound AWS KMS publishes for a key identifier can be enforced — and a stored
+        // record keeps whatever it is given for the process's lifetime.
+        if input
+            .kms_key_id
+            .as_ref()
+            .is_some_and(|key_id| key_id.chars().count() > MAX_KMS_KEY_ID_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "kmsKeyId accepts at most {MAX_KMS_KEY_ID_CHARS} characters"
+            )));
+        }
+
+        // The caller-chosen bytes this create would retain for the process's lifetime:
+        // the tags, the KMS key identifier and the client token the token map keeps,
+        // counted by the ONE definition of that charge. A COUNT ceiling admits gigabytes
+        // on its own, because each record holds strings the caller chose the length of,
+        // so both are asked below.
+        let payload_bytes = volume_payload_bytes(
+            &tag_list(&tags),
+            input.kms_key_id.as_deref(),
+            input.client_token.as_deref(),
+        );
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`CreateVolumeRequest$ClientToken`) — one token
+        // names the one volume it minted, so a replay reports that volume and creates
+        // nothing. Read here, answered below the DryRun check, because a replay stores
+        // nothing and so passes the ceiling a fresh create has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.volume_client_tokens.get(token).cloned());
+
+        if replayed.is_none() && store.volumes.len() >= MAX_STORED_VOLUMES {
+            return Err(volume_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_VOLUMES} EBS volumes, \
+                 which is as many as it stores"
+            )));
+        }
+        // A replay stores nothing, so it is charged nothing and clears this gate; a fresh
+        // create is refused rather than overshooting the store's byte budget.
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(volume_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first
+        // write: the flag asks whether the request WOULD have worked, so one that would
+        // have been refused is refused with that reason instead, and one that would have
+        // succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        if let Some(volume_id) = replayed {
+            return store
+                .volumes
+                .get(&volume_id)
+                .map(|record| record.create_response(now))
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names volume '{volume_id}', which is not stored"
+                    ))
+                });
+        }
+
+        let volume_id = store.next_id("vol");
+        let record = VolumeRecord {
+            view: VolumeView {
+                volume_id: Some(volume_id.clone()),
+                volume_arn: Some(::engine::emulator_arn(
+                    "ec2",
+                    &region,
+                    &format!("volume/{volume_id}"),
+                )),
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                availability_zone: Some(zone.zone_name.clone()),
+                availability_zone_id: Some(zone.zone_id.clone()),
+                create_time: Some(system_time_to_date_time(::std::time::SystemTime::now())),
+                size: Some(size),
+                volume_type: Some(volume_type),
+                iops,
+                throughput,
+                multi_attach_enabled: Some(multi_attach_enabled),
+                encrypted: Some(encrypted),
+                kms_key_id: input.kms_key_id.clone(),
+                tags: Some(tag_list(&tags)),
+                // A fresh volume is attached to nothing; `AttachVolume` is the operation
+                // that would add an attachment, and it is still a stub.
+                attachments: Some(Vec::new()),
+                // The volume was created empty, not from a snapshot (a request naming
+                // one is refused above), and not as a copy of another volume.
+                snapshot_id: None,
+                source_volume_id: None,
+                // "Indicates whether the volume was created using fast snapshot
+                // restore" (`Volume$FastRestored`): there is no snapshot to restore
+                // from, so it was not.
+                fast_restored: Some(false),
+                // "Reserved for future use" (`Volume$SseType`), and not returned by
+                // CreateVolume at all.
+                sse_type: None,
+                // "Reserved for internal use" (`CreateVolumeRequest$Operator`): this
+                // volume is the caller's, not a service's, so no managing operator.
+                operator: None,
+                // An Outpost volume is one created on an Outpost, which this emulator
+                // has none of.
+                outpost_arn: None,
+                // "If no volume initialization rate was specified, the value is null"
+                // (`Volume$VolumeInitializationRate`). The member is only supported for
+                // a volume created from a snapshot, which this is not.
+                volume_initialization_rate: None,
+                // Derived from `available_at` on every read.
+                state: None,
+            },
+            // A volume AWS hands back is `creating` and reaches `available` without
+            // anyone asking: the same clock-owed span an instance's `pending` ->
+            // `running` move takes in this crate.
+            available_at: now + TRANSITION_DELAY,
+        };
+        if let Some(token) = input.client_token.clone() {
+            store.volume_client_tokens.insert(token, volume_id.clone());
+        }
+        // The bytes this record and its token retain are charged against the store's
+        // budget at the insert, so no path can store them uncharged; a removal path must
+        // give them back with `release_stored_bytes`, the way `remove_launch_template`
+        // does.
+        store.add_stored_bytes(payload_bytes);
+        store.volumes.insert(volume_id.clone(), record);
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeVolumes will see rather than the request object.
+        store
+            .volumes
+            .get(&volume_id)
+            .map(|record| record.create_response(now))
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created volume '{volume_id}' could not be read back"
+                ))
+            })
     }
 }
