@@ -154,7 +154,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Report the status the Outpost holds NOW: a transition the clock has
+        // already made due is materialised before the record is read, so a poll
+        // sees a provisioning Outpost become active exactly when it was owed.
+        store.settle_outposts();
         let outpost = store
             .outposts
             .get(&outpost_id)
