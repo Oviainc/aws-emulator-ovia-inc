@@ -5,12 +5,17 @@
 //! finding store, so `ListFindings` and `GetFindings` read them back. An unknown
 //! detector id is refused with `BadRequestException`.
 //!
-//! Everything about a generated finding is derived from the finding TYPE, following
+//! A requested finding type must be a GuardDuty finding type: the service generates a
+//! sample only for a type in its own catalogue, and rejects any other entry with the
+//! modelled 400 before anything is written. The catalogue is also where a generated
+//! finding's severity comes from — GuardDuty publishes one severity LEVEL per finding
+//! type, not one severity for the whole service.
+//!
+//! The rest of a generated finding is derived from the finding TYPE, following
 //! GuardDuty's documented finding-type naming convention
 //! `ThreatPurpose:ResourceTypeAffected/ThreatFamilyName.DetectionMechanism!Artifact`:
-//! the affected resource type comes from the second segment and the severity band from
-//! the threat purpose in the first. Per-type severity values and titles are not in the
-//! model, so they are derived rather than invented per request.
+//! the affected resource type comes from the second segment and the title and
+//! description from the type itself.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -152,13 +157,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "If 'NULL' is specified for findingTypes, the API generates sample findings
         // of all supported finding types"
-        // (`smithy_query(query="doc",shape="CreateSampleFindings")`). The model carries
-        // no list of finding types, so "all supported" is this emulator's catalogue.
-        let requested: Vec<String> = match input.finding_types.as_ref() {
-            Some(types) if !types.is_empty() => types.clone(),
-            _ => SUPPORTED_FINDING_TYPES
+        // (`smithy_query(query="doc",shape="CreateSampleFindings")`). The supported
+        // types are the catalogue below: generating a sample means knowing the
+        // finding type's published properties, so a type outside the catalogue is one
+        // this service cannot generate.
+        //
+        // The request is validated BEFORE the store is touched (and before the
+        // detector is looked up, which is a resource lookup, not input validation), so
+        // a refused request leaves no finding behind.
+        let requested: Vec<(String, f64)> = match input.finding_types.as_ref() {
+            Some(types) if !types.is_empty() => types
                 .iter()
-                .map(|t| (*t).to_string())
+                .map(|finding_type| {
+                    catalogued_severity(finding_type)
+                        .map(|severity| (finding_type.clone(), severity))
+                        .ok_or_else(|| invalid_input(INVALID_FINDING_TYPE_MESSAGE))
+                })
+                .collect::<Result<_, _>>()?,
+            _ => FINDING_TYPE_CATALOG
+                .iter()
+                .map(|(finding_type, severity)| ((*finding_type).to_string(), *severity))
                 .collect(),
         };
 
@@ -166,19 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = ::engine::emulator_account_id().to_string();
         let mut state = state.lock();
         if state.detector_in(&region, &input.detector_id).is_none() {
-            return Err(CreateSampleFindingsErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "The request is rejected because the specified detector ID does not exist: {}.",
-                        input.detector_id
-                    )),
-                    r#type: None,
-                },
-            )
-            .into());
+            return Err(invalid_input(format!(
+                "The request is rejected because the specified detector ID does not exist: {}.",
+                input.detector_id
+            )));
         }
 
-        for finding_type in requested {
+        for (finding_type, severity) in requested {
             let now = state.tick_millis();
 
             // GuardDuty AGGREGATES repeated occurrences of the same finding type on
@@ -216,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 region: region.clone(),
                 partition: crate::state::PARTITION.to_string(),
                 schema_version: crate::state::FINDING_SCHEMA_VERSION.to_string(),
-                severity: severity_for(&finding_type),
+                severity,
                 confidence: None,
                 title: Some(format!("[SAMPLE] {finding_type}")),
                 description: Some(describe(&finding_type)),
@@ -261,64 +273,262 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// bound expressed in a count, so the in-memory store cannot grow without limit.
 const MAX_RETAINED_FINDINGS_PER_DETECTOR: usize = 1024;
 
-/// GuardDuty finding types this emulator can generate a sample for, one per
-/// documented threat purpose so the generated set spans the taxonomy. Source: the
-/// GuardDuty finding-types reference (the Smithy model carries no list — `FindingType`
-/// is an unconstrained `string`, `smithy_query(shape="FindingType")`).
-const SUPPORTED_FINDING_TYPES: [&str; 21] = [
-    "Backdoor:EC2/C&CActivity.B",
-    "Backdoor:EC2/DenialOfService.Tcp",
-    "Behavior:EC2/NetworkPortUnusual",
-    "CredentialAccess:IAMUser/AnomalousBehavior",
-    "CryptoCurrency:EC2/BitcoinTool.B",
-    "DefenseEvasion:IAMUser/AnomalousBehavior",
-    "Discovery:S3/MaliciousIPCaller",
-    "Execution:EC2/MaliciousFile",
-    "Execution:Kubernetes/ExecInKubeSystemPod",
-    "Exfiltration:S3/ObjectRead.Unusual",
-    "Impact:EC2/AbusedDomainRequest.Reputation",
-    "InitialAccess:IAMUser/AnomalousBehavior",
-    "PenTest:IAMUser/KaliLinux",
-    "Persistence:IAMUser/AnomalousBehavior",
-    "Policy:IAMUser/RootCredentialUsage",
-    "PrivilegeEscalation:IAMUser/AnomalousBehavior",
-    "Recon:EC2/PortProbeUnprotectedPort",
-    "ResourceConsumption:IAMUser/ComputeResourceAbuse",
-    "Stealth:IAMUser/CloudTrailLoggingDisabled",
-    "Trojan:EC2/BlackholeTraffic",
-    "UnauthorizedAccess:EC2/SSHBruteForce",
-];
-
 /// The role the affected resource plays in a sample finding: GuardDuty reports
 /// `TARGET` when the resource was the subject of the suspicious activity.
 const RESOURCE_ROLE_TARGET: &str = "TARGET";
 
-/// GuardDuty's documented severity levels, as the midpoint of each band: Low
-/// 1.0–3.9, Medium 4.0–6.9, High 7.0–8.9, Critical 9.0–10.0 (GuardDuty
-/// "Severity levels for GuardDuty findings").
+/// The numeric `Finding.Severity` GuardDuty reports for a finding whose published
+/// severity LEVEL is Low. The levels are bands — Low 1.0–3.9, Medium 4.0–6.9, High
+/// 7.0–8.9, Critical 9.0–10.0 (GuardDuty "Severity levels for GuardDuty findings") —
+/// and a generated finding carries the representative value of its band, which is
+/// what a recorded High sample finding (8.0) and a recorded Critical one (9.0) show.
 const SEVERITY_LOW: f64 = 2.0;
 /// See [`SEVERITY_LOW`].
 const SEVERITY_MEDIUM: f64 = 5.0;
 /// See [`SEVERITY_LOW`].
 const SEVERITY_HIGH: f64 = 8.0;
+/// See [`SEVERITY_LOW`].
+const SEVERITY_CRITICAL: f64 = 9.0;
 
-/// The severity a finding of this type carries.
+/// The severity the catalogue publishes for `finding_type`, or `None` when the type
+/// is not a GuardDuty finding type.
 ///
-/// A finding type's first segment is its THREAT PURPOSE, which is what says how
-/// dangerous the activity is: reconnaissance and policy observations sit in the Low
-/// band, anomalous-behaviour and discovery purposes in the Medium band, and the
-/// purposes that mean the resource is already compromised or losing data in the High
-/// band. An unrecognised purpose takes the Medium band, GuardDuty's own default for
-/// an unclassified observation.
-fn severity_for(finding_type: &str) -> f64 {
-    match threat_purpose(finding_type).to_ascii_lowercase().as_str() {
-        "pentest" | "policy" | "recon" | "unusual" => SEVERITY_LOW,
-        "behavior" | "defenseevasion" | "discovery" | "initialaccess" | "resourceconsumption"
-        | "stealth" | "unauthorizedaccess" => SEVERITY_MEDIUM,
-        "backdoor" | "credentialaccess" | "cryptocurrency" | "execution" | "exfiltration"
-        | "impact" | "persistence" | "privilegeescalation" | "trojan" => SEVERITY_HIGH,
-        _ => SEVERITY_MEDIUM,
-    }
+/// Matching is EXACT: a finding type is an identifier, so a near miss (another case,
+/// a mistyped threat family) is a different string and not a finding type.
+fn catalogued_severity(finding_type: &str) -> Option<f64> {
+    FINDING_TYPE_CATALOG
+        .iter()
+        .find(|(candidate, _)| *candidate == finding_type)
+        .map(|(_, severity)| *severity)
+}
+
+/// Every GuardDuty finding type this service can generate a sample for, with the
+/// severity level GuardDuty publishes for it. Source: the GuardDuty finding-types
+/// reference (the "Severity" column of the EC2, IAM, S3, EKS/Kubernetes, Malware
+/// Protection, RDS, Lambda, Runtime Monitoring and attack-sequence finding-type
+/// tables). The Smithy model carries no list and no severity — `FindingType` is a
+/// length-constrained `string` (`smithy_query(shape="FindingType")`) and
+/// `Finding.Severity` a required `Double` — so the catalogue is the service's own.
+///
+/// Sorted by finding type, which is also the order a request that names no finding
+/// type generates the samples in.
+const FINDING_TYPE_CATALOG: &[(&str, f64)] = &[
+    // Attack sequence (GuardDuty Extended Threat Detection): the only findings
+    // published at the Critical level.
+    ("AttackSequence:IAM/CompromisedCredentials", SEVERITY_CRITICAL),
+    ("AttackSequence:S3/CompromisedData", SEVERITY_CRITICAL),
+    // EC2 finding types.
+    ("Backdoor:EC2/C&CActivity.B", SEVERITY_HIGH),
+    ("Backdoor:EC2/C&CActivity.B!DNS", SEVERITY_HIGH),
+    ("Backdoor:EC2/DenialOfService.Dns", SEVERITY_HIGH),
+    ("Backdoor:EC2/DenialOfService.Tcp", SEVERITY_HIGH),
+    ("Backdoor:EC2/DenialOfService.Udp", SEVERITY_HIGH),
+    ("Backdoor:EC2/DenialOfService.UdpOnTcpPorts", SEVERITY_HIGH),
+    ("Backdoor:EC2/DenialOfService.UnusualProtocol", SEVERITY_HIGH),
+    ("Backdoor:EC2/Spambot", SEVERITY_MEDIUM),
+    ("Behavior:EC2/NetworkPortUnusual", SEVERITY_MEDIUM),
+    ("Behavior:EC2/TrafficVolumeUnusual", SEVERITY_MEDIUM),
+    ("CryptoCurrency:EC2/BitcoinTool.B", SEVERITY_HIGH),
+    ("CryptoCurrency:EC2/BitcoinTool.B!DNS", SEVERITY_HIGH),
+    ("DefenseEvasion:EC2/UnusualDNSResolver", SEVERITY_MEDIUM),
+    ("DefenseEvasion:EC2/UnusualDoHActivity", SEVERITY_MEDIUM),
+    ("DefenseEvasion:EC2/UnusualDoTActivity", SEVERITY_MEDIUM),
+    ("Impact:EC2/AbusedDomainRequest.Reputation", SEVERITY_MEDIUM),
+    ("Impact:EC2/BitcoinDomainRequest.Reputation", SEVERITY_HIGH),
+    ("Impact:EC2/MaliciousDomainRequest.Reputation", SEVERITY_HIGH),
+    ("Impact:EC2/PortSweep", SEVERITY_HIGH),
+    ("Impact:EC2/SuspiciousDomainRequest.Reputation", SEVERITY_LOW),
+    ("Impact:EC2/WinRMBruteForce", SEVERITY_MEDIUM),
+    ("Recon:EC2/PortProbeEMRUnprotectedPort", SEVERITY_HIGH),
+    ("Recon:EC2/PortProbeUnprotectedPort", SEVERITY_LOW),
+    ("Recon:EC2/Portscan", SEVERITY_MEDIUM),
+    ("Trojan:EC2/BlackholeTraffic", SEVERITY_MEDIUM),
+    ("Trojan:EC2/BlackholeTraffic!DNS", SEVERITY_MEDIUM),
+    ("Trojan:EC2/DGADomainRequest.B", SEVERITY_HIGH),
+    ("Trojan:EC2/DGADomainRequest.C!DNS", SEVERITY_HIGH),
+    ("Trojan:EC2/DNSDataExfiltration", SEVERITY_HIGH),
+    ("Trojan:EC2/DriveBySourceTraffic!DNS", SEVERITY_HIGH),
+    ("Trojan:EC2/DropPoint", SEVERITY_MEDIUM),
+    ("Trojan:EC2/DropPoint!DNS", SEVERITY_MEDIUM),
+    ("Trojan:EC2/PhishingDomainRequest!DNS", SEVERITY_HIGH),
+    ("UnauthorizedAccess:EC2/MaliciousIPCaller.Custom", SEVERITY_MEDIUM),
+    ("UnauthorizedAccess:EC2/MetadataDNSRebind", SEVERITY_HIGH),
+    ("UnauthorizedAccess:EC2/RDPBruteForce", SEVERITY_LOW),
+    ("UnauthorizedAccess:EC2/SSHBruteForce", SEVERITY_LOW),
+    ("UnauthorizedAccess:EC2/TorClient", SEVERITY_HIGH),
+    ("UnauthorizedAccess:EC2/TorRelay", SEVERITY_HIGH),
+    // IAM finding types.
+    ("CredentialAccess:IAMUser/AnomalousBehavior", SEVERITY_MEDIUM),
+    ("DefenseEvasion:IAMUser/AnomalousBehavior", SEVERITY_MEDIUM),
+    ("Discovery:IAMUser/AnomalousBehavior", SEVERITY_LOW),
+    ("Exfiltration:IAMUser/AnomalousBehavior", SEVERITY_HIGH),
+    ("Impact:IAMUser/AnomalousBehavior", SEVERITY_HIGH),
+    ("InitialAccess:IAMUser/AnomalousBehavior", SEVERITY_MEDIUM),
+    ("PenTest:IAMUser/KaliLinux", SEVERITY_MEDIUM),
+    ("PenTest:IAMUser/ParrotLinux", SEVERITY_MEDIUM),
+    ("PenTest:IAMUser/PentooLinux", SEVERITY_MEDIUM),
+    ("Persistence:IAMUser/AnomalousBehavior", SEVERITY_MEDIUM),
+    ("Policy:IAMUser/RootCredentialUsage", SEVERITY_LOW),
+    ("Policy:IAMUser/ShortTermRootCredentialUsage", SEVERITY_LOW),
+    ("PrivilegeEscalation:IAMUser/AnomalousBehavior", SEVERITY_MEDIUM),
+    ("Recon:IAMUser/MaliciousIPCaller", SEVERITY_MEDIUM),
+    ("Recon:IAMUser/MaliciousIPCaller.Custom", SEVERITY_MEDIUM),
+    ("Recon:IAMUser/TorIPCaller", SEVERITY_MEDIUM),
+    ("ResourceConsumption:IAMUser/ComputeResourceAbuse", SEVERITY_MEDIUM),
+    ("Stealth:IAMUser/CloudTrailLoggingDisabled", SEVERITY_LOW),
+    ("Stealth:IAMUser/PasswordPolicyChange", SEVERITY_LOW),
+    ("UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B", SEVERITY_MEDIUM),
+    (
+        "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS",
+        SEVERITY_HIGH,
+    ),
+    (
+        "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS",
+        SEVERITY_HIGH,
+    ),
+    ("UnauthorizedAccess:IAMUser/MaliciousIPCaller", SEVERITY_MEDIUM),
+    ("UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom", SEVERITY_MEDIUM),
+    ("UnauthorizedAccess:IAMUser/TorIPCaller", SEVERITY_MEDIUM),
+    // S3 finding types.
+    ("Discovery:S3/AnomalousBehavior", SEVERITY_LOW),
+    ("Discovery:S3/MaliciousIPCaller", SEVERITY_HIGH),
+    ("Discovery:S3/MaliciousIPCaller.Custom", SEVERITY_HIGH),
+    ("Discovery:S3/TorIPCaller", SEVERITY_MEDIUM),
+    ("Exfiltration:S3/AnomalousBehavior", SEVERITY_HIGH),
+    ("Exfiltration:S3/MaliciousIPCaller", SEVERITY_HIGH),
+    ("Exfiltration:S3/ObjectRead.Unusual", SEVERITY_HIGH),
+    ("Impact:S3/AnomalousBehavior.Delete", SEVERITY_HIGH),
+    ("Impact:S3/AnomalousBehavior.Permission", SEVERITY_HIGH),
+    ("Impact:S3/AnomalousBehavior.Write", SEVERITY_MEDIUM),
+    ("Impact:S3/MaliciousIPCaller", SEVERITY_HIGH),
+    ("Impact:S3/TorIPCaller", SEVERITY_HIGH),
+    ("Object:S3/MaliciousFile", SEVERITY_HIGH),
+    ("PenTest:S3/KaliLinux", SEVERITY_MEDIUM),
+    ("PenTest:S3/ParrotLinux", SEVERITY_MEDIUM),
+    ("PenTest:S3/PentooLinux", SEVERITY_MEDIUM),
+    ("Policy:S3/AccountBlockPublicAccessDisabled", SEVERITY_LOW),
+    ("Policy:S3/BucketAnonymousAccessGranted", SEVERITY_HIGH),
+    ("Policy:S3/BucketBlockPublicAccessDisabled", SEVERITY_LOW),
+    ("Policy:S3/BucketPublicAccessGranted", SEVERITY_HIGH),
+    ("Stealth:S3/ServerAccessLoggingDisabled", SEVERITY_LOW),
+    ("UnauthorizedAccess:S3/MaliciousIPCaller.Custom", SEVERITY_HIGH),
+    ("UnauthorizedAccess:S3/TorIPCaller", SEVERITY_HIGH),
+    // EKS / Kubernetes finding types.
+    ("CredentialAccess:Kubernetes/MaliciousIPCaller", SEVERITY_HIGH),
+    ("CredentialAccess:Kubernetes/MaliciousIPCaller.Custom", SEVERITY_HIGH),
+    ("CredentialAccess:Kubernetes/SuccessfulAnonymousAccess", SEVERITY_HIGH),
+    ("CredentialAccess:Kubernetes/TorIPCaller", SEVERITY_HIGH),
+    ("DefenseEvasion:Kubernetes/MaliciousIPCaller", SEVERITY_HIGH),
+    ("DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom", SEVERITY_HIGH),
+    ("DefenseEvasion:Kubernetes/SuccessfulAnonymousAccess", SEVERITY_HIGH),
+    ("DefenseEvasion:Kubernetes/TorIPCaller", SEVERITY_HIGH),
+    ("Discovery:Kubernetes/MaliciousIPCaller", SEVERITY_MEDIUM),
+    ("Discovery:Kubernetes/MaliciousIPCaller.Custom", SEVERITY_MEDIUM),
+    ("Discovery:Kubernetes/SuccessfulAnonymousAccess", SEVERITY_MEDIUM),
+    ("Discovery:Kubernetes/TorIPCaller", SEVERITY_MEDIUM),
+    ("Execution:Kubernetes/ExecInKubeSystemPod", SEVERITY_MEDIUM),
+    ("Impact:Kubernetes/MaliciousIPCaller", SEVERITY_HIGH),
+    ("Impact:Kubernetes/MaliciousIPCaller.Custom", SEVERITY_HIGH),
+    ("Impact:Kubernetes/SuccessfulAnonymousAccess", SEVERITY_HIGH),
+    ("Impact:Kubernetes/TorIPCaller", SEVERITY_HIGH),
+    ("Persistence:Kubernetes/ContainerWithSensitiveMount", SEVERITY_MEDIUM),
+    ("Persistence:Kubernetes/MaliciousIPCaller", SEVERITY_MEDIUM),
+    ("Persistence:Kubernetes/MaliciousIPCaller.Custom", SEVERITY_MEDIUM),
+    ("Persistence:Kubernetes/SuccessfulAnonymousAccess", SEVERITY_MEDIUM),
+    ("Persistence:Kubernetes/TorIPCaller", SEVERITY_MEDIUM),
+    ("Policy:Kubernetes/AdminAccessToDefaultServiceAccount", SEVERITY_HIGH),
+    ("Policy:Kubernetes/AnonymousAccessGranted", SEVERITY_HIGH),
+    ("Policy:Kubernetes/ExposedDashboard", SEVERITY_MEDIUM),
+    ("Policy:Kubernetes/KubeflowDashboardExposed", SEVERITY_MEDIUM),
+    ("PrivilegeEscalation:Kubernetes/PrivilegedContainer", SEVERITY_MEDIUM),
+    // Malware Protection finding types (one per scanned resource kind).
+    ("Execution:Container/MaliciousFile", SEVERITY_HIGH),
+    ("Execution:Container/SuspiciousFile", SEVERITY_MEDIUM),
+    ("Execution:EC2/MaliciousFile", SEVERITY_HIGH),
+    ("Execution:EC2/SuspiciousFile", SEVERITY_MEDIUM),
+    ("Execution:ECS/MaliciousFile", SEVERITY_HIGH),
+    ("Execution:ECS/SuspiciousFile", SEVERITY_MEDIUM),
+    ("Execution:Kubernetes/MaliciousFile", SEVERITY_HIGH),
+    ("Execution:Kubernetes/SuspiciousFile", SEVERITY_MEDIUM),
+    // RDS Protection finding types.
+    ("CredentialAccess:RDS/AnomalousBehavior.FailedLogin", SEVERITY_MEDIUM),
+    (
+        "CredentialAccess:RDS/AnomalousBehavior.SuccessfulBruteForce",
+        SEVERITY_HIGH,
+    ),
+    ("CredentialAccess:RDS/AnomalousBehavior.SuccessfulLogin", SEVERITY_HIGH),
+    ("CredentialAccess:RDS/MaliciousIPCaller.FailedLogin", SEVERITY_MEDIUM),
+    ("CredentialAccess:RDS/MaliciousIPCaller.SuccessfulLogin", SEVERITY_HIGH),
+    ("CredentialAccess:RDS/TorIPCaller.FailedLogin", SEVERITY_MEDIUM),
+    ("CredentialAccess:RDS/TorIPCaller.SuccessfulLogin", SEVERITY_HIGH),
+    ("Discovery:RDS/MaliciousIPCaller", SEVERITY_MEDIUM),
+    ("Discovery:RDS/TorIPCaller", SEVERITY_MEDIUM),
+    // Lambda Protection finding types.
+    ("Backdoor:Lambda/C&CActivity.B", SEVERITY_HIGH),
+    ("CryptoCurrency:Lambda/BitcoinTool.B", SEVERITY_HIGH),
+    ("Impact:Lambda/AbusedDomainRequest.Reputation", SEVERITY_MEDIUM),
+    ("Impact:Lambda/BitcoinDomainRequest.Reputation", SEVERITY_HIGH),
+    ("Impact:Lambda/MaliciousDomainRequest.Reputation", SEVERITY_HIGH),
+    ("Impact:Lambda/SuspiciousDomainRequest.Reputation", SEVERITY_LOW),
+    ("Trojan:Lambda/BlackholeTraffic", SEVERITY_MEDIUM),
+    ("Trojan:Lambda/DropPoint", SEVERITY_MEDIUM),
+    ("UnauthorizedAccess:Lambda/MaliciousIPCaller.Custom", SEVERITY_MEDIUM),
+    ("UnauthorizedAccess:Lambda/TorClient", SEVERITY_HIGH),
+    ("UnauthorizedAccess:Lambda/TorRelay", SEVERITY_HIGH),
+    // Runtime Monitoring finding types.
+    ("Backdoor:Runtime/C&CActivity.B", SEVERITY_HIGH),
+    ("Backdoor:Runtime/C&CActivity.B!DNS", SEVERITY_HIGH),
+    ("CryptoCurrency:Runtime/BitcoinTool.B", SEVERITY_HIGH),
+    ("CryptoCurrency:Runtime/BitcoinTool.B!DNS", SEVERITY_HIGH),
+    ("DefenseEvasion:Runtime/FilelessExecution", SEVERITY_HIGH),
+    ("DefenseEvasion:Runtime/ProcessInjection.Proc", SEVERITY_HIGH),
+    ("DefenseEvasion:Runtime/ProcessInjection.Ptrace", SEVERITY_HIGH),
+    ("DefenseEvasion:Runtime/ProcessInjection.VirtualMemoryWrite", SEVERITY_HIGH),
+    ("Execution:Runtime/MaliciousFileExecuted", SEVERITY_HIGH),
+    ("Execution:Runtime/NewBinaryExecuted", SEVERITY_MEDIUM),
+    ("Execution:Runtime/NewLibraryLoaded", SEVERITY_MEDIUM),
+    ("Execution:Runtime/ReverseShell", SEVERITY_HIGH),
+    ("Execution:Runtime/SuspiciousCommand", SEVERITY_HIGH),
+    ("Execution:Runtime/SuspiciousTool", SEVERITY_MEDIUM),
+    ("Impact:Runtime/AbusedDomainRequest.Reputation", SEVERITY_MEDIUM),
+    ("Impact:Runtime/BitcoinDomainRequest.Reputation", SEVERITY_HIGH),
+    ("Impact:Runtime/CryptoMinerExecuted", SEVERITY_HIGH),
+    ("Impact:Runtime/MaliciousDomainRequest.Reputation", SEVERITY_HIGH),
+    ("Impact:Runtime/SuspiciousDomainRequest.Reputation", SEVERITY_LOW),
+    ("PrivilegeEscalation:Runtime/ContainerMountsHostDirectory", SEVERITY_MEDIUM),
+    ("PrivilegeEscalation:Runtime/DockerSocketAccessed", SEVERITY_MEDIUM),
+    ("PrivilegeEscalation:Runtime/RuncContainerEscape", SEVERITY_HIGH),
+    ("Trojan:Runtime/BlackholeTraffic", SEVERITY_MEDIUM),
+    ("Trojan:Runtime/BlackholeTraffic!DNS", SEVERITY_MEDIUM),
+    ("Trojan:Runtime/DGADomainRequest.C!DNS", SEVERITY_HIGH),
+    ("Trojan:Runtime/DriveBySourceTraffic!DNS", SEVERITY_HIGH),
+    ("Trojan:Runtime/DropPoint", SEVERITY_MEDIUM),
+    ("Trojan:Runtime/DropPoint!DNS", SEVERITY_MEDIUM),
+    ("Trojan:Runtime/PhishingDomainRequest!DNS", SEVERITY_HIGH),
+    ("UnauthorizedAccess:Runtime/MetadataDNSRebind", SEVERITY_HIGH),
+    ("UnauthorizedAccess:Runtime/TorClient", SEVERITY_HIGH),
+    ("UnauthorizedAccess:Runtime/TorRelay", SEVERITY_HIGH),
+];
+
+/// The error CLASS a GuardDuty client rejection reports in the `Type` member of its
+/// `BadRequestException` ("The error type", `smithy_query(shape="BadRequestException")`):
+/// a request this service refuses for what it carries is an invalid input.
+const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
+
+/// The wording GuardDuty answers a `findingTypes` entry that is not a finding type
+/// with. The HTTP status (400) and the error class are the requirement; the text
+/// states the rule and names no value from the request, as the service's own does.
+const INVALID_FINDING_TYPE_MESSAGE: &str =
+    "The request is rejected because of invalid finding type is specified.";
+
+/// Refuse the request with this operation's modeled 400, classified as an invalid
+/// input.
+fn invalid_input(message: impl Into<String>) -> CreateSampleFindingsError {
+    CreateSampleFindingsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+        r#type: Some(INVALID_INPUT_EXCEPTION.to_string()),
+    })
+    .into()
 }
 
 /// The first segment of a finding type: everything before the `:`.
@@ -342,7 +552,9 @@ fn resource_type_affected(finding_type: &str) -> &str {
 fn resource_type_for(finding_type: &str) -> String {
     match resource_type_affected(finding_type) {
         "EC2" | "Runtime" => "Instance",
-        "IAMUser" => "AccessKey",
+        // An IAM principal is reported through its credential, which is the
+        // `AccessKey` resource.
+        "IAMUser" | "IAM" => "AccessKey",
         "S3" => "S3Bucket",
         "Kubernetes" | "EKS" => "EKSCluster",
         "ECS" => "ECSCluster",
