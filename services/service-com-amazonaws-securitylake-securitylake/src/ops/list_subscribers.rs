@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSubscribers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSubscribers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSubscribers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the stored subscribers of the Region this request was signed for, in
+//! creation order, `maxResults` at a time, handing back an opaque `nextToken` only while
+//! more remain.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +121,10 @@ impl From<ListSubscribersErrorModeled> for ListSubscribersError {
     }
 }
 
+/// `ListSubscribersRequest$maxResults` carries `@default(50)` in the model, and a member
+/// sent with no value deserializes to zero.
+const DEFAULT_MAX_RESULTS: usize = 50;
+
 /// The `ListSubscribers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +161,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSubscribers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSubscribersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSubscribers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSubscribersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Security Lake state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` reaches this handler already inside the model's
+        // `@range(min: 1, max: 100)` — the boundary validator refused anything else — so
+        // the only value to interpret here is the zero that stands for "not sent".
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|requested| *requested > 0)
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        let region = crate::state::caller_region(ctx.parts());
+        // A pure read: paging does not consume anything, so the same token always
+        // returns the same page.
+        let store = state.lock();
+        let in_region = store.subscribers_in(&region);
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some((index, anchor)) = crate::state::decode_next_token(token) else {
+                    return Err(ListSubscribersErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "nextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                in_region
+                    .clone()
+                    .position(|subscriber| subscriber.subscriber_id == anchor)
+                    // The anchor was deleted between pages: resume at the position it
+                    // held, so a concurrent DeleteSubscriber does not break an in-flight
+                    // paginator. BEST EFFORT by construction — if entries BEFORE the
+                    // anchor were deleted too, the saved position now points past where
+                    // the anchor's successor moved to, so a paginator can skip an item
+                    // (and, with concurrent creates, see one twice). Any opaque-token
+                    // scheme has to choose between that and refusing the page; a list
+                    // that keeps going is the behaviour AWS list APIs show.
+                    .unwrap_or_else(|| index.min(in_region.clone().count()))
+            }
+        };
+
+        let subscribers: Vec<SubscriberResource> = in_region
+            .clone()
+            .skip(start)
+            .take(page_size)
+            .map(|subscriber| subscriber.to_resource())
+            .collect();
+
+        // A token only when something follows this page, and it names the NEXT item, so a
+        // round trip resumes exactly after the last one returned.
+        let next = start + subscribers.len();
+        let next_token = in_region
+            .clone()
+            .nth(next)
+            .map(|subscriber| crate::state::encode_next_token(next, &subscriber.subscriber_id));
+
+        Ok(ListSubscribersOutput {
+            subscribers: Some(subscribers),
+            next_token,
+        })
     }
 }
