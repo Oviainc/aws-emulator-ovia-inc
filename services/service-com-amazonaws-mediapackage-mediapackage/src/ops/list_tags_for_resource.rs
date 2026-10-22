@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tag set the stored MediaPackage resource named by `ResourceArn` carries.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure READ: it renders the tag set the creates and `TagResource`/`UntagResource`
+//! wrote, and writes nothing itself, so calling it never changes what a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -71,9 +67,28 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediapackage-mediapacka
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediapackage#ListTagsForResource")]
+//
+// `ListTagsForResource` lists no errors of its own, so the same three errors this SERVICE
+// models are widened in through `extra_errors` as on `TagResource`/`UntagResource`, which
+// address a resource by the identical `ResourceArn` member: a `ResourceArn` that is not a
+// MediaPackage resource ARN is an invalid parameter (422 `UnprocessableEntityException`),
+// one naming a resource this service does not hold has no tag set to report (404
+// `NotFoundException`), and a service mounted on an engine that holds no state is a
+// server fault (500 `InternalServerErrorException`). All three are shapes the service
+// models and other operations declare, so a client deserializes them into a modeled type.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediapackage#ListTagsForResource",
+    extra_errors = [
+        "InternalServerErrorException",
+        "NotFoundException",
+        "UnprocessableEntityException"
+    ]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
+    UnprocessableEntityException(UnprocessableEntityException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -127,18 +142,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // Reporting a tag set needs nothing from the request beyond its deserialized
+        // input.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the mediapackage state store is unavailable".into()),
+                },
+            )
+        })?;
+
+        // The ARN is parsed BEFORE the store is read, exactly as on
+        // `TagResource`/`UntagResource`: "that is not a MediaPackage resource ARN" is a
+        // value in the request, so it is keyed by the member, and it is a different
+        // failure from "no such resource", which is keyed by the resource type.
+        let Some(target) = crate::state::parse_tag_arn(&input.resource_arn) else {
+            return Err(crate::state::member_invalid(
+                "resourceArn",
+                "must be a MediaPackage channel or origin endpoint ARN",
+            )
+            .into());
+        };
+
+        // Nothing below writes, so a `ListTagsForResource` leaves the store exactly as it
+        // found it: the tag set it reports is the one the creates and the tagging
+        // operations stored.
+        let state = state.lock();
+        let Some(tags) = state.tags(&target) else {
+            return Err(crate::state::resource_not_found(target.kind(), target.id()).into());
+        };
+
+        // The whole stored tag set, rendered the one way every MediaPackage read renders
+        // it (`ChannelRecord::to_channel`, `OriginEndpointRecord::to_origin_endpoint`), so
+        // `Tags` here and `Tags` on a `Describe*` of the same resource cannot disagree —
+        // including for a resource carrying none, which reports an EMPTY map rather than
+        // an absent member.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(crate::state::tags_to_wire(tags)),
+        })
     }
 }

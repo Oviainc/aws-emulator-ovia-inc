@@ -521,25 +521,17 @@ pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
         .then(|| (outpost_id.to_string(), endpoint_id.to_string()))
 }
 
-/// The `ResourceNotFoundException$Message` an unresolvable reference carries
-/// when the `OutpostId` names a physical Outpost directly — the `op-` and `ec2`
-/// branches of `OutpostId`'s pattern, which are exactly the two branches
-/// `OutpostArn`'s pattern
-/// `^arn:…:outposts:…:outpost/(op-[a-f0-9]{17}|ec2)$` admits.
+/// The one `ResourceNotFoundException$Message` this service answers an
+/// unresolvable reference under an `OutpostId` with, whichever branch of
+/// `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$` the request used.
 ///
-/// Such an id names a piece of hardware that may belong to an account the
-/// caller cannot see at all, so the service MASKS the lookup: it reports neither
-/// which id failed nor whether the Outpost exists. Recorded behaviour — the
-/// model carries no message text for `ResourceNotFoundException`.
-pub const MASKED_NOT_FOUND_MESSAGE: &str = "Access Denied";
-
-/// The `ResourceNotFoundException$Message` an unresolvable reference carries
-/// when the `OutpostId` is in the 12-digit account-id branch of the pattern —
-/// the one branch no `OutpostArn` admits, so it cannot name an Outpost resource
-/// and nothing is masked.
-///
-/// Recorded behaviour, like [`MASKED_NOT_FOUND_MESSAGE`]: the text is a service
-/// constant, never built from the request.
+/// The text is a service constant, never built from the request: it names no id
+/// and does not say which resource under the Outpost failed to resolve, so one
+/// text covers every operation and every reference. Recorded behaviour — the
+/// model carries no message text for `ResourceNotFoundException` — and it
+/// reports what actually went wrong: an Outpost that does not exist or has no S3
+/// capacity provisioned on it. An authorization failure is this service's
+/// separate `AccessDeniedException` (403), not a 404 message.
 pub const OUTPOST_NOT_FOUND_MESSAGE: &str =
     "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
 
@@ -549,27 +541,18 @@ pub fn is_account_outpost_id(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The fixed `Message` this service answers an unresolvable reference under
-/// `outpost_id` with.
-///
-/// It is selected by the FORM of the `OutpostId` alone, never by the ids in the
-/// request and never by which resource failed to resolve: every reference below
-/// an Outpost is resolved by first resolving that Outpost, so the Outpost-level
-/// text is the only one a caller ever sees.
-pub fn not_found_message(outpost_id: &str) -> &'static str {
-    if is_account_outpost_id(outpost_id) {
-        OUTPOST_NOT_FOUND_MESSAGE
-    } else {
-        MASKED_NOT_FOUND_MESSAGE
-    }
-}
-
-/// The `ResourceNotFoundException` payload for a reference under `outpost_id`
+/// The `ResourceNotFoundException` payload for a reference under an `OutpostId`
 /// that resolves to nothing this caller has access to — the Outpost itself, or
 /// an endpoint on it.
-pub fn not_found(outpost_id: &str) -> ResourceNotFoundException {
+///
+/// It takes no argument on purpose: the message is one fixed constant, not a
+/// function of the request's ids, of the form of the `OutpostId` or of which
+/// resource failed to resolve. Every reference below an Outpost is resolved by
+/// first resolving that Outpost, so the Outpost-level text is the only one a
+/// caller ever sees.
+pub fn not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(not_found_message(outpost_id).to_string()),
+        message: Some(OUTPOST_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 

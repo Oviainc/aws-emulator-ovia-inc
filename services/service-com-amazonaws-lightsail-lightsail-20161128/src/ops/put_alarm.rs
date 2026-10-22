@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAlarm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAlarm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates or re-configures ONE alarm in this service's store under the alarm
+//! name the request names, associated with the metric it names on the resource it
+//! names, and answers the operation-log entry the write appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAlarm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -231,18 +227,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAlarm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAlarmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAlarm"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: an alarm watches ONE resource, so the region it lives in
+        // is the region of that resource's own record, not the one the request
+        // signed for.
+        let _ = ctx;
+
+        // `alarmName`, `metricName`, `monitoredResourceName`,
+        // `comparisonOperator`, `threshold` and `evaluationPeriods` are modelled
+        // `@required` members, and both name patterns plus every enum this input
+        // reaches (`MetricName`, `ComparisonOperator`, `TreatMissingData`,
+        // `ContactProtocol`, and the `AlarmState` entries of
+        // `notificationTriggers`) are modelled constraints, so the centralized
+        // walk refused anything outside them before this body ran. What is left
+        // is what the model cannot express: the evaluation period count and the
+        // "M out of N" datapoint count must be within the range the service
+        // documents, a notification trigger list must name the `ALARM` state, the
+        // monitored resource must be one this account holds, the metric must be
+        // one that resource's type publishes, and the caller-sized lists must be
+        // within the store's bounds. Every one of those is checked BEFORE the
+        // first write, so a refused request stores nothing.
+        let evaluation_periods = input.evaluation_periods;
+        if !(crate::state::MIN_EVALUATION_PERIODS..=crate::state::MAX_EVALUATION_PERIODS)
+            .contains(&evaluation_periods)
+        {
+            return Err(invalid(format!(
+                "evaluationPeriods must be between {} and {}, got {evaluation_periods}",
+                crate::state::MIN_EVALUATION_PERIODS,
+                crate::state::MAX_EVALUATION_PERIODS
+            )));
+        }
+        // `datapointsToAlarm` is the M of an "M out of N" alarm and
+        // `evaluationPeriods` is the N, so an M above N describes an alarm that
+        // can never trigger, and an M below one never evaluates.
+        if let Some(datapoints) = input.datapoints_to_alarm {
+            if !(1..=evaluation_periods).contains(&datapoints) {
+                return Err(invalid(format!(
+                    "datapointsToAlarm must be between 1 and evaluationPeriods \
+                     ({evaluation_periods}), got {datapoints}"
+                )));
+            }
+        }
+        let notification_triggers = input.notification_triggers.clone().unwrap_or_default();
+        if !notification_triggers.is_empty()
+            && !notification_triggers
+                .iter()
+                .any(|trigger| trigger == crate::state::ALARM_STATE_ALARM)
+        {
+            return Err(invalid(format!(
+                "notificationTriggers must include the {} state when it names any trigger, \
+                 got [{}]",
+                crate::state::ALARM_STATE_ALARM,
+                notification_triggers.join(", ")
+            )));
+        }
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let contact_protocols = input.contact_protocols.clone().unwrap_or_default();
+        let treat_missing_data = input
+            .treat_missing_data
+            .clone()
+            .unwrap_or_else(|| crate::state::TREAT_MISSING_DATA_DEFAULT.to_string());
+        let notification_enabled = input
+            .notification_enabled
+            .unwrap_or(crate::state::NOTIFICATION_ENABLED_DEFAULT);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let monitored = store
+                .monitored_resource(&input.monitored_resource_name)
+                .ok_or_else(|| monitored_resource_does_not_exist(&input.monitored_resource_name))?;
+            // Each resource type publishes its own metrics, so a metric the
+            // monitored resource does not publish is refused rather than stored
+            // on an alarm that could never be evaluated.
+            let metric = crate::state::alarm_metric(monitored.resource_type, &input.metric_name)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "metricName '{}' is not published by a {}: the metrics an alarm on a {} \
+                         can watch are [{}]",
+                        input.metric_name,
+                        monitored.resource_type,
+                        monitored.resource_type,
+                        crate::state::alarm_metric_names(monitored.resource_type)
+                    ))
+                })?;
+            // Re-putting an EXISTING alarm name overwrites that one record, so
+            // only the OTHER alarms on this metric count towards the limit.
+            let on_metric = store.alarms_on_metric(&monitored.name, metric.name, &input.alarm_name);
+            if on_metric >= crate::state::MAX_ALARMS_PER_METRIC {
+                return Err(invalid(format!(
+                    "{} already has the {} alarms a single metric accepts on '{}'",
+                    monitored.name,
+                    crate::state::MAX_ALARMS_PER_METRIC,
+                    metric.name
+                )));
+            }
+            // An alarm this account already holds under this name is UPDATED:
+            // "specify the name of an existing alarm to update, and overwrite the
+            // previous configuration of the alarm". Its identity (ARN, support
+            // code, creation time) and its state are not configuration, so they
+            // survive the overwrite — "when you update an existing alarm, its
+            // state is left unchanged".
+            let existing = store.alarm(&input.alarm_name).cloned();
+            if existing.is_none() && store.alarms.len() >= crate::state::MAX_ALARMS {
+                return Err(invalid(format!(
+                    "creating an alarm would take this account past the {} this emulator holds",
+                    crate::state::MAX_ALARMS
+                )));
+            }
+            let (arn, support_code, created_at_ms, state) = match &existing {
+                Some(alarm) => (
+                    alarm.arn.clone(),
+                    alarm.support_code.clone(),
+                    alarm.created_at_ms,
+                    alarm.state.clone(),
+                ),
+                None => {
+                    let id = store.mint_uuid();
+                    (
+                        crate::state::alarm_arn(&monitored.location.region_name, &id),
+                        crate::state::support_code(&id),
+                        now,
+                        // "When this action creates an alarm, the alarm state is
+                        // immediately set to INSUFFICIENT_DATA."
+                        crate::state::ALARM_STATE_INSUFFICIENT_DATA.to_string(),
+                    )
+                }
+            };
+            let location = monitored.location.clone();
+            store.insert_alarm(crate::state::StoredAlarm {
+                name: input.alarm_name.clone(),
+                arn,
+                support_code,
+                created_at_ms,
+                location: location.clone(),
+                monitored_resource: monitored,
+                metric: *metric,
+                comparison_operator: input.comparison_operator.clone(),
+                threshold: input.threshold,
+                evaluation_periods,
+                datapoints_to_alarm: input.datapoints_to_alarm,
+                treat_missing_data: treat_missing_data.clone(),
+                contact_protocols: contact_protocols.clone(),
+                notification_triggers: notification_triggers.clone(),
+                notification_enabled,
+                tags: tags.clone(),
+                state,
+            });
+            // The alarm exists, configured as asked, as this call returns, so the
+            // work this operation describes is already done and the operation is
+            // terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_PUT_ALARM,
+                crate::state::RESOURCE_TYPE_ALARM,
+                &input.alarm_name,
+                &location,
+                None,
+            );
+            Ok(PutAlarmOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> PutAlarmError {
+    PutAlarmErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No resource an alarm can monitor is stored under that name: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist`, and a message built from the request.
+///
+/// The message names the three resource types an alarm can monitor rather than
+/// one, because the request names a resource without saying what kind it is.
+fn monitored_resource_does_not_exist(name: &str) -> PutAlarmError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "monitoredResourceName '{name}' does not name an Instance, LoadBalancer or \
+         RelationalDatabase of this account"
+    ))
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> PutAlarmError {
+    PutAlarmErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail alarm store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

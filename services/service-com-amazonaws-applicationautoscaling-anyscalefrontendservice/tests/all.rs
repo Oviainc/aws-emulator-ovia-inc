@@ -13,8 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/control_plane_rules.rs"]
 mod control_plane_rules;
+#[path = "all/customized_metric_alarms.rs"]
+mod customized_metric_alarms;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/predictive_scaling_forecast.rs"]
+mod predictive_scaling_forecast;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/resource_tags.rs"]
@@ -25,6 +29,8 @@ mod scalable_target_lifecycle;
 mod scalable_target_resolution;
 #[path = "all/scaling_activities.rs"]
 mod scaling_activities;
+#[path = "all/scaling_policy_preconditions.rs"]
+mod scaling_policy_preconditions;
 #[path = "all/scheduled_action_deletion.rs"]
 mod scheduled_action_deletion;
 #[path = "all/scheduled_action_lifecycle.rs"]

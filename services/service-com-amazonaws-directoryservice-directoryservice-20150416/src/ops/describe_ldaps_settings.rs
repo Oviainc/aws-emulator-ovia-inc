@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLDAPSSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLDAPSSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLDAPSSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the LDAPS security recorded for a stored directory, optionally for one
+//! `LDAPSType` only, a page at a time.
+//!
+//! The order the request is answered in is the order a client depends on: the modelled
+//! constraints (`Type`'s enum values, `Limit`'s 1–50 range) are refused by the
+//! framework's boundary validator BEFORE this handler runs, so a well-formed request
+//! for a directory that does not exist reaches directory resolution and is refused
+//! there with `DirectoryDoesNotExistException`.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +81,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// The cursor a page hands back carries the boundary and the filter the page was
+// issued under: the one `crate::state::CURSOR_SEPARATOR` every listing of this service
+// agrees on, so a token cannot be read as a page of another listing or another filter.
+use crate::state::CURSOR_SEPARATOR;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +160,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLDAPSSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLDAPSSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLDAPSSettings"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The cursor a previous page handed back: the `LDAPSType` this page resumes
+        // after, together with the filter it was issued under — the `DirectoryId` and
+        // the `Type` the request narrowed to. A later page asked for under a different
+        // filter decodes to a different string and is refused rather than served.
+        let filter = crate::state::cursor_filter(&[
+            &input.directory_id,
+            input.r#type.as_deref().unwrap_or_default(),
+        ]);
+        let after_type = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_cursor(CURSOR_KIND, token)
+                    .and_then(|value| {
+                        let (ldaps_type, issued_for) = value.split_once(CURSOR_SEPARATOR)?;
+                        if issued_for != filter.as_str() {
+                            return None;
+                        }
+                        Some(ldaps_type.to_string())
+                    })
+                    .ok_or_else(|| {
+                        DescribeLDAPSSettingsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                                request_id: None,
+                            },
+                        )
+                    })?,
+            ),
+        };
+        let page_size = crate::state::page_size(input.limit);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            DescribeLDAPSSettingsErrorModeled::DirectoryDoesNotExistException(
+                DirectoryDoesNotExistException {
+                    message: Some(crate::state::no_such_directory(&input.directory_id)),
+                    request_id: None,
+                },
+            )
+        })?;
+
+        // Only the types the store holds a setting for are reported: `EnableLDAPS`
+        // (still scaffolded) is what records one, so a directory nothing has enabled
+        // LDAPS for reports an empty list rather than an invented status.
+        let mut page: Vec<(String, LDAPSSettingInfo)> = directory
+            .ldaps_settings
+            .iter()
+            .filter(|(ldaps_type, _)| {
+                input
+                    .r#type
+                    .as_deref()
+                    .is_none_or(|wanted| *ldaps_type == wanted)
+            })
+            .filter(|(ldaps_type, _)| after_type.as_ref().is_none_or(|after| *ldaps_type > after))
+            .map(|(ldaps_type, setting)| (ldaps_type.clone(), setting.to_info()))
+            .collect();
+        drop(store);
+
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+        let page_ended_after = page.last().map(|(ldaps_type, _)| ldaps_type.clone());
+
+        Ok(DescribeLDAPSSettingsOutput {
+            ldaps_settings_info: Some(page.into_iter().map(|(_, info)| info).collect()),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(|ldaps_type| {
+                    crate::state::encode_cursor(
+                        CURSOR_KIND,
+                        &format!("{ldaps_type}{CURSOR_SEPARATOR}{filter}"),
+                    )
+                })
+            } else {
+                None
+            },
+        })
     }
 }
+
+/// Which listing this operation's `NextToken` belongs to, so a token issued by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ldaps-settings";

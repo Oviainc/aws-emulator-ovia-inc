@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !store.outposts.contains_key(&input.outpost_id) {
             return Err(ListSharedEndpointsErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(&input.outpost_id),
+                crate::state::not_found(),
             )
             .into());
         }

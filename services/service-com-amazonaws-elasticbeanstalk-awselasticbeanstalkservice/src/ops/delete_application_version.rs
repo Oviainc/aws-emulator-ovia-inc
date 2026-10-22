@@ -234,6 +234,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = input.delete_source_bundle;
         store.application_versions.remove(&key);
 
+        // The activity this call performed, recorded for `DescribeEvents`.
+        store.record_event(
+            &crate::state::new_request_id(),
+            crate::state::SEVERITY_INFO,
+            "deleteApplicationVersion completed successfully.",
+            crate::state::EventSubject {
+                application_name: Some(input.application_name.clone()),
+                version_label: Some(input.version_label.clone()),
+                ..Default::default()
+            },
+        );
+
         Ok(DeleteApplicationVersionOutput)
     }
 }
