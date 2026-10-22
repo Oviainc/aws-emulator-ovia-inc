@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterEventTopic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterEventTopic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterEventTopic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates a directory with an Amazon SNS topic, so the directory publishes its
+//! status changes to that topic. Implemented here — this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +138,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterEventTopic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterEventTopicErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterEventTopic"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // "This Amazon SNS topic must be in the same region as the specified Directory
+        // ID", so the ARN the stored association reports carries the caller's own
+        // Region.
+        let region = crate::state::region_from_request(ctx.parts());
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The association hangs off the directory, so an id naming no stored directory
+        // is refused with the modelled "specified entity could not be found" and
+        // stores nothing.
+        let Some(directory) = store.directories.get_mut(&input.directory_id) else {
+            return Err(RegisterEventTopicErrorModeled::EntityDoesNotExistException(
+                EntityDoesNotExistException {
+                    message: Some(crate::state::no_such_directory(&input.directory_id)),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+
+        // Re-registering a topic the directory already publishes to is the association
+        // it already has: the stored record — and with it `CreatedDateTime` — is left
+        // as it was, so the call neither duplicates the association nor moves it.
+        if directory.event_topics.contains_key(&input.topic_name) {
+            return Ok(RegisterEventTopicOutput {});
+        }
+
+        // The per-directory index is the one store here a caller can grow with a fresh
+        // name forever, so it carries its own documented maximum and the call is
+        // refused once the index is full. Checked BEFORE the insert below, so a refused
+        // call stores nothing.
+        if directory.event_topics.len() >= crate::state::MAX_EVENT_TOPICS_PER_DIRECTORY {
+            return Err(RegisterEventTopicErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "This emulator associates at most {max} Amazon SNS topics with one directory",
+                        max = crate::state::MAX_EVENT_TOPICS_PER_DIRECTORY
+                    )),
+                    request_id: None,
+                },
+            )
+            .into());
+        }
+
+        directory.event_topics.insert(
+            input.topic_name.clone(),
+            crate::state::EventTopicRegistration {
+                topic_arn: crate::state::sns_topic_arn(&region, &input.topic_name),
+                topic_name: input.topic_name,
+                created_at: now,
+                status: crate::state::TOPIC_STATUS_REGISTERED.to_string(),
+            },
+        );
+
+        // The operation models no output members: `DescribeEventTopics` is what reports
+        // the association back.
+        Ok(RegisterEventTopicOutput {})
     }
 }

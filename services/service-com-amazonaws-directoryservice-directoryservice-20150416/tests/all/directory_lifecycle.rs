@@ -52,8 +52,13 @@ const TAG_QUOTA: usize = 50;
 /// test machine.
 const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
 
+/// The Region the calls below are signed for, and the one a minted ARN therefore
+/// carries. `tests/all/event_topics.rs` reuses the harness below with another Region,
+/// which is why [`call_in_region`] takes it as a parameter.
+pub(crate) const REGION: &str = "us-east-1";
+
 /// A router with just this service mounted on a fresh engine.
-fn service() -> MultiServiceRouter {
+pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests exercise the service, not SigV4: requests carry a credential scope so
@@ -63,18 +68,32 @@ fn service() -> MultiServiceRouter {
     router
 }
 
-/// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+/// One `awsJson1_1` call signed for [`REGION`], returning the HTTP status and the
+/// parsed response body.
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+    call_in_region(router, operation, body, REGION).await
+}
+
+/// One `awsJson1_1` call whose sigv4 credential scope names `region`, returning the
+/// HTTP status and the parsed response body.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    region: &str,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", "ds.us-east-1.amazonaws.com")
+        .header("host", format!("ds.{region}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.1")
         .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDDSTEST/20260101/us-east-1/ds/aws4_request, \
-             SignedHeaders=host;x-amz-target, Signature=00",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDDSTEST/20260101/{region}/ds/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=00"
+            ),
         )
         .body(bytes::Bytes::from(
             serde_json::to_vec(&body).expect("the request body serializes"),
@@ -94,7 +113,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// A call that must succeed, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
+pub(crate) async fn ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -104,7 +128,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &st
 }
 
 /// A call that must be refused with HTTP 400 and the given modelled error code.
-async fn refused(
+pub(crate) async fn refused(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -124,7 +148,7 @@ async fn refused(
 }
 
 /// A required string member of a response body.
-fn string(body: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
@@ -141,7 +165,11 @@ fn assert_directory_id(id: &str, case: &str) {
 }
 
 /// `CreateDirectory` with `body`, asserting it was accepted and returning the id.
-async fn create_directory(router: &MultiServiceRouter, body: Value, case: &str) -> String {
+pub(crate) async fn create_directory(
+    router: &MultiServiceRouter,
+    body: Value,
+    case: &str,
+) -> String {
     let answer = ok(router, "CreateDirectory", body, case).await;
     let id = string(&answer, "DirectoryId", case);
     assert_directory_id(&id, case);
@@ -149,7 +177,7 @@ async fn create_directory(router: &MultiServiceRouter, body: Value, case: &str) 
 }
 
 /// A minimal well-formed `CreateDirectory` body for `name`.
-fn minimal_create(name: &str) -> Value {
+pub(crate) fn minimal_create(name: &str) -> Value {
     json!({ "Name": name, "Password": PASSWORD, "Size": "Small" })
 }
 

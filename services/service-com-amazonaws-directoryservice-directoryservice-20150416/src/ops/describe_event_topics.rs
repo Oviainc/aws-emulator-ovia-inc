@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventTopics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventTopics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventTopics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports which Amazon SNS topics receive status messages from a directory, from the
+//! associations this service persisted. Implemented here — this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventTopics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventTopicsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventTopics"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `TopicNames`' own documentation: "If this member is null, all associations
+        // for the specified Directory ID are returned. An empty list results in an
+        // InvalidParameterException being thrown."
+        if input.topic_names.as_ref().is_some_and(Vec::is_empty) {
+            return Err(invalid_parameter(
+                "TopicNames must not be an empty list".to_string(),
+            ));
+        }
+
+        // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the
+        // filter is bounded here — before anything is allocated from it and before
+        // `state.lock()` is taken — by a guard set well above any list a caller has
+        // reason to send.
+        if let Some(requested) = input.topic_names.as_ref() {
+            if requested.len() > crate::state::MAX_TOPIC_NAMES_PER_REQUEST {
+                return Err(invalid_parameter(format!(
+                    "TopicNames may carry at most {max} entries, got {got}",
+                    max = crate::state::MAX_TOPIC_NAMES_PER_REQUEST,
+                    got = requested.len()
+                )));
+            }
+        }
+
+        // The already-bounded filter as a set, built ONCE, so narrowing the stored
+        // associations below is one lookup per association rather than a scan of the
+        // caller's list per association.
+        let wanted: Option<::std::collections::BTreeSet<&String>> = input
+            .topic_names
+            .as_ref()
+            .map(|names| names.iter().collect());
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // "If this member is null, associations for all Directory IDs are returned" —
+        // and an id that names no stored directory is reported rather than answered
+        // with an empty list.
+        let event_topics = match input.directory_id.as_ref() {
+            Some(directory_id) => {
+                let directory = store.directories.get(directory_id).ok_or_else(|| {
+                    DescribeEventTopicsErrorModeled::EntityDoesNotExistException(
+                        EntityDoesNotExistException {
+                            message: Some(crate::state::no_such_directory(directory_id)),
+                            request_id: None,
+                        },
+                    )
+                })?;
+                directory.event_topic_list(wanted.as_ref())
+            }
+            None => store
+                .directories_in_creation_order()
+                .into_iter()
+                .flat_map(|directory| directory.event_topic_list(wanted.as_ref()))
+                .collect(),
+        };
+
+        // Every member reported comes off the stored association, so a topic nothing
+        // registered cannot appear and one that was registered cannot be missing.
+        Ok(DescribeEventTopicsOutput {
+            event_topics: Some(event_topics),
+        })
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> DescribeEventTopicsError {
+    DescribeEventTopicsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        request_id: None,
+    })
+    .into()
 }
