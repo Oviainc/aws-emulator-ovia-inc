@@ -165,10 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored site.
         let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
             CreateOutpostErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "SiteId must be a site id or site ARN, got {}",
-                    input.site_id
-                )),
+                message: Some(crate::state::site_id_pattern_report()),
             })
         })?;
 
@@ -181,7 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|record| record.site.site_arn.clone())
             .ok_or_else(|| {
                 CreateOutpostErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!("the site {site_id} does not exist")),
+                    // The identifier echo names the member the absent identifier
+                    // arrived in — here the site, not the Outpost being created —
+                    // and echoes the value AS SUPPLIED.
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::SITE_ID_MEMBER,
+                        &input.site_id,
+                    )),
                 })
             })?;
         // See `CreateSite`: the store's growth is capped and refused with the quota

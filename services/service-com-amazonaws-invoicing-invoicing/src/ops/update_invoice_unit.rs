@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInvoiceUnit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInvoiceUnit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInvoiceUnit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored invoice unit's configuration with the members the request
+//! carries, leaving the ones it omits as they were, and records the new `LastModified`.
+//! `Name` and `InvoiceReceiver` are not updatable, so this never touches them.
+//!
+//! An omitted member and an explicit `null` are the same value in the generated input,
+//! so `Description` cannot be CLEARED through this operation — a request that carries
+//! no description leaves the stored one in place. Sending an empty string replaces it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +157,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInvoiceUnit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInvoiceUnitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInvoiceUnit"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateInvoiceUnitErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // `@idempotent`: a replay (the same `ClientToken` against the same invoice
+        // unit) answers with the ARN the first call returned and applies the change
+        // once. The same token against a DIFFERENT unit is a different request and is
+        // applied on its own.
+        if let Some(arn) =
+            store.replayed_result(Self::NAME, &input.invoice_unit_arn, client_token)
+        {
+            if store.invoice_units.contains_key(&arn) {
+                return Ok(UpdateInvoiceUnitOutput {
+                    invoice_unit_arn: Some(arn),
+                });
+            }
+        }
+
+        {
+            let unit = store
+                .invoice_units
+                .get_mut(&input.invoice_unit_arn)
+                .ok_or_else(|| {
+                    UpdateInvoiceUnitErrorModeled::ResourceNotFoundException(
+                        crate::state::no_such_resource(&input.invoice_unit_arn),
+                    )
+                })?;
+            // An omitted member leaves that part of the configuration as it was; a
+            // member the request carries replaces it.
+            let next = crate::state::InvoiceUnitVersion {
+                description: input
+                    .description
+                    .or_else(|| unit.current.description.clone()),
+                tax_inheritance_disabled: input
+                    .tax_inheritance_disabled
+                    .unwrap_or(unit.current.tax_inheritance_disabled),
+                rule: input.rule.unwrap_or_else(|| unit.current.rule.clone()),
+                last_modified: crate::state::now(),
+            };
+            unit.apply(next);
+        }
+
+        store.record_result(
+            Self::NAME,
+            &input.invoice_unit_arn,
+            client_token,
+            &input.invoice_unit_arn,
+        );
+        Ok(UpdateInvoiceUnitOutput {
+            invoice_unit_arn: Some(input.invoice_unit_arn),
+        })
     }
 }

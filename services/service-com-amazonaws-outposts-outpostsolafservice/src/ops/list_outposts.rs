@@ -158,11 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::decode_page_token(crate::state::OUTPOST_PAGE, token).ok_or_else(
                     || {
                         ListOutpostsErrorModeled::ValidationException(ValidationException {
-                            message: Some(
-                                "NextToken is not a pagination token this service issued for \
-                                 ListOutposts"
-                                    .to_string(),
-                            ),
+                            message: Some(crate::state::page_token_report("ListOutposts")),
                         })
                     },
                 )?,

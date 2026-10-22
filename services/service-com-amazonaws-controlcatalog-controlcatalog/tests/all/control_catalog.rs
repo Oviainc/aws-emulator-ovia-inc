@@ -190,17 +190,24 @@ pub(crate) fn by_arn(mut items: Vec<Value>) -> Vec<Value> {
     items
 }
 
+/// The string at `path` (a chain of object members) in `item`, or `None` when the
+/// chain does not resolve to a string.
+///
+/// `pub(crate)`: the ONE member-path walk this test target uses, shared with the
+/// sibling suites rather than reimplemented beside them.
+pub(crate) fn at_path<'a>(item: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut cursor = item;
+    for key in path {
+        cursor = cursor.get(key)?;
+    }
+    cursor.as_str()
+}
+
 /// Every distinct string at `path` (a chain of object members) across `items`.
 fn distinct<'a>(items: &'a [Value], path: &[&str]) -> Vec<&'a str> {
     let mut values: Vec<&str> = items
         .iter()
-        .filter_map(|item| {
-            let mut cursor = item;
-            for key in path {
-                cursor = cursor.get(key)?;
-            }
-            cursor.as_str()
-        })
+        .filter_map(|item| at_path(item, path))
         .collect();
     values.sort_unstable();
     values.dedup();

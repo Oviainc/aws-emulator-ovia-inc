@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the project stored in [`crate::state`] under the requested space and name,
+//! exactly as `CreateProject` stored it. A space or project that does not exist is
+//! refused with the modelled `ResourceNotFoundException` (404) — the request's path is
+//! never echoed back as a project.
 //!
 //! ## Shape of an operation
 //!
@@ -81,9 +76,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codecatalyst-codecataly
 // here — hence the `GetProjectError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codecatalyst#GetProject")]
+//
+// CodeCatalyst declares its errors on the SERVICE shape, not per operation, so the
+// ones this handler answers with are widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codecatalyst#GetProject",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetProjectErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -137,18 +139,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProject"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Not a service behaviour: the engine this service was constructed with
+            // holds no state store, so the operation cannot be served at all.
+            crate::scaffolded::Scaffolded::not_implemented(
+                "GetProject (the engine this service was built with provides no state store)",
+            )
+        })?;
+        let state = state.lock();
+
+        if state.space(&input.space_name).is_none() {
+            return Err(GetProjectErrorModeled::ResourceNotFoundException(not_found(
+                "space",
+                &input.space_name,
+            ))
+            .into());
+        }
+        let project = state
+            .project(&input.space_name, &input.name)
+            .ok_or_else(|| {
+                GetProjectErrorModeled::ResourceNotFoundException(not_found(
+                    "project",
+                    &input.name,
+                ))
+            })?;
+
+        Ok(GetProjectOutput {
+            space_name: Some(project.space_name.clone()),
+            name: project.name.clone(),
+            display_name: project.display_name.clone(),
+            description: project.description.clone(),
+        })
     }
 }

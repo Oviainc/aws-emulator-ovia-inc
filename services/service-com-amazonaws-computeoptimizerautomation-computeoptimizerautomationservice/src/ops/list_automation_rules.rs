@@ -168,12 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Filter$name` is typed as the `AutomationRuleFilterName` value set, but
         // a name outside it is refused here too so a filter is never silently
         // ignored.
-        if let Some(unknown) = crate::state::unknown_filter_name(&filters) {
-            return Err(invalid_parameter(format!(
-                "Value '{unknown}' at 'filters.member.name' failed to satisfy constraint: Member \
-                 must satisfy enum value set: [Name, RecommendedActionType, Status, RuleType, \
-                 OrganizationConfigurationRuleApplyOrder, AccountId]"
-            )));
+        if crate::state::unknown_filter_name(&filters).is_some() {
+            return Err(invalid_parameter(
+                crate::state::unknown_filter_name_message(),
+            ));
         }
 
         // The page token carries the filters it was taken with, so resuming a
@@ -184,17 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(format!(
-                        "Value '{token}' at 'nextToken' failed to satisfy constraint: Member must \
-                         be a token returned by a previous ListAutomationRules call"
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned by a previous ListAutomationRules call",
                     )));
                 };
                 if cursor.filter_fingerprint != filter_fingerprint {
-                    return Err(invalid_parameter(
-                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
-                         token returned for the same filters"
-                            .to_string(),
-                    ));
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned for the same filters",
+                    )));
                 }
                 cursor.offset
             }

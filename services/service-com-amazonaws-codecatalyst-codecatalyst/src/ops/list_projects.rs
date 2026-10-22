@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the projects stored in [`crate::state`] for a space, in project-name
+//! order, and never a canned list. A space that does not exist is refused with the
+//! modelled `ResourceNotFoundException` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Paging: at most `maxResults` projects are returned, capped by the service's own
+//! published page maximum (`crate::state::MAX_PAGE_SIZE`) so no request can make one
+//! response proportional to everything stored, and `nextToken` is emitted ONLY when
+//! the page was truncated — a token resumes strictly after the last project the
+//! previous page returned. A token this service did not issue is refused with the
+//! modelled `ValidationException` (400) rather than silently answered with the first
+//! page.
+//!
+//! Filters: a `ProjectListFilter` narrows the listing. Each filter is applied (ANDed),
+//! and a project matches one filter when it matches ANY of that filter's `values`
+//! (ORed) under its `comparisonOperator`, which defaults to `EQ`. The `hasAccessTo`
+//! key needs space membership this emulator does not model, so a request using it is
+//! answered with a 501 naming it — never with a list that ignored the filter.
 //!
 //! ## Shape of an operation
 //!
@@ -83,9 +91,118 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codecatalyst-codecataly
 // here — hence the `ListProjectsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codecatalyst#ListProjects")]
+//
+// CodeCatalyst declares its errors on the SERVICE shape, not per operation, so the
+// ones this handler answers with are widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codecatalyst#ListProjects",
+    extra_errors = ["ResourceNotFoundException", "ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListProjectsErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
+}
+
+/// The comparison a `ProjectListFilter` applies when it names no
+/// `comparisonOperator`: equality, the only operator that narrows to the values
+/// the caller listed rather than to a range around them.
+const DEFAULT_COMPARISON_OPERATOR: &str = "EQ";
+
+/// The `FilterKey` this emulator cannot evaluate: `hasAccessTo` selects the
+/// projects a named user can reach, which takes space membership the emulator
+/// does not model. A request that uses it is answered honestly (501) rather than
+/// with an unfiltered list that would be right only if the named principal could
+/// reach every project.
+const UNSUPPORTED_FILTER_KEY: &str = "hasAccessTo";
+
+/// The most filters one request may carry, and the most values across all of
+/// them. `ProjectListFilters` and `StringList` carry no modelled length limit,
+/// and the matching cost is entries x filters x values, so the emulator
+/// publishes its own bound to keep the work one request can ask for proportional
+/// to the page it gets back (`crate::state::MAX_PAGE_SIZE`).
+const MAX_FILTERS: usize = 10;
+const MAX_FILTER_VALUES: usize = 100;
+
+/// Refuse a filter whose `key` or `comparisonOperator` is not one the model
+/// declares. The value lists are the generated `FilterKey` / `ComparisonOperator`
+/// catalogues in `super::types` (`smithy_query(query="shape",shape="FilterKey")`),
+/// so this cannot drift from the model.
+fn validate_filter(filter: &ProjectListFilter) -> Result<(), ListProjectsErrorModeled> {
+    if !FILTER_KEY_VALUES.contains(&filter.key.as_str()) {
+        return Err(ListProjectsErrorModeled::ValidationException(invalid_input(
+            format!(
+                "filters.key must be one of [{}]; got {}",
+                FILTER_KEY_VALUES.join(", "),
+                filter.key
+            ),
+        )));
+    }
+    let operator = filter
+        .comparison_operator
+        .as_deref()
+        .unwrap_or(DEFAULT_COMPARISON_OPERATOR);
+    if !COMPARISON_OPERATOR_VALUES.contains(&operator) {
+        return Err(ListProjectsErrorModeled::ValidationException(invalid_input(
+            format!(
+                "filters.comparisonOperator must be one of [{}]; got {operator}",
+                COMPARISON_OPERATOR_VALUES.join(", ")
+            ),
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a filter list bigger than this emulator states it evaluates, so the
+/// matching work one request can ask for stays bounded.
+fn validate_filter_budget(
+    filters: &[ProjectListFilter],
+) -> Result<(), ListProjectsErrorModeled> {
+    if filters.len() > MAX_FILTERS {
+        return Err(ListProjectsErrorModeled::ValidationException(invalid_input(
+            format!(
+                "filters must hold at most {MAX_FILTERS} filters; got {}",
+                filters.len()
+            ),
+        )));
+    }
+    let values: usize = filters.iter().map(|filter| filter.values.len()).sum();
+    if values > MAX_FILTER_VALUES {
+        return Err(ListProjectsErrorModeled::ValidationException(invalid_input(
+            format!(
+                "filters must hold at most {MAX_FILTER_VALUES} values in total; got {values}"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `project` satisfies one (already validated) `ProjectListFilter`: the
+/// field the `key` names compares true, under `comparisonOperator`, against ANY
+/// of the filter's `values`.
+///
+/// Only `name` reaches here — [`UNSUPPORTED_FILTER_KEY`] is refused before any
+/// project is examined — so no filter this function sees can silently narrow
+/// nothing.
+fn matches_filter(project: &crate::state::Project, filter: &ProjectListFilter) -> bool {
+    let field = match filter.key.as_str() {
+        "name" => project.name.as_str(),
+        _ => return true,
+    };
+    let operator = filter
+        .comparison_operator
+        .as_deref()
+        .unwrap_or(DEFAULT_COMPARISON_OPERATOR);
+    filter.values.iter().any(|value| match operator {
+        "GT" => field > value.as_str(),
+        "GE" => field >= value.as_str(),
+        "LT" => field < value.as_str(),
+        "LE" => field <= value.as_str(),
+        "BEGINS_WITH" => field.starts_with(value.as_str()),
+        // `EQ`, and nothing else reaches here: `validate_filter` refused every
+        // operator the model does not declare before any project was examined.
+        _ => field == value.as_str(),
+    })
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +256,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProjects"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Not a service behaviour: the engine this service was constructed with
+            // holds no state store, so the operation cannot be served at all.
+            crate::scaffolded::Scaffolded::not_implemented(
+                "ListProjects (the engine this service was built with provides no state store)",
+            )
+        })?;
+        let state = state.lock();
+
+        let space = state.space(&input.space_name).ok_or_else(|| {
+            ListProjectsErrorModeled::ResourceNotFoundException(not_found(
+                "space",
+                &input.space_name,
+            ))
+        })?;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_cursor(token).ok_or_else(|| {
+                ListProjectsErrorModeled::ValidationException(invalid_input(
+                    "nextToken is not a pagination token issued by this service",
+                ))
+            })?),
+            None => None,
+        };
+
+        // Validate every filter ONCE, before paging: a filter the model does not
+        // describe is a bad request whatever page it would have landed on, and a
+        // filter this emulator cannot evaluate must not be answered with a list.
+        let filters = input.filters.unwrap_or_default();
+        validate_filter_budget(&filters)?;
+        for filter in &filters {
+            validate_filter(filter)?;
+            if filter.key == UNSUPPORTED_FILTER_KEY {
+                // 501: "this emulator has not implemented it", not "bad request" and
+                // certainly not a 200 whose list ignored the filter.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "ListProjects with filters.key = {UNSUPPORTED_FILTER_KEY}, which needs \
+                     space membership this emulator does not model"
+                )));
+            }
+        }
+
+        let page = crate::state::page_where(
+            &space.projects,
+            after.as_deref(),
+            input.max_results,
+            |project| filters.iter().all(|filter| matches_filter(project, filter)),
+        );
+
+        let items: Vec<ProjectSummary> = page
+            .items
+            .iter()
+            .map(|project| ProjectSummary {
+                name: project.name.clone(),
+                display_name: project.display_name.clone(),
+                description: project.description.clone(),
+            })
+            .collect();
+        let next_token = page.next_token;
+        // Release the shared-state guard before returning: the response is built
+        // from owned values, so no other caller waits on this one's serialization.
+        drop(state);
+
+        Ok(ListProjectsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

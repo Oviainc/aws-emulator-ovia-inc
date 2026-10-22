@@ -8,6 +8,11 @@
 //! The input lifecycle lives beside it: one [`InputRecord`] per created input,
 //! its own id counter and its own token map.
 //!
+//! The input security group lifecycle lives here too: one
+//! [`InputSecurityGroupRecord`] per created group and the counter that mints its
+//! `Id`. A group's `State`, `Inputs` and `Channels` are derived from the rest of
+//! the state on every read, never recorded at create time.
+//!
 //! Every value a channel- or input-shaped response carries is either stored
 //! verbatim from the request that created the resource or derived from the stored
 //! state ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
@@ -22,13 +27,14 @@ use crate::ops::types::{
     DescribeAnywhereSettings, DescribeFollowerChannelSettings, DescribeInferenceSettings,
     DescribeLinkedChannelSettings, DescribePrimaryChannelSettings, EncoderSettings,
     InferenceSettings, Input, InputAttachment, InputDestination, InputDestinationRequest,
-    InputDestinationRoute, InputDeviceSettings, InputSource, InputSourceRequest,
-    InputSpecification, InputVpcRequest, LinkedChannelSettings, MaintenanceStatus,
-    MediaConnectFlow, MediaConnectFlowRequest, MulticastSettings,
-    MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
-    RouterDestination, RouterInputSettings, RouterSettings, Smpte2110ReceiverGroupSettings,
-    SrtCallerDecryption, SrtCallerSource, SrtListenerDecryption, SrtListenerSettings,
-    SrtSettings, SrtSettingsRequest, VpcOutputSettings, VpcOutputSettingsDescription,
+    InputDestinationRoute, InputDeviceSettings, InputSecurityGroup, InputSource,
+    InputSourceRequest, InputSpecification, InputVpcRequest, InputWhitelistRule,
+    LinkedChannelSettings, MaintenanceStatus, MediaConnectFlow, MediaConnectFlowRequest,
+    MulticastSettings, MulticastSettingsCreateRequest, MulticastSource, OutputDestination,
+    PipelineDetail, RouterDestination, RouterInputSettings, RouterSettings,
+    Smpte2110ReceiverGroupSettings, SrtCallerDecryption, SrtCallerSource,
+    SrtListenerDecryption, SrtListenerSettings, SrtSettings, SrtSettingsRequest,
+    VpcOutputSettings, VpcOutputSettingsDescription,
 };
 
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
@@ -51,6 +57,16 @@ pub mod channel_state {
 pub mod channel_class {
     pub const STANDARD: &str = "STANDARD";
     pub const SINGLE_PIPELINE: &str = "SINGLE_PIPELINE";
+}
+
+/// The `InputSecurityGroupState` enum values, spelled exactly as the model
+/// declares them (`smithy_query(query="shape", shape="InputSecurityGroupState")`:
+/// IDLE | IN_USE | UPDATING | DELETED).
+pub mod input_security_group_state {
+    pub const IDLE: &str = "IDLE";
+    pub const IN_USE: &str = "IN_USE";
+    pub const UPDATING: &str = "UPDATING";
+    pub const DELETED: &str = "DELETED";
 }
 
 /// The `InputState` enum values this slice uses, spelled exactly as the model
@@ -128,6 +144,21 @@ pub const MAX_CHANNELS: usize = 100;
 /// enforced anyway, by evicting the oldest token, so the map cannot accumulate
 /// caller-chosen strings independently of the channels they name.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_CHANNELS;
+
+/// The id the first input security group of a process gets. AWS input security
+/// group ids are numeric strings, the same shape as channel and input ids; a
+/// range of its own keeps the id spaces apart, so a caller (or a test) that
+/// passes a channel's or an input's id where a group id belongs gets a
+/// `NotFoundException` rather than a coincidental hit.
+const FIRST_INPUT_SECURITY_GROUP_ID: u64 = 3_000_000;
+
+/// The most input security groups this emulator stores for one account.
+///
+/// A ceiling, not a guess at AWS's published quota: it exists so a create loop
+/// cannot grow the emulator's heap without bound. `CreateInputSecurityGroup`
+/// models `TooManyRequestsException`, which is the refusal once the store is
+/// full.
+pub const MAX_INPUT_SECURITY_GROUPS: usize = 100;
 
 /// The id the first input of a process gets. AWS input ids are numeric strings,
 /// so they are minted from a counter at a fixed seven-digit width, which keeps
@@ -285,6 +316,43 @@ impl ChannelRecord {
     }
 }
 
+/// One created input security group, as `CreateInputSecurityGroup` stored it.
+///
+/// Only the members the request supplies are stored. `State`, `Inputs` and
+/// `Channels` are NOT stored: the model documents them as what currently uses
+/// the group, so they are derived from the rest of the state on every read
+/// ([`ComAmazonawsMedialiveMedialiveState::input_security_group_description`]).
+#[derive(Debug, Clone)]
+pub struct InputSecurityGroupRecord {
+    pub id: String,
+    pub arn: String,
+    /// The whitelisted IPv4 CIDRs, in the order the request listed them.
+    pub whitelist_rules: Vec<String>,
+    pub tags: HashMap<String, String>,
+}
+
+/// Whether `cidr` is an IPv4 CIDR block, which is what
+/// `CreateInputSecurityGroup`'s `WhitelistRules` member documents it accepts
+/// ("List of IPv4 CIDR addresses to whitelist",
+/// `smithy_query(query="doc", shape="InputWhitelistRuleCidr", member="Cidr")`:
+/// "The IPv4 CIDR to whitelist").
+///
+/// Dotted-quad address, `/`, then a prefix length of 0..=32 — the published
+/// bounds of an IPv4 prefix. The model declares no `@pattern` for it, so this is
+/// the service-side rule the boundary validator cannot express.
+pub fn is_ipv4_cidr(cidr: &str) -> bool {
+    let Some((address, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(prefix_length) = prefix.parse::<u32>() else {
+        return false;
+    };
+    prefix_length <= 32 && address.parse::<::std::net::Ipv4Addr>().is_ok()
+}
+
 /// A bounded map from a caller-chosen `@idempotencyToken` to the id of the
 /// resource that token created, so a retried create returns the resource the
 /// first attempt made instead of a second one.
@@ -352,6 +420,12 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     pub channels: BTreeMap<String, ChannelRecord>,
     /// Mint counter behind [`Self::mint_channel_id`].
     pub next_channel_id: u64,
+    /// Every input security group that exists, keyed by its minted `Id`. A
+    /// `BTreeMap` for the same reason as [`Self::channels`]: a reader walks it in
+    /// id order on every call.
+    pub input_security_groups: BTreeMap<String, InputSecurityGroupRecord>,
+    /// Mint counter behind [`Self::mint_input_security_group_id`].
+    pub next_input_security_group_id: u64,
     /// `CreateChannel`'s `RequestId` (`@idempotencyToken`) -> the channel it
     /// created, so a retry returns that channel instead of a second one.
     ///
@@ -409,6 +483,88 @@ impl ComAmazonawsMedialiveMedialiveState {
         let id = FIRST_CHANNEL_ID + self.next_channel_id;
         self.next_channel_id += 1;
         id.to_string()
+    }
+
+    /// The next input security group id, as AWS shapes them: a numeric string.
+    pub fn mint_input_security_group_id(&mut self) -> String {
+        let id = FIRST_INPUT_SECURITY_GROUP_ID + self.next_input_security_group_id;
+        self.next_input_security_group_id += 1;
+        id.to_string()
+    }
+
+    /// Whether the input security group store is full, so
+    /// `CreateInputSecurityGroup` must refuse rather than mint another group.
+    pub fn input_security_groups_are_full(&self) -> bool {
+        self.input_security_groups.len() >= MAX_INPUT_SECURITY_GROUPS
+    }
+
+    /// The ids of the channels currently using `group_id` as one of their
+    /// channel security groups — `InputSecurityGroup$Channels` ("The list of
+    /// channels currently using this Input Security Group as their channel
+    /// security group"). Derived from the channel store, so it tracks every
+    /// later create and delete rather than being recorded at create time.
+    pub fn channels_using_security_group(&self, group_id: &str) -> Vec<String> {
+        self.channels
+            .values()
+            .filter(|channel| {
+                channel
+                    .channel_security_groups
+                    .iter()
+                    .any(|attached| attached == group_id)
+            })
+            .map(|channel| channel.id.clone())
+            .collect()
+    }
+
+    /// The ids of the inputs currently using `group_id` as one of their input
+    /// security groups — `InputSecurityGroup$Inputs` ("The list of inputs
+    /// currently using this Input Security Group"). Derived from the input store
+    /// for the same reason as [`Self::channels_using_security_group`].
+    pub fn inputs_using_security_group(&self, group_id: &str) -> Vec<String> {
+        self.inputs
+            .values()
+            .filter(|input| {
+                input
+                    .security_groups
+                    .iter()
+                    .any(|attached| attached == group_id)
+            })
+            .map(|input| input.id.clone())
+            .collect()
+    }
+
+    /// The full `InputSecurityGroup` description of one stored group, or `None`
+    /// when no group has that id.
+    ///
+    /// `State` is derived, not stored: a group is `IN_USE` exactly while some
+    /// resource in state references it, and `IDLE` otherwise ("The current state
+    /// of the Input Security Group").
+    pub fn input_security_group_description(&self, id: &str) -> Option<InputSecurityGroup> {
+        let group = self.input_security_groups.get(id)?;
+        let inputs = self.inputs_using_security_group(id);
+        let channels = self.channels_using_security_group(id);
+        let state = if inputs.is_empty() && channels.is_empty() {
+            input_security_group_state::IDLE
+        } else {
+            input_security_group_state::IN_USE
+        };
+        Some(InputSecurityGroup {
+            arn: Some(group.arn.clone()),
+            id: Some(group.id.clone()),
+            inputs: Some(inputs),
+            state: Some(state.to_string()),
+            tags: Some(group.tags.clone()),
+            whitelist_rules: Some(
+                group
+                    .whitelist_rules
+                    .iter()
+                    .map(|cidr| InputWhitelistRule {
+                        cidr: Some(cidr.clone()),
+                    })
+                    .collect(),
+            ),
+            channels: Some(channels),
+        })
     }
 
     /// The channel a stored `RequestId` created, if that channel still exists.

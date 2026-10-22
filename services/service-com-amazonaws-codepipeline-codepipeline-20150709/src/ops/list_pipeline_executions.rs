@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPipelineExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPipelineExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPipelineExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the pipeline's stored executions, newest first, with an opaque `nextToken`
+//! naming the execution the next page starts at.
+//!
+//! The `succeededInStage` filter is refused with the scaffold's 501: it selects on
+//! which stage an execution succeeded in, and stage-level execution state belongs to
+//! the action-execution plane (`GetPipelineState`, `PollForJobs`,
+//! `PutJobSuccessResult`), which is still 501 — so answering a filtered list would
+//! mean inventing stage outcomes.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +120,11 @@ impl From<ListPipelineExecutionsErrorModeled> for ListPipelineExecutionsError {
     }
 }
 
+/// The page size a request that names no `maxResults` gets. The operation's own
+/// documentation for that member states "Default value is 100", which is also the
+/// maximum the model allows (`MaxResults`, `@range(min: 1, max: 100)`).
+const DEFAULT_EXECUTIONS_PER_PAGE: usize = 100;
+
 /// The `ListPipelineExecutions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +161,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPipelineExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPipelineExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPipelineExecutions"))
+        let _ = ctx;
+        // A `succeededInStage` filter selects on stage-level execution state, which
+        // nothing in this emulator records yet: answering it would mean inventing
+        // stage outcomes, so it is refused as not implemented rather than answered.
+        if input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.succeeded_in_stage.as_ref())
+            .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListPipelineExecutions with a succeededInStage filter",
+            ));
+        }
+
+        let state = crate::state::require_state(&*self.engine)?;
+        let state = state.lock();
+
+        if !state.pipelines.contains_key(&input.pipeline_name) {
+            return Err(
+                ListPipelineExecutionsErrorModeled::PipelineNotFoundException(
+                    PipelineNotFoundException {
+                        message: Some(format!(
+                            "pipeline {} does not exist",
+                            input.pipeline_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Newest first: the stored order is oldest-first, so the listing walks it
+        // backwards.
+        let newest_first: Vec<&String> = state
+            .executions_by_pipeline
+            .get(&input.pipeline_name)
+            .map(|ids| ids.iter().rev().collect())
+            .unwrap_or_default();
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                // An execution that is no longer retained has no position in this
+                // order, so its cursor is refused rather than silently restarting
+                // the listing (see `state::encode_page_token`).
+                crate::state::decode_page_token(crate::state::CURSOR_EXECUTION, token)
+                    .and_then(|key| newest_first.iter().position(|id| **id == key))
+                    .ok_or_else(|| {
+                        ListPipelineExecutionsError::from(
+                            ListPipelineExecutionsErrorModeled::InvalidNextTokenException(
+                                InvalidNextTokenException {
+                                    message: Some(
+                                        "nextToken was not issued by ListPipelineExecutions for \
+                                         this pipeline"
+                                            .to_string(),
+                                    ),
+                                },
+                            ),
+                        )
+                    })?
+            }
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator is what refuses an out-of-range request before this handler
+        // runs; the clamp keeps the page bound local to the growth site, so the
+        // vector below cannot exceed it whatever reaches here.
+        let limit = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_EXECUTIONS_PER_PAGE)
+            .clamp(1, DEFAULT_EXECUTIONS_PER_PAGE);
+
+        // The cursor is the first id that did NOT fit on this page, so the page and
+        // the cursor stay consistent by construction even if an id in the per-pipeline
+        // order were ever missing from `executions`.
+        let mut pipeline_execution_summaries: Vec<PipelineExecutionSummary> =
+            Vec::with_capacity(limit.min(newest_first.len()));
+        let mut next_token = None;
+        for id in &newest_first[start..] {
+            if pipeline_execution_summaries.len() == limit {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::CURSOR_EXECUTION,
+                    id,
+                ));
+                break;
+            }
+            if let Some(record) = state.executions.get(*id) {
+                pipeline_execution_summaries.push(record.to_summary());
+            }
+        }
+
+        Ok(ListPipelineExecutionsOutput {
+            pipeline_execution_summaries: Some(pipeline_execution_summaries),
+            next_token,
+        })
     }
 }
