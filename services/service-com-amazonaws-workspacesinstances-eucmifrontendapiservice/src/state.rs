@@ -39,6 +39,22 @@ pub const WORKSPACE_INSTANCE_RESOURCE_TYPE: &str = "WORKSPACE_INSTANCE";
 /// shape, its members and its wire code the model's.
 pub const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
 
+/// The `ResourceType` this service reports for a volume in its resource-scoped
+/// errors.
+///
+/// Like [`WORKSPACE_INSTANCE_RESOURCE_TYPE`], this member is a free `String` the
+/// model enumerates no token for, and the recorded token form for this service is
+/// upper case and underscore separated, so the volume kind takes the same form. (The
+/// `ResourceTypeEnum` in `crate::ops::types` is the EC2-style tag-specification enum
+/// — the `volume` value a `TagSpecification` carries — and has nothing to do with
+/// these error members.)
+pub const VOLUME_RESOURCE_TYPE: &str = "VOLUME";
+
+/// The `ResourceType` token a `TagSpecification` names for a volume: the
+/// `ResourceTypeEnum` member (`crate::ops::types::RESOURCE_TYPE_ENUM_VALUES`), which
+/// is what `CreateVolume` matches a tag specification against.
+pub const VOLUME_TAG_SPECIFICATION_RESOURCE_TYPE: &str = "volume";
+
 /// The `ServiceCode` this service reports in its quota errors: the service's own
 /// code, which is also its sigv4 signing name and ARN namespace.
 pub const SERVICE_CODE: &str = "workspaces-instances";
@@ -46,6 +62,10 @@ pub const SERVICE_CODE: &str = "workspaces-instances";
 /// The `QuotaCode` for the running-instance quota below. AWS publishes no code for
 /// it, so this is the emulator's own stable identifier for the quota it enforces.
 pub const WORKSPACE_INSTANCE_QUOTA_CODE: &str = "L-WorkSpaceInstancesPerAccount";
+
+/// The `QuotaCode` for the volume quota below. AWS publishes no code for it, so
+/// this is the emulator's own stable identifier for the quota it enforces.
+pub const VOLUME_QUOTA_CODE: &str = "L-VolumesPerAccount";
 
 /// The number of WorkSpace Instances this emulator will hold at once.
 ///
@@ -56,6 +76,15 @@ pub const WORKSPACE_INSTANCE_QUOTA_CODE: &str = "L-WorkSpaceInstancesPerAccount"
 /// modelled error rather than by exhausting memory. Capacity is released by
 /// `DeleteWorkspaceInstance`, as on the real service.
 pub const MAX_INSTANCES: usize = 500;
+
+/// The number of volumes this emulator will hold at once.
+///
+/// As with [`MAX_INSTANCES`], a real account has a Service Quotas limit on volumes
+/// and `CreateVolume` models `ServiceQuotaExceededException` (HTTP 402) for reaching
+/// it; AWS publishes no figure, so the number is CHOSEN. Its purpose is that the
+/// store cannot grow without bound, and that the bound is reached through the
+/// modelled error. Capacity is released by `DeleteVolume`.
+pub const MAX_VOLUMES: usize = 500;
 
 /// The number of tags one WorkSpace Instance holds.
 ///
@@ -409,6 +438,41 @@ impl WorkspaceInstanceRecord {
     }
 }
 
+/// One volume, as created by `CreateVolume`.
+///
+/// The configuration is held exactly as the creating call supplied it — nothing is
+/// defaulted, because this service models no operation that reports a volume's
+/// configuration back, and `ModifyVolume` reports the TARGET of a modification. A
+/// member the caller left out stays `None` so a later reader can tell "unset" from
+/// "set to the service default".
+#[derive(Debug, Clone)]
+pub struct VolumeRecord {
+    /// The minted `vol-…` id, matching `^vol-[0-9a-zA-Z]{1,63}$`.
+    pub id: String,
+    /// The `AvailabilityZone` the volume was created in (a required member).
+    pub availability_zone: String,
+    /// `SizeInGB`, inside the modelled `range 1..16384` when present.
+    pub size_in_gb: Option<i32>,
+    /// A `VolumeTypeEnum` value (`crate::ops::types::VOLUME_TYPE_ENUM_VALUES`).
+    pub volume_type: Option<String>,
+    /// `Iops`, as supplied.
+    pub iops: Option<i32>,
+    /// `Throughput`, as supplied.
+    pub throughput: Option<i32>,
+    /// `Encrypted`, as supplied.
+    pub encrypted: Option<bool>,
+    /// `KmsKeyId`, as supplied. Sensitive: never logged.
+    pub kms_key_id: Option<String>,
+    /// The `snap-…` id the volume was restored from, if any.
+    pub snapshot_id: Option<String>,
+    /// Tags from the creating call's `TagSpecifications`, keyed by `Tag.Key`.
+    pub tags: BTreeMap<String, String>,
+    /// The `ClientToken` the creating call carried, if any.
+    pub client_token: Option<String>,
+    /// When the record was created.
+    pub created_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-workspacesinstances-eucmifrontendapiservice. A handler reaches it through [`service_state`].
 ///
 /// `instances` is a `BTreeMap` rather than a hash map so iteration order is the
@@ -421,6 +485,13 @@ pub struct ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     pub instances: BTreeMap<String, WorkspaceInstanceRecord>,
     /// `ClientToken` -> `WorkspaceInstanceId`, for `@idempotent` create replay.
     pub client_tokens: BTreeMap<String, String>,
+    /// Every live volume, keyed by its `vol-…` id.
+    pub volumes: BTreeMap<String, VolumeRecord>,
+    /// `ClientToken` -> `VolumeId`, for `CreateVolume`'s `@idempotent` replay. A
+    /// separate namespace from [`Self::client_tokens`]: a token is scoped to the
+    /// create call that carried it, so a volume token can never replay an instance
+    /// id (the two ids are not even the same shape).
+    pub volume_client_tokens: BTreeMap<String, String>,
     /// Source of the unique `wsinst-…` / `i-…` identifiers.
     pub id_counter: u64,
 }
@@ -455,6 +526,22 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     /// Whether another instance fits inside [`MAX_INSTANCES`].
     pub fn has_instance_capacity(&self) -> bool {
         self.instances.len() < MAX_INSTANCES
+    }
+
+    /// Mint the next `vol-…` volume id.
+    ///
+    /// The `vol-` prefix is 4 characters and the model requires 1..63 further
+    /// `[0-9a-zA-Z]`, so a 17-hex-digit counter is well inside the pattern. The
+    /// counter is the one [`Self::mint_ids`] draws from, so no two resources of this
+    /// service ever share a number.
+    pub fn mint_volume_id(&mut self) -> String {
+        self.id_counter += 1;
+        format!("vol-{:017x}", self.id_counter)
+    }
+
+    /// Whether another volume fits inside [`MAX_VOLUMES`].
+    pub fn has_volume_capacity(&self) -> bool {
+        self.volumes.len() < MAX_VOLUMES
     }
 }
 
@@ -501,15 +588,16 @@ pub fn instance_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
 /// rejected value.
 pub const INSTANCE_NOT_FOUND_MESSAGE: &str = "Workspace instance is not found";
 
-/// The modelled `ResourceNotFoundException` for a WorkSpace Instance id that names
-/// no stored record. Every member the model marks `@required` is filled: the
-/// request-independent [`INSTANCE_NOT_FOUND_MESSAGE`], the id that was looked up,
-/// and this service's [`WORKSPACE_INSTANCE_RESOURCE_TYPE`] token.
-pub fn instance_not_found(id: &str) -> ResourceNotFoundException {
+/// The modelled `ResourceNotFoundException` for `id`, reporting `resource_type` as
+/// the kind that was not found and the request-independent `message`.
+///
+/// The ONE place this shape is built, so no resource kind can drift on which
+/// members it fills: every member the model marks `@required` is set here.
+fn resource_not_found(id: &str, resource_type: &str, message: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+        message: message.to_string(),
         resource_id: id.to_string(),
-        resource_type: WORKSPACE_INSTANCE_RESOURCE_TYPE.to_string(),
+        resource_type: resource_type.to_string(),
     }
 }
 
@@ -554,20 +642,77 @@ pub fn invalid_next_token() -> ValidationException {
     }
 }
 
-/// [`instance_not_found`] lifted into an operation's error channel, answered with
+/// [`resource_not_found`] lifted into an operation's error channel, answered with
+/// [`RESOURCE_NOT_FOUND_STATUS`].
 /// [`RESOURCE_NOT_FOUND_STATUS`].
 ///
 /// `wrap` is the operation's own `ResourceNotFoundException` variant, so every
-/// single-instance operation reports a missing instance through this ONE place and
-/// none of them can drift to the shape's status or to another token.
+/// operation of this service reports a missing resource through this ONE place and
+/// none of them can drift to the shape's status.
+fn not_found_error<E>(
+    error: ResourceNotFoundException,
+    wrap: impl FnOnce(ResourceNotFoundException) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::modeled_with_status(wrap(error), RESOURCE_NOT_FOUND_STATUS)
+}
+
+/// The modelled `ResourceNotFoundException` for a WorkSpace Instance id that names
+/// no stored record: the request-independent [`INSTANCE_NOT_FOUND_MESSAGE`], the id
+/// that was looked up, and this service's [`WORKSPACE_INSTANCE_RESOURCE_TYPE`] token.
+pub fn instance_not_found(id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        id,
+        WORKSPACE_INSTANCE_RESOURCE_TYPE,
+        INSTANCE_NOT_FOUND_MESSAGE,
+    )
+}
+
+/// [`instance_not_found`] lifted into an operation's error channel through
+/// [`not_found_error`], so every single-instance operation answers the same
+/// (status, code) pair.
 pub fn instance_not_found_error<E>(
     id: &str,
     wrap: impl FnOnce(ResourceNotFoundException) -> E,
 ) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::modeled_with_status(
-        wrap(instance_not_found(id)),
-        RESOURCE_NOT_FOUND_STATUS,
-    )
+    not_found_error(instance_not_found(id), wrap)
+}
+
+/// The message this service reports for a volume id that names no volume.
+///
+/// A FIXED sentence, like [`INSTANCE_NOT_FOUND_MESSAGE`] and for the same reason:
+/// the service states that the resource kind was not found and leaves the identity
+/// to the modelled `ResourceId` member, so the prose does not vary per request.
+pub const VOLUME_NOT_FOUND_MESSAGE: &str = "Workspace managed EBS volume is not found";
+
+/// The modelled `ResourceNotFoundException` for a volume id that names no stored
+/// record: the request-independent [`VOLUME_NOT_FOUND_MESSAGE`], the id that was
+/// looked up, and this service's [`VOLUME_RESOURCE_TYPE`] token.
+pub fn volume_not_found(id: &str) -> ResourceNotFoundException {
+    resource_not_found(id, VOLUME_RESOURCE_TYPE, VOLUME_NOT_FOUND_MESSAGE)
+}
+
+/// [`volume_not_found`] lifted into an operation's error channel, answered with
+/// [`RESOURCE_NOT_FOUND_STATUS`] — the status this service answers the shape with,
+/// whichever resource was looked up, so the volume paths cannot drift from the
+/// instance paths on the (status, code) pair a client branches on.
+pub fn volume_not_found_error<E>(
+    id: &str,
+    wrap: impl FnOnce(ResourceNotFoundException) -> E,
+) -> crate::scaffolded::Scaffolded<E> {
+    not_found_error(volume_not_found(id), wrap)
+}
+
+/// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would
+/// pass [`MAX_VOLUMES`]. The quota is account-scoped and no volume was created, so
+/// `ResourceId` names the subject the quota applies to — this emulator's account.
+pub fn volume_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: format!("the account already holds {held} volumes, the maximum for this quota"),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: VOLUME_RESOURCE_TYPE.to_string(),
+        service_code: SERVICE_CODE.to_string(),
+        quota_code: VOLUME_QUOTA_CODE.to_string(),
+    }
 }
 
 /// The persisted tags of a record, as the modelled `TagList`.
