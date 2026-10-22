@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgreementPaymentRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgreementPaymentRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgreementPaymentRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored payment requests the caller is a party to, applying the
+//! request's optional selectors and page size. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +159,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgreementPaymentRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgreementPaymentRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgreementPaymentRequests"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAgreementPaymentRequestsErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // `partyType` is a plain string in the model, so the boundary validator
+        // only checked its length and pattern: which of the two roles it names
+        // is this handler's to enforce (`PARTY_TYPE_VALUES`), and it is enforced
+        // before any payment request is scanned, so a bad party type answers the
+        // same 400 whatever the store holds.
+        if !crate::state::PARTY_TYPE_VALUES.contains(&input.party_type.as_str()) {
+            return Err(ListAgreementPaymentRequestsErrorModeled::ValidationException(
+                crate::state::validation_exception("INVALID_PARTY_TYPE", "partyType"),
+            )
+            .into());
+        }
+
+        // A pure report: it reads the stored payment requests and writes
+        // nothing.
+        let store = state.lock();
+        let mut matched: Vec<PaymentRequestSummary> = Vec::new();
+        for request in store.payment_requests.values() {
+            // The agreement is the single copy of its own parties, type and
+            // catalog, so every selector about the agreement reads it from
+            // there rather than from a second copy on the payment request.
+            let agreement = store.agreements.get(&request.agreement_id);
+            if !crate::state::payment_request_party_matches(
+                request,
+                agreement,
+                &input.party_type,
+            ) {
+                continue;
+            }
+            // "An optional parameter to list payment requests for a specific
+            // agreement."
+            if input
+                .agreement_id
+                .as_deref()
+                .is_some_and(|id| id != request.agreement_id)
+            {
+                continue;
+            }
+            // "An optional parameter to list payment requests by status."
+            if input
+                .status
+                .as_deref()
+                .is_some_and(|status| status != request.status)
+            {
+                continue;
+            }
+            // "…by agreement type (e.g., PurchaseAgreement)" and "…by catalog
+            // (e.g., AWSMarketplace)": both are attributes of the agreement the
+            // request was sent for, so a request whose agreement is gone is
+            // selected by neither.
+            if let Some(agreement_type) = input.agreement_type.as_deref() {
+                if agreement.is_none_or(|agreement| agreement.agreement_type != agreement_type) {
+                    continue;
+                }
+            }
+            if let Some(catalog) = input.catalog.as_deref() {
+                if agreement.is_none_or(|agreement| agreement.catalog != catalog) {
+                    continue;
+                }
+            }
+            matched.push(request.to_summary());
+        }
+
+        // The token resumes THIS list: one minted for a different party type or
+        // a different selector would index into a different sequence. The
+        // sequence itself is the store's own order over payment request ids,
+        // which are minted from a counter, so a page indexes into the same
+        // sequence on every call.
+        let scope = crate::state::payment_request_scope(
+            &input.party_type,
+            input.agreement_id.as_deref(),
+            input.agreement_type.as_deref(),
+            input.catalog.as_deref(),
+            input.status.as_deref(),
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::page_offset(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    // The token names no page of this list: a token is bound to
+                    // the query it was minted for.
+                    return Err(
+                        ListAgreementPaymentRequestsErrorModeled::ValidationException(
+                            crate::state::validation_exception(
+                                "INVALID_NEXT_TOKEN",
+                                "nextToken",
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let Some((items, next_token)) = crate::state::paginate(
+            &matched,
+            &scope,
+            offset,
+            crate::state::page_size(input.max_results),
+        ) else {
+            // The offset is past the end of what this list selects, which no
+            // token this operation minted for it ever named.
+            return Err(ListAgreementPaymentRequestsErrorModeled::ValidationException(
+                crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+            )
+            .into());
+        };
+
+        Ok(ListAgreementPaymentRequestsOutput { items, next_token })
     }
 }
