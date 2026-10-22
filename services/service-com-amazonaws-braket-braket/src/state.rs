@@ -4,7 +4,8 @@
 //!
 //! Everything the Braket operations answer with is computed from the values held
 //! here: the seeded device inventory (devices are published by AWS, never created
-//! through the API) and the quantum-task records `CreateQuantumTask` writes.
+//! through the API), the quantum-task records `CreateQuantumTask` writes and the
+//! hybrid-job records `CreateJob` writes.
 //!
 //! This module also owns the few helpers more than one operation needs — the
 //! request's region, the clock-owed status transitions, request digests and the
@@ -16,7 +17,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Association, ExperimentalCapabilities, TimePeriod};
+use crate::ops::types::{
+    AlgorithmSpecification, Association, DeviceConfig, ExperimentalCapabilities, InputFileConfig,
+    InstanceConfig, JobCheckpointConfig, JobOutputDataConfig, JobStoppingCondition, TimePeriod,
+};
 
 // ---------------------------------------------------------------------------
 // Modelled enum values this service stores and emits.
@@ -28,15 +32,20 @@ use crate::ops::types::{Association, ExperimentalCapabilities, TimePeriod};
 
 /// `QuantumTaskStatus` — the task is accepted and not queued yet.
 pub const STATUS_CREATED: &str = "CREATED";
-/// `QuantumTaskStatus` — the task is waiting for its device.
+/// `QuantumTaskStatus` / `JobPrimaryStatus` — the work is waiting for its device or
+/// its instances.
 pub const STATUS_QUEUED: &str = "QUEUED";
-/// `QuantumTaskStatus` — the task reached a terminal failure.
+/// `QuantumTaskStatus` / `JobPrimaryStatus` — the work is executing.
+pub const STATUS_RUNNING: &str = "RUNNING";
+/// `QuantumTaskStatus` / `JobPrimaryStatus` — the work reached a terminal failure.
 pub const STATUS_FAILED: &str = "FAILED";
-/// `QuantumTaskStatus` — the task completed successfully.
+/// `QuantumTaskStatus` / `JobPrimaryStatus` — the work completed successfully.
 pub const STATUS_COMPLETED: &str = "COMPLETED";
-/// `QuantumTaskStatus` / `CancellationStatus` — cancellation is in progress.
+/// `QuantumTaskStatus` / `JobPrimaryStatus` / `CancellationStatus` — cancellation is in
+/// progress.
 pub const STATUS_CANCELLING: &str = "CANCELLING";
-/// `QuantumTaskStatus` / `CancellationStatus` — the task was cancelled.
+/// `QuantumTaskStatus` / `JobPrimaryStatus` / `CancellationStatus` — the work was
+/// cancelled.
 pub const STATUS_CANCELLED: &str = "CANCELLED";
 
 /// `DeviceStatus` values.
@@ -85,6 +94,17 @@ pub const TERMINAL_SPAN: Duration = Duration::from_millis(1_200);
 /// `CANCELLING` -> `CANCELLED`, measured from `CancelQuantumTask`.
 pub const CANCELLATION_SPAN: Duration = Duration::from_millis(600);
 
+/// `QUEUED` -> `RUNNING` for a hybrid job, measured from `CreateJob`.
+///
+/// `CreateJob` returns a job in the non-terminal `QUEUED` status, so its later
+/// statuses are owed by the clock. As with the quantum-task spans above, the span is
+/// the emulator's own choice and never zero, so a caller reading the job immediately
+/// after creating it still observes `QUEUED`.
+pub const JOB_RUNNING_SPAN: Duration = Duration::from_millis(600);
+/// `RUNNING` -> terminal for a hybrid job, measured from `CreateJob`: 600 ms after
+/// the transition that starts it.
+pub const JOB_TERMINAL_SPAN: Duration = Duration::from_millis(1_200);
+
 /// Why a quantum task this emulator accepted ends in `FAILED`.
 ///
 /// The emulator has no quantum processor and runs no quantum simulator, so no
@@ -93,6 +113,17 @@ pub const CANCELLATION_SPAN: Duration = Duration::from_millis(600);
 /// in the modelled failure status with this reason instead.
 pub const NOT_EXECUTED_FAILURE_REASON: &str = "This emulator does not execute quantum programs: \
 no device or simulator ran this quantum task, so no result was written to the output S3 location.";
+
+/// Why a hybrid job this emulator accepted ends in `FAILED`.
+///
+/// A Braket hybrid job runs a caller-supplied Python entry point on a provisioned ML
+/// instance, from a container image or an S3 script bundle. This emulator provisions
+/// no instance and runs no entry point, so reporting `COMPLETED` would claim
+/// artifacts that were never written; the job ends in the modelled failure status
+/// carrying this reason instead.
+pub const JOB_NOT_EXECUTED_FAILURE_REASON: &str = "This emulator does not run hybrid job \
+algorithms: no instance was provisioned and no entry point was executed, so no job artifacts \
+were written to the output S3 location.";
 
 // ---------------------------------------------------------------------------
 // Bounds on the caller-driven stores
@@ -119,8 +150,8 @@ pub const MAX_QUANTUM_TASKS: usize = 1_000;
 
 /// The most `clientToken` entries this emulator remembers at once.
 ///
-/// One per retained task: a token whose task has been dropped is of no further use,
-/// because the ARN it would replay no longer resolves. With this cap and
+/// One per retained resource: a token whose resource has been dropped is of no further
+/// use, because the ARN it would replay no longer resolves. With this cap and
 /// [`IDEMPOTENCY_TTL`], a caller sending an endless stream of fresh tokens cannot grow
 /// the index without limit (see
 /// [`ComAmazonawsBraketBraketState::prune_idempotency`]).
@@ -151,6 +182,17 @@ pub const DEFAULT_SPENDING_LIMIT_WINDOW: Duration = Duration::from_secs(30 * 24 
 /// (minutes at most) always gets the first ARN back, short enough that the index does
 /// not hold tokens for work that finished a day ago.
 pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most hybrid jobs that may be in flight (not yet terminal) at once.
+///
+/// Amazon Braket publishes a quota for concurrent hybrid jobs and answers a request
+/// past it with `ServiceQuotaExceededException`; this is the emulator's own figure,
+/// and it is what bounds how many live job records one caller can hold open.
+pub const MAX_JOBS_IN_FLIGHT: usize = 100;
+
+/// The most hybrid-job records this emulator keeps at once, bounding the job store by
+/// COUNT exactly as [`MAX_QUANTUM_TASKS`] bounds the quantum-task store.
+pub const MAX_JOBS: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // Records
@@ -200,9 +242,10 @@ pub struct QuantumTask {
     pub created_at: SystemTime,
     pub ended_at: Option<SystemTime>,
     pub failure_reason: Option<String>,
-    /// The ARN of the hybrid job that submitted this task. Stays `None` until
-    /// hybrid jobs exist: `CreateJob` is still a stub, so no `jobToken` a caller
-    /// presents can name one.
+    /// The ARN of the hybrid job that submitted this task. Stays `None`: a task is
+    /// attributed to a job through the `jobToken` the job's own container is handed,
+    /// and this emulator runs no job container, so no `jobToken` a caller presents
+    /// names a job it minted.
     pub job_arn: Option<String>,
     pub job_token: Option<String>,
     pub associations: Vec<Association>,
@@ -241,6 +284,53 @@ impl QuantumTask {
     }
 }
 
+/// A hybrid job created through `CreateJob`.
+///
+/// Every member `GetJob` reports is either stored here as the create supplied it or
+/// computed from the timestamps below; nothing is kept twice.
+#[derive(Debug, Clone)]
+pub struct HybridJob {
+    pub job_arn: String,
+    pub job_name: String,
+    /// A `JobPrimaryStatus` value.
+    pub status: String,
+    pub role_arn: String,
+    pub algorithm_specification: AlgorithmSpecification,
+    pub input_data_config: Vec<InputFileConfig>,
+    pub output_data_config: JobOutputDataConfig,
+    pub checkpoint_config: Option<JobCheckpointConfig>,
+    pub stopping_condition: Option<JobStoppingCondition>,
+    pub instance_config: InstanceConfig,
+    pub hyper_parameters: BTreeMap<String, String>,
+    pub device_config: DeviceConfig,
+    pub associations: Vec<Association>,
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    /// When the job entered `RUNNING`; `None` while it is still queued.
+    pub started_at: Option<SystemTime>,
+    /// When the job reached a terminal status; `None` until it does.
+    pub ended_at: Option<SystemTime>,
+    pub failure_reason: Option<String>,
+    /// When the `QUEUED` -> `RUNNING` transition falls due.
+    pub running_due: SystemTime,
+    /// When the terminal transition falls due.
+    pub terminal_due: SystemTime,
+}
+
+impl HybridJob {
+    /// Whether the job is in a status it can never leave.
+    pub fn is_terminal(&self) -> bool {
+        self.status == STATUS_COMPLETED
+            || self.status == STATUS_FAILED
+            || self.status == STATUS_CANCELLED
+    }
+
+    /// Whether the job still occupies the jobs queue.
+    pub fn is_queued(&self) -> bool {
+        self.status == STATUS_QUEUED
+    }
+}
+
 /// An `@idempotencyToken` this service has seen, and what it minted.
 #[derive(Debug, Clone)]
 pub struct IdempotencyRecord {
@@ -249,7 +339,8 @@ pub struct IdempotencyRecord {
     /// operation's own name takes part, so one token used for two different creates is
     /// a reuse rather than a replay.
     pub fingerprint: String,
-    /// The ARN that first use minted — a quantum task's or a spending limit's.
+    /// The ARN that first use minted — a quantum task's, a hybrid job's or a spending
+    /// limit's.
     pub resource_arn: String,
     /// When the token was first seen — what [`IDEMPOTENCY_TTL`] is measured from.
     pub recorded_at: SystemTime,
@@ -290,6 +381,8 @@ pub struct ComAmazonawsBraketBraketState {
     /// returns the first ARN instead of creating a second resource. Bounded: see
     /// [`ComAmazonawsBraketBraketState::prune_idempotency`].
     pub idempotency: BTreeMap<String, IdempotencyRecord>,
+    /// Every hybrid job created in this emulator, keyed by its ARN.
+    pub jobs: BTreeMap<String, HybridJob>,
 }
 
 impl Default for ComAmazonawsBraketBraketState {
@@ -299,6 +392,7 @@ impl Default for ComAmazonawsBraketBraketState {
             quantum_tasks: BTreeMap::new(),
             spending_limits: BTreeMap::new(),
             idempotency: BTreeMap::new(),
+            jobs: BTreeMap::new(),
         }
     }
 }
@@ -312,6 +406,60 @@ impl ComAmazonawsBraketBraketState {
     pub fn apply_due_transitions(&mut self, now: SystemTime) {
         for task in self.quantum_tasks.values_mut() {
             apply_due_transitions_to(task, now);
+        }
+        for job in self.jobs.values_mut() {
+            apply_due_transitions_to_job(job, now);
+        }
+    }
+
+    /// The jobs still waiting in the jobs queue, oldest first — the queue a hybrid
+    /// job's position is counted in.
+    ///
+    /// Call [`apply_due_transitions`](Self::apply_due_transitions) first, so a job the
+    /// clock has already started is not still reported as waiting.
+    pub fn queued_jobs(&self) -> Vec<&HybridJob> {
+        let mut queued: Vec<&HybridJob> =
+            self.jobs.values().filter(|job| job.is_queued()).collect();
+        queued.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.job_arn.cmp(&b.job_arn))
+        });
+        queued
+    }
+
+    /// How many hybrid jobs have not reached a terminal status — the number
+    /// [`MAX_JOBS_IN_FLIGHT`] bounds.
+    ///
+    /// Call [`apply_due_transitions`](Self::apply_due_transitions) first, so a job the
+    /// clock has already finished does not hold a slot.
+    pub fn jobs_in_flight(&self) -> usize {
+        self.jobs.values().filter(|job| !job.is_terminal()).count()
+    }
+
+    /// Make room for one more job record, the way
+    /// [`evict_finished_tasks_over_capacity`](Self::evict_finished_tasks_over_capacity)
+    /// makes room for one more task: drop the oldest TERMINAL jobs, with the
+    /// idempotency tokens that name them, until the store holds at most
+    /// `MAX_JOBS - 1`.
+    pub fn evict_finished_jobs_over_capacity(&mut self) {
+        if self.jobs.len() < MAX_JOBS {
+            return;
+        }
+        let mut finished: Vec<(SystemTime, String)> = self
+            .jobs
+            .values()
+            .filter(|job| job.is_terminal())
+            .map(|job| (job.ended_at.unwrap_or(job.created_at), job.job_arn.clone()))
+            .collect();
+        finished.sort();
+        for (_, arn) in finished {
+            if self.jobs.len() < MAX_JOBS {
+                break;
+            }
+            self.jobs.remove(&arn);
+            self.idempotency
+                .retain(|_, record| record.resource_arn != arn);
         }
     }
 
@@ -383,9 +531,11 @@ impl ComAmazonawsBraketBraketState {
     /// stores one.
     pub fn prune_idempotency(&mut self, now: SystemTime) {
         let tasks = &self.quantum_tasks;
+        let jobs = &self.jobs;
         let spending_limits = &self.spending_limits;
         self.idempotency.retain(|_, record| {
             if !tasks.contains_key(&record.resource_arn)
+                && !jobs.contains_key(&record.resource_arn)
                 && !spending_limits.contains_key(&record.resource_arn)
             {
                 return false;
@@ -471,6 +621,27 @@ impl ComAmazonawsBraketBraketState {
 /// carries: whole cents, never an exponent.
 pub fn usd(amount: f64) -> String {
     format!("{amount:.2}")
+}
+
+/// Apply the transitions `now` has made due to one hybrid job.
+///
+/// A job leaves `QUEUED` for `RUNNING` when [`JOB_RUNNING_SPAN`] is up, and ends at
+/// [`JOB_TERMINAL_SPAN`] in `FAILED`: nothing ran the algorithm, so
+/// [`JOB_NOT_EXECUTED_FAILURE_REASON`] is the reason it carries.
+fn apply_due_transitions_to_job(job: &mut HybridJob, now: SystemTime) {
+    if job.is_terminal() || job.status == STATUS_CANCELLING {
+        return;
+    }
+    if now >= job.running_due && job.started_at.is_none() {
+        job.started_at = Some(job.running_due);
+    }
+    if now >= job.terminal_due {
+        job.status = STATUS_FAILED.to_string();
+        job.ended_at = Some(job.terminal_due);
+        job.failure_reason = Some(JOB_NOT_EXECUTED_FAILURE_REASON.to_string());
+    } else if now >= job.running_due {
+        job.status = STATUS_RUNNING.to_string();
+    }
 }
 
 /// Apply the transitions `now` has made due to one task.
@@ -1281,9 +1452,23 @@ pub const ARN_RESOURCE_QUANTUM_TASK: &str = "quantum-task";
 /// The resource type a device ARN names (`DeviceResource`).
 pub const ARN_RESOURCE_DEVICE: &str = "device";
 
+/// The resource type a hybrid-job ARN names (`JobResource`), and the prefix
+/// `JobArn`'s own `@pattern` spells (`...:[0-9]{12}:job/.*$`).
+pub const ARN_RESOURCE_JOB: &str = "job";
+
 /// The resource type a spending-limit ARN names (`SpendingLimitResource`), and the
 /// resource prefix `CreateSpendingLimit` mints its ARNs with.
 pub const ARN_RESOURCE_SPENDING_LIMIT: &str = "spending-limit";
+
+/// The `position` a queue-info structure reports for a resource that is not waiting in
+/// its queue any more.
+///
+/// `QuantumTaskQueueInfo$position` and `HybridJobQueueInfo$position` are both required
+/// strings, and the Amazon Braket SDK documents `position` as "The current position of
+/// the quantum task in the queue. If the task is not in a queue, the position is
+/// 'None'"; a number here would claim the resource is still waiting. One definition for
+/// both queue-info structures, so the two cannot drift.
+pub const QUEUE_POSITION_NOT_QUEUED: &str = "None";
 
 /// Whether `value` is syntactically an Amazon Braket ARN naming `resource_type`.
 ///

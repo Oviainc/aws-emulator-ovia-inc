@@ -60,12 +60,69 @@
 //! label). [`service_common::front_door::FrontDoor`] is where that distinction lives:
 //! each modelled operation is served wrapped in it, and the wrapper reads the HTTP
 //! BINDING of the violated member off THAT operation's own input schema.
+//!
+//! ## And its one reworded refusal: an invalid ARN parameter
+//!
+//! What DOES key on the violation alone is the prose Braket gives one class of
+//! refusal: a parameter naming a resource by ARN whose value is not a valid ARN is
+//! refused as the modelled `ValidationException` worded `"<parameter> parameter is not
+//! valid."` — the parameter the caller got wrong, rather than the regular expression
+//! the framework walked. That is what the `GetJob` recording asserts (see
+//! [`invalid_arn_parameter`] for the citation), and the suite in
+//! `tests/all/request_body_rejection.rs` pins it over every ARN parameter the model
+//! gives a `@pattern` outside the body (`jobArn`, `spendingLimitArn`).
 
 use service_common::front_door::FrontDoor;
 use smithy_server_runtime::{
-    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code every Braket operation models for input that fails its constraints,
+/// and the one the framework's own refusal channel names for this restJson1 service.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The suffix of an ARN-shaped PARAMETER's member name. Every member of this service
+/// that names a resource by ARN spells it this way (`jobArn`, `quantumTaskArn`,
+/// `spendingLimitArn`, `deviceArn`, `resourceArn`).
+const ARN_MEMBER_SUFFIX: &str = "Arn";
+
+/// Braket's wording for an ARN-shaped parameter whose value is not a valid ARN: the
+/// parameter's own name, then a fixed clause — `"<parameter> parameter is not valid."`.
+///
+/// RECORDED: the behavioural recording behind
+/// `issues/things-that-now-work/20261022T134201Z-braket-getjob-stub.md`
+/// (`braket.braket-malformed-job-arn-returns-validation-not-not-found`) asserts exactly
+/// this message for `GetJob` with a `jobArn` that is not a hybrid-job ARN —
+/// `Message == "jobArn parameter is not valid."` — where the framework's own wording
+/// quotes the regular expression it walked instead. The parameter NAME is the only part
+/// that varies, and it comes from the request, so this generalises to the class rather
+/// than fitting the recorded value.
+///
+/// Narrow on purpose: ONE violation, of `@pattern`, on a TOP-LEVEL member named as an
+/// ARN. A member that fails some other constraint (a label longer than its `@length`
+/// bound, an absent member) failed something else and keeps the framework's wording,
+/// which states the constraint it broke; a body member's violation never reaches this
+/// seam, because [`FrontDoor`] answers that as a body rejection first.
+fn invalid_arn_parameter(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    let [violation] = violations.as_slice() else {
+        return None;
+    };
+    if !matches!(violation.kind, ViolationKind::Pattern(_)) {
+        return None;
+    }
+    let parameter = violation.path.as_str();
+    if parameter.contains('.') || !parameter.ends_with(ARN_MEMBER_SUFFIX) {
+        return None;
+    }
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message: format!("{parameter} parameter is not valid."),
+    })
+}
 
 /// The `com-amazonaws-braket-braket` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -181,8 +238,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `spendingLimitArn` or `jobArn` URI LABEL is answered `ValidationException`.
         // The one refusal this service words differently is a BODY that breaks a
         // modelled constraint, which `FrontDoor` answers before this walk is reached.
-        let _ = refusal;
-        None
+        //
+        // The code stays the modelled one in every case; what [`invalid_arn_parameter`]
+        // changes is the PROSE for the one class Braket words itself: an ARN-shaped
+        // parameter whose value is not a valid ARN is refused by naming that parameter
+        // (`"jobArn parameter is not valid."`) rather than by quoting the regular
+        // expression the framework walked.
+        invalid_arn_parameter(refusal)
     }
 
     fn override_routing_error(
