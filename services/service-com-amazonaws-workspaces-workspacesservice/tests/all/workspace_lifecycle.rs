@@ -85,7 +85,7 @@ pub(crate) async fn call(
 /// Asking the store about a future instant is deterministic, so the suite asserts the
 /// rule instead of racing a wall clock on a loaded runner. The handlers themselves
 /// always settle against the real clock.
-fn settle(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn settle(engine: &Arc<engine::InMemoryEngine>) {
     let state = service_state(&**engine).expect("the WorkSpaces state store");
     state
         .lock()

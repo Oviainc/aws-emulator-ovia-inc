@@ -41,9 +41,146 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: the modeled
+/// `ValidationException`, which every operation of this service declares with
+/// `@httpError 400` (the framework's own default code for a refusal, restated here
+/// because `override_refusal` replaces code and message together).
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Render one constraint violation the way this service states it.
+///
+/// The envelope and the clause skeleton are AWS's standard constraint report — `Value
+/// '<value>' at '<member path>' failed to satisfy constraint: <requirement>` — and two
+/// of its details are rules of how the report is BUILT rather than of the model it is
+/// built from:
+///
+/// * a `@pattern` is reported as the expression a value must satisfy, WITHOUT the `^` /
+///   `$` anchoring a model spells it with (see [`unanchored`]);
+/// * the echoed value is entity-escaped TWICE (see [`entity_escaped_twice`]).
+///
+/// Everything else — the member path, the bound a `@length` / `@range` clause states, and
+/// the membership of an enumerated value set — is read off the violation the framework
+/// reports. An enumerated set arrives in the order the MODEL declares (the framework
+/// reads it off the `@enum` trait / enum shape's member list, which is ordered) and is
+/// listed in that order: a set has no order of its own that the model or AWS's
+/// documentation fixes, and a report has to read the same on every run.
+///
+/// Returns `None` for a violation class this service has no wording for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent a sentence for it ([`ViolationKind`] is `#[non_exhaustive]`, so a
+/// class can be added upstream).
+pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
+    let requirement = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    };
+    let path = &violation.path;
+    Some(match &violation.value {
+        Some(shown) => format!(
+            "Value '{}' at '{path}' failed to satisfy constraint: {requirement}",
+            entity_escaped_twice(shown)
+        ),
+        // An absent member has no value to echo: that is a fact of the request's shape,
+        // not a value the caller sent, so there is nothing to escape.
+        None => format!("Value null at '{path}' failed to satisfy constraint: {requirement}"),
+    })
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
+/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
+/// it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The rejected value as the report echoes it: entity-escaped, then entity-escaped
+/// AGAIN, so a caller's `&` reaches the client as `&amp;amp;`.
+///
+/// Recorded AWS behaviour for this service: a value carrying a markup-significant
+/// character comes back doubly escaped, the validation frontend escaping it once while
+/// building the report and the response serializer escaping the result again. The rule
+/// is the double escape of the request-derived value; the clause around it is unchanged.
+/// Only the three characters that are markup-significant in text (`&`, `<`, `>`) are
+/// escaped — quotes are left alone, since the clause quotes the value with `'` of its
+/// own and no recorded response shows a quote escaped.
+fn entity_escaped_twice(value: &str) -> String {
+    entity_escaped(&entity_escaped(value))
+}
+
+/// One entity-escaping pass over the characters that are markup-significant in text.
+/// `&` is handled first by construction: each character is mapped independently, so an
+/// entity this pass introduces is never rescanned.
+///
+/// Deliberately NOT the framework's `xml_escape`: that one also escapes `"` and `'` and
+/// emits numeric references for control characters, which would alter values no recorded
+/// response attests, and it is an XML-envelope concern while this is a step in building
+/// the report's text.
+fn entity_escaped(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope (`N validation
+/// error(s) detected: `) over one clause per violation.
+///
+/// `None` declines the whole refusal — see [`constraint_clause`].
+pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
 /// first segment (`"/"`, `""`).
@@ -140,15 +277,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service states a constraint violation in AWS's standard validation
+        // report, which `constraint_envelope` builds: the anchors stripped from a
+        // modeled `@pattern` and the echoed value entity-escaped twice. An enumerated
+        // value set is listed in the order the MODEL declares — deliberately, since
+        // nothing fixes an order for a set, and a report has to read the same on every
+        // run. The code stays the modeled `ValidationException` (HTTP 400), which is
+        // what the framework would have answered — only the wording changes.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

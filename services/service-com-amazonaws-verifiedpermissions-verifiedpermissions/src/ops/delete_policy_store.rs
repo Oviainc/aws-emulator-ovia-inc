@@ -159,7 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store owns its policies, so removing it removes them too, and the
         // aliases that named it stop resolving.
         state.policy_stores.remove(&store_id);
-        state.aliases.retain(|_, target| *target != store_id);
+        state
+            .aliases
+            .retain(|_, alias| alias.policy_store_id != store_id);
         crate::ops::audit(ctx, "DeletePolicyStore", &store_id, "deleted");
 
         Ok(DeletePolicyStoreOutput {})

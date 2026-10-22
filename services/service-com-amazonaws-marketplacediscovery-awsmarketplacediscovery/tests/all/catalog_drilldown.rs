@@ -16,11 +16,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::EmulatedService;
 
 /// The model's `POST /2026-02-05/<op>` route prefix (`OPERATIONS.md`).
-const PREFIX: &str = "http://discovery-marketplace.us-east-1.amazonaws.com/2026-02-05";
+pub(crate) const PREFIX: &str = "http://discovery-marketplace.us-east-1.amazonaws.com/2026-02-05";
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name, which is what the router's `can_handle` routes on.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260205/us-east-1/aws-marketplace/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
