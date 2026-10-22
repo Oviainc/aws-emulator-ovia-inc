@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketNotificationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketNotificationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketNotificationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the notification configuration `PutBucketNotificationConfiguration` last set on
+//! a bucket — an empty `NotificationConfiguration` while the bucket has none.
 //!
 //! ## Shape of an operation
 //!
@@ -100,14 +93,22 @@ use super::types::*;
 // `GetBucketNotificationConfigurationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetBucketNotificationConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketNotificationConfiguration")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketNotificationConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket
+// does not exist", `httpError 404`). `extra_errors` widens the set with that shape, which
+// the SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketNotificationConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketNotificationConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,18 +162,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketNotificationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketNotificationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketNotificationConfiguration"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and the
+            // widened-in `NoSuchBucket` would be a false statement about it, so this goes
+            // out as the server fault S3 publishes for a request it could not carry out.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // Read-only: the guard is taken, the configuration is copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(
+                GetBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
+                    .into(),
+            );
+        };
+        let configuration = bucket.notification_configuration();
+
+        // "If notifications are not enabled on the bucket, the action returns an empty
+        // NotificationConfiguration element" (this operation's own documentation): an empty
+        // list is reported as an ABSENT member, so the body carries the empty container
+        // rather than empty `<TopicConfiguration/>` elements.
+        Ok(GetBucketNotificationConfigurationOutput {
+            topic_configurations: reported(&configuration.topic_configurations, |target| {
+                TopicConfiguration {
+                    id: target.id.clone(),
+                    topic_arn: target.arn.clone(),
+                    events: target.events.clone(),
+                    filter: reported_filter(target),
+                }
+            }),
+            queue_configurations: reported(&configuration.queue_configurations, |target| {
+                QueueConfiguration {
+                    id: target.id.clone(),
+                    queue_arn: target.arn.clone(),
+                    events: target.events.clone(),
+                    filter: reported_filter(target),
+                }
+            }),
+            lambda_function_configurations: reported(
+                &configuration.lambda_function_configurations,
+                |target| LambdaFunctionConfiguration {
+                    id: target.id.clone(),
+                    lambda_function_arn: target.arn.clone(),
+                    events: target.events.clone(),
+                    filter: reported_filter(target),
+                },
+            ),
+            // The shape has no members, so reporting it at all is what says EventBridge
+            // delivery is enabled.
+            event_bridge_configuration: configuration
+                .event_bridge_enabled
+                .then(EventBridgeConfiguration::default),
+        })
     }
+}
+
+/// One output list, or `None` when the bucket holds no configuration of that kind — so a
+/// bucket with no notifications configured reports the empty container AWS reports rather
+/// than three empty lists.
+fn reported<T>(
+    targets: &[crate::state::NotificationTarget],
+    report: impl Fn(&crate::state::NotificationTarget) -> T,
+) -> Option<Vec<T>> {
+    if targets.is_empty() {
+        return None;
+    }
+    Some(targets.iter().map(report).collect())
+}
+
+/// The `Filter` to report for a stored configuration, or `None` when it filters on no key
+/// name.
+///
+/// `NotificationConfigurationFilter` carries exactly one member, `Key`, whose own single
+/// member is the `FilterRules` list
+/// (`smithy_query(query="shape",shape="NotificationConfigurationFilter")`), so the rules
+/// the put recorded are reported in that nesting and in the order they were applied.
+fn reported_filter(
+    target: &crate::state::NotificationTarget,
+) -> Option<NotificationConfigurationFilter> {
+    let rules = target.filter_rules.as_ref()?;
+    Some(NotificationConfigurationFilter {
+        key: Some(S3KeyFilter {
+            filter_rules: Some(
+                rules
+                    .iter()
+                    .map(|rule| FilterRule {
+                        name: rule.name.clone(),
+                        value: rule.value.clone(),
+                    })
+                    .collect(),
+            ),
+        }),
+    })
 }

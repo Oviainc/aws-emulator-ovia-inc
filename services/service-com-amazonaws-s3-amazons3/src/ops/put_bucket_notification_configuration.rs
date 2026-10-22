@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketNotificationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketNotificationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketNotificationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets a bucket's whole event notification configuration, replacing whatever it carried
+//! before, and answers the modelled 200 with an empty body. `GetBucketNotificationConfiguration`
+//! reports what this stored.
 //!
 //! ## Shape of an operation
 //!
@@ -128,14 +122,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketNotificationCon
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketNotificationConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketNotificationConfiguration")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketNotificationConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket
+// that does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified
+// bucket does not exist", `httpError 404`). `extra_errors` widens the set with that shape,
+// which the SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketNotificationConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketNotificationConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -189,18 +191,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketNotificationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketNotificationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing about this write depends on request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // answering 200 would report a configuration that was never recorded, so this
+            // goes out as the server fault S3 publishes for a request it could not carry
+            // out (`InternalError`, HTTP 500) — the channel the object loop beside this one
+            // uses for the same case.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The container the request carried, in the order it arrived.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketNotificationConfiguration"))
+        // `SkipDestinationValidation` is read but cannot change the outcome here: AWS's
+        // destination validation is a test message to the SNS topic, SQS queue or Lambda
+        // function named, and this handler reaches none of those services, so every put
+        // behaves the way AWS behaves when validation is skipped — the configuration is
+        // recorded as given. What IS checked below is the request itself: the destination
+        // ARNs, the events, the filter rules and the ids.
+        let _ = input.skip_destination_validation;
+        let configuration = crate::state::BucketNotificationConfiguration {
+            topic_configurations: input
+                .notification_configuration
+                .topic_configurations
+                .iter()
+                .flatten()
+                .map(|configuration| crate::state::NotificationTarget {
+                    id: configuration.id.clone(),
+                    arn: configuration.topic_arn.clone(),
+                    events: configuration.events.clone(),
+                    filter_rules: stored_filter_rules(configuration.filter.as_ref()),
+                })
+                .collect(),
+            queue_configurations: input
+                .notification_configuration
+                .queue_configurations
+                .iter()
+                .flatten()
+                .map(|configuration| crate::state::NotificationTarget {
+                    id: configuration.id.clone(),
+                    arn: configuration.queue_arn.clone(),
+                    events: configuration.events.clone(),
+                    filter_rules: stored_filter_rules(configuration.filter.as_ref()),
+                })
+                .collect(),
+            lambda_function_configurations: input
+                .notification_configuration
+                .lambda_function_configurations
+                .iter()
+                .flatten()
+                .map(|configuration| crate::state::NotificationTarget {
+                    id: configuration.id.clone(),
+                    arn: configuration.lambda_function_arn.clone(),
+                    events: configuration.events.clone(),
+                    filter_rules: stored_filter_rules(configuration.filter.as_ref()),
+                })
+                .collect(),
+            // The shape has no members, so its presence in the request IS the state:
+            // "Enables delivery of events to Amazon EventBridge"
+            // (`NotificationConfiguration$EventBridgeConfiguration`).
+            event_bridge_enabled: input
+                .notification_configuration
+                .event_bridge_configuration
+                .is_some(),
+        };
+
+        // The bucket is looked up FIRST, so a request naming a bucket this emulator does
+        // not hold answers that — the way every other bucket subresource put orders the
+        // two refusals — rather than reporting what is wrong with a configuration the
+        // bucket could never have carried.
+        let mut store = state.lock();
+        if store.bucket(&input.bucket).is_none() {
+            return Err(
+                PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
+                    .into(),
+            );
+        }
+
+        // Validated BEFORE anything is written, because "the PUT notification is an atomic
+        // operation … If the message fails, the entire PUT action will fail, and Amazon S3
+        // will not add the configuration to your bucket" (this operation's own
+        // documentation). AWS refuses these with `InvalidArgument`, a code this service's
+        // model declares no shape for, so the refusal goes out through the unmodelled
+        // channel with the code and status S3 sends.
+        if let Err(rejection) = crate::state::validate_notification_configuration(&configuration) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                rejection.to_string(),
+            ));
+        }
+
+        // A replacement of the whole subresource, with an id minted for every
+        // configuration that named none. The bucket was found above and the guard has not
+        // been released since, so the `None` arm is unreachable; it answers the same 404
+        // rather than claiming a configuration was stored.
+        if store
+            .put_notification_configuration(&input.bucket, configuration)
+            .is_none()
+        {
+            return Err(
+                PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
+                    .into(),
+            );
+        }
+
+        // `Unit` output: success is the 200 and an empty body.
+        Ok(PutBucketNotificationConfigurationOutput)
     }
+}
+
+/// The key-name filter rules to record for a configuration's `Filter`, or `None` when it
+/// filters on nothing.
+///
+/// `NotificationConfigurationFilter` carries exactly one member, `Key`
+/// (`smithy_query(query="shape",shape="NotificationConfigurationFilter")`), so a `Filter`
+/// naming no `Key` restricts nothing and is recorded as no filter at all; a `Key` naming no
+/// `FilterRules` is an empty rule list, which is also what it filters by.
+fn stored_filter_rules(
+    filter: Option<&NotificationConfigurationFilter>,
+) -> Option<Vec<crate::state::NotificationFilterRule>> {
+    let key = filter?.key.as_ref()?;
+    Some(
+        key.filter_rules
+            .iter()
+            .flatten()
+            .map(|rule| crate::state::NotificationFilterRule {
+                name: rule.name.clone(),
+                value: rule.value.clone(),
+            })
+            .collect(),
+    )
 }
