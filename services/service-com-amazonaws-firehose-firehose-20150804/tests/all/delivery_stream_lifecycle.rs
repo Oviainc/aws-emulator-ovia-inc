@@ -7,6 +7,9 @@
 //! Every request goes through the real router (`POST /` with
 //! `X-Amz-Target: Firehose_20150804.<Op>`), so what is asserted here is the wire
 //! behaviour a client sees, not a handler called directly.
+//!
+//! The harness ([`Emulator`], [`s3_configuration`], [`error_code`]) is `pub(crate)` so a
+//! sibling suite in this test target reuses it instead of standing up a second one.
 
 use std::sync::Arc;
 use std::time::Duration;
