@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The Managed Blockchain accessor, end to end over HTTP: `CreateAccessor` persists an
-//! accessor and `GetAccessor` answers from that one record.
+//! accessor, `GetAccessor` answers from that one record, and `DeleteAccessor` moves that
+//! record from `AVAILABLE` to `PENDING_DELETION` and, on the clock, to `DELETED`.
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
 //! exercise routing, restJson1 (de)serialization, the handlers and the shared engine
@@ -13,13 +14,16 @@
 //! id-shaped lookup that names nothing stored, and each way a create request can be
 //! malformed.
 
+use std::time::Instant;
+
 use serde_json::{json, Value};
+use service_com_amazonaws_managedblockchain_taigawebservice::state::ACCESSOR_DELETION_SPAN;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The harness (a router over a fresh engine, a signed call, and the answer it returns)
 // is shared with the network/node suite rather than copied.
 use crate::network_and_node_lifecycle::{
-    call, is_date_time, is_resource_id, new_router, Answer, ACCOUNT, REGION,
+    call, is_date_time, is_resource_id, new_router, Answer, ACCOUNT, PAST_TRANSITION, REGION,
 };
 
 /// The only `AccessorType` the model declares (smithy_query: shape AccessorType =
@@ -419,4 +423,272 @@ async fn create_accessor_refuses_a_request_the_model_rejects() {
             answer.body
         );
     }
+}
+
+/// Read one accessor back.
+async fn get_accessor(router: &MultiServiceRouter, accessor_id: &str) -> Answer {
+    call(router, "GET", &format!("/accessors/{accessor_id}"), None).await
+}
+
+/// Delete one accessor.
+async fn delete_accessor(router: &MultiServiceRouter, accessor_id: &str) -> Answer {
+    call(router, "DELETE", &format!("/accessors/{accessor_id}"), None).await
+}
+
+/// `DeleteAccessor` moves the stored accessor to `PENDING_DELETION` — "After an accessor
+/// is deleted, the status of the accessor changes from AVAILABLE to PENDING_DELETION" —
+/// leaves every other property of the record exactly as the create persisted it, and the
+/// clock then owes the accessor `DELETED`.
+///
+/// The table spans the accessor class the rule generalises over: every `NetworkType` the
+/// model declares plus its omission, and tag counts from none to the published maximum.
+#[tokio::test]
+async fn delete_moves_the_accessor_to_pending_deletion_then_the_clock_owes_deleted() {
+    let router = new_router();
+
+    let cases: &[AccessorCase] = &[
+        AccessorCase {
+            token: "delete-mainnet",
+            network_type: Some("ETHEREUM_MAINNET"),
+            expected_network_type: "ETHEREUM_MAINNET",
+            tag_count: 0,
+        },
+        AccessorCase {
+            token: "delete-goerli",
+            network_type: Some("ETHEREUM_GOERLI"),
+            expected_network_type: "ETHEREUM_GOERLI",
+            tag_count: 2,
+        },
+        AccessorCase {
+            token: "delete-mainnet-and-goerli",
+            network_type: Some("ETHEREUM_MAINNET_AND_GOERLI"),
+            expected_network_type: "ETHEREUM_MAINNET_AND_GOERLI",
+            tag_count: 1,
+        },
+        AccessorCase {
+            token: "delete-polygon-mainnet",
+            network_type: Some("POLYGON_MAINNET"),
+            expected_network_type: "POLYGON_MAINNET",
+            tag_count: MAX_INPUT_TAGS,
+        },
+        AccessorCase {
+            token: "delete-polygon-mumbai",
+            network_type: Some("POLYGON_MUMBAI"),
+            expected_network_type: "POLYGON_MUMBAI",
+            tag_count: 3,
+        },
+        AccessorCase {
+            token: "delete-default-network-type",
+            network_type: None,
+            expected_network_type: "ETHEREUM_MAINNET_AND_GOERLI",
+            tag_count: 0,
+        },
+    ];
+
+    let mut deleted_ids: Vec<String> = Vec::new();
+    for case in cases {
+        let &AccessorCase {
+            token,
+            network_type,
+            tag_count,
+            expected_network_type,
+        } = case;
+        let created = create_accessor(&router, token, network_type, tag_count).await;
+        let accessor_id = created.text(&["AccessorId"]);
+        let before = get_accessor(&router, &accessor_id).await;
+        assert_eq!(
+            before.body["Accessor"]["Status"].as_str(),
+            Some("AVAILABLE"),
+            "case {case:?}: expected the accessor to start AVAILABLE, got {:?}",
+            before.body
+        );
+
+        let started = Instant::now();
+        let answer = delete_accessor(&router, &accessor_id).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected DeleteAccessor 200, got {} {:?}",
+            answer.status, answer.body
+        );
+
+        // `PENDING_DELETION` is where the delete leaves the accessor, and the record is
+        // still readable: `AccessorStatus` has a value for each stage of the deletion
+        // (smithy_query: shape AccessorStatus = AVAILABLE | PENDING_DELETION | DELETED).
+        let after = get_accessor(&router, &accessor_id).await;
+        assert!(
+            started.elapsed() < ACCESSOR_DELETION_SPAN,
+            "case {case:?}: this row must read the accessor back inside the deletion span \
+             ({ACCESSOR_DELETION_SPAN:?}), but {:?} had already passed",
+            started.elapsed()
+        );
+        assert_eq!(
+            after.status, 200,
+            "case {case:?}: expected GetAccessor 200 for the deleted accessor, got {} {:?}",
+            after.status, after.body
+        );
+        assert_eq!(
+            after.body["Accessor"]["Status"].as_str(),
+            Some("PENDING_DELETION"),
+            "case {case:?}: expected Accessor.Status PENDING_DELETION after the delete, got {:?}",
+            after.body
+        );
+        assert_eq!(
+            after.body["Accessor"]["NetworkType"].as_str(),
+            Some(expected_network_type),
+            "case {case:?}: expected the stored NetworkType {expected_network_type} to survive \
+             the delete, got {:?}",
+            after.body
+        );
+
+        // The delete changes the STATUS and nothing else: every other property is the one
+        // the create persisted.
+        let mut expected = before.body["Accessor"].clone();
+        expected["Status"] = Value::String("PENDING_DELETION".to_string());
+        assert_eq!(
+            after.body["Accessor"], expected,
+            "case {case:?}: expected only Accessor.Status to change, got {:?} from {:?}",
+            after.body, before.body
+        );
+
+        // A second delete inside the span is a success that moves nothing: the accessor
+        // is already on its way out, and the operation models no state-conflict error.
+        let again = delete_accessor(&router, &accessor_id).await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: expected a repeated DeleteAccessor 200, got {} {:?}",
+            again.status, again.body
+        );
+
+        deleted_ids.push(accessor_id);
+    }
+
+    // Past the deletion span the clock owes every one of them `DELETED`.
+    tokio::time::sleep(PAST_TRANSITION).await;
+    for (case, accessor_id) in cases.iter().zip(&deleted_ids) {
+        let settled = get_accessor(&router, accessor_id).await;
+        assert_eq!(
+            settled.body["Accessor"]["Status"].as_str(),
+            Some("DELETED"),
+            "case {case:?}: expected Accessor.Status DELETED once the deletion came due, got {:?}",
+            settled.body
+        );
+        // `DELETED` is terminal, and a read of it changes nothing a later caller sees.
+        let again = get_accessor(&router, accessor_id).await;
+        assert_eq!(
+            again.body, settled.body,
+            "case {case:?}: expected GetAccessor to answer identically twice, got {:?} then {:?}",
+            settled.body, again.body
+        );
+    }
+}
+
+/// Deleting an accessor whose deletion has already finished is a success that leaves it
+/// in its terminal `DELETED` status: `DeleteAccessor` starts a deletion once, so a repeat
+/// neither moves the status back nor re-arms the transition.
+#[tokio::test]
+async fn a_repeated_delete_leaves_the_accessor_deleted() {
+    let router = new_router();
+
+    // Rows: how many times the accessor is deleted after it has already settled.
+    let repeats: &[usize] = &[1, 2, 5];
+
+    for repeat in repeats {
+        let created = create_accessor(
+            &router,
+            &format!("repeat-delete-{repeat}"),
+            Some("ETHEREUM_MAINNET"),
+            1,
+        )
+        .await;
+        let accessor_id = created.text(&["AccessorId"]);
+
+        let answer = delete_accessor(&router, &accessor_id).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {repeat:?}: expected the first DeleteAccessor 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        tokio::time::sleep(PAST_TRANSITION).await;
+        let settled = get_accessor(&router, &accessor_id).await;
+        assert_eq!(
+            settled.body["Accessor"]["Status"].as_str(),
+            Some("DELETED"),
+            "case {repeat:?}: expected the accessor to settle DELETED, got {:?}",
+            settled.body
+        );
+
+        for attempt in 0..*repeat {
+            let answer = delete_accessor(&router, &accessor_id).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {repeat:?} attempt {attempt}: expected a repeated DeleteAccessor 200, got \
+                 {} {:?}",
+                answer.status, answer.body
+            );
+            let read = get_accessor(&router, &accessor_id).await;
+            assert_eq!(
+                read.body, settled.body,
+                "case {repeat:?} attempt {attempt}: expected the repeat to leave the record as \
+                 it was, got {:?} from {:?}",
+                read.body, settled.body
+            );
+        }
+    }
+}
+
+/// An accessor id nothing minted cannot be deleted: `DeleteAccessor` models
+/// `ResourceNotFoundException` (HTTP 404) for "a requested resource doesn't exist", and
+/// the refusal changes no stored accessor.
+#[tokio::test]
+async fn delete_accessor_refuses_an_id_nothing_holds() {
+    let router = new_router();
+
+    // One accessor exists, so these are refused for naming nothing stored rather than
+    // because the store is empty.
+    let created = create_accessor(&router, "the-kept-accessor", Some("POLYGON_MUMBAI"), 2).await;
+    let existing = created.text(&["AccessorId"]);
+    let before = get_accessor(&router, &existing).await;
+
+    // Rows span the id shapes a caller can name: an unminted accessor id, another
+    // resource family's id, a one-character id, `ResourceIdString`'s 32-character
+    // maximum, and the stored id with one suffix character changed.
+    let unknown_ids: &[String] = &[
+        "ac-ZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+        format!("nd-{}", "Y".repeat(26)),
+        "q".to_string(),
+        "z".repeat(32),
+        format!(
+            "ac-{}{}",
+            if existing[3..4] == *"A" { "B" } else { "A" },
+            &existing[4..]
+        ),
+    ];
+
+    for id in unknown_ids {
+        let answer = delete_accessor(&router, id).await;
+        assert_eq!(
+            answer.status, 404,
+            "case {id:?}: expected DeleteAccessor 404, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_type, "ResourceNotFoundException",
+            "case {id:?}: expected ResourceNotFoundException, got {:?} {:?}",
+            answer.error_type, answer.body
+        );
+    }
+
+    // The accessor that does exist is untouched by the refusals.
+    let after = get_accessor(&router, &existing).await;
+    assert_eq!(
+        after.body, before.body,
+        "expected the stored accessor {existing} to be untouched, got {:?} from {:?}",
+        after.body, before.body
+    );
+    assert_eq!(
+        after.body["Accessor"]["Status"].as_str(),
+        Some("AVAILABLE"),
+        "expected the stored accessor {existing} to still be AVAILABLE, got {:?}",
+        after.body
+    );
 }

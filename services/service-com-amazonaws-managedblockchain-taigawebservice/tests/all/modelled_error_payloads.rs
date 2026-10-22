@@ -257,6 +257,13 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             resource_type: "Accessor",
             id: gone_accessor.clone(),
         },
+        NotFoundCase {
+            case: "DeleteAccessor/unknown",
+            method: "DELETE",
+            path: format!("/accessors/{gone_accessor}"),
+            resource_type: "Accessor",
+            id: gone_accessor.clone(),
+        },
         // A LISTING that models the exception answers it the same way: the scope it
         // could not resolve is named in `Message`, with no `ResourceName`.
         NotFoundCase {

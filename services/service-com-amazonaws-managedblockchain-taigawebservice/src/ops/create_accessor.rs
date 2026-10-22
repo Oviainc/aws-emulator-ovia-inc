@@ -229,6 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `AccessorStatus` declares no creating state at all, so an accessor is
             // ready as soon as it exists and the clock owes it no transition.
             status: crate::state::ACCESSOR_STATUS_AVAILABLE.to_string(),
+            // Nothing has deleted this accessor, so no `DELETED` transition is owed.
+            deleted_at: None,
             creation_date: now,
             tags: crate::state::map_in(input.tags),
             // The blockchain network the token is created for, as the request named it;
