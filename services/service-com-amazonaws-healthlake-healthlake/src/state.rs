@@ -7,6 +7,10 @@
 //! `TagResource` / `ListTagsForResource` / `UpdateFHIRDatastore` /
 //! `DeleteFHIRDatastore` all read and write the SAME record, so a create is
 //! observable through every one of them.
+//!
+//! The data transformation profile is the second: `CreateDataTransformationProfile`
+//! mints one in DRAFT here and `GetDataTransformationProfile` reads the SAME
+//! record back, version by version.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -60,6 +64,22 @@ pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "Could not find specified datastor
 /// is one fixed text for "the data store cannot be written to right now".
 pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str = "Specified datastore is not active.";
 
+/// The sentence this service's `ResourceNotFoundException` carries when the
+/// request names a data transformation profile no record holds.
+///
+/// Fixed, for the reason [`DATASTORE_NOT_FOUND_MESSAGE`] is: the same sentence
+/// whatever `ProfileId` was asked about, so a not-found answer never quotes the
+/// request back at the caller. Every profile not-found path in this crate states
+/// it through this one constant.
+pub const PROFILE_NOT_FOUND_MESSAGE: &str = "Could not find specified profile.";
+
+/// The sentence this service's `ResourceNotFoundException` carries when the
+/// profile exists but not at the version the request asked for — a version that
+/// was never published, or a latest published version on a profile that has only
+/// its DRAFT. Fixed for the same reason as [`PROFILE_NOT_FOUND_MESSAGE`].
+pub const PROFILE_VERSION_NOT_FOUND_MESSAGE: &str =
+    "Could not find specified profile version.";
+
 /// The most data stores this emulator holds at once.
 ///
 /// A ceiling, not a claim about any AWS quota: it exists so a `CreateFHIRDatastore`
@@ -94,6 +114,57 @@ const DATASTORE_ARN_RESOURCE_PREFIX: &str = "datastore/fhir/";
 /// The enabled value of the modelled `BackupStatus` enum
 /// (`BACKUP_STATUS_VALUES` = `["DISABLED", "ENABLED"]`).
 const BACKUP_ENABLED: &str = "ENABLED";
+
+/// The `dataTransformationProfile` resource prefix of a HealthLake data
+/// transformation profile ARN, as the same modelled `AmazonResourceName`
+/// pattern spells it, and as the `DataTransformationProfile` resource's
+/// `aws.api#arn` template does (`dataTransformationProfile/{ProfileId}`).
+const PROFILE_ARN_RESOURCE_PREFIX: &str = "dataTransformationProfile/";
+
+/// The version number that names a data transformation profile's DRAFT.
+///
+/// `CreateDataTransformationProfile` documents it: "The starting version is
+/// always 0, which indicates the profile is in DRAFT state", and
+/// `GetDataTransformationProfile` reads it back the same way ("Specify 0 to
+/// retrieve the DRAFT version").
+pub const DRAFT_PROFILE_VERSION: i32 = 0;
+
+/// The highest version number a data transformation profile reaches, from the
+/// modelled `ProfileVersion` range (0..99): the DRAFT is 0, so at most 99
+/// published versions exist.
+pub const MAX_PROFILE_VERSION: i32 = 99;
+
+/// The most mapping entries one profile version holds, from the modelled
+/// `ProfileMapping` map's own length bound (1..500) — the shape
+/// `GetDataTransformationProfile` reports the content through, so content past
+/// it could be stored but never read back.
+pub const MAX_PROFILE_MAPPING_ENTRIES: usize = 500;
+
+/// The fewest mapping entries one profile version holds, from the same
+/// modelled `ProfileMapping` length bound (1..500): a profile version always
+/// carries content.
+pub const MIN_PROFILE_MAPPING_ENTRIES: usize = 1;
+
+/// The longest mapping key, from the modelled `ProfileMappingKey` length bound
+/// (1..500).
+pub const MAX_PROFILE_MAPPING_KEY_LEN: usize = 500;
+
+/// The longest mapping value, from the modelled `ProfileMappingValue` length
+/// bound (0..102400).
+pub const MAX_PROFILE_MAPPING_VALUE_LEN: usize = 102_400;
+
+/// The most data transformation profiles this emulator holds at once.
+///
+/// A ceiling, not a claim about any AWS quota: it exists so a
+/// `CreateDataTransformationProfile` loop cannot grow the emulator's heap
+/// without bound. `CreateDataTransformationProfile` refuses past it with the
+/// `ServiceQuotaExceededException` it models.
+pub const MAX_PROFILES: usize = 100;
+
+/// The most `ClientToken` entries kept for `CreateDataTransformationProfile`
+/// idempotency — one per profile that can be stored, for the same reason
+/// [`MAX_CLIENT_TOKENS`] bounds the data store tokens.
+pub const MAX_PROFILE_CLIENT_TOKENS: usize = MAX_PROFILES;
 
 /// The states a data store moves through in this slice, as the modelled
 /// `DatastoreStatus` enum names them on the wire. The states the enum also
@@ -234,6 +305,135 @@ pub struct ClientTokenRecord {
     pub fingerprint: String,
 }
 
+/// What one `CreateDataTransformationProfile` `ClientToken` recorded: the
+/// profile it minted and a fingerprint of the request that minted it.
+///
+/// Kept apart from [`ClientTokenRecord`] because the two operations mint
+/// different resources: one caller's token for a data store must never resolve
+/// to a profile, or the other way round.
+#[derive(Debug, Clone)]
+pub struct ProfileClientTokenRecord {
+    pub profile_id: String,
+    pub fingerprint: String,
+}
+
+/// One version of a data transformation profile: its content, why it changed,
+/// and when it last did.
+///
+/// The DRAFT (version [`DRAFT_PROFILE_VERSION`]) is the mutable one; a
+/// published version is an immutable snapshot of the DRAFT taken when it was
+/// published, which is why the two are the same record type.
+#[derive(Debug, Clone)]
+pub struct ProfileVersionRecord {
+    pub version: i32,
+    /// The profile content, keyed by file path. A `BTreeMap` so the content a
+    /// caller reads back is ordered the same way on every read. Satisfies the
+    /// modelled `ProfileMapping` bounds — see [`validate_profile_mapping`].
+    pub mapping: BTreeMap<String, String>,
+    pub change_description: Option<String>,
+    pub last_updated_at: ::aws_smithy_types::DateTime,
+}
+
+impl ProfileVersionRecord {
+    /// The content as the modelled `ProfileMapping`, the shape
+    /// `GetDataTransformationProfile` reports it through.
+    pub fn profile_mapping(&self) -> ::std::collections::HashMap<String, String> {
+        self.mapping
+            .iter()
+            .map(|(path, content)| (path.clone(), content.clone()))
+            .collect()
+    }
+}
+
+/// One persisted data transformation profile: the metadata
+/// `CreateDataTransformationProfile` was given, plus its DRAFT and every
+/// version published from it.
+#[derive(Debug)]
+pub struct DataTransformationProfile {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The format the profile converts FROM, as the modelled `SourceFormat`
+    /// enum spells it on the wire.
+    pub source_format: String,
+    /// The format the profile converts TO. The modelled `TargetFormat` enum
+    /// declares exactly one value, which `CreateDataTransformationProfile`
+    /// documents as "Always FHIR_R4" — stored rather than re-derived so a
+    /// later value of the enum does not silently change an existing profile.
+    pub target_format: String,
+    pub kms_key_id: Option<String>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    /// Version [`DRAFT_PROFILE_VERSION`], the one `UpdateDataTransformationProfile`
+    /// rewrites. A profile always has one: it is created in DRAFT state.
+    pub draft: ProfileVersionRecord,
+    /// The published versions, by version number (1..=[`MAX_PROFILE_VERSION`]).
+    /// A `BTreeMap` so "the latest published version" is its last key and a
+    /// listing is in a stable order.
+    pub published: BTreeMap<i32, ProfileVersionRecord>,
+    /// Tags by key, seeded from `CreateDataTransformationProfile`'s `Tags`, so
+    /// the reported order is stable across reads.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl DataTransformationProfile {
+    /// The version `version` names: the DRAFT at [`DRAFT_PROFILE_VERSION`], a
+    /// published snapshot above it, or `None` when this profile has no such
+    /// version.
+    pub fn version(&self, version: i32) -> Option<&ProfileVersionRecord> {
+        if version == DRAFT_PROFILE_VERSION {
+            Some(&self.draft)
+        } else {
+            self.published.get(&version)
+        }
+    }
+
+    /// The highest published version, or `None` while the profile has only its
+    /// DRAFT — which is what `GetDataTransformationProfile` resolves when the
+    /// caller omits the version ("the service returns the latest published
+    /// version").
+    pub fn latest_published(&self) -> Option<&ProfileVersionRecord> {
+        self.published.values().next_back()
+    }
+}
+
+/// Refuse profile content the modelled `ProfileMapping` could not carry, with
+/// the member and the bound it violates.
+///
+/// The create/update SOURCE shapes take an unconstrained `StringMap`, but the
+/// content is read back through `ProfileMapping` (1..500 entries, keys 1..500,
+/// values 0..102400), so content past those bounds could be stored and never
+/// read. `Ok(())` means every bound holds.
+pub fn validate_profile_mapping(mapping: &BTreeMap<String, String>) -> Result<(), String> {
+    if mapping.len() < MIN_PROFILE_MAPPING_ENTRIES {
+        return Err(format!(
+            "ProfileMapping must hold at least {MIN_PROFILE_MAPPING_ENTRIES} entry, got {}",
+            mapping.len()
+        ));
+    }
+    if mapping.len() > MAX_PROFILE_MAPPING_ENTRIES {
+        return Err(format!(
+            "ProfileMapping must hold at most {MAX_PROFILE_MAPPING_ENTRIES} entries, got {}",
+            mapping.len()
+        ));
+    }
+    for (path, content) in mapping {
+        if path.is_empty() || path.chars().count() > MAX_PROFILE_MAPPING_KEY_LEN {
+            return Err(format!(
+                "every ProfileMapping key must be 1..{MAX_PROFILE_MAPPING_KEY_LEN} characters long, got one of {}",
+                path.chars().count()
+            ));
+        }
+        if content.chars().count() > MAX_PROFILE_MAPPING_VALUE_LEN {
+            return Err(format!(
+                "every ProfileMapping value must be at most {MAX_PROFILE_MAPPING_VALUE_LEN} characters long, got one of {}",
+                content.chars().count()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Per-service state for com-amazonaws-healthlake-healthlake. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsHealthlakeHealthlakeState {
@@ -252,6 +452,21 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// How many data stores have been minted, mixed into the next identifier so
     /// two creates in the same clock tick still get distinct ones.
     pub datastores_created: u64,
+    /// Every data transformation profile, by `ProfileId`. A `BTreeMap` so
+    /// `ListDataTransformationProfiles` pages in a stable, resumable order.
+    /// Bounded by [`MAX_PROFILES`].
+    pub profiles: BTreeMap<String, DataTransformationProfile>,
+    /// `CreateDataTransformationProfile` idempotency: `ClientToken` -> what the
+    /// first call with that token minted. Bounded by
+    /// [`MAX_PROFILE_CLIENT_TOKENS`]; write it through
+    /// [`Self::record_profile_client_token`], never directly.
+    pub profile_client_tokens: BTreeMap<String, ProfileClientTokenRecord>,
+    /// The order [`Self::profile_client_tokens`] was written in, so the cap
+    /// evicts the oldest token rather than an arbitrary one.
+    profile_client_token_order: VecDeque<String>,
+    /// How many profiles have been minted, mixed into the next identifier so two
+    /// creates in the same clock tick still get distinct ones.
+    pub profiles_created: u64,
 }
 
 impl ComAmazonawsHealthlakeHealthlakeState {
@@ -360,23 +575,88 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// the modelled data store ARN requires (`datastore/fhir/.{32}`) and what
     /// `DatastoreId`'s own length bound (1..32) allows.
     pub fn next_datastore_id(&mut self, created_at: SystemTime) -> String {
-        use sha2::Digest;
-
-        let nanos = created_at
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
         loop {
             self.datastores_created += 1;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(self.datastores_created.to_be_bytes());
-            hasher.update(nanos.to_be_bytes());
-            let id = hex::encode(&hasher.finalize()[..16]);
+            let id = mint_hex_id(
+                DATASTORE_ARN_RESOURCE_PREFIX,
+                self.datastores_created,
+                created_at,
+            );
             if !self.datastores.contains_key(&id) {
                 return id;
             }
         }
     }
+
+    /// Record `token` as having minted `profile_id` from a request with
+    /// `fingerprint`, evicting the oldest token first if that would push the map
+    /// past [`MAX_PROFILE_CLIENT_TOKENS`].
+    pub fn record_profile_client_token(
+        &mut self,
+        token: String,
+        profile_id: &str,
+        fingerprint: String,
+    ) {
+        while self.profile_client_tokens.len() >= MAX_PROFILE_CLIENT_TOKENS {
+            match self.profile_client_token_order.pop_front() {
+                Some(oldest) => {
+                    self.profile_client_tokens.remove(&oldest);
+                }
+                // The order queue and the map are written together, so this is
+                // unreachable; clearing rather than looping forever keeps the
+                // cap an invariant even if they ever drift.
+                None => {
+                    self.profile_client_tokens.clear();
+                    break;
+                }
+            }
+        }
+        if self
+            .profile_client_tokens
+            .insert(
+                token.clone(),
+                ProfileClientTokenRecord {
+                    profile_id: profile_id.to_string(),
+                    fingerprint,
+                },
+            )
+            .is_none()
+        {
+            self.profile_client_token_order.push_back(token);
+        }
+    }
+
+    /// Mint an unused `ProfileId`: 32 lowercase hex characters, which is
+    /// exactly what the modelled `ProfileIdString` pattern (`^[a-f0-9]{32}$`)
+    /// and the profile ARN template both require.
+    pub fn next_profile_id(&mut self, created_at: SystemTime) -> String {
+        loop {
+            self.profiles_created += 1;
+            let id = mint_hex_id(PROFILE_ARN_RESOURCE_PREFIX, self.profiles_created, created_at);
+            if !self.profiles.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+}
+
+/// One 32-lowercase-hex identifier, the form this service's resource ids and ARNs
+/// take, minted from the resource's own `domain` prefix, the mint counter and the
+/// creation instant — so an identifier leaks neither verbatim, two creates in the
+/// same clock tick still differ, and the two resource kinds cannot collide on one
+/// hash. Shared by every mint here; the caller re-mints while the id is taken.
+fn mint_hex_id(domain: &str, counter: u64, created_at: SystemTime) -> String {
+    use sha2::Digest;
+
+    let nanos = created_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(counter.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    hex::encode(&hasher.finalize()[..16])
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -422,6 +702,60 @@ pub fn datastore_arn(region: &str, id: &str) -> String {
 /// The FHIR endpoint of the data store `id` in `region`.
 pub fn datastore_endpoint(region: &str, id: &str) -> String {
     format!("https://healthlake.{region}.amazonaws.com/datastore/{id}/r4/")
+}
+
+/// The ARN of the data transformation profile `id` in `region`, in the form the
+/// modelled `AmazonResourceName` pattern and the `DataTransformationProfile`
+/// resource's `aws.api#arn` template both require.
+pub fn profile_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        "healthlake",
+        region,
+        &format!("{PROFILE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// A stable fingerprint of the fields that define one request, for `ClientToken`
+/// idempotency: a token resolves to the resource it minted only for a repeat of
+/// the SAME request, and a token reused with a different request is refused.
+///
+/// Fields are hashed LENGTH-PREFIXED, so two different splits of the same bytes
+/// cannot fingerprint alike. Every field a caller passes must have a CANONICAL
+/// form: order a map (a `BTreeMap`, never the `HashMap` a modelled map
+/// deserializes into — its iteration order differs per instance) and render
+/// presence explicitly, or two identical requests fingerprint differently and
+/// idempotency breaks.
+pub fn request_fingerprint<I: IntoIterator<Item = String>>(fields: I) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    for field in fields {
+        hasher.update(field.len().to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// One optional member as a fingerprint field, so an absent member and an empty
+/// one are different requests rather than being collapsed by a default.
+pub fn optional_field(member: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("{member}=present:{value}"),
+        None => format!("{member}=absent"),
+    }
+}
+
+/// Whether `id` has the shape of a `ProfileId`, i.e. satisfies the modelled
+/// `ProfileIdString` pattern `^[a-f0-9]{32}$`.
+///
+/// The members that carry a `ProfileId` INSIDE a source union target a plain
+/// `String`, so the boundary validator does not hold them to that pattern; a
+/// handler reading one must.
+pub fn is_profile_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The `DatastoreId` named by a HealthLake data store ARN, or `None` when the

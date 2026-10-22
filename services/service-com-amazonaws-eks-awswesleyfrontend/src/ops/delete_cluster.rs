@@ -11,6 +11,11 @@
 //! `InvalidRequestException` and left in the store: "the cluster cannot be deleted
 //! unless deletion protection is first disabled".
 //!
+//! A capability exists only inside a cluster — its key and its ARN both name one — so the
+//! cluster leaving the store takes its capabilities with it. Without that, a later cluster
+//! created with the same name in the same region would inherit the deleted cluster's
+//! capabilities.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -184,6 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found());
         };
         guard.arn_index.remove(&record.arn);
+        guard.remove_capabilities_of(&key.0, &key.1);
         // An EKS Pod Identity association is a child of its cluster, so the
         // cluster's associations go with it: a cluster later created with the same
         // name in the same Region must not inherit the deleted cluster's

@@ -19,11 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::{
-    AnswerRecord, ChoiceAnswerRecord,
-};
+use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord;
 
-use super::workload_harness::{created_id, minimal_create, Answer, Client};
+use super::workload_harness::{
+    answered, created_id, minimal_create, official_lens_arn, Answer, Client,
+};
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
 /// by pillar in the order the framework presents them: OPS 1-11, SEC 1-11, REL 1-13,
@@ -64,21 +64,6 @@ const PAGE_CEILING: usize = 50;
 
 fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
     answer.body.get(name).and_then(Value::as_str).unwrap_or("")
-}
-
-/// The ARN an AWS-OFFICIAL lens carries: "the lens ARN, such as
-/// `arn:aws:wellarchitected:us-east-1::lens/serverless`" (`LensAlias` doc) — the account
-/// segment is EMPTY, because AWS publishes the lens rather than an account owning it.
-/// Spelled out here (rather than read back out of the code under test) with the account
-/// placeholder taken from the emulator's one source of truth, so the row would fail if
-/// an owner account appeared in it.
-fn official_lens_arn(region: &str, alias: &str) -> String {
-    let arn = format!("arn:aws:wellarchitected:{region}::lens/{alias}");
-    assert!(
-        !arn.contains(engine::emulator_account_id()),
-        "an AWS-official lens ARN names no owner account, got {arn:?}"
-    );
-    arn
 }
 
 async fn list_answers(client: &Client, workload_id: &str, lens: &str, query: &[String]) -> Answer {
@@ -170,33 +155,6 @@ async fn collect_answers(
     }
 
     (collected, pages)
-}
-
-/// An answer that records `selected` as the best practices in place and `choices` as the
-/// status of each choice it speaks about.
-fn answered(
-    selected: &[&str],
-    choices: &[(&str, &str)],
-    is_applicable: bool,
-    reason: Option<&str>,
-) -> AnswerRecord {
-    AnswerRecord {
-        selected_choices: selected.iter().map(ToString::to_string).collect(),
-        choice_answers: choices
-            .iter()
-            .map(|(choice_id, status)| {
-                (
-                    (*choice_id).to_string(),
-                    ChoiceAnswerRecord {
-                        status: (*status).to_string(),
-                        reason: None,
-                    },
-                )
-            })
-            .collect(),
-        is_applicable,
-        reason: reason.map(ToString::to_string),
-    }
 }
 
 async fn framework_workload(client: &Client, name: &str) -> String {

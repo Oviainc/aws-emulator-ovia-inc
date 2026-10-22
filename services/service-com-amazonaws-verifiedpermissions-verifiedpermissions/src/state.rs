@@ -198,9 +198,25 @@ pub const MAX_CLIENT_TOKENS: usize = 10_000;
 /// response" — `ListPolicies` and `ListIdentitySources` both state it, in those
 /// words, for their own item. Every list operation here is `@paginated`, so an
 /// absent `maxResults` must not mean "the whole store in one response": the
-/// caller gets a bounded page plus a `nextToken`. ONE constant, so two list
-/// operations of one service cannot page differently.
+/// caller gets a bounded page plus a `nextToken`. ONE constant for every list
+/// operation whose model states that figure, so they cannot page differently.
+///
+/// `ListPolicyStoreAliases` is the one operation whose own documentation states
+/// a different figure — and whose `maxResults` carries a modelled `@default` to
+/// match — so it reads [`ALIAS_DEFAULT_PAGE_SIZE`] instead; a page size is
+/// per-operation only where the model says so, and both constants live here so
+/// that is visible in one place.
 pub const DEFAULT_PAGE_SIZE: usize = 10;
+
+/// The page size `ListPolicyStoreAliases` uses when the caller names no
+/// `maxResults`, from `ListPolicyStoreAliasesInput$maxResults`'s own
+/// documentation: "If you do not specify this parameter, the operation defaults
+/// to 5 policy store aliases per response" — which that member also carries as
+/// its modelled `@default: 5`, unlike the other list operations' `maxResults`.
+/// The framework materialises that modelled default before a handler runs, so
+/// this is the handler's own fallback for a value that is no usable page size at
+/// all.
+pub const ALIAS_DEFAULT_PAGE_SIZE: usize = 5;
 
 /// The largest page a list operation of this service will build, whatever
 /// `maxResults` asks for, from the next sentence of that same documentation:

@@ -206,6 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_max_results(input.max_results),
             crate::state::check_language(input.language.as_deref()),
             crate::state::check_political_view(input.political_view.as_deref()),
+            // `SearchTextRequest$QueryText` is modeled `len 1..200`; enforced here
+            // too, so an in-process caller is held to the same ceiling as a client
+            // on the wire.
+            crate::state::check_query_text(input.query_text.as_deref(), "QueryText"),
         ] {
             if let Err(invalid) = invalid {
                 return Err(SearchTextErrorModeled::ValidationException(invalid).into());
@@ -432,8 +436,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 SearchTextResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title.clone(),
-                    address: Some(place.address.to_modeled()),
+                    title: place.title_modeled(),
+                    address: Some(place.address_modeled()),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),

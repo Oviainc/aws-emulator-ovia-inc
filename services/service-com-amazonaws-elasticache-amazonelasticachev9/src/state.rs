@@ -29,10 +29,11 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AvailabilityZone, CacheCluster, CacheNode, CacheParameterGroupStatus, CacheSubnetGroup,
-    DestinationDetails, Endpoint, LogDeliveryConfiguration, LogDeliveryConfigurationRequest,
-    NodeGroupConfiguration, NodeSnapshot, NotificationConfiguration, PendingModifiedValues,
-    RecurringCharge, ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership,
+    AvailabilityZone, CacheCluster, CacheNode, CacheParameterGroup, CacheParameterGroupStatus,
+    CacheSubnetGroup, DestinationDetails, Endpoint, LogDeliveryConfiguration,
+    LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
+    NotificationConfiguration, PendingModifiedValues, RecurringCharge, ReservedCacheNodesOffering,
+    ScaleConfig, SecurityGroupMembership,
     ServiceUpdate, Snapshot, Subnet, Tag,
 };
 
@@ -325,44 +326,136 @@ pub fn default_port(engine: &str) -> i32 {
     }
 }
 
-/// The parameter group a cluster is associated with when the request names
-/// none: "the default parameter group for the specified engine"
-/// (`CacheParameterGroupName`).
+/// Every cache parameter group family this service publishes.
 ///
-/// An ElastiCache parameter group family is the engine plus its version line —
-/// `redis<major>` / `valkey<major>` for Valkey and Redis OSS, and
-/// `memcached<major>.<minor>` for Memcached — and the family's default group is
-/// named `default.<family>`.
-pub fn default_parameter_group_name(engine: &str, engine_version: &str) -> String {
+/// The order here is the catalog's own; what a describe pages is the STORED key
+/// order of
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::cache_parameter_groups`].
+///
+/// Source: `smithy_query(query="doc", shape="CreateCacheParameterGroupMessage",
+/// member="CacheParameterGroupFamily")` — "Valid values are: valkey8 | valkey7
+/// | memcached1.4 | memcached1.5 | memcached1.6 | redis2.6 | redis2.8 |
+/// redis3.2 | redis4.0 | redis5.0 | redis6.x | redis7". A family's name is the
+/// engine followed by its version line, which is why the line is `<major>` for
+/// Valkey and current Redis OSS, `<major>.<minor>` for Memcached and the older
+/// Redis OSS lines, and `6.x` for Redis OSS 6.
+pub const PARAMETER_GROUP_FAMILIES: [&str; 12] = [
+    "memcached1.4",
+    "memcached1.5",
+    "memcached1.6",
+    "redis2.6",
+    "redis2.8",
+    "redis3.2",
+    "redis4.0",
+    "redis5.0",
+    "redis6.x",
+    "redis7",
+    "valkey7",
+    "valkey8",
+];
+
+/// The name prefix of the parameter group AWS itself provides for a family:
+/// `default.<family>` (`DeleteCacheParameterGroup`: "You cannot delete the
+/// default cache parameter groups in your account.").
+pub const DEFAULT_PARAMETER_GROUP_PREFIX: &str = "default.";
+
+/// The published parameter group family `engine_version` of `engine` belongs
+/// to, or `None` when no published family covers that version.
+///
+/// A published family covers a version line, so the version is matched against
+/// the lines in [`PARAMETER_GROUP_FAMILIES`] from the most specific to the
+/// least: `<major>.<minor>` (Memcached 1.6.22 is `memcached1.6`), then
+/// `<major>.x` (Redis OSS 6.2 is `redis6.x`), then `<major>` (Redis OSS 7.1 is
+/// `redis7`, Valkey 8.0 is `valkey8`).
+pub fn parameter_group_family(engine: &str, engine_version: &str) -> Option<&'static str> {
     let mut parts = engine_version.split('.');
     let major = parts.next().unwrap_or_default();
     let minor = parts.next().unwrap_or("0");
-    if engine == "memcached" {
-        format!("default.memcached{major}.{minor}")
-    } else {
-        format!("default.{engine}{major}")
-    }
+    let candidates = [
+        format!("{engine}{major}.{minor}"),
+        format!("{engine}{major}.x"),
+        format!("{engine}{major}"),
+    ];
+    candidates.iter().find_map(|candidate| {
+        PARAMETER_GROUP_FAMILIES
+            .iter()
+            .find(|family| **family == candidate.as_str())
+            .copied()
+    })
 }
 
-/// True when `name` names a parameter group this emulator holds.
-///
-/// Only the engine families' default groups exist: `CreateCacheParameterGroup`
-/// is still a scaffolded 501, so no custom group can have been created, and a
-/// request naming one is refused with the modelled
-/// `CacheParameterGroupNotFoundFault` exactly as it would be against a real
-/// account that never created it. A default group is `default.<family>`, and a
-/// family is an engine plus its version line — see
-/// [`default_parameter_group_name`] — so a name that is not one of those is not
-/// a group either.
-pub fn is_known_parameter_group(name: &str) -> bool {
-    let Some(family) = name.strip_prefix("default.") else {
-        return false;
-    };
-    ENGINES.iter().any(|engine| {
-        family.strip_prefix(engine).is_some_and(|version| {
-            !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+/// The parameter group a cluster is associated with when the request names
+/// none: "the default parameter group for the specified engine"
+/// (`CacheParameterGroupName`) — the default group of the version's
+/// [`parameter_group_family`], or `None` when no published family covers the
+/// version, in which case there is no default group for it to join.
+pub fn default_parameter_group_name(engine: &str, engine_version: &str) -> Option<String> {
+    parameter_group_family(engine, engine_version)
+        .map(|family| format!("{DEFAULT_PARAMETER_GROUP_PREFIX}{family}"))
+}
+
+/// The ARN of a cache parameter group:
+/// `arn:aws:elasticache:<region>:<account>:parametergroup:<name>`.
+pub fn parameter_group_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("parametergroup:{name}"))
+}
+
+/// The default parameter groups an account holds the moment ElastiCache becomes
+/// available in it: one per published family, which is why
+/// `DescribeCacheParameterGroups` answers with groups before anything has been
+/// created. Seeded into
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::cache_parameter_groups`]
+/// when the store is created, so the groups a read reports and the
+/// [`default_parameter_group_name`] a `CreateCacheCluster` applies cannot
+/// disagree.
+pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord> {
+    PARAMETER_GROUP_FAMILIES
+        .iter()
+        .map(|family| {
+            let record = CacheParameterGroupRecord {
+                name: format!("{DEFAULT_PARAMETER_GROUP_PREFIX}{family}"),
+                family: (*family).to_string(),
+                // The description AWS gives a family's own default group.
+                description: format!("Default parameter group for {family}"),
+            };
+            (record.name.clone(), record)
         })
-    })
+        .collect()
+}
+
+/// One cache parameter group, as this emulator persists it.
+///
+/// Every group this store holds is one AWS provides in EVERY Region (a custom
+/// group needs `CreateCacheParameterGroup`, still a scaffolded 501 with its own
+/// issue), so the ARN a read reports names the Region of the request reading it
+/// — see [`CacheParameterGroupRecord::to_modeled`].
+#[derive(Debug, Clone)]
+pub struct CacheParameterGroupRecord {
+    /// The group's identity, which "is stored as a lowercase string"
+    /// (`CreateCacheParameterGroup$CacheParameterGroupName`).
+    pub name: String,
+    /// One of [`PARAMETER_GROUP_FAMILIES`] (`CacheParameterGroupFamily`).
+    pub family: String,
+    /// `CacheParameterGroup$Description`.
+    pub description: String,
+}
+
+impl CacheParameterGroupRecord {
+    /// This record as the modelled `CacheParameterGroup`, read from `region`.
+    pub fn to_modeled(&self, region: &str) -> CacheParameterGroup {
+        CacheParameterGroup {
+            cache_parameter_group_name: Some(self.name.clone()),
+            cache_parameter_group_family: Some(self.family.clone()),
+            description: Some(self.description.clone()),
+            // "Indicates whether the parameter group is associated with a
+            // Global datastore": a global datastore is a global replication
+            // group, and every global-replication-group operation in this
+            // service is still a scaffolded 501, so no group is associated with
+            // one.
+            is_global: Some(false),
+            arn: Some(parameter_group_arn(region, &self.name)),
+        }
+    }
 }
 
 /// The Availability Zone the emulator places the `index`-th subnet of a subnet
@@ -1891,6 +1984,13 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Every stored subnet group, keyed by its (lowercased) name, ordered for
     /// the same reason.
     pub cache_subnet_groups: BTreeMap<String, CacheSubnetGroupRecord>,
+    /// Every cache parameter group, keyed by its (lowercased) name, ordered for
+    /// the same reason. Unlike the maps above this one is SEEDED when the store
+    /// is created, with the default group of every published family (see
+    /// [`default_parameter_groups`]): those groups exist in an account before
+    /// anything has been created, and seeding them HERE rather than from a
+    /// handler is what keeps `DescribeCacheParameterGroups` a pure read.
+    pub cache_parameter_groups: BTreeMap<String, CacheParameterGroupRecord>,
     /// Every stored snapshot, keyed by its (lowercased) `SnapshotName` — the
     /// resource's identity in this API, which `CreateSnapshot$SnapshotName`
     /// "is stored as a lowercase string". Ordered for the same reason as
@@ -1914,9 +2014,11 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
 }
 
 impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
-    /// A store with no customer resources in it, already holding the catalogs
-    /// this service publishes rather than an account creating them: the
-    /// service updates and the reserved-cache-node offerings.
+    /// A fresh store is an account ElastiCache has just become available in: no
+    /// customer resources, the default parameter group of every family the
+    /// service publishes, and the catalogs this service publishes rather than
+    /// an account creating them — the service updates and the
+    /// reserved-cache-node offerings.
     ///
     /// The engine builds this the first time a handler of this service asks for
     /// its state, so that instant is the anchor the service-update catalog's
@@ -1926,6 +2028,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
         Self {
             cache_clusters: BTreeMap::new(),
             cache_subnet_groups: BTreeMap::new(),
+            cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
             service_updates: published_service_updates(SystemTime::now()),
             dns_token_seq: 0,
@@ -1936,6 +2039,15 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
 }
 
 impl ComAmazonawsElasticacheAmazonelasticachev9State {
+    /// The parameter group `name` names, or `None` when this account holds no
+    /// such group — the one lookup every handler that resolves a
+    /// `CacheParameterGroupName` goes through, so they cannot disagree about
+    /// which groups exist. The name "is stored as a lowercase string", so the
+    /// lookup is case-insensitive.
+    pub fn parameter_group(&self, name: &str) -> Option<&CacheParameterGroupRecord> {
+        self.cache_parameter_groups.get(&name.to_ascii_lowercase())
+    }
+
     /// Mint the DNS label a new cluster's endpoints carry: six lowercase
     /// hex digits, the shape of the label in `ConfigurationEndpoint`'s example.
     pub fn mint_dns_token(&mut self) -> String {

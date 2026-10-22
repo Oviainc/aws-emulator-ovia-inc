@@ -131,7 +131,10 @@ async fn a_created_snapshot_is_read_back_from_persisted_state() {
             engine_version: "6.2",
             port: "6379",
             num_cache_nodes: "1",
-            parameter_group: "default.redis6",
+            // Redis OSS 6 is the one published parameter group family whose
+            // version line is `<major>.x` rather than `<major>`
+            // (`state::PARAMETER_GROUP_FAMILIES`).
+            parameter_group: "default.redis6.x",
             retention_limit: "1",
             snapshot_window: None,
             kms_key_id: None,

@@ -213,6 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_max_results(input.max_results),
             crate::state::check_language(input.language.as_deref()),
             crate::state::check_political_view(input.political_view.as_deref()),
+            // A free-form query longer than the published ceiling is refused, not
+            // matched: it also bounds the matching work this request asks for.
+            crate::state::check_query_text(input.query_text.as_deref(), "QueryText"),
         ] {
             if let Err(invalid) = invalid {
                 return Err(GeocodeErrorModeled::ValidationException(invalid).into());
@@ -265,6 +268,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A structured query names address LEVELS, so a query made ONLY of
+        // components resolves at the granularity of the finest one it supplies:
+        // "country, region, locality" asks for that locality, not for the streets
+        // and businesses inside it. Free-form text names a place rather than a
+        // level, so a query that carries QueryText is not restricted this way.
+        if query_text.is_empty() {
+            if let Some(place_types) = crate::state::granularity_place_types(&components) {
+                candidates.retain(|candidate| {
+                    place_types
+                        .iter()
+                        .any(|place_type| *place_type == state.places[candidate.index].place_type)
+                });
+            }
+        }
+
         // `Distance` is the distance from the position the caller biased towards; with
         // no bias there is no reference point, so it keeps its modeled default of 0.
         // A bias that is not a two-element position is refused, not ignored.
@@ -307,16 +325,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(GeocodeErrorModeled::ValidationException(invalid).into())
             }
         };
+        let pricing_bucket = state.pricing_bucket(Self::NAME, input.intended_use.as_deref());
 
-        let result_items = candidates
+        // Composing the items is the one part of this handler driven by the LENGTH
+        // of the caller's query, so it runs OUTSIDE the catalog lock: the page's
+        // records (at most `MAX_RESULTS_CEILING` of them) are copied out and the
+        // guard released, so no caller's query can hold the catalog against the
+        // others while its own response is assembled.
+        let page: Vec<(crate::state::PlaceRecord, crate::state::Scored)> = candidates
             .iter()
-            .map(|candidate| {
-                let place = &state.places[candidate.index];
+            .map(|candidate| (state.places[candidate.index].clone(), *candidate))
+            .collect();
+        drop(state);
+
+        // The query is tokenized ONCE for the whole response, not once per result.
+        let query = crate::state::QueryTokens::new(query_text);
+        let result_items = page
+            .iter()
+            .map(|(place, candidate)| {
+                // How this query matched THIS place, component by component: what
+                // `MatchScores` and `ParsedQuery` report. Neither is gated behind
+                // `AdditionalFeatures` (whose enum is TimeZone | Access |
+                // SecondaryAddresses | Intersections), so both are reported for
+                // every result the query matched.
+                let explanation = place.explain_match(candidate.score, &query, &components);
                 GeocodeResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title.clone(),
-                    address: Some(place.address.to_modeled()),
+                    title: place.title_modeled(),
+                    address: Some(place.address_modeled()),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),
@@ -331,17 +368,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .then(|| place.time_zone_modeled())
                         .flatten(),
                     political_view: political_view.clone(),
-                    match_scores: Some(MatchScoreDetails {
-                        overall: candidate.score,
-                        components: None,
-                    }),
+                    match_scores: Some(match_scores(&explanation)),
+                    parsed_query: parsed_query(&explanation),
                     ..GeocodeResultItem::default()
                 }
             })
             .collect();
 
         Ok(GeocodeOutput {
-            pricing_bucket: state.pricing_bucket(Self::NAME, input.intended_use.as_deref()),
+            pricing_bucket,
             result_items: Some(result_items),
         })
     }
@@ -368,4 +403,78 @@ fn supplied_components(components: Option<&GeocodeQueryComponents>) -> Vec<(&'st
     .filter_map(|(name, value)| value.map(|value| (name, value.trim().to_string())))
     .filter(|(_, value)| !value.is_empty())
     .collect()
+}
+
+/// `MatchScores`: "Indicates how well the entire input matches the returned. It is
+/// equal to 1 if all input tokens are recognized and matched."
+///
+/// `Overall` is how much of the query this result answered; `Components` breaks
+/// that down over the title and the address components. A component the query never
+/// named keeps `MatchScore`'s modeled default of 0 — "no tokens were matched".
+fn match_scores(explanation: &crate::state::MatchExplanation) -> MatchScoreDetails {
+    MatchScoreDetails {
+        overall: explanation.overall,
+        components: Some(ComponentMatchScores {
+            title: explanation
+                .title
+                .as_ref()
+                .map_or(0.0, |matched| matched.score),
+            address: Some(AddressComponentMatchScores {
+                country: explanation.score_of("Country"),
+                region: explanation.score_of("Region"),
+                sub_region: explanation.score_of("SubRegion"),
+                locality: explanation.score_of("Locality"),
+                district: explanation.score_of("District"),
+                postal_code: explanation.score_of("PostalCode"),
+                address_number: explanation.score_of("AddressNumber"),
+                ..AddressComponentMatchScores::default()
+            }),
+        }),
+    }
+}
+
+/// `ParsedQuery`: "Parsed components in the provided QueryText" — every span of the
+/// query this result recognized, keyed by the address component it was recognized
+/// as, or `None` when the query named nothing about the place (a match on a
+/// category, say, parses no address component).
+fn parsed_query(explanation: &crate::state::MatchExplanation) -> Option<GeocodeParsedQuery> {
+    if explanation.is_empty() {
+        return None;
+    }
+    let spans = |component: &str| {
+        explanation.spans_of(component).map(|spans| {
+            spans
+                .into_iter()
+                .map(|matched| ParsedQueryComponent {
+                    start_index: Some(matched.start_index),
+                    end_index: Some(matched.end_index),
+                    value: Some(matched.value.clone()),
+                    query_component: Some(matched.query_component.clone()),
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let address = GeocodeParsedQueryAddressComponents {
+        country: spans("Country"),
+        region: spans("Region"),
+        sub_region: spans("SubRegion"),
+        locality: spans("Locality"),
+        district: spans("District"),
+        postal_code: spans("PostalCode"),
+        street: spans("Street"),
+        address_number: spans("AddressNumber"),
+        ..GeocodeParsedQueryAddressComponents::default()
+    };
+    let parsed_address = !explanation.components.is_empty();
+    Some(GeocodeParsedQuery {
+        title: explanation.title.as_ref().map(|matched| {
+            vec![ParsedQueryComponent {
+                start_index: Some(matched.start_index),
+                end_index: Some(matched.end_index),
+                value: Some(matched.value.clone()),
+                query_component: Some(matched.query_component.clone()),
+            }]
+        }),
+        address: parsed_address.then_some(address),
+    })
 }

@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-configservice-starlingdoveservice service.
 //!
 //! This holds the AWS Config setup-and-rule loop: the customer managed configuration
-//! recorder, its status record, the delivery channel, and the Config rules. Every
+//! recorder, its status record, the delivery channel, the Config rules, and the
+//! retention configuration that governs how long history is kept. Every
 //! handler under `src/ops/` computes its response from these maps; nothing is
 //! hardcoded and no response echoes the request that produced it.
 //!
@@ -20,7 +21,7 @@ use crate::ops::types::{
     ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
     DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
     OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup, RecordingMode,
-    RecordingStrategy, Scope, Source, Tag,
+    RecordingStrategy, RetentionConfiguration, Scope, Source, Tag,
 };
 
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
@@ -199,6 +200,19 @@ pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// The most retention configurations this account and Region can hold
+/// (`DescribeRetentionConfigurations` and `PutRetentionConfiguration`: "Currently,
+/// Config supports only one retention configuration per region in your account").
+pub const RETENTION_CONFIGURATIONS_QUOTA: usize = 1;
+
+/// How many retention configurations one `DescribeRetentionConfigurations` page
+/// carries.
+///
+/// The operation models no `Limit` member, so the page size is this emulator's: it
+/// matches [`RETENTION_CONFIGURATIONS_QUOTA`], so one page carries every retention
+/// configuration the account is allowed to hold.
+pub const DESCRIBE_RETENTION_CONFIGURATIONS_PAGE_SIZE: usize = RETENTION_CONFIGURATIONS_QUOTA;
 
 /// The most pending aggregation requests one `DescribePendingAggregationRequests`
 /// page carries: the maximum of that operation's own `Limit`
@@ -522,6 +536,24 @@ impl ConfigRuleEntry {
     }
 }
 
+/// One persisted retention configuration: the name Config gave the object and the
+/// number of days it keeps historical information for.
+#[derive(Debug, Clone, Default)]
+pub struct RetentionConfigurationEntry {
+    pub name: String,
+    pub retention_period_in_days: i32,
+}
+
+impl RetentionConfigurationEntry {
+    /// The modelled `RetentionConfiguration`, read back out of state.
+    pub fn to_shape(&self) -> RetentionConfiguration {
+        RetentionConfiguration {
+            name: self.name.clone(),
+            retention_period_in_days: self.retention_period_in_days,
+        }
+    }
+}
+
 /// One pending aggregation request this account holds.
 ///
 /// A pending aggregation request is an aggregator account that has asked to aggregate
@@ -642,6 +674,11 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Retention configurations, keyed by `RetentionConfigurationName`. A `BTreeMap`
+    /// so `DescribeRetentionConfigurations` pages over a stable ordering; it holds at
+    /// most [`RETENTION_CONFIGURATIONS_QUOTA`] entries, because one engine's store
+    /// stands for one account in one Region.
+    pub retention_configurations: BTreeMap<String, RetentionConfigurationEntry>,
     /// Aggregator accounts that have asked to aggregate this account's data and are
     /// not authorized yet, keyed by the (requester account, requester Region) pair
     /// that identifies one. A `BTreeMap` so `DescribePendingAggregationRequests`
@@ -946,6 +983,30 @@ pub fn no_such_config_rule_message(name: &str) -> String {
     format!(
         "The ConfigRule '{name}' provided in the request is invalid. Please check the \
          configRule name."
+    )
+}
+
+/// How Config words `NoSuchRetentionConfigurationException` for a request that named
+/// a retention configuration this account does not hold.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the name the caller sent and
+/// names the member to check — so every operation that refuses an absent retention
+/// configuration words it the same way.
+pub fn no_such_retention_configuration_message(name: &str) -> String {
+    format!(
+        "Cannot find retention configuration with the specified name '{name}'. Please \
+         check the retentionConfigurationName."
+    )
+}
+
+/// How Config words `MaxNumberOfRetentionConfigurationsExceededException`: the write
+/// would take the account past [`RETENTION_CONFIGURATIONS_QUOTA`] retention
+/// configurations in this Region.
+pub fn retention_configurations_quota_message() -> String {
+    format!(
+        "Failed to add the retention configuration because this account already holds \
+         the maximum of {RETENTION_CONFIGURATIONS_QUOTA} retention configuration(s) in \
+         this region."
     )
 }
 

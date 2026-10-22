@@ -157,6 +157,9 @@ fn form_encode(value: &str) -> String {
 /// `pub(crate)` for the same reason as [`Reply`]: one harness per test target.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine the mounted service keeps its state in — the same handle
+    /// `router/src/lib.rs` hands every service.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -167,8 +170,18 @@ impl Emulator {
         // by the SigV4 credential scope below, which is also where an ARN's
         // region comes from.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The store this emulator's service reads and writes — for a suite that has
+    /// to put a record in the store that no implemented operation can create
+    /// yet.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<state::ComAmazonawsElasticacheAmazonelasticachev9State> {
+        self.engine
+            .state::<state::ComAmazonawsElasticacheAmazonelasticachev9State>()
     }
 
     /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs.
@@ -295,8 +308,8 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
     // The axis: the engine and its documented defaults (`Engine` "memcached |
     // redis", the operation's own doc adding Valkey), the node count the engine
     // permits, and whether the request names a port and a version at all. The
-    // parameter group is the family rule: `default.redis<major>` /
-    // `default.valkey<major>` / `default.memcached<major>.<minor>`.
+    // parameter group is the family rule: the default group of the published
+    // family the engine version belongs to (`state::PARAMETER_GROUP_FAMILIES`).
     let cases = [
         ClusterCase {
             id: "demo-cluster",
@@ -318,7 +331,9 @@ async fn a_created_cluster_is_read_back_from_persisted_state() {
             engine_version: "6.2",
             port: "6379",
             num_cache_nodes: 1,
-            parameter_group: "default.redis6",
+            // Redis OSS 6 is the one published family whose version line is
+            // `<major>.x` rather than `<major>`.
+            parameter_group: "default.redis6.x",
         },
         ClusterCase {
             id: "memcached-three",

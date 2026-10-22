@@ -21,8 +21,13 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly, or serve a modelled operation WRAPPED. This service wraps one:
+//!   `CreateStream` is served behind
+//!   [`crate::ops::create_stream::PassRoleGate`], because the pass-role
+//!   authorization decision on its `targetDefinition` has to be reached before
+//!   the framework's model-constraint validation, and this is the only seam
+//!   handed the request. Every other key resolves through the generated routing
+//!   table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -159,6 +164,11 @@ fn unanchored(pattern: &str) -> &str {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// `CreateStream` as this service serves it: the generated operation behind
+    /// its pass-role gate, so the authorization decision on the target's role is
+    /// reached ahead of the framework's model-constraint validation. See
+    /// [`crate::ops::create_stream::PassRoleGate`] and [`Self::override_operation`].
+    create_stream: crate::ops::create_stream::PassRoleGate<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -167,6 +177,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            // The SAME engine, so the gated `CreateStream` reads and writes the one
+            // shared store every other operation does.
+            create_stream: crate::ops::create_stream::PassRoleGate::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -194,12 +207,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol
+        // resolves, and for `CreateStream` the operation served is that same
+        // operation — wrapped so the pass-role authorization decision on
+        // `targetDefinition` is reached ahead of the framework's model-constraint
+        // validation, which no other seam is handed the request to do (see
+        // `PassRoleGate`). Every other key answers `None` here and resolves through
+        // the generated routing table exactly as it did before.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        let create_stream =
+            <crate::ops::create_stream::CreateStream<Eng> as smithy_server_runtime::Operation>::NAME;
+        (key == create_stream).then_some(&self.create_stream as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

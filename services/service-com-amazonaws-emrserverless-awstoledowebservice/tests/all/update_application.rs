@@ -16,7 +16,11 @@
 //! 2. The operation's documented precondition — "An application has to be in a stopped
 //!    or created state in order to be updated" — is judged against the state the
 //!    application has SETTLED on, and a state outside it is refused with the modelled
-//!    `ValidationException` (HTTP 400) without changing the record.
+//!    `ValidationException` (HTTP 400) without changing the record. A RUNNING
+//!    application is the one state that admits part of an update: the members EMR
+//!    Serverless documents as updatable on it are asserted in
+//!    `update_application_while_started`, and the rows here name a member OUTSIDE that
+//!    set, so they assert the general precondition alone.
 //! 3. An application that does not exist is refused with `ResourceNotFoundException`
 //!    (HTTP 404).
 
@@ -29,6 +33,7 @@ use super::application_lifecycle::{
     call, create_application, delete_application, emulator, get_application, wait_for_transition,
     Answer,
 };
+use super::update_application_while_started::RUNNING_CARVE_OUT_REFUSAL;
 
 /// The `ApplicationState` values that admit an update, and the ones that do not.
 ///
@@ -41,7 +46,8 @@ use super::application_lifecycle::{
 const UPDATABLE_STATES: &[&str] = &["CREATED", "STOPPED"];
 
 /// An image URI satisfying `ImageUri`'s pattern (an Amazon ECR registry reference).
-const IMAGE_URI: &str = "000000000000.dkr.ecr.eu-west-1.amazonaws.com/emr-serverless:7.1.0";
+pub(crate) const IMAGE_URI: &str =
+    "000000000000.dkr.ecr.eu-west-1.amazonaws.com/emr-serverless:7.1.0";
 
 /// A `CreateApplication` body carrying a value for every member an update can change,
 /// so a row that names one member can assert that the OTHERS did not move.
@@ -82,12 +88,16 @@ fn rich_create(token: &str) -> Value {
     })
 }
 
-async fn update_application(router: &MultiServiceRouter, id: &str, body: Value) -> Answer {
+pub(crate) async fn update_application(
+    router: &MultiServiceRouter,
+    id: &str,
+    body: Value,
+) -> Answer {
     call(router, "PATCH", &format!("/applications/{id}"), Some(body)).await
 }
 
 /// Create the baseline application, let the clock settle it, and return its id.
-async fn settled_application(router: &MultiServiceRouter, token: &str) -> String {
+pub(crate) async fn settled_application(router: &MultiServiceRouter, token: &str) -> String {
     let created = create_application(router, rich_create(token)).await;
     assert_eq!(
         created.status, 200,
@@ -104,7 +114,7 @@ async fn settled_application(router: &MultiServiceRouter, token: &str) -> String
 }
 
 /// An update body: the required `clientToken` plus the members the row names.
-fn update_body(token: &str, members: &Value) -> Value {
+pub(crate) fn update_body(token: &str, members: &Value) -> Value {
     let mut body = json!({ "clientToken": token });
     if let (Some(target), Some(members)) = (body.as_object_mut(), members.as_object()) {
         for (name, value) in members {
@@ -469,6 +479,11 @@ async fn successive_updates_accumulate_on_the_stored_application() {
 /// Rule 2: the documented precondition, over every `ApplicationState` an application
 /// can be in — and judged against the state it has SETTLED on, so a transition the
 /// clock still owes never refuses an update the settled application admits.
+///
+/// Every row names `autoStartConfiguration`, a member OUTSIDE the set EMR Serverless
+/// documents as updatable on a RUNNING application, so each one turns on the general
+/// precondition alone; the running-application carve-out has its own suite in
+/// `update_application_while_started`.
 #[tokio::test]
 async fn an_update_is_admitted_only_in_the_states_the_operation_documents() {
     // (case, the lifecycle calls after the create, whether the LAST call is given time
@@ -528,6 +543,10 @@ async fn an_update_is_admitted_only_in_the_states_the_operation_documents() {
 
 /// One row of rule 2: the update is admitted exactly when the settled state is one the
 /// operation documents, and a refused update leaves the record alone.
+///
+/// The member named is outside the running-application carve-out, so a `STARTED`
+/// application refuses it too — with the refusal that states which members it would
+/// have admitted rather than the one that states the precondition.
 async fn assert_update_precondition(
     router: &MultiServiceRouter,
     id: &str,
@@ -542,7 +561,7 @@ async fn assert_update_precondition(
         id,
         update_body(
             &format!("state-{index}"),
-            &json!({ "maximumCapacity": { "cpu": "2 vCPU", "memory": "8 GB" } }),
+            &json!({ "autoStartConfiguration": { "enabled": true } }),
         ),
     )
     .await;
@@ -557,10 +576,10 @@ async fn assert_update_precondition(
 
     if admitted {
         assert_eq!(
-            answered.at("/application/maximumCapacity"),
-            json!({ "cpu": "2 vCPU", "memory": "8 GB" }),
+            answered.at("/application/autoStartConfiguration"),
+            json!({ "enabled": true }),
             "case {case:?}: the admitted update must apply the member it named, got {:?}",
-            answered.at("/application/maximumCapacity")
+            answered.at("/application/autoStartConfiguration")
         );
         return;
     }
@@ -571,23 +590,33 @@ async fn assert_update_precondition(
         "case {case:?}: expected ValidationException, got {:?}",
         answered.body
     );
-    // The refusal states the condition it refused on: the state the application is in
-    // and the states the operation admits.
     let message = answered.body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(settled_state)
-            && UPDATABLE_STATES.iter().all(|state| message.contains(state)),
-        "case {case:?}: the refusal must state the state it refused on and the states it \
-         admits, got {message:?}"
-    );
+    if settled_state == "STARTED" {
+        // A running application refuses this member because it is not one of the
+        // members an update may name while it runs, so the refusal enumerates those.
+        assert_eq!(
+            message, RUNNING_CARVE_OUT_REFUSAL,
+            "case {case:?}: a running application must refuse a member outside the \
+             carve-out with the enumeration of it, got {message:?}"
+        );
+    } else {
+        // Every other state refuses the whole update: the refusal states the condition
+        // it refused on — the state the application is in and the states it admits.
+        assert!(
+            message.contains(settled_state)
+                && UPDATABLE_STATES.iter().all(|state| message.contains(state)),
+            "case {case:?}: the refusal must state the state it refused on and the states it \
+             admits, got {message:?}"
+        );
+    }
     // And nothing was written: the member the refused update named is as it was.
     let after = get_application(router, id).await;
     assert_eq!(
-        after.at("/application/maximumCapacity"),
-        before.at("/application/maximumCapacity"),
+        after.at("/application/autoStartConfiguration"),
+        before.at("/application/autoStartConfiguration"),
         "case {case:?}: a refused update must change nothing, got {:?} against {:?}",
-        after.at("/application/maximumCapacity"),
-        before.at("/application/maximumCapacity")
+        after.at("/application/autoStartConfiguration"),
+        before.at("/application/autoStartConfiguration")
     );
 }
 

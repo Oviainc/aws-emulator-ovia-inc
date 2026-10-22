@@ -419,21 +419,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Only the engine families' default parameter groups exist here; see
-        // `crate::state::is_known_parameter_group`.
-        if let Some(name) = input.cache_parameter_group_name.as_deref() {
-            if !crate::state::is_known_parameter_group(name) {
-                return Err(
-                    CreateCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(
-                        CacheParameterGroupNotFoundFault {
-                            message: Some(format!("CacheParameterGroup {name} not found.")),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
-
         // A cluster can only be seeded from a snapshot that exists, and none
         // can: `CreateSnapshot` / `CopySnapshot` are scaffolded 501s, and an
         // `SnapshotArns` entry would have to be read out of Amazon S3, which
@@ -550,6 +535,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // The parameter group the cluster joins has to be one this account
+        // holds, so the name is resolved against the stored groups — the
+        // default group of every published family, plus whatever
+        // `CreateCacheParameterGroup` added. The STORED name is what the
+        // cluster carries, so it reports the group's own identity rather than
+        // the casing the request used.
+        let requested_parameter_group = match input.cache_parameter_group_name.as_deref() {
+            Some(name) => match store.parameter_group(name) {
+                Some(group) => Some(group.name.clone()),
+                None => {
+                    return Err(
+                        CreateCacheClusterErrorModeled::CacheParameterGroupNotFoundFault(
+                            CacheParameterGroupNotFoundFault {
+                                message: Some(format!("CacheParameterGroup {name} not found.")),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
         if store.cache_clusters.contains_key(&cache_cluster_id) {
             return Err(CreateCacheClusterErrorModeled::CacheClusterAlreadyExistsFault(
                 CacheClusterAlreadyExistsFault {
@@ -603,9 +611,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let engine_version = input
             .engine_version
             .unwrap_or_else(|| crate::state::default_engine_version(&engine).to_string());
-        let cache_parameter_group_name = input
-            .cache_parameter_group_name
-            .unwrap_or_else(|| crate::state::default_parameter_group_name(&engine, &engine_version));
+        // "Default: ... the default parameter group for the specified engine":
+        // the derived default is resolved through the SAME stored map as a named
+        // group, so the group a cluster reports is always one this account
+        // holds. A version no published family covers has no default group to
+        // join, so the version itself is refused rather than the cluster
+        // joining a group `DescribeCacheParameterGroups` would answer 404 for.
+        let cache_parameter_group_name = match requested_parameter_group {
+            Some(name) => name,
+            None => {
+                let derived = crate::state::default_parameter_group_name(&engine, &engine_version)
+                    .and_then(|derived| {
+                        store.parameter_group(&derived).map(|group| group.name.clone())
+                    });
+                match derived {
+                    Some(name) => name,
+                    None => {
+                        return Err(
+                            CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                                InvalidParameterValueException {
+                                    message: Some(format!(
+                                        "Invalid value {engine_version} for EngineVersion: no \
+                                         cache parameter group family supports it."
+                                    )),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                }
+            }
+        };
         // `SnapshotRetentionLimit` / `SnapshotWindow` are "only valid if the
         // Engine parameter is redis", so a Memcached cluster cannot carry
         // either: the request is refused rather than answered 200 with the
