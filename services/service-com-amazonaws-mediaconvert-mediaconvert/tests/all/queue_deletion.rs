@@ -13,7 +13,7 @@
 
 use serde_json::{json, Value};
 
-use crate::job_lifecycle::{settings, Emulator, Reply, PAST_THE_SETTLE, ROLE, SHORT_SETTLE};
+use crate::job_lifecycle::{arn, settings, Emulator, Reply, PAST_THE_SETTLE, ROLE, SHORT_SETTLE};
 
 /// `DELETE /2017-08-29/queues/{Name}` — the binding `smithy_query(query="operation",
 /// operation="DeleteQueue")` reports for this operation.
@@ -340,7 +340,7 @@ async fn a_queue_holding_non_terminal_jobs_cannot_be_deleted_until_they_are_term
         );
         assert_eq!(
             job.string("/job/queue"),
-            "busy",
+            arn("queues/busy"),
             "case job {id:?}: the job keeps the queue it recorded, got {}",
             job.body
         );

@@ -6,6 +6,10 @@
 //! here, in `BTreeMap`s keyed by the resource name AWS keys them by, so
 //! `ListModels` has one stable order to sort and paginate over and every
 //! `Describe*` replays exactly what the matching `Create*` stored.
+//!
+//! Studio apps live here too, keyed by the [`AppKey`] their five input members name
+//! rather than by a bare name, because that tuple — domain, owning user profile or
+//! space, app type, app name — is what identifies one app.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -13,7 +17,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     ArtifactSource, AsyncInferenceConfig, ContainerDefinition, DataCaptureConfig, ExplainerConfig,
     IamIdentity, InferenceExecutionConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
-    ProductionVariant, ProductionVariantSummary, Tag, UserContext, VpcConfig,
+    ProductionVariant, ProductionVariantSummary, ResourceSpec, Tag, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -32,6 +36,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// the span is compressed, never zero.
 pub const ENDPOINT_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
 
+/// How long after `CreateApp` the clock owes the `Pending` -> `InService` transition.
+///
+/// Same contract as [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that describes the app
+/// straight after creating it still observes `Pending`, one that waits observes
+/// `InService`. Real Studio app launches take minutes; the span is compressed, never
+/// zero.
+pub const APP_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
+
 /// The most records each of this service's stores holds, after which a create is
 /// refused with the modelled `ResourceLimitExceeded`.
 ///
@@ -46,6 +58,8 @@ pub const MODEL_QUOTA: usize = 1_000;
 pub const ENDPOINT_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const ENDPOINT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`].
+pub const APP_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const MODEL_PACKAGE_GROUP_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the lineage-artifact store the same way, and is what
@@ -75,6 +89,14 @@ pub const MAX_PAGE_SIZE: i32 = 50;
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
+
+/// `AppStatus`'s members this emulator moves an app through. The modelled enum
+/// (`smithy_query(query="shape", shape="AppStatus")`) also carries `Deleting`,
+/// `Deleted` and `Failed`, which this slice does not reach: `DeleteApp` releases the
+/// record, and nothing here fails a launch.
+pub const APP_STATUS_PENDING: &str = "Pending";
+/// See [`APP_STATUS_PENDING`].
+pub const APP_STATUS_IN_SERVICE: &str = "InService";
 
 /// The `ModelPackageGroupStatus` a model package group carries once `CreateModelPackageGroup`
 /// has returned.
@@ -164,6 +186,123 @@ impl Endpoint {
     }
 }
 
+/// Which Studio principal a Studio app hangs off.
+///
+/// `CreateApp` / `DescribeApp` / `DeleteApp` all take `UserProfileName` and `SpaceName`
+/// as optional members whose model docs say each must be set when the other is not
+/// (`smithy_query(query="doc", shape="DeleteAppRequest", member="SpaceName")`), so
+/// exactly one of the two identifies the app.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AppOwner {
+    /// `UserProfileName`.
+    UserProfile(String),
+    /// `SpaceName`.
+    Space(String),
+}
+
+impl AppOwner {
+    /// The owner's name, whichever member named it — the component an app ARN carries.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::UserProfile(name) | Self::Space(name) => name,
+        }
+    }
+
+    /// `UserProfileName` as the app reports it, i.e. only for a user-profile app.
+    pub fn user_profile_name(&self) -> Option<String> {
+        match self {
+            Self::UserProfile(name) => Some(name.clone()),
+            Self::Space(_) => None,
+        }
+    }
+
+    /// `SpaceName` as the app reports it, i.e. only for a space app.
+    pub fn space_name(&self) -> Option<String> {
+        match self {
+            Self::Space(name) => Some(name.clone()),
+            Self::UserProfile(_) => None,
+        }
+    }
+}
+
+/// What identifies one Studio app: the domain, the owning user profile or space, the
+/// app type and the app name — the five members every app operation takes. Two apps
+/// differing in any one of them are different apps, so this is the store's key.
+///
+/// Ordered (domain, owner, type, name) so the store has one stable order to list over.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AppKey {
+    pub domain_id: String,
+    pub owner: AppOwner,
+    pub app_type: String,
+    pub app_name: String,
+}
+
+/// Why a request naming neither or both of `UserProfileName` and `SpaceName` is refused.
+///
+/// Both members are optional in the model, so the boundary validator passes such a
+/// request; the rule lives in their docs ("If this value is not set, then
+/// UserProfileName must be set", and the mirror of it), and an app whose owner is
+/// unnamed — or named twice — cannot be resolved.
+pub const APP_OWNER_REQUIRED: &str =
+    "Exactly one of UserProfileName or SpaceName must be specified.";
+
+/// The key the app operations' five input members name, or [`APP_OWNER_REQUIRED`] when
+/// the owner is not exactly one of the user profile and the space.
+///
+/// Shared by `CreateApp`, `DescribeApp` and `DeleteApp` so all three resolve an app the
+/// same way: a create and the reader or delete that names the same five members must
+/// agree on the key, or the resource is unreachable.
+pub fn app_key(
+    domain_id: &str,
+    user_profile_name: Option<&str>,
+    space_name: Option<&str>,
+    app_type: &str,
+    app_name: &str,
+) -> Result<AppKey, &'static str> {
+    let owner = match (user_profile_name, space_name) {
+        (Some(user_profile), None) => AppOwner::UserProfile(user_profile.to_string()),
+        (None, Some(space)) => AppOwner::Space(space.to_string()),
+        (Some(_), Some(_)) | (None, None) => return Err(APP_OWNER_REQUIRED),
+    };
+    Ok(AppKey {
+        domain_id: domain_id.to_string(),
+        owner,
+        app_type: app_type.to_string(),
+        app_name: app_name.to_string(),
+    })
+}
+
+/// A Studio app created by `CreateApp`, as `DescribeApp` replays it.
+///
+/// `in_service_at` is the instant the clock owes the `Pending` -> `InService`
+/// transition; it is stored, never slept on, and materialised by whichever reporting
+/// call first runs at or after it.
+#[derive(Debug, Clone)]
+pub struct App {
+    pub arn: String,
+    pub status: String,
+    pub resource_spec: Option<ResourceSpec>,
+    pub recovery_mode: Option<bool>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub in_service_at: SystemTime,
+}
+
+impl App {
+    /// Materialise the `Pending` -> `InService` transition the clock already owes, the
+    /// way [`Endpoint::settle_status`] does for an endpoint.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == APP_STATUS_PENDING && now >= self.in_service_at {
+            self.status = APP_STATUS_IN_SERVICE.to_string();
+            return true;
+        }
+        false
+    }
+}
+
 /// An artifact created by `CreateArtifact`, as `DescribeArtifact` replays it.
 ///
 /// `properties` keeps the caller's map as given — `None` for an absent member and
@@ -212,6 +351,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by [`AppKey`] — an app is named by five members, not by one name.
+    pub apps: BTreeMap<AppKey, App>,
     /// Keyed by `ModelPackageGroupName`.
     pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
     /// Lineage artifacts, keyed by `ArtifactArn` — the only identifier `DescribeArtifact`
@@ -234,6 +375,11 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another app fits, i.e. the store is below [`APP_QUOTA`].
+    pub fn apps_below_quota(&self) -> bool {
+        self.apps.len() < APP_QUOTA
     }
 
     /// Whether another model package group fits, i.e. the store is below
@@ -325,6 +471,33 @@ pub fn record_state_change(
 /// service mints, for the resource kinds it owns.
 pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{name}"))
+}
+
+/// An app's ARN: `...:app/<DomainId>/<owner>/<AppType>/<AppName>`.
+///
+/// A Studio app is identified by five members, so its ARN names all of them — a single
+/// `AppName` would not distinguish two apps of different types under one user profile.
+/// Each component is carried exactly as the request supplied it, which is safe for a
+/// positional ARN segment because every one of them is already refused at the boundary
+/// unless it matches its modelled constraint: `AppName`, `UserProfileName` and
+/// `SpaceName` are `len 0..63, pattern ^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$`, `DomainId`
+/// is `len 0..63, pattern ^d-(-*[a-z0-9]){1,61}$` and `AppType` is an enum
+/// (`smithy_query(query="operation", operation="CreateApp")`), so none can carry a `:`,
+/// a `/` or a control character and the result always matches `AppArn`'s
+/// `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:app/`. The real service composes
+/// the ARN from the same five members, so its `len 0..256` bound binds the same inputs.
+pub fn app_arn(region: &str, key: &AppKey) -> String {
+    resource_arn(
+        region,
+        "app",
+        &format!(
+            "{}/{}/{}/{}",
+            key.domain_id,
+            key.owner.name(),
+            key.app_type,
+            key.app_name
+        ),
+    )
 }
 
 /// The ARN of the Region's default lineage group (see [`DEFAULT_LINEAGE_GROUP`]), as

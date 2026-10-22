@@ -3,7 +3,9 @@
 //! @op CreateStateMachine
 //! IMPLEMENTED: mints a state machine and PERSISTS it in [`crate::state`], so every
 //! later `DescribeStateMachine`, `ListStateMachines` and `StartExecution` answers from
-//! the record this call stored.
+//! the record this call stored. When `publish` is set it also publishes version 1 of
+//! that record, under its own qualified ARN, and reports it as
+//! `stateMachineVersionArn`.
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
@@ -228,9 +230,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `name` (1..80), `definition` (1..1048576), `roleArn` (1..256) and
         // `versionDescription` (0..256) are modelled constraints, so the centralized
-        // walk has already refused anything outside them. The character rule on
-        // `name`, the Amazon States Language structure of `definition` and the tag
-        // count are NOT modelled, so they are checked here.
+        // walk has already refused anything outside them, and so are the enums
+        // (`type`, `EncryptionType`, `LogLevel`) and the `kmsKeyId` length and
+        // `kmsDataKeyReusePeriodSeconds` range. What the model does NOT carry is
+        // checked here, each with the operation's own modelled error: the character
+        // rule on `name`, the Amazon States Language structure of `definition`,
+        // `roleArn` naming an IAM role, the members each configuration structure
+        // needs, and the tag count.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
@@ -240,6 +246,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(why) = crate::state::invalid_name_reason(&input.name) {
             return Err(
                 CreateStateMachineErrorModeled::InvalidName(InvalidName { message: Some(why) })
+                    .into(),
+            );
+        }
+
+        // `roleArn` is "the Amazon Resource Name (ARN) of the IAM role to use for
+        // this state machine", and `InvalidArn` is modelled on this operation: the
+        // only ARN it takes is checked before anything is stored.
+        if let Some(why) = crate::state::invalid_role_arn_reason(&input.role_arn) {
+            return Err(
+                CreateStateMachineErrorModeled::InvalidArn(InvalidArn { message: Some(why) })
                     .into(),
             );
         }
@@ -267,6 +283,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InvalidDefinition { message: Some(why) },
             )
             .into());
+        }
+
+        // An `encryptionConfiguration` is only a configuration the service can
+        // apply when its members agree with its `type`: the length of `kmsKeyId`
+        // (1..2048) and the range of `kmsDataKeyReusePeriodSeconds` (60..900) are
+        // modelled, but which members each `type` needs is not, so that rule lives
+        // in `crate::state` and every operation that accepts the structure reads
+        // it.
+        if let Some(configuration) = input.encryption_configuration.as_ref() {
+            if let Some(why) = crate::state::invalid_encryption_reason(configuration) {
+                return Err(
+                    CreateStateMachineErrorModeled::InvalidEncryptionConfiguration(
+                        InvalidEncryptionConfiguration { message: Some(why) },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A `loggingConfiguration` is the same kind of rule: `destinations` is
+        // "limited to size 1" and "required, if your log level is not set to OFF",
+        // and a destination names a CloudWatch Logs log group. None of that is
+        // modelled, so it lives in `crate::state` beside the encryption rule.
+        if let Some(configuration) = input.logging_configuration.as_ref() {
+            if let Some(why) = crate::state::invalid_logging_reason(configuration) {
+                return Err(CreateStateMachineErrorModeled::InvalidLoggingConfiguration(
+                    InvalidLoggingConfiguration { message: Some(why) },
+                )
+                .into());
+            }
         }
 
         let tags = input.tags.clone().unwrap_or_default();
@@ -298,24 +344,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // State machine VERSIONS are not implemented in this emulator —
-        // `PublishStateMachineVersion`, `ListStateMachineVersions` and
-        // `DeleteStateMachineVersion` all still answer 501 — so a request that asks
-        // for one is refused with this operation's own modelled error rather than
-        // handed a `stateMachineVersionArn` with no version behind it.
-        if input.publish {
-            return Err(CreateStateMachineErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(
-                        "publish is not supported by this emulator: state machine versions are \
-                         not implemented"
-                            .to_string(),
-                    ),
-                    reason: None,
-                },
-            )
-            .into());
-        }
+        // State machine VERSIONS are a numbered, immutable snapshot of the state
+        // machine's configuration: "If you set the publish parameter of this API
+        // action to true, it publishes version 1 as the first revision of the state
+        // machine." The version is STORED below and reachable by its own qualified
+        // ARN, so `stateMachineVersionArn` names a record a later
+        // `DescribeStateMachine` answers from.
 
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::state_machine_arn(&region, &input.name);
@@ -341,10 +375,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 machine.arn.clone(),
                 machine.creation_date,
                 machine.is_deleting(),
-                machine.fingerprint.clone(),
+                machine.fingerprint(),
+                machine.published_version_arn.clone(),
             )
         });
-        if let Some((existing_arn, creation_date, deleting, existing_fingerprint)) = existing {
+        if let Some((existing_arn, creation_date, deleting, existing_fingerprint, version_arn)) =
+            existing
+        {
             if deleting {
                 return Err(CreateStateMachineErrorModeled::StateMachineDeleting(
                     StateMachineDeleting {
@@ -357,26 +394,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // create a duplicate resource if it was already created." The check reads
             // the name plus the members in the fingerprint, so a repeat that differs
             // only in `roleArn` or `tags` is the same request and neither member is
-            // updated.
+            // updated — and a repeat answers the FIRST response, version ARN
+            // included, rather than publishing a second version.
             if existing_fingerprint == fingerprint {
                 return Ok(CreateStateMachineOutput {
                     state_machine_arn: existing_arn,
                     creation_date: crate::state::to_date_time(creation_date),
-                    state_machine_version_arn: None,
+                    state_machine_version_arn: version_arn,
                 });
             }
             return Err(CreateStateMachineErrorModeled::StateMachineAlreadyExists(
                 StateMachineAlreadyExists {
-                    message: Some(format!(
-                        "a state machine named '{}' already exists with a different definition or \
-                         configuration",
-                        input.name
-                    )),
+                    // The service's message for this condition is the condition's
+                    // own name followed by the colliding ARN in single quotes, built
+                    // from the request rather than from this emulator's prose.
+                    message: Some(format!("State Machine Already Exists: '{existing_arn}'")),
                 },
             )
             .into());
         }
 
+        let publish = input.publish;
+        // A fresh state machine has published nothing, so the create's own version —
+        // "it publishes version 1 as the first revision of the state machine" — is
+        // version 1. Recorded on the record so an idempotent repeat answers the
+        // first response, version ARN included, and so the ARN's bytes are counted
+        // by the admission below.
+        let published_version_arn = publish.then(|| crate::state::state_machine_version_arn(&arn, 1));
         let candidate = crate::state::StateMachine {
             arn: arn.clone(),
             name: input.name,
@@ -394,7 +438,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             revision_id: None,
             description: input.version_description,
             tags,
-            fingerprint,
+            publish,
+            published_version_arn,
+            // Bumped by the publish below, when this create asked for a version.
+            version_counter: 0,
             delete_due_at: None,
             // Measured and counted by `insert_state_machine`.
             retained_bytes: 0,
@@ -403,20 +450,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store's caps are on the WHOLE store, in records AND in bytes: the
         // definition is caller-sized (up to the modelled 1 MiB), so a record count
         // alone would not bound the memory, and keying a cap on the signed region
-        // would let a caller mint a fresh quota per region it signs for.
-        if let Some(why) = store.state_machine_rejection(candidate.measure()) {
+        // would let a caller mint a fresh quota per region it signs for. A
+        // published version retains a second snapshot of the same caller-sized
+        // text, so it is admitted here too rather than growing the store after the
+        // decision was taken.
+        let mut needed = candidate.measure();
+        if publish {
+            needed = needed.saturating_mul(2);
+        }
+        if let Some(why) = store.state_machine_rejection(needed) {
             return Err(CreateStateMachineErrorModeled::StateMachineLimitExceeded(
                 StateMachineLimitExceeded { message: Some(why) },
             )
             .into());
         }
 
+        let description = candidate.description.clone();
         store.insert_state_machine(candidate);
 
+        let version_arn = if publish {
+            store
+                .publish_state_machine_version(&arn, description, created)
+                .map(|version| version.arn)
+        } else {
+            None
+        };
+
         Ok(CreateStateMachineOutput {
-            state_machine_arn: arn,
+            state_machine_arn: arn.clone(),
             creation_date: crate::state::to_date_time(created),
-            state_machine_version_arn: None,
+            state_machine_version_arn: version_arn,
         })
     }
 }

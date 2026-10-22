@@ -268,12 +268,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             settings: input.settings,
             queue,
             job_template: input.job_template,
-            priority: input.priority,
+            // Every member below is one the service fills in when the request omits it:
+            // "If you don't specify a priority, the service uses the default value 0",
+            // "Leave blank to use the default value, Job" for the billing tags source,
+            // the default status-update cadence, and acceleration left off. They are
+            // persisted, so every reader of the job reports the same value.
+            priority: input.priority.unwrap_or(crate::state::DEFAULT_PRIORITY),
             status: crate::state::JOB_STATUS_SUBMITTED.to_string(),
             created_at: now,
-            status_update_interval: input.status_update_interval,
-            billing_tags_source: input.billing_tags_source,
-            acceleration_settings: input.acceleration_settings,
+            status_update_interval: input
+                .status_update_interval
+                .unwrap_or_else(|| crate::state::DEFAULT_STATUS_UPDATE_INTERVAL.to_string()),
+            billing_tags_source: input
+                .billing_tags_source
+                .unwrap_or_else(|| crate::state::BILLING_TAGS_SOURCE_JOB.to_string()),
+            acceleration_settings: input
+                .acceleration_settings
+                .unwrap_or_else(crate::state::default_acceleration_settings),
+            // Nothing has shared this job: a resource share is what moves the status.
+            share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
             hop_destinations: input.hop_destinations.unwrap_or_default(),
             job_engine_version_requested: input.job_engine_version,
             simulate_reserved_queue: input.simulate_reserved_queue,
