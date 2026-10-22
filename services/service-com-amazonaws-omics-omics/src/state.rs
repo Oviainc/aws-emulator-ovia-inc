@@ -685,6 +685,116 @@ pub fn timestamp(millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(millis)
 }
 
+/// Emit the structured access record for one call to this service.
+///
+/// Every operation in this slice calls it exactly once, on the branch it returns from —
+/// above all the four that CHANGE the store (`CreateWorkflow`, `StartRun`, `DeleteRun`,
+/// `DeleteWorkflow`), whose effect on it is otherwise invisible after the fact. The
+/// record carries the operation, the identity the request PRESENTED (its SigV4 access key
+/// id, which is an identifier and not a secret), the request target it named, the
+/// resource the call resolved when it resolved one, and the outcome; the `tracing`
+/// subscriber supplies the timestamp.
+///
+/// There is no network peer in the record because a Smithy handler is not given one:
+/// [`smithy_server_runtime::OperationContext::parts`] carries the request's method, URI,
+/// headers and extensions, and nothing in this framework puts a peer address in them. The
+/// presented credential is therefore what identifies the caller.
+///
+/// Deliberately metadata only: no tag, run parameter, workflow definition, output URI or
+/// idempotency token is logged, so a caller's own data never reaches the log. Every
+/// interpolated value is request-derived, so [`audit_field`] bounds it and replaces the
+/// control characters that would otherwise let one request forge a second record.
+pub fn audit(
+    operation: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: AuditOutcome,
+    resource: Option<&str>,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation,
+        access_key_id = %audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target = %audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        resource = %audit_field(resource.unwrap_or(AUDIT_NO_RESOURCE)),
+        outcome = outcome.as_str(),
+        "omics api call"
+    );
+}
+
+/// What the `resource` field reads as when the call resolved no resource (a refusal
+/// before any lookup, or a listing, which names none).
+pub const AUDIT_NO_RESOURCE: &str = "-";
+
+/// Longest request-derived value one audit field carries.
+///
+/// A SigV4 access key id, a request path and a resource id are all caller-controlled, so
+/// an unbounded echo would let one request emit an arbitrarily long log line.
+const MAX_AUDIT_FIELD: usize = 128;
+
+/// A request-derived value as it may appear in an audit record: control characters (above
+/// all CR and LF, which would forge a second record) replaced, and the whole value
+/// bounded by [`MAX_AUDIT_FIELD`] on a character boundary.
+fn audit_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .take(MAX_AUDIT_FIELD)
+        .collect()
+}
+
+/// What a call answered, as the one closed set [`audit`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// A private workflow was minted and stored.
+    WorkflowCreated,
+    /// A stored workflow was removed from the store.
+    WorkflowDeleted,
+    /// A run was minted and stored against a stored workflow.
+    RunStarted,
+    /// A stored run was removed from the store.
+    RunDeleted,
+    /// A replayed `@idempotencyToken` changed nothing and answered with the resource the
+    /// first call created.
+    NoChange,
+    /// A reporting operation answered from state and changed nothing beyond the status
+    /// transitions the clock already owed.
+    Reported,
+    /// The request was refused as invalid (400).
+    ValidationRefused,
+    /// The named resource does not exist, or is not one this emulator holds (404).
+    NotFound,
+    /// The request cannot be applied to the resource in its current state (409).
+    Conflict,
+    /// A quota — the service's or this emulator's own ceiling — was met (402).
+    QuotaExceeded,
+    /// This service's own store was unreachable (500).
+    StoreUnavailable,
+    /// The request asked for behaviour this emulator does not implement (501).
+    NotImplemented,
+}
+
+impl AuditOutcome {
+    /// The stable token this outcome is logged as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkflowCreated => "workflow-created",
+            Self::WorkflowDeleted => "workflow-deleted",
+            Self::RunStarted => "run-started",
+            Self::RunDeleted => "run-deleted",
+            Self::NoChange => "no-change",
+            Self::Reported => "reported",
+            Self::ValidationRefused => "validation-refused",
+            Self::NotFound => "not-found",
+            Self::Conflict => "conflict",
+            Self::QuotaExceeded => "quota-exceeded",
+            Self::StoreUnavailable => "store-unavailable",
+            Self::NotImplemented => "not-implemented",
+        }
+    }
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

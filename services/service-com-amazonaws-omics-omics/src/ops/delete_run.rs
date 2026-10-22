@@ -178,8 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Every branch below records the call through `crate::state::audit`: a delete
+        // leaves no trace in the store, so the log is the only place its effect is
+        // attributable afterwards.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
             DeleteRunErrorModeled::InternalServerException(InternalServerException {
                 message: "the omics run store is unavailable".to_string(),
             })
@@ -196,6 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (key, status) = key
             .and_then(|key| store.runs.get(&key).map(|run| (key, run.status.clone())))
             .ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(&input.id),
+                );
                 DeleteRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: format!("no run with id {} exists in this region", input.id),
                 })
@@ -204,6 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can only delete a run that has reached a COMPLETED, FAILED, or CANCELLED
         // stage": a run still in flight cannot have its metadata removed.
         if !crate::state::is_deletable_run_status(&status) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::Conflict,
+                Some(&input.id),
+            );
             return Err(DeleteRunErrorModeled::ConflictException(ConflictException {
                 message: format!(
                     "run {} is {status}; only a run that has reached one of [{}] can be deleted",
@@ -215,6 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.runs.remove(&key);
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::RunDeleted,
+            Some(&input.id),
+        );
 
         Ok(DeleteRunOutput)
     }

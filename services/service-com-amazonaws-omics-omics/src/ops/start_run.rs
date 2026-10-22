@@ -288,12 +288,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled, so the centralized walk refused anything outside them before this
         // body ran. The `tags` map carries NO modelled length, so its bound is here.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
             StartRunErrorModeled::InternalServerException(InternalServerException {
                 message: "the omics run store is unavailable".to_string(),
             })
         })?;
 
         if let Some(why) = crate::state::tag_bounds_rejection(input.tags.as_ref()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                None,
+            );
             return Err(
                 StartRunErrorModeled::ValidationException(ValidationException { message: why })
                     .into(),
@@ -312,10 +324,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.replayed(crate::state::IdempotencyScope::StartRun, &input.request_id)
         {
             let run = store.runs.get(&key).ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::StoreUnavailable,
+                    None,
+                );
                 StartRunErrorModeled::InternalServerException(InternalServerException {
                     message: "the run this requestId started is no longer held".to_string(),
                 })
             })?;
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NoChange,
+                Some(&run.id),
+            );
             return Ok(StartRunOutput {
                 arn: Some(run.arn.clone()),
                 id: Some(run.id.clone()),
@@ -333,6 +357,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // much a missing target as an unknown `workflowId`.
         let source = match input.run_id.as_deref() {
             Some(run_id) => Some(store.run(run_id).cloned().ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(run_id),
+                );
                 StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: format!("no run with id {run_id} exists in this region"),
                 })
@@ -346,6 +376,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .or_else(|| source.map(|run| run.workflow_id.clone()))
             .ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    None,
+                );
                 StartRunErrorModeled::ValidationException(ValidationException {
                     message: "StartRun needs a workflowId, or a runId naming the run to \
                               duplicate"
@@ -382,6 +418,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ] {
             if let Some(value) = value {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(value),
+                );
                 return Err(StartRunErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: format!(
@@ -400,6 +442,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|owner| !crate::state::is_emulator_account(owner))
         {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&workflow_id),
+            );
             return Err(StartRunErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("no workflow shared from account {owner} exists here"),
@@ -416,6 +464,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .workflow(&workflow_id)
             .filter(|workflow| workflow.r#type == workflow_type)
             .ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(&workflow_id),
+                );
                 StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: format!(
                         "no {workflow_type} workflow with id {workflow_id} exists in this region"
@@ -447,6 +501,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let undefined_parameters =
             crate::state::undefined_parameters(&workflow.parameter_template, parameters.as_ref());
         if let Some(undefined) = undefined_parameters {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&workflow_id),
+            );
             return Err(
                 StartRunErrorModeled::ValidationException(ValidationException {
                     message: format!(
@@ -477,6 +537,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with a DYNAMIC storage type" — so a run that resolves to STATIC must have one,
         // from the request, the run it duplicates or the workflow's default.
         if storage_type == crate::state::STORAGE_TYPE_STATIC && storage_capacity.is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&workflow_id),
+            );
             return Err(
                 StartRunErrorModeled::ValidationException(ValidationException {
                     message: format!(
@@ -489,6 +555,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.runs.len() >= crate::state::MAX_RUNS {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&workflow_id),
+            );
             return Err(StartRunErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -597,6 +669,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::IdempotencyScope::StartRun,
             input.request_id,
             key,
+        );
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::RunStarted,
+            Some(&id),
         );
 
         Ok(StartRunOutput {
