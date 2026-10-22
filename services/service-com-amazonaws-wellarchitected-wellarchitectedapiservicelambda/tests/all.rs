@@ -14,6 +14,9 @@
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 
+#[path = "all/lens_review_answers.rs"]
+mod lens_review_answers;
+
 #[path = "all/lookup_error_envelopes.rs"]
 mod lookup_error_envelopes;
 

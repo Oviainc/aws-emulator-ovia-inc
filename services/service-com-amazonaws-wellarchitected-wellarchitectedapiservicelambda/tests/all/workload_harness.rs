@@ -97,9 +97,41 @@ impl Client {
                     applications: Vec::new(),
                     discovery_config: None,
                     jira_configuration: None,
+                    answers: std::collections::BTreeMap::new(),
                 },
             );
         }
+    }
+
+    /// Record an answer to one question of one lens review straight through the shared
+    /// state, so a test has a stored answer for the reads to report. `UpdateAnswer` —
+    /// the operation that answers a question over the wire — is still a stub with its
+    /// own issue; the READ under test still crosses the HTTP boundary.
+    pub(crate) fn record_answer(
+        &self,
+        workload_id: &str,
+        lens: &str,
+        question_id: &str,
+        answer: service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord,
+    ) {
+        let state = self
+            .engine
+            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let mut store = state.lock();
+        let workload = store
+            .workloads
+            .get_mut(workload_id)
+            .expect("the workload under test must exist");
+        workload
+            .answers
+            .entry(
+                service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::lens_alias(
+                    lens,
+                )
+                .to_string(),
+            )
+            .or_default()
+            .insert(question_id.to_string(), answer);
     }
 
     pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
