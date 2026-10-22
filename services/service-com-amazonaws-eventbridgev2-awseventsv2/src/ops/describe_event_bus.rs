@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventBus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventBus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventBus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the stored event bus with this ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -110,9 +102,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `DescribeEventBusError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#DescribeEventBus")]
+//
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation, so it is the modelled answer when the
+// engine cannot hand back this service's store, but the scaffold generated the
+// enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#DescribeEventBus",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum DescribeEventBusErrorModeled {
+    InternalException(InternalException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -167,18 +168,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventBus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventBusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventBus"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeEventBusErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        // Reporting only: the sole write is materialising the lifecycle
+        // transition the clock already made due.
+        state.settle_lifecycles(now);
+
+        let Some(bus) = state.bus(&input.event_bus_arn) else {
+            return Err(DescribeEventBusErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("event bus {} does not exist", input.event_bus_arn)),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeEventBusOutput {
+            event_bus_arn: Some(bus.arn.clone()),
+            name: Some(bus.name.clone()),
+            description: bus.description.clone(),
+            encryption_configuration: bus.encryption_configuration.clone(),
+            storage_configuration: bus.storage_configuration_output(now),
+            creation_time: Some(crate::state::to_date_time(bus.creation_time)),
+            last_modified_time: Some(crate::state::to_date_time(bus.last_modified_time)),
+            state: Some(bus.state.wire_value().to_string()),
+            state_reason: bus.state_reason.clone(),
+        })
     }
 }

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventBus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventBus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventBus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints an event bus in `crate::state` and reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -134,12 +126,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `CreateEventBusError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#CreateEventBus")]
+//
+// `InternalException` is widened in with `extra_errors`: this service declares it
+// as a common error for every operation (`AWSEventsV2`'s `errors` list), so it is
+// the modelled answer when the engine cannot hand back this service's store, but
+// the scaffold generated the enum from the OPERATION's own `errors` list only.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#CreateEventBus",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum CreateEventBusErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InvalidStateException(InvalidStateException),
+    InternalException(InternalException),
     LimitExceededException(LimitExceededException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
 }
@@ -195,18 +196,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventBus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventBusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventBus"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEventBusErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        state.settle_lifecycles(now);
+
+        // A retry carrying the same ClientToken replays the bus that token
+        // minted — identical parameters only; different ones are the mismatch
+        // the model names. The record is per region, because a bus belongs to
+        // the region its create named.
+        if let Some(token) = input.client_token.as_deref() {
+            let replay_key = crate::state::idempotency_key(&region, token);
+            if let Some(arn) = state.idempotency.get(&replay_key).cloned() {
+                if let Some(bus) = state.bus(&arn) {
+                    if !matches_stored(bus, &input) {
+                        return Err(CreateEventBusErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: Some(format!(
+                                    "ClientToken {token} was already used to create event bus \
+                                     {arn} with different parameters"
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                    return Ok(created_response(bus, now));
+                }
+                // The bus that token minted is gone, so the token no longer
+                // replays anything and the name is free again.
+                state.idempotency.remove(&replay_key);
+            }
+        }
+
+        // A bus name is unique per account AND region, so only a bus in the
+        // region this request names can collide with it.
+        if let Some(existing) = state.bus_by_name(&region, &input.name) {
+            return Err(CreateEventBusErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "event bus {} already exists as {}",
+                        input.name, existing.arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's per-region event-bus quota, which this operation models
+        // an error for.
+        if state.buses_in_region(&region) >= crate::state::MAX_EVENT_BUSES {
+            return Err(CreateEventBusErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the account already holds the maximum of {} event buses in {region}",
+                        crate::state::MAX_EVENT_BUSES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The EMULATOR's own bound on the registry. The region a request names
+        // is request-derived, so the per-region quota bounds each bucket but not
+        // how many buckets exist; this is what keeps one process's heap finite,
+        // and the model's own quota error is how it is reported.
+        if state.event_buses.len() >= crate::state::MAX_EVENT_BUSES_PER_EMULATOR {
+            return Err(CreateEventBusErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator holds the maximum of {} event buses across all regions; \
+                         delete an event bus before creating another",
+                        crate::state::MAX_EVENT_BUSES_PER_EMULATOR
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::event_bus_arn(
+            &region,
+            &input.name,
+            &crate::state::new_bus_id(state.next_id_seed(), now),
+        );
+        let bus = crate::state::EventBus {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            account_id: ::engine::emulator_account_id().to_string(),
+            region,
+            description: input.description.clone(),
+            encryption_configuration: input.encryption_configuration.clone(),
+            storage_configuration: input.storage_configuration.clone(),
+            // Provisioning is asynchronous, so the bus is reported CREATING and
+            // the clock owes it ACTIVE one span later.
+            state: crate::state::BusLifecycleState::Creating,
+            state_reason: None,
+            creation_time: now,
+            last_modified_time: now,
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<_, _>>(),
+            events: Vec::new(),
+            deduplicated_events: ::std::collections::BTreeMap::new(),
+            client_token: input.client_token.clone(),
+            transition_due_at: Some(crate::state::lifecycle_due(now)),
+            next_sequence_number: 1,
+        };
+
+        if let Some(token) = input.client_token.as_deref() {
+            // Keyed with the bus's own region, so a token used against another
+            // region records a create of its own.
+            let replay_key = crate::state::idempotency_key(&bus.region, token);
+            state.idempotency.insert(replay_key, arn.clone());
+        }
+        state.event_buses.insert(arn.clone(), bus);
+        let stored = state
+            .bus(&arn)
+            .expect("the bus just inserted is in the store");
+        Ok(created_response(stored, now))
     }
+}
+
+/// Project a stored bus into `CreateEventBusResponse`. Every member is read back
+/// out of the store, including `State`, which is the bus's own lifecycle state.
+fn created_response(
+    bus: &crate::state::EventBus,
+    now: ::std::time::SystemTime,
+) -> CreateEventBusOutput {
+    CreateEventBusOutput {
+        event_bus_arn: Some(bus.arn.clone()),
+        name: Some(bus.name.clone()),
+        description: bus.description.clone(),
+        encryption_configuration: bus.encryption_configuration.clone(),
+        storage_configuration: bus.storage_configuration_output(now),
+        state: Some(bus.state.wire_value().to_string()),
+        state_reason: bus.state_reason.clone(),
+        creation_time: Some(crate::state::to_date_time(bus.creation_time)),
+    }
+}
+
+/// Whether a repeat create describes exactly the bus already stored, which is
+/// what separates an idempotent replay from an
+/// `IdempotentParameterMismatchException`. Presence is compared as well as
+/// value, so an omitted member and a present-but-empty one are not the same
+/// request.
+fn matches_stored(bus: &crate::state::EventBus, input: &CreateEventBusInput) -> bool {
+    let stored_kms = bus
+        .encryption_configuration
+        .as_ref()
+        .map(|config| config.kms_key_identifier.clone());
+    let requested_kms = input
+        .encryption_configuration
+        .as_ref()
+        .map(|config| config.kms_key_identifier.clone());
+    let stored_retention = bus
+        .storage_configuration
+        .as_ref()
+        .map(|config| config.retention_period_in_days);
+    let requested_retention = input
+        .storage_configuration
+        .as_ref()
+        .map(|config| config.retention_period_in_days);
+    let requested_tags: ::std::collections::BTreeMap<String, String> = input
+        .tags
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    bus.name == input.name
+        && bus.description == input.description
+        && stored_kms == requested_kms
+        && stored_retention == requested_retention
+        && bus.tags == requested_tags
 }

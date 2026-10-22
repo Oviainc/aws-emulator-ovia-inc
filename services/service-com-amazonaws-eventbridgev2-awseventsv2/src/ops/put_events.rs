@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: appends each accepted entry to the target bus's event log.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +141,287 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEvents"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(PutEventsErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        state.settle_lifecycles(now);
+
+        // What this batch deduplicates by, per `DeduplicationType`'s own
+        // documentation: "How duplicate events are detected: by a hash of the
+        // event content (CONTENT_BASED). To deduplicate by a caller-supplied
+        // token instead, omit DeduplicationConfiguration and set DeduplicationId
+        // on each entry." Either way the key is looked up on the bus, and an
+        // entry whose key is already on the log is reported DEDUPLICATED against
+        // the event that first carried it rather than published a second time.
+        let content_based = input
+            .deduplication_configuration
+            .as_ref()
+            .is_some_and(|config| config.deduplication_type == CONTENT_BASED_DEDUPLICATION);
+
+        let Some(bus) = state.bus(&input.event_bus_arn) else {
+            return Err(PutEventsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("event bus {} does not exist", input.event_bus_arn)),
+                },
+            )
+            .into());
+        };
+        if !bus.accepts_events() {
+            return Err(PutEventsErrorModeled::InvalidStateException(InvalidStateException {
+                message: Some(format!(
+                    "event bus {} is in state {} and cannot accept events",
+                    bus.arn,
+                    bus.state.wire_value()
+                )),
+            })
+            .into());
+        }
+
+        // One identifier seed per request entry, reserved from the STORE's own
+        // counter now that the publish will go ahead, so an `EventId` is unique
+        // across every bus this emulator holds and not just within one log, and
+        // a refused call hands out none.
+        let id_seeds: Vec<u64> = (0..input.entries.len())
+            .map(|_| state.next_id_seed())
+            .collect();
+        let bus = state
+            .event_buses
+            .get_mut(&input.event_bus_arn)
+            .expect("the bus just read is still in the store");
+
+        let mut entries = Vec::with_capacity(input.entries.len());
+        for (entry, id_seed) in input.entries.iter().zip(id_seeds) {
+            // "The `aws.` value prefix is service-reserved and cannot be used as
+            // a value" — the `Source` member's own documentation. A rejected
+            // entry is reported in its own position and is NOT published, which
+            // is what makes `FailedEntryCount` a count rather than a constant.
+            if entry.source.starts_with(RESERVED_SOURCE_PREFIX) {
+                entries.push(PutEventsResultEntry {
+                    event_id: None,
+                    sequence_number: None,
+                    success_code: None,
+                    error_code: Some(INVALID_ARGUMENT.to_string()),
+                    error_message: Some(format!(
+                        "Source must not start with the service-reserved prefix \
+                         '{RESERVED_SOURCE_PREFIX}'"
+                    )),
+                });
+                continue;
+            }
+
+            // The caller-supplied token is kept on the stored event whether or
+            // not this batch deduplicates by it, because it is what the client
+            // sent; the KEY the log is indexed under is the one the request's
+            // `DeduplicationConfiguration` selects.
+            let deduplication_id = entry
+                .system_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.deduplication_id.clone());
+            let deduplication_key = if content_based {
+                Some(content_deduplication_key(entry))
+            } else {
+                deduplication_id.as_deref().map(token_deduplication_key)
+            };
+            let duplicate_of = deduplication_key
+                .as_deref()
+                .and_then(|key| bus.deduplicated_events.get(key).cloned());
+            if let Some((event_id, sequence_number)) = duplicate_of {
+                entries.push(PutEventsResultEntry {
+                    event_id: Some(event_id),
+                    sequence_number: Some(sequence_number.to_string()),
+                    success_code: Some(DEDUPLICATED.to_string()),
+                    error_code: None,
+                    error_message: None,
+                });
+                continue;
+            }
+
+            // "Defaults to the time the service receives the event when
+            // omitted" — the `Time` member's own documentation. A `Timestamp`
+            // carries no modelled range, so a value this platform cannot
+            // represent as an instant is refused in its own position rather
+            // than silently replaced with one the caller did not send.
+            let time = match entry.time.as_ref() {
+                None => now,
+                Some(sent) => match crate::state::from_date_time(sent) {
+                    Some(time) => time,
+                    None => {
+                        entries.push(PutEventsResultEntry {
+                            event_id: None,
+                            sequence_number: None,
+                            success_code: None,
+                            error_code: Some(INVALID_ARGUMENT.to_string()),
+                            error_message: Some(
+                                "Time is outside the range of representable instants".to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+                },
+            };
+
+            let stored = crate::state::StoredEvent {
+                event_id: crate::state::new_event_id(id_seed, now),
+                sequence_number: bus.next_sequence_number,
+                source: entry.source.clone(),
+                detail_type: entry.detail_type.clone(),
+                detail: entry.detail.clone(),
+                resources: entry.resources.clone().unwrap_or_default(),
+                time,
+                received_at: now,
+                deduplication_id: deduplication_id.clone(),
+                deduplication_key: deduplication_key.clone(),
+                event_group_id: entry
+                    .system_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.event_group_id.clone()),
+            };
+            bus.next_sequence_number = bus.next_sequence_number.saturating_add(1);
+            entries.push(PutEventsResultEntry {
+                event_id: Some(stored.event_id.clone()),
+                sequence_number: Some(stored.sequence_number.to_string()),
+                success_code: Some(PUBLISHED.to_string()),
+                error_code: None,
+                error_message: None,
+            });
+            if let Some(key) = deduplication_key {
+                bus.deduplicated_events
+                    .insert(key, (stored.event_id.clone(), stored.sequence_number));
+            }
+            bus.events.push(stored);
+        }
+
+        // The emulator's own memory bound on the stored log, and on the
+        // deduplication index with it: `trim_to_capacity` drops each forgotten
+        // event's index entry too, so the index is bounded by the same constant
+        // and cannot report an event the log no longer holds.
+        bus.trim_to_capacity();
+
+        // Counted from the results just built, never assumed.
+        let failed_entry_count = entries
+            .iter()
+            .filter(|entry| entry.error_code.is_some())
+            .count();
+
+        Ok(PutEventsOutput {
+            failed_entry_count: i32::try_from(failed_entry_count).unwrap_or(i32::MAX),
+            entries: Some(entries),
+        })
+    }
+}
+
+/// The value prefix the `Source` member's documentation reserves for AWS's own
+/// services, so no caller may publish under it.
+const RESERVED_SOURCE_PREFIX: &str = "aws.";
+
+/// The one `DeduplicationType` the model declares, per
+/// `smithy_query(query="shape",shape="DeduplicationType")`.
+const CONTENT_BASED_DEDUPLICATION: &str = "CONTENT_BASED";
+
+/// `SuccessCode::PUBLISHED` — "the event was published to the message store".
+/// One of the two entries of the generated [`SUCCESS_CODE_VALUES`].
+const PUBLISHED: &str = "PUBLISHED";
+
+/// `SuccessCode::DEDUPLICATED` — "the event was identified as a duplicate and was
+/// not re-published". The other entry of [`SUCCESS_CODE_VALUES`].
+const DEDUPLICATED: &str = "DEDUPLICATED";
+
+/// The `ErrorCode` a refused entry carries.
+///
+/// `PutEventsResultEntry$ErrorCode` is a free-form string in the model (no enum
+/// enumerates the per-entry codes), so this is named once here rather than
+/// written at each refusal, which is what keeps the two refusal paths reporting
+/// the same code.
+const INVALID_ARGUMENT: &str = "InvalidArgument";
+
+/// The deduplication key of an entry the caller deduplicates with its own
+/// token: the token itself, in its own namespace so no caller-chosen value can
+/// be mistaken for a content key.
+fn token_deduplication_key(deduplication_id: &str) -> String {
+    format!("id:{deduplication_id}")
+}
+
+/// The deduplication key of an entry under `CONTENT_BASED`: "a hash of the
+/// event content", per `DeduplicationType`'s documentation.
+///
+/// A SHA-256 digest, so the index that holds these keys is FIXED-WIDTH whatever
+/// the size of the event: it costs one 32-byte digest per deduplicated event
+/// rather than a second copy of the payload, and a lookup is a compare of two
+/// short strings. The index is pruned with the log, so it stays bounded by
+/// [`crate::state::MAX_STORED_EVENTS_PER_BUS`].
+///
+/// The content is the event the bus stores and delivers — `Source`,
+/// `DetailType`, `Detail` and `Resources`. `Time` is deliberately not part of
+/// it: it "defaults to the time the service receives the event when omitted",
+/// so hashing it would give every entry of an omitted-`Time` batch a distinct
+/// digest and deduplicate nothing. Nor is `SystemMetadata`, which carries the
+/// caller's own deduplication token — the alternative this mode replaces.
+///
+/// Each field is absorbed length-prefixed, and an absent one is absorbed as a
+/// distinct marker, so no two different entries can frame to the same bytes.
+fn content_deduplication_key(entry: &PutEventsRequestEntry) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    absorb(&mut hasher, Some(entry.source.as_str()));
+    absorb(&mut hasher, Some(entry.detail_type.as_str()));
+    absorb(&mut hasher, entry.detail.as_deref());
+    // `Resources` is a list on the wire, so its length and order are part of
+    // the content.
+    let resources = entry.resources.as_deref().unwrap_or_default();
+    hasher.update(u64::try_from(resources.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for resource in resources {
+        absorb(&mut hasher, Some(resource.as_str()));
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+/// Absorb one optional field into `hasher`, framed so the digest cannot confuse
+/// two different field splits: a present value contributes a presence marker,
+/// its byte length and its bytes; an absent one contributes only its own
+/// marker.
+fn absorb(hasher: &mut sha2::Sha256, field: Option<&str>) {
+    use sha2::Digest;
+
+    match field {
+        None => hasher.update([0u8]),
+        Some(value) => {
+            hasher.update([1u8]);
+            hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTENT_BASED_DEDUPLICATION, DEDUPLICATED, PUBLISHED};
+    use crate::ops::types::{DEDUPLICATION_TYPE_VALUES, SUCCESS_CODE_VALUES};
+
+    /// Every value this handler puts on the wire is a value the model declares,
+    /// so the constants above cannot drift from the generated enums.
+    #[test]
+    fn the_reported_codes_are_modelled_enum_values() {
+        for (case, value, declared) in [
+            ("SuccessCode::PUBLISHED", PUBLISHED, SUCCESS_CODE_VALUES),
+            ("SuccessCode::DEDUPLICATED", DEDUPLICATED, SUCCESS_CODE_VALUES),
+            (
+                "DeduplicationType::CONTENT_BASED",
+                CONTENT_BASED_DEDUPLICATION,
+                DEDUPLICATION_TYPE_VALUES,
+            ),
+        ] {
+            assert!(
+                declared.contains(&value),
+                "case {case:?}: {value:?} is not one of the modelled values {declared:?}"
+            );
+        }
     }
 }

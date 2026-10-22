@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex, to render the opaque ListEventBuses NextToken from the page cursor and
+# the content-deduplication digest PutEvents indexes an event under.
+hex = { workspace = true }
+# SHA-256, for the "hash of the event content" CONTENT_BASED deduplication keys
+# PutEvents entries on: a fixed-width key keeps that index small whatever the
+# size of the event.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

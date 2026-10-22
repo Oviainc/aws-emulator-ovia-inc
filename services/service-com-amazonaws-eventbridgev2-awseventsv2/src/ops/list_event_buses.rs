@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventBuses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventBuses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventBuses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enumerates the stored event buses, one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -87,9 +79,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `ListEventBusesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#ListEventBuses")]
+//
+// This operation lists no error of its own, so the enum would be UNINHABITED;
+// `InternalException`, which the service declares as a common error for every
+// operation, is widened in with `extra_errors` so the handler has a modelled
+// answer for an engine that cannot hand back this service's store.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#ListEventBuses",
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum ListEventBusesErrorModeled {
+    InternalException(InternalException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -143,18 +144,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventBuses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventBusesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventBuses"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEventBusesErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        // An event bus lives in one region, and a request names the region it is
+        // addressing, so an enumeration reports the buses of THAT region only.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        // Reporting only: the sole write is materialising the lifecycle
+        // transitions the clock already made due.
+        state.settle_lifecycles(now);
+
+        let resume_after = input.next_token.as_deref().map(decode_next_token);
+        if let Some(None) = resume_after {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "NextToken is not a token this service issued",
+            ));
+        }
+        let resume_after = resume_after.flatten();
+
+        // `MaxResults` is modelled `range(min: 1, max: 100)` with a default of
+        // 100, and the boundary validator refuses anything outside that window
+        // before the handler runs. An in-process caller can still hand over a
+        // value the wire never carries, so a value at or below zero takes the
+        // MODELLED DEFAULT rather than the range's minimum — a page of one is
+        // not what an absent member asks for — and anything above the maximum is
+        // capped at it.
+        let page_size = match input.max_results {
+            requested if requested > 0 => {
+                usize::try_from(requested.min(MAX_PAGE_SIZE)).unwrap_or(DEFAULT_PAGE_SIZE)
+            }
+            _ => DEFAULT_PAGE_SIZE,
+        };
+
+        // Ordered by name, the key `NamePrefix` filters on, with the ARN
+        // breaking ties so the order is total and a page boundary is stable.
+        let mut page_keys: Vec<PageKey> = state
+            .event_buses
+            .values()
+            .filter(|bus| bus.region == region)
+            .filter(|bus| {
+                input
+                    .name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| bus.name.starts_with(prefix))
+            })
+            .filter(|bus| {
+                input
+                    .event_bus_account_id
+                    .as_deref()
+                    .is_none_or(|account| bus.account_id == account)
+            })
+            .map(|bus| PageKey {
+                name: bus.name.clone(),
+                arn: bus.arn.clone(),
+            })
+            .collect();
+        page_keys.sort();
+
+        let start = match &resume_after {
+            Some(cursor) => page_keys.partition_point(|key| key <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(page_keys.len());
+        let page = &page_keys[start..end];
+
+        let event_buses: Vec<EventBusSummary> = page
+            .iter()
+            .filter_map(|key| state.bus(&key.arn))
+            .map(|bus| EventBusSummary {
+                name: Some(bus.name.clone()),
+                event_bus_arn: Some(bus.arn.clone()),
+                description: bus.description.clone(),
+                creation_time: Some(crate::state::to_date_time(bus.creation_time)),
+                last_modified_time: Some(crate::state::to_date_time(bus.last_modified_time)),
+                state: Some(bus.state.wire_value().to_string()),
+                state_reason: bus.state_reason.clone(),
+                event_bus_account_id: Some(bus.account_id.clone()),
+            })
+            .collect();
+
+        // A token only when buses remain after this page, so a caller stops
+        // paging exactly when the enumeration is exhausted.
+        let next_token = (end < page_keys.len())
+            .then(|| page.last().map(encode_next_token))
+            .flatten();
+
+        Ok(ListEventBusesOutput {
+            event_buses: Some(event_buses),
+            next_token,
+        })
+    }
+}
+
+/// The largest page this operation returns, from the modelled `MaxResults`
+/// range (`range(min: 1, max: 100)`).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The page size a request that names no `MaxResults` gets: the member's own
+/// modelled default, which is also the range's maximum.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The total order `ListEventBuses` enumerates in, and exactly what a
+/// `NextToken` carries: the name the list is ordered by, with the ARN breaking
+/// ties.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PageKey {
+    name: String,
+    arn: String,
+}
+
+/// Separates the two fields inside a token. A unit separator cannot occur in
+/// either: `EventBusName` is `[A-Za-z0-9][\.\-_A-Za-z0-9]*` and `EventBusArn` is
+/// printable ASCII.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// Render the page cursor as the opaque `NextToken` the next request replays.
+/// `NextToken` is modelled as an opaque string of 1..4096 characters, so the
+/// cursor is rendered in hex: an alphabet that survives any transport and that
+/// no client can mistake for a value it may construct itself.
+fn encode_next_token(key: &PageKey) -> String {
+    hex::encode(format!("{}{TOKEN_SEPARATOR}{}", key.name, key.arn))
+}
+
+/// Read a cursor back out of a `NextToken`. `None` when the token is not one
+/// this service issued.
+fn decode_next_token(token: &str) -> Option<PageKey> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (name, arn) = decoded.split_once(TOKEN_SEPARATOR)?;
+    Some(PageKey {
+        name: name.to_string(),
+        arn: arn.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_next_token, encode_next_token, PageKey};
+
+    /// A cursor survives the token it is rendered as, and nothing else is read
+    /// as a cursor: the token is this operation's own encoding, so its
+    /// round-trip is pinned here beside it.
+    #[test]
+    fn a_cursor_round_trips_through_its_token() {
+        for (case, key) in [
+            (
+                "plain name",
+                PageKey {
+                    name: "demo-bus".to_string(),
+                    arn: "arn:aws:events:us-east-1:000000000000:event-busv2/demo-bus/abc"
+                        .to_string(),
+                },
+            ),
+            (
+                "name with every character class the grammar allows",
+                PageKey {
+                    name: "A.b-c_9".to_string(),
+                    arn: "arn:aws:events:eu-west-3:000000000000:event-busv2/A.b-c_9/xyz"
+                        .to_string(),
+                },
+            ),
+        ] {
+            let token = encode_next_token(&key);
+            assert_eq!(
+                decode_next_token(&token).as_ref(),
+                Some(&key),
+                "case {case:?}: the cursor must survive its token {token:?}"
+            );
+        }
+
+        for (case, token) in [
+            ("not hex at all", "not-a-token"),
+            ("odd number of digits", "abc"),
+            ("hex without the separator", "6162"),
+        ] {
+            assert!(
+                decode_next_token(token).is_none(),
+                "case {case:?}: {token:?} is not a token this service issued"
+            );
+        }
     }
 }
