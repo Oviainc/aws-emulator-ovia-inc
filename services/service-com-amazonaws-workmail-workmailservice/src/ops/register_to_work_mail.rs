@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterToWorkMail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterToWorkMail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterToWorkMail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a disabled user of an organization for WorkMail use: assigns its primary
+//! email address and moves it to `ENABLED` in this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +173,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterToWorkMail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterToWorkMailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterToWorkMail"))
+        let _ = ctx;
+        // Absent only when this service is mounted on an engine that carries no store,
+        // in which case the operation genuinely cannot be served here.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("RegisterToWorkMail"))?;
+        let mut store = state.lock();
+
+        let organization = store
+            .organizations
+            .get_mut(&input.organization_id)
+            .ok_or_else(|| {
+                RegisterToWorkMailErrorModeled::OrganizationNotFoundException(
+                    OrganizationNotFoundException {
+                        message: Some(format!(
+                            "An organization with the identifier {} was not found.",
+                            input.organization_id
+                        )),
+                    },
+                )
+            })?;
+        if organization.state != crate::state::ORGANIZATION_STATE_ACTIVE {
+            return Err(RegisterToWorkMailErrorModeled::OrganizationStateException(
+                OrganizationStateException {
+                    message: Some(format!(
+                        "The organization {} is in state {} and cannot be written to.",
+                        organization.organization_id, organization.state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The identifier can accept UserId, ResourceId, or GroupId, or Username,
+        // Resourcename, or Groupname" (`RegisterToWorkMailRequest$EntityId`). Only users
+        // exist in this store so far; groups and resources are still unimplemented.
+        let entity_id = if organization.users.contains_key(&input.entity_id) {
+            input.entity_id.clone()
+        } else {
+            organization
+                .user_id_for_name(&input.entity_id)
+                .cloned()
+                .ok_or_else(|| {
+                    RegisterToWorkMailErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
+                            message: Some(format!(
+                                "The entity {} does not exist in organization {}.",
+                                input.entity_id, input.organization_id
+                            )),
+                        },
+                    )
+                })?
+        };
+
+        let current_state = organization
+            .users
+            .get(&entity_id)
+            .map(|user| user.state.clone())
+            .unwrap_or_default();
+        // "It performs no change if the user, group, or resource is enabled and fails if
+        // the user, group, or resource is deleted."
+        if current_state == crate::state::entity_state::ENABLED {
+            return Ok(RegisterToWorkMailOutput {});
+        }
+        if current_state != crate::state::entity_state::DISABLED {
+            return Err(RegisterToWorkMailErrorModeled::EntityStateException(
+                EntityStateException {
+                    message: Some(format!(
+                        "The entity {entity_id} is in state {current_state} and cannot be \
+                         registered."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The domain specified is not found in your organization"
+        // (`MailDomainNotFoundException`): the address must sit in one of the
+        // organization's mail domains.
+        let domain = input.email.rsplit('@').next().unwrap_or_default().to_string();
+        if !organization.has_mail_domain(&domain) {
+            return Err(RegisterToWorkMailErrorModeled::MailDomainNotFoundException(
+                MailDomainNotFoundException {
+                    message: Some(format!(
+                        "The domain {domain} is not associated with organization {}.",
+                        input.organization_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The email address that you're trying to assign is already created for a
+        // different user, group, or resource" (`EmailAddressInUseException`).
+        let email_key = input.email.to_ascii_lowercase();
+        if organization
+            .email_index
+            .get(&email_key)
+            .is_some_and(|owner| owner != &entity_id)
+        {
+            return Err(RegisterToWorkMailErrorModeled::EmailAddressInUseException(
+                EmailAddressInUseException {
+                    message: Some(format!(
+                        "The email address {} is already assigned in this organization.",
+                        input.email
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        if let Some(user) = organization.users.get_mut(&entity_id) {
+            user.email = Some(input.email);
+            user.state = crate::state::entity_state::ENABLED.to_string();
+            user.enabled_date = Some(now);
+            user.disabled_date = None;
+        }
+        organization.email_index.insert(email_key, entity_id);
+
+        Ok(RegisterToWorkMailOutput {})
     }
 }

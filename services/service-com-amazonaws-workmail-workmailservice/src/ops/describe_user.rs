@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads a user of an organization back out of this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +194,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUser"))
+        let _ = ctx;
+        // Absent only when this service is mounted on an engine that carries no store,
+        // in which case the operation genuinely cannot be served here.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("DescribeUser"))?;
+        let store = state.lock();
+
+        let organization = store
+            .organizations
+            .get(&input.organization_id)
+            .ok_or_else(|| {
+                DescribeUserErrorModeled::OrganizationNotFoundException(
+                    OrganizationNotFoundException {
+                        message: Some(format!(
+                            "An organization with the identifier {} was not found.",
+                            input.organization_id
+                        )),
+                    },
+                )
+            })?;
+        // `UserId` accepts an id or a name on the wire (`EntityIdentifier`), so resolve
+        // the id first and fall back to this organization's name index.
+        let user = organization
+            .users
+            .get(&input.user_id)
+            .or_else(|| {
+                organization
+                    .user_id_for_name(&input.user_id)
+                    .and_then(|id| organization.users.get(id))
+            })
+            .ok_or_else(|| {
+                DescribeUserErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                    message: Some(format!(
+                        "The user {} was not found in organization {}.",
+                        input.user_id, input.organization_id
+                    )),
+                })
+            })?;
+
+        Ok(DescribeUserOutput {
+            user_id: Some(user.user_id.clone()),
+            name: Some(user.name.clone()),
+            email: user.email.clone(),
+            display_name: Some(user.display_name.clone()),
+            state: Some(user.state.clone()),
+            user_role: Some(user.role.clone()),
+            enabled_date: user.enabled_date.map(crate::state::as_date_time),
+            disabled_date: user.disabled_date.map(crate::state::as_date_time),
+            // The mailbox lifecycle (provision / deprovision) and the directory
+            // attributes below are owned by operations this emulator does not implement
+            // yet (`UpdateUser`, `RegisterMailDomain`, the Identity Center operations),
+            // so nothing has set them.
+            mailbox_provisioned_date: None,
+            mailbox_deprovisioned_date: None,
+            first_name: user.first_name.clone(),
+            last_name: user.last_name.clone(),
+            hidden_from_global_address_list: user.hidden_from_global_address_list,
+            initials: None,
+            telephone: None,
+            street: None,
+            job_title: None,
+            city: None,
+            company: None,
+            zip_code: None,
+            department: None,
+            country: None,
+            office: None,
+            identity_provider_user_id: user.identity_provider_user_id.clone(),
+            identity_provider_identity_store_id: None,
+        })
     }
 }
