@@ -420,21 +420,13 @@ fn validate_revocation_configuration(
 }
 
 /// Tag keys are unique within a resource, and the `aws:` prefix is reserved for the tags
-/// AWS itself applies.
+/// AWS itself applies — the rules [`crate::state::invalid_tag_reason`] holds every tag
+/// set this service reads to, whichever operation carries it.
 fn validate_tags(tags: Option<&[Tag]>) -> Result<(), CreateCertificateAuthorityError> {
-    let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
-    for tag in tags.unwrap_or_default() {
-        if tag.key.starts_with("aws:") {
-            return Err(invalid_tag(crate::state::RESERVED_TAG_MESSAGE));
-        }
-        if !seen.insert(tag.key.as_str()) {
-            return Err(invalid_tag(format!(
-                "the tag key '{}' is given twice",
-                tag.key
-            )));
-        }
+    match crate::state::invalid_tag_reason(tags.unwrap_or_default()) {
+        Some(reason) => Err(invalid_tag(reason)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// "One or more of the specified arguments was not valid.", naming the member and the

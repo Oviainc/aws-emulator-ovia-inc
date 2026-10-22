@@ -44,6 +44,9 @@ pub(crate) fn wait_for_the_clock() {
 }
 
 /// One emulator with this service mounted.
+///
+/// `pub(crate)` so every suite in this test target drives the emulator through ONE
+/// harness: a sibling suite reaches it as `crate::private_ca_lifecycle::Emulator`.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
