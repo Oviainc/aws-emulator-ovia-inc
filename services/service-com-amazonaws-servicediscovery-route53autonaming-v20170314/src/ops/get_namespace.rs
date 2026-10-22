@@ -150,10 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|id| state.namespaces.get(&id).cloned())
         else {
             return Err(GetNamespaceErrorModeled::NamespaceNotFound(NamespaceNotFound {
-                message: Some(format!(
-                    "No namespace exists with the specified ID {}.",
-                    input.id
-                )),
+                // `NamespaceNotFound` carries no message: the service reports the class
+                // of failure and echoes no requested id into the body.
+                message: None,
             })
             .into());
         };

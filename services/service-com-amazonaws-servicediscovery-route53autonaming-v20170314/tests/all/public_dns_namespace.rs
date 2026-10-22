@@ -237,9 +237,11 @@ async fn a_soa_ttl_outside_the_published_range_is_refused() {
     );
 }
 
-/// The name index holds every namespace type, so a name already taken is refused with
-/// `NamespaceAlreadyExists` whichever create took it; a replayed `CreatorRequestId`
-/// replays the first operation instead of creating a second namespace.
+/// The name index holds every namespace type, so a name already taken is refused
+/// whichever create took it — and a name owned by a create that has COMPLETED is the
+/// request conflict `DuplicateRequest` (409) naming that create, not a validation
+/// failure; a replayed `CreatorRequestId` replays the first operation instead of
+/// creating a second namespace.
 #[tokio::test]
 async fn a_taken_name_is_refused_and_a_replayed_token_replays_its_operation() {
     let router = emulator();
@@ -270,7 +272,7 @@ async fn a_taken_name_is_refused_and_a_replayed_token_replays_its_operation() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (400, "NamespaceAlreadyExists"),
+            (409, "DuplicateRequest"),
             "case {case:?}: a second namespace named {name:?} must be refused"
         );
     }

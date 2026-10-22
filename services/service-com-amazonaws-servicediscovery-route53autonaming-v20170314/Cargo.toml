@@ -25,6 +25,11 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes the opaque pagination cursor a `NextToken` carries.
 hex = { workspace = true }
+# Applies the modelled `@pattern` on a namespace name: its negative lookahead needs an
+# engine with look-around, which the boundary validator's `regex` has not. Bounded
+# range (0.16.x), and every match runs under an explicit backtrack budget — see
+# `state::NAMESPACE_NAME_BACKTRACK_LIMIT`.
+fancy-regex = "0.16"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

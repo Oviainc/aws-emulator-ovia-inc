@@ -11909,6 +11909,7 @@ dependencies = [
  "aws-smithy-schema",
  "aws-smithy-types",
  "bytes",
+ "fancy-regex",
  "hex",
  "http",
  "serde_json",

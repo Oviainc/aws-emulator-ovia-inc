@@ -157,8 +157,9 @@ async fn submit(router: &MultiServiceRouter, service: &str, instance_id: &str, s
 }
 
 /// Only a service whose health checking is a custom health check accepts a submitted
-/// status; a Route 53 health check and no health check at all both answer
-/// `CustomHealthNotFound` (HTTP 404), whatever status is submitted.
+/// status; a Route 53 health check answers `CustomHealthNotFound` (HTTP 404), and a
+/// service that configures no health checking at all is in no health registry and
+/// answers `ServiceNotFound` (HTTP 404) — whatever status is submitted.
 ///
 /// The Route 53 check types come from the model's `HealthCheckType` enum
 /// (`HEALTH_CHECK_TYPE_VALUES` in `src/ops/types/shared_types.rs`) and the statuses from
@@ -168,20 +169,21 @@ async fn a_status_is_client_settable_only_for_a_custom_health_check() {
     let (router, _engine) = emulator_with_engine();
     let (_, namespace_id) = namespace(&router, "settable-ns").await;
 
-    // (case name, the service's health-check configuration, whether a submit is accepted)
-    let mut cases: Vec<(String, Value, bool)> = vec![
-        ("a custom health check".to_string(), json!({ "HealthCheckCustomConfig": { "FailureThreshold": 1 } }), true),
-        ("no health checking at all".to_string(), json!({}), false),
+    // (case name, the service's health-check configuration, the code a submit answers
+    // with — `None` when the submit is accepted)
+    let mut cases: Vec<(String, Value, Option<&str>)> = vec![
+        ("a custom health check".to_string(), json!({ "HealthCheckCustomConfig": { "FailureThreshold": 1 } }), None),
+        ("no health checking at all".to_string(), json!({}), Some("ServiceNotFound")),
     ];
     for check_type in cloudmap::ops::types::HEALTH_CHECK_TYPE_VALUES {
         cases.push((
             format!("a Route 53 {check_type} health check"),
             json!({ "HealthCheckConfig": { "Type": check_type, "FailureThreshold": 2 } }),
-            false,
+            Some("CustomHealthNotFound"),
         ));
     }
 
-    for (index, (case, configuration, settable)) in cases.iter().enumerate() {
+    for (index, (case, configuration, refused_with)) in cases.iter().enumerate() {
         let service_name = format!("settable-svc-{index}");
         let mut body = json!({ "Name": service_name, "NamespaceId": namespace_id });
         for (member, value) in configuration.as_object().expect("an object") {
@@ -195,7 +197,7 @@ async fn a_status_is_client_settable_only_for_a_custom_health_check() {
             for status in cloudmap::ops::types::CUSTOM_HEALTH_STATUS_VALUES {
                 let request =
                     json!({ "ServiceId": reference, "InstanceId": "i-1", "Status": status });
-                if *settable {
+                let Some(expected_code) = *refused_with else {
                     let accepted = ok(
                         &router,
                         "UpdateInstanceCustomHealthStatus",
@@ -207,19 +209,21 @@ async fn a_status_is_client_settable_only_for_a_custom_health_check() {
                         json!({}),
                         "case {case:?} status {status}: expected an empty success, got {accepted}"
                     );
-                } else {
-                    let (http_status, code, message) = refusal(
-                        &router,
-                        "UpdateInstanceCustomHealthStatus",
-                        request.clone(),
-                    )
-                    .await;
-                    assert_eq!(
-                        (http_status, code.as_str()),
-                        (404, "CustomHealthNotFound"),
-                        "case {case:?} status {status}: expected 404 CustomHealthNotFound, \
-                         got {http_status} {code}"
-                    );
+                    continue;
+                };
+                let (http_status, code, message) = refusal(
+                    &router,
+                    "UpdateInstanceCustomHealthStatus",
+                    request.clone(),
+                )
+                .await;
+                assert_eq!(
+                    (http_status, code.as_str()),
+                    (404, expected_code),
+                    "case {case:?} status {status}: expected 404 {expected_code}, \
+                     got {http_status} {code}"
+                );
+                if expected_code == "CustomHealthNotFound" {
                     // The message is built from the request and the stored service: it
                     // names the instance the call asked about and the service by its
                     // own ARN, however the call addressed it. The service wraps the

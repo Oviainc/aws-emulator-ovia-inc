@@ -162,12 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (ARN) of the namespace", so either form resolves to the one stored record.
         let Some(namespace_id) = state.resolve_namespace_id(&input.id) else {
             return Err(UpdateHttpNamespaceErrorModeled::NamespaceNotFound(
-                NamespaceNotFound {
-                    message: Some(format!(
-                        "No namespace exists with the specified ID {}.",
-                        input.id
-                    )),
-                },
+                // `NamespaceNotFound` carries no message: the service reports the class
+                // of failure and echoes no requested id into the body.
+                NamespaceNotFound { message: None },
             )
             .into());
         };
@@ -212,10 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `HttpNamespaceChange$Description` is required, so every call carries the
-        // description the namespace is to hold afterwards — including the empty string,
-        // which stores an empty description rather than leaving the old one in place.
+        // description the namespace is to hold afterwards. The empty string replaces the
+        // previous description rather than leaving it in place — and it stores NO
+        // description, because an empty `ResourceDescription` is indistinguishable on a
+        // read from none at all: the member is absent from both.
         if let Some(namespace) = state.namespaces.get_mut(&namespace_id) {
-            namespace.description = Some(input.namespace.description.clone());
+            namespace.description =
+                crate::state::described(Some(input.namespace.description.clone()));
         }
 
         let operation_id = state.record_operation(

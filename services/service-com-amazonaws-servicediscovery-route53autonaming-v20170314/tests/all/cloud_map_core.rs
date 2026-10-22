@@ -1136,21 +1136,12 @@ async fn the_service_type_follows_whether_dns_records_are_registered() {
 
     let dns_config = json!({ "DnsRecords": [{ "Type": "A", "TTL": 60 }] });
     // (case, the namespace to create in, the extra request members, expected Type)
+    // A `DnsConfig` against the HTTP namespace is not a row here: it is refused, which
+    // `cloud_map_lifecycle::a_dns_config_is_refused_against_a_namespace_that_holds_no_hosted_zone`
+    // pins.
     let cases: Vec<(&str, &str, Value, &str)> = vec![
         ("no DnsConfig", http_namespace.as_str(), json!({}), "HTTP"),
         ("Type=HTTP", http_namespace.as_str(), json!({ "Type": "HTTP" }), "HTTP"),
-        (
-            "a DnsConfig in an HTTP namespace, which holds no hosted zone",
-            http_namespace.as_str(),
-            json!({ "DnsConfig": dns_config.clone() }),
-            "HTTP",
-        ),
-        (
-            "Type=HTTP alongside a DnsConfig",
-            http_namespace.as_str(),
-            json!({ "Type": "HTTP", "DnsConfig": dns_config.clone() }),
-            "HTTP",
-        ),
         (
             "no DnsConfig in a DNS namespace, so no records are registered",
             dns_namespace.as_str(),
@@ -1310,8 +1301,8 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
             "a namespace name that is already taken",
             "CreateHttpNamespace",
             json!({ "Name": "errors-ns" }),
-            400,
-            "NamespaceAlreadyExists",
+            409,
+            "DuplicateRequest",
         ),
         (
             "a service name that is already taken in the namespace",
@@ -1381,16 +1372,17 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
         );
     }
 
-    // The conflict carries the id of the resource that already exists.
-    let (_, conflict) = call(
-        &router,
-        "CreateHttpNamespace",
-        json!({ "Name": "errors-ns" }),
-    )
-    .await;
+    // The conflict names the create that already owns the name, so a caller can poll it.
+    let create_operation = ok(&router, "CreateHttpNamespace", json!({ "Name": "poll-ns" })).await
+        ["OperationId"]
+        .as_str()
+        .expect("an OperationId")
+        .to_string();
+    let (_, conflict) = call(&router, "CreateHttpNamespace", json!({ "Name": "poll-ns" })).await;
     assert_eq!(
-        conflict["NamespaceId"], json!(namespace_id),
-        "NamespaceAlreadyExists names the namespace that already exists, got {conflict}"
+        conflict["DuplicateOperationId"],
+        json!(create_operation),
+        "DuplicateRequest names the create that already owns the name, got {conflict}"
     );
     let (_, conflict) = call(
         &router,

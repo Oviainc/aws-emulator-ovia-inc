@@ -174,10 +174,17 @@ async fn every_description_a_call_carries_is_what_the_namespace_reads_back() {
             "case {case:?}: UpdateHttpNamespace must return an OperationId, got {updated}"
         );
 
+        // An empty description is no description: it replaces whatever was there, and
+        // the read omits the member — the same projection a create with
+        // `Description=""` produces, so a client cannot tell the two paths apart.
+        let expected = if description.is_empty() {
+            Value::Null
+        } else {
+            json!(description)
+        };
         let read = stored_description(&router, &namespace_id).await;
         assert_eq!(
-            read,
-            json!(description),
+            read, expected,
             "case {case:?}: expected the namespace to read back the description it was given, \
              got {read}"
         );

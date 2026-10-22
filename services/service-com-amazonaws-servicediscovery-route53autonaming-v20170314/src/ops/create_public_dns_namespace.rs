@@ -212,17 +212,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One name index holds every namespace type, so a public DNS namespace cannot
-        // take a name any namespace already answers to.
+        // take a name any namespace already answers to. A name already owned by a
+        // COMPLETED create is a duplicate request, not a validation failure: the create
+        // that owns the name has already run, so the conflict is reported as
+        // `DuplicateRequest` (409) naming that operation — the same rule every namespace
+        // create follows. Deleting the namespace frees the name.
         if let Some(existing) = state
             .namespace_ids_by_name
             .get(&input.name)
             .and_then(|id| state.namespaces.get(id))
         {
-            return Err(CreatePublicDnsNamespaceErrorModeled::NamespaceAlreadyExists(
-                NamespaceAlreadyExists {
-                    message: Some(format!("The namespace {} already exists.", input.name)),
-                    namespace_id: Some(existing.id.clone()),
-                    creator_request_id: existing.creator_request_id.clone(),
+            return Err(CreatePublicDnsNamespaceErrorModeled::DuplicateRequest(
+                DuplicateRequest {
+                    message: Some(crate::state::duplicate_create_message(
+                        Self::NAME,
+                        existing.create_operation_id.as_deref(),
+                    )),
+                    duplicate_operation_id: existing.create_operation_id.clone(),
                 },
             )
             .into());
@@ -243,6 +249,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = state.next_id("ns", 16);
         let hosted_zone_id = state.next_hosted_zone_id();
+        // The operation is filed first because the namespace record carries its id:
+        // that is what a later create of the same name is refused with.
+        let operation_id = state.record_operation(
+            "CREATE_NAMESPACE",
+            now,
+            [("NAMESPACE".to_string(), id.clone())],
+        );
         let namespace = crate::state::NamespaceRecord {
             arn: crate::state::service_arn(&region, &format!("namespace/{id}")),
             id: id.clone(),
@@ -252,12 +265,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // API", so the namespace carries BOTH the hosted zone Cloud Map creates
             // for it and the HTTP name `DiscoverInstances` resolves it by.
             namespace_type: "DNS_PUBLIC".to_string(),
-            description: input.description.clone(),
+            // An empty `Description` is no description, so it is not stored and the read
+            // projection omits the member.
+            description: crate::state::described(input.description.clone()),
             create_date: now,
             creator_request_id: input.creator_request_id.clone(),
             http_name: Some(input.name.clone()),
             hosted_zone_id: Some(hosted_zone_id),
             soa_ttl,
+            create_operation_id: Some(operation_id.clone()),
             tags: input
                 .tags
                 .unwrap_or_default()
@@ -267,10 +283,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let name = input.name.clone();
         state.namespace_ids_by_name.insert(input.name, id.clone());
-        state.namespaces.insert(id.clone(), namespace);
+        state.namespaces.insert(id, namespace);
 
-        let operation_id =
-            state.record_operation("CREATE_NAMESPACE", now, [("NAMESPACE".to_string(), id)]);
         if let Some(token) = input.creator_request_id.as_deref() {
             state.remember(
                 crate::state::IdempotencyScope::CreatePublicDnsNamespace,

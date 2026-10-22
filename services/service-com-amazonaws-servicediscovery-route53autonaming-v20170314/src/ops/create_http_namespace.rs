@@ -4,6 +4,8 @@
 //! Implemented: mints a namespace record and files the `CREATE_NAMESPACE` operation
 //! whose id is this call's only output. The namespace id reaches the caller through
 //! that operation's `Targets` map, which is how Cloud Map's asynchronous create works.
+//! A `Name` already owned by a completed create is refused with `DuplicateRequest`
+//! naming that operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,6 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The modelled `@pattern` on `NamespaceNameHttp`, which the boundary validator
+        // cannot apply (its `(?!arn:)` lookahead does not compile), so it is applied
+        // here before anything is created.
+        if let Some(message) = crate::state::namespace_name_violation(
+            "name",
+            &input.name,
+            crate::state::NAMESPACE_NAME_HTTP_PATTERN,
+        ) {
+            return Err(CreateHttpNamespaceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(message),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx);
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
@@ -198,16 +214,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // A name already owned by a COMPLETED create is a duplicate request, not a
+        // validation failure: the create that owns the name has already run, so the
+        // conflict is reported as `DuplicateRequest` (409) naming that operation.
+        // Deleting the namespace frees the name and the identical call then succeeds.
         if let Some(existing) = state
             .namespace_ids_by_name
             .get(&input.name)
             .and_then(|id| state.namespaces.get(id))
         {
-            return Err(CreateHttpNamespaceErrorModeled::NamespaceAlreadyExists(
-                NamespaceAlreadyExists {
-                    message: Some(format!("The namespace {} already exists.", input.name)),
-                    namespace_id: Some(existing.id.clone()),
-                    creator_request_id: existing.creator_request_id.clone(),
+            return Err(CreateHttpNamespaceErrorModeled::DuplicateRequest(
+                DuplicateRequest {
+                    message: Some(crate::state::duplicate_create_message(
+                        Self::NAME,
+                        existing.create_operation_id.as_deref(),
+                    )),
+                    duplicate_operation_id: existing.create_operation_id.clone(),
                 },
             )
             .into());
@@ -227,6 +249,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = state.next_id("ns", 16);
+        // The operation is filed first because the namespace record carries its id:
+        // that is what a later create of the same name is refused with.
+        let operation_id = state.record_operation(
+            "CREATE_NAMESPACE",
+            now,
+            [("NAMESPACE".to_string(), id.clone())],
+        );
         let namespace = crate::state::NamespaceRecord {
             arn: crate::state::service_arn(&region, &format!("namespace/{id}")),
             id: id.clone(),
@@ -234,12 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An HTTP namespace holds no hosted zone, so it carries only
             // `Properties.HttpProperties.HttpName`.
             namespace_type: "HTTP".to_string(),
-            description: input.description.clone(),
+            description: crate::state::described(input.description.clone()),
             create_date: now,
             creator_request_id: input.creator_request_id.clone(),
             http_name: Some(input.name.clone()),
             hosted_zone_id: None,
             soa_ttl: None,
+            create_operation_id: Some(operation_id.clone()),
             tags: input
                 .tags
                 .unwrap_or_default()
@@ -249,10 +279,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let name = input.name.clone();
         state.namespace_ids_by_name.insert(input.name, id.clone());
-        state.namespaces.insert(id.clone(), namespace);
+        state.namespaces.insert(id, namespace);
 
-        let operation_id =
-            state.record_operation("CREATE_NAMESPACE", now, [("NAMESPACE".to_string(), id)]);
         if let Some(token) = input.creator_request_id.as_deref() {
             state.remember(
                 crate::state::IdempotencyScope::CreateHttpNamespace,

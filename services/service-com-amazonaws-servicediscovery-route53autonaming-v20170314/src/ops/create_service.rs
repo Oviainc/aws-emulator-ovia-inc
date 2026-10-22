@@ -2,7 +2,9 @@
 
 //! @op CreateService
 //! Implemented: a synchronous create that returns the full `Service` computed from the
-//! record it just persisted, and keeps the owning namespace's `ServiceCount` true.
+//! record it just persisted, and keeps the owning namespace's `ServiceCount` true. A
+//! `DnsConfig` against a namespace that holds no hosted zone is refused with
+//! `InvalidInput`.
 //!
 //! ## Shape of an operation
 //!
@@ -246,14 +248,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
 
+        // `NamespaceNotFound` carries no message: the service reports the class of
+        // failure and echoes no requested id into the body.
         let Some(namespace_id) = state.resolve_namespace_id(&namespace_reference) else {
             return Err(CreateServiceErrorModeled::NamespaceNotFound(NamespaceNotFound {
-                message: Some(format!(
-                    "No namespace exists with the specified ID {namespace_reference}."
-                )),
+                message: None,
             })
             .into());
         };
+        // A `DnsConfig` asks Cloud Map to create Route 53 records in the parent
+        // namespace's hosted zone. A namespace that holds no hosted zone has nowhere
+        // for those records to go, so the call is refused up front — before the replay
+        // and the conflict checks, and so before anything is stored — rather than
+        // stored as a service promising DNS records no resolver would ever answer.
+        // The precondition is read from the stored `hosted_zone_id`, which is the
+        // thing the records need, rather than from the namespace's type: a namespace
+        // type that holds no zone is refused whether or not it is `HTTP`.
+        let namespace_has_no_hosted_zone = state
+            .namespaces
+            .get(&namespace_id)
+            .is_some_and(|namespace| namespace.hosted_zone_id.is_none());
+        if namespace_has_no_hosted_zone && input.dns_config.is_some() {
+            return Err(CreateServiceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(
+                    "When you create a service using a namespace that has a type of HTTP, you \
+                     can't include a DnsConfig element."
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
         // What the token identifies: this service name in this namespace.
         let requested = format!("{namespace_id}/{}", input.name);
 
@@ -283,10 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateServiceErrorModeled::ServiceAlreadyExists(
                 ServiceAlreadyExists {
-                    message: Some(format!(
-                        "The service {} already exists in namespace {namespace_id}.",
-                        input.name
-                    )),
+                    message: Some(crate::state::SERVICE_ALREADY_EXISTS_MESSAGE.to_string()),
                     creator_request_id: existing.creator_request_id.clone(),
                     service_id: Some(existing.id.clone()),
                     service_arn: Some(existing.arn.clone()),
@@ -296,17 +318,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `Service$Type` says what can discover the instances: `HTTP` when no DNS
-        // record is registered for them — the caller asked for `HTTP`, supplied no
-        // `DnsConfig`, or the namespace is an HTTP namespace, which holds no hosted
-        // zone — and `DNS_HTTP` when DNS records are registered, which both DNS
+        // record is registered for them — the caller asked for `HTTP` or supplied no
+        // `DnsConfig` — and `DNS_HTTP` when DNS records are registered, which both DNS
         // queries and `DiscoverInstances` can then find.
-        let namespace_is_http = state
-            .namespaces
-            .get(&namespace_id)
-            .is_some_and(|namespace| namespace.namespace_type == "HTTP");
-        let http_only = input.r#type.as_deref() == Some("HTTP")
-            || input.dns_config.is_none()
-            || namespace_is_http;
+        let http_only = input.r#type.as_deref() == Some("HTTP") || input.dns_config.is_none();
         let service_type = if http_only { "HTTP" } else { "DNS_HTTP" };
 
         if usize::try_from(state.service_count(&namespace_id)).unwrap_or(usize::MAX)
@@ -330,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             name: input.name.clone(),
             namespace_id,
-            description: input.description.clone(),
+            description: crate::state::described(input.description.clone()),
             dns_config: input.dns_config.clone(),
             health_check_config: input.health_check_config.clone(),
             health_check_custom_config: input.health_check_custom_config.clone(),

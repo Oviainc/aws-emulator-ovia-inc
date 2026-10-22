@@ -223,10 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         else {
             return Err(DiscoverInstancesErrorModeled::NamespaceNotFound(NamespaceNotFound {
-                message: Some(format!(
-                    "No namespace exists with the specified name {}.",
-                    input.namespace_name
-                )),
+                // `NamespaceNotFound` carries no message: the service reports the
+                // class of failure and echoes no requested name into the body.
+                message: None,
             })
             .into());
         };

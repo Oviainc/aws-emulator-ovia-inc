@@ -199,7 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The one answer for a service this emulator does not hold, whether the
         // reference resolves to no id at all or the id it resolves to is no longer
-        // stored: a request never depends on the two agreeing.
+        // stored: a request never depends on the two agreeing. It is also the answer
+        // for a service that configures NO health checking, which the recorded units
+        // for this operation show: such a service is in no health registry at all, so
+        // the custom-health registry this call addresses holds nothing for it.
         let service_not_found = || {
             UpdateInstanceCustomHealthStatusErrorModeled::ServiceNotFound(ServiceNotFound {
                 message: Some(format!(
@@ -217,11 +220,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(service_not_found().into());
         };
 
-        // Only a custom health check's status is client-settable. A service whose
-        // health checking is Route 53's (`HealthCheckConfig`), or that configures none
-        // at all, has no custom health check for any of its instances to carry — so the
-        // request is refused whatever instance it names.
+        // Only a custom health check's status is client-settable, and the refusal says
+        // WHICH registry is missing the service:
+        //
+        // * a service whose health checking is Route 53's (`HealthCheckConfig`) IS
+        //   health-checked, just not by a check a client may set, so the call answers
+        //   `CustomHealthNotFound` — "the health check for the instance that's
+        //   specified by ServiceId and InstanceId is not a custom health check";
+        // * a service that configures no health checking at all is in no health
+        //   registry, and the recorded units for this operation show that call refused
+        //   as `ServiceNotFound`.
+        //
+        // Either way the request is refused whatever instance it names.
         if !service.custom_health_checked() {
+            if service.health_check_config.is_none() {
+                return Err(service_not_found().into());
+            }
             return Err(
                 UpdateInstanceCustomHealthStatusErrorModeled::CustomHealthNotFound(
                     CustomHealthNotFound {

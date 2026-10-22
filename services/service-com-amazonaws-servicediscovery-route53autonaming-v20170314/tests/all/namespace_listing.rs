@@ -97,9 +97,10 @@ async fn namespace(router: &MultiServiceRouter, name: &str) -> String {
         .to_string()
 }
 
-/// Store a namespace of `namespace_type` directly, for the kinds whose `Create…`
-/// operation is still a scaffold (`CreatePublicDnsNamespace`,
-/// `CreatePrivateDnsNamespace`). The record is the same one a create would write.
+/// Store a namespace of `namespace_type` directly, which is cheaper than driving its
+/// `Create…` operation when a listing needs several of each kind. The record is the
+/// same one a create would write — except that a namespace nobody created through the
+/// API owns no create operation, so it carries no `create_operation_id`.
 fn seed_namespace(
     engine: &Arc<engine::InMemoryEngine>,
     id: &str,
@@ -125,6 +126,9 @@ fn seed_namespace(
             // A seeded DNS namespace states no SOA TTL, which the record reports as
             // absent rather than inventing one.
             soa_ttl: None,
+            // Nothing created this namespace through the API, so no completed create
+            // owns its name.
+            create_operation_id: None,
             tags: Vec::new(),
         },
     );

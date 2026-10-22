@@ -179,12 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             return Err(DeleteNamespaceErrorModeled::NamespaceNotFound(
-                NamespaceNotFound {
-                    message: Some(format!(
-                        "No namespace exists with the specified ID {}.",
-                        input.id
-                    )),
-                },
+                // `NamespaceNotFound` carries no message: the service reports the class
+                // of failure and echoes no requested id into the body.
+                NamespaceNotFound { message: None },
             )
             .into());
         };
