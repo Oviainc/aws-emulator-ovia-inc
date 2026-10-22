@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#CreateMilestoneInput")]
+// `WorkloadId` is a path label this operation RESOLVES; see the note in
+// `get_workload_types.rs`. `MilestoneName` and `ClientRequestToken` are request BODY
+// members the service validates, so their `@length`/`@pattern` are still enforced at
+// the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#CreateMilestoneInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateMilestoneInput {
     pub workload_id: String,

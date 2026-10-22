@@ -3,10 +3,16 @@
 //! Engine state for the com-amazonaws-wellarchitected-wellarchitectedapiservicelambda service.
 //!
 //! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
-//! `UpdateWorkload`, `DeleteWorkload`) is backed entirely by the maps below, so a
-//! create is visible to the next request on the same engine. The record type and its
-//! two projections live here rather than in a handler because five operations reach
-//! them.
+//! `UpdateWorkload`, `DeleteWorkload`) and the milestones recorded against a workload
+//! (`CreateMilestone`, `GetMilestone`) are backed entirely by the maps below, so a
+//! create is visible to the next request on the same engine. The record types and
+//! their projections live here rather than in a handler because several operations
+//! reach them.
+//!
+//! The modelled `ResourceNotFoundException` / `ConflictException` constructors live
+//! here for the same reason: every operation that resolves an identifier or enforces a
+//! uniqueness rule must word the failure identically, so there is ONE place each
+//! message is built.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -14,8 +20,8 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Workload, WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput,
-    WorkloadJiraConfigurationOutput, WorkloadSummary, RISK_VALUES,
+    ConflictException, Milestone, ResourceNotFoundException, Workload, WorkloadDiscoveryConfig,
+    WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadSummary, RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
@@ -67,6 +73,10 @@ pub const FRAMEWORK_LENS_PILLARS: &[(&str, usize)] = &[
 /// workload.
 pub const WORKLOAD_RESOURCE_TYPE: &str = "WORKLOAD";
 
+/// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
+/// milestone.
+pub const MILESTONE_RESOURCE_TYPE: &str = "MILESTONE";
+
 /// The ARN service namespace (`OPERATIONS.md`: "ARN namespace: `wellarchitected`").
 pub const ARN_NAMESPACE: &str = "wellarchitected";
 
@@ -86,6 +96,12 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// maps are bounded by this one count. It sits far above any realistic client workflow,
 /// so a caller never meets it by accident.
 pub const MAX_WORKLOADS_PER_ACCOUNT_REGION: usize = 10_000;
+
+/// The most milestones one workload holds: "A workload can have a maximum of 100
+/// milestones" (`MilestoneNumber` doc), which is also why `MilestoneNumber` is
+/// `@range(min: 1, max: 100)`. Numbers are handed out from 1 upwards and never reused,
+/// so this is what bounds the milestone map per workload.
+pub const MAX_MILESTONES_PER_WORKLOAD: i32 = 100;
 
 /// One stored workload. Every member of the modelled `Workload` output that a request
 /// can set is persisted here, and the members the SERVICE computes — the risk roll-up
@@ -232,6 +248,31 @@ fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32> {
     counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
 }
 
+/// One stored milestone: a workload recorded as it stood at one instant.
+///
+/// The workload is held by VALUE, not by id: "A milestone records the state of a
+/// workload at a particular point in time" (`CreateMilestone` doc), so a later
+/// `UpdateWorkload` must not change what a recorded milestone reports.
+#[derive(Debug, Clone)]
+pub struct MilestoneRecord {
+    pub milestone_number: i32,
+    pub milestone_name: String,
+    pub recorded_at: SystemTime,
+    pub workload: WorkloadRecord,
+}
+
+impl MilestoneRecord {
+    /// The `Milestone` shape `GetMilestone` returns.
+    pub fn to_milestone(&self) -> Milestone {
+        Milestone {
+            milestone_number: Some(self.milestone_number),
+            milestone_name: Some(self.milestone_name.clone()),
+            recorded_at: Some(::aws_smithy_types::DateTime::from(self.recorded_at)),
+            workload: Some(self.workload.to_workload()),
+        }
+    }
+}
+
 /// The lens a `LensAlias` names, as its bare alias.
 ///
 /// "For Amazon Web Services official lenses, this is either the lens alias, such as
@@ -279,11 +320,25 @@ pub struct CreateWorkloadToken {
     pub fingerprint: String,
 }
 
+/// What a `CreateMilestone` idempotency token resolves to: the milestone the original
+/// request recorded, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateMilestoneToken {
+    pub workload_id: String,
+    pub milestone_number: i32,
+    pub fingerprint: String,
+}
+
 /// Per-service state for com-amazonaws-wellarchitected-wellarchitectedapiservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// Every stored workload, keyed by its 32-lowercase-hex `WorkloadId`.
     pub workloads: HashMap<String, WorkloadRecord>,
+    /// Every recorded milestone, keyed by `WorkloadId` then by `MilestoneNumber`. A
+    /// `BTreeMap` because the next number is one past the highest already handed out.
+    pub milestones: HashMap<String, BTreeMap<i32, MilestoneRecord>>,
+    /// `CreateMilestone`'s `ClientRequestToken` -> what the original request recorded.
+    pub create_milestone_tokens: HashMap<String, CreateMilestoneToken>,
     /// Normalized workload name -> `WorkloadId`. Backs the documented "name must be
     /// unique within an account within a Region; spaces and capitalization are
     /// ignored" rule.
@@ -336,7 +391,41 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .remove(&normalize_workload_name(&record.workload_name));
         self.create_workload_tokens
             .retain(|_, token| token.workload_id != workload_id);
+        // A milestone belongs to its workload, so the whole set goes with it — and with
+        // it every create token that resolved to one of them.
+        self.milestones.remove(workload_id);
+        self.create_milestone_tokens
+            .retain(|_, token| token.workload_id != workload_id);
         Some(record)
+    }
+
+    /// The workload already holding `name` under the service's own loose comparison
+    /// ("spaces and capitalization are ignored"): its name AS STORED and its id, in the
+    /// order [`workload_name_conflict`] takes them. The stored name is what a collision
+    /// reports, rather than the caller's spelling of it.
+    pub fn workload_holding_name(&self, name: &str) -> Option<(&str, &str)> {
+        let workload_id = self.workload_name_index.get(&normalize_workload_name(name))?;
+        let record = self.workloads.get(workload_id)?;
+        Some((
+            record.workload_name.as_str(),
+            record.workload_id.as_str(),
+        ))
+    }
+
+    /// The milestone `number` recorded for `workload_id`, if one is.
+    pub fn milestone(&self, workload_id: &str, number: i32) -> Option<&MilestoneRecord> {
+        self.milestones.get(workload_id)?.get(&number)
+    }
+
+    /// The number the next milestone of `workload_id` takes: one past the highest ever
+    /// handed out, starting at 1. Can exceed [`MAX_MILESTONES_PER_WORKLOAD`], which is
+    /// how a caller meets the quota.
+    pub fn next_milestone_number(&self, workload_id: &str) -> i32 {
+        self.milestones
+            .get(workload_id)
+            .and_then(|recorded| recorded.keys().next_back().copied())
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 }
 
@@ -374,6 +463,136 @@ pub fn decode_next_token(token: &str) -> Option<(String, String)> {
     let name = cursor.get("n")?.as_str()?.to_string();
     let id = cursor.get("i")?.as_str()?.to_string();
     Some((name, id))
+}
+
+/// The tag this service opens an exception message with: the failure class in square
+/// brackets, then the sentence — `[ResourceNotFound] …`, `[Conflict] …`. Every lookup
+/// and collision failure this service words goes through here, so one form covers them
+/// all. (Recorded `ValidationException` messages carry a `[Validation] …` tag of the
+/// same shape; wording those is the subject of its own open issue, so
+/// [`validation_detail`] below is left as it stands.)
+fn tagged_message(tag: &str, sentence: &str) -> String {
+    format!("[{tag}] {sentence}")
+}
+
+/// A modelled `ResourceNotFoundException` (HTTP 404) for a lookup that resolved
+/// nothing.
+///
+/// The message is built from the request and the owning account: it names the resource
+/// that was looked for (`subject`, e.g. `workload with ID <id>`) and the account it was
+/// looked for in, so a caller can tell "not in this account / not shared with me" from
+/// "deleted". `resource_id` is the identifier AS SENT, and `resource_type` the modelled
+/// type of the resource that was missing — both are `@required` on the shape.
+pub fn resource_not_found(
+    resource_type: &str,
+    resource_id: String,
+    subject: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: tagged_message(
+            "ResourceNotFound",
+            &format!(
+                "No {subject} was found in account {}.",
+                ::engine::emulator_account_id()
+            ),
+        ),
+        resource_id,
+        resource_type: resource_type.to_string(),
+    }
+}
+
+/// [`resource_not_found`] for a workload id that names no stored workload. Shared by
+/// every operation that resolves a `WorkloadId`, so they cannot word it differently.
+pub fn workload_not_found(workload_id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        WORKLOAD_RESOURCE_TYPE,
+        workload_id.to_string(),
+        &format!("workload with ID {workload_id}"),
+    )
+}
+
+/// [`resource_not_found`] for a milestone number that names no recorded milestone of
+/// `workload_id`.
+///
+/// A milestone is identified by the pair, so the `ResourceId` is the composite
+/// `<workloadId>.<milestoneNumber>` and the message names both.
+pub fn milestone_not_found(workload_id: &str, milestone_number: i32) -> ResourceNotFoundException {
+    resource_not_found(
+        MILESTONE_RESOURCE_TYPE,
+        milestone_resource_id(workload_id, milestone_number),
+        &format!(
+            "milestone with number {milestone_number} in a workload with ID {workload_id}"
+        ),
+    )
+}
+
+/// How a milestone is named in an exception's `ResourceId`: the workload it belongs to
+/// and its number, which together identify it.
+pub fn milestone_resource_id(workload_id: &str, milestone_number: i32) -> String {
+    format!("{workload_id}.{milestone_number}")
+}
+
+/// A modelled `ConflictException` (HTTP 409) for a request that collides with a
+/// resource that already exists.
+///
+/// The message names the resource that is in the way AS STORED, and `resource_id`
+/// identifies it, so a caller can fetch it. It is deliberately the stored value rather
+/// than the spelling the request submitted: the two differ wherever the uniqueness rule
+/// compares loosely (workload names ignore spaces and capitalization), and what the
+/// caller needs named is the resource it collided with.
+pub fn conflict(resource_type: &str, resource_id: String, sentence: &str) -> ConflictException {
+    ConflictException {
+        message: tagged_message("Conflict", sentence),
+        resource_id,
+        resource_type: resource_type.to_string(),
+    }
+}
+
+/// [`conflict`] for a workload name that is already taken: "The name must be unique
+/// within an account within an Amazon Web Services Region. Spaces and capitalization
+/// are ignored when checking for uniqueness" (`CreateWorkloadInput$WorkloadName` doc).
+///
+/// `existing_name` / `existing_id` are the stored name and id of the workload already
+/// holding the name, not the request's spelling of it.
+pub fn workload_name_conflict(existing_name: &str, existing_id: &str) -> ConflictException {
+    conflict(
+        WORKLOAD_RESOURCE_TYPE,
+        existing_id.to_string(),
+        &format!("A workload with name {existing_name} already exists."),
+    )
+}
+
+/// [`conflict`] for a milestone name that is already taken within its workload:
+/// "Milestone names must be unique within a workload"
+/// (`CreateMilestoneInput$MilestoneName` doc). `existing_name` / `existing_number` are
+/// the stored name and number of the milestone already holding it.
+pub fn milestone_name_conflict(
+    existing_name: &str,
+    workload_id: &str,
+    existing_number: i32,
+) -> ConflictException {
+    conflict(
+        MILESTONE_RESOURCE_TYPE,
+        milestone_resource_id(workload_id, existing_number),
+        &format!("A milestone with name {existing_name} already exists."),
+    )
+}
+
+/// [`conflict`] for an idempotency token replayed with different parameters: the token
+/// already names a resource, so the second request cannot be the same request.
+pub fn idempotency_token_conflict(
+    resource_type: &str,
+    resource_id: String,
+    client_request_token: &str,
+) -> ConflictException {
+    conflict(
+        resource_type,
+        resource_id,
+        &format!(
+            "A request with ClientRequestToken {client_request_token} was already \
+             submitted with different parameters."
+        ),
+    )
 }
 
 /// The `message` and `Fields` a modelled `ValidationException` carries for one member

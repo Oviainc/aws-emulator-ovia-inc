@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#GetWorkloadInput")]
+// `WorkloadId` is a path label this operation RESOLVES: the lookup in
+// `ops::get_workload` owns a value that names no workload, and answers the modelled
+// 404 `ResourceNotFoundException` for it (with `ResourceId` as sent), so the boundary
+// validator must not refuse the id's `@length`/`@pattern` with a 400 first.
+// `skip_validation` drops only that member's constraint traits; every other member of
+// this shape is still validated at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#GetWorkloadInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetWorkloadInput {
     pub workload_id: String,
