@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTagsToResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTagsToResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTagsToResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges tags into a stored directory's tag map — a key already present takes the new
+//! value — and refuses a merge that would take the directory past the 50-tag limit.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +137,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTagsToResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsToResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTagsToResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the
+        // request's tag list is bounded before anything is allocated from it and
+        // before `state.lock()` is taken, so the merge below is work proportional to a
+        // constant, not to the request.
+        if input.tags.len() > crate::state::MAX_TAGS {
+            return Err(tag_limit_exceeded(input.tags.len()));
+        }
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store
+            .directories
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| {
+                AddTagsToResourceErrorModeled::EntityDoesNotExistException(
+                    EntityDoesNotExistException {
+                        message: Some(crate::state::no_such_directory(&input.resource_id)),
+                        request_id: None,
+                    },
+                )
+            })?;
+
+        // The merged map is sized BEFORE anything is written, so a merge that would
+        // take the stored map past the limit leaves the stored tags exactly as they
+        // were. Both operands are already bounded by `MAX_TAGS`, the request's list by
+        // the check above and the stored map by this one.
+        let mut merged = directory.tags.clone();
+        for tag in input.tags {
+            merged.insert(tag.key, tag.value);
+        }
+        if merged.len() > crate::state::MAX_TAGS {
+            return Err(tag_limit_exceeded(merged.len()));
+        }
+        directory.tags = merged;
+
+        Ok(AddTagsToResourceOutput {})
     }
+}
+
+/// Refuse the request with the modelled `TagLimitExceededException`, naming the bound
+/// and the count that broke it.
+fn tag_limit_exceeded(count: usize) -> AddTagsToResourceError {
+    AddTagsToResourceErrorModeled::TagLimitExceededException(TagLimitExceededException {
+        message: Some(format!(
+            "A resource may carry at most {max} tags; the request would leave {count}",
+            max = crate::state::MAX_TAGS
+        )),
+        request_id: None,
+    })
+    .into()
 }
