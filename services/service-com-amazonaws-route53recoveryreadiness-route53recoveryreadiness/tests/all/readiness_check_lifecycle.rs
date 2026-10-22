@@ -14,6 +14,11 @@
 //! the `DnsTargetResource` subtree goes, resource-set type, name form and length, tag
 //! count, stored record count and page size, and which of the two resource kinds is
 //! addressed. The `my_set` / `my_check` case the bootstrap issue recorded is one row.
+//!
+//! Every emulator here is built for an account that MAY create readiness resources
+//! ([`Emulator::new`]): the feature is closed to accounts that do not already use it, so
+//! a create is denied account-wide unless the store says this account is eligible. The
+//! gate itself is tested in `account_gate_and_not_found.rs`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,7 +26,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_route53recoveryreadiness_route53recoveryreadiness::state::{
-    DEFAULT_MAX_RESULTS, MAX_READINESS_SCOPES_PER_RESOURCE, MAX_RECORDS_PER_STORE,
+    service_state, DEFAULT_MAX_RESULTS, MAX_READINESS_SCOPES_PER_RESOURCE, MAX_RECORDS_PER_STORE,
     MAX_RESOURCES_PER_SET, MAX_TAGS_PER_RESOURCE,
 };
 use service_com_amazonaws_route53recoveryreadiness_route53recoveryreadiness::EmulatedService;
@@ -121,25 +126,25 @@ impl Kind {
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn field(&self, name: &str) -> Option<&Value> {
+    pub(crate) fn field(&self, name: &str) -> Option<&Value> {
         self.body.get(name).filter(|v| !v.is_null())
     }
 
-    fn string(&self, name: &str) -> Option<String> {
+    pub(crate) fn string(&self, name: &str) -> Option<String> {
         self.field(name).and_then(Value::as_str).map(str::to_string)
     }
 
     /// The error shape the answer names: the `x-amzn-errortype` header restJson1 sets,
     /// falling back to the body's `__type` (which carries the shape even when the
     /// header had to be omitted).
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let raw = if self.error_type.is_empty() {
             self.string("__type").unwrap_or_default()
         } else {
@@ -151,13 +156,28 @@ impl Reply {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    /// An emulator whose account MAY create readiness resources — what an account that
+    /// already used the feature before it was closed to new accounts has. Everything
+    /// about a stored record is only reachable through such an account.
+    pub(crate) fn new() -> Self {
+        Self::with_account_eligibility(true)
+    }
+
+    /// An emulator whose account is eligible to create readiness resources or not.
+    ///
+    /// The eligibility is a field of this service's store ([`service_state`]), set here
+    /// the way `state::ACCOUNT_ELIGIBLE_ENV` sets it at start-up.
+    pub(crate) fn with_account_eligibility(eligible: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        service_state(&*engine)
+            .expect("this service's state store")
+            .lock()
+            .account_readiness_eligible = eligible;
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by the
         // SigV4 credential scope below.
@@ -166,7 +186,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         let authorization = "AWS4-HMAC-SHA256 \
              Credential=AKIDEXAMPLE/20260101/us-east-1/route53-recovery-readiness/aws4_request, \
              SignedHeaders=host, Signature=deadbeef";

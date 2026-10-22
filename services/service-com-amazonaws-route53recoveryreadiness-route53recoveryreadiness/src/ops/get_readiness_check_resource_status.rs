@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReadinessCheckResourceStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReadinessCheckResourceStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReadinessCheckResourceStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the readiness of ONE resource of the resource set a readiness check watches,
+//! or the modelled `ResourceNotFoundException` when this account has no check by that
+//! name, or that check watches no resource with this identifier. A report: it writes
+//! nothing.
+//!
+//! Nothing in this emulator audits the real AWS resource, so no readiness rule has ever
+//! been evaluated against it: the readiness is [`crate::state::READINESS_UNKNOWN`] and
+//! `Rules` is empty rather than carrying a rule verdict, a rule id and a "last checked"
+//! time for an audit that never ran.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReadinessCheckResourceStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReadinessCheckResourceStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReadinessCheckResourceStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetReadinessCheckResourceStatusErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        let not_found = || {
+            GetReadinessCheckResourceStatusErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+        };
+
+        let check = state
+            .readiness_checks
+            .get(&input.readiness_check_name)
+            .ok_or_else(not_found)?;
+        // The identifier addresses a resource OF THE WATCHED SET: either its ARN or the
+        // component id this API generates for a DNS target resource
+        // (`smithy_query(query="doc", shape="GetReadinessCheckResourceStatusRequest",
+        // member="ResourceIdentifier")`). A check that does not watch it has no status
+        // for it.
+        let watched = state
+            .resource_sets
+            .get(&check.resource_set_name)
+            .is_some_and(|set| {
+                set.resources.iter().any(|resource| {
+                    resource.resource_arn.as_deref() == Some(input.resource_identifier.as_str())
+                        || resource.component_id.as_deref()
+                            == Some(input.resource_identifier.as_str())
+                })
+            });
+        if !watched {
+            return Err(not_found().into());
+        }
+
+        // A cursor is only ever one this service minted, whatever it points at.
+        crate::state::validate_next_token(input.next_token.as_deref()).map_err(|message| {
+            GetReadinessCheckResourceStatusErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        Ok(GetReadinessCheckResourceStatusOutput {
+            // No audit has run, so there is no page of rule results and no page to
+            // resume from.
+            next_token: None,
+            readiness: Some(crate::state::READINESS_UNKNOWN.to_string()),
+            rules: Some(Vec::new()),
+        })
     }
 }

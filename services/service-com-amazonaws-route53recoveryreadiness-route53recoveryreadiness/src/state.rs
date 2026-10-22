@@ -72,6 +72,121 @@ pub const MAX_READINESS_SCOPES_PER_RESOURCE: usize = 50;
 /// The maximum number of tags one record may carry (the emulator's own ceiling).
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The maximum number of nested cell ARNs one cell may carry (the emulator's own
+/// ceiling, for the same reason as [`MAX_RESOURCES_PER_SET`]: one accepted record must
+/// not be arbitrarily large).
+pub const MAX_NESTED_CELLS_PER_CELL: usize = 50;
+
+/// The sentence EVERY not-found answer of this service's resource-addressed operations
+/// carries.
+///
+/// This service's not-found message is a CONSTANT, resource-agnostic text — the same
+/// string whatever was asked for — rather than a sentence built from the request, as
+/// recorded consistently across `DeleteCell`, `GetCell`, `GetCellReadinessSummary`,
+/// `GetReadinessCheck`, `GetReadinessCheckStatus` and `GetReadinessCheckResourceStatus`.
+/// Keeping it in one place is what keeps every handler's wording identical, and it is
+/// why no handler echoes the requested name back (which would also leak which names an
+/// account uses into an error body).
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The same constant for the ARN-addressed TAGGING operations
+/// (`ListTagsForResources`, `TagResource`, `UntagResource`), which this service answers
+/// with its own wire error code [`crate::scaffolded::NOT_FOUND_EXCEPTION_NAME`] and its
+/// own fixed sentence.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The sentence a list operation answers when the `NextToken` it was handed is not one
+/// this service minted. Also a constant: the rejected token is NOT echoed back.
+pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token.";
+
+/// The sentence the account-eligibility gate below refuses a create with.
+pub const ACCOUNT_NOT_ELIGIBLE_MESSAGE: &str =
+    "This operation is currently unavailable for new accounts.";
+
+/// The environment variable an operator uses to tell this emulated account that it MAY
+/// create Route 53 Application Recovery Controller readiness resources, since the API
+/// models no operation that grants that eligibility
+/// (`ROUTE53_RECOVERY_READINESS_ACCOUNT_ELIGIBLE=1`), read once when this service's
+/// store is created.
+///
+/// Unset means NOT eligible, which is what an account that does not already use the
+/// readiness feature has: the feature is closed to new accounts, so AWS passes such a
+/// create through input validation and then denies it with HTTP 403. See
+/// [`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::account_readiness_eligible`].
+pub const ACCOUNT_ELIGIBLE_ENV: &str = "ROUTE53_RECOVERY_READINESS_ACCOUNT_ELIGIBLE";
+
+/// Whether `setting` grants this account the readiness feature: `1`, `true`, `yes` or
+/// `on` in any case grants it, and anything else — including an empty value or a typo —
+/// grants nothing rather than being guessed at.
+pub fn parse_account_eligible(setting: &str) -> bool {
+    matches!(
+        setting.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// The readiness this emulator reports for a check, a cell or a resource it has never
+/// audited: `UNKNOWN`, one of the four values the `Readiness` enum declares
+/// (`smithy_query(query="shape", shape="Readiness")`: READY, NOT_READY, UNKNOWN,
+/// NOT_AUTHORIZED).
+///
+/// Nothing in this emulator inspects the real AWS resources a resource set names, so no
+/// readiness rule has ever been evaluated against them. `UNKNOWN` is the value that
+/// says exactly that, and it is what AWS itself reports for a readiness check whose
+/// first audit has not completed; reporting READY or NOT_READY would be a verdict on
+/// work nothing ran.
+pub const READINESS_UNKNOWN: &str = "UNKNOWN";
+
+/// The resource types this API supports, as the `ResourceSetType` member's own
+/// documentation enumerates them (`smithy_query(query="doc",
+/// shape="CreateResourceSetRequest", member="ResourceSetType")`).
+///
+/// This is the catalog a readiness rule can apply to, and therefore the set of values
+/// `ListRules`' `ResourceType` filter accepts.
+pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
+    "AWS::ApiGateway::Stage",
+    "AWS::ApiGatewayV2::Stage",
+    "AWS::AutoScaling::AutoScalingGroup",
+    "AWS::CloudWatch::Alarm",
+    "AWS::DynamoDB::Table",
+    "AWS::EC2::CustomerGateway",
+    "AWS::EC2::VPC",
+    "AWS::EC2::VPNConnection",
+    "AWS::EC2::VPNGateway",
+    "AWS::EC2::Volume",
+    "AWS::ElasticLoadBalancing::LoadBalancer",
+    "AWS::ElasticLoadBalancingV2::LoadBalancer",
+    "AWS::Lambda::Function",
+    "AWS::MSK::Cluster",
+    "AWS::RDS::DBCluster",
+    "AWS::Route53::HealthCheck",
+    "AWS::Route53RecoveryReadiness::DNSTargetResource",
+    "AWS::SNS::Subscription",
+    "AWS::SNS::Topic",
+    "AWS::SQS::Queue",
+];
+
+/// Refuse a resource-type filter this API does not support, in the wording AWS's
+/// boundary validator uses.
+///
+/// A filter value outside [`SUPPORTED_RESOURCE_TYPES`] names no resource type this
+/// service has rules for, so it is refused rather than silently ignored — a filter that
+/// is honoured for supported values and dropped for unsupported ones would hand back
+/// the whole catalog for a typo.
+pub fn validate_resource_type(path: &str, value: &str) -> Result<(), String> {
+    if SUPPORTED_RESOURCE_TYPES.contains(&value) {
+        return Ok(());
+    }
+    Err(validation_message(
+        path,
+        value,
+        &format!(
+            "Member must be one of the supported resource types: {}",
+            SUPPORTED_RESOURCE_TYPES.join(", ")
+        ),
+    ))
+}
+
 /// Longest prefix of a rejected value a validation message echoes back, so a
 /// multi-megabyte member cannot be amplified into a multi-megabyte error body.
 const ECHO_LIMIT: usize = 64;
@@ -99,6 +214,32 @@ pub struct ResourceSetRecord {
     pub tags: BTreeMap<String, String>,
 }
 
+/// One stored cell: the ARN the service minted, the name it is keyed by, the ARNs of
+/// the cells nested inside it and its tags.
+///
+/// A cell's `ParentReadinessScopes` is NOT stored: it is the set of records that name
+/// THIS cell as nested, which is derived from the other records rather than submitted
+/// (see
+/// [`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::parent_readiness_scopes`]),
+/// so one representation cannot drift from the other.
+#[derive(Debug, Clone)]
+pub struct CellRecord {
+    pub arn: String,
+    pub name: String,
+    pub nested_cell_arns: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// One stored recovery group: the ARN the service minted, the name it is keyed by, the
+/// ARNs of the cells it contains and its tags.
+#[derive(Debug, Clone)]
+pub struct RecoveryGroupRecord {
+    pub arn: String,
+    pub name: String,
+    pub cell_arns: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+}
+
 /// One stored readiness check: the ARN the service minted, the name it is keyed by,
 /// the resource set it watches and its tags.
 #[derive(Debug, Clone)]
@@ -116,6 +257,8 @@ pub struct ReadinessCheckRecord {
 pub enum ResourceKey {
     ResourceSet(String),
     ReadinessCheck(String),
+    Cell(String),
+    RecoveryGroup(String),
 }
 
 impl ResourceSetRecord {
@@ -156,6 +299,22 @@ impl ReadinessCheckRecord {
     }
 }
 
+impl CellRecord {
+    /// The persisted tags as the modelled `Tags` map, or `None` when the cell carries
+    /// none.
+    pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
+        modeled_tags(&self.tags)
+    }
+}
+
+impl RecoveryGroupRecord {
+    /// The persisted tags as the modelled `Tags` map, or `None` when the recovery group
+    /// carries none.
+    pub fn modeled_tags(&self) -> Option<HashMap<String, String>> {
+        modeled_tags(&self.tags)
+    }
+}
+
 fn modeled_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
     if tags.is_empty() {
         return None;
@@ -175,13 +334,17 @@ fn modeled_tags(tags: &BTreeMap<String, String>) -> Option<HashMap<String, Strin
 /// size — so both the retained state and the largest response are a finite product of
 /// those ceilings rather than something a caller chooses. The size of the individual
 /// strings inside a record is bounded by the server's own request-size limit.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
     /// Every stored resource set, keyed by `ResourceSetName` (this API's identity
     /// for the resource).
     pub resource_sets: BTreeMap<String, ResourceSetRecord>,
     /// Every stored readiness check, keyed by `ReadinessCheckName`.
     pub readiness_checks: BTreeMap<String, ReadinessCheckRecord>,
+    /// Every stored cell, keyed by `CellName`.
+    pub cells: BTreeMap<String, CellRecord>,
+    /// Every stored recovery group, keyed by `RecoveryGroupName`.
+    pub recovery_groups: BTreeMap<String, RecoveryGroupRecord>,
     /// ARN -> owning record, so an ARN-addressed call (the tag operations, which
     /// take a `ResourceArn` rather than a name) resolves one without scanning
     /// every map.
@@ -193,12 +356,177 @@ pub struct ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
     /// reports a bare list of those values): the same value cannot be authorized
     /// twice, and `BTreeSet` keeps list order — and therefore pagination — stable.
     pub cross_account_authorizations: BTreeSet<String>,
+    /// Whether THIS account may create readiness resources at all.
+    ///
+    /// The Route 53 Application Recovery Controller readiness feature is closed to
+    /// accounts that do not already use it: a syntactically valid `CreateCell` /
+    /// `CreateReadinessCheck` / `CreateRecoveryGroup` / `CreateResourceSet` passes
+    /// input validation and is then denied account-wide with HTTP 403. The API models
+    /// no operation that grants the eligibility, so it is a field rather than a
+    /// constant: `false` (what a new account has, and the default) makes every create
+    /// answer that denial, and [`ACCOUNT_ELIGIBLE_ENV`] is how an operator says this
+    /// emulated account is one of the accounts that already had the feature.
+    pub account_readiness_eligible: bool,
+}
+
+impl Default for ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
+    /// An account with no resources, eligible to create readiness resources only when
+    /// [`ACCOUNT_ELIGIBLE_ENV`] says so.
+    fn default() -> Self {
+        Self {
+            resource_sets: BTreeMap::new(),
+            readiness_checks: BTreeMap::new(),
+            cells: BTreeMap::new(),
+            recovery_groups: BTreeMap::new(),
+            arn_index: BTreeMap::new(),
+            cross_account_authorizations: BTreeSet::new(),
+            account_readiness_eligible: ::std::env::var(ACCOUNT_ELIGIBLE_ENV)
+                .is_ok_and(|setting| parse_account_eligible(&setting)),
+        }
+    }
+}
+
+impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
+    /// The ACCOUNT-ELIGIBILITY GATE every create of a readiness resource passes
+    /// through, AFTER its input has been validated and BEFORE anything is written.
+    ///
+    /// `Err` carries [`ACCOUNT_NOT_ELIGIBLE_MESSAGE`]; each create answers it as its
+    /// own modelled `AccessDeniedException` (HTTP 403), the error its model declares
+    /// for a denial. One gate in one place, so the four creates cannot disagree about
+    /// when a create is allowed, and no create can write first and deny after.
+    pub fn check_create_allowed(&self) -> Result<(), &'static str> {
+        if self.account_readiness_eligible {
+            return Ok(());
+        }
+        Err(ACCOUNT_NOT_ELIGIBLE_MESSAGE)
+    }
+
+    /// The tags of the record `key` names, or `None` when no record holds that key.
+    pub fn tags_of(&self, key: &ResourceKey) -> Option<&BTreeMap<String, String>> {
+        match key {
+            ResourceKey::ResourceSet(name) => self.resource_sets.get(name).map(|r| &r.tags),
+            ResourceKey::ReadinessCheck(name) => self.readiness_checks.get(name).map(|r| &r.tags),
+            ResourceKey::Cell(name) => self.cells.get(name).map(|r| &r.tags),
+            ResourceKey::RecoveryGroup(name) => self.recovery_groups.get(name).map(|r| &r.tags),
+        }
+    }
+
+    /// The tags of the record `key` names, for writing.
+    pub fn tags_mut(&mut self, key: &ResourceKey) -> Option<&mut BTreeMap<String, String>> {
+        match key {
+            ResourceKey::ResourceSet(name) => {
+                self.resource_sets.get_mut(name).map(|r| &mut r.tags)
+            }
+            ResourceKey::ReadinessCheck(name) => {
+                self.readiness_checks.get_mut(name).map(|r| &mut r.tags)
+            }
+            ResourceKey::Cell(name) => self.cells.get_mut(name).map(|r| &mut r.tags),
+            ResourceKey::RecoveryGroup(name) => {
+                self.recovery_groups.get_mut(name).map(|r| &mut r.tags)
+            }
+        }
+    }
+
+    /// The readiness scopes that CONTAIN the cell whose ARN is `cell_arn`: the ARN of
+    /// every stored cell that names it as a nested cell, and of every stored recovery
+    /// group that names it as one of its cells — the two kinds of scope the member's
+    /// own documentation allows ("a cell Amazon Resource Name (ARN) or a recovery group
+    /// ARN").
+    ///
+    /// Derived on every read rather than stored, so a cell reports the containment the
+    /// store actually holds — a parent created after the child included.
+    pub fn parent_readiness_scopes(&self, cell_arn: &str) -> Vec<String> {
+        let nesting_cells = self
+            .cells
+            .values()
+            .filter(|candidate| {
+                candidate.arn != cell_arn
+                    && candidate
+                        .nested_cell_arns
+                        .iter()
+                        .any(|nested| nested == cell_arn)
+            })
+            .map(|parent| parent.arn.clone());
+        let owning_groups = self
+            .recovery_groups
+            .values()
+            .filter(|group| group.cell_arns.iter().any(|cell| cell == cell_arn))
+            .map(|group| group.arn.clone());
+        nesting_cells.chain(owning_groups).collect()
+    }
+
+    /// Every readiness scope the cell named `cell_name` covers: its own ARN plus the
+    /// ARN of every cell nested inside it, transitively.
+    ///
+    /// A resource of a resource set declares the cell ARNs that contain it in its
+    /// `ReadinessScopes`, and a cell contains whatever its nested cells contain, so
+    /// this is the set a resource's scope is matched against. Cycles terminate: an ARN
+    /// is expanded at most once.
+    pub fn cell_scope_arns(&self, cell_name: &str) -> BTreeSet<String> {
+        let mut scopes = BTreeSet::new();
+        let Some(root) = self.cells.get(cell_name) else {
+            return scopes;
+        };
+        let mut pending = vec![root.arn.clone()];
+        while let Some(arn) = pending.pop() {
+            if !scopes.insert(arn.clone()) {
+                continue;
+            }
+            let nested = match self.arn_index.get(&arn) {
+                Some(ResourceKey::Cell(name)) => self.cells.get(name),
+                _ => None,
+            };
+            if let Some(cell) = nested {
+                pending.extend(cell.nested_cell_arns.iter().cloned());
+            }
+        }
+        scopes
+    }
+
+    /// The names of the readiness checks that watch a resource scoped to the cell named
+    /// `cell_name` — the checks a cell's readiness summary aggregates.
+    ///
+    /// A check watches a resource set; that set's resources carry the cell ARNs that
+    /// contain them. So a check belongs to a cell exactly when one of the resources it
+    /// watches is scoped to that cell or to a cell nested inside it.
+    pub fn readiness_check_names_in_cell(&self, cell_name: &str) -> BTreeSet<String> {
+        let scopes = self.cell_scope_arns(cell_name);
+        self.readiness_checks
+            .values()
+            .filter(|check| {
+                self.resource_sets
+                    .get(&check.resource_set_name)
+                    .is_some_and(|set| {
+                        set.resources.iter().any(|resource| {
+                            resource.readiness_scopes.iter().flatten().any(|scope| scopes.contains(scope))
+                        })
+                    })
+            })
+            .map(|check| check.name.clone())
+            .collect()
+    }
 }
 
 /// The ARN of the resource set named `name`:
 /// `arn:aws:route53-recovery-readiness::<account>:resource-set/<name>`.
 pub fn resource_set_arn(name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, ARN_REGION, &format!("resource-set/{name}"))
+}
+
+/// The ARN of the cell named `name`:
+/// `arn:aws:route53-recovery-readiness::<account>:cell/<name>`.
+pub fn cell_arn(name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, ARN_REGION, &format!("cell/{name}"))
+}
+
+/// The ARN of the recovery group named `name`:
+/// `arn:aws:route53-recovery-readiness::<account>:recovery-group/<name>`.
+pub fn recovery_group_arn(name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        ARN_REGION,
+        &format!("recovery-group/{name}"),
+    )
 }
 
 /// The ARN of the readiness check named `name`:
@@ -316,6 +644,33 @@ pub fn validate_tags(tags: Option<&HashMap<String, String>>) -> Result<(), Strin
     Ok(())
 }
 
+/// Refuse a nested-cell list longer than this emulator stores. Also what a recovery
+/// group's `Cells` list is bounded by: the member is the same, so the ceiling is.
+pub fn validate_nested_cells(cells: Option<&Vec<String>>) -> Result<(), String> {
+    let count = cells.map_or(0, Vec::len);
+    if count > MAX_NESTED_CELLS_PER_CELL {
+        return Err(count_message("Cells", count, MAX_NESTED_CELLS_PER_CELL));
+    }
+    Ok(())
+}
+
+/// Refuse a resulting tag set larger than this emulator stores per record, counting the
+/// keys `incoming` adds to the `existing` ones.
+pub fn validate_added_tags(
+    existing: &BTreeMap<String, String>,
+    incoming: &HashMap<String, String>,
+) -> Result<(), String> {
+    let merged = existing.len()
+        + incoming
+            .keys()
+            .filter(|key| !existing.contains_key(*key))
+            .count();
+    if merged > MAX_TAGS_PER_RESOURCE {
+        return Err(count_message("Tags", merged, MAX_TAGS_PER_RESOURCE));
+    }
+    Ok(())
+}
+
 /// One validation clause for a collection that is too large. The COUNT is reported
 /// rather than the collection, so a refusal cannot amplify an oversized request into
 /// an oversized error body.
@@ -363,6 +718,18 @@ pub fn decode_cursor(token: &str) -> Option<String> {
     decoded.strip_prefix(CURSOR_TAG).map(str::to_string)
 }
 
+/// Refuse a `NextToken` this service did not mint, with
+/// [`INVALID_PAGINATION_TOKEN_MESSAGE`] — for an operation that walks something other
+/// than one of the stores [`page`] pages.
+pub fn validate_next_token(token: Option<&str>) -> Result<(), String> {
+    match token {
+        Some(token) if decode_cursor(token).is_none() => {
+            Err(INVALID_PAGINATION_TOKEN_MESSAGE.to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// One page of a list operation: the records on it, and the cursor the next call
 /// resumes from (`None` on the last page).
 #[derive(Debug)]
@@ -374,8 +741,8 @@ pub struct Page<'a, V> {
 /// The page of `records` the caller asked for.
 ///
 /// `max_results` bounds the page (defaulting to [`DEFAULT_MAX_RESULTS`]) and
-/// `next_token` resumes at the key the previous page stopped before. `Err` carries a
-/// validation message for a token this service did not mint.
+/// `next_token` resumes at the key the previous page stopped before. `Err` carries
+/// [`INVALID_PAGINATION_TOKEN_MESSAGE`] for a token this service did not mint.
 pub fn page<'a, V>(
     records: &'a BTreeMap<String, V>,
     max_results: Option<i32>,
@@ -433,17 +800,14 @@ fn page_size(max_results: Option<i32>) -> usize {
     }
 }
 
-/// The inclusive key the page starts at, or `None` for the first page. `Err` carries a
-/// validation message for a token this service did not mint.
+/// The inclusive key the page starts at, or `None` for the first page. `Err` carries
+/// [`INVALID_PAGINATION_TOKEN_MESSAGE`] for a token this service did not mint — the
+/// constant sentence, which does not echo the rejected token back.
 fn start_key(next_token: Option<&str>) -> Result<Option<String>, String> {
     match next_token {
-        Some(token) => Ok(Some(decode_cursor(token).ok_or_else(|| {
-            validation_message(
-                "nextToken",
-                token,
-                "Member must be a pagination token returned by a previous call",
-            )
-        })?)),
+        Some(token) => Ok(Some(
+            decode_cursor(token).ok_or_else(|| INVALID_PAGINATION_TOKEN_MESSAGE.to_string())?,
+        )),
         None => Ok(None),
     }
 }

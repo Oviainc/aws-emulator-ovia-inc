@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: this operation's LISTING is not written yet — it answers
+//! HTTP 501 `NotImplemented` for every request that gets past the filter check below,
+//! and asserts NOTHING about the readiness-rule catalog `ListRules` reports. Implement
+//! it here — this is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ListRules::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
+//!
+//! WHAT IS IMPLEMENTED HERE: the `ResourceType` FILTER'S VALIDATION, and nothing else.
+//! A filter value outside the resource types this API documents
+//! ([`crate::state::SUPPORTED_RESOURCE_TYPES`]) names no type this service has rules
+//! for, so it is refused with the service-common `ValidationException` (400) instead of
+//! being silently ignored — a request that cannot be answered is a bad request, not an
+//! unwritten one. The LISTING itself still answers 501: the readiness-rule catalog
+//! (rule ids and descriptions) is AWS data this service's model does not carry, so
+//! there is nothing here to compute it from and an invented rule id would be worse than
+//! a 501. That part is what the filed `ListRules` scaffold issue covers, which is why
+//! the marker line above stays.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +161,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        let _ = (ctx, &self.engine);
+        // A `ResourceType` filter is validated BEFORE the listing: the value must name
+        // a resource type this API supports, whatever the listing then answers.
+        if let Some(resource_type) = input.resource_type.as_deref() {
+            crate::state::validate_resource_type("resourceType", resource_type).map_err(
+                |message| {
+                    ListRulesErrorModeled::ValidationException(ValidationException {
+                        message: Some(message),
+                    })
+                },
+            )?;
+        }
+        // The rule catalog itself is not implemented — see the module header. Implement
+        // it here, then delete the SCAFFOLDED marker at the top of this file.
         Err(crate::scaffolded::Scaffolded::not_implemented("ListRules"))
     }
 }
