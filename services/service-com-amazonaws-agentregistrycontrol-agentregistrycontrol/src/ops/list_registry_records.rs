@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegistryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegistryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegistryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the stored records of one registry in record-id order, honouring
+//! `maxResults`, the `filters` the model declares and an opaque `nextToken` that resumes
+//! exactly where the previous page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegistryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegistryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegistryRecords"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRegistryRecordsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        // The filter attributes `RegistryRecordFilterName` declares, which the generated
+        // catalogue `REGISTRY_RECORD_FILTER_NAME_VALUES` is the model's own copy of: a
+        // name outside it is refused below, and these three constants name the record
+        // field each catalogue entry selects.
+        const FILTER_NAME: &str = "name";
+        const FILTER_STATUS: &str = "status";
+        const FILTER_RECORD_TYPE: &str = "recordType";
+
+        for filter in input.filters.iter().flatten() {
+            if !REGISTRY_RECORD_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
+                return Err(ListRegistryRecordsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("filters: {} is not a filterable attribute", filter.name),
+                        reason: "FieldValidationFailed".to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "filters".to_string(),
+                            message: format!("{} is not a filterable attribute", filter.name),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let registry_id = crate::state::identifier_to_id(&input.registry_id);
+        let Some(registry) = state.registries.get(registry_id) else {
+            return Err(ListRegistryRecordsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("registry {registry_id} was not found")),
+                },
+            )
+            .into());
+        };
+
+        // The token is opaque on the wire; it carries the registry it was issued for and
+        // the last record id the previous page returned, so this page resumes at the next
+        // one. A token this service did not issue for this registry is refused rather
+        // than silently treated as a first page.
+        let resume_after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => None,
+            Some(token) => {
+                let Some(record_id) = crate::state::decode_page_token(registry_id, token) else {
+                    return Err(ListRegistryRecordsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a pagination token this service issued \
+                                      for this registry"
+                                .to_string(),
+                            reason: "CannotParse".to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "not a pagination token this service issued for this \
+                                          registry"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                };
+                Some(record_id)
+            }
+        };
+
+        // A filter selects the records whose attribute equals ANY of that filter's
+        // `values` — `RegistryRecordFilter.values` is `@length(min: 1, max: 1)`, so the
+        // model lets a filter carry exactly one value — and every filter in the list has
+        // to hold, so the list is an AND.
+        let matches_filters = |record: &crate::state::RegistryRecord| {
+            input.filters.iter().flatten().all(|filter| {
+                let attribute = match filter.name.as_str() {
+                    FILTER_NAME => &record.name,
+                    FILTER_STATUS => &record.status,
+                    FILTER_RECORD_TYPE => &record.record_type,
+                    // Unreachable: a name outside the model's catalogue was refused
+                    // above. A catalogue entry this handler does not select on yet
+                    // matches nothing rather than being silently ignored.
+                    _ => return false,
+                };
+                filter.values.iter().any(|value| value == attribute)
+            })
+        };
+
+        // Absent `maxResults` pages at the model's own maximum rather than serialising
+        // the whole registry into one response.
+        let page_size = input.max_results.map_or(crate::state::DEFAULT_PAGE_SIZE, |requested| {
+            requested.max(1) as usize
+        });
+        // `records` is keyed by record id, so iteration is in id order and "after the
+        // last id of the previous page" is a well-defined resume point.
+        let mut page: Vec<&crate::state::RegistryRecord> = registry
+            .records
+            .values()
+            .filter(|record| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| record.record_id.as_str() > after)
+            })
+            .filter(|record| matches_filters(record))
+            .take(page_size.saturating_add(1))
+            .collect();
+        let next_token = if page.len() > page_size {
+            page.pop();
+            page.last()
+                .map(|record| crate::state::encode_page_token(registry_id, &record.record_id))
+        } else {
+            None
+        };
+
+        let registry_records = page
+            .into_iter()
+            .map(|record| RegistryRecordSummary {
+                registry_arn: record.registry_arn.clone(),
+                record_arn: record.record_arn.clone(),
+                record_id: record.record_id.clone(),
+                name: record.name.clone(),
+                display_name: record.display_name.clone(),
+                description: record.description.clone(),
+                record_type: record.record_type.clone(),
+                record_version: record.record_version.clone(),
+                status: record.status.clone(),
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+                created_by_auto_detection: record.created_by_auto_detection,
+                created_by: record.created_by.clone(),
+                provenance_summary_list: (!record.provenance.is_empty()).then(|| {
+                    record
+                        .provenance
+                        .iter()
+                        .map(|entry| ProvenanceSummary {
+                            relation: entry.relation.clone(),
+                            source_id: entry.source_id.clone(),
+                            source_type: entry.source_type.clone(),
+                        })
+                        .collect()
+                }),
+                custom_metadata_schema_compliance_status: record
+                    .custom_metadata_schema_compliance_status
+                    .clone(),
+            })
+            .collect();
+
+        Ok(ListRegistryRecordsOutput {
+            registry_records,
+            next_token,
+        })
     }
 }

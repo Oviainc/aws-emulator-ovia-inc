@@ -45,6 +45,160 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether the request these `parts` came from matches this service's SigV4 signing
+/// name AND the modelled URI path space its generated `ROUTE_PATH_SEGMENTS` declares.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of that rule, and it is CALLED here rather than re-implemented: the request's
+/// route key must match this service's signing name AND its first URI path segment must
+/// be one the generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact segment
+/// equality. That path conjunct is what separates two services sharing one SigV4 signing
+/// name — this low-latency IVS endpoint (`ivs`) and the IVS RealTime endpoint
+/// (`ivsrealtime`) both sign as `ivs`, so the key alone matches both and the router
+/// rejects every such request as `500 AmbiguousService`.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed only
+/// the request's parts, so the two things it reads — the URI and the headers — are
+/// re-presented to it as a bodiless request. It reads neither the body nor the method, so
+/// nothing it decides on is missing.
+fn claims_route_key_and_path(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
+/// The one first URI path segment the two services that sign as `ivs` BOTH bind, so the
+/// model-derived path discriminator alone cannot separate them there.
+///
+/// Each of the two models binds its three tagging operations to `/tags/{resourceArn}`
+/// (`ListTagsForResource` `GET`, `TagResource` `POST`, `UntagResource` `DELETE`); every
+/// other operation of either service binds a URI whose first segment is its own
+/// operation name, and those are disjoint. Source: `smithy_query(query="digest",
+/// model_path="services/service-com-amazonaws-ivs-amazoninteractivevideoservice/\
+/// smithy-model/com-amazonaws-ivs-amazoninteractivevideoservice.json")` and the same
+/// call on the `…-ivsrealtime-amazoninteractivevideoservicerealtime` model.
+const SHARED_TAGGING_PATH_SEGMENT: &str = "tags";
+
+/// The ARN resource types the SIBLING `ivsrealtime` endpoint owns — the resources its own
+/// model creates and therefore the only ones its tagging operations can address.
+///
+/// Both services' ARNs live in the one `ivs` arnNamespace, so the resource TYPE is what
+/// names the owning endpoint. Source: the `ivsrealtime` model's ARN shapes, whose
+/// patterns pin the resource segment —
+/// `smithy_query(query="shape", shape="CompositionArn,EncoderConfigurationArn,\
+/// IngestConfigurationArn,PublicKeyArn,StageArn,StorageConfigurationArn",
+/// model_path="services/service-com-amazonaws-ivsrealtime-\
+/// amazoninteractivevideoservicerealtime/smithy-model/\
+/// com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime.json")`. That model's
+/// `ChannelArn` is deliberately NOT here: it is a REFERENCE to a low-latency channel
+/// (RealTime has no operation that creates one), and a channel is tagged through this
+/// endpoint.
+const SIBLING_ENDPOINT_RESOURCE_TYPES: &[&str] = &[
+    "composition",
+    "encoder-configuration",
+    "ingest-configuration",
+    "public-key",
+    "stage",
+    "storage-configuration",
+];
+
+/// The `arnNamespace` both services share, and so the only service field an ARN either
+/// of their tagging operations addresses can carry. From
+/// `smithy_query(query="service_info")` on either model (`awsService.arnNamespace`:
+/// `ivs` for both).
+const SHARED_ARN_NAMESPACE: &str = "ivs";
+
+/// What a request path says about the `/tags/{resourceArn}` space both `ivs`-signing
+/// services publish.
+#[derive(Debug)]
+enum TaggingTarget {
+    /// Not on the shared path at all: the modelled path space has already decided the
+    /// claim, and this discriminator adds nothing.
+    NotShared,
+    /// On the shared path, naming an IVS resource of this type (lowercased).
+    Resource(String),
+    /// On the shared path, naming no IVS resource either model could recognise.
+    Unrecognised,
+}
+
+/// Read the shared tagging path: whether this request is on it, and which IVS resource
+/// type its `{resourceArn}` label names.
+///
+/// One function rather than a path-segment helper plus an ARN helper, so the whole
+/// shared-path decision is read in one place. The `{resourceArn}` label is
+/// percent-decoded (it is a non-greedy `@httpLabel`, so a client encodes its `:` and
+/// `/`) and its resource type is lowercased, so a non-canonical ARN cannot land a
+/// request on the wrong endpoint. The `tags` segment itself is compared RAW, because
+/// the framework's path conjunct has already matched that segment against the model's
+/// `ROUTE_PATH_SEGMENTS` by exact equality: decoding it here could only disagree with
+/// the conjunct that runs first.
+///
+/// The label counts as naming a resource only when it is an ARN in the `ivs` namespace
+/// the two services share — `arn:<partition>:ivs:<region>:<account>:<type>/<id>`, the
+/// form every ARN shape in either model pins — so another service's ARN, or a string
+/// that merely has a sixth `:`-field, names nothing. Reading that field and cutting it
+/// at `/` also handles a client that sent the ARN's separators raw, because the ARN's
+/// own `/` then just starts the next path segment.
+fn tagging_target(path: &str) -> TaggingTarget {
+    let mut segments = path.trim_start_matches('/').split('/');
+    if segments.next() != Some(SHARED_TAGGING_PATH_SEGMENT) {
+        return TaggingTarget::NotShared;
+    }
+    let Some(label) = segments.next() else {
+        return TaggingTarget::Unrecognised;
+    };
+    let arn = smithy_server_runtime::percent_decode(label);
+    let fields: Vec<&str> = arn.split(':').collect();
+    // arn : <partition> : <service> : <region> : <account> : <resource-type>/<id>
+    let [prefix, _partition, service, region, account, resource, ..] = fields.as_slice() else {
+        return TaggingTarget::Unrecognised;
+    };
+    let kind = resource
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !prefix.eq_ignore_ascii_case("arn")
+        || !service.eq_ignore_ascii_case(SHARED_ARN_NAMESPACE)
+        || region.is_empty()
+        || account.is_empty()
+        || kind.is_empty()
+    {
+        return TaggingTarget::Unrecognised;
+    }
+    TaggingTarget::Resource(kind)
+}
+
+/// Whether this service claims a request on the `/tags/{resourceArn}` path space both
+/// `ivs`-signing services publish.
+///
+/// The ARN in the path names the resource, and a resource belongs to exactly one of the
+/// two endpoints, so the resource type decides: this endpoint claims every tagging
+/// request EXCEPT one naming a resource type the sibling `ivsrealtime` endpoint owns.
+/// Stated as a complement rather than as "my own types" on purpose — it makes this
+/// service, whose `endpointPrefix` is the shared signing name `ivs`, the single claimant
+/// for a label that names no recognisable IVS resource, so a malformed or unknown ARN is
+/// answered by a modelled 4xx from a real service instead of the router's
+/// `404 UnknownService`.
+fn claims_shared_tagging_path(parts: &http::request::Parts) -> bool {
+    match tagging_target(parts.uri.path()) {
+        TaggingTarget::NotShared | TaggingTarget::Unrecognised => true,
+        TaggingTarget::Resource(kind) => {
+            !SIBLING_ENDPOINT_RESOURCE_TYPES.contains(&kind.as_str())
+        }
+    }
+}
+
 /// The `com-amazonaws-ivs-amazoninteractivevideoservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +228,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `ivs` — a signing name it SHARES with IVS RealTime
+        // (`services/service-com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime`),
+        // whose endpoint is `ivsrealtime` while this one's is `ivs`. The router resolves a
+        // request's routing key from its SigV4 credential scope first, so BOTH services
+        // see the key `ivs`: claiming on the signing name alone makes each one claim the
+        // other's traffic, which the router answers `500 AmbiguousService` instead of
+        // serving either.
+        //
+        // So the claim is narrowed to this service's own request space, in the two steps
+        // the request itself can be read by: its modelled URI path space
+        // (`claims_route_key_and_path`), and — for the one path space both models publish,
+        // `/tags/{resourceArn}` — the resource the ARN in that path names
+        // (`claims_shared_tagging_path`).
+        claims_route_key_and_path(parts) && claims_shared_tagging_path(parts)
     }
 
     fn override_operation(
