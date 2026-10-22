@@ -1,11 +1,161 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-cloudwatchomni-cloudwatchomnifrontend service.
+//!
+//! One store holds the service's resource hierarchy — a domain, and the spaces that
+//! belong to it — plus the small amount of bookkeeping the modelled contract needs:
+//! a name index for the duplicate-name conflict, the idempotency-token maps for the
+//! `@idempotencyToken` creates, and a monotonic sequence so list pagination is
+//! deterministic across pages.
+//!
+//! The derivation helpers below (ids, ARNs, endpoint URLs, timestamps, the opaque
+//! page token) live here rather than in one operation's file because several
+//! operations read them, and because every one of them is a property of the STORE
+//! rather than of a single request.
+
+use std::collections::HashMap;
+
+use crate::ops::types::{Domain, EncryptionConfiguration, IdentityProviderConfiguration, Space, SpaceSummary};
+
+/// The region a resource is recorded in when the request carries no SigV4
+/// credential scope to read one from (an unsigned, in-process call).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// This service's ARN namespace — `awsService.arnNamespace` in the Smithy model
+/// (`smithy_query(query="service_info")`).
+pub const ARN_NAMESPACE: &str = "cloudwatch";
+
+/// This service's endpoint prefix — `awsService.endpointPrefix` in the Smithy model.
+pub const ENDPOINT_PREFIX: &str = "cloudwatch-omni";
+
+/// The only value `DomainStatus` declares, so a persisted domain always reports it.
+pub const DOMAIN_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `SpaceStatus` declares ACTIVE, SUSPENDED and MOVING — none of them a transient
+/// "creating" state, so a created space is recorded ready.
+pub const SPACE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `EncryptionStrategy`'s value for a resource encrypted with an AWS owned key.
+pub const ENCRYPTION_STRATEGY_AWS_OWNED: &str = "AWS_OWNED";
+
+/// `EncryptionStrategy`'s value for a resource encrypted with a customer managed key.
+pub const ENCRYPTION_STRATEGY_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
+
+/// `IdentityProvider`'s value for an AWS Identity Center domain.
+pub const IDENTITY_PROVIDER_IDC: &str = "IDC";
+
+/// The page bound a list operation applies when the request names no `maxResults`.
+///
+/// `ListSpaces`'s `maxResults` model doc: "The maximum number of spaces to return per
+/// page. Defaults to 100." That is also the maximum its `@range(min: 1, max: 100)` allows.
+pub const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// How many domains the store holds before `CreateDomain` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// CloudWatchOmni publishes an adjustable quota on domains per account per Region, and
+/// this emulator models neither Service Quotas nor an account's adjustments — so this
+/// is the emulator's OWN bound on the store rather than a claim about any account's
+/// limit. It is set far above any workflow an emulator serves, and it is what stops
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::domains`] growing without
+/// end. It bounds `domain_name_index` and `create_domain_tokens` with it: both are
+/// keyed one-to-one to a live domain and are forgotten by `DeleteDomain`, so neither
+/// can outgrow this number.
+pub const DOMAIN_QUOTA: usize = 1_000;
+
+/// How many spaces the store holds before `CreateSpace` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// The emulator's OWN bound, for the same reason as [`DOMAIN_QUOTA`]. It bounds
+/// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::spaces`] and, with it,
+/// `create_space_tokens` (one entry per live space, forgotten by `DeleteSpace`) — and
+/// therefore also the per-request work [`spaces_after`] and [`domain_has_spaces`] do
+/// under the store lock, which is linear in the number of stored spaces.
+///
+/// [`spaces_after`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::spaces_after
+/// [`domain_has_spaces`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::domain_has_spaces
+pub const SPACE_QUOTA: usize = 10_000;
+
+/// A domain as persisted, with the bookkeeping the wire shape does not carry.
+#[derive(Debug, Clone)]
+pub struct StoredDomain {
+    /// Creation order, so `ListDomains`-style enumeration is stable.
+    pub seq: u64,
+    /// Exactly what `GetDomain` returns.
+    pub domain: Domain,
+    /// The request's `tags`; no modelled operation reads them back yet.
+    pub tags: HashMap<String, String>,
+}
+
+/// A space as persisted. The wire `Space` shape carries only the parent's
+/// `domainArn`, so the parent's id is kept beside it for `ListSpaces`'s
+/// `domainId` filter and for the `DeleteDomain` conflict check.
+#[derive(Debug, Clone)]
+pub struct StoredSpace {
+    /// Creation order, and the cursor `ListSpaces`'s page token resumes from.
+    pub seq: u64,
+    /// The id of the domain this space belongs to.
+    pub domain_id: String,
+    /// Exactly what `GetSpace` returns.
+    pub space: Space,
+    /// The request's `tags`; no modelled operation reads them back yet.
+    pub tags: HashMap<String, String>,
+}
 
 /// Per-service state for com-amazonaws-cloudwatchomni-cloudwatchomnifrontend. A handler reaches it through [`service_state`].
+///
+/// Every map here is BOUNDED: `domains` (and the two maps keyed one-to-one to a live
+/// domain) by [`DOMAIN_QUOTA`], `spaces` (and the token map keyed to a live space) by
+/// [`SPACE_QUOTA`]. `CreateDomain`/`CreateSpace` refuse with the modelled
+/// `ServiceQuotaExceededException` once the bound is reached, and the deletes release
+/// records and their tokens together, so nothing in the store grows without end.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
-    // TODO: add service-specific state fields
+    /// Every persisted domain, keyed by its `domainId`.
+    pub domains: HashMap<String, StoredDomain>,
+    /// `name` -> `domainId`, the index behind the duplicate-name `ConflictException`.
+    pub domain_name_index: HashMap<String, String>,
+    /// Every persisted space, keyed by its `spaceId`.
+    pub spaces: HashMap<String, StoredSpace>,
+    /// `CreateDomain` `clientToken` -> the `domainId` that token created.
+    pub create_domain_tokens: HashMap<String, String>,
+    /// `CreateSpace` `clientToken` -> the `spaceId` that token created.
+    pub create_space_tokens: HashMap<String, String>,
+    /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`].
+    next_seq: u64,
+}
+
+impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
+    /// The next creation-order sequence number. Strictly increasing and never
+    /// reused, so a page token minted from one stays valid as the store grows.
+    pub fn next_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
+    /// Every stored space in creation order, optionally restricted to one parent
+    /// domain, skipping everything at or before `after_seq`.
+    ///
+    /// Linear in the number of stored spaces, which [`SPACE_QUOTA`] bounds.
+    pub fn spaces_after(&self, domain_id: Option<&str>, after_seq: u64) -> Vec<&StoredSpace> {
+        let mut selected: Vec<&StoredSpace> = self
+            .spaces
+            .values()
+            .filter(|stored| stored.seq > after_seq)
+            .filter(|stored| domain_id.is_none_or(|id| stored.domain_id == id))
+            .collect();
+        selected.sort_by_key(|stored| stored.seq);
+        selected
+    }
+
+    /// Whether any stored space still belongs to `domain_id`.
+    ///
+    /// Linear in the number of stored spaces, which [`SPACE_QUOTA`] bounds.
+    pub fn domain_has_spaces(&self, domain_id: &str) -> bool {
+        self.spaces
+            .values()
+            .any(|stored| stored.domain_id == domain_id)
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +167,217 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCloudwatchomniCloudwatchomnifrontendState>)
+}
+
+/// Now, as the modelled `Timestamp` type.
+pub fn now() -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+}
+
+/// The region the request was signed for, which is the region the resource it
+/// creates lives in. Falls back to [`DEFAULT_REGION`] for an unsigned request.
+pub fn request_region(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Base36 (`0-9a-z`) rendering of a 128-bit value, most significant digit first.
+///
+/// `36^25 > 2^128`, so the longest output is 25 characters — which is exactly the
+/// budget `DomainId`'s `^d-[0-9a-z]{1,25}$` leaves after the `d-` prefix.
+fn base36(mut value: u128) -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        digits.push(ALPHABET[(value % 36) as usize]);
+        value /= 36;
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("the base36 alphabet is ASCII")
+}
+
+/// A fresh v4 UUID, canonical lowercase hyphenated form.
+///
+/// The randomness is the `uuid` crate's: this reaches it through
+/// `emulator_telemetry`'s uuid-backed id newtype (`BatchId::random()` is
+/// `uuid::Uuid::new_v4()` rendered canonically), which this crate ALREADY depends on,
+/// rather than declaring a second path to the same crate. Nothing here is a
+/// hand-rolled generator, and this crate adds no dependency — so the whole service
+/// carries no `Cargo.lock` delta, which is what lets it land beside the other fixes
+/// that are being merged into the same lock file concurrently.
+fn fresh_uuid() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
+/// The 128 bits of a fresh v4 UUID.
+fn fresh_uuid_bits() -> u128 {
+    let hyphenless: String = fresh_uuid().chars().filter(|c| *c != '-').collect();
+    let bytes = ::hex::decode(hyphenless).expect("a canonical UUID is 32 hex digits");
+    let octets: [u8; 16] = bytes
+        .try_into()
+        .expect("a canonical UUID is exactly 16 bytes");
+    u128::from_be_bytes(octets)
+}
+
+/// A fresh `domainId`.
+///
+/// `DomainId`'s model doc: "Minted by the backend as \"d-\" + base36(UUID) — at most
+/// \"d-\" plus 25 chars", so that is what this mints.
+pub fn mint_domain_id() -> String {
+    format!("d-{}", base36(fresh_uuid_bits()))
+}
+
+/// A fresh `spaceId`. `SpaceId`'s model doc: "a v4 UUID minted by the backend".
+pub fn mint_space_id() -> String {
+    fresh_uuid()
+}
+
+/// The ARN of a domain, in this service's ARN namespace.
+pub fn domain_arn(region: &str, domain_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_id}"))
+}
+
+/// The ARN of a space, in this service's ARN namespace.
+pub fn space_arn(region: &str, space_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("space/{space_id}"))
+}
+
+/// A domain's HTTPS endpoint URL, built from its id, its region and this service's
+/// documented endpoint prefix.
+pub fn domain_endpoint_url(region: &str, domain_id: &str) -> String {
+    format!("https://{domain_id}.{ENDPOINT_PREFIX}.{region}.amazonaws.com")
+}
+
+/// The additional endpoint URLs the model describes as "derived from the domain
+/// name": the same endpoint addressed by name rather than by id.
+pub fn custom_endpoint_urls(region: &str, name: &str) -> Vec<String> {
+    vec![format!(
+        "https://{name}.{ENDPOINT_PREFIX}.{region}.amazonaws.com"
+    )]
+}
+
+/// The Identity Center application ARN for a domain, or `None` — the model says it
+/// is "Absent for IAM-only domains", so it exists exactly when the domain lists the
+/// `IDC` identity provider. When the request named an Identity Center instance the
+/// application is minted under that instance.
+pub fn identity_center_application_arn(
+    identity_providers: &[String],
+    configuration: Option<&IdentityProviderConfiguration>,
+) -> Option<String> {
+    if !identity_providers
+        .iter()
+        .any(|provider| provider == IDENTITY_PROVIDER_IDC)
+    {
+        return None;
+    }
+    let instance = configuration
+        .and_then(|configuration| configuration.identity_center_configuration.as_ref())
+        .and_then(|center| center.identity_center_instance_arn.as_deref())
+        .and_then(|arn| arn.split('/').next_back())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ssoins-{}", short_hex()));
+    // Identity Center applications are account-scoped, hence the empty region segment.
+    Some(::engine::emulator_arn(
+        "sso",
+        "",
+        &format!("application/{instance}/apl-{}", short_hex()),
+    ))
+}
+
+/// Sixteen hex characters of a fresh v4 UUID — the body AWS Identity Center ids use.
+fn short_hex() -> String {
+    fresh_uuid()
+        .chars()
+        .filter(|c| *c != '-')
+        .take(16)
+        .collect()
+}
+
+/// The `EncryptionConfiguration` a space with no customer managed key reports.
+///
+/// The `Space.encryptionConfiguration` model doc: "Always populated: a space with no
+/// customer managed key reports `encryptionStrategy` AWS_OWNED and no `kmsKeyArn`".
+pub fn aws_owned_encryption() -> EncryptionConfiguration {
+    EncryptionConfiguration {
+        encryption_strategy: ENCRYPTION_STRATEGY_AWS_OWNED.to_string(),
+        kms_key_arn: None,
+    }
+}
+
+/// Project a stored space into the `SpaceSummary` the list operations return.
+///
+/// Every `SpaceSummary` member is a member of `Space` with the same name, so the
+/// projection is a straight copy — a summary never reports a value the full space
+/// does not.
+pub fn space_summary(space: &Space) -> SpaceSummary {
+    SpaceSummary {
+        space_id: space.space_id.clone(),
+        name: space.name.clone(),
+        space_arn: space.space_arn.clone(),
+        domain_arn: space.domain_arn.clone(),
+        region: space.region.clone(),
+        owner_account_id: space.owner_account_id.clone(),
+        status: space.status.clone(),
+        status_reason: space.status_reason.clone(),
+        created_at: space.created_at,
+        updated_at: space.updated_at,
+    }
+}
+
+/// The prefix a space-list page token carries, so a token minted for one collection
+/// cannot be replayed against another.
+const SPACE_PAGE_TOKEN_PREFIX: &str = "spaces:";
+
+/// Mint the opaque `nextToken` that resumes a space listing after `seq`.
+pub fn encode_space_page_token(seq: u64) -> String {
+    ::hex::encode(format!("{SPACE_PAGE_TOKEN_PREFIX}{seq}"))
+}
+
+/// Read a space-list `nextToken` back, or `None` when it is not one this service minted.
+pub fn decode_space_page_token(token: &str) -> Option<u64> {
+    let decoded = ::hex::decode(token).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    text.strip_prefix(SPACE_PAGE_TOKEN_PREFIX)?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base36_never_exceeds_the_domain_id_budget() {
+        assert_eq!(base36(0), "0", "zero renders as a single digit");
+        assert_eq!(base36(35), "z", "the last alphabet digit");
+        assert_eq!(base36(36), "10", "the first two-digit value");
+        assert!(
+            base36(u128::MAX).len() <= 25,
+            "base36(u128::MAX) is {} chars, over DomainId's 25-char budget",
+            base36(u128::MAX).len()
+        );
+    }
+
+    #[test]
+    fn a_page_token_round_trips_and_rejects_foreign_text() {
+        for seq in [1_u64, 2, 99, u64::MAX] {
+            let token = encode_space_page_token(seq);
+            assert_eq!(
+                decode_space_page_token(&token),
+                Some(seq),
+                "case {seq}: token {token} did not round-trip"
+            );
+        }
+        for bogus in ["", "not-hex", &::hex::encode("domains:1")] {
+            assert_eq!(
+                decode_space_page_token(bogus),
+                None,
+                "case {bogus:?}: a foreign token must not decode"
+            );
+        }
+    }
 }

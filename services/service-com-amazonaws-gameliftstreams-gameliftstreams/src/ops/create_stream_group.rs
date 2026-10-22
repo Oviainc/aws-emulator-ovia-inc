@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStreamGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStreamGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStreamGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and PERSISTS a stream group, resolving `DefaultApplicationIdentifier`
+//! against the stored applications and associating the two resources both ways.
 //!
 //! ## Shape of an operation
 //!
@@ -282,18 +275,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStreamGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStreamGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateStreamGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize(now);
+
+        // A replayed `ClientToken` answers with the group the first request created.
+        let replayed = state.replayed(Self::NAME, input.client_token.as_deref());
+        let replayed = replayed.filter(|id| state.stream_groups.contains_key(id));
+
+        let id = match replayed {
+            Some(id) => id,
+            None => {
+                // The emulator's own bound on the store, refused with the error the
+                // model already declares for a quota.
+                if state.stream_groups.len() >= crate::state::STREAM_GROUP_QUOTA {
+                    return Err(
+                        CreateStreamGroupErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException {
+                                message: format!(
+                                    "this emulator holds the maximum of {} stream groups; \
+                                     delete one before creating another",
+                                    crate::state::STREAM_GROUP_QUOTA
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // The default application must already exist: a
+                // `DefaultApplicationIdentifier` that names no stored application is
+                // not a group that streams nothing, it is a request for a resource
+                // that is not there.
+                let default_application = match input.default_application_identifier.as_deref() {
+                    Some(identifier) => match state.application(identifier) {
+                        Some(application) => Some(DefaultApplication {
+                            id: Some(application.id.clone()),
+                            arn: Some(application.arn.clone()),
+                        }),
+                        None => {
+                            return Err(
+                                CreateStreamGroupErrorModeled::ResourceNotFoundException(
+                                    ResourceNotFoundException {
+                                        message: format!(
+                                            "no application matches \
+                                             DefaultApplicationIdentifier {identifier}"
+                                        ),
+                                    },
+                                )
+                                .into(),
+                            );
+                        }
+                    },
+                    None => None,
+                };
+
+                // Every capacity member of `LocationConfiguration` is modelled
+                // `@range(min: 0)`. The capacities are stored, echoed and used in
+                // this service's capacity arithmetic, so a negative one is refused
+                // here rather than carried into state.
+                let configurations = input.location_configurations.unwrap_or_default();
+                for configuration in &configurations {
+                    for (member, value) in [
+                        ("AlwaysOnCapacity", configuration.always_on_capacity),
+                        ("OnDemandCapacity", configuration.on_demand_capacity),
+                        ("TargetIdleCapacity", configuration.target_idle_capacity),
+                        ("MaximumCapacity", configuration.maximum_capacity),
+                    ] {
+                        if value.is_some_and(|capacity| capacity < 0) {
+                            return Err(CreateStreamGroupErrorModeled::ValidationException(
+                                ValidationException {
+                                    message: format!(
+                                        "LocationConfigurations[{}].{member} must not be \
+                                         negative, got {}",
+                                        configuration.location_name,
+                                        value.unwrap_or_default()
+                                    ),
+                                },
+                            )
+                            .into());
+                        }
+                    }
+                }
+                let locations: Vec<crate::state::LocationSlot> = configurations
+                    .into_iter()
+                    .map(|configuration| crate::state::LocationSlot {
+                        name: configuration.location_name,
+                        always_on_capacity: configuration.always_on_capacity,
+                        on_demand_capacity: configuration.on_demand_capacity,
+                        target_idle_capacity: configuration.target_idle_capacity,
+                        maximum_capacity: configuration.maximum_capacity,
+                    })
+                    .collect();
+
+                let region = crate::state::region_of(ctx.parts());
+                let id = state.mint_id("sg-");
+                let arn = crate::state::stream_group_arn(&region, &id);
+                let associated_applications: Vec<String> = default_application
+                    .as_ref()
+                    .and_then(|application| application.arn.clone())
+                    .into_iter()
+                    .collect();
+
+                // The application now replicates its content to every location the
+                // group asked for.
+                for application_arn in &associated_applications {
+                    let Some(application) = state.application_mut(application_arn) else {
+                        continue;
+                    };
+                    application.associated_stream_groups.push(arn.clone());
+                    application.last_updated_at = now;
+                    for location in &locations {
+                        application.replications.push(crate::state::Replication {
+                            stream_group_arn: arn.clone(),
+                            location: location.name.clone(),
+                            completes_at: now + crate::state::TRANSITION,
+                        });
+                    }
+                }
+
+                // "If the CreateStreamGroup request is successful, Amazon GameLift
+                // Streams assigns a unique ID to the stream group resource and sets
+                // the status to ACTIVATING." The clock owes the move to ACTIVE.
+                let group = crate::state::StreamGroup {
+                    id: id.clone(),
+                    arn,
+                    description: input.description,
+                    stream_class: input.stream_class,
+                    default_application,
+                    locations,
+                    status: crate::state::STREAM_GROUP_ACTIVATING.to_string(),
+                    status_reason: None,
+                    associated_applications,
+                    sessions: ::std::collections::HashMap::new(),
+                    tags: input.tags.unwrap_or_default(),
+                    created_at: now,
+                    last_updated_at: now,
+                    expires_at: now + crate::state::STREAM_GROUP_LIFETIME,
+                    status_due_at: Some(now + crate::state::TRANSITION),
+                };
+                state.stream_groups.insert(id.clone(), group);
+                state.remember(Self::NAME, input.client_token.as_deref(), &id);
+                id
+            }
+        };
+
+        let group = state
+            .stream_groups
+            .get(&id)
+            .expect("the stream group was just stored under this id");
+        Ok(CreateStreamGroupOutput {
+            arn: group.arn.clone(),
+            description: Some(group.description.clone()),
+            default_application: group.default_application.clone(),
+            location_states: Some(group.location_states()),
+            stream_class: Some(group.stream_class.clone()),
+            id: Some(group.id.clone()),
+            status: Some(group.status.clone()),
+            status_reason: group.status_reason.clone(),
+            last_updated_at: Some(crate::state::timestamp(group.last_updated_at)),
+            created_at: Some(crate::state::timestamp(group.created_at)),
+            expires_at: Some(crate::state::timestamp(group.expires_at)),
+            associated_applications: Some(group.associated_applications.clone()),
+        })
     }
 }

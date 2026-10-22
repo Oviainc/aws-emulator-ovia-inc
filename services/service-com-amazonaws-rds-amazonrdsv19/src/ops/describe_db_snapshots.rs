@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports DB snapshots out of this service's store.
+//! This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with the other implemented operations.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +173,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBSnapshots"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBSnapshotsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBSnapshotsError::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeDBSnapshotsError::validation)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBSnapshotsError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones
+        // owed at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the snapshots of the region it was
+        // signed for.
+        let candidates: Vec<&crate::state::DbSnapshotRecord> = match &input.db_snapshot_identifier {
+            Some(requested) => {
+                let record = store
+                    .db_snapshots
+                    .get(&(region.clone(), requested.clone()))
+                    .ok_or_else(|| {
+                        DescribeDBSnapshotsError::from(
+                            DescribeDBSnapshotsErrorModeled::DBSnapshotNotFoundFault(
+                                DBSnapshotNotFoundFault {
+                                    message: Some(format!("DBSnapshot {requested} not found")),
+                                },
+                            ),
+                        )
+                    })?;
+                vec![record]
+            }
+            None => store.snapshots_in(&region),
+        };
+
+        let source_instance = input
+            .db_instance_identifier
+            .as_deref()
+            .map(str::to_ascii_lowercase);
+        let matching: Vec<(String, DBSnapshot)> = candidates
+            .into_iter()
+            .filter(|record| {
+                source_instance
+                    .as_ref()
+                    .is_none_or(|wanted| record.db_instance_identifier == *wanted)
+            })
+            .filter(|record| {
+                input
+                    .dbi_resource_id
+                    .as_ref()
+                    .is_none_or(|wanted| record.dbi_resource_id == *wanted)
+            })
+            // "If you don't specify a SnapshotType value, then both automated and
+            // manual snapshots are returned" — and this store holds no shared or
+            // public snapshots, so `IncludeShared` / `IncludePublic` add nothing.
+            .filter(|record| {
+                input
+                    .snapshot_type
+                    .as_ref()
+                    .is_none_or(|wanted| record.snapshot_type.eq_ignore_ascii_case(wanted))
+            })
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.snapshot_identifier.clone(), record.to_wire()))
+            .collect();
+
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        Ok(DescribeDBSnapshotsOutput {
+            marker: page.next_marker,
+            db_snapshots: Some(page.items),
+        })
     }
+}
+
+/// The filter names this operation's `Filters` member documents:
+/// "`db-instance-id`", "`db-snapshot-id`", "`dbi-resource-id`", "`snapshot-type`"
+/// and "`engine`". RDS refuses any other name, and so does this operation — with a
+/// 400, because quietly ignoring a filter would report snapshots the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 5] = [
+    "db-instance-id",
+    "db-snapshot-id",
+    "dbi-resource-id",
+    "engine",
+    "snapshot-type",
+];
+
+/// Refuse a filter this operation does not support. "Filter names are
+/// case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches
+/// the member that filter names. "Filter values are case-sensitive."
+fn matches_filter(record: &crate::state::DbSnapshotRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        // "Accepts DB instance identifiers and DB instance Amazon Resource Names
+        // (ARNs)."
+        "db-instance-id" => {
+            *wanted == record.db_instance_identifier
+                || *wanted
+                    == crate::state::db_instance_arn(
+                        &record.region,
+                        &record.db_instance_identifier,
+                    )
+        }
+        "db-snapshot-id" => *wanted == record.snapshot_identifier || *wanted == record.arn(),
+        "dbi-resource-id" => *wanted == record.dbi_resource_id,
+        "engine" => *wanted == record.engine,
+        "snapshot-type" => *wanted == record.snapshot_type,
+        _ => false,
+    })
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports a persisted workflow from this service's store
+//! (`crate::state`). A read NEVER changes what a later caller sees. The optional
+//! `WorkflowVersion` selects the immutable version record to report; an ARN (or a
+//! version) the store does not hold is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +201,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflow"))
+        // `ctx` carries only request metadata; a read needs none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWorkflowErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let store = state.lock();
+
+        let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
+            GetWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("No workflow found for {}", input.workflow_arn),
+                resource_id: input.workflow_arn.clone(),
+                resource_type: "workflow".to_string(),
+            })
+        })?;
+
+        let requested = input.workflow_version.as_deref();
+        let record = workflow.version(requested).ok_or_else(|| {
+            GetWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "Workflow {} has no version {}",
+                    input.workflow_arn,
+                    requested.unwrap_or("<latest>")
+                ),
+                resource_id: input.workflow_arn.clone(),
+                resource_type: "workflow-version".to_string(),
+            })
+        })?;
+        let snapshot = &record.snapshot;
+
+        Ok(GetWorkflowOutput {
+            workflow_arn: workflow.arn.clone(),
+            workflow_version: Some(record.version.clone()),
+            name: Some(workflow.name.clone()),
+            description: snapshot.description.clone(),
+            created_at: Some(crate::state::timestamp(workflow.created_at)),
+            // A specific version was written once, at its own instant; the latest
+            // version's instant is the workflow's last modification.
+            modified_at: Some(crate::state::timestamp(if requested.is_some() {
+                record.created_at
+            } else {
+                workflow.modified_at
+            })),
+            encryption_configuration: snapshot.encryption_configuration.clone(),
+            logging_configuration: snapshot.logging_configuration.clone(),
+            engine_version: snapshot.engine_version,
+            workflow_status: Some(workflow.status.clone()),
+            definition_s3_location: Some(snapshot.definition_s3_location.clone()),
+            code: snapshot.code.clone(),
+            // The definition snapshot is taken when a version is created.
+            code_snapshotted_at: Some(crate::state::timestamp(if requested.is_some() {
+                record.created_at
+            } else {
+                workflow.code_snapshotted_at
+            })),
+            // No operation in this slice persists a schedule, and the definition body
+            // itself is never fetched from S3, so neither is reported.
+            schedule_configuration: None,
+            role_arn: Some(snapshot.role_arn.clone()),
+            network_configuration: snapshot.network_configuration.clone(),
+            trigger_mode: snapshot.trigger_mode.clone(),
+            workflow_definition: None,
+        })
     }
 }

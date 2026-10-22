@@ -8,6 +8,10 @@
 //! `createdAt` is preserved. An ARN no dashboard is stored under answers
 //! `ResourceNotFoundException` (404).
 //!
+//! Being state-changing, it emits the audit record `crate::state::record_state_change`
+//! writes (timestamp, source, presented access key id, operation, resource, outcome) on
+//! both the success and the not-found path.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -156,7 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateDashboardErrorModeled::InternalServerException(InternalServerException {
                 message: "the dashboard store is unavailable".to_string(),
@@ -173,6 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve the record FIRST, so a request that names no dashboard mints no widget
         // id and leaves the id counter where it was.
         if !state.dashboards.contains_key(&arn) {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &arn,
+                "ResourceNotFoundException",
+            );
             return Err(not_found().into());
         }
 
@@ -199,9 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dashboard.widgets = widgets;
         }
         dashboard.updated_at = now;
+        let changed = dashboard.arn.clone();
 
-        Ok(UpdateDashboardOutput {
-            arn: dashboard.arn.clone(),
-        })
+        // The record this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &changed, "SUCCESS");
+
+        Ok(UpdateDashboardOutput { arn: changed })
     }
 }

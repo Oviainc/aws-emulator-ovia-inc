@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIncidentRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIncidentRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIncidentRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +119,18 @@ impl From<UpdateIncidentRecordErrorModeled> for UpdateIncidentRecordError {
     }
 }
 
+/// The `ResourceNotFoundException` this operation answers for an incident-record ARN
+/// that is not in the store. Built in one place so the two lookup sites in `handle`
+/// cannot drift apart.
+fn record_not_found(arn: &str) -> UpdateIncidentRecordError {
+    UpdateIncidentRecordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Incident record {arn} could not be found"),
+        resource_identifier: Some(arn.to_string()),
+        resource_type: Some(crate::state::RESOURCE_TYPE_INCIDENT_RECORD.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateIncidentRecord` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +167,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIncidentRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIncidentRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIncidentRecord"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateIncidentRecordErrorModeled::InternalServerException(InternalServerException {
+                message: "the ssm-incidents state store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a replay of the same token against the
+        // SAME record must not apply the update twice (which would bump
+        // `lastModifiedTime` again). The remembered key is scoped to the target ARN, so
+        // reusing one token across two different incidents still updates both.
+        let client_token = input.client_token.as_deref();
+        let arn = input.arn;
+        let scope = format!("{}:{arn}", Self::NAME);
+
+        // The record is resolved FIRST, so a replayed token against an incident that
+        // has since been deleted still answers `ResourceNotFoundException` rather than
+        // a success for a resource that is gone. Both lookups below raise the SAME
+        // error value, built in one place by `record_not_found`.
+        if !state.incident_records.contains_key(&arn) {
+            return Err(record_not_found(&arn));
+        }
+        if state.replayed_arn(&scope, client_token).is_some() {
+            return Ok(UpdateIncidentRecordOutput {});
+        }
+
+        let principal = crate::state::caller_principal(&ctx.parts().headers);
+        let modified_at = crate::state::now();
+
+        let record = state
+            .incident_records
+            .get_mut(&arn)
+            .ok_or_else(|| record_not_found(&arn))?;
+
+        // Only the members the request supplies are changed.
+        if let Some(title) = input.title {
+            record.title = title;
+        }
+        if let Some(summary) = input.summary {
+            record.summary = Some(summary);
+        }
+        if let Some(impact) = input.impact {
+            record.impact = impact;
+        }
+        if let Some(chat_channel) = input.chat_channel {
+            // The `ChatChannel` union's `empty` member is how a caller REMOVES the chat
+            // channel, so it clears the member rather than storing an empty channel.
+            record.chat_channel = match chat_channel {
+                ChatChannel::Empty(_) => None,
+                channel => Some(channel),
+            };
+        }
+        if let Some(targets) = input.notification_targets {
+            record.notification_targets = Some(targets);
+        }
+        if let Some(status) = input.status {
+            // `resolvedTime` is the instant the incident reached RESOLVED, so it is set
+            // when the status moves there and cleared if the incident is reopened.
+            if status != record.status {
+                record.resolved_time = (status == crate::state::STATUS_RESOLVED)
+                    .then_some(modified_at);
+            }
+            record.status = status;
+        }
+        record.last_modified_time = modified_at;
+        record.last_modified_by = principal;
+
+        state.remember_arn(&scope, client_token, &arn);
+
+        Ok(UpdateIncidentRecordOutput {})
     }
 }

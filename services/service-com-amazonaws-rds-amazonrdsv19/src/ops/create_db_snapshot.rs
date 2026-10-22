@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation copies the stored source DB instance's settings into
+//! a new DB snapshot. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with the other implemented operations.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBSnapshot"))
+        let region =
+            crate::state::request_region(ctx).map_err(CreateDBSnapshotError::validation)?;
+        let snapshot_identifier = input.db_snapshot_identifier;
+        crate::state::check_identifier("DBSnapshotIdentifier", &snapshot_identifier, 255)
+            .map_err(CreateDBSnapshotError::validation)?;
+        // The source instance's identifier "is stored as a lowercase string", so the
+        // lookup folds the same way the stored key does.
+        let source_identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated snapshot.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let snapshot_key = (region.clone(), snapshot_identifier.clone());
+        if store.db_snapshots.contains_key(&snapshot_key) {
+            return Err(CreateDBSnapshotErrorModeled::DBSnapshotAlreadyExistsFault(
+                DBSnapshotAlreadyExistsFault {
+                    message: Some(format!(
+                        "DB snapshot already exists: {snapshot_identifier}"
+                    )),
+                },
+            )
+            .into());
+        }
+        // The source instance is resolved BEFORE the quota, so a snapshot of an
+        // instance that does not exist is a 404 rather than a quota refusal.
+        let source = store
+            .db_instances
+            .get(&(region.clone(), source_identifier.clone()))
+            .ok_or_else(|| {
+                CreateDBSnapshotError::from(CreateDBSnapshotErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance {source_identifier} not found")),
+                    },
+                ))
+            })?;
+        // A snapshot is a copy of the instance's storage, so the instance has to be
+        // up: RDS refuses while it is still `creating` or being modified.
+        if source.status != "available" {
+            return Err(CreateDBSnapshotErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {source_identifier} is not available for a snapshot (status {})",
+                        source.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every setting the snapshot reports is COPIED from the source record, so a
+        // later change to the instance does not rewrite history.
+        let snapshot = crate::state::DbSnapshotRecord::from_instance(
+            source,
+            &snapshot_identifier,
+            input.tags.unwrap_or_default(),
+        );
+
+        // The region's manual DB snapshot quota, and the number of regions this store
+        // keeps records for at all: the store cannot be grown without bound, and the
+        // modelled fault says exactly this.
+        if store.snapshots_in(&region).len() >= crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CreateDBSnapshotErrorModeled::SnapshotQuotaExceededFault(
+                SnapshotQuotaExceededFault {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of manual DB snapshots \
+                         ({} per region, in at most {} regions)",
+                        crate::state::DB_SNAPSHOT_QUOTA_PER_REGION,
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let db_snapshot = snapshot.to_wire();
+        store.db_snapshots.insert(snapshot_key, snapshot);
+
+        Ok(CreateDBSnapshotOutput {
+            db_snapshot: Some(db_snapshot),
+        })
     }
 }

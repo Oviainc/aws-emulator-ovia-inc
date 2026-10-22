@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `JobId`, persists every supplied input against it and starts the job in
+//! `JobState` `New`, so `DescribeJob` and `ListJobs` report what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -255,18 +249,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+        let mut store = state.lock();
+
+        // A job is built from a resource it names: the address its device ships to, or
+        // the cluster it joins — "If you're creating a job for a node in a cluster, you
+        // only need to provide the clusterId value; the other job attributes are
+        // inherited from the cluster". An id no stored resource answers to names none.
+        if let Some(cluster_id) = input.cluster_id.as_deref() {
+            // `CreateCluster` is not implemented yet (it still answers 501), so this
+            // emulator holds no cluster and every well-formed cluster id names one that
+            // does not exist.
+            return Err(CreateJobErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The cluster ID {cluster_id} can't be found. Check the information you \
+                         provided in your last request, and try again."
+                    )),
+                    resource_type: Some("cluster".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(address_id) = input.address_id.clone() else {
+            // Neither an address nor a cluster: nothing says where the device goes, so
+            // the inputs cannot hold together.
+            return Err(CreateJobErrorModeled::InvalidInputCombinationException(
+                InvalidInputCombinationException {
+                    message: Some(
+                        "Job creation failed. One or more inputs were invalid: a job must \
+                         provide the AddressId the Snow device is shipped to, or the ClusterId \
+                         of the cluster whose attributes it inherits."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        if !store.addresses.contains_key(&address_id) {
+            return Err(CreateJobErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The address ID {address_id} can't be found. Check the information you \
+                         provided in your last request, and try again."
+                    )),
+                    resource_type: Some("address".to_string()),
+                },
+            )
+            .into());
+        }
+        // A forwarding address is an address too, so the same rule holds for it.
+        if let Some(forwarding_address_id) = input.forwarding_address_id.as_deref() {
+            if !store.addresses.contains_key(forwarding_address_id) {
+                return Err(CreateJobErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The address ID {forwarding_address_id} can't be found. Check the \
+                             information you provided in your last request, and try again."
+                        )),
+                        resource_type: Some("address".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let job_id = store.mint_job_id();
+        let job = crate::state::StoredJob {
+            job_id: job_id.clone(),
+            // A job AWS has accepted but not started preparing a device for is `New`,
+            // the state from which `CancelJob` is still permitted. It leaves `New` when
+            // the device is prepared and shipped — physical work no clock here owes, and
+            // what this API moves through its own shipment operations.
+            job_state: crate::state::JobState::New,
+            job_type: input.job_type,
+            snowball_type: input.snowball_type,
+            snowball_capacity_preference: input.snowball_capacity_preference,
+            shipping_option: input.shipping_option,
+            creation_date: ::std::time::SystemTime::now(),
+            description: input.description,
+            address_id: Some(address_id),
+            forwarding_address_id: input.forwarding_address_id,
+            role_arn: input.role_arn,
+            kms_key_arn: input.kms_key_arn,
+            resources: input.resources,
+            notification: input.notification,
+            on_device_service_configuration: input.on_device_service_configuration,
+            cluster_id: None,
+            long_term_pricing_id: input.long_term_pricing_id,
+            tax_documents: input.tax_documents,
+            device_configuration: input.device_configuration,
+            remote_management: input.remote_management,
+            impact_level: input.impact_level,
+            pickup_details: input.pickup_details,
+        };
+
+        // This emulator holds a bounded number of jobs, and `CancelJob` does not remove
+        // one, so a store at its ceiling refuses the create rather than growing the
+        // process further. The model declares no quota error on this operation, so the
+        // refusal travels on the framework's channel, naming the limit reached.
+        if !store.insert_job(job) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator stores at most {} jobs, and that limit has been reached",
+                crate::state::MAX_STORED_JOBS
+            )));
+        }
+
+        Ok(CreateJobOutput {
+            job_id: Some(job_id),
+        })
     }
 }

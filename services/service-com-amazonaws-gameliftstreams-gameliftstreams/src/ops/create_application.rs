@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and PERSISTS an application: it mints the `Id`/`Arn`, stores every
+//! configured value, and answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -265,18 +258,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize(now);
+
+        // `ApplicationLogOutputUri` — "Required if you specify one or more
+        // ApplicationLogPaths." The model cannot express the dependency, so it is
+        // refused here with the modelled client-input error.
+        let log_paths = input.application_log_paths.clone().unwrap_or_default();
+        let log_output_uri = input
+            .application_log_output_uri
+            .clone()
+            .filter(|uri| !uri.is_empty());
+        if !log_paths.is_empty() && log_output_uri.is_none() {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "ApplicationLogOutputUri is required when ApplicationLogPaths is set \
+                         ({} path(s) given)",
+                        log_paths.len()
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A replayed `ClientToken` answers with the application the first request
+        // created rather than creating a second one.
+        let replayed = state.replayed(Self::NAME, input.client_token.as_deref());
+        let replayed = replayed.filter(|id| state.applications.contains_key(id));
+        let id = match replayed {
+            Some(id) => id,
+            None => {
+                // The emulator's own bound on the store, refused with the error the
+                // model already declares for a quota.
+                if state.applications.len() >= crate::state::APPLICATION_QUOTA {
+                    return Err(
+                        CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException {
+                                message: format!(
+                                    "this emulator holds the maximum of {} applications; \
+                                     delete one before creating another",
+                                    crate::state::APPLICATION_QUOTA
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                let region = crate::state::region_of(ctx.parts());
+                let id = state.mint_id("a-");
+                let arn = crate::state::application_arn(&region, &id);
+                // "If the request is successful, Amazon GameLift Streams begins to
+                // create an application and sets the status to INITIALIZED." The
+                // clock owes the move to READY.
+                let application = crate::state::Application {
+                    id: id.clone(),
+                    arn,
+                    description: input.description,
+                    runtime_environment: input.runtime_environment,
+                    executable_path: input.executable_path,
+                    application_source_uri: input.application_source_uri,
+                    application_log_paths: log_paths,
+                    application_log_output_uri: log_output_uri,
+                    status: crate::state::APPLICATION_INITIALIZED.to_string(),
+                    status_reason: None,
+                    replications: Vec::new(),
+                    associated_stream_groups: Vec::new(),
+                    tags: input.tags.unwrap_or_default(),
+                    created_at: now,
+                    last_updated_at: now,
+                    status_due_at: Some(now + crate::state::TRANSITION),
+                };
+                state.applications.insert(id.clone(), application);
+                state.remember(Self::NAME, input.client_token.as_deref(), &id);
+                id
+            }
+        };
+
+        // Everything below is read back out of the stored record.
+        let application = state
+            .applications
+            .get(&id)
+            .expect("the application was just stored under this id");
+        Ok(CreateApplicationOutput {
+            arn: application.arn.clone(),
+            description: Some(application.description.clone()),
+            runtime_environment: Some(application.runtime_environment.clone()),
+            executable_path: Some(application.executable_path.clone()),
+            application_log_paths: Some(application.application_log_paths.clone()),
+            application_log_output_uri: application.application_log_output_uri.clone(),
+            application_source_uri: Some(application.application_source_uri.clone()),
+            id: Some(application.id.clone()),
+            status: Some(application.status.clone()),
+            status_reason: application.status_reason.clone(),
+            replication_statuses: Some(application.replication_statuses(now)),
+            created_at: Some(crate::state::timestamp(application.created_at)),
+            last_updated_at: Some(crate::state::timestamp(application.last_updated_at)),
+            associated_stream_groups: Some(application.associated_stream_groups.clone()),
+        })
     }
 }

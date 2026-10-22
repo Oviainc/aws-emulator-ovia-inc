@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnectionInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnectionInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnectionInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and STORES a connection invitation: the response is built from the record
+//! this handler persisted, and a retry carrying the same `ClientToken` answers with
+//! that same record instead of creating a second invitation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +170,29 @@ impl From<CreateConnectionInvitationErrorModeled> for CreateConnectionInvitation
     }
 }
 
+/// The stored invitation as this operation's response. Every member comes from the
+/// record, so the caller sees what was persisted rather than what it sent.
+fn output_for(
+    record: &crate::state::ConnectionInvitationRecord,
+) -> CreateConnectionInvitationOutput {
+    CreateConnectionInvitationOutput {
+        catalog: record.catalog.clone(),
+        id: record.id.clone(),
+        arn: record.arn.clone(),
+        connection_id: record.connection_id.clone(),
+        connection_type: record.connection_type.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+        updated_at: ::aws_smithy_types::DateTime::from(record.updated_at),
+        expires_at: Some(::aws_smithy_types::DateTime::from(record.expires_at)),
+        other_participant_identifier: record.other_participant_identifier.clone(),
+        participant_type: record.participant_type.clone(),
+        status: record.status.clone(),
+        invitation_message: record.invitation_message.clone(),
+        inviter_email: record.inviter_email.clone(),
+        inviter_name: record.inviter_name.clone(),
+    }
+}
+
 /// The `CreateConnectionInvitation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -211,18 +229,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnectionInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnectionInvitation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectionInvitationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PartnerCentralAccount store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        let now = ::std::time::SystemTime::now();
+        state.materialise_due_transitions(now);
+
+        // A `ClientToken` makes the call repeatable: the SAME token with the SAME
+        // request answers with the invitation the first call stored, while the same
+        // token with a DIFFERENT request is the conflict the model names
+        // `CONFLICT_CLIENT_TOKEN`.
+        let fingerprint = crate::state::fingerprint(&[
+            &input.catalog,
+            &input.connection_type,
+            &input.email,
+            &input.message,
+            &input.name,
+            &input.receiver_identifier,
+        ]);
+        if let Some(replay) = state.replay(Self::NAME, &input.client_token) {
+            if replay.fingerprint != fingerprint {
+                return Err(CreateConnectionInvitationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "The ClientToken {} was already used for a different CreateConnectionInvitation request.",
+                            input.client_token
+                        ),
+                        reason: crate::state::REASON_CONFLICT_CLIENT_TOKEN.to_string(),
+                    },
+                )
+                .into());
+            }
+            let key = (input.catalog.clone(), replay.resource_id.clone());
+            if let Some(stored) = state.invitations.get(&key) {
+                return Ok(output_for(stored));
+            }
+        }
+
+        // Every resource this service mints carries an ARN whose catalog segment is
+        // `catalog/[a-zA-Z]+`, so a catalog the ARN cannot spell is refused here
+        // rather than answered with an ARN that violates its own modelled pattern.
+        if !crate::state::catalog_is_arn_safe(&input.catalog) {
+            return Err(CreateConnectionInvitationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Catalog {} is not a catalog of this service: a catalog identifier is letters only.",
+                        input.catalog
+                    ),
+                    reason: crate::state::REASON_REQUEST_VALIDATION_FAILED.to_string(),
+                    error_details: Some(vec![ValidationError::FieldValidationError(
+                        FieldValidationError {
+                            name: "Catalog".to_string(),
+                            message: "Catalog must match [a-zA-Z]+.".to_string(),
+                            code: crate::state::FIELD_CODE_INVALID_STRING_FORMAT.to_string(),
+                        },
+                    )]),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        // The store a caller can grow is bounded: past the ceiling the create is
+        // refused with the modelled quota error rather than accepted.
+        if state.invitations.len() >= crate::state::MAX_INVITATIONS {
+            return Err(
+                CreateConnectionInvitationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "This account already holds {} connection invitations, the most this catalog stores.",
+                            crate::state::MAX_INVITATIONS
+                        ),
+                        reason: crate::state::REASON_LIMIT_EXCEEDED_OPEN_CONNECTION_INVITATION
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+        let id = state.mint_invitation_id();
+        let record = crate::state::ConnectionInvitationRecord {
+            catalog: input.catalog.clone(),
+            arn: crate::state::invitation_arn(&region, &input.catalog, &id),
+            id: id.clone(),
+            // No connection exists until the invitation is accepted.
+            connection_id: None,
+            connection_type: input.connection_type,
+            created_at: now,
+            updated_at: now,
+            expires_at: now + crate::state::INVITATION_TTL,
+            other_participant_identifier: input.receiver_identifier,
+            // The caller of this operation is the participant sending the invitation.
+            participant_type: crate::state::PARTICIPANT_SENDER.to_string(),
+            status: crate::state::INVITATION_PENDING.to_string(),
+            invitation_message: input.message,
+            inviter_email: input.email,
+            inviter_name: input.name,
+        };
+        state
+            .invitations
+            .insert((input.catalog.clone(), id.clone()), record);
+        state.record_idempotent_call(Self::NAME, &input.client_token, &id, &fingerprint);
+
+        let stored = state
+            .invitations
+            .get(&(input.catalog, id))
+            .expect("the invitation just inserted is in the store");
+        Ok(output_for(stored))
     }
 }

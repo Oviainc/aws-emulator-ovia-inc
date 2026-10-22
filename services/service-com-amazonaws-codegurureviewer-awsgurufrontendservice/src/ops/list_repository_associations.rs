@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRepositoryAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRepositoryAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRepositoryAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +149,42 @@ impl<Eng> ListRepositoryAssociations<Eng> {
     }
 }
 
+/// The page size this operation uses when the caller names none.
+///
+/// From `MaxResults`' own documentation: "If this parameter is not used,
+/// ListRepositoryAssociations returns up to 100 results and a nextToken value if
+/// applicable."
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// The page sizes `MaxResults` accepts, from its modelled `range 1..100`.
+const MAX_RESULTS_RANGE: ::std::ops::RangeInclusive<i32> = 1..=100;
+
+/// The opaque continuation token for the item after `seq`.
+///
+/// `NextToken` is documented as "an opaque identifier that is only used to retrieve the
+/// next items in a list and not for other programmatic purposes", so the cursor is encoded
+/// rather than handed over as a readable position.
+fn encode_next_token(seq: u64) -> String {
+    ::hex::encode(seq.to_string())
+}
+
+/// The cursor a token carries, or `None` when the token is not one this service issued.
+fn decode_next_token(token: &str) -> Option<u64> {
+    let decoded = ::hex::decode(token).ok()?;
+    String::from_utf8(decoded).ok()?.parse::<u64>().ok()
+}
+
+/// A filter list matches when it is absent, or when it contains the stored value.
+///
+/// Values inside one filter are alternatives (`?Name=a&Name=b` means either); separate
+/// filters all have to match.
+fn matches_filter(filter: Option<&Vec<String>>, value: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some(allowed) => value.is_some_and(|value| allowed.iter().any(|a| a == value)),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListRepositoryAssociations<Eng>
 {
@@ -173,20 +200,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRepositoryAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRepositoryAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRepositoryAssociations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRepositoryAssociationsError::Modeled(
+                ListRepositoryAssociationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the repository-association store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+
+        let after = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "NextToken is not a continuation token issued by ListRepositoryAssociations",
+                )
+            })?,
+        };
+        // `MaxResults` is modelled `range 1..100`, so the boundary validator already refused
+        // anything outside it; this is the one refusal that holds whether or not the
+        // boundary ran, and it is the ONLY path — an out-of-range page size is never
+        // silently adjusted into range.
+        let requested = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
+        if !MAX_RESULTS_RANGE.contains(&requested) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "MaxResults must be between {} and {}",
+                MAX_RESULTS_RANGE.start(),
+                MAX_RESULTS_RANGE.end()
+            )));
+        }
+        let page_size = usize::try_from(requested).expect("a value in 1..=100 fits in usize");
+
+        let mut store = state.lock();
+        // Reporting operation: the only write it makes is materialising a status change the
+        // clock already owed, so a listing never moves a status that was not already due.
+        store.settle_due_transitions();
+
+        let matching: Vec<&crate::state::Association> = store
+            .associations_after(after)
+            .filter(|association| {
+                matches_filter(
+                    input.provider_types.as_ref(),
+                    Some(&association.provider_type),
+                ) && matches_filter(input.states.as_ref(), Some(&association.state))
+                    && matches_filter(input.names.as_ref(), Some(&association.name))
+                    && matches_filter(input.owners.as_ref(), association.owner.as_deref())
+            })
+            // One more than the page, so "is there a next page" is answered by the store
+            // rather than guessed.
+            .take(page_size + 1)
+            .collect();
+
+        let next_token =
+            (matching.len() > page_size).then(|| encode_next_token(matching[page_size - 1].seq));
+        let summaries = matching
+            .iter()
+            .take(page_size)
+            .map(|association| association.to_summary())
+            .collect();
+
+        Ok(ListRepositoryAssociationsOutput {
+            repository_association_summaries: Some(summaries),
+            next_token,
+        })
     }
 }

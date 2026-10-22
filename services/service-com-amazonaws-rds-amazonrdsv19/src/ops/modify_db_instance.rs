@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation writes the supplied settings into the stored DB
+//! instance. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with the other implemented DB-instance operations.
 //!
 //! ## Shape of an operation
 //!
@@ -359,18 +355,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBInstance"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyDBInstanceError::validation)?;
+        // "This value is stored as a lowercase string" — for the instance being
+        // modified and for the new identifier it may be renamed to.
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        let renamed_to = match &input.new_db_instance_identifier {
+            Some(requested) => {
+                let renamed = requested.to_ascii_lowercase();
+                crate::state::check_identifier("NewDBInstanceIdentifier", &renamed, 63)
+                    .map_err(ModifyDBInstanceError::validation)?;
+                Some(renamed)
+            }
+            None => None,
+        };
+        if let Some(period) = input.backup_retention_period {
+            if !crate::state::BACKUP_RETENTION_RANGE.contains(&period) {
+                return Err(ModifyDBInstanceError::validation(format!(
+                    "invalid value {period} for BackupRetentionPeriod: must be a value from {} to {}",
+                    crate::state::BACKUP_RETENTION_RANGE.start(),
+                    crate::state::BACKUP_RETENTION_RANGE.end()
+                )));
+            }
+        }
+        if let Some(port) = input.db_port_number {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(ModifyDBInstanceError::validation(format!(
+                    "invalid value {port} for DBPortNumber: must be a value from {} to {}",
+                    crate::state::PORT_RANGE.start(),
+                    crate::state::PORT_RANGE.end()
+                )));
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        if !store.db_instances.contains_key(&key) {
+            return Err(ModifyDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!("DBInstance {identifier} not found")),
+                },
+            )
+            .into());
+        }
+        // An instance that is still coming up, or is on its way out, cannot take a
+        // modification — the state the clock has yet to settle is real. One that is
+        // already `modifying` can: RDS accepts a further change while it applies the
+        // last one.
+        let current_status = store.db_instances[&key].status.clone();
+        if current_status != "available" && current_status != "modifying" {
+            return Err(ModifyDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is not available for modification (status {current_status})"
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(renamed) = &renamed_to {
+            if *renamed != identifier
+                && store
+                    .db_instances
+                    .contains_key(&(region.clone(), renamed.clone()))
+            {
+                return Err(ModifyDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
+                    DBInstanceAlreadyExistsFault {
+                        message: Some(format!("DB instance already exists: {renamed}")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut record = store
+            .db_instances
+            .remove(&key)
+            .expect("the instance was found above and the store is locked");
+
+        // Every supplied setting is written into the stored record. The settings RDS
+        // defers to the maintenance window when `ApplyImmediately` is disabled are
+        // applied immediately here: this slice keeps no pending-modified-values set,
+        // so deferring a change would mean dropping it.
+        let mut changed = false;
+        if let Some(renamed) = renamed_to {
+            changed |= renamed != record.identifier;
+            record.identifier = renamed;
+        }
+        if let Some(value) = input.db_instance_class {
+            changed = true;
+            record.db_instance_class = value;
+        }
+        if let Some(value) = input.engine {
+            changed = true;
+            record.engine = value;
+        }
+        if let Some(value) = input.engine_version {
+            changed = true;
+            record.engine_version = Some(value);
+        }
+        if let Some(value) = input.allocated_storage {
+            changed = true;
+            record.allocated_storage = Some(value);
+        }
+        if let Some(value) = input.max_allocated_storage {
+            changed = true;
+            record.max_allocated_storage = Some(value);
+        }
+        if let Some(value) = input.backup_retention_period {
+            changed = true;
+            record.backup_retention_period = value;
+        }
+        if let Some(value) = input.preferred_backup_window {
+            changed = true;
+            record.preferred_backup_window = Some(value);
+        }
+        if let Some(value) = input.preferred_maintenance_window {
+            changed = true;
+            record.preferred_maintenance_window = Some(value);
+        }
+        if let Some(value) = input.multi_az {
+            changed = true;
+            record.multi_az = value;
+        }
+        if let Some(value) = input.storage_type {
+            changed = true;
+            record.storage_type = value;
+        }
+        if let Some(value) = input.iops {
+            changed = true;
+            record.iops = Some(value);
+        }
+        if let Some(value) = input.license_model {
+            changed = true;
+            record.license_model = Some(value);
+        }
+        if let Some(value) = input.db_port_number {
+            changed = true;
+            record.endpoint_port = value;
+        }
+        if let Some(value) = input.publicly_accessible {
+            changed = true;
+            record.publicly_accessible = value;
+        }
+        if let Some(value) = input.auto_minor_version_upgrade {
+            changed = true;
+            record.auto_minor_version_upgrade = value;
+        }
+        if let Some(value) = input.copy_tags_to_snapshot {
+            changed = true;
+            record.copy_tags_to_snapshot = value;
+        }
+        if let Some(value) = input.deletion_protection {
+            changed = true;
+            record.deletion_protection = value;
+        }
+        if let Some(value) = input.db_subnet_group_name {
+            changed = true;
+            record.db_subnet_group_name = Some(value);
+        }
+        if let Some(value) = input.db_parameter_group_name {
+            changed = true;
+            record.db_parameter_group_name = Some(value);
+        }
+        if let Some(value) = input.vpc_security_group_ids {
+            changed = true;
+            record.vpc_security_group_ids = value;
+        }
+        // `DisableDomain` wins over `Domain`, as its name says: it leaves the domain.
+        if let Some(value) = input.domain {
+            changed = true;
+            record.domain = Some(value);
+        }
+        if input.disable_domain == Some(true) {
+            changed = true;
+            record.domain = None;
+        }
+        // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it:
+        // it is accepted and neither stored nor returned.
+        changed |= input.master_user_password.is_some();
+
+        if changed {
+            // RDS answers a modification with the instance in `modifying`; it settles
+            // back to `available` on its own.
+            record.status = "modifying".to_string();
+            record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+        }
+
+        let db_instance = record.to_wire();
+        store
+            .db_instances
+            .insert((region, record.identifier.clone()), record);
+
+        Ok(ModifyDBInstanceOutput {
+            db_instance: Some(db_instance),
+        })
     }
 }

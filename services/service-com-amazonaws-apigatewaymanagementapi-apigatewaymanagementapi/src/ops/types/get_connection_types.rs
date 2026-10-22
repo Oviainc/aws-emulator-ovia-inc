@@ -130,4 +130,3 @@ pub struct Identity {
     pub source_ip: String,
     pub user_agent: String,
 }
-

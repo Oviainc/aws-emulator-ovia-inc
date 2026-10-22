@@ -21,13 +21,19 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination tokens: hex codec for the list cursor.
+hex = { workspace = true }
+# Resource ids: SHA-256 over the store's unique sequence plus per-process entropy, laid out
+# as the v4 UUID the model's AssociationArn pattern requires.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# The integration suite waits out a clock-owed transition, which needs tokio's time driver
+# (the workspace default enables only `macros` and the runtimes).
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
