@@ -230,6 +230,10 @@ pub struct StandardsSubscriptionRecord {
 /// Per-service state for com-amazonaws-securityhub-securityhubapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
+    /// Finding aggregators, keyed by account id: cross-Region aggregation is one
+    /// account-wide setting, so an account holds at most one and
+    /// `ListFindingAggregators` answers the same ARN in every Region.
+    pub finding_aggregators: HashMap<String, StoredFindingAggregator>,
     /// Custom insights, keyed by hub + the ARN `CreateInsight` minted.
     pub insights: HashMap<InsightKey, StoredInsight>,
     /// The subscribed hubs, one per `(account id, Region)`.
@@ -1074,5 +1078,130 @@ pub fn custom_insight_arn(key: &HubKey, insight_id: &str) -> String {
         ARN_NAMESPACE,
         &key.1,
         &format!("insight/{}/custom/{insight_id}", key.0),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Region aggregation (finding aggregators). Kept together at the end of
+// this module so the whole resource — its record, its bounds and its ARN
+// helpers — reads in one place.
+// ---------------------------------------------------------------------------
+
+/// The account's cross-Region aggregation settings, as `CreateFindingAggregator`
+/// stored them and `GetFindingAggregator` / `ListFindingAggregators` report them.
+///
+/// Named with a `Stored` prefix because the modelled `FindingAggregator` shape in
+/// `ops::types` carries only the ARN; this is the whole resource behind it.
+#[derive(Debug, Clone)]
+pub struct StoredFindingAggregator {
+    pub arn: String,
+    /// The home Region: "This operation can be invoked from the home Region only"
+    /// (`smithy_query(query="operation", operation="CreateFindingAggregator")` doc),
+    /// so the Region the create was signed for IS the home Region.
+    pub finding_aggregation_region: String,
+    pub region_linking_mode: String,
+    /// The excluded or included Regions. Empty for a `RegionLinkingMode` that names
+    /// no Region list.
+    pub regions: Vec<String>,
+}
+
+/// How many Regions a finding aggregator's `Regions` list may name. `Regions` is a
+/// `StringList` the model puts no `@length` trait on, and the list enumerates Regions
+/// of ONE partition — every AWS partition has well under this many — so the cap is
+/// above anything a faithful caller sends while keeping a stored record's size
+/// independent of what a caller chooses to send.
+pub const MAX_AGGREGATOR_REGIONS: usize = 64;
+
+/// The longest Region name a finding aggregator's `Regions` list may carry. A Region
+/// name is a short dash-separated code (`ap-southeast-4` is 14 characters), so this
+/// is far above any real one; the model documents no bound for the member, so this is
+/// what keeps one entry from growing with whatever a caller sends.
+pub const MAX_REGION_NAME_LEN: usize = 64;
+
+/// The resource type of a finding aggregator ARN
+/// (`arn:aws:securityhub:<home-region>:<account>:finding-aggregator/<id>`).
+pub const FINDING_AGGREGATOR_RESOURCE_TYPE: &str = "finding-aggregator";
+
+/// The documented `RegionLinkingMode` values, in the order
+/// `smithy_query(query="doc", shape="CreateFindingAggregatorRequest",
+/// member="RegionLinkingMode")` lists them: `ALL_REGIONS`,
+/// `ALL_REGIONS_EXCEPT_SPECIFIED`, `SPECIFIED_REGIONS`, `NO_REGIONS`. The member is
+/// modelled `NonEmptyString`, not an enum, so the handler is what refuses anything
+/// else.
+pub const REGION_LINKING_MODES: [&str; 4] = [
+    "ALL_REGIONS",
+    "ALL_REGIONS_EXCEPT_SPECIFIED",
+    "SPECIFIED_REGIONS",
+    "NO_REGIONS",
+];
+
+/// Whether a `RegionLinkingMode` consumes the `Regions` list. `Regions` is
+/// documented as "the list of Regions that don't replicate" for
+/// `ALL_REGIONS_EXCEPT_SPECIFIED` and "the list of Regions that do replicate" for
+/// `SPECIFIED_REGIONS` — those two modes read it; `ALL_REGIONS` and `NO_REGIONS`
+/// name no list at all (`smithy_query(query="doc",
+/// shape="CreateFindingAggregatorRequest", member="Regions")`).
+pub fn region_linking_mode_takes_regions(mode: &str) -> bool {
+    matches!(mode, "ALL_REGIONS_EXCEPT_SPECIFIED" | "SPECIFIED_REGIONS")
+}
+
+/// A fresh finding aggregator id, in the 8-4-4-4-12 hex grouping Security Hub CSPM's
+/// own finding aggregator ARNs carry.
+///
+/// Minted through [`mint_resource_id`] from the account, the home Region, the store's
+/// monotonic write sequence and the clock, so two creates — even in the same instant,
+/// even after a delete — cannot mint the same id, and the id is derived from no caller
+/// input.
+pub fn new_finding_aggregator_id(
+    account_id: &str,
+    region: &str,
+    write_seq: u64,
+    now_nanos: i128,
+) -> String {
+    mint_resource_id(
+        &[account_id.as_bytes(), region.as_bytes()],
+        write_seq,
+        now_nanos,
+    )
+}
+
+/// A 128-bit identifier for a resource this service mints, rendered in the 8-4-4-4-12
+/// hex grouping Security Hub CSPM's own resource ids carry.
+///
+/// The bits come from SHA-256 over `fields` (each one separated, so two different field
+/// splits cannot hash alike), the store's monotonic write sequence and the clock, so two
+/// creates cannot mint the same identifier — not even when a deleted resource's fields
+/// are used again in the same instant, because the write sequence has moved on. Shared
+/// by every operation here that mints such an id (`CreateInsight`,
+/// `CreateFindingAggregator`) so the construction is stated once.
+pub fn mint_resource_id(fields: &[&[u8]], write_seq: u64, now_nanos: i128) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hasher.update(field);
+        // A separator, so two different field splits cannot hash alike.
+        hasher.update([0u8]);
+    }
+    hasher.update(write_seq.to_be_bytes());
+    hasher.update(now_nanos.to_be_bytes());
+    let digest = hasher.finalize();
+    let hex = ::hex::encode(&digest[..16]);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// `arn:aws:securityhub:<home-region>:<account>:finding-aggregator/<id>`.
+pub fn finding_aggregator_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{FINDING_AGGREGATOR_RESOURCE_TYPE}/{id}"),
     )
 }

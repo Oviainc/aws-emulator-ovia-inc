@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFindingAggregator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFindingAggregator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFindingAggregator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables cross-Region aggregation for the caller's account: the Region the call is
+//! signed for becomes the home Region, and the account's single finding aggregator is
+//! minted there. Because an account has exactly one set of cross-Region aggregation
+//! settings, a second create is refused as a bad request (`InvalidInputException`,
+//! HTTP 400) naming the account that already aggregates.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFindingAggregator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFindingAggregatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateFindingAggregatorError::Modeled(
+                CreateFindingAggregatorErrorModeled::InternalException(InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        // Every Security Hub CSPM API call is answered for a subscribed account in the
+        // Region it is signed for; an unsubscribed one has no settings to create.
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(CreateFindingAggregatorErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(&account_id, &region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Whether the request is well formed is decided before the singleton is
+        // consulted, so an invalid mode is refused identically on a fresh account and
+        // on one that already aggregates.
+        let mode = input.region_linking_mode.clone();
+        if !crate::state::REGION_LINKING_MODES.contains(&mode.as_str()) {
+            return Err(invalid_input(format!(
+                "RegionLinkingMode {mode} is not one of {}",
+                crate::state::REGION_LINKING_MODES.join(", ")
+            )));
+        }
+        let regions: Vec<String> = input.regions.unwrap_or_default();
+        if let Err(message) = validate_regions(&mode, &regions) {
+            return Err(invalid_input(message));
+        }
+
+        // Cross-Region aggregation is ONE account-wide setting, so an account that
+        // already has a finding aggregator cannot create another: deleting the existing
+        // one (or `UpdateFindingAggregator`) is what changes it. Security Hub CSPM
+        // refuses the second create as a bad request (`InvalidInputException`, HTTP
+        // 400) rather than as a quota failure, and its message names the account the
+        // aggregator already belongs to and the delete that unblocks the create.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFindingAggregator"))
+        // The status and code are the RECORDED ones, not a choice: the recorded unit
+        // `securityhub.create-finding-aggregator-singleton-limit-exceeded` is graded on
+        // the status and error code of every wire step, and it replays as passed
+        // against this refusal — the operation's other candidate,
+        // `LimitExceededException` (HTTP 429), would fail it. The unit's NAME is not the
+        // code it recorded.
+        if store.finding_aggregators.contains_key(&account_id) {
+            return Err(invalid_input(format!(
+                "A finding aggregator already exists for the account ID: {account_id}. \
+                 Delete the aggregator before creating a new one."
+            )));
+        }
+
+        let aggregator_id = crate::state::new_finding_aggregator_id(
+            &account_id,
+            &region,
+            store.next_write_seq(),
+            crate::state::now_nanos(),
+        );
+        let aggregator = crate::state::StoredFindingAggregator {
+            arn: crate::state::finding_aggregator_arn(&region, &aggregator_id),
+            finding_aggregation_region: region,
+            region_linking_mode: mode,
+            regions,
+        };
+        store
+            .finding_aggregators
+            .insert(account_id, aggregator.clone());
+        drop(store);
+
+        Ok(CreateFindingAggregatorOutput {
+            finding_aggregator_arn: Some(aggregator.arn),
+            finding_aggregation_region: Some(aggregator.finding_aggregation_region),
+            region_linking_mode: Some(aggregator.region_linking_mode),
+            regions: (!aggregator.regions.is_empty()).then_some(aggregator.regions),
+        })
     }
+}
+
+/// A 400 `InvalidInputException` naming the member and the constraint it broke.
+fn invalid_input(message: String) -> CreateFindingAggregatorError {
+    CreateFindingAggregatorError::Modeled(
+        CreateFindingAggregatorErrorModeled::InvalidInputException(InvalidInputException {
+            message: Some(message),
+            code: Some("InvalidInputException".to_string()),
+        }),
+    )
+}
+
+/// The documented agreement between `RegionLinkingMode` and `Regions`: the two modes
+/// that read a Region list need one ("If RegionLinkingMode is
+/// ALL_REGIONS_EXCEPT_SPECIFIED, then this is a space-separated list of Regions that
+/// don't replicate …; if SPECIFIED_REGIONS, then this is a space-separated list of
+/// Regions that do replicate"), and a mode that reads none must not be given one. Only
+/// the `NO_REGIONS` half is documented verbatim ("An InvalidInputException error
+/// results if you populate this field while RegionLinkingMode is NO_REGIONS" —
+/// `smithy_query(query="doc", shape="CreateFindingAggregatorRequest",
+/// member="Regions")`); the other three refusals are INFERRED from the same member's
+/// text, which gives the list a meaning for exactly the two `*SPECIFIED*` modes.
+///
+/// The size bounds are this crate's doctrine for an unmodelled member: `Regions`
+/// carries no `@length` trait, so a stored record must not grow with whatever a
+/// caller sends ([`crate::state::MAX_AGGREGATOR_REGIONS`] /
+/// [`crate::state::MAX_REGION_NAME_LEN`]).
+fn validate_regions(mode: &str, regions: &[String]) -> Result<(), String> {
+    let takes_regions = crate::state::region_linking_mode_takes_regions(mode);
+    if takes_regions && regions.is_empty() {
+        return Err(format!(
+            "Regions must list at least one Region when RegionLinkingMode is {mode}"
+        ));
+    }
+    if !takes_regions && !regions.is_empty() {
+        return Err(format!(
+            "Regions must be empty when RegionLinkingMode is {mode}"
+        ));
+    }
+    if regions.len() > crate::state::MAX_AGGREGATOR_REGIONS {
+        return Err(format!(
+            "Regions must name at most {} Regions, got {}",
+            crate::state::MAX_AGGREGATOR_REGIONS,
+            regions.len()
+        ));
+    }
+    if let Some(blank) = regions.iter().find(|region| region.trim().is_empty()) {
+        return Err(format!(
+            "Regions must not contain an empty Region name (got {blank:?})"
+        ));
+    }
+    if let Some(long) = regions
+        .iter()
+        .find(|region| region.chars().count() > crate::state::MAX_REGION_NAME_LEN)
+    {
+        return Err(format!(
+            "Regions entries must be at most {} characters, got one of {}",
+            crate::state::MAX_REGION_NAME_LEN,
+            long.chars().count()
+        ));
+    }
+    Ok(())
 }
