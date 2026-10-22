@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_kafka_kafka::state::CLUSTER_ACTIVATION_DELAY;
+use service_com_amazonaws_kafka_kafka::state::{CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The signing region every request below is scoped to; it is the region the
@@ -304,4 +304,12 @@ impl ClusterRequest {
 /// timer feature; nothing else has to make progress here.
 pub fn sleep_past_activation() {
     std::thread::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250));
+}
+
+/// Sleep past the emulator's own `UPDATING` -> `ACTIVE` span, so a later read
+/// sees the cluster update the clock now owes the cluster. Beside
+/// [`sleep_past_activation`] so every suite that drives an update operation
+/// waits through one helper.
+pub fn sleep_past_update() {
+    std::thread::sleep(CLUSTER_UPDATE_DELAY + Duration::from_millis(250));
 }

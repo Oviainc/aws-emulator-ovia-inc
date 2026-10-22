@@ -206,12 +206,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let state = state.lock();
+        let mut state = state.lock();
         // An ARN this endpoint's region holds no cluster for — absent, or
         // belonging to another region — is refused the same way. Resolved
-        // WITHOUT settling, unlike Describe and List: this reader reports no
-        // `State`, so no clock-owed transition is due to it.
-        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+        // through the settling lookup: every string below is derived from the
+        // cluster's connectivity configuration, which a completed
+        // `UpdateConnectivity` changes, so the endpoints this reader reports
+        // depend on a transition the clock may already owe the cluster.
+        let Some(cluster) = state.settled_cluster_in(
+            &region,
+            &input.cluster_arn,
+            std::time::SystemTime::now(),
+        ) else {
             return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
                 BadRequestException {
                     invalid_parameter: Some("ClusterArn".to_string()),
