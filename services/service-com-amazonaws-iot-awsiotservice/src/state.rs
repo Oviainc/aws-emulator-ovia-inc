@@ -14,7 +14,9 @@
 //! `CreateThing` returns the created thing member-for-member: a reader clones what
 //! the writer stored and the two cannot drift.
 //!
-//! Beside the registry it holds the account's IoT ENDPOINT IDENTIFIERS — the
+//! Beside the registry it holds the THING GROUP registry, keyed by `thingGroupName`
+//! for the same reason — the name is the group's identity and the `@httpLabel` of
+//! `/thing-groups/{thingGroupName}` — and the account's IoT ENDPOINT IDENTIFIERS — the
 //! `<identifier>` of `<identifier>.iot.<region>.amazonaws.com`, the account-specific
 //! prefix every IoT endpoint address is built from. `DescribeEndpoint` is documented
 //! as "returns or creates a unique endpoint specific to the Amazon Web Services
@@ -24,6 +26,7 @@
 //! later call.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -112,6 +115,95 @@ impl RegisteredThing {
     }
 }
 
+/// The configuration of a thing group: the members of a `CreateThingGroup` request
+/// that describe the group rather than name it.
+///
+/// It is a type of its own for the same reason [`ThingConfiguration`] is:
+/// `CreateThingGroup` is documented idempotent ON it — "If the ThingGroup that you
+/// create has the exact same attributes as an existing ThingGroup, you will get a
+/// 200 success response" — so deciding a repeat create is a single `==`.
+///
+/// `AttributePayload$merge` is NOT part of it: the member documents "The `merge`
+/// attribute is only valid when calling `UpdateThing` or `UpdateThingGroup`", and a
+/// create starts from no attributes, so merging into the empty map and replacing it
+/// are the same thing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThingGroupConfiguration {
+    /// The group this group hangs under in the hierarchy, when it has one. It is
+    /// part of the configuration because a group's place in the hierarchy is fixed
+    /// at create time: `ThingGroupMetadata$parentGroupName` is metadata of the
+    /// record, not something a later call to `CreateThingGroup` may re-point.
+    pub parent_group_name: Option<String>,
+    /// `ThingGroupProperties$thingGroupDescription`, when the request carried one.
+    pub description: Option<String>,
+    /// `ThingGroupProperties$attributePayload$attributes`, as the last writer
+    /// persisted them. Ordered so a paginated reader over them is stable.
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// One thing group in the registry, as this service persists it.
+#[derive(Debug, Clone)]
+pub struct RegisteredThingGroup {
+    /// The name the group was created under; also its key in the registry.
+    pub thing_group_name: String,
+    /// The id minted when the group was created — stable for its lifetime.
+    pub thing_group_id: String,
+    /// `arn:aws:iot:<region>:<account>:thinggroup/<thingGroupName>`, minted on create.
+    pub thing_group_arn: String,
+    /// What the group is configured with; see [`ThingGroupConfiguration`].
+    pub configuration: ThingGroupConfiguration,
+    /// `Tag$Key` -> `Tag$Value` for the tags the create request carried. Tags are
+    /// NOT part of [`ThingGroupConfiguration`]: they "are used to manage the
+    /// resource" rather than describe the group, so they do not decide whether a
+    /// repeat create is the same group.
+    pub tags: BTreeMap<String, Option<String>>,
+    /// When the group was created — `ThingGroupMetadata$creationDate`, "The UNIX
+    /// timestamp of when the thing group was created".
+    pub creation_date: SystemTime,
+    /// The registry version of this record.
+    pub version: i64,
+}
+
+/// The `version` a freshly created thing group carries.
+///
+/// `DescribeThingGroup$version` is `@required` ("The version of the thing group")
+/// and is what a caller passes as `expectedVersion` to `UpdateThingGroup`. A record
+/// that exists has had one write (its create), so its version is 1 — the same rule
+/// [`FIRST_THING_VERSION`] states for a thing.
+pub const FIRST_THING_GROUP_VERSION: i64 = 1;
+
+impl RegisteredThingGroup {
+    /// A newly created thing group: the minted identity plus the requested
+    /// configuration and tags, at [`FIRST_THING_GROUP_VERSION`].
+    pub fn new(
+        thing_group_name: String,
+        thing_group_id: String,
+        thing_group_arn: String,
+        configuration: ThingGroupConfiguration,
+        tags: BTreeMap<String, Option<String>>,
+        creation_date: SystemTime,
+    ) -> Self {
+        Self {
+            thing_group_name,
+            thing_group_id,
+            thing_group_arn,
+            configuration,
+            tags,
+            creation_date,
+            version: FIRST_THING_GROUP_VERSION,
+        }
+    }
+
+    /// The group's attributes as the modelled `Attributes` map a response carries.
+    pub fn attributes(&self) -> HashMap<String, String> {
+        self.configuration
+            .attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+}
+
 /// Length of an account's IoT endpoint identifier.
 ///
 /// The identifier is one DNS label of lowercase alphanumerics (the AWS IoT
@@ -182,6 +274,14 @@ pub fn derive_endpoint_identifier(account_id: &str, region: &str) -> String {
 pub struct ComAmazonawsIotAwsiotserviceState {
     /// Every thing that exists, keyed by `thingName`.
     pub things: BTreeMap<String, RegisteredThing>,
+    /// Every thing group that exists, keyed by `thingGroupName`.
+    ///
+    /// The name is the group's identity — the model binds it as the `@httpLabel` of
+    /// `/thing-groups/{thingGroupName}` on every single-group operation — so a
+    /// `BTreeMap` keyed by name is the registry itself. `BTreeMap` (not `HashMap`)
+    /// because `ListThingGroups` is `@paginated` and a page boundary is only
+    /// meaningful over a stable order.
+    pub thing_groups: BTreeMap<String, RegisteredThingGroup>,
     /// The names of the thing types that exist.
     ///
     /// `CreateThing` answers `ResourceNotFoundException` for a `thingTypeName` that
@@ -218,6 +318,51 @@ impl ComAmazonawsIotAwsiotserviceState {
                 return candidate;
             }
         }
+    }
+
+    /// Mint a `thingGroupId` no thing group in the registry is using.
+    ///
+    /// `ThingGroupId` is modelled `length 1..128, pattern ^[a-zA-Z0-9\-]+$`
+    /// (`smithy_query(query="operation",operation="CreateThingGroup")`), which the
+    /// canonical hyphenated form of a version-4 UUID satisfies; the loop re-mints on
+    /// the (astronomically unlikely) collision, so two `CreateThingGroup` calls can
+    /// never be handed the same id.
+    pub fn mint_thing_group_id(&self) -> String {
+        loop {
+            let candidate = fresh_uuid();
+            if !self
+                .thing_groups
+                .values()
+                .any(|group| group.thing_group_id == candidate)
+            {
+                return candidate;
+            }
+        }
+    }
+
+    /// The chain of groups from the hierarchy ROOT down to `parent_group_name`, as
+    /// `(name, arn)` pairs — `ThingGroupMetadata$rootToParentThingGroups`.
+    ///
+    /// Walked from the parent upwards through each record's own
+    /// `parent_group_name` and then reversed, so the first entry is the root and the
+    /// last is the parent itself. The walk is bounded by the number of groups that
+    /// exist, so a record whose parent chain is somehow cyclic terminates instead of
+    /// spinning.
+    pub fn root_to_parent_thing_groups(&self, parent_group_name: &str) -> Vec<(String, String)> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(parent_group_name.to_string());
+        while let Some(name) = cursor {
+            let Some(group) = self.thing_groups.get(&name) else {
+                break;
+            };
+            chain.push((group.thing_group_name.clone(), group.thing_group_arn.clone()));
+            if chain.len() >= self.thing_groups.len() {
+                break;
+            }
+            cursor = group.configuration.parent_group_name.clone();
+        }
+        chain.reverse();
+        chain
     }
 
     /// The endpoint identifier recorded for `region`, if an endpoint has been created
@@ -274,6 +419,15 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// one, which [`::emulator_server::emulator_arn`] owns.
 pub fn thing_arn(region: &str, thing_name: &str) -> String {
     ::emulator_server::emulator_arn("iot", region, &format!("thing/{thing_name}"))
+}
+
+/// The ARN of a thing group: `arn:aws:iot:<region>:<account>:thinggroup/<thingGroupName>`.
+///
+/// `thinggroup` (one word, lowercase) is the resource type AWS IoT's thing-group
+/// ARNs use, beside `thing/` for a thing; the namespace and account segments are the
+/// same ones [`thing_arn`] documents.
+pub fn thing_group_arn(region: &str, thing_group_name: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("thinggroup/{thing_group_name}"))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
