@@ -20,7 +20,21 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# `serde::de::IgnoredAny` validates a JSON document without building a tree.
+serde = { workspace = true }
 tracing = { workspace = true }
+# Greengrass component recipes are YAML *or* JSON documents; YAML 1.2 is a
+# superset of JSON, so one YAML parser reads both and re-renders either.
+# yaml-rust2 is a pure-Rust YAML 1.2 implementation (no `unsafe`, no C
+# transpile), which keeps SR-MEM-001 true of the whole request path.
+yaml-rust2 = { version = "0.10", default-features = false }
+# Component versions are semantic versions, so `latestVersion` is the greatest
+# one by semver precedence rather than by byte order.
+semver = "1"
+# Deployment and IoT job identifiers are UUIDs.
+uuid = { version = "1", features = ["v4"] }
+# Opaque pagination cursors are hex-encoded resume keys.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

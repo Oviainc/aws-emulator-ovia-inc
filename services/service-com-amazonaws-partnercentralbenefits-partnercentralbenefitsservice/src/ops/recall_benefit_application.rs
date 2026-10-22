@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RecallBenefitApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RecallBenefitApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes one stored benefit application back from AWS: a SUBMITTED application that AWS
+//! has not finished with returns to draft (`PENDING_SUBMISSION`), the required `Reason`
+//! becomes its `StatusReason`, and its revision and `UpdatedAt` advance, so the partner
+//! can modify it and submit it again.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RecallBenefitApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A recall is refused with the modelled `ConflictException` from any status that is not
+//! in [`crate::state::RECALLABLE_STATUSES`]: `PENDING_SUBMISSION` was never submitted,
+//! and `CANCELED`, `APPROVED` and `REJECTED` are terminal.
+//!
+//! `ClientToken` is this request's idempotency token, so a retry carrying the token of
+//! the recall that is still in effect answers success and changes nothing rather than
+//! conflicting with its own first attempt.
 //!
 //! ## Shape of an operation
 //!
@@ -155,26 +158,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
+        let _ = ctx;
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`].
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(RecallBenefitApplicationErrorModeled::AccessDeniedException(denied).into());
         }
-        // Implement `RecallBenefitApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RecallBenefitApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RecallBenefitApplication"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RecallBenefitApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
+            return Err(
+                RecallBenefitApplicationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::APPLICATION_KIND,
+                            &input.identifier,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A retry of the recall already in effect: answer success and leave the record —
+        // its status, its `StatusReason`, its revision and its `UpdatedAt` — exactly as
+        // that recall left it. A request carrying no `ClientToken` is not a retry.
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| application.is_recall_retry(token))
+        {
+            return Ok(RecallBenefitApplicationOutput {});
+        }
+
+        if !application.is_recallable() {
+            return Err(RecallBenefitApplicationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "benefit application {} is {}, so it cannot be recalled",
+                        application.id, application.status
+                    ),
+                },
+            )
+            .into());
+        }
+
+        application.status = crate::state::STATUS_PENDING_SUBMISSION.to_string();
+        // `Reason` is required on this operation, so a recalled application always
+        // reports why it was recalled.
+        application.status_reason = Some(input.reason);
+        application.revise(now);
+        // Recorded AFTER the revision, which clears the previous recall's token: this
+        // recall's idempotency window opens here and closes at the next change to the
+        // record.
+        application.recall_client_token = input.client_token;
+
+        Ok(RecallBenefitApplicationOutput {})
     }
 }
