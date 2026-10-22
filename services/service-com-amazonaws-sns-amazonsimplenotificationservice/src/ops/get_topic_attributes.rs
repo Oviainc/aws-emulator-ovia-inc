@@ -73,95 +73,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::TopicRecord;
-use std::collections::HashMap;
-
-/// The topic attribute holding the access policy a caller set.
-const POLICY_ATTRIBUTE: &str = "Policy";
-
-/// The topic attribute holding the delivery policy a caller set.
-const DELIVERY_POLICY_ATTRIBUTE: &str = "DeliveryPolicy";
-
-/// The topic attribute holding the display name a caller set.
-const DISPLAY_NAME_ATTRIBUTE: &str = "DisplayName";
-
-/// The access policy of a topic whose owner has set none: the one SNS generates,
-/// which allows the topic's own account every topic action.
-fn default_policy(topic: &TopicRecord) -> String {
-    serde_json::json!({
-        "Version": "2008-10-17",
-        "Id": "__default_policy_ID",
-        "Statement": [{
-            "Sid": "__default_statement_ID",
-            "Effect": "Allow",
-            "Principal": { "AWS": "*" },
-            "Action": [
-                "SNS:GetTopicAttributes",
-                "SNS:SetTopicAttributes",
-                "SNS:AddPermission",
-                "SNS:RemovePermission",
-                "SNS:DeleteTopic",
-                "SNS:Subscribe",
-                "SNS:ListSubscriptionsByTopic",
-                "SNS:Publish"
-            ],
-            "Resource": topic.arn,
-            "Condition": {
-                "StringEquals": { "AWS:SourceOwner": topic.owner }
-            }
-        }]
-    })
-    .to_string()
-}
-
-/// SNS's own delivery policy for HTTP/S endpoints: a linear retry of 3 attempts
-/// 20 seconds apart. It is the "system defaults" an `EffectiveDeliveryPolicy` is
-/// taken over (`GetTopicAttributesResponse$Attributes` doc).
-fn system_delivery_policy() -> serde_json::Value {
-    serde_json::json!({
-        "http": {
-            "defaultHealthyRetryPolicy": {
-                "minDelayTarget": 20,
-                "maxDelayTarget": 20,
-                "numRetries": 3,
-                "numMaxDelayRetries": 0,
-                "numNoDelayRetries": 0,
-                "numMinDelayRetries": 0,
-                "backoffFunction": "linear"
-            },
-            "disableSubscriptionOverrides": false
-        }
-    })
-}
-
-/// Overlay `override_with` onto `base`, member by member: an object merges into an
-/// object, anything else replaces. This is what makes an `EffectiveDeliveryPolicy`
-/// the topic's own policy "taking system defaults into account" rather than either
-/// one alone.
-fn merge_json(base: &mut serde_json::Value, override_with: serde_json::Value) {
-    match (base, override_with) {
-        (serde_json::Value::Object(base), serde_json::Value::Object(override_with)) => {
-            for (key, value) in override_with {
-                merge_json(base.entry(key).or_insert(serde_json::Value::Null), value);
-            }
-        }
-        (base, override_with) => *base = override_with,
-    }
-}
-
-/// The effective delivery policy: the system defaults with the topic's own
-/// `DeliveryPolicy` laid over them.
-fn effective_delivery_policy(topic: &TopicRecord) -> String {
-    let mut effective = system_delivery_policy();
-    if let Some(configured) = topic
-        .attributes
-        .get(DELIVERY_POLICY_ATTRIBUTE)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-    {
-        merge_json(&mut effective, configured);
-    }
-    effective.to_string()
-}
+use crate::state::{self, TopicAttributeName};
+use std::collections::BTreeMap;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -259,43 +172,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(topic) = store.topics.get(&input.topic_arn) else {
             return Err(GetTopicAttributesErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::TOPIC_DOES_NOT_EXIST.to_string()),
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
                 },
             )
             .into());
         };
 
-        // Start from what the caller set, then add the attributes SNS itself computes.
-        let mut attributes: HashMap<String, String> = topic.attributes.clone();
+        // Every attribute SNS reports for a topic: the ones it computes — the owner,
+        // the ARN, the subscription counts, the effective delivery policy and the
+        // access policy — beside the ones its owner set. The map is keyed by
+        // `TopicAttributeName`, so the entries serialize in the order SNS reports them
+        // whatever order they are written here.
         let (confirmed, pending) = store.subscription_counts(&topic.arn);
-        attributes.insert("TopicArn".to_string(), topic.arn.clone());
-        attributes.insert("Owner".to_string(), topic.owner.clone());
+        let mut attributes: BTreeMap<TopicAttributeName, String> = BTreeMap::new();
         attributes.insert(
-            DISPLAY_NAME_ATTRIBUTE.to_string(),
+            state::POLICY_ATTRIBUTE.into(),
+            topic.policy_attribute(),
+        );
+        attributes.insert(state::OWNER_ATTRIBUTE.into(), topic.owner.clone());
+        attributes.insert(
+            state::SUBSCRIPTIONS_PENDING_ATTRIBUTE.into(),
+            pending.to_string(),
+        );
+        attributes.insert(state::TOPIC_ARN_ATTRIBUTE.into(), topic.arn.clone());
+        attributes.insert(
+            state::EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE.into(),
+            state::effective_delivery_policy(topic),
+        );
+        attributes.insert(
+            state::SUBSCRIPTIONS_CONFIRMED_ATTRIBUTE.into(),
+            confirmed.to_string(),
+        );
+        attributes.insert(
+            state::SUBSCRIPTIONS_DELETED_ATTRIBUTE.into(),
+            topic.subscriptions_deleted.to_string(),
+        );
+        // DisplayName is reported whether or not it is set: SNS answers with an empty
+        // value for a topic whose owner has set none.
+        attributes.insert(
+            state::DISPLAY_NAME_ATTRIBUTE.into(),
             topic
                 .attributes
-                .get(DISPLAY_NAME_ATTRIBUTE)
+                .get(state::DISPLAY_NAME_ATTRIBUTE)
                 .cloned()
                 .unwrap_or_default(),
         );
-        attributes.insert("SubscriptionsConfirmed".to_string(), confirmed.to_string());
-        attributes.insert("SubscriptionsPending".to_string(), pending.to_string());
-        attributes.insert(
-            "SubscriptionsDeleted".to_string(),
-            topic.subscriptions_deleted.to_string(),
-        );
-        attributes.insert(
-            POLICY_ATTRIBUTE.to_string(),
-            topic
-                .attributes
-                .get(POLICY_ATTRIBUTE)
-                .cloned()
-                .unwrap_or_else(|| default_policy(topic)),
-        );
-        attributes.insert(
-            "EffectiveDeliveryPolicy".to_string(),
-            effective_delivery_policy(topic),
-        );
+        // Every other attribute the topic holds — the KMS key id of an encrypted
+        // topic, a delivery policy, a FIFO topic's deduplication settings — reported
+        // because its owner set it, and only then.
+        for (name, value) in &topic.attributes {
+            let name = TopicAttributeName::from(name.clone());
+            attributes.entry(name).or_insert_with(|| value.clone());
+        }
 
         Ok(GetTopicAttributesOutput {
             attributes: Some(attributes),

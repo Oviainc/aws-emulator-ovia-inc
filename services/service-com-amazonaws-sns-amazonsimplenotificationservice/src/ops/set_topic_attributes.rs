@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetTopicAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetTopicAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetTopicAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +71,82 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
+
+/// The topic attributes `SetTopicAttributes` does NOT set, though they are attributes
+/// of a topic: a topic's kind is decided by `CreateTopic` and cannot be changed, so
+/// `FifoTopic` is refused here the way an undocumented name is.
+const CREATE_ONLY_ATTRIBUTES: &[&str] = &[state::FIFO_TOPIC_ATTRIBUTE];
+
+/// The tracing modes SNS defines: "By default TracingConfig is set to PassThrough …
+/// If set to Active" (`SetTopicAttributesInput$AttributeName` doc).
+const TRACING_CONFIG_VALUES: &[&str] = &["PassThrough", "Active"];
+
+/// The signature versions SNS defines: "The signature version corresponds to the
+/// hashing algorithm used while creating the signature … By default SignatureVersion
+/// is set to 1" (`SetTopicAttributesInput$AttributeName` doc); SNS publishes 1 (SHA1)
+/// and 2 (SHA256).
+const SIGNATURE_VERSION_VALUES: &[&str] = &["1", "2"];
+
+/// The bounds of a delivery-status sample rate: "the sample rate percentage (0-100)"
+/// (`SetTopicAttributesInput$AttributeName` doc).
+const MIN_SAMPLE_RATE: u64 = 0;
+const MAX_SAMPLE_RATE: u64 = 100;
+
+/// The suffix of every delivery-status sample-rate attribute
+/// (`HTTPSuccessFeedbackSampleRate`, `SQSSuccessFeedbackSampleRate`, …).
+const SAMPLE_RATE_SUFFIX: &str = "SampleRate";
+
+/// The reason the named attribute does not accept `value`, or `None` when it does.
+///
+/// The documented constraints of the attributes this emulator gives a meaning to
+/// (`SetTopicAttributesInput$AttributeName` doc): `Policy` is an access policy
+/// document, `DeliveryPolicy` a delivery policy document, `MaximumMessageSize` a byte
+/// count SNS bounds, `TracingConfig` and `SignatureVersion` closed value sets, and
+/// every `…SampleRate` a percentage. An attribute whose value SNS documents no
+/// constraint for (a role ARN, a display name, an encryption key id) is stored as the
+/// caller wrote it.
+fn invalid_value(name: &str, value: &str) -> Option<String> {
+    let one_of = |allowed: &[&str]| {
+        (!allowed.contains(&value)).then(|| format!("the value must be one of {allowed:?}"))
+    };
+    match name {
+        state::POLICY_ATTRIBUTE => serde_json::from_str::<state::TopicPolicyDocument>(value)
+            .err()
+            .map(|_| {
+                "the value must be an access policy document with a Statement list".to_string()
+            }),
+        state::DELIVERY_POLICY_ATTRIBUTE => {
+            // A delivery policy is a JSON DOCUMENT whose members the effective policy
+            // is computed from, so the value is refused unless THAT read can honour it:
+            // a bare scalar names no member, and a member of the wrong type would be
+            // stored only to be left out of the effective policy.
+            state::delivery_policy_refusal(value)
+        }
+        state::MAXIMUM_MESSAGE_SIZE_ATTRIBUTE => match value.parse::<u64>() {
+            Ok(size)
+                if (state::MIN_MAXIMUM_MESSAGE_SIZE..=state::MAX_MAXIMUM_MESSAGE_SIZE)
+                    .contains(&size) =>
+            {
+                None
+            }
+            _ => Some(format!(
+                "the value must be a byte count between {} and {}",
+                state::MIN_MAXIMUM_MESSAGE_SIZE,
+                state::MAX_MAXIMUM_MESSAGE_SIZE
+            )),
+        },
+        "TracingConfig" => one_of(TRACING_CONFIG_VALUES),
+        "SignatureVersion" => one_of(SIGNATURE_VERSION_VALUES),
+        name if name.ends_with(SAMPLE_RATE_SUFFIX) => match value.parse::<u64>() {
+            Ok(rate) if (MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate) => None,
+            _ => Some(format!(
+                "the value must be a percentage between {MIN_SAMPLE_RATE} and {MAX_SAMPLE_RATE}"
+            )),
+        },
+        _ => None,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -170,20 +237,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetTopicAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetTopicAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetTopicAttributes"))
+        let invalid_parameter = |message: String| -> Self::Error {
+            SetTopicAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // SNS defines a closed set of topic attribute names and refuses any other.
+        if !state::is_topic_attribute(&input.attribute_name)
+            || CREATE_ONLY_ATTRIBUTES.contains(&input.attribute_name.as_str())
+        {
+            return Err(invalid_parameter(format!(
+                "Invalid parameter: AttributeName Reason: {} is not a topic attribute this \
+                 operation sets",
+                input.attribute_name
+            )));
+        }
+        if let Some(value) = input.attribute_value.as_deref() {
+            if let Some(reason) = invalid_value(&input.attribute_name, value) {
+                return Err(invalid_parameter(format!(
+                    "Invalid parameter: AttributeValue Reason: {} - {reason}",
+                    input.attribute_name
+                )));
+            }
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(SetTopicAttributesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        let Some(topic) = store.topics.get_mut(&input.topic_arn) else {
+            return Err(SetTopicAttributesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+        if let Some(refusal) = state::attribute_write_refusal(
+            state::TOPIC_RECORD,
+            &topic.attributes,
+            &input.attribute_name,
+            input.attribute_value.as_deref(),
+        ) {
+            return Err(invalid_parameter(refusal));
+        }
+
+        // "The new value for the attribute" (`AttributeValue` doc) — and a request that
+        // carries none clears the attribute, so the topic reports what SNS reports for
+        // a topic that was never given one.
+        match input.attribute_value {
+            Some(value) => {
+                topic.attributes.insert(input.attribute_name, value);
+            }
+            None => {
+                topic.attributes.remove(&input.attribute_name);
+            }
+        }
+
+        Ok(SetTopicAttributesOutput)
     }
 }

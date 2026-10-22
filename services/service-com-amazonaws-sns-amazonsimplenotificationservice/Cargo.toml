@@ -20,6 +20,9 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# The policy and delivery-policy documents SNS answers with are serialized from typed
+# structs, so their members keep SNS's own order rather than being sorted by key.
+serde = { workspace = true }
 tracing = { workspace = true }
 # The content-based MessageDeduplicationId of a FIFO publish is a SHA-256 of the body,
 # and the message/subscription ids are formatted from a SHA-256 digest.
