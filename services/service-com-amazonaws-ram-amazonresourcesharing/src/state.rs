@@ -30,6 +30,16 @@ pub const ARN_SERVICE: &str = "ram";
 /// The resource portion a resource-share ARN carries before its id.
 pub const SHARE_ARN_RESOURCE_PREFIX: &str = "resource-share/";
 
+/// The ARN service field of AWS Organizations, the service whose ARNs name a part of
+/// an organization's hierarchy (`arn:aws:organizations::<account>:organization/o-…`,
+/// `…:ou/o-…/ou-…`, `…:root/o-…/r-…`, `…:account/o-…/<id>`).
+pub const ORGANIZATIONS_ARN_SERVICE: &str = "organizations";
+
+/// The id prefixes AWS Organizations gives the parts of its hierarchy, which a RAM
+/// principal may name without an ARN: an organization (`o-`), an organizational unit
+/// (`ou-`) and a root (`r-`). Longest prefix first, so `ou-` is never read as `o-`.
+pub const ORGANIZATIONS_ID_PREFIXES: [&str; 3] = ["ou-", "o-", "r-"];
+
 /// The region used when a request carries no SigV4 credential scope to read one
 /// from; the emulator's documented default region.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -894,6 +904,14 @@ pub fn arn_account(value: &str) -> Option<&str> {
     value.split(':').nth(4)
 }
 
+/// The service field of an ARN, or `None` when `value` is not one.
+pub fn arn_service(value: &str) -> Option<&str> {
+    if !is_arn(value) {
+        return None;
+    }
+    value.split(':').nth(2)
+}
+
 /// Whether `value` is an ARN of THIS service's resource-share resource.
 pub fn is_share_arn(value: &str) -> bool {
     if !is_arn(value) {
@@ -915,13 +933,51 @@ pub fn share_arn(region: &str, id: &str) -> String {
     )
 }
 
-/// Whether an associated entity belongs to an account other than `owner`.
+/// Whether `entity` names a part of an AWS Organizations hierarchy: an organization,
+/// a root, an organizational unit, or an account inside one — either by an ARN of the
+/// `organizations` service ([`ORGANIZATIONS_ARN_SERVICE`]) or by the bare id
+/// Organizations gives it ([`ORGANIZATIONS_ID_PREFIXES`]).
 ///
-/// `ResourceShareAssociation$external` reports whether the entity sits outside the
-/// account that owns the share, so an entity that names that account — a bare
-/// account id equal to it, or an ARN whose account field is it — is internal and
-/// everything else is external.
+/// `ResourceShareAssociation$associatedEntity` admits these forms for a principal
+/// ("For a principal association, this is one of the following: … an organization in
+/// Organizations … an organizational unit (OU) in Organizations"), and RAM admits only
+/// the CALLER'S OWN organization, root or OU there, so an entity of this form belongs
+/// to the owner's organization by construction.
+pub fn entity_is_organization_scoped(entity: &str) -> bool {
+    if let Some(service) = arn_service(entity) {
+        return service == ORGANIZATIONS_ARN_SERVICE;
+    }
+    ORGANIZATIONS_ID_PREFIXES.iter().any(|prefix| {
+        entity.strip_prefix(prefix).is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+    })
+}
+
+/// Whether an associated entity lies OUTSIDE the organization of the account that owns
+/// the share.
+///
+/// `ResourceShareAssociation$external` "indicates whether the principal belongs to the
+/// same organization in Organizations as the Amazon Web Services account that owns the
+/// resource share" (that member's own documentation), so the flag is the negation of
+/// in-organization membership, derived from the entity and the share's owner:
+///
+/// * an entity that names the owning account ITSELF — a bare account id equal to it, or
+///   an ARN whose account field is it — is that account, hence in its organization;
+/// * an entity that names a part of an Organizations hierarchy
+///   ([`entity_is_organization_scoped`]) is inside the owner's organization whatever
+///   account the ARN carries, because RAM admits only the owner's own organization
+///   there — so the management account the ARN names does not make it external;
+/// * every other entity — another account, a principal in one, a service principal —
+///   is one this service cannot place inside the owner's organization, and an
+///   association it cannot place there is reported as external.
 pub fn entity_is_external(owner: &str, entity: &str) -> bool {
+    if entity_is_organization_scoped(entity) {
+        return false;
+    }
     match arn_account(entity) {
         Some(account) => account != owner,
         None => entity != owner,

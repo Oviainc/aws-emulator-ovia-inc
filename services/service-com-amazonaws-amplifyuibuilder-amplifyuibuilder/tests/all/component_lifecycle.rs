@@ -93,9 +93,18 @@ impl Answer {
         self.body["id"].as_str().unwrap_or_default().to_string()
     }
 
-    /// The wire error code (`__type`), or the empty string on a success.
+    /// The error-type discriminator the body carries — `__type`, or the `code` / `Code`
+    /// spellings the same JSON error parsers also accept — or the empty string when it
+    /// carries none.
+    ///
+    /// Every refusal of one of this service's own modelled exceptions must carry NONE of
+    /// them: AmplifyUIBuilder names no exception on the wire, so a client classifies a
+    /// failure by HTTP status.
     fn error_code(&self) -> &str {
-        self.body["__type"].as_str().unwrap_or_default()
+        ["__type", "code", "Code"]
+            .iter()
+            .find_map(|member| self.body[*member].as_str())
+            .unwrap_or_default()
     }
 }
 
@@ -462,10 +471,14 @@ async fn a_repeated_create_with_one_client_token_returns_one_component() {
 
     let router = emulator();
     let mut distinct = Vec::new();
-    for (case, token, attempts) in &cases {
+    for (index, (case, token, attempts)) in cases.iter().enumerate() {
         let mut ids = Vec::new();
         for attempt in 0..*attempts {
-            let answer = create_with_token(&router, minimal_create("Idempotent"), token).await;
+            // A name per row: a component name is unique within its app environment, so
+            // two rows sharing one would be refused as a conflict (see
+            // `component_refusals.rs`) rather than exercising the token rule.
+            let data = minimal_create(&format!("Idempotent{index}"));
+            let answer = create_with_token(&router, data, token).await;
             assert_eq!(
                 answer.status, 200,
                 "case {case:?}: attempt {attempt} expected HTTP 200, got {} with {:?}",
@@ -482,7 +495,7 @@ async fn a_repeated_create_with_one_client_token_returns_one_component() {
 
     // Two creates with no token at all are two components.
     let first = create(&router, minimal_create("Untokened")).await.id();
-    let second = create(&router, minimal_create("Untokened")).await.id();
+    let second = create(&router, minimal_create("UntokenedAgain")).await.id();
     assert_ne!(
         first, second,
         "a create carrying no clientToken must mint a new component every time"
@@ -709,8 +722,8 @@ async fn list_components_pages_over_one_stable_order() {
         );
         assert_eq!(
             refused.error_code(),
-            "InvalidParameterException",
-            "case nextToken={token:?}: expected the modelled InvalidParameterException, got {:?}",
+            "",
+            "case nextToken={token:?}: a refusal must name no error type, got {:?}",
             refused.body
         );
     }
@@ -858,8 +871,13 @@ async fn update_component_merges_only_the_members_the_request_carries() {
     ];
 
     let router = emulator();
-    for (case, patch, pointer, expected) in cases {
-        let created = create(&router, baseline.clone()).await;
+    for (index, (case, patch, pointer, expected)) in cases.into_iter().enumerate() {
+        // A name per row: a component name identifies a component within its app
+        // environment, so each row's baseline takes its own name rather than being
+        // refused as a conflict (the rule `component_refusals.rs` pins).
+        let mut data = baseline.clone();
+        data["name"] = json!(format!("Baseline{index}"));
+        let created = create(&router, data).await;
         let id = created.id();
         let before = get(&router, &id).await.body;
 
@@ -922,7 +940,9 @@ async fn update_component_merges_only_the_members_the_request_carries() {
 
     // A payload naming the component it addresses is accepted and merged, since
     // `UpdateComponentData$id` names the component being updated.
-    let id = create(&router, baseline.clone()).await.id();
+    let mut data = baseline.clone();
+    data["name"] = json!("BaselineEchoed");
+    let id = create(&router, data).await.id();
     let echoed = update(&router, &id, json!({"id": id, "name": "EchoedId"})).await;
     assert_eq!(
         echoed.status, 200,
@@ -938,7 +958,9 @@ async fn update_component_merges_only_the_members_the_request_carries() {
 
     // A payload naming a different component than the URI is contradictory, so it is
     // refused rather than applied either way.
-    let id = create(&router, baseline.clone()).await.id();
+    let mut data = baseline.clone();
+    data["name"] = json!("Baseline");
+    let id = create(&router, data).await.id();
     let refused = update(
         &router,
         &id,
@@ -952,8 +974,8 @@ async fn update_component_merges_only_the_members_the_request_carries() {
     );
     assert_eq!(
         refused.error_code(),
-        "InvalidParameterException",
-        "expected the modelled InvalidParameterException, got {:?}",
+        "",
+        "a refusal must name no error type, got {:?}",
         refused.body
     );
     assert_eq!(
@@ -963,85 +985,43 @@ async fn update_component_merges_only_the_members_the_request_carries() {
     );
 }
 
-/// An id that names no stored component is reported as missing, not as an empty success:
-/// `GetComponent` and `DeleteComponent` answer the modelled `ResourceNotFoundException`
-/// (HTTP 404), and `UpdateComponent`, which declares no such error, answers the modelled
-/// `InvalidParameterException` (HTTP 400).
+/// An id that names no stored component anywhere is reported as missing, not as an empty
+/// success: `GetComponent`, `DeleteComponent` and `UpdateComponent` all answer HTTP 404,
+/// naming no error type. (An id that resolves under ANOTHER app environment is a different
+/// failure, pinned in `component_refusals.rs`.)
 #[tokio::test]
 async fn an_id_naming_no_component_is_reported_as_missing() {
     let router = emulator();
     let id = create(&router, minimal_create("Doomed")).await.id();
 
-    // Rows differ in how the id fails to name a stored component.
     let never_created = "11111111-1111-4111-8111-111111111111";
-    let cases: Vec<(&str, String, String, String)> = vec![
+    for (case, answer) in [
+        ("GetComponent", get(&router, never_created).await),
         (
-            "an id that was never created",
-            APP_ID.to_string(),
-            ENVIRONMENT.to_string(),
-            never_created.to_string(),
+            "UpdateComponent",
+            update(&router, never_created, json!({"name": "Nothing"})).await,
         ),
-        (
-            "a stored id under another environment",
-            APP_ID.to_string(),
-            "production".to_string(),
-            id.clone(),
-        ),
-        (
-            "a stored id under another app",
-            "d9999zzzz".to_string(),
-            ENVIRONMENT.to_string(),
-            id.clone(),
-        ),
-    ];
-
-    for (case, app_id, environment, missing) in &cases {
-        let read = get_in(&router, app_id, environment, missing).await;
+        ("DeleteComponent", delete(&router, never_created).await),
+    ] {
         assert_eq!(
-            read.status, 404,
-            "case {case:?}: GetComponent must answer HTTP 404, got {} with {:?}",
-            read.status, read.body
+            answer.status, 404,
+            "case {case:?}: an id that was never created must answer HTTP 404, got {} with \
+             {:?}",
+            answer.status, answer.body
         );
         assert_eq!(
-            read.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected the modelled ResourceNotFoundException, got {:?}",
-            read.body
+            answer.error_code(),
+            "",
+            "case {case:?}: a refusal must name no error type, got {:?}",
+            answer.body
         );
     }
 
-    // The component is still there: a failed lookup changed nothing.
+    // Nothing was created or removed as a side effect: a failed lookup changed nothing.
     assert_eq!(
         listed_ids(&list(&router, "").await),
         vec![id.clone()],
-        "a 404 lookup must not touch the store"
-    );
-
-    let refused = update(&router, never_created, json!({"name": "Nothing"})).await;
-    assert_eq!(
-        refused.status, 400,
-        "UpdateComponent declares no ResourceNotFoundException, so an unknown id is an \
-         invalid parameter: got {} with {:?}",
-        refused.status, refused.body
-    );
-    assert_eq!(
-        refused.error_code(),
-        "InvalidParameterException",
-        "expected the modelled InvalidParameterException, got {:?}",
-        refused.body
-    );
-
-    let missing_delete = delete(&router, never_created).await;
-    assert_eq!(
-        missing_delete.status, 404,
-        "deleting an id that names no component must answer HTTP 404, got {} with {:?}",
-        missing_delete.status, missing_delete.body
-    );
-    assert_eq!(
-        missing_delete.error_code(),
-        "ResourceNotFoundException",
-        "expected the modelled ResourceNotFoundException, got {:?}",
-        missing_delete.body
+        "a refused lookup must not touch the store"
     );
 
     // A delete removes the record: the answer carries no members, and every later read of
@@ -1106,8 +1086,8 @@ async fn a_reserved_property_name_is_refused() {
         );
         assert_eq!(
             refused.error_code(),
-            "InvalidParameterException",
-            "case {member:?}: expected the modelled InvalidParameterException, got {:?}",
+            "",
+            "case {member:?}: a refusal must name no error type, got {:?}",
             refused.body
         );
     }
@@ -1129,8 +1109,8 @@ async fn a_reserved_property_name_is_refused() {
         );
         assert_eq!(
             refused.error_code(),
-            "InvalidParameterException",
-            "case {member:?}: expected the modelled InvalidParameterException, got {:?}",
+            "",
+            "case {member:?}: a refusal must name no error type, got {:?}",
             refused.body
         );
     }

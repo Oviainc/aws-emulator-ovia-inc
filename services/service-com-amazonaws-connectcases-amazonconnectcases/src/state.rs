@@ -35,7 +35,7 @@
 //! store.
 
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -44,7 +44,7 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    BasicLayout, EventBridgeConfiguration, FieldAttributes, FieldValueUnion,
+    BasicLayout, EventBridgeConfiguration, FieldAttributes, FieldOption, FieldValueUnion,
     InternalServerException, LayoutConfiguration, LayoutContent, LayoutSections, RequiredField,
     ResourceNotFoundException, Section, ServiceQuotaExceededException, TagPropagationConfiguration,
     UserUnion, ValidationException,
@@ -65,6 +65,12 @@ pub const DOMAIN_STATUS_ACTIVE: &str = "Active";
 /// `TemplateStatus` a template takes when `CreateTemplate` is given no `status`.
 /// One of `TEMPLATE_STATUS_VALUES` (`Active | Inactive`).
 pub const TEMPLATE_STATUS_ACTIVE: &str = "Active";
+
+/// The one `FieldType` that has field options: the model documents
+/// `BatchPutFieldOptions` as creating and updating "a set of field options for a
+/// single select field", so options belong to a field of this type and to no
+/// other. One of `FIELD_TYPE_VALUES`.
+pub const FIELD_TYPE_SINGLE_SELECT: &str = "SingleSelect";
 
 /// `FieldNamespace` of a field a customer created through `CreateField`; the
 /// service's own built-in fields are the other value, `System`.
@@ -128,6 +134,25 @@ pub const MAX_CASE_FIELD_IDS: usize = 220;
 /// the same reason as [`MAX_CASE_FIELD_IDS`].
 pub const MAX_BATCH_FIELD_IDS: usize = 50;
 
+/// Most field options one `BatchPutFieldOptions` request may carry: the model's
+/// `BatchPutFieldOptionsRequest$options` cap of `..50`, re-checked in the
+/// handler for the same reason as [`MAX_CASE_FIELD_IDS`]. It also bounds the
+/// response's `errors` list, whose own cap is the same `..50`.
+pub const MAX_BATCH_FIELD_OPTIONS: usize = 50;
+
+/// Most field options one single-select field holds. Emulator-owned ceiling on
+/// request-driven growth, as [`MAX_DOMAINS`]: the real service's limit is an
+/// account quota, while this one exists so a caller cannot grow one field's
+/// option set without end. Putting a NEW option past it is refused with the
+/// modelled quota error; updating one the field already holds is not growth and
+/// is always accepted.
+pub const MAX_FIELD_OPTIONS_PER_FIELD: usize = 500;
+
+/// Most values one `ListFieldOptions` request may filter on: the model's
+/// `ListFieldOptionsRequest$values` cap of `..1`, re-checked in the handler for
+/// the same reason as [`MAX_CASE_FIELD_IDS`].
+pub const MAX_LIST_FIELD_OPTION_VALUES: usize = 1;
+
 /// Most required fields one template may declare: the model's
 /// `CreateTemplateRequest$requiredFields` cap of `..100`, re-checked in the
 /// handler for the same reason as [`MAX_CASE_FIELD_IDS`].
@@ -171,6 +196,14 @@ pub struct Field {
     pub namespace: String,
     pub description: Option<String>,
     pub attributes: Option<FieldAttributes>,
+    /// The field's options, keyed by `FieldOption$value` — the value identifies
+    /// the option within its field, which is why `BatchPutFieldOptions` is an
+    /// upsert on it. Ordered by value (a `BTreeMap`), so `ListFieldOptions`
+    /// answers in one stable order and a page cursor naming the last value of a
+    /// page resumes correctly even when options are added between pages.
+    /// Bounded by [`MAX_FIELD_OPTIONS_PER_FIELD`]. Only a
+    /// [`FIELD_TYPE_SINGLE_SELECT`] field can carry any.
+    pub options: BTreeMap<String, FieldOption>,
     pub deleted: bool,
     /// Reserved for the tagging slice: `CreateField` takes no tags and
     /// `TagResource`/`UntagResource` are still 501s, so nothing can populate
@@ -343,6 +376,24 @@ impl Domain {
             .ok_or_else(|| not_found("Template", template_id))
     }
 
+    /// The live field `field_id` names, or the modelled 404 for it. A field that
+    /// has been deleted is gone as far as a reader is concerned, exactly as
+    /// [`Self::template`] treats a deleted template.
+    pub fn field(&self, field_id: &str) -> Result<&Field, ResourceNotFoundException> {
+        self.fields
+            .get(field_id)
+            .filter(|field| !field.deleted)
+            .ok_or_else(|| not_found("Field", field_id))
+    }
+
+    /// The live field `field_id` names, for writing, or the modelled 404 for it.
+    pub fn field_mut(&mut self, field_id: &str) -> Result<&mut Field, ResourceNotFoundException> {
+        self.fields
+            .get_mut(field_id)
+            .filter(|field| !field.deleted)
+            .ok_or_else(|| not_found("Field", field_id))
+    }
+
     /// Every template this domain still holds, in creation order and each
     /// paired with the key [`order_key`] builds for it, with the deleted ones
     /// left out: what a listing of templates reports before the request's own
@@ -451,6 +502,50 @@ impl Domain {
         mismatched
     }
 }
+
+/// Field options: the set a single-select field offers.
+impl Field {
+    /// Refuse `adding` new options once the field would hold more than
+    /// [`MAX_FIELD_OPTIONS_PER_FIELD`]. `adding` counts only values the field
+    /// does not hold yet, since putting a value it already holds updates that
+    /// option rather than growing the set.
+    pub fn option_capacity(&self, adding: usize) -> Result<(), ServiceQuotaExceededException> {
+        if self.options.len() + adding <= MAX_FIELD_OPTIONS_PER_FIELD {
+            Ok(())
+        } else {
+            Err(ServiceQuotaExceededException {
+                message: format!(
+                    "the emulator holds at most {MAX_FIELD_OPTIONS_PER_FIELD} field options per \
+                     field; this field already holds {} and the request adds {adding} more",
+                    self.options.len()
+                ),
+            })
+        }
+    }
+}
+
+/// Whether `value` is a well-formed `FieldOptionValue`.
+///
+/// The model's own `pattern` on `FieldOptionValue` only forbids a trailing
+/// space, but its documentation states the rule the service enforces:
+/// "`FieldOptionValue` has max length 100 and must be alphanumeric with hyphens
+/// and underscores"
+/// (`smithy_query(query="shape", shape="FieldOption")`, member `value`). A value
+/// outside that character set therefore passes the boundary validator and has to
+/// be refused here — per option, through `BatchPutFieldOptions`'s own `errors`
+/// list, which exists for exactly that. The length bound is the model's and is
+/// restated so this one function answers "is this a value the service accepts".
+pub fn field_option_value_is_well_formed(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_FIELD_OPTION_TEXT_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Longest `FieldOptionName` / `FieldOptionValue` the model accepts: both are
+/// `length 1..100` (`smithy_query(query="shape", shape="FieldOptionValue")`).
+pub const MAX_FIELD_OPTION_TEXT_LEN: usize = 100;
 
 /// `Ok` while `held` is below `limit`, else the modelled quota error naming
 /// what filled up.
