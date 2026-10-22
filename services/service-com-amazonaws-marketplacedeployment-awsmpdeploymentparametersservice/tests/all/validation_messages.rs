@@ -22,9 +22,7 @@ use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice
     TAG_CHARACTER_CLASS, TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
 };
 
-use crate::deployment_parameters::{
-    emulator, error_code, provision, put, tag, SECRET_MAX_LEN,
-};
+use crate::deployment_parameters::{emulator, error_code, message, provision, put, tag};
 
 /// `Catalog`'s `@pattern`, unanchored. Model value: `^[a-zA-Z_-]+$`
 /// (`smithy_query(query="shape",shape="Catalog")`).
@@ -38,15 +36,6 @@ const PARAMETER_NAME_PATTERN: &str = "[a-zA-Z0-9/_+=.@-]+";
 /// `ClientToken`'s `@pattern`, unanchored. Model value:
 /// `^[a-zA-Z0-9/_+=.:@-]+$`.
 const CLIENT_TOKEN_PATTERN: &str = "[a-zA-Z0-9/_+=.:@-]+";
-
-/// The `message` of an error body.
-fn message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or("<no message>")
-        .to_string()
-}
 
 #[tokio::test]
 async fn a_pattern_violation_quotes_the_pattern_without_the_models_anchors() {
@@ -213,32 +202,34 @@ async fn a_bound_violation_states_the_bound_and_a_sensitive_value_is_not_echoed(
     }
 
     // `SecretString` is the model's only `@sensitive` shape: a violation on it
-    // names the member and the constraint and echoes NOTHING of the value.
-    let secret = format!("{}{}", "topsecret-", "x".repeat(SECRET_MAX_LEN));
+    // names the member and the constraint and echoes NOTHING of the value. The
+    // bound tested here is its MINIMUM (`length 1..15000`): a value past the
+    // MAXIMUM never reaches this refusal at all — the front door answers it with
+    // HTTP 403 `ForbiddenException`, which the `front_door_forbidden` suite pins.
     let (status, answer) = put(
         &router,
         "AWSMarketplace",
         "prod-held",
         &json!({
             "agreementId": "agmt-held",
-            "deploymentParameter": { "name": "N", "secretString": secret },
+            "deploymentParameter": { "name": "N", "secretString": "" },
         }),
     )
     .await;
     assert_eq!(
         status, 400,
-        "a secret past its maximum must be 400, got {status} {answer:?}"
+        "a secret short of its minimum must be 400, got {status} {answer:?}"
     );
     let reported = message(&answer);
     assert_eq!(
         reported,
         "1 validation error detected: Value at 'deploymentParameter.secretString' failed to \
-         satisfy constraint: Member must have length less than or equal to 15000",
+         satisfy constraint: Member must have length greater than or equal to 1",
         "a @sensitive member must be refused without its value, got {reported:?}"
     );
     assert!(
-        !reported.contains("topsecret-"),
-        "a rejected secret must not be echoed, got {reported:?}"
+        !reported.contains('^') && !reported.contains('$'),
+        "a reported bound carries no anchors, got {reported:?}"
     );
 }
 
