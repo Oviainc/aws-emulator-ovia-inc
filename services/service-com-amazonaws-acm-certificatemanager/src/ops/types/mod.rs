@@ -28,6 +28,7 @@ pub mod describe_acme_endpoint_types;
 pub mod describe_acme_external_account_binding_types;
 pub mod describe_certificate_types;
 pub mod export_certificate_types;
+pub mod get_account_configuration_types;
 pub mod get_acme_external_account_binding_credentials_types;
 pub mod get_certificate_types;
 pub mod import_certificate_types;
@@ -83,6 +84,8 @@ pub use describe_acme_external_account_binding_types::*;
 pub use describe_certificate_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use export_certificate_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_account_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_acme_external_account_binding_credentials_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

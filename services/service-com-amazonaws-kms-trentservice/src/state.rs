@@ -7,7 +7,11 @@
 //! key state. The records and the helpers more than one operation needs live here;
 //! each operation builds its own modelled output in its own `src/ops/<op>.rs`.
 //!
-//! ## Key material and the ciphertext envelope
+//! ## Key specs, key material and the ciphertext envelope
+//!
+//! A key's `KeySpec` decides what it can do and what it is made of, and
+//! [`KeySpecProfile`] is that table: the `KeyUsage` values the spec accepts, the
+//! algorithms it supports under each, and the kind of key material it holds.
 //!
 //! A `SYMMETRIC_DEFAULT` KMS key is "a 256-bit AES-GCM key"
 //! (`smithy_query(query="doc",shape="KeySpec")`), so that is exactly what a key
@@ -30,7 +34,9 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{KeyMetadata, MultiRegionConfiguration, MultiRegionKey};
+use crate::ops::types::{
+    KeyMetadata, MultiRegionConfiguration, MultiRegionKey, CUSTOMER_MASTER_KEY_SPEC_VALUES,
+};
 
 /// `KeyState` values, from `smithy_query(shape="KeyState")`.
 pub const KEY_STATE_ENABLED: &str = "Enabled";
@@ -38,12 +44,30 @@ pub const KEY_STATE_ENABLED: &str = "Enabled";
 pub const KEY_STATE_DISABLED: &str = "Disabled";
 /// See [`KEY_STATE_ENABLED`].
 pub const KEY_STATE_PENDING_DELETION: &str = "PendingDeletion";
+/// The state of a key created with no key material, which waits for
+/// `ImportKeyMaterial` to supply it. See [`KEY_STATE_ENABLED`].
+pub const KEY_STATE_PENDING_IMPORT: &str = "PendingImport";
 
 /// The `KeyUsageType` a cryptographic encrypt/decrypt key carries, from
 /// `smithy_query(shape="KeyUsageType")`. "For encrypting, decrypting,
 /// re-encrypting, and generating data keys, the KeyUsage must be ENCRYPT_DECRYPT"
 /// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
 pub const KEY_USAGE_ENCRYPT_DECRYPT: &str = "ENCRYPT_DECRYPT";
+
+/// The `KeyUsageType` of an asymmetric signing key: "For asymmetric KMS keys with
+/// RSA key pairs, specify `ENCRYPT_DECRYPT` or `SIGN_VERIFY`"
+/// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")`).
+pub const KEY_USAGE_SIGN_VERIFY: &str = "SIGN_VERIFY";
+
+/// The `KeyUsageType` of an HMAC key: "For HMAC KMS keys (symmetric), specify
+/// `GENERATE_VERIFY_MAC`"
+/// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")`).
+pub const KEY_USAGE_GENERATE_VERIFY_MAC: &str = "GENERATE_VERIFY_MAC";
+
+/// The `KeyUsageType` of a key-agreement key: "For asymmetric KMS keys with
+/// NIST-standard elliptic curve key pairs, specify `SIGN_VERIFY` or `KEY_AGREEMENT`"
+/// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")`).
+pub const KEY_USAGE_KEY_AGREEMENT: &str = "KEY_AGREEMENT";
 
 /// The default `KeySpec`: "The default value, SYMMETRIC_DEFAULT, creates a KMS key
 /// with a 256-bit AES-GCM key"
@@ -54,6 +78,11 @@ pub const KEY_SPEC_SYMMETRIC_DEFAULT: &str = "SYMMETRIC_DEFAULT";
 /// the key material"
 /// (`smithy_query(query="doc",shape="CreateKeyRequest",member="Origin")`).
 pub const ORIGIN_AWS_KMS: &str = "AWS_KMS";
+
+/// The `OriginType` of a key created with no key material: "To create a KMS key with
+/// no key material (for imported key material), set this value to EXTERNAL"
+/// (`smithy_query(query="doc",shape="CreateKeyRequest",member="Origin")`).
+pub const ORIGIN_EXTERNAL: &str = "EXTERNAL";
 
 /// The `KeyManagerType` of a key the customer created, as opposed to an
 /// AWS managed key, from `smithy_query(shape="KeyManagerType")`.
@@ -375,14 +404,16 @@ pub struct Cmk {
     /// The waiting period `ScheduleKeyDeletion` was given.
     pub pending_window_in_days: Option<i32>,
     pub tags: BTreeMap<String, String>,
-    /// The 256-bit AES-GCM key behind this KMS key. Never serialized into a
-    /// response: the material of a symmetric key "never leaves KMS unencrypted"
+    /// The key material behind this KMS key, in the form its [`Self::key_spec`]
+    /// calls for. Never serialized into a response: the material of a symmetric key
+    /// "never leaves KMS unencrypted"
     /// (`smithy_query(query="doc",shape="CreateKey")`).
-    pub material: [u8; MATERIAL_LEN],
+    pub material: KeyMaterial,
     /// `KeyMaterialId`: 64 lowercase hex characters
     /// (`smithy_query(shape="BackingKeyIdType")`), derived from the material so it
-    /// is stable for as long as the material is.
-    pub current_key_material_id: String,
+    /// is stable for as long as the material is. `None` for a key whose material
+    /// KMS gives no id — see [`KeyMaterial::id`].
+    pub current_key_material_id: Option<String>,
 }
 
 impl std::fmt::Debug for Cmk {
@@ -414,8 +445,12 @@ impl std::fmt::Debug for Cmk {
 }
 
 impl Cmk {
-    /// Mint a key in `region` from `material`, in the `Enabled` state a key with
-    /// KMS-generated material starts in.
+    /// Mint a key in `region` from `material`.
+    ///
+    /// A key KMS generated material for starts `Enabled`; a key created with no key
+    /// material waits in `PendingImport` until `ImportKeyMaterial` supplies it, and
+    /// is not enabled, since "without its key material, the KMS key is unusable"
+    /// (`smithy_query(query="doc",shape="ImportKeyMaterialRequest",member="ValidTo")`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         key_id: String,
@@ -427,17 +462,22 @@ impl Cmk {
         multi_region: bool,
         policy: String,
         tags: BTreeMap<String, String>,
-        material: [u8; MATERIAL_LEN],
+        material: KeyMaterial,
     ) -> Self {
         let arn = ::engine::emulator_arn(ARN_SERVICE, &region, &format!("key/{key_id}"));
+        let awaiting_import = matches!(material, KeyMaterial::AwaitingImport);
         Self {
             key_id,
             arn,
             aws_account_id: ::engine::emulator_account_id().to_string(),
             region,
             creation_date: SystemTime::now(),
-            enabled: true,
-            key_state: KEY_STATE_ENABLED.to_string(),
+            enabled: !awaiting_import,
+            key_state: if awaiting_import {
+                KEY_STATE_PENDING_IMPORT.to_string()
+            } else {
+                KEY_STATE_ENABLED.to_string()
+            },
             description,
             key_usage,
             key_spec,
@@ -448,7 +488,7 @@ impl Cmk {
             deletion_date: None,
             pending_window_in_days: None,
             tags,
-            current_key_material_id: material_id(&material),
+            current_key_material_id: material.id(),
             material,
         }
     }
@@ -474,16 +514,23 @@ impl Cmk {
             cloud_hsm_cluster_id: None,
             expiration_model: None,
             key_manager: Some(self.key_manager.clone()),
-            // "The KeySpec and CustomerMasterKeySpec parameters work the same way.
-            // Only the names differ."
-            // (`smithy_query(query="doc",shape="CreateKeyRequest",member="CustomerMasterKeySpec")`)
-            customer_master_key_spec: Some(self.key_spec.clone()),
+            // "The KeySpec and CustomerMasterKeySpec fields have the same value"
+            // (`smithy_query(shape="KeyMetadata")` -> `CustomerMasterKeySpec`) — for
+            // every spec the DEPRECATED enum can express. `CustomerMasterKeySpec`
+            // was frozen before the newer specs were added
+            // (`smithy_query(shape="CustomerMasterKeySpec")` lists its values), so a
+            // key whose spec it cannot name reports the spec through `KeySpec` only
+            // rather than putting an unmodelled value on the wire.
+            customer_master_key_spec: CUSTOMER_MASTER_KEY_SPEC_VALUES
+                .contains(&self.key_spec.as_str())
+                .then(|| self.key_spec.clone()),
             key_spec: Some(self.key_spec.clone()),
-            encryption_algorithms: (self.key_usage == KEY_USAGE_ENCRYPT_DECRYPT).then(|| {
-                vec![ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string()]
-            }),
-            signing_algorithms: None,
-            key_agreement_algorithms: None,
+            // Each of these four lists "is present only when the KeyUsage of the
+            // KMS key is" the matching one (`smithy_query(shape="KeyMetadata")`),
+            // and which algorithms it names follows from the key's spec.
+            encryption_algorithms: self.algorithms_under(KEY_USAGE_ENCRYPT_DECRYPT),
+            signing_algorithms: self.algorithms_under(KEY_USAGE_SIGN_VERIFY),
+            key_agreement_algorithms: self.algorithms_under(KEY_USAGE_KEY_AGREEMENT),
             multi_region: Some(self.multi_region),
             multi_region_configuration: self.multi_region.then(|| MultiRegionConfiguration {
                 multi_region_key_type: Some(MULTI_REGION_KEY_TYPE_PRIMARY.to_string()),
@@ -496,39 +543,398 @@ impl Cmk {
                 replica_keys: Some(Vec::new()),
             }),
             pending_deletion_window_in_days: None,
-            mac_algorithms: None,
+            mac_algorithms: self.algorithms_under(KEY_USAGE_GENERATE_VERIFY_MAC),
             xks_key_configuration: None,
-            current_key_material_id: Some(self.current_key_material_id.clone()),
+            current_key_material_id: self.current_key_material_id.clone(),
         }
+    }
+
+    /// The algorithms this key supports under `key_usage`, or `None` when that is
+    /// not the usage the key was created with — which is what makes `KeyMetadata`
+    /// carry exactly one of the four per-usage algorithm lists.
+    fn algorithms_under(&self, key_usage: &str) -> Option<Vec<String>> {
+        if self.key_usage != key_usage {
+            return None;
+        }
+        let algorithms = key_spec_profile(&self.key_spec)?.algorithms_under(key_usage)?;
+        Some(algorithms.iter().map(|name| (*name).to_string()).collect())
     }
 
     /// Whether this key can be used in a cryptographic operation right now.
     pub fn is_usable(&self) -> bool {
         self.enabled && self.key_state == KEY_STATE_ENABLED
     }
+
+    /// Whether this key's key state is one of the two `EnableKey` and `DisableKey`
+    /// move between. A key awaiting deletion or awaiting imported key material is in
+    /// neither, so those operations refuse it rather than dropping the state it is
+    /// actually in.
+    pub fn is_enableable(&self) -> bool {
+        self.key_state == KEY_STATE_ENABLED || self.key_state == KEY_STATE_DISABLED
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Key specs: what a key of each spec can do, and the material behind it
+// ---------------------------------------------------------------------------
 
 /// The length of a `SYMMETRIC_DEFAULT` key's material: a 256-bit AES-GCM key.
 pub const MATERIAL_LEN: usize = 32;
 
-/// `KeyMaterialId` for `material`: the 64 lowercase hex characters
-/// `BackingKeyIdType` requires, derived from the material itself so two keys never
-/// share one and a read never changes it.
-fn material_id(material: &[u8; MATERIAL_LEN]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"kms-key-material-id\0");
-    hasher.update(material);
-    hex::encode(hasher.finalize())
+/// What one `KeySpec` is: which `KeyUsage` values a key of that spec may carry,
+/// which algorithms it supports under each of them, and what its key material is.
+///
+/// "The `KeySpec` determines whether the KMS key contains a symmetric key or an
+/// asymmetric key pair. It also determines the algorithms that the KMS key supports"
+/// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeySpec")`), so this
+/// one table is what `CreateKey` validates against and what `KeyMetadata` projects
+/// its algorithm lists from. A usage is valid for a spec exactly when the spec has
+/// algorithms under it, which is the matrix
+/// `smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")` states
+/// ("For HMAC KMS keys (symmetric), specify `GENERATE_VERIFY_MAC`", "For asymmetric
+/// KMS keys with RSA key pairs, specify `ENCRYPT_DECRYPT` or `SIGN_VERIFY`", and so
+/// on). The algorithm names are the `EncryptionAlgorithmSpec`,
+/// `SigningAlgorithmSpec`, `MacAlgorithmSpec` and `KeyAgreementAlgorithmSpec` enum
+/// values (`crate::ops::types` renders each as a `*_VALUES` list); which of them
+/// each spec supports is the "Key spec reference" the `KeySpec` doc links.
+#[derive(Debug, Clone, Copy)]
+pub struct KeySpecProfile {
+    /// The `KeySpec` this profile describes.
+    pub key_spec: &'static str,
+    /// `EncryptionAlgorithms`, for a key of this spec whose usage is
+    /// `ENCRYPT_DECRYPT`. Empty when the spec cannot encrypt.
+    pub encryption_algorithms: &'static [&'static str],
+    /// `SigningAlgorithms`, for usage `SIGN_VERIFY`.
+    pub signing_algorithms: &'static [&'static str],
+    /// `MacAlgorithms`, for usage `GENERATE_VERIFY_MAC`.
+    pub mac_algorithms: &'static [&'static str],
+    /// `KeyAgreementAlgorithms`, for usage `KEY_AGREEMENT`.
+    pub key_agreement_algorithms: &'static [&'static str],
+    /// The key material a key of this spec is minted with.
+    pub material: MaterialKind,
 }
 
-/// 256 bits of key material from the OS CSPRNG.
+impl KeySpecProfile {
+    /// The algorithms a key of this spec supports under `key_usage`, or `None` when
+    /// the spec does not support that usage at all.
+    pub fn algorithms_under(&self, key_usage: &str) -> Option<&'static [&'static str]> {
+        let algorithms = match key_usage {
+            KEY_USAGE_ENCRYPT_DECRYPT => self.encryption_algorithms,
+            KEY_USAGE_SIGN_VERIFY => self.signing_algorithms,
+            KEY_USAGE_GENERATE_VERIFY_MAC => self.mac_algorithms,
+            KEY_USAGE_KEY_AGREEMENT => self.key_agreement_algorithms,
+            _ => &[],
+        };
+        (!algorithms.is_empty()).then_some(algorithms)
+    }
+
+    /// Whether a key of this spec may carry `key_usage`.
+    pub fn supports(&self, key_usage: &str) -> bool {
+        self.algorithms_under(key_usage).is_some()
+    }
+
+    /// Every `KeyUsage` this spec accepts, in the order
+    /// `smithy_query(shape="KeyUsageType")` lists them — what a refusal names so the
+    /// caller can pick one.
+    pub fn supported_usages(&self) -> Vec<&'static str> {
+        [
+            KEY_USAGE_SIGN_VERIFY,
+            KEY_USAGE_ENCRYPT_DECRYPT,
+            KEY_USAGE_GENERATE_VERIFY_MAC,
+            KEY_USAGE_KEY_AGREEMENT,
+        ]
+        .into_iter()
+        .filter(|usage| self.supports(usage))
+        .collect()
+    }
+}
+
+/// What kind of key material a key of a given spec holds.
+#[derive(Debug, Clone, Copy)]
+pub enum MaterialKind {
+    /// A 256-bit AES-GCM key, which is what `SYMMETRIC_DEFAULT` names: "a 256-bit
+    /// AES-GCM key that is used for encryption and decryption"
+    /// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeySpec")`).
+    Aes256,
+    /// An HMAC key of this many bytes: an `HMAC_<bits>` spec names the length of its
+    /// key in bits, so `HMAC_256` is 32 bytes.
+    Hmac(usize),
+    /// An asymmetric key pair. This slice does not generate asymmetric key material
+    /// (see [`KeyMaterial::KeyPairNotGenerated`]).
+    KeyPair,
+}
+
+/// The key material behind one KMS key.
+pub enum KeyMaterial {
+    /// The 256-bit AES-GCM key of a symmetric encryption KMS key, from the OS
+    /// CSPRNG. `Encrypt` and `Decrypt` seal and open under exactly these bytes.
+    Aes256([u8; MATERIAL_LEN]),
+    /// The key of an HMAC KMS key: as many bytes from the OS CSPRNG as the spec's
+    /// name gives bits.
+    Hmac(Vec<u8>),
+    /// A key pair this emulator has not generated.
+    ///
+    /// The KMS key itself is real: it is persisted, reported by `DescribeKey` and
+    /// `ListKeys`, and moves through its key states like any other. What is absent
+    /// is the private key, so every operation that would USE it — `Sign`, `Verify`,
+    /// `GetPublicKey`, `DeriveSharedSecret`, and `Encrypt`/`Decrypt` for an
+    /// asymmetric spec — answers the scaffold's 501 rather than a fabricated
+    /// signature, public key or ciphertext.
+    KeyPairNotGenerated,
+    /// No key material, because the caller asked for a key with none: "To create a
+    /// KMS key with no key material (for imported key material), set this value to
+    /// EXTERNAL"
+    /// (`smithy_query(query="doc",shape="CreateKeyRequest",member="Origin")`). Such
+    /// a key waits in `PendingImport` until `ImportKeyMaterial` supplies material.
+    AwaitingImport,
+}
+
+impl KeyMaterial {
+    /// The `CurrentKeyMaterialId` of this material, which "is present for symmetric
+    /// encryption keys with `AWS_KMS` or `EXTERNAL` origin"
+    /// (`smithy_query(shape="KeyMetadata")` -> `CurrentKeyMaterialId`) and is
+    /// therefore absent for every other kind of material.
+    ///
+    /// It is the 64 lowercase hex characters `BackingKeyIdType` requires, derived
+    /// from the material itself so two keys never share one and a read never
+    /// changes it.
+    fn id(&self) -> Option<String> {
+        let Self::Aes256(material) = self else {
+            return None;
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"kms-key-material-id\0");
+        hasher.update(material);
+        Some(hex::encode(hasher.finalize()))
+    }
+
+    /// The AES-256-GCM key behind a symmetric encryption KMS key, or `None` for
+    /// material of any other kind.
+    pub fn aes256(&self) -> Option<&[u8; MATERIAL_LEN]> {
+        match self {
+            Self::Aes256(material) => Some(material),
+            Self::Hmac(_) | Self::KeyPairNotGenerated | Self::AwaitingImport => None,
+        }
+    }
+}
+
+/// The key material a key of `kind` is minted with.
+///
+/// The kinds that HAVE material draw it from the OS CSPRNG; `MaterialKind::KeyPair`
+/// mints none, because this emulator does not generate asymmetric key pairs, and
+/// says so in the material it returns rather than inventing bytes that are not a key
+/// pair.
 ///
 /// `None` means the platform refused to produce entropy; the caller answers a
 /// modelled server error rather than minting a key with predictable material.
-pub fn fresh_material() -> Option<[u8; MATERIAL_LEN]> {
-    let mut material = [0u8; MATERIAL_LEN];
-    SystemRandom::new().fill(&mut material).ok()?;
-    Some(material)
+pub fn mint_material(kind: MaterialKind) -> Option<KeyMaterial> {
+    match kind {
+        MaterialKind::Aes256 => {
+            let mut material = [0u8; MATERIAL_LEN];
+            SystemRandom::new().fill(&mut material).ok()?;
+            Some(KeyMaterial::Aes256(material))
+        }
+        MaterialKind::Hmac(len) => {
+            let mut material = vec![0u8; len];
+            SystemRandom::new().fill(&mut material).ok()?;
+            Some(KeyMaterial::Hmac(material))
+        }
+        MaterialKind::KeyPair => Some(KeyMaterial::KeyPairNotGenerated),
+    }
+}
+
+/// The `SigningAlgorithmSpec` values an RSA key pair supports: RSASSA-PSS and
+/// RSASSA-PKCS1-v1_5 over each SHA-2 digest. "When signing with RSA key pairs,
+/// RSASSA-PSS algorithms are preferred. We include RSASSA-PKCS1-v1_5 algorithms for
+/// compatibility with existing applications"
+/// (`smithy_query(query="doc",shape="SignRequest",member="SigningAlgorithm")`).
+///
+/// Every list in this table is in ascending order of the algorithm name, which is
+/// the order KMS reports these lists in and the order the model's own rendered enum
+/// values carry (`crate::ops::types::SIGNING_ALGORITHM_SPEC_VALUES`).
+const RSA_SIGNING_ALGORITHMS: &[&str] = &[
+    "RSASSA_PKCS1_V1_5_SHA_256",
+    "RSASSA_PKCS1_V1_5_SHA_384",
+    "RSASSA_PKCS1_V1_5_SHA_512",
+    "RSASSA_PSS_SHA_256",
+    "RSASSA_PSS_SHA_384",
+    "RSASSA_PSS_SHA_512",
+];
+
+/// The `EncryptionAlgorithmSpec` values an RSA key pair supports.
+const RSA_ENCRYPTION_ALGORITHMS: &[&str] = &["RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"];
+
+/// The only `KeyAgreementAlgorithmSpec` (`smithy_query(shape="KeyAgreementAlgorithmSpec")`),
+/// which every spec that can derive a shared secret supports.
+const ECDH: &[&str] = &["ECDH"];
+
+/// No algorithms: the spec does not support that usage.
+const NONE: &[&str] = &[];
+
+/// Every `KeySpec` `smithy_query(shape="KeySpec")` declares, with what each one can
+/// do. A spec missing from this table is one this service cannot mint.
+const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
+    // Symmetric encryption key (default).
+    KeySpecProfile {
+        key_spec: KEY_SPEC_SYMMETRIC_DEFAULT,
+        encryption_algorithms: &[ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT],
+        signing_algorithms: NONE,
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::Aes256,
+    },
+    // HMAC keys (symmetric): each spec supports the one MAC algorithm over the
+    // digest its name gives.
+    KeySpecProfile {
+        key_spec: "HMAC_224",
+        encryption_algorithms: NONE,
+        signing_algorithms: NONE,
+        mac_algorithms: &["HMAC_SHA_224"],
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::Hmac(28),
+    },
+    KeySpecProfile {
+        key_spec: "HMAC_256",
+        encryption_algorithms: NONE,
+        signing_algorithms: NONE,
+        mac_algorithms: &["HMAC_SHA_256"],
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::Hmac(32),
+    },
+    KeySpecProfile {
+        key_spec: "HMAC_384",
+        encryption_algorithms: NONE,
+        signing_algorithms: NONE,
+        mac_algorithms: &["HMAC_SHA_384"],
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::Hmac(48),
+    },
+    KeySpecProfile {
+        key_spec: "HMAC_512",
+        encryption_algorithms: NONE,
+        signing_algorithms: NONE,
+        mac_algorithms: &["HMAC_SHA_512"],
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::Hmac(64),
+    },
+    // Asymmetric RSA key pairs (encryption and decryption -or- signing and
+    // verification).
+    KeySpecProfile {
+        key_spec: "RSA_2048",
+        encryption_algorithms: RSA_ENCRYPTION_ALGORITHMS,
+        signing_algorithms: RSA_SIGNING_ALGORITHMS,
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    KeySpecProfile {
+        key_spec: "RSA_3072",
+        encryption_algorithms: RSA_ENCRYPTION_ALGORITHMS,
+        signing_algorithms: RSA_SIGNING_ALGORITHMS,
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    KeySpecProfile {
+        key_spec: "RSA_4096",
+        encryption_algorithms: RSA_ENCRYPTION_ALGORITHMS,
+        signing_algorithms: RSA_SIGNING_ALGORITHMS,
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    // Asymmetric NIST-standard elliptic curve key pairs (signing and verification
+    // -or- deriving shared secrets): the ECDSA algorithm pairs with the curve's
+    // digest size.
+    KeySpecProfile {
+        key_spec: "ECC_NIST_P256",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ECDSA_SHA_256"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: ECDH,
+        material: MaterialKind::KeyPair,
+    },
+    KeySpecProfile {
+        key_spec: "ECC_NIST_P384",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ECDSA_SHA_384"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: ECDH,
+        material: MaterialKind::KeyPair,
+    },
+    KeySpecProfile {
+        key_spec: "ECC_NIST_P521",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ECDSA_SHA_512"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: ECDH,
+        material: MaterialKind::KeyPair,
+    },
+    // "ECC_NIST_EDWARDS25519 (ed25519) - signing and verification only", with both
+    // Ed25519 signing algorithms the model declares
+    // (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeySpec")`).
+    KeySpecProfile {
+        key_spec: "ECC_NIST_EDWARDS25519",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ED25519_PH_SHA_512", "ED25519_SHA_512"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    // Other asymmetric elliptic curve key pairs (signing and verification).
+    KeySpecProfile {
+        key_spec: "ECC_SECG_P256K1",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ECDSA_SHA_256"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    // Asymmetric ML-DSA key pairs (signing and verification), which share the one
+    // ML-DSA signing algorithm the model declares.
+    KeySpecProfile {
+        key_spec: "ML_DSA_44",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ML_DSA_SHAKE_256"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    KeySpecProfile {
+        key_spec: "ML_DSA_65",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ML_DSA_SHAKE_256"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    KeySpecProfile {
+        key_spec: "ML_DSA_87",
+        encryption_algorithms: NONE,
+        signing_algorithms: &["ML_DSA_SHAKE_256"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        material: MaterialKind::KeyPair,
+    },
+    // "SM2 key pairs (encryption and decryption -or- signing and verification -or-
+    // deriving shared secrets)".
+    KeySpecProfile {
+        key_spec: "SM2",
+        encryption_algorithms: &["SM2PKE"],
+        signing_algorithms: &["SM2DSA"],
+        mac_algorithms: NONE,
+        key_agreement_algorithms: ECDH,
+        material: MaterialKind::KeyPair,
+    },
+];
+
+/// The profile of `key_spec`, or `None` when it is not a `KeySpec` this service
+/// knows — which is what makes an unknown spec a refusal rather than a key nothing
+/// can use.
+pub fn key_spec_profile(key_spec: &str) -> Option<&'static KeySpecProfile> {
+    KEY_SPEC_PROFILES
+        .iter()
+        .find(|profile| profile.key_spec == key_spec)
 }
 
 /// A freshly minted key id.
@@ -619,9 +1025,10 @@ pub struct Envelope {
     body: Vec<u8>,
 }
 
-/// This key's material as an AES-256-GCM key.
+/// This key's material as an AES-256-GCM key, or `None` when the key is not a
+/// symmetric encryption key and has no AES material to seal or open with.
 fn cipher(key: &Cmk) -> Option<LessSafeKey> {
-    UnboundKey::new(&AES_256_GCM, &key.material)
+    UnboundKey::new(&AES_256_GCM, key.material.aes256()?)
         .ok()
         .map(LessSafeKey::new)
 }

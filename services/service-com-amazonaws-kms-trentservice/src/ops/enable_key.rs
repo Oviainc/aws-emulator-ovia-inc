@@ -200,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // A key pending deletion must have its deletion cancelled before it can be
-        // enabled again.
-        if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
+        // Only a key that is enabled or disabled can be enabled: a key pending
+        // deletion must have its deletion cancelled first, and a key awaiting
+        // imported key material has no material to enable.
+        if !key.is_enableable() {
             return Err(EnableKeyErrorModeled::KMSInvalidStateException(
                 KMSInvalidStateException {
                     message: Some(crate::state::invalid_state_message(key)),

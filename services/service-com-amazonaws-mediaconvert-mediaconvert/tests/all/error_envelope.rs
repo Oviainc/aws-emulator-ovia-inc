@@ -12,14 +12,14 @@
 //! operation and every modelled exception, not just for the 404s a client happens to read
 //! first.
 //!
-//! The rows span what the rule generalises over: the operation (nine of them, read, write
+//! The rows span what the rule generalises over: the operation (eleven of them, read, write
 //! and delete), the error code (`NotFoundException`, `ForbiddenException`,
 //! `ConflictException`, `BadRequestException`), the HTTP status (404, 403, 409, 400), the
-//! resource plane (jobs, queues, job templates, presets) and the layer that produced the
-//! failure (a handler's own refusal, and a framework refusal raised while the operation was
-//! being served). Each case drives the real restJson1 wire path through the router — the
-//! harness is the one `job_lifecycle` builds — so what is asserted is the bytes a client
-//! would see.
+//! resource plane (jobs, queues, job templates, presets, jobs queries) and the layer that
+//! produced the failure (a handler's own refusal, and a framework refusal raised while the
+//! operation was being served). Each case drives the real restJson1 wire path through the
+//! router — the harness is the one `job_lifecycle` builds — so what is asserted is the
+//! bytes a client would see.
 
 use serde_json::{json, Value};
 
@@ -178,6 +178,30 @@ async fn seeded() -> (Emulator, Vec<Case>) {
             operation: "GetPreset",
             status: 404,
             error_type: "NotFoundException",
+        },
+        Case {
+            // The jobs-query plane: reading the results of a jobs query id that is not
+            // present, which is the recorded call
+            // `issues/.../mediaconvert-getjobsqueryresults-404-omits-the-error-envelope-members.md`
+            // was filed about.
+            label: "GetJobsQueryResults on an id the store does not hold",
+            method: "GET",
+            uri: "/2017-08-29/jobsQueries/1700000000000-nosuch".to_string(),
+            body: None,
+            operation: "GetJobsQueryResults",
+            status: 404,
+            error_type: "NotFoundException",
+        },
+        Case {
+            // The same plane's write: `nextToken` is this service's own opaque cursor, so
+            // a token it never issued is a problem in the request.
+            label: "StartJobsQuery with a nextToken this service never issued",
+            method: "POST",
+            uri: "/2017-08-29/jobsQueries".to_string(),
+            body: Some(json!({ "nextToken": "not-a-token-this-service-issued" })),
+            operation: "StartJobsQuery",
+            status: 400,
+            error_type: "BadRequestException",
         },
         Case {
             label: "CancelJob on an id the store does not hold",
@@ -380,11 +404,26 @@ async fn a_successful_response_carries_no_envelope_members() {
         .await;
     let read = emulator.get_queue("envelope-success").await;
     let listed = emulator.list_job_templates("listBy=SYSTEM").await;
+    // The jobs-query plane's own success, so the operation this suite's 404 row is about
+    // is covered on both sides: a query that WAS started reads back as a 200 with no
+    // envelope member on it.
+    let started = emulator
+        .send("POST", "/2017-08-29/jobsQueries", Some(json!({})))
+        .await;
+    let results = emulator
+        .send(
+            "GET",
+            &format!("/2017-08-29/jobsQueries/{}", started.string("/id")),
+            None,
+        )
+        .await;
 
     for (label, reply, status) in [
         ("CreateQueue", &created, 201),
         ("GetQueue", &read, 200),
         ("ListJobTemplates", &listed, 200),
+        ("StartJobsQuery", &started, 201),
+        ("GetJobsQueryResults", &results, 200),
     ] {
         assert_eq!(
             reply.status, status,

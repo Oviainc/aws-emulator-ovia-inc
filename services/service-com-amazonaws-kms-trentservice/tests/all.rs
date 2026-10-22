@@ -13,7 +13,11 @@
 // points it into `tests/all/`.
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/key_lifecycle.rs"]
 mod key_lifecycle;
+#[path = "all/key_specs.rs"]
+mod key_specs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

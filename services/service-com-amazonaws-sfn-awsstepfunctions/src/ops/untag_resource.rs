@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tags a `tagKeys` list names from a Step Functions state machine or
+//! activity, keyed by tag key, and answers an empty 200.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +92,15 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// The modelled failure for a taggable ARN the store holds no resource under.
+fn not_found(resource_arn: &str) -> UntagResourceError {
+    UntagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
+        message: Some(crate::state::resource_not_found_message(resource_arn)),
+        resource_name: Some(resource_arn.to_string()),
+    })
+    .into()
+}
+
 /// The `UntagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -134,18 +137,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN rule the other two tagging calls read: `resourceArn` is "the ARN
+        // for the Step Functions state machine or activity", and an ARN of another
+        // service, another Step Functions resource type or another region is an ARN
+        // this operation cannot use, which `InvalidArn` reports before any resource
+        // resolution.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let target = match crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region) {
+            Ok(target) => target,
+            Err(message) => {
+                return Err(UntagResourceErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into())
+            }
+        };
+
+        let mut store = state.lock();
+        // This write must see the store a report sees: a state machine whose removal
+        // the clock already made due is gone, and is not untagged back into life.
+        store.settle(crate::state::now());
+
+        // Only a state machine can be in the store: `CreateActivity` is still
+        // scaffolded, so no activity exists for an activity ARN to name, and the
+        // honest answer for one is that the resource could not be found.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // `tagKeys` is "the list of tags to remove from the resource": a key the
+        // resource does not carry is nothing to remove rather than a failure, so a
+        // request naming only keys it does not hold is an empty 200 that changes
+        // nothing. The modelled errors are about the ARN and the resource, not about
+        // the keys.
+        match target {
+            crate::state::TaggableResource::Activity(_) => Err(not_found(&input.resource_arn)),
+            crate::state::TaggableResource::StateMachine(_) => {
+                if store.remove_state_machine_tags(&input.resource_arn, &input.tag_keys) {
+                    Ok(UntagResourceOutput {})
+                } else {
+                    Err(not_found(&input.resource_arn))
+                }
+            }
+        }
     }
 }

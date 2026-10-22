@@ -160,11 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
-            return Err(ListChangeSetsErrorModeled::ValidationException(
-                crate::state::wrong_catalog(&input.catalog),
-            )
-            .into());
+        // `Catalog` is judged here, not at the boundary (`skip_validation` on
+        // `ListChangeSetsInput`): a value that is not a catalog NAME is refused
+        // for its syntax, and a well-formed name other than the fixed value
+        // every operation's `Catalog` documents names nothing this service has.
+        if let Err(fault) = crate::state::check_catalog(&input.catalog) {
+            return Err(ListChangeSetsErrorModeled::ValidationException(fault).into());
         }
 
         // Each filter has to name one of the attributes this list filters on,
@@ -250,7 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::DEFAULT_SORT_ORDER.to_string());
 
         // The token is the offset the next page resumes at; one this service
-        // never issued names no page.
+        // never issued names no page, and neither does one outside the modelled
+        // `NextToken` syntax (`skip_validation` on `ListChangeSetsInput`), so
+        // both are the one page-token fault.
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
@@ -258,10 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(offset) => offset,
                     None => {
                         return Err(ListChangeSetsErrorModeled::ValidationException(
-                            crate::state::validation(
-                                "NextToken",
-                                format!("{token:?} is not a token returned by ListChangeSets"),
-                            ),
+                            crate::state::invalid_page_token(),
                         )
                         .into())
                     }
@@ -269,19 +269,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `MaxResults` is modelled `@range(min: 1, max: 20)`, so the boundary
-        // validator already refused anything outside it; an absent value serves
-        // the largest page the model allows.
-        let requested = input
-            .max_results
-            .unwrap_or(crate::state::LIST_CHANGE_SETS_PAGE_LIMIT);
-        debug_assert!(
-            (1..=crate::state::LIST_CHANGE_SETS_PAGE_LIMIT).contains(&requested),
-            "MaxResults {requested} should have been refused at the boundary"
-        );
-        let page_size =
-            usize::try_from(requested.clamp(1, crate::state::LIST_CHANGE_SETS_PAGE_LIMIT))
-                .expect("a page size clamped into 1..=20 fits in usize");
+        // `MaxResults` is modelled `@range(min: 1, max: 20)`. The range is
+        // CHECKED here rather than assumed: a page size outside it is refused
+        // with the modelled `ValidationException`, so no request can reach the
+        // paging arithmetic with a size the model does not allow — and an
+        // absent value serves the largest page the model allows.
+        let page_size = match input.max_results {
+            None => crate::state::LIST_CHANGE_SETS_PAGE_LIMIT,
+            Some(requested)
+                if (1..=crate::state::LIST_CHANGE_SETS_PAGE_LIMIT).contains(&requested) =>
+            {
+                requested
+            }
+            Some(requested) => {
+                return Err(ListChangeSetsErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "MaxResults",
+                        format!(
+                            "ListChangeSets serves between 1 and {} change sets a page, \
+                             not {requested}",
+                            crate::state::LIST_CHANGE_SETS_PAGE_LIMIT
+                        ),
+                    ),
+                )
+                .into())
+            }
+        };
+        let page_size = usize::try_from(page_size).expect("a page size in 1..=20 fits in usize");
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

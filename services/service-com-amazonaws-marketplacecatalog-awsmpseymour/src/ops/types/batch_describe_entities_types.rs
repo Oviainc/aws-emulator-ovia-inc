@@ -17,7 +17,14 @@ pub struct BatchDescribeEntitiesInput {
     pub entity_request_list: Vec<EntityRequest>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#EntityRequest")]
+// `skip_validation` names `Catalog` (see `CancelChangeSetInput`) and `EntityId`: a batch
+// read reports a malformed entry PER ENTRY in `Errors`, so an `EntityId` outside the
+// published form must reach the handler rather than failing the whole call at the
+// boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#EntityRequest",
+    skip_validation = ["Catalog", "EntityId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct EntityRequest {
     pub catalog: String,

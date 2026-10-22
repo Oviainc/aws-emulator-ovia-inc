@@ -435,7 +435,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Only a `Recipient` request has a ciphertext for one, and those are
             // refused above.
             ciphertext_for_recipient: None,
-            key_material_id: Some(key.current_key_material_id.clone()),
+            // "The identifier of the key material used to decrypt the ciphertext.
+            // This field is present only when the operation uses a symmetric
+            // encryption KMS key" (`smithy_query(shape="DecryptResponse")`), which is
+            // exactly the material that carries an id.
+            key_material_id: key.current_key_material_id.clone(),
         })
     }
 }
