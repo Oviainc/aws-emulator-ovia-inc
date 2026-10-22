@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: evaluates the request's `FilterStatement` against the stored
+//! certificate records — a tree of `And`/`Or`/`Not` over leaf filters, each comparing
+//! one X.509 attribute or one piece of ACM metadata OF THE RECORD — orders the
+//! certificates it keeps by the requested `SortBy`/`SortOrder`, and answers at most
+//! `MaxResults` of them as `CertificateSearchResult` values with a `NextToken` that
+//! resumes where the page stopped IN THAT ORDER.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting, not mutating: the only write it makes is
+//! [`crate::state::ComAmazonawsAcmCertificatemanagerState::materialize_due`], which
+//! applies the validation outcomes the clock already owed at this instant — so a
+//! `Status` filter selects on the statuses the certificates are actually in, and this
+//! operation and `DescribeCertificate` cannot disagree about one certificate.
+//!
+//! A request it cannot satisfy as written is refused with the modelled 400
+//! `ValidationException` rather than answered with an empty page: a `TimestampRange`
+//! that bounds nothing or can contain no instant, a filter value outside the value set
+//! its member's enum declares, a statement nested deeper or wider than the bounds this
+//! service enforces, and a `NextToken` this service did not issue or issued for
+//! another order (see [`validate_statement`] and [`decode_next_token`]).
+//!
+//! The modelled `AccessDeniedException` is unreachable here, deliberately: the
+//! emulator verifies the request signature at its boundary and evaluates no IAM
+//! policy, so no caller is refused for want of a permission. That is a documented gap,
+//! not an authorization decision this operation makes.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +181,664 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchCertificates"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(validation_exception("the acm certificate store is unavailable"));
+        };
+
+        // Refused before the store is touched: a filter statement that cannot select
+        // anything is a bad request, not an empty result.
+        if let Some(statement) = input.filter_statement.as_ref() {
+            validate_statement(statement)?;
+        }
+
+        // The order this response is built in, which is also the order its `NextToken`
+        // resumes against — decided once, so a page boundary cannot be cut in one
+        // order and resumed in another.
+        let order = ResultOrder {
+            sort_by: input.sort_by.clone(),
+            descending: input.sort_order == crate::state::SORT_ORDER_DESCENDING,
+        };
+        let resume_after = input
+            .next_token
+            .as_deref()
+            .map(|token| decode_next_token(token, &order))
+            .transpose()?;
+
+        let mut store = state.lock();
+        // The metadata this call filters, sorts and reports is the metadata the clock
+        // has already made due, so a `Status` filter and a `DescribeCertificate` of
+        // the same certificate cannot disagree.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // Every stored certificate the filter statement keeps. A request that names no
+        // statement selects every one of them: unlike `ListCertificates`, this
+        // operation documents no default filtering.
+        let mut matching: Vec<&crate::state::Certificate> = store
+            .certificates
+            .values()
+            .filter(|cert| {
+                input
+                    .filter_statement
+                    .as_ref()
+                    .is_none_or(|statement| statement_matches(statement, cert))
+            })
+            .collect();
+        // Sorted on the requested field, with the ARN as the tie-break so equal
+        // values — and every certificate when the field is one no record carries —
+        // order the same way on every call.
+        matching.sort_by_cached_key(|cert| (order.sort_value(cert), cert.arn.clone()));
+        if order.descending {
+            matching.reverse();
+        }
+
+        // `NextToken` names where the previous page stopped, so this one starts at the
+        // first certificate that sorts strictly after it IN THIS ORDER — whether or
+        // not that certificate is still stored. A caller paging while certificates are
+        // deleted therefore keeps the tail instead of losing it.
+        let start = match resume_after.as_ref() {
+            None => 0,
+            Some(cursor) => matching
+                .iter()
+                .position(|cert| order.is_after(cursor, cert))
+                .unwrap_or(matching.len()),
+        };
+        let page = &matching[start.min(matching.len())..];
+
+        // The caller's `MaxResults`, bounded by the range the model declares for it
+        // (`SearchMaxResults`, `range 1..500`) so one response can never serialise the
+        // whole store however large it has grown. The member carries the model's
+        // `@default` of 100 when the request omits it, and the boundary validator has
+        // already refused a value outside that range — the clamp is the safety net
+        // behind that refusal, never the handling of it.
+        let limit = usize::try_from(input.max_results)
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, MAX_RESULTS_CEILING);
+        let emitted = page.len().min(limit);
+
+        let results: Vec<CertificateSearchResult> = page[..emitted]
+            .iter()
+            .copied()
+            .map(crate::state::certificate_search_result)
+            .collect();
+        // A token is issued only when this page stopped short of the matches, and it
+        // names the last certificate the page emitted.
+        let next_token = if emitted < page.len() {
+            page[..emitted]
+                .last()
+                .map(|cert| order.encode_next_token(cert))
+        } else {
+            None
+        };
+
+        Ok(SearchCertificatesOutput {
+            results: Some(results),
+            next_token,
+        })
     }
+}
+
+/// The most results one `SearchCertificates` response carries: the maximum the model
+/// allows for `MaxResults` (`SearchMaxResults`, `range 1..500`).
+const MAX_RESULTS_CEILING: usize = 500;
+
+/// The page size a request that names no `MaxResults` gets: the model's `@default`
+/// for that member, which the deserializer materialises — and the size the handler
+/// falls back to for a value that is not a page size at all, so an unreadable
+/// `MaxResults` fails closed rather than open.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// `ComparisonOperator=CONTAINS`: the filter's value must occur inside the
+/// certificate's own value. The only other operator the model declares is `EQUALS`
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#ComparisonOperator")`).
+const COMPARISON_CONTAINS: &str = "CONTAINS";
+
+/// A 400 `ValidationException` — this operation's modelled refusal for a request the
+/// model's own constraints cannot express ("The supplied input failed to satisfy
+/// constraints of an Amazon Web Services service").
+fn validation_exception(message: impl Into<String>) -> SearchCertificatesError {
+    SearchCertificatesErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The member path of the X.509 leaf filters, as a refusal names them.
+const X509_PATH: &str = "FilterStatement.Filter.X509AttributeFilter";
+
+/// The member path of the ACM-metadata leaf filters, as a refusal names them.
+const METADATA_PATH: &str = "FilterStatement.Filter.AcmCertificateMetadataFilter";
+
+/// The deepest nesting of `And`/`Or`/`Not` one `FilterStatement` may carry, counting
+/// the leaf filter as a level.
+///
+/// A CHOSEN bound, not a documented one: the model caps an `And`/`Or` list at 15
+/// elements but says nothing about depth, and a statement tree is walked recursively
+/// — once to validate it and once per stored certificate to evaluate it — so an
+/// unbounded tree from one request would decide how deep this process recurses and how
+/// much work every certificate costs. It is enforced BEFORE any certificate is
+/// matched, so the evaluation walk is bounded by the same number, and it is far above
+/// any statement a caller writes.
+const MAX_STATEMENT_DEPTH: usize = 20;
+
+/// The most filter nodes one `FilterStatement` may hold, bounding the work each
+/// stored certificate costs — a CHOSEN bound for the same reason as
+/// [`MAX_STATEMENT_DEPTH`], and more than the model's 15-element lists hold at three
+/// levels of nesting.
+const MAX_STATEMENT_NODES: usize = 10_000;
+
+/// Refuse a filter statement no certificate could be compared against.
+///
+/// Walks the whole statement, since a tree is refused for any leaf it carries. Three
+/// rules are enforced here:
+///
+/// * The tree is bounded: at most [`MAX_STATEMENT_DEPTH`] levels of nesting and
+///   [`MAX_STATEMENT_NODES`] nodes, so the depth of this walk — and of the evaluation
+///   walk that runs once per stored certificate after it — is decided by the service
+///   rather than by the request.
+/// * A `TimestampRange` is a range, and both of its bounds are inclusive
+///   (`smithy_query(query="doc", shape="com.amazonaws.acm#TimestampRange",
+///   member="Start")`), so a range with no bound at all constrains nothing and a range
+///   whose start is after its end can contain no instant. The model cannot express
+///   either, so only the service can refuse them.
+/// * A filter member targeting an enum may only carry a value that enum declares: a
+///   value outside the set is not a value of the type, so there is nothing to compare
+///   a certificate against. The modelled value sets ARE in the model, and the boundary
+///   validator enforces them for a value sitting on a STRUCTURE member — a
+///   `ComparisonOperator`, say, is already refused with `Value 'STARTS_WITH' at
+///   'filterStatement.filter.x509AttributeFilter.subject.commonName.comparisonOperator'
+///   failed to satisfy constraint: Member must satisfy enum value set: [CONTAINS,
+///   EQUALS]` — but NOT for one sitting directly on a UNION member, which its walk
+///   does not descend into. Those are the values checked here, with the same sentence
+///   and the same 400 `ValidationException`, so a caller cannot tell which of the two
+///   refused the request.
+fn validate_statement(
+    statement: &CertificateFilterStatement,
+) -> Result<(), SearchCertificatesError> {
+    let mut remaining_nodes = MAX_STATEMENT_NODES;
+    validate_nested(statement, 1, &mut remaining_nodes)
+}
+
+/// One level of [`validate_statement`]'s walk: `depth` is this statement's level and
+/// `remaining_nodes` the node budget left for the whole tree.
+fn validate_nested(
+    statement: &CertificateFilterStatement,
+    depth: usize,
+    remaining_nodes: &mut usize,
+) -> Result<(), SearchCertificatesError> {
+    if depth > MAX_STATEMENT_DEPTH {
+        return Err(validation_exception(format!(
+            "FilterStatement may nest at most {MAX_STATEMENT_DEPTH} levels of And, Or and Not"
+        )));
+    }
+    let Some(left) = remaining_nodes.checked_sub(1) else {
+        return Err(validation_exception(format!(
+            "FilterStatement may carry at most {MAX_STATEMENT_NODES} filters"
+        )));
+    };
+    *remaining_nodes = left;
+    match statement {
+        CertificateFilterStatement::And(statements)
+        | CertificateFilterStatement::Or(statements) => {
+            for nested in statements {
+                validate_nested(nested, depth + 1, remaining_nodes)?;
+            }
+            Ok(())
+        }
+        CertificateFilterStatement::Not(nested) => {
+            validate_nested(nested, depth + 1, remaining_nodes)
+        }
+        CertificateFilterStatement::Filter(filter) => validate_filter(filter),
+    }
+}
+
+/// Refuse one leaf filter, naming the member the refused value came from.
+fn validate_filter(filter: &CertificateFilter) -> Result<(), SearchCertificatesError> {
+    match filter {
+        // An ARN is only ever compared for equality with a stored one, and its
+        // `@length`/`@pattern` are the model's own.
+        CertificateFilter::CertificateArn(_) => Ok(()),
+        CertificateFilter::X509AttributeFilter(filter) => match filter {
+            // The comparison operator of a name filter sits on a STRUCTURE member, so
+            // the boundary validator has already refused any value outside its enum —
+            // including its absence, the member being `@required`.
+            X509AttributeFilter::Subject(SubjectFilter::CommonName(_))
+            | X509AttributeFilter::SubjectAlternativeName(
+                SubjectAlternativeNameFilter::DnsName(_),
+            ) => Ok(()),
+            X509AttributeFilter::ExtendedKeyUsage(name) => validate_enum(
+                &format!("{X509_PATH}.ExtendedKeyUsage"),
+                name,
+                EXTENDED_KEY_USAGE_NAME_VALUES,
+            ),
+            X509AttributeFilter::KeyUsage(name) => validate_enum(
+                &format!("{X509_PATH}.KeyUsage"),
+                name,
+                KEY_USAGE_NAME_VALUES,
+            ),
+            X509AttributeFilter::KeyAlgorithm(algorithm) => validate_enum(
+                &format!("{X509_PATH}.KeyAlgorithm"),
+                algorithm,
+                KEY_ALGORITHM_VALUES,
+            ),
+            X509AttributeFilter::SerialNumber(_) => Ok(()),
+            X509AttributeFilter::NotAfter(range) => validate_range("NotAfter", range),
+            X509AttributeFilter::NotBefore(range) => validate_range("NotBefore", range),
+        },
+        CertificateFilter::AcmCertificateMetadataFilter(filter) => match filter {
+            AcmCertificateMetadataFilter::Status(status) => validate_enum(
+                &format!("{METADATA_PATH}.Status"),
+                status,
+                CERTIFICATE_STATUS_VALUES,
+            ),
+            AcmCertificateMetadataFilter::RenewalStatus(status) => validate_enum(
+                &format!("{METADATA_PATH}.RenewalStatus"),
+                status,
+                RENEWAL_STATUS_VALUES,
+            ),
+            AcmCertificateMetadataFilter::Type(cert_type) => validate_enum(
+                &format!("{METADATA_PATH}.Type"),
+                cert_type,
+                CERTIFICATE_TYPE_VALUES,
+            ),
+            AcmCertificateMetadataFilter::ExportOption(option) => validate_enum(
+                &format!("{METADATA_PATH}.ExportOption"),
+                option,
+                CERTIFICATE_EXPORT_VALUES,
+            ),
+            AcmCertificateMetadataFilter::ManagedBy(manager) => validate_enum(
+                &format!("{METADATA_PATH}.ManagedBy"),
+                manager,
+                CERTIFICATE_MANAGED_BY_VALUES,
+            ),
+            AcmCertificateMetadataFilter::ValidationMethod(method) => validate_enum(
+                &format!("{METADATA_PATH}.ValidationMethod"),
+                method,
+                VALIDATION_METHOD_VALUES,
+            ),
+            AcmCertificateMetadataFilter::CertificateKeyPairOrigin(origin) => validate_enum(
+                &format!("{METADATA_PATH}.CertificateKeyPairOrigin"),
+                origin,
+                CERTIFICATE_KEY_PAIR_ORIGIN_VALUES,
+            ),
+            // A boolean has no value set to be outside of, and the ACME members carry
+            // free text the model constrains itself.
+            AcmCertificateMetadataFilter::InUse(_)
+            | AcmCertificateMetadataFilter::Exported(_)
+            | AcmCertificateMetadataFilter::AcmeEndpointArn(_)
+            | AcmCertificateMetadataFilter::AcmeAccountId(_) => Ok(()),
+        },
+    }
+}
+
+/// Refuse a filter value outside the value set its member's enum declares.
+///
+/// `allowed` is the value set CODEGEN captured from the model for that enum (the
+/// `*_VALUES` consts in `super::types`), so it cannot drift from the model and is the
+/// very set the boundary validator checks a structure member against.
+///
+/// The sentence is the one that validator renders for an enum violation
+/// (`Violation::requirement` in `aws_smithy_schema_server::constraints`), built from
+/// the request: the refused value, the member it sits on, and the set it had to be in.
+fn validate_enum(
+    path: &str,
+    value: &str,
+    allowed: &[&str],
+) -> Result<(), SearchCertificatesError> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(validation_exception(format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: Member must satisfy enum value set: [{}]",
+        allowed.join(", ")
+    )))
+}
+
+/// Refuse a `TimestampRange` that selects no instant, naming the member it came from.
+fn validate_range(member: &str, range: &TimestampRange) -> Result<(), SearchCertificatesError> {
+    match (range.start.as_ref(), range.end.as_ref()) {
+        (None, None) => Err(validation_exception(format!(
+            "{X509_PATH}.{member} must specify Start, End or both"
+        ))),
+        (Some(start), Some(end)) if epoch_pair(start) > epoch_pair(end) => {
+            Err(validation_exception(format!(
+                "{X509_PATH}.{member}.Start must not be after End"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A modelled timestamp as the `(seconds, nanoseconds)` pair instants are compared
+/// on, since `TStamp` values are only ever ordered here, never arithmetic.
+fn epoch_pair(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// The same pair for a stored instant, so a record's timestamp and a filter's bound
+/// are compared in one representation.
+fn stored_epoch_pair(at: ::std::time::SystemTime) -> (i64, u32) {
+    epoch_pair(&crate::state::to_date_time(at))
+}
+
+/// Whether `cert` satisfies `statement`: the logical operators combine the leaf
+/// filters below, each of which compares one value the RECORD carries.
+///
+/// Recurses over the statement tree, whose depth and node count
+/// [`validate_statement`] has already bounded ([`MAX_STATEMENT_DEPTH`]) — this walk
+/// runs once per stored certificate, so that bound is what keeps one request from
+/// deciding how deep it recurses.
+fn statement_matches(
+    statement: &CertificateFilterStatement,
+    cert: &crate::state::Certificate,
+) -> bool {
+    match statement {
+        CertificateFilterStatement::And(statements) => statements
+            .iter()
+            .all(|nested| statement_matches(nested, cert)),
+        CertificateFilterStatement::Or(statements) => statements
+            .iter()
+            .any(|nested| statement_matches(nested, cert)),
+        CertificateFilterStatement::Not(nested) => !statement_matches(nested, cert),
+        CertificateFilterStatement::Filter(filter) => filter_matches(filter, cert),
+    }
+}
+
+/// Whether `cert` satisfies one leaf filter.
+fn filter_matches(filter: &CertificateFilter, cert: &crate::state::Certificate) -> bool {
+    match filter {
+        // An ARN identifies one certificate, so this selects the record stored under it.
+        CertificateFilter::CertificateArn(arn) => cert.arn == *arn,
+        CertificateFilter::X509AttributeFilter(filter) => x509_matches(filter, cert),
+        CertificateFilter::AcmCertificateMetadataFilter(filter) => metadata_matches(filter, cert),
+    }
+}
+
+/// Whether `cert`'s X.509 attributes satisfy an [`X509AttributeFilter`].
+///
+/// Each arm reads the same stored value [`crate::state::certificate_search_result`]
+/// reports for that attribute, so a certificate a filter keeps is one whose reported
+/// attributes carry the filtered value.
+fn x509_matches(filter: &X509AttributeFilter, cert: &crate::state::Certificate) -> bool {
+    match filter {
+        // The subject common name of an ACM certificate is the certificate's domain
+        // name, which is the name this record was requested for.
+        X509AttributeFilter::Subject(SubjectFilter::CommonName(filter)) => {
+            name_matches(&cert.domain_name, &filter.value, &filter.comparison_operator)
+        }
+        // A certificate's subject alternative names are the name set it covers; one
+        // matching name is enough for the certificate to match.
+        X509AttributeFilter::SubjectAlternativeName(SubjectAlternativeNameFilter::DnsName(
+            filter,
+        )) => cert
+            .subject_alternative_names
+            .iter()
+            .any(|name| name_matches(name, &filter.value, &filter.comparison_operator)),
+        // The X.509 key-usage extensions exist only once the certificate has been
+        // issued, so a pending or failed record carries none and no such filter keeps
+        // it — which comes from the record rather than from the filter being unwritten.
+        X509AttributeFilter::ExtendedKeyUsage(name) => cert.extended_key_usages.contains(name),
+        X509AttributeFilter::KeyUsage(name) => cert.key_usages.contains(name),
+        X509AttributeFilter::KeyAlgorithm(algorithm) => cert.key_algorithm == *algorithm,
+        // A serial number is minted by the certificate authority that signs an X.509
+        // certificate. This emulator signs none, so no record carries one — the same
+        // reason `DescribeCertificate` reports no `Serial` — and a serial filter keeps
+        // nothing.
+        X509AttributeFilter::SerialNumber(_) => false,
+        // The validity window exists only once the certificate has been issued; an
+        // absent bound is in no range.
+        X509AttributeFilter::NotAfter(range) => in_range(cert.not_after, range),
+        X509AttributeFilter::NotBefore(range) => in_range(cert.not_before, range),
+    }
+}
+
+/// Whether `cert`'s ACM metadata satisfies an [`AcmCertificateMetadataFilter`].
+fn metadata_matches(
+    filter: &AcmCertificateMetadataFilter,
+    cert: &crate::state::Certificate,
+) -> bool {
+    match filter {
+        AcmCertificateMetadataFilter::Status(status) => cert.status == *status,
+        AcmCertificateMetadataFilter::Type(cert_type) => cert.cert_type == *cert_type,
+        // A certificate is in use when something has associated it; `InUseBy` is the
+        // list of those resources.
+        AcmCertificateMetadataFilter::InUse(in_use) => {
+            let certificate_is_in_use = !cert.in_use_by.is_empty();
+            certificate_is_in_use == *in_use
+        }
+        AcmCertificateMetadataFilter::Exported(exported) => cert.exported == *exported,
+        AcmCertificateMetadataFilter::ExportOption(option) => {
+            crate::state::export_option(cert) == *option
+        }
+        AcmCertificateMetadataFilter::ManagedBy(manager) => {
+            cert.managed_by.as_deref() == Some(manager.as_str())
+        }
+        AcmCertificateMetadataFilter::ValidationMethod(method) => {
+            cert.validation_method.as_deref() == Some(method.as_str())
+        }
+        AcmCertificateMetadataFilter::CertificateKeyPairOrigin(origin) => {
+            cert.key_pair_origin == *origin
+        }
+        // A renewal status belongs to a renewal ACM has started for a certificate, and
+        // an ACME endpoint arn / account id to a certificate obtained through an ACME
+        // endpoint. No stored record carries either — nothing in this service starts a
+        // renewal or issues through ACME — so these filters keep nothing, which is the
+        // record's answer and not a missing comparison.
+        AcmCertificateMetadataFilter::RenewalStatus(_)
+        | AcmCertificateMetadataFilter::AcmeEndpointArn(_)
+        | AcmCertificateMetadataFilter::AcmeAccountId(_) => false,
+    }
+}
+
+/// Whether a stored instant falls inside a [`TimestampRange`], whose `Start` and
+/// `End` are both inclusive and either of which may be absent (an open end).
+///
+/// An absent instant — a validity bound a certificate does not have yet — is in no
+/// range, so a range filter selects only certificates that carry that bound.
+fn in_range(at: Option<::std::time::SystemTime>, range: &TimestampRange) -> bool {
+    let Some(at) = at.map(stored_epoch_pair) else {
+        return false;
+    };
+    range
+        .start
+        .as_ref()
+        .is_none_or(|start| at >= epoch_pair(start))
+        && range.end.as_ref().is_none_or(|end| at <= epoch_pair(end))
+}
+
+/// Whether a domain name the certificate carries satisfies a `(Value,
+/// ComparisonOperator)` filter.
+///
+/// The comparison is ASCII-case-insensitive because DNS labels are: `Example.COM` and
+/// `example.com` are one name — which is [`crate::state::same_domain`], the `EQUALS`
+/// comparison itself.
+fn name_matches(name: &str, value: &str, comparison_operator: &str) -> bool {
+    if comparison_operator == COMPARISON_CONTAINS {
+        name.to_ascii_lowercase()
+            .contains(&value.to_ascii_lowercase())
+    } else {
+        // `EQUALS`, the only other operator the model declares — and the boundary
+        // validator has already refused any value outside that enum.
+        crate::state::same_domain(name, value)
+    }
+}
+
+/// The order one `SearchCertificates` response is built in: the requested sort field
+/// and direction.
+///
+/// A cursor compared against a different field would land before or after the
+/// position the page actually stopped at, repeating or skipping certificates, so the
+/// page order and its `NextToken` are both read off this one value.
+#[derive(Debug)]
+struct ResultOrder {
+    /// A `SearchCertificatesSortBy` value; the model's default is `CREATED_AT`.
+    sort_by: String,
+    /// `SortOrder=DESCENDING`.
+    descending: bool,
+}
+
+impl ResultOrder {
+    /// The sorted-on value of `cert`, rendered so that comparing the renderings
+    /// compares the values: an instant as fixed-width epoch seconds and nanoseconds, a
+    /// flag as `0`/`1`, anything else as the stored string.
+    ///
+    /// A value the record does not carry renders as the empty string, which sorts
+    /// before every other rendering — so certificates missing the sorted-on field come
+    /// first ascending and last descending, and keep their ARN order among themselves.
+    fn sort_value(&self, cert: &crate::state::Certificate) -> String {
+        // Every `SearchCertificatesSortBy` value the model declares
+        // (`smithy_query(query="shape",
+        // shape="com.amazonaws.acm#SearchCertificatesSortBy")`), each reading the same
+        // stored value the search result reports for it.
+        match self.sort_by.as_str() {
+            "CERTIFICATE_ARN" => cert.arn.clone(),
+            "COMMON_NAME" => cert.domain_name.clone(),
+            "STATUS" => cert.status.clone(),
+            "TYPE" => cert.cert_type.clone(),
+            "KEY_ALGORITHM" => cert.key_algorithm.clone(),
+            "CERTIFICATE_KEY_PAIR_ORIGIN" => cert.key_pair_origin.clone(),
+            "RENEWAL_ELIGIBILITY" => cert.renewal_eligibility.clone(),
+            "EXPORT_OPTION" => crate::state::export_option(cert),
+            "MANAGED_BY" => cert.managed_by.clone().unwrap_or_default(),
+            "VALIDATION_METHOD" => cert.validation_method.clone().unwrap_or_default(),
+            "EXPORTED" => flag_key(cert.exported),
+            "IN_USE" => flag_key(!cert.in_use_by.is_empty()),
+            "NOT_AFTER" => instant_key(cert.not_after),
+            "NOT_BEFORE" => instant_key(cert.not_before),
+            "ISSUED_AT" => instant_key(cert.issued_at),
+            "REVOKED_AT" => instant_key(cert.revoked_at),
+            // A renewal status, an import instant and the ACME members are values no
+            // stored record carries (see [`metadata_matches`]), so sorting on one
+            // leaves every certificate in ARN order.
+            "RENEWAL_STATUS" | "IMPORTED_AT" | "ACME_ENDPOINT_ARN" | "ACME_ACCOUNT_ID" => {
+                String::new()
+            }
+            // `CREATED_AT`, the model's default, and the field any value the model adds
+            // later falls back to; the boundary validator refuses a value outside the
+            // enum before this handler runs.
+            _ => instant_key(Some(cert.created_at)),
+        }
+    }
+
+    /// Whether `cert` sorts strictly after `cursor` in this order, i.e. whether it
+    /// belongs on the page that resumes from it.
+    fn is_after(&self, cursor: &Cursor, cert: &crate::state::Certificate) -> bool {
+        let here = (cursor.sort_value.as_str(), cursor.arn.as_str());
+        let value = self.sort_value(cert);
+        let there = (value.as_str(), cert.arn.as_str());
+        if self.descending {
+            there < here
+        } else {
+            there > here
+        }
+    }
+
+    /// This order's direction, as a `NextToken` records it.
+    fn direction(&self) -> &'static str {
+        if self.descending {
+            "D"
+        } else {
+            "A"
+        }
+    }
+
+    /// The opaque `NextToken` naming the last certificate a page emitted: the order it
+    /// was cut in, that certificate's sorted-on value and its ARN — everything the
+    /// next page needs to resume even if that certificate is gone.
+    ///
+    /// Hex-encoded so the token is opaque to the caller and satisfies the member's
+    /// `^[\u0009\u000A\u000D\u0020-\u00FF]*$` pattern whatever the values contain.
+    fn encode_next_token(&self, cert: &crate::state::Certificate) -> String {
+        hex::encode(format!(
+            "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}",
+            self.sort_by,
+            self.direction(),
+            self.sort_value(cert),
+            cert.arn
+        ))
+    }
+}
+
+/// A flag as a sort key: `false` before `true` ascending.
+fn flag_key(value: bool) -> String {
+    if value { "1" } else { "0" }.to_string()
+}
+
+/// An instant as a sort key: fixed-width epoch seconds and nanoseconds, so comparing
+/// the renderings compares the instants. An absent instant renders as the empty
+/// string, which sorts before every rendered instant.
+///
+/// The seconds are biased into the unsigned range before they are padded, so the
+/// rendering stays monotonic over the whole signed domain: a negative decimal does not
+/// sort lexicographically in instant order. (Today [`crate::state::to_date_time`]
+/// reports a pre-epoch instant as the epoch itself, so no stored record reaches the
+/// negative range — the bias is what keeps this key correct if one ever does.)
+fn instant_key(at: Option<::std::time::SystemTime>) -> String {
+    match at {
+        None => String::new(),
+        Some(at) => {
+            let (secs, nanos) = stored_epoch_pair(at);
+            let biased = i128::from(secs) - i128::from(i64::MIN);
+            format!("{biased:020}.{nanos:09}")
+        }
+    }
+}
+
+/// Where a page stopped: the sorted-on value of the last certificate it emitted and
+/// that certificate's ARN, the pair the page order is a total order on.
+///
+/// `ListCertificates` issues its own `NextToken` for its own order, and the two
+/// formats are deliberately separate: this one also binds the sort field and the
+/// direction the page was cut in, which that operation has no equivalent of (its only
+/// sort key is `CREATED_AT`).
+#[derive(Debug)]
+struct Cursor {
+    sort_value: String,
+    arn: String,
+}
+
+/// The byte separating a token's two fields. Outside the `Arn` pattern
+/// (`^arn:[\w+=/,.@-]+:acm:...`) and outside every rendering [`ResultOrder::sort_value`]
+/// produces, so it cannot occur inside either field.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The [`Cursor`] inside a `NextToken`, or a `ValidationException` when the token did
+/// not come from [`ResultOrder::encode_next_token`] in THIS order.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so no value read
+/// out of it may panic the handler. The ARN is checked as well as the encoding, so a
+/// forged-but-well-encoded token is refused instead of silently answering an empty
+/// page — and so is a token issued for another `SortBy`/`SortOrder`, whose cursor
+/// value was rendered from a different field and would skip or repeat certificates if
+/// it were compared against this order's values.
+fn decode_next_token(
+    token: &str,
+    order: &ResultOrder,
+) -> Result<Cursor, SearchCertificatesError> {
+    let invalid = || validation_exception("NextToken is not a token this service issued");
+    let bytes = hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    // The order the token was cut in comes first, then the sorted-on value and the
+    // ARN. The ARN is taken from the RIGHT: a sorted-on value never contains the
+    // separator, but splitting from the right keeps the ARN whole whatever it held.
+    let mut fields = decoded.splitn(3, CURSOR_SEPARATOR);
+    let (Some(sort_by), Some(direction), Some(rest)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return Err(invalid());
+    };
+    let (sort_value, arn) = rest.rsplit_once(CURSOR_SEPARATOR).ok_or_else(invalid)?;
+    if crate::state::certificate_id_from_arn(arn).is_none() {
+        return Err(invalid());
+    }
+    if sort_by != order.sort_by || direction != order.direction() {
+        return Err(validation_exception(
+            "NextToken was issued for a different SortBy or SortOrder; page with the \
+             SortBy and SortOrder the token came from",
+        ));
+    }
+    Ok(Cursor {
+        sort_value: sort_value.to_string(),
+        arn: arn.to_string(),
+    })
 }
