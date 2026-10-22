@@ -1,11 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutParameter
+//! Create or update a parameter in Parameter Store — the write half of this slice. This
+//! is the ONLY file to touch for this operation.
 //!
-//! Creates a parameter, or writes a new version of one that already exists, in this
-//! service's Parameter Store state. The rules this handler applies — the naming
-//! constraints, the tier and content-size rules, version numbering and retention —
-//! live in [`crate::state`], which every parameter operation shares.
+//! What it persists is read back by `GetParameter`; both reach the one store in
+//! [`crate::state`]. A put against a name that already exists is refused unless
+//! `Overwrite` is set, and an overwrite APPENDS a version rather than replacing the
+//! stored one, so an earlier value stays reachable through a `name:version` selector
+//! until the documented 100-version retention displaces it.
+//!
+//! Implementing this operation also closes `issues/.../ssm-putparameter-stub.md`, which
+//! asks for exactly this handler; `GetParameter` needs it to have anything to read.
+//!
+//! ## Parameter policies
+//!
+//! A `Policies` document is validated against the supported policy types and their
+//! documented limits and is persisted with the version, but no policy EFFECT is
+//! materialised: an `Expiration` whose timestamp has passed does not delete the
+//! parameter here, and no `ExpirationNotification` event is raised. Those are the
+//! parameter-policy behaviours, and nothing in this emulator fabricates an event for
+//! work that did not run — so an accepted policy means "recorded", not "acting".
 //!
 //! ## Shape of an operation
 //!
@@ -187,8 +202,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::NameProblem;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -235,34 +248,150 @@ impl From<PutParameterErrorModeled> for PutParameterError {
     }
 }
 
-/// The refusal a `PutParameter` that does not overwrite gets when the parameter it
-/// names already exists at `version`.
-///
-/// One function because the refusal is reached twice: once from the short read that
-/// precedes validation (so a duplicate create costs nothing more) and once under
-/// the write guard, which is the authoritative check.
-fn already_exists(name: &str, version: i64) -> PutParameterError {
-    PutParameterErrorModeled::ParameterAlreadyExists(ParameterAlreadyExists {
-        message: Some(format!(
-            "The parameter {name} already exists at version {version}. To write a new version of \
-             it, set Overwrite to true."
-        )),
-    })
-    .into()
+/// What the store already holds for the name a put names, read once so the refusals
+/// below need no second lookup.
+#[derive(Debug)]
+struct Existing {
+    /// The stored parameter's current `Type` — what an update that names none inherits.
+    type_: Option<String>,
+    /// Its current `Tier`, which an update may raise but not lower.
+    tier: Option<String>,
+    /// The number the version this put creates will carry.
+    next_version: i64,
+    /// How many versions are retained right now.
+    retained: usize,
+    /// Whether the oldest retained version carries a label, which stops it from being
+    /// displaced.
+    oldest_labelled: bool,
 }
 
-/// The refusal an update gets when it would move an existing advanced parameter back
-/// into the standard tier (`Tier`: "you can't revert an advanced parameter to a
-/// standard parameter … you must delete it and recreate it as a new standard
-/// parameter").
+/// How large an `AllowedPattern` may compile to, in bytes of compiled program, and how
+/// large the lazy-DFA cache it may use.
 ///
-/// One function because it is reached twice: from the snapshot the request validates
-/// against, and again under the write guard, where the stored tier is authoritative.
-fn cannot_revert_tier(name: &str) -> PutParameterError {
-    crate::scaffolded::Scaffolded::validation(format!(
-        "The parameter {name} is an advanced parameter and can't be reverted to the standard \
-         tier: delete it and recreate it as a new standard parameter."
-    ))
+/// Emulator resource guards: the expression comes from the request, so the automaton it
+/// builds and the cache it matches through are bounded explicitly rather than left to
+/// the crate's defaults — a cache that cannot be thrashed into the slower engine. A
+/// pattern past the first is refused as one this service cannot evaluate. The haystack
+/// is bounded too: `PutParameter` refuses a `Value` larger than the biggest content
+/// size any tier allows before this runs, so neither factor of the matching cost is
+/// caller-unbounded.
+const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
+
+/// See [`COMPILED_PATTERN_LIMIT`].
+const PATTERN_DFA_LIMIT: usize = 64 * 1024;
+
+/// Why the `Policies` document is one Parameter Store will not take, named by the
+/// modelled error that reports it.
+#[derive(Debug)]
+enum PolicyRejection {
+    /// Not a policy document at all: a `ValidationException`, since the model has no
+    /// error for a malformed document.
+    Shape(String),
+    /// `InvalidPolicyTypeException`.
+    Type(String),
+    /// `InvalidPolicyAttributeException`.
+    Attribute(String),
+    /// `IncompatiblePolicyException`.
+    Incompatible(String),
+    /// `PoliciesLimitExceededException`.
+    Limit(String),
+}
+
+/// How many policies the `Policies` document carries, or why it is refused.
+///
+/// `Policies` is "one or more policies to apply to a parameter. This operation takes a
+/// JSON array", and the rules applied here are the ones the modelled policy errors
+/// state: the supported policy types (`InvalidPolicyTypeException`), at most
+/// [`crate::state::MAX_POLICIES`] of them (`PoliciesLimitExceededException`), no two
+/// policies of one type (`IncompatiblePolicyException`: "You can't, for example,
+/// specify two Expiration policies for a parameter"), and an `Attributes` value that
+/// is a policy attribute map (`InvalidPolicyAttributeException`).
+///
+/// What each policy then DOES — deleting the parameter when an `Expiration` comes due,
+/// raising the notification events — is not implemented: those are the parameter-policy
+/// behaviours, not this operation's, and nothing here fabricates an event for work that
+/// did not run. The document is validated and persisted with the version.
+fn policy_count(policies: Option<&str>) -> Result<usize, PolicyRejection> {
+    let Some(policies) = policies.filter(|policies| !policies.trim().is_empty()) else {
+        return Ok(0);
+    };
+    let parsed: ::serde_json::Value = ::serde_json::from_str(policies)
+        .map_err(|why| PolicyRejection::Shape(format!("Policies isn't a JSON document: {why}")))?;
+    let Some(entries) = parsed.as_array() else {
+        return Err(PolicyRejection::Shape(
+            "Policies must be a JSON array of policy objects".to_string(),
+        ));
+    };
+    if entries.len() > crate::state::MAX_POLICIES {
+        return Err(PolicyRejection::Limit(format!(
+            "Policies carries {} policies; the maximum is {}",
+            entries.len(),
+            crate::state::MAX_POLICIES
+        )));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(policy) = entry.as_object() else {
+            return Err(PolicyRejection::Shape(
+                "every entry of Policies must be a policy object".to_string(),
+            ));
+        };
+        let Some(policy_type) = policy.get("Type").and_then(::serde_json::Value::as_str) else {
+            return Err(PolicyRejection::Type(
+                "a policy carries no Type".to_string(),
+            ));
+        };
+        if !crate::state::POLICY_TYPES.contains(&policy_type) {
+            return Err(PolicyRejection::Type(format!(
+                "Policy type '{policy_type}' isn't supported; the supported policy types are {}",
+                crate::state::POLICY_TYPES.join(", ")
+            )));
+        }
+        if policy
+            .get("Attributes")
+            .is_some_and(|attributes| !attributes.is_object())
+        {
+            return Err(PolicyRejection::Attribute(format!(
+                "the Attributes of the {policy_type} policy is not a policy attribute map"
+            )));
+        }
+        if seen.contains(&policy_type) {
+            return Err(PolicyRejection::Incompatible(format!(
+                "Policies carries two {policy_type} policies"
+            )));
+        }
+        seen.push(policy_type);
+    }
+    Ok(entries.len())
+}
+
+/// Why `value` does not satisfy `pattern`, or `None` when it does (or when the request
+/// named no pattern).
+///
+/// `AllowedPattern` is "a regular expression used to validate the parameter value", so
+/// the value is matched against it in full — the whole value, not a substring, the way
+/// a regular-expression constraint on a member reads. The expression comes from the
+/// request, so it is evaluated by the `regex` crate, whose matching is linear in the
+/// input and has no backtracking blowup, under that crate's own compiled-size limit;
+/// the modelled `AllowedPattern` length (0..1024) bounds what is compiled.
+fn allowed_pattern_rejection(pattern: Option<&str>, value: &str) -> Option<String> {
+    let pattern = pattern.filter(|pattern| !pattern.is_empty())?;
+    let anchored = format!("^(?:{pattern})$");
+    // An explicit compiled-size budget, so a pattern inside the modelled 1024-character
+    // `AllowedPattern` length still cannot compile into an arbitrarily large automaton.
+    match ::regex::RegexBuilder::new(&anchored)
+        .size_limit(COMPILED_PATTERN_LIMIT)
+        .dfa_size_limit(PATTERN_DFA_LIMIT)
+        .build()
+    {
+        Err(why) => Some(format!(
+            "AllowedPattern '{pattern}' is not a regular expression this service can \
+             evaluate: {why}"
+        )),
+        Ok(expression) => (!expression.is_match(value)).then(|| {
+            format!("Value doesn't satisfy the regular expression requirement '{pattern}'")
+        }),
+    }
 }
 
 /// The `PutParameter` operation.
@@ -301,188 +430,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // `Name`'s length and `KeyId`'s pattern are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them. `Value`
+        // (`PSParameterValue`) carries NO modelled length, so its size is bounded here,
+        // before anything walks it. What is checked beyond that is what the model cannot
+        // say: every naming constraint, tier and quota rule the operation's own
+        // documentation states.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutParameterErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Parameter Store is unavailable".to_string()),
+                message: Some("the parameter store is unavailable".to_string()),
             })
         })?;
 
-        // The service stores the name without the spaces around it, and refuses one
-        // whose remaining text breaks a naming constraint. Decided from the request
-        // alone, before the store is touched at all.
-        let name = crate::state::canonical_name(&input.name).to_string();
-        if let Err(problem) = crate::state::check_parameter_name(&name) {
-            return Err(match problem {
-                NameProblem::ContainsSpace => crate::scaffolded::Scaffolded::validation(format!(
-                    "Name {name:?} contains a space between characters: parameter names can't \
-                     contain spaces"
-                )),
-                NameProblem::ReservedPrefix => crate::scaffolded::Scaffolded::validation(format!(
-                    "Name {name:?} starts with a reserved prefix: a parameter name can't be \
-                     prefixed with \"aws\" or \"ssm\" (case-insensitive)"
-                )),
-                NameProblem::InvalidCharacter(bad) => {
-                    PutParameterErrorModeled::ParameterPatternMismatchException(
-                        ParameterPatternMismatchException {
-                            message: Some(format!(
-                                "Name {name:?} contains the character {bad:?}: parameter names can \
-                                 include only the symbols and letters a-zA-Z0-9_.- and the \
-                                 hierarchy separator /"
-                            )),
-                        },
-                    )
-                    .into()
-                }
-                NameProblem::TooManyLevels(levels) => {
-                    PutParameterErrorModeled::HierarchyLevelLimitExceededException(
-                        HierarchyLevelLimitExceededException {
-                            message: Some(format!(
-                                "Name {name:?} describes {levels} hierarchy levels; a hierarchy \
-                                 can have a maximum of {} levels",
-                                crate::state::MAX_HIERARCHY_LEVELS
-                            )),
-                        },
-                    )
-                    .into()
-                }
-            });
+        // The largest content size ANY tier allows, applied before the value is walked
+        // or matched, so no per-request work is proportional to an unbounded request:
+        // the exact per-tier limit is applied below, once the tier is resolved.
+        if input.value.len() > crate::state::ADVANCED_VALUE_LIMIT {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Value is {} bytes: the largest content size limit a parameter has is {} bytes",
+                input.value.len(),
+                crate::state::ADVANCED_VALUE_LIMIT
+            )));
         }
 
-        let overwrite = input.overwrite.unwrap_or(false);
-        let tagged = input.tags.as_ref().is_some_and(|tags| !tags.is_empty());
-        if overwrite && tagged {
-            // `Tags`: "To add tags to an existing Systems Manager parameter, use the
-            // AddTagsToResource operation." The two members are exclusive in the
-            // request itself, so this does not depend on whether the parameter
-            // already exists.
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Tags can't be used in the same request as Overwrite: tag a parameter when you \
-                 create it, or with AddTagsToResource afterwards.",
-            ));
-        }
-
-        // A SHORT read of the store: what the parameter already is (an overwrite
-        // numbers its new version from the current one and may inherit its type and
-        // tier), and how many OTHER parameters exist, which the `Intelligent-Tiering`
-        // decision and the store's capacity consult. The guard is released before any
-        // caller-supplied work — compiling a pattern, scanning a value — so one
-        // request's regex cannot serialise every other caller's parameter operation.
-        let (previous, other_parameters) = {
-            let store = state.lock();
-            let previous = store.parameters.get(&name).map(|record| {
-                (
-                    record.current.version,
-                    record.current.r#type.clone(),
-                    record.current.tier.clone(),
+        let name = crate::state::trimmed_name(&input.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        match crate::state::name_rejection(name) {
+            Some(crate::state::NameRejection::Pattern(why)) => {
+                return Err(PutParameterErrorModeled::ParameterPatternMismatchException(
+                    ParameterPatternMismatchException { message: Some(why) },
                 )
-            });
-            let others = store.parameters.len() - usize::from(previous.is_some());
-            (previous, others)
-        };
+                .into())
+            }
+            Some(crate::state::NameRejection::Depth(why)) => {
+                return Err(
+                    PutParameterErrorModeled::HierarchyLevelLimitExceededException(
+                        HierarchyLevelLimitExceededException { message: Some(why) },
+                    )
+                    .into(),
+                )
+            }
+            None => {}
+        }
 
-        if let Some((version, _, _)) = &previous {
-            if !overwrite {
-                return Err(already_exists(&name, *version));
+        // `Type` and `Tier` are modelled enums, so the centralized walk has already
+        // refused any value outside their value sets with a 400 `ValidationException`
+        // before this body runs. `Tier` is re-checked here all the same, because the
+        // tier decides the content-size limit below and a value the model does not
+        // declare must not be served as if it were the standard tier. `DataType` is a
+        // plain string, so its catalog is enforced here too.
+        if let Some(requested) = input.tier.as_deref() {
+            if !PARAMETER_TIER_VALUES.contains(&requested) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Tier '{requested}' isn't one of the parameter tiers {}",
+                    PARAMETER_TIER_VALUES.join(", ")
+                )));
             }
         }
+        let data_type = input
+            .data_type
+            .clone()
+            .filter(|data_type| !data_type.is_empty())
+            .unwrap_or_else(|| crate::state::DEFAULT_DATA_TYPE.to_string());
+        if !crate::state::PARAMETER_DATA_TYPES.contains(&data_type.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "DataType '{data_type}' isn't supported; the supported data type values are {}",
+                crate::state::PARAMETER_DATA_TYPES.join(" ")
+            )));
+        }
+        // The `aws:ec2:image` data type's own validation — "that the specified AMI is
+        // available in your Amazon Web Services account" — is the asynchronous one the
+        // doc describes ("a successful response indicates that the request was received"),
+        // and this emulator holds no image catalog to run it against, so the value is
+        // stored as given rather than refused on a guess.
+        //
+        // "Parameters can't be referenced or nested in the values of other parameters.
+        // You can't include values wrapped in double brackets {{}} or
+        // {{ssm:parameter-name}} in a parameter value."
+        if input.value.contains("{{") {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Value carries a value wrapped in double brackets: a parameter value can't \
+                 reference or nest another parameter"
+                    .to_string(),
+            ));
+        }
+        if let Some(why) = allowed_pattern_rejection(input.allowed_pattern.as_deref(), &input.value)
+        {
+            return Err(PutParameterErrorModeled::InvalidAllowedPatternException(
+                InvalidAllowedPatternException { message: Some(why) },
+            )
+            .into());
+        }
 
-        // `Type`: "Specifying a parameter type isn't required when updating a
-        // parameter. You must specify a parameter type when creating a parameter."
-        let parameter_type = match (input.r#type.as_deref(), previous.as_ref()) {
-            (Some(requested), _) => requested.to_string(),
-            (None, Some((_, existing, _))) => existing.clone(),
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let overwrite = input.overwrite.unwrap_or(false);
+        // Tags belong to the parameter, and `AddTagsToResource` is how an existing one
+        // is tagged: "To add tags to an existing Systems Manager parameter, use the
+        // AddTagsToResource operation." So a request may create a parameter with tags
+        // or update one's value, never both at once — an update that carried tags would
+        // otherwise silently replace the set.
+        if overwrite && input.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Tags and Overwrite can't be used together; use AddTagsToResource to tag an \
+                 existing parameter"
+                    .to_string(),
+            ));
+        }
+        let policies = match policy_count(input.policies.as_deref()) {
+            Ok(count) => count,
+            Err(PolicyRejection::Shape(why)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(why))
+            }
+            Err(PolicyRejection::Type(why)) => {
+                return Err(PutParameterErrorModeled::InvalidPolicyTypeException(
+                    InvalidPolicyTypeException { message: Some(why) },
+                )
+                .into())
+            }
+            Err(PolicyRejection::Attribute(why)) => {
+                return Err(PutParameterErrorModeled::InvalidPolicyAttributeException(
+                    InvalidPolicyAttributeException { message: Some(why) },
+                )
+                .into())
+            }
+            Err(PolicyRejection::Incompatible(why)) => {
+                return Err(PutParameterErrorModeled::IncompatiblePolicyException(
+                    IncompatiblePolicyException { message: Some(why) },
+                )
+                .into())
+            }
+            Err(PolicyRejection::Limit(why)) => {
+                return Err(PutParameterErrorModeled::PoliciesLimitExceededException(
+                    PoliciesLimitExceededException { message: Some(why) },
+                )
+                .into())
+            }
+        };
+        let has_policies = policies > 0;
+
+        let mut store = state.lock();
+        let parameters_in_region = store.parameters_in_region(&region);
+        let existing = store.parameter(&region, name).map(|record| Existing {
+            type_: record.latest().map(|latest| latest.type_.clone()),
+            tier: record.latest().map(|latest| latest.tier.clone()),
+            next_version: record.next_version(),
+            retained: record.versions.len(),
+            oldest_labelled: record
+                .oldest()
+                .is_some_and(|oldest| !oldest.labels.is_empty()),
+        });
+
+        // "The parameter already exists. You can't create duplicate parameters" —
+        // unless the request asked to overwrite it.
+        if existing.is_some() && !overwrite {
+            return Err(PutParameterErrorModeled::ParameterAlreadyExists(
+                ParameterAlreadyExists {
+                    message: Some(format!(
+                        "Parameter {name} already exists; set Overwrite to update it"
+                    )),
+                },
+            )
+            .into());
+        }
+        // "Specifying a parameter type isn't required when updating a parameter. You
+        // must specify a parameter type when creating a parameter."
+        let type_ = match (
+            input.r#type.clone(),
+            existing.as_ref().and_then(|held| held.type_.clone()),
+        ) {
+            // "Parameter Store doesn't support changing a parameter type in a
+            // hierarchy. For example, you can't change a parameter from a String type
+            // to a SecureString type. You must create a new, unique parameter."
+            (Some(requested), Some(stored)) if requested != stored => {
+                return Err(PutParameterErrorModeled::HierarchyTypeMismatchException(
+                    HierarchyTypeMismatchException {
+                        message: Some(format!(
+                            "Parameter {name} is a {stored} parameter: Parameter Store doesn't \
+                             support changing a parameter type to {requested}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            (Some(requested), _) => requested,
+            (None, Some(stored)) => stored,
             (None, None) => {
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    "Type is required when creating a parameter; it is optional only when \
-                     updating one.",
+                    "Type is required when creating a parameter".to_string(),
                 ))
             }
         };
 
-        // `DataType`: "The following data type values are supported. text
-        // aws:ec2:image aws:ssm:integration". Whether an `aws:ec2:image` value names
-        // an image that exists is NOT decided here: the model records that check as
-        // asynchronous, so the call itself still answers 200.
-        let data_type = input
-            .data_type
-            .clone()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| crate::state::DEFAULT_DATA_TYPE.to_string());
-        if !crate::state::DATA_TYPES.contains(&data_type.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "DataType {data_type:?} isn't supported; the supported data types are {}.",
-                crate::state::DATA_TYPES.join(", ")
-            )));
+        // A `KeyId` only means anything for a `SecureString`: "To use a custom KMS key,
+        // choose the SecureString data type with the Key ID parameter." The type under
+        // test is the resolved one, so an update that inherits `SecureString` may still
+        // name a key.
+        let secure = type_ == crate::state::TYPE_SECURE_STRING;
+        if input.key_id.is_some() && !secure {
+            return Err(PutParameterErrorModeled::InvalidKeyId(InvalidKeyId {
+                message: Some(format!(
+                    "KeyId applies only to the {} parameter type",
+                    crate::state::TYPE_SECURE_STRING
+                )),
+            })
+            .into());
         }
 
-        // The tier, and with it the content-size limit the value has to fit. This is
-        // settled BEFORE the value is scanned against any pattern, so an oversized
-        // value is refused rather than searched.
-        //
-        // `Tier`: "You can change a standard parameter to an advanced parameter any
-        // time. But you can't revert an advanced parameter to a standard parameter …
-        // you must delete it and recreate it as a new standard parameter." So an
-        // advanced parameter stays advanced — whether the update names no tier or asks
-        // the service to evaluate one with `Intelligent-Tiering` — and only an explicit
-        // `Standard` on it is refused. A create that names no tier falls back to the
-        // account's default tier.
-        let policies = input.policies.clone().filter(|policy| !policy.is_empty());
-        let value_len = input.value.len();
-        let stored_tier = previous.as_ref().map(|(_, _, tier)| tier.as_str());
-        let advanced_already = stored_tier == Some(crate::state::TIER_ADVANCED);
-        if advanced_already && input.tier.as_deref() == Some(crate::state::TIER_STANDARD) {
-            return Err(cannot_revert_tier(&name));
-        }
-        let tier = if advanced_already {
-            crate::state::TIER_ADVANCED.to_string()
-        } else {
-            crate::state::resolve_tier(
-                input.tier.as_deref().or(stored_tier),
-                value_len,
-                policies.is_some(),
-                other_parameters,
-            )
-        };
-        if tier == crate::state::TIER_STANDARD && policies.is_some() {
-            // `Tier`: "Standard parameters … can't be configured to use parameter
-            // policies."
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "Policies can't be used with the Standard tier: a standard parameter can't be \
-                 configured to use parameter policies. Use the Advanced or Intelligent-Tiering \
-                 tier instead.",
-            ));
+        let tier = crate::state::resolve_tier(
+            input.tier.as_deref(),
+            existing.as_ref().and_then(|held| held.tier.as_deref()),
+            input.value.len(),
+            has_policies,
+            parameters_in_region,
+        );
+        // "You can change a standard parameter to an advanced parameter any time. But
+        // you can't revert an advanced parameter to a standard parameter." An update
+        // that names no tier stays in the one it has (see `resolve_tier`), so this
+        // fires only for a request that asks for the lower tier.
+        if existing
+            .as_ref()
+            .and_then(|held| held.tier.as_deref())
+            .is_some_and(|stored| stored == crate::state::TIER_ADVANCED)
+            && tier != crate::state::TIER_ADVANCED
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Parameter {name} is an {} parameter and can't be reverted to the {tier} tier",
+                crate::state::TIER_ADVANCED
+            )));
         }
         let limit = crate::state::value_limit(&tier);
-        if value_len > limit {
+        if input.value.len() > limit {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Value has a content size of {value_len} bytes, which exceeds the {limit} byte \
-                 limit of the {tier} tier."
+                "Value is {} bytes: a {tier} parameter has a content size limit of {limit} bytes",
+                input.value.len()
             )));
         }
-
-        // `AllowedPattern`: "A regular expression used to validate the parameter
-        // value." A pattern that is not a regular expression, or is longer or larger
-        // than the budget [`crate::state::compile_allowed_pattern`] allows, is refused
-        // as such; a value the pattern does not accept is a pattern mismatch. Both the
-        // compile and the match run with NO store guard held, and on a value the tier
-        // limit above has already bounded.
-        let allowed_pattern = input
-            .allowed_pattern
-            .clone()
-            .filter(|pattern| !pattern.is_empty());
-        if let Some(pattern) = allowed_pattern.as_deref() {
-            let compiled = crate::state::compile_allowed_pattern(pattern).map_err(|refusal| {
-                PutParameterErrorModeled::InvalidAllowedPatternException(
-                    InvalidAllowedPatternException {
-                        message: Some(refusal),
-                    },
-                )
-            })?;
-            if !compiled.is_match(&input.value) {
-                return Err(PutParameterErrorModeled::ParameterPatternMismatchException(
-                    ParameterPatternMismatchException {
+        // "Standard parameters ... can't be configured to use parameter policies."
+        if has_policies && tier != crate::state::TIER_ADVANCED {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Policies require an {} parameter; this request would create a {tier} parameter",
+                crate::state::TIER_ADVANCED
+            )));
+        }
+        // Retention displaces the oldest version — but "if the oldest version has a
+        // label attached to it, Parameter Store won't delete the version and instead
+        // presents this error message".
+        if existing.as_ref().is_some_and(|held| {
+            held.retained >= crate::state::MAX_VERSIONS_RETAINED && held.oldest_labelled
+        }) {
+            return Err(PutParameterErrorModeled::ParameterMaxVersionLimitExceeded(
+                ParameterMaxVersionLimitExceeded {
+                    message: Some(format!(
+                        "Parameter {name} retains {} versions and its oldest version can't be \
+                         deleted because it has a label associated with it",
+                        crate::state::MAX_VERSIONS_RETAINED
+                    )),
+                },
+            )
+            .into());
+        }
+        // A create is refused once either bound is reached: the per-Region quota, and
+        // the store's own total — the Region is a caller-chosen partition of the key
+        // space, so only the total keeps this process finite.
+        if existing.is_none() {
+            let full = (parameters_in_region >= crate::state::MAX_PARAMETERS_PER_REGION)
+                .then_some(("Region", parameters_in_region, crate::state::MAX_PARAMETERS_PER_REGION))
+                .or_else(|| {
+                    (store.parameters.len() >= crate::state::MAX_PARAMETERS_TOTAL).then_some((
+                        "store",
+                        store.parameters.len(),
+                        crate::state::MAX_PARAMETERS_TOTAL,
+                    ))
+                });
+            if let Some((scope, held, maximum)) = full {
+                return Err(PutParameterErrorModeled::ParameterLimitExceeded(
+                    ParameterLimitExceeded {
                         message: Some(format!(
-                            "Parameter value cannot be validated against AllowedPattern: {pattern}"
+                            "this {scope} already holds {held} parameters, the maximum of {maximum}"
                         )),
                     },
                 )
@@ -490,94 +715,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `KeyId`: "Required for parameters that use the SecureString data type. If
-        // you don't specify a key ID, the system uses the default key associated with
-        // your Amazon Web Services account."
-        let key_id = match (parameter_type.as_str(), input.key_id.clone()) {
-            (crate::state::TYPE_SECURE_STRING, None) => {
-                Some(crate::state::DEFAULT_SECURE_STRING_KEY_ID.to_string())
-            }
-            (_, key_id) => key_id,
-        };
-
-        let mut version = crate::state::ParameterVersion {
-            // Replaced below with the number the store settles on.
-            version: 1,
+        let version = existing.as_ref().map_or(1, |held| held.next_version);
+        let stored_version = crate::state::ParameterVersionRecord {
+            version,
             value: input.value,
-            r#type: parameter_type,
-            description: input.description,
-            key_id,
-            allowed_pattern,
-            policies,
+            type_,
             data_type,
             tier: tier.clone(),
-            last_modified_date: ::std::time::SystemTime::now(),
+            description: input.description,
+            allowed_pattern: input.allowed_pattern,
+            // "If you don't specify a key ID, the system uses the default key
+            // associated with your Amazon Web Services account", which Parameter Store
+            // reaches through this alias; a type that is not encrypted carries none.
+            key_id: match (secure, input.key_id) {
+                (true, Some(key_id)) => Some(key_id),
+                (true, None) => Some(crate::state::DEFAULT_SECURE_STRING_KEY_ID.to_string()),
+                (false, _) => None,
+            },
+            policies: input.policies,
+            last_modified_date: now,
+            // Only `LabelParameterVersion` attaches a label, so a version is created
+            // carrying none.
+            labels: ::std::collections::BTreeSet::new(),
         };
 
-        // The write, under the guard. Everything only the stored record can settle is
-        // decided HERE, against what the store holds now rather than against the
-        // snapshot this request validated with: another request may have created or
-        // versioned this parameter while that validation ran.
-        let mut store = state.lock();
-        let assigned_version = match store.parameters.get_mut(&name) {
+        match store.parameter_mut(&region, name) {
             Some(record) => {
-                if !overwrite {
-                    return Err(already_exists(&name, record.current.version));
+                record.push_version(stored_version);
+                // Tags are a property of the parameter rather than of one version, so
+                // a put that carries them replaces the set and one that carries none
+                // leaves it as it was.
+                if let Some(tags) = input.tags {
+                    record.tags = crate::state::to_btree_map(Some(tags));
                 }
-                // An advanced parameter cannot be written back to the standard tier,
-                // even if it only became advanced after the snapshot was taken.
-                if record.current.tier == crate::state::TIER_ADVANCED
-                    && version.tier != crate::state::TIER_ADVANCED
-                {
-                    return Err(cannot_revert_tier(&name));
-                }
-                // An update that names no type inherits the stored one, so it is the
-                // type the record carries now that is inherited.
-                if input.r#type.is_none() {
-                    version.r#type = record.current.r#type.clone();
-                }
-                // Versions have to stay a sequence.
-                version.version = record.current.version + 1;
-                let assigned = version.version;
-                record.push_version(version);
-                assigned
             }
-            None => {
-                // The store's capacity, decided under the same guard as the insert so
-                // the map cannot grow past it however many requests race here.
-                if store.parameters.len() >= crate::state::MAX_PARAMETERS {
-                    return Err(PutParameterErrorModeled::ParameterLimitExceeded(
-                        ParameterLimitExceeded {
-                            message: Some(format!(
-                                "This account and Region already holds {} parameters, the maximum \
-                                 of {}. Delete one or more parameters and try again.",
-                                store.parameters.len(),
-                                crate::state::MAX_PARAMETERS
-                            )),
-                        },
-                    )
-                    .into());
-                }
-                let region = crate::state::request_region(ctx.parts());
-                let record = crate::state::ParameterRecord {
-                    arn: crate::state::parameter_arn(&region, &name),
-                    name: name.clone(),
-                    tags: input
-                        .tags
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|tag| (tag.key, tag.value))
-                        .collect(),
-                    current: version,
-                    superseded: Vec::new(),
-                };
-                store.parameters.insert(name, record);
-                1
-            }
-        };
+            None => store.insert_parameter(crate::state::ParameterRecord {
+                name: name.to_string(),
+                region,
+                tags: crate::state::to_btree_map(input.tags),
+                versions: vec![stored_version],
+            }),
+        }
 
         Ok(PutParameterOutput {
-            version: assigned_version,
+            version,
             tier: Some(tier),
         })
     }

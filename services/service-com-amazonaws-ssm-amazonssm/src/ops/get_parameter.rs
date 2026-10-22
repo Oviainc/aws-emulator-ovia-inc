@@ -1,14 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParameter
+//! Get information about a single parameter by specifying the parameter name — the read
+//! half of Parameter Store. This is the ONLY file to touch for this operation.
 //!
-//! Reports one parameter out of this service's Parameter Store state, at the version
-//! the request's `Name` selector addresses. A pure read: it writes nothing.
+//! The answer is computed from the persisted parameter `PutParameter` wrote (see
+//! [`crate::state`]): the parameter's newest version by default, or the version or label
+//! a `name:selector` suffix names. Nothing here mutates the store — a read must not
+//! change what a later caller sees.
 //!
-//! `WithDecryption` does not change the reported value. This emulator stores a
-//! `SecureString`'s value as the `PutParameter` call gave it and holds no KMS
-//! ciphertext, so there is nothing to decrypt and nothing encrypted to report
-//! instead — the flag is accepted and the stored value is answered either way.
+//! ## `WithDecryption` and `SecureString`
+//!
+//! This emulator holds no key material and encrypts nothing, so a `SecureString`'s value
+//! is reported exactly as `PutParameter` persisted it and `WithDecryption` selects
+//! nothing. The alternative — answering an undecrypted read with a ciphertext-shaped
+//! blob — would be inventing a value nothing computed, which is worse than reporting what
+//! is stored. For `String` and `StringList` the flag is ignored by the service too
+//! ("This flag is ignored for String and StringList parameter types").
+//!
+//! ## Parameters nobody created
+//!
+//! A name this Region and account hold no parameter for is the modelled
+//! `ParameterNotFound`, including the AWS-managed `/aws/...` namespace (the public
+//! AMI-alias parameters, say). No caller can create one — `PutParameter` refuses a name
+//! prefixed with `aws` or `ssm` — and this emulator seeds none: their values are AWS's
+//! own published catalog data (an AMI id for a Region and a release), which nothing here
+//! computes and no other operation of this emulator would recognise. Answering with an
+//! invented id would be fabricating a value nothing produced, so such a read reports the
+//! modelled error instead.
 //!
 //! ## Shape of an operation
 //!
@@ -165,69 +184,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetParameterErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Parameter Store is unavailable".to_string()),
+                message: Some("the parameter store is unavailable".to_string()),
             })
         })?;
-        let state = state.lock();
 
-        // "Parameter names can't contain spaces. The service removes any spaces
-        // specified for the beginning or end of a parameter name. If the specified
-        // name for a parameter contains spaces between characters, the request fails
-        // with a ValidationException error."
-        let requested = crate::state::canonical_name(&input.name);
-        if requested.chars().any(char::is_whitespace) {
+        // The spaces rule is the one refusal a read makes: the service trims the name
+        // and fails a name with spaces between characters with a `ValidationException`,
+        // which `GetParameter` models no error for.
+        let name = crate::state::trimmed_name(&input.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let not_found = || {
+            GetParameterErrorModeled::ParameterNotFound(ParameterNotFound {
+                message: Some(format!("Parameter {name} not found")),
+            })
+        };
+
+        // A name this service could never have stored (an ARN of another service, say)
+        // names no parameter, so it is a miss rather than a refusal.
+        let Some(query) = crate::state::parse_parameter_query(name) else {
+            return Err(not_found().into());
+        };
+        // `name:` names neither a version nor a label: the selector is missing rather
+        // than unknown, so the request is refused rather than answered with a
+        // version-not-found for a selector that was never given.
+        if query.selector == Some("") {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Name {requested:?} contains a space between characters: parameter names can't \
-                 contain spaces"
+                "Name '{name}' ends in ':' but names no version or label after it"
             )));
         }
+        // A full ARN names the account and the Region its parameter lives in, and a
+        // parameter is resolved through the endpoint it is asked for: an ARN naming
+        // another account or another Region than this request was signed for names
+        // nothing reachable here. The Region therefore never comes from the request
+        // body — only from the signed credential scope, which [`request_region`]
+        // constrains.
+        let region = crate::state::request_region(ctx.parts());
+        if query
+            .account
+            .is_some_and(|account| account != ::engine::emulator_account_id())
+            || query.region.is_some_and(|named| named != region)
+        {
+            return Err(not_found().into());
+        }
 
-        let (addressed, selector) = crate::state::split_selector(requested);
-        let record = state.parameter(addressed).ok_or_else(|| {
-            GetParameterErrorModeled::ParameterNotFound(ParameterNotFound {
-                message: Some(format!(
-                    "Parameter {addressed} not found. Verify the name and try again."
-                )),
-            })
-        })?;
-
-        // A selector is either a version number or a label. A version number names a
-        // retained version or nothing; a label resolves no version at all here —
-        // `LabelParameterVersion` is still a scaffold, so nothing can attach one — and
-        // a `name:label` that resolves to nothing is the parameter not being found,
-        // the version-not-found error being about a version number.
-        let version = match selector {
-            None => &record.current,
-            Some(selector) => match selector.parse::<i64>() {
-                Ok(number) => record.version(number).ok_or_else(|| {
-                    GetParameterErrorModeled::ParameterVersionNotFound(ParameterVersionNotFound {
-                        message: Some(format!(
-                            "Version {number} of parameter {} wasn't found. Verify the parameter \
-                             name and version, and try again.",
-                            record.name
-                        )),
-                    })
-                })?,
-                Err(_) => {
-                    return Err(GetParameterErrorModeled::ParameterNotFound(
-                        ParameterNotFound {
-                            message: Some(format!(
-                                "Parameter {} has no version labelled {selector}. Verify the name \
-                                 and try again.",
-                                record.name
-                            )),
-                        },
-                    )
-                    .into())
-                }
-            },
+        let store = state.lock();
+        let Some(record) = store.parameter(&region, query.name) else {
+            return Err(not_found().into());
+        };
+        let Some(version) = record.select(query.selector) else {
+            // The parameter exists, so what the request named is a version or a label
+            // this parameter does not carry.
+            return Err(GetParameterErrorModeled::ParameterVersionNotFound(
+                ParameterVersionNotFound {
+                    message: Some(format!(
+                        "Parameter {} has no version or label '{}'",
+                        record.name,
+                        query.selector.unwrap_or_default()
+                    )),
+                },
+            )
+            .into());
         };
 
         Ok(GetParameterOutput {
-            parameter: Some(record.to_modeled(version, selector.map(str::to_string))),
+            parameter: Some(version.to_parameter(record, query.selector)),
         })
     }
 }
