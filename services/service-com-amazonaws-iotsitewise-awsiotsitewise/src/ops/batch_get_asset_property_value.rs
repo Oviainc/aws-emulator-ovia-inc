@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetAssetPropertyValue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetAssetPropertyValue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetAssetPropertyValue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the latest stored value of every asset property
+//! an entry names, reading the shared engine store (`crate::state`) and writing
+//! nothing; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,285 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetAssetPropertyValue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetAssetPropertyValueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetAssetPropertyValue"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal("the IoT SiteWise store is unavailable"))?;
+        let _ = ctx;
+
+        // "You can specify up to 128 entries per request." The model carries no
+        // `@length` for the list, so the documented bound is enforced here; it is a
+        // bound on the INPUT SHAPE, so it is a request-validation failure
+        // (`InvalidRequestException`, 400), the same status the runtime's own
+        // constraint check answers with for a modelled `@length`.
+        if input.entries.len() > MAX_ENTRIES {
+            return Err(invalid_request(format!(
+                "A request carries at most {MAX_ENTRIES} entries, but this one carries {}.",
+                input.entries.len()
+            )));
+        }
+
+        // A `nextToken` resumes THIS request's entry list at the entry the previous
+        // page stopped before, so it only means something against the SAME list: a
+        // token this service never issued, one replayed against a different entry
+        // list, or one past the end of the list it is replayed against names no page.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => decode_page_token(token, &input.entries)
+                .filter(|at| *at < input.entries.len())
+                .ok_or_else(|| {
+                    invalid_request(format!(
+                        "The nextToken {token} does not name a page of this request's {} entries.",
+                        input.entries.len()
+                    ))
+                })?,
+        };
+
+        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // Everything before `start` was "completely processed by previous paginated
+        // requests", so it is reported as skipped rather than answered again, with
+        // the completion status the entry resolves to.
+        let mut skipped_entries = Vec::with_capacity(start);
+        for entry in &input.entries[..start] {
+            let (completion_status, error_info) = match resolve_entry(&store, entry) {
+                Ok(_) => (COMPLETION_SUCCESS, None),
+                Err((error_code, _)) => (
+                    COMPLETION_ERROR,
+                    Some(BatchGetAssetPropertyValueErrorInfo {
+                        error_code: error_code.to_string(),
+                        error_timestamp: crate::state::to_date_time(now),
+                    }),
+                ),
+            };
+            skipped_entries.push(BatchGetAssetPropertyValueSkippedEntry {
+                entry_id: entry.entry_id.clone(),
+                completion_status: completion_status.to_string(),
+                error_info,
+            });
+        }
+
+        // Walk from `start` while the page's result set stays inside its byte
+        // budget: an entry that resolves reports the latest stored value of the
+        // property it names, one that does not reports the error code for why.
+        let mut success_entries = Vec::new();
+        let mut error_entries = Vec::new();
+        let mut spent = 0usize;
+        let mut at = start;
+        while let Some(entry) = input.entries.get(at) {
+            let resolved = resolve_entry(&store, entry);
+            let cost = entry_bytes(entry, &resolved);
+            // The first entry of a page always goes in, so one entry larger than the
+            // whole budget still makes progress instead of stalling the walk.
+            if at > start && spent + cost > PAGE_BYTE_BUDGET {
+                break;
+            }
+            spent += cost;
+            match resolved {
+                Ok(asset_property_value) => {
+                    success_entries.push(BatchGetAssetPropertyValueSuccessEntry {
+                        entry_id: entry.entry_id.clone(),
+                        asset_property_value,
+                    })
+                }
+                Err((error_code, error_message)) => {
+                    error_entries.push(BatchGetAssetPropertyValueErrorEntry {
+                        error_code: error_code.to_string(),
+                        error_message,
+                        entry_id: entry.entry_id.clone(),
+                    })
+                }
+            }
+            at += 1;
+        }
+
+        Ok(BatchGetAssetPropertyValueOutput {
+            error_entries,
+            success_entries,
+            skipped_entries,
+            // "The token for the next set of results, or null if there are no
+            // additional results."
+            next_token: (at < input.entries.len()).then(|| encode_page_token(at, &input.entries)),
+        })
     }
+}
+
+/// How many entries one request carries, from the model doc on
+/// `BatchGetAssetPropertyValueRequest$entries`: "You can specify up to 128 entries
+/// per request."
+const MAX_ENTRIES: usize = 128;
+
+/// How many bytes of result set one page carries before the rest of the entries
+/// become the next page.
+///
+/// CHOSEN, not documented: IoT SiteWise publishes a size-based result-set limit for
+/// the sibling `BatchGetAssetPropertyValueHistory` (4 MB) but none for this
+/// operation, whose request is instead bounded at [`MAX_ENTRIES`] entries of one
+/// value each. The cap is set high enough that an ordinary request — 128 latest
+/// values of bounded size — is answered in a SINGLE page, exactly as the real
+/// service answers it, and only a request whose values are themselves megabytes
+/// (`PropertyValueStringValue` carries no length bound) is split.
+const PAGE_BYTE_BUDGET: usize = 1024 * 1024;
+
+/// Fixed per-entry cost of a result entry: the JSON braces, member names and
+/// separators every `successEntries`/`errorEntries` element carries, before its
+/// `entryId` and its value.
+const ENTRY_OVERHEAD_BYTES: usize = 96;
+
+/// Fixed cost of one `AssetPropertyValue`: its `timestamp`, `quality` and the
+/// `Variant` member names, before a string value's own bytes.
+const VALUE_OVERHEAD_BYTES: usize = 128;
+
+/// `BatchEntryCompletionStatus` value a skipped entry that had resolved reports.
+const COMPLETION_SUCCESS: &str = "SUCCESS";
+
+/// `BatchEntryCompletionStatus` value a skipped entry that had not resolved reports.
+const COMPLETION_ERROR: &str = "ERROR";
+
+/// Resolve one entry to the latest stored value of the property it names — `None`
+/// when the property exists but nothing has been written to it — or to the
+/// `BatchGetAssetPropertyValueErrorCode` and message the entry should report.
+///
+/// The asset label goes through [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::resolve_asset_id`],
+/// the same resolver `GetAssetPropertyValue`/`BatchPutAssetPropertyValue` use, so
+/// one asset is named one way across the service.
+fn resolve_entry(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    entry: &BatchGetAssetPropertyValueEntry,
+) -> Result<Option<AssetPropertyValue>, (&'static str, String)> {
+    // "To identify an asset property, you must specify one of the following: the
+    // assetId and propertyId of an asset property; a propertyAlias."
+    let (asset_id, property_id) = match (
+        entry.asset_id.as_deref(),
+        entry.property_id.as_deref(),
+        entry.property_alias.as_deref(),
+    ) {
+        (Some(asset_label), Some(property_id), None) => {
+            let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                (
+                    ERROR_NOT_FOUND,
+                    format!("The asset {asset_label} could not be found."),
+                )
+            })?;
+            let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
+                asset
+                    .properties
+                    .iter()
+                    .any(|property| property.id == property_id)
+            });
+            if !has_property {
+                return Err((
+                    ERROR_NOT_FOUND,
+                    format!("The asset {asset_label} has no property {property_id}."),
+                ));
+            }
+            (asset_id, property_id.to_string())
+        }
+        (None, None, Some(alias)) => store
+            .property_alias_index
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    ERROR_NOT_FOUND,
+                    format!("The property alias {alias} could not be found."),
+                )
+            })?,
+        _ => {
+            return Err((
+                ERROR_INVALID_REQUEST,
+                "Each entry must specify either assetId and propertyId, or propertyAlias."
+                    .to_string(),
+            ))
+        }
+    };
+
+    // The latest value is the last element of the ascending series.
+    Ok(store.latest_property_value(&asset_id, &property_id).cloned())
+}
+
+/// `BatchGetAssetPropertyValueErrorCode` value for an entry naming no stored
+/// property.
+const ERROR_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// `BatchGetAssetPropertyValueErrorCode` value for an entry that identifies no
+/// property at all.
+const ERROR_INVALID_REQUEST: &str = "InvalidRequestException";
+
+/// How many bytes of result set this entry's answer contributes, as the page
+/// budget counts them.
+fn entry_bytes(
+    entry: &BatchGetAssetPropertyValueEntry,
+    resolved: &Result<Option<AssetPropertyValue>, (&'static str, String)>,
+) -> usize {
+    let answer = match resolved {
+        Ok(Some(value)) => {
+            VALUE_OVERHEAD_BYTES
+                + value
+                    .value
+                    .string_value
+                    .as_ref()
+                    .map_or(0, |string| string.len())
+        }
+        Ok(None) => 0,
+        Err((error_code, error_message)) => error_code.len() + error_message.len(),
+    };
+    ENTRY_OVERHEAD_BYTES + entry.entry_id.len() + answer
+}
+
+/// The `nextToken` for a page of `entries` resuming at entry `at`, in the hex form
+/// this service's other paginated operations issue (and inside `NextToken`'s
+/// modelled `^[A-Za-z0-9+/=]+$` pattern).
+///
+/// The token carries the FINGERPRINT of the entry list beside the position, so a
+/// token is only honoured against the request that produced it: replayed against a
+/// different list it names no page, rather than silently re-paging that other list
+/// and reporting its leading entries as already processed.
+fn encode_page_token(at: usize, entries: &[BatchGetAssetPropertyValueEntry]) -> String {
+    ::hex::encode(format!("{at}|{}", entries_fingerprint(entries)))
+}
+
+/// The entry index a `nextToken` resumes `entries` at, or `None` when it is not a
+/// token this service issued for this entry list.
+fn decode_page_token(token: &str, entries: &[BatchGetAssetPropertyValueEntry]) -> Option<usize> {
+    let decoded = ::hex::decode(token).ok()?;
+    let (at, fingerprint) = ::std::str::from_utf8(&decoded).ok()?.split_once('|')?;
+    (fingerprint == entries_fingerprint(entries)).then_some(())?;
+    at.parse().ok()
+}
+
+/// A short digest of what the entries of one request identify, in order: the value
+/// a page token binds itself to.
+fn entries_fingerprint(entries: &[BatchGetAssetPropertyValueEntry]) -> String {
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    for entry in entries {
+        for field in [
+            entry.entry_id.as_str(),
+            entry.asset_id.as_deref().unwrap_or(""),
+            entry.property_id.as_deref().unwrap_or(""),
+            entry.property_alias.as_deref().unwrap_or(""),
+        ] {
+            ::sha2::Digest::update(&mut digest, field.as_bytes());
+            ::sha2::Digest::update(&mut digest, b"\x1f");
+        }
+        ::sha2::Digest::update(&mut digest, b"\x1e");
+    }
+    ::hex::encode(&<::sha2::Sha256 as ::sha2::Digest>::finalize(digest)[..8])
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal(message: &str) -> BatchGetAssetPropertyValueError {
+    BatchGetAssetPropertyValueError::Modeled(
+        BatchGetAssetPropertyValueErrorModeled::InternalFailureException(InternalFailureException {
+            message: message.to_string(),
+        }),
+    )
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> BatchGetAssetPropertyValueError {
+    BatchGetAssetPropertyValueError::Modeled(
+        BatchGetAssetPropertyValueErrorModeled::InvalidRequestException(InvalidRequestException {
+            message,
+        }),
+    )
 }
