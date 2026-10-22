@@ -174,6 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@idempotent`: deactivating an already-inactive subscription is a no-op, so
         // the stamps it already carries stay put rather than being rewritten per call.
+        //
+        // `activated_at` is deliberately NOT cleared here, mirroring
+        // `ActivateSubscription`: each stamp records that its transition happened, so
+        // both boundaries of the billing interval stay readable.
         if subscription.status != crate::state::SubscriptionStatus::Inactive {
             subscription.status = crate::state::SubscriptionStatus::Inactive;
             subscription.deactivated_at = Some(now);
