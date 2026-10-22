@@ -21,7 +21,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Encodes/decodes the opaque `NextToken` ListWorkspaceInstances pages with.
+# Encodes/decodes the opaque `NextToken` the paginated list operations page with.
 hex = { workspace = true }
 
 [build-dependencies]
