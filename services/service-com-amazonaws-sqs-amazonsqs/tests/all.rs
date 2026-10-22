@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/queue_configuration.rs"]
 mod queue_configuration;
+#[path = "all/queue_tags.rs"]
+mod queue_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support.rs"]
+mod support;

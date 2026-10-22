@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds cost allocation tags to one queue, as an UPSERT over the tag map stored on
+//! that queue's [`crate::state::Queue`] record: "A new tag with a key identical to
+//! that of an existing tag overwrites the existing tag", and every key the request
+//! does not name keeps the value it had. `ListQueueTags` reports the result.
+//!
+//! The tag restrictions the member's documentation points at bound the map, over the
+//! tag set a call would leave the queue with — see [`crate::state::tag_refusal`].
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagQueue"))
+        use crate::state;
+
+        let _ = ctx;
+        // "The list of tags to be added to the specified queue": a map that names no
+        // tag adds nothing, a request this operation models no error for — so it rides
+        // the 400 `ValidationException` channel, exactly as an empty `Attributes` map
+        // does in `SetQueueAttributes`.
+        if input.tags.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Tags must name at least one tag to add",
+            ));
+        }
+
+        let store = state::service_state(&*self.engine).ok_or_else(|| {
+            TagQueueErrorModeled::UnsupportedOperation(state::store_unavailable())
+        })?;
+        let mut store = store.lock();
+
+        let name = state::queue_name_from_url(&input.queue_url)
+            .filter(|name| store.queues.contains_key(*name))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                TagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(
+                    &input.queue_url,
+                ))
+            })?;
+
+        let queue = store
+            .queues
+            .get_mut(&name)
+            .expect("the queue was resolved out of this same store");
+        // The tag restrictions the member's documentation points at, checked against
+        // the tag set this call would LEAVE the queue with, BEFORE anything is stored:
+        // a refused request changes nothing, and no sequence of calls grows one queue's
+        // tag map past the bound. This operation models no error for a malformed
+        // member, hence the 400 `ValidationException` channel rather than a 501.
+        if let Some(why) = state::tag_refusal(&queue.tags, &input.tags) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        // An UPSERT, never a replace: "A new tag with a key identical to that of an
+        // existing tag overwrites the existing tag", and "Tags are case-sensitive", so
+        // keys that differ only in case are different tags. The values are stored
+        // verbatim — "Amazon SQS interprets tags as character strings" with no semantic
+        // meaning, so nothing here normalises or re-encodes them.
+        for (key, value) in &input.tags {
+            queue.tags.insert(key.clone(), value.clone());
+        }
+        // `last_modified_at` is NOT touched: it reports the queue's
+        // `LastModifiedTimestamp` attribute, and a tag is not one of the attributes
+        // `GetQueueAttributes` reports, so tagging leaves that view of the queue
+        // unchanged.
+
+        Ok(TagQueueOutput)
     }
 }
