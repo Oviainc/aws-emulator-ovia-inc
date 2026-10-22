@@ -181,6 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                 })?;
 
+        let now = ::std::time::SystemTime::now();
+
         // The per-resource tag rules hold wherever a caller supplies tags, so a create
         // applies the same ones `TagResource` does: at most
         // `MAX_TAGS_PER_RESOURCE` tags on the resource, no reserved key, one tag per key.
@@ -197,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        store.settle(::std::time::SystemTime::now());
+        store.settle(now);
 
         // "keyspace names must be unique within each Region": a create of a name already
         // taken is the `ConflictException` the model declares for this operation. Checked
@@ -229,6 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let resource_arn = crate::state::keyspace_arn(&region, &input.keyspace_name);
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
         store.keyspaces.insert(
             input.keyspace_name.clone(),
             crate::state::Keyspace {
@@ -237,9 +240,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 replication_strategy,
                 replication_regions,
                 tags,
+                // "CreateKeyspace is an asynchronous operation. You can monitor the
+                // creation status of the new keyspace by using the GetKeyspace operation."
+                // The clock owes the ACTIVE transition one span from now; `settle`
+                // materialises it, and nothing sleeps for it.
+                status: crate::state::KEYSPACE_STATUS_CREATING.to_string(),
+                status_due_at: Some(settles_at),
                 tables: ::std::collections::BTreeMap::new(),
             },
         );
+        // The clock now owes this keyspace its ACTIVE transition; tell the store the
+        // earliest instant at which `settle` has to look at the store again.
+        store.note_transition_due(settles_at);
 
         Ok(CreateKeyspaceOutput { resource_arn })
     }

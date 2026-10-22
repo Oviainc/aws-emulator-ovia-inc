@@ -221,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // parameters; a request with no token is not a retry of anything.
             let is_retry = input.creator_request_id.is_some()
                 && existing.creator_request_id == input.creator_request_id
+                && existing.vault_type == crate::state::VAULT_TYPE_BACKUP_VAULT
                 && named_key == input.encryption_key_arn
                 && existing.tags == tags;
             if !is_retry {
@@ -278,6 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_date: now,
             vault_type: crate::state::VAULT_TYPE_BACKUP_VAULT.to_string(),
             vault_state: None,
+            // An ordinary vault is ready the moment it is created (this
+            // operation's output models no `VaultState` at all), so the clock
+            // owes it no transition.
+            settles_at: None,
             tags,
             lock: None,
         };

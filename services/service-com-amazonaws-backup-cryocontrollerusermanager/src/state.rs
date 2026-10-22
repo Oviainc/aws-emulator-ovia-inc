@@ -40,6 +40,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// `VaultType` for an ordinary backup vault (model enum `VaultType`).
 pub const VAULT_TYPE_BACKUP_VAULT: &str = "BACKUP_VAULT";
+/// `VaultType` for a logically air-gapped backup vault (model enum `VaultType`).
+pub const VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT: &str =
+    "LOGICALLY_AIR_GAPPED_BACKUP_VAULT";
+/// `VaultState` of a vault that is ready to receive backups (model enum `VaultState`).
+pub const VAULT_STATE_AVAILABLE: &str = "AVAILABLE";
+/// `VaultState` of a vault whose creation has not settled yet (model enum
+/// `VaultState`).
+pub const VAULT_STATE_CREATING: &str = "CREATING";
 /// `EncryptionKeyType` when the caller supplied no `EncryptionKeyArn`.
 pub const ENCRYPTION_KEY_TYPE_AWS_OWNED: &str = "AWS_OWNED_KMS_KEY";
 /// `EncryptionKeyType` when the caller supplied an `EncryptionKeyArn`.
@@ -162,6 +170,26 @@ pub const IDEMPOTENCY_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// `CREATED` state, and the due instant is stored on the job
 /// ([`BackupJob::settles_at`]) so no handler ever sleeps for it.
 pub const JOB_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// How long after a create the vault settles from `CREATING` to `AVAILABLE`.
+///
+/// A CHOSEN span, not a documented one: AWS takes as long as provisioning the
+/// vault needs. It is deliberately non-zero so a caller that describes or
+/// deletes the vault straight after creating it still observes the transient
+/// `CREATING` state and the refusal that goes with it, and the due instant is
+/// stored on the vault ([`BackupVault::settles_at`]) so no handler ever sleeps
+/// for it.
+pub const VAULT_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// The smallest `MinRetentionDays` a logically air-gapped vault accepts, as the
+/// model documents for the member ("This setting specifies the minimum
+/// retention period that the vault retains its recovery points. The minimum
+/// value accepted is 7 days").
+pub const MIN_RETENTION_DAYS_FLOOR: i64 = 7;
+
+/// The `Code` AWS Backup carries on the `InvalidRequestException` that refuses
+/// an operation on a vault still in `CREATING` state.
+pub const ERROR_CODE_VAULT_STILL_CREATING: &str = "ERROR_9100";
 
 /// A seconds-per-day constant for turning `Lifecycle` day counts into the
 /// instants `CalculatedLifecycle` reports.
@@ -525,14 +553,20 @@ pub struct BackupVault {
     pub encryption_key_type: Option<String>,
     pub creator_request_id: Option<String>,
     pub creation_date: SystemTime,
-    /// Always [`VAULT_TYPE_BACKUP_VAULT`] for a vault made by `CreateBackupVault`;
-    /// the other `VaultType` values belong to operations still at 501.
+    /// [`VAULT_TYPE_BACKUP_VAULT`] for a vault made by `CreateBackupVault` and
+    /// [`VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT`] for one made by
+    /// `CreateLogicallyAirGappedBackupVault`; `RESTORE_ACCESS_BACKUP_VAULT`
+    /// belongs to an operation still at 501.
     pub vault_type: String,
     /// `VaultState`, as this vault's type reports it. `None` for a standard
     /// `BACKUP_VAULT`, for the reason given on [`Self::encryption_key_type`];
     /// the vault types that do carry a state are created by operations still at
     /// 501.
     pub vault_state: Option<String>,
+    /// When the clock owes this vault its `CREATING` -> `AVAILABLE`
+    /// transition, for a vault whose create reports a non-terminal state. See
+    /// [`VAULT_SETTLE_AFTER`]. `None` for a vault created ready.
+    pub settles_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
     /// The vault-lock configuration, once one has been applied.
     pub lock: Option<VaultLock>,
@@ -718,6 +752,37 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             ((seq >> 48) & 0xffff) as u16,
             seq & 0xffff_ffff_ffff,
         )
+    }
+
+    /// Materialise the transition the clock has already made due, for ONE
+    /// vault: the `CREATING` -> `AVAILABLE` transition a create that reports a
+    /// non-terminal state owes. Like [`Self::settle_job`] this is the only
+    /// write a reporting operation performs — the vault was owed its
+    /// availability at `settles_at` whether or not anybody called — and only
+    /// the vault asked about is touched.
+    pub fn settle_vault(&mut self, vault_name: &str, now: SystemTime) {
+        if let Some(vault) = self.vaults.get_mut(vault_name) {
+            if vault.vault_state.as_deref() == Some(VAULT_STATE_CREATING)
+                && vault.settles_at.is_some_and(|due| now >= due)
+            {
+                vault.vault_state = Some(VAULT_STATE_AVAILABLE.to_string());
+            }
+        }
+    }
+
+    /// The same for every stored vault, for an operation that reports them all:
+    /// a list and a describe of the same vault can then never disagree about
+    /// its state.
+    pub fn settle_vaults(&mut self, now: SystemTime) {
+        let names: Vec<String> = self
+            .vaults
+            .iter()
+            .filter(|(_, vault)| vault.vault_state.as_deref() == Some(VAULT_STATE_CREATING))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            self.settle_vault(&name, now);
+        }
     }
 
     /// The KMS key this service encrypts a vault with when the create request

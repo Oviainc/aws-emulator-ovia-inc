@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTagOption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTagOption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTagOption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +137,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTagOption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTagOptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTagOption"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // A TagOption IS its key/value pair: `AssociateTagOptionWithResource` addresses
+        // one by id, and a resource may carry one value per key, so the same pair cannot
+        // exist twice. `DuplicateResourceException` ("The specified resource is a
+        // duplicate") is the modelled refusal for exactly that, and its message names
+        // the pair the request asked for.
+        if state
+            .tag_options
+            .values()
+            .any(|option| option.key == input.key && option.value == input.value)
+        {
+            return Err(CreateTagOptionErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!(
+                        "TagOption with key {} and value {} already exists",
+                        input.key, input.value
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's TagOption quota. Refused before anything is stored, so a caller
+        // cannot grow the store past it by repeating the call. It also bounds the
+        // uniqueness scan above.
+        if state.tag_options.len() >= crate::state::MAX_TAG_OPTIONS {
+            return Err(CreateTagOptionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "An account cannot hold more than {} TagOptions.",
+                        crate::state::MAX_TAG_OPTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.next_tag_option_id();
+        let option = crate::state::TagOption {
+            id: id.clone(),
+            key: input.key,
+            value: input.value,
+            // A created TagOption is active: `UpdateTagOption`'s `Active` member is what
+            // deactivates one.
+            active: true,
+            // "The Amazon Web Services account Id of the owner account that created the
+            // TagOption" — this emulator's one account.
+            owner: ::emulator_server::emulator_account_id().to_string(),
+        };
+
+        let detail = option.detail();
+        state.tag_options.insert(id, option);
+
+        Ok(CreateTagOptionOutput {
+            tag_option_detail: Some(detail),
+        })
     }
 }

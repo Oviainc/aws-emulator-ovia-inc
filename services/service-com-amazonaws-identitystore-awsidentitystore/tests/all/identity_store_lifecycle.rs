@@ -1274,3 +1274,291 @@ async fn an_unknown_user_or_group_is_reported_as_not_found() {
         );
     }
 }
+
+/// AWS's fixed `ResourceNotFoundException` message for a `MembershipId` an identity
+/// store does not hold: one constant sentence naming the identity store ("pool") and
+/// the request member, independent of which id was probed (recorded behaviour, the same
+/// text on every recorded rejection of that class).
+const MEMBERSHIP_NOT_FOUND_MESSAGE: &str =
+    "Group membership not found for given pool and membershipId.";
+
+/// The members a `DescribeGroupMembership` response and a `ListGroupMemberships` entry
+/// both carry, from the two modelled shapes
+/// (`smithy_query(query="operation",operation="DescribeGroupMembership")` and
+/// `smithy_query(query="shape",shape="GroupMembership")`). Both report the same stored
+/// record, so they must agree on every one of them.
+const SHARED_MEMBERSHIP_MEMBERS: &[&str] = &[
+    "IdentityStoreId",
+    "MembershipId",
+    "MembershipArn",
+    "GroupId",
+    "MemberId",
+    "CreatedAt",
+    "UpdatedAt",
+];
+
+/// Create a membership and return its `CreateGroupMembership` response.
+async fn create_membership(
+    router: &MultiServiceRouter,
+    store: &str,
+    group: &str,
+    user: &str,
+    case: &str,
+) -> Value {
+    ok(
+        router,
+        "CreateGroupMembership",
+        json!({
+            "IdentityStoreId": store,
+            "GroupId": group,
+            "MemberId": { "UserId": user },
+        }),
+        case,
+    )
+    .await
+}
+
+/// `id` written in the identifier `form` a row asks for: the modelled `ResourceId`
+/// pattern admits the bare id, the resource's ARN and either letter case, and all three
+/// name the same membership.
+fn membership_identifier(form: &str, id: &str) -> String {
+    match form {
+        "bare id" => id.to_string(),
+        "membership ARN" => format!("arn:aws:identitystore:::membership/{id}"),
+        "upper-case id" => id.to_ascii_uppercase(),
+        other => panic!("unknown identifier form {other:?}"),
+    }
+}
+
+/// The `Message` of an error body, under either protocol casing.
+fn error_message(body: &Value) -> String {
+    body["Message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_created_membership_is_described_exactly_as_it_was_stored() {
+    let router = emulator();
+    // Rows differ along how many members the group holds, WHICH of them is described,
+    // the form of the `MembershipId` the describe names, and whether the identity store
+    // is named by id or by ARN. The single-membership create-then-describe of the
+    // recorded reproduction is the first row.
+    let rows: [(&str, usize, usize, &str, bool); 6] = [
+        ("one member, bare id", 1, 0, "bare id", false),
+        ("three members, the first by ARN", 3, 0, "membership ARN", false),
+        (
+            "three members, a middle one upper-cased",
+            3,
+            1,
+            "upper-case id",
+            false,
+        ),
+        ("three members, the last by id", 3, 2, "bare id", false),
+        ("two members, the store by ARN", 2, 1, "bare id", true),
+        (
+            "five members, membership and store by ARN",
+            5,
+            4,
+            "membership ARN",
+            true,
+        ),
+    ];
+    let store_arn = format!("arn:aws:identitystore::000000000000:identitystore/{STORE}");
+
+    for (case, members, described, form, store_by_arn) in rows {
+        let group = create_group(&router, STORE, &format!("group-{case}"), case).await;
+        let mut created: Vec<(String, String, String)> = Vec::new();
+        for index in 0..members {
+            let user = create_user(&router, STORE, &user_name(case, index), case).await;
+            let response = create_membership(&router, STORE, &group, &user, case).await;
+            created.push((
+                string(&response, "MembershipId", case),
+                string(&response, "MembershipArn", case),
+                user,
+            ));
+        }
+
+        let (membership_id, membership_arn, member) = created[described].clone();
+        let store = if store_by_arn {
+            store_arn.clone()
+        } else {
+            STORE.to_string()
+        };
+        let request = json!({
+            "IdentityStoreId": store,
+            "MembershipId": membership_identifier(form, &membership_id),
+        });
+        let body = ok(&router, "DescribeGroupMembership", request.clone(), case).await;
+
+        // Every member comes from the stored record: the ids are the canonical ones the
+        // create minted, whatever form the request named them in.
+        let reported_id = string(&body, "MembershipId", case);
+        assert_eq!(
+            reported_id, membership_id,
+            "case {case:?}: expected the membership minted as {membership_id}, got {reported_id:?}"
+        );
+        assert_uuid(&reported_id, "MembershipId", case);
+        let reported_arn = string(&body, "MembershipArn", case);
+        assert_eq!(
+            reported_arn, membership_arn,
+            "case {case:?}: expected the ARN minted with the membership ({membership_arn}), \
+             got {reported_arn:?}"
+        );
+        assert_resource_arn(&reported_arn, "membership", &membership_id, case);
+        let reported_store = string(&body, "IdentityStoreId", case);
+        assert_eq!(
+            reported_store, STORE,
+            "case {case:?}: expected the describe to report store {STORE}, got {reported_store:?}"
+        );
+        let reported_group = string(&body, "GroupId", case);
+        assert_eq!(
+            reported_group, group,
+            "case {case:?}: expected the membership's group {group}, got {reported_group:?}"
+        );
+        assert_eq!(
+            body["MemberId"],
+            json!({ "UserId": member }),
+            "case {case:?}: expected the stored member {member}, got {}",
+            body["MemberId"]
+        );
+
+        // The timestamps are the record's own: present, numeric, and equal on a
+        // membership nothing has updated since it was created.
+        for member_name in ["CreatedAt", "UpdatedAt"] {
+            let value = &body[member_name];
+            assert!(
+                value.as_f64().is_some_and(|seconds| seconds > 0.0),
+                "case {case:?}: expected a positive epoch {member_name}, got {value}"
+            );
+        }
+        assert_eq!(
+            body["CreatedAt"], body["UpdatedAt"],
+            "case {case:?}: expected UpdatedAt to equal CreatedAt on a membership \
+             nothing updated, got {} and {}",
+            body["CreatedAt"], body["UpdatedAt"]
+        );
+        // Nothing resolves a caller to an identity-store principal, so these are not
+        // invented.
+        for member_name in ["CreatedBy", "UpdatedBy"] {
+            assert!(
+                body.get(member_name).unwrap_or(&Value::Null).is_null(),
+                "case {case:?}: expected no {member_name} on a membership no principal \
+                 created, got {}",
+                body[member_name]
+            );
+        }
+
+        // The describe and the listing report ONE record, so they agree member by
+        // member.
+        let page = ok(
+            &router,
+            "ListGroupMemberships",
+            json!({ "IdentityStoreId": STORE, "GroupId": group }),
+            case,
+        )
+        .await;
+        let listed = page["GroupMemberships"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["MembershipId"] == json!(membership_id))
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected {membership_id} in the listing, got {page}")
+            });
+        for member_name in SHARED_MEMBERSHIP_MEMBERS {
+            assert_eq!(
+                body[*member_name], listed[*member_name],
+                "case {case:?}: expected the describe and the listing to agree on \
+                 {member_name}, got {} and {}",
+                body[*member_name], listed[*member_name]
+            );
+        }
+
+        // A read changes nothing: the same request answers the same body again.
+        let again = ok(&router, "DescribeGroupMembership", request, case).await;
+        assert_eq!(
+            again, body,
+            "case {case:?}: expected a repeated describe to answer the same body, got {again}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_membership_the_store_does_not_hold_is_reported_as_not_found() {
+    let router = emulator();
+    let case = "seed";
+    let group = create_group(&router, STORE, "engineering", case).await;
+    let alice = create_user(&router, STORE, "alice", case).await;
+    let live = string(
+        &create_membership(&router, STORE, &group, &alice, case).await,
+        "MembershipId",
+        case,
+    );
+    let bob = create_user(&router, STORE, "bob", case).await;
+    let deleted = string(
+        &create_membership(&router, STORE, &group, &bob, case).await,
+        "MembershipId",
+        case,
+    );
+    ok(
+        &router,
+        "DeleteGroupMembership",
+        json!({ "IdentityStoreId": STORE, "MembershipId": deleted.clone() }),
+        case,
+    )
+    .await;
+    // A well-formed id of a membership nothing created: the modelled pattern admits it,
+    // so the refusal comes from state rather than from the boundary validator.
+    let missing = "0123abcd-4567-89ab-cdef-0123456789ab";
+
+    // Rows differ along WHY the store does not hold the membership: never created,
+    // deleted, held by another store, or a store nothing was ever created in.
+    let rows: [(&str, &str, &str); 4] = [
+        ("a well-formed id nothing created", STORE, missing),
+        ("a membership that was deleted", STORE, deleted.as_str()),
+        ("a live membership of another store", OTHER_STORE, live.as_str()),
+        ("a store nothing was created in", OTHER_STORE, missing),
+    ];
+    for (row, store, membership) in rows {
+        let body = refused(
+            &router,
+            "DescribeGroupMembership",
+            json!({ "IdentityStoreId": store, "MembershipId": membership }),
+            404,
+            "ResourceNotFoundException",
+            row,
+        )
+        .await;
+        let resource_type = body["ResourceType"].as_str().unwrap_or_default();
+        assert_eq!(
+            resource_type, "GROUP_MEMBERSHIP",
+            "case {row:?}: expected the modelled ResourceType of a membership, got {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message, MEMBERSHIP_NOT_FOUND_MESSAGE,
+            "case {row:?}: expected the service's fixed not-found message, got {message:?}"
+        );
+    }
+
+    // A refused read left the store as it was: the live membership still describes.
+    let still_there = ok(
+        &router,
+        "DescribeGroupMembership",
+        json!({ "IdentityStoreId": STORE, "MembershipId": live.clone() }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        string(&still_there, "MembershipId", case),
+        live,
+        "case {case:?}: expected the live membership to survive the refused reads, \
+         got {still_there}"
+    );
+}
