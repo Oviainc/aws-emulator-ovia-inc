@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssessments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssessments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssessments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects every STORED assessment into an `AssessmentMetadataItem`, filtered by
+//! `status` and paged by `maxResults`/`nextToken`, with no change to what a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +142,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssessments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssessmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssessments"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssessmentsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Audit Manager store is unavailable".to_string(),
+            })
+        })?;
+        let store = state.lock();
+
+        // The stable ordering every page of this list is cut from: creation
+        // instant, then identifier.
+        let mut ordered: Vec<(String, AssessmentMetadataItem)> = store
+            .assessments
+            .values()
+            .filter(|record| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| record.status == status)
+            })
+            .map(|record| (record.page_key(), record.to_metadata_item()))
+            .collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let page = crate::state::paginate(
+            crate::state::LISTING_ASSESSMENTS,
+            ordered,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListAssessmentsErrorModeled::ValidationException(ValidationException {
+                message: "nextToken: the token is not one this listing issued".to_string(),
+                reason: Some("cannotParse".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: "the token could not be decoded".to_string(),
+                }]),
+            })
+        })?;
+
+        Ok(ListAssessmentsOutput {
+            assessment_metadata: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

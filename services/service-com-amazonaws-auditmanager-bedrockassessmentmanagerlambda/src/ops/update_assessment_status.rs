@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssessmentStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssessmentStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssessmentStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Flips the STORED assessment's status, bumps `lastUpdated`, and answers with
+//! the updated record.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssessmentStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssessmentStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssessmentStatus"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAssessmentStatusErrorModeled::InternalServerException(InternalServerException {
+                message: "the Audit Manager store is unavailable".to_string(),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let updated = crate::state::now();
+        let mut guard = state.lock();
+        // Destructured so the record being mutated and the framework it is
+        // projected with are borrows of two different fields, which is what lets
+        // one lookup both update and answer.
+        let crate::state::ComAmazonawsAuditmanagerBedrockassessmentmanagerlambdaState {
+            assessments,
+            frameworks,
+            ..
+        } = &mut *guard;
+
+        let Some(record) = assessments.get_mut(&input.assessment_id) else {
+            return Err(UpdateAssessmentStatusErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "No assessment found with the identifier {}",
+                        input.assessment_id
+                    ),
+                    resource_id: input.assessment_id.clone(),
+                    resource_type: "assessment".to_string(),
+                },
+            )
+            .into());
+        };
+        // `status` is `@required` and an `AssessmentStatus`, so the boundary has
+        // already refused anything outside the modelled value set.
+        record.status = input.status;
+        record.last_updated = updated;
+
+        // Answer from the STORED record, so this response cannot differ from what
+        // a later read returns.
+        let framework = frameworks.get(&record.framework_id);
+        Ok(UpdateAssessmentStatusOutput {
+            assessment: Some(record.to_assessment(framework, &region)),
+        })
     }
 }

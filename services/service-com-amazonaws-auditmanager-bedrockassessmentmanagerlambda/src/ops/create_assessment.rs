@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssessment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssessment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssessment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an assessment from one of the account's frameworks and STORES it: the
+//! response is a projection of the stored record, so a later `GetAssessment`
+//! returns what this returned.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssessment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssessmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssessment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssessmentErrorModeled::InternalServerException(InternalServerException {
+                message: "the Audit Manager store is unavailable".to_string(),
+            })
+        })?;
+
+        // `Role$roleType`: "In CreateAssessment, roleType can only be PROCESS_OWNER."
+        if let Some(role) = input
+            .roles
+            .iter()
+            .find(|role| role.role_type != crate::state::ROLE_TYPE_PROCESS_OWNER)
+        {
+            return Err(CreateAssessmentErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "roles: roleType must be {} in CreateAssessment, got {}",
+                        crate::state::ROLE_TYPE_PROCESS_OWNER,
+                        role.role_type
+                    ),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "roles".to_string(),
+                        message: format!(
+                            "roleType must be {}",
+                            crate::state::ROLE_TYPE_PROCESS_OWNER
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let created = crate::state::now();
+        let mut store = state.lock();
+
+        // An assessment is created FROM a framework the account holds, so an
+        // identifier that names none is a missing resource.
+        let Some(framework) = store.frameworks.get(&input.framework_id).cloned() else {
+            return Err(CreateAssessmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "No framework found with the identifier {}",
+                        input.framework_id
+                    ),
+                    resource_id: input.framework_id.clone(),
+                    resource_type: "assessmentFramework".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The store is bounded: it holds state for the life of the process and
+        // every create request may add a caller-sized record to it.
+        if store.assessments.len() >= crate::state::ASSESSMENT_QUOTA {
+            return Err(CreateAssessmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This emulator holds at most {} assessments and already holds that \
+                         many; delete an assessment before creating another",
+                        crate::state::ASSESSMENT_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_uuid(created);
+        let record = crate::state::AssessmentRecord {
+            arn: crate::state::assessment_arn(&region, &id),
+            id: id.clone(),
+            region: region.clone(),
+            name: input.name,
+            description: input.description,
+            // The compliance standard comes from the framework, not the request.
+            compliance_type: framework.compliance_type.clone(),
+            status: crate::state::STATUS_ACTIVE.to_string(),
+            assessment_reports_destination: input.assessment_reports_destination,
+            scope: crate::state::stored_scope(&input.scope),
+            roles: input.roles,
+            delegations: Vec::new(),
+            framework_id: input.framework_id,
+            tags: input.tags.unwrap_or_default(),
+            creation_time: created,
+            last_updated: created,
+        };
+        // An unconditional insert of a freshly minted identifier: the store
+        // cannot already hold it, and a collision is a server fault rather than
+        // an update of someone else's assessment. Answer from the STORED record,
+        // so this response cannot differ from what a later read returns.
+        let stored = match store.assessments.entry(id) {
+            ::std::collections::hash_map::Entry::Vacant(slot) => slot.insert(record),
+            ::std::collections::hash_map::Entry::Occupied(taken) => {
+                return Err(CreateAssessmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "the minted assessment identifier {} is already in use",
+                            taken.key()
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+        Ok(CreateAssessmentOutput {
+            assessment: Some(stored.to_assessment(Some(&framework), &region)),
+        })
     }
 }
