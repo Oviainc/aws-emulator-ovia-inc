@@ -94,12 +94,8 @@ async fn update_customizations(
     call(router, "PATCH", "/v1/account-customizations", Some(body)).await
 }
 
-/// One page of `ListServices`: `(services, nextToken)`.
-async fn list_page(
-    router: &MultiServiceRouter,
-    max_results: Option<i64>,
-    next_token: Option<&str>,
-) -> (Vec<String>, Option<String>) {
+/// The `ListServices` request URI for one page request.
+fn list_services_uri(max_results: Option<i64>, next_token: Option<&str>) -> String {
     let mut query: Vec<String> = Vec::new();
     if let Some(max) = max_results {
         query.push(format!("maxResults={max}"));
@@ -107,11 +103,20 @@ async fn list_page(
     if let Some(token) = next_token {
         query.push(format!("nextToken={}", encode_query_value(token)));
     }
-    let uri = if query.is_empty() {
+    if query.is_empty() {
         "/v1/services".to_string()
     } else {
         format!("/v1/services?{}", query.join("&"))
-    };
+    }
+}
+
+/// One page of `ListServices`: `(services, nextToken)`.
+async fn list_page(
+    router: &MultiServiceRouter,
+    max_results: Option<i64>,
+    next_token: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let uri = list_services_uri(max_results, next_token);
 
     let (status, _, body) = call(router, "GET", &uri, None).await;
     assert_eq!(status, 200, "ListServices {uri}: expected 200, got {status} with body {body}");
@@ -586,14 +591,7 @@ async fn bad_page_inputs_are_refused() {
     ];
 
     for (name, max_results, next_token) in cases {
-        let mut query: Vec<String> = Vec::new();
-        if let Some(max) = max_results {
-            query.push(format!("maxResults={max}"));
-        }
-        if let Some(token) = &next_token {
-            query.push(format!("nextToken={}", encode_query_value(token)));
-        }
-        let uri = format!("/v1/services?{}", query.join("&"));
+        let uri = list_services_uri(max_results, next_token.as_deref());
         let (status, error_type, body) = call(&router, "GET", &uri, None).await;
         assert_eq!(
             status, 400,
@@ -602,6 +600,203 @@ async fn bad_page_inputs_are_refused() {
         assert_eq!(
             error_type, "ValidationException",
             "case {name:?}: expected a ValidationException, got {error_type:?} ({body})"
+        );
+    }
+}
+
+/// The pagination framework's refusal message for a continuation token that does
+/// not decode as a cursor: a fixed template whose only variable part is the
+/// operation name.
+fn pagination_token_message(operation: &str) -> String {
+    format!(
+        "Pagination token exception in operation '{operation}': invalid payload wrapping schema 0"
+    )
+}
+
+/// The modelled `NextToken` constraints — `@length(32, 512)` and
+/// `@pattern ^[-A-Za-z0-9+/_]+=*$`
+/// (`smithy_query(query="operation", operation="ListServices")`) — asserted on
+/// every row of the table below, so a case cannot accidentally exercise the
+/// boundary validator instead of the cursor decode.
+fn assert_well_formed_token(name: &str, token: &str) {
+    assert!(
+        (32..=512).contains(&token.len()),
+        "case {name:?}: a row must satisfy @length(32, 512), got {} chars",
+        token.len()
+    );
+    let (body, padding) = match token.find('=') {
+        Some(at) => token.split_at(at),
+        None => (token, ""),
+    };
+    let charset_ok = body
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'/' | b'_'));
+    assert!(
+        !body.is_empty() && charset_ok && padding.bytes().all(|b| b == b'='),
+        "case {name:?}: a row must satisfy @pattern ^[-A-Za-z0-9+/_]+=*$, got {token:?}"
+    );
+}
+
+/// The rule, over a table spanning the class: a `nextToken` that SATISFIES the
+/// modelled `NextToken` constraints but does not decode as a cursor this service
+/// issued for the listing is refused with HTTP 400 `ValidationException` carrying
+/// the pagination-token exception template for this operation — and no `fieldList`,
+/// because no input member's own constraint was violated.
+///
+/// Rows differ along length (the modelled minimum, the maximum and in between),
+/// charset (one repeated letter, the full alphabet including `+`, `/`, `-`, `_` and
+/// `=` padding), payload (undecodable base64, base64 of a non-cursor plaintext) and
+/// provenance (invented, versus an issued token tampered with or truncated).
+#[tokio::test]
+async fn a_well_formed_non_cursor_next_token_is_refused_with_the_pagination_token_message() {
+    let router = build_router();
+    let (_, token) = list_page(&router, Some(1), None).await;
+    let issued = token.expect("a first page of one item must carry a nextToken");
+
+    let tampered: String = {
+        // One character of an issued token changed, inside the same charset: it
+        // still clears the member's constraints, but no longer decodes.
+        let mut chars: Vec<char> = issued.chars().collect();
+        let middle = chars.len() / 2;
+        chars[middle] = if chars[middle] == 'Z' { 'Y' } else { 'Z' };
+        chars.into_iter().collect()
+    };
+    let truncated: String = issued.chars().take(32).collect();
+    assert!(
+        issued.len() > 32,
+        "an issued token must be longer than the modelled minimum to truncate, got {issued:?}"
+    );
+
+    let cases: Vec<(&str, String)> = vec![
+        // The recorded instance: 32 characters, charset-valid.
+        ("one letter at the modelled minimum length", "A".repeat(32)),
+        ("one letter at the modelled maximum length", "A".repeat(512)),
+        (
+            "the whole modelled charset, no padding",
+            "aZ09+/-_".repeat(5),
+        ),
+        (
+            "charset-valid run with trailing padding",
+            format!("{}==", "QUJD".repeat(10)),
+        ),
+        (
+            "base64 of a plaintext that is not a cursor",
+            aws_smithy_types::base64::encode("definitely-not-a-cursor-token-payload"),
+        ),
+        (
+            "base64 of a cursor-shaped plaintext with the wrong prefix",
+            aws_smithy_types::base64::encode("not/a/catalog/offset=000000000042"),
+        ),
+        ("an issued token with one character changed", tampered),
+        ("an issued token truncated to the minimum length", truncated),
+    ];
+
+    let expected = pagination_token_message("ListServices");
+    for (name, token) in cases {
+        assert_well_formed_token(name, &token);
+
+        // Both with and without a page size: the refusal does not depend on it.
+        for max_results in [None, Some(1), Some(1000)] {
+            let uri = list_services_uri(max_results, Some(&token));
+            let (status, error_type, body) = call(&router, "GET", &uri, None).await;
+            assert_eq!(
+                status, 400,
+                "case {name:?} (maxResults={max_results:?}): expected HTTP 400, got {status} ({body})"
+            );
+            assert_eq!(
+                error_type, "ValidationException",
+                "case {name:?} (maxResults={max_results:?}): expected a ValidationException, got {error_type:?} ({body})"
+            );
+            assert_eq!(
+                body.get("message").and_then(Value::as_str),
+                Some(expected.as_str()),
+                "case {name:?} (maxResults={max_results:?}): expected the pagination-token exception message, got {body:?}"
+            );
+            assert!(
+                body.get("fieldList").is_none(),
+                "case {name:?} (maxResults={max_results:?}): a cursor-decode failure names no member, got {body:?}"
+            );
+        }
+    }
+}
+
+/// The other side of the same rule: a request that violates an input member's own
+/// constraint keeps the member-constraint refusal — HTTP 400 `ValidationException`
+/// naming the member — so a caller can still tell a shape violation from a stale
+/// cursor by the message.
+#[tokio::test]
+async fn a_member_constraint_violation_is_not_reported_as_a_pagination_token_exception() {
+    let router = build_router();
+    let pagination_message = pagination_token_message("ListServices");
+
+    // (case, maxResults, nextToken, the member whose constraint is violated)
+    let cases: Vec<(&str, Option<i64>, Option<String>, &str)> = vec![
+        ("nextToken one character below @length min", None, Some("A".repeat(31)), "nextToken"),
+        ("nextToken far below @length min", None, Some("abc".to_string()), "nextToken"),
+        ("nextToken one character above @length max", None, Some("A".repeat(513)), "nextToken"),
+        ("nextToken outside @pattern", None, Some("!".repeat(40)), "nextToken"),
+        ("nextToken with padding in the middle", None, Some(format!("{}{}", "=".repeat(4), "A".repeat(32))), "nextToken"),
+        ("maxResults one below @range min", Some(0), None, "maxResults"),
+        ("maxResults one above @range max", Some(1001), None, "maxResults"),
+        ("negative maxResults", Some(-1), None, "maxResults"),
+    ];
+
+    for (name, max_results, next_token, member) in cases {
+        let uri = list_services_uri(max_results, next_token.as_deref());
+        let (status, error_type, body) = call(&router, "GET", &uri, None).await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected HTTP 400, got {status} ({body})"
+        );
+        assert_eq!(
+            error_type, "ValidationException",
+            "case {name:?}: expected a ValidationException, got {error_type:?} ({body})"
+        );
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {name:?}: no message in {body}"));
+        assert_ne!(
+            message, pagination_message,
+            "case {name:?}: a member-constraint violation must not borrow the pagination-token message, got {message:?}"
+        );
+        assert!(
+            message.contains(member),
+            "case {name:?}: expected the refusal to name {member:?}, got {message:?}"
+        );
+    }
+}
+
+/// The positive control for the same decode path: a `nextToken` the service DID
+/// issue still resumes the listing, at every page size, and the resumed page is a
+/// distinct, contiguous slice of the catalog.
+#[tokio::test]
+async fn an_issued_next_token_resumes_the_listing() {
+    let router = build_router();
+    let catalog = whole_catalog(&router).await;
+
+    for size in [1_i64, 2, 3, 7] {
+        let (first, token) = list_page(&router, Some(size), None).await;
+        let token = token.unwrap_or_else(|| {
+            panic!("case maxResults={size}: a first page must carry a nextToken")
+        });
+        let (second, _) = list_page(&router, Some(size), Some(&token)).await;
+
+        assert_eq!(
+            first,
+            catalog[..size as usize].to_vec(),
+            "case maxResults={size}: page one must be the catalog's first slice, got {first:?}"
+        );
+        assert_ne!(
+            second.first(),
+            first.first(),
+            "case maxResults={size}: the resumed page must start past page one, got {second:?}"
+        );
+        let end = (2 * size as usize).min(catalog.len());
+        assert_eq!(
+            second,
+            catalog[size as usize..end].to_vec(),
+            "case maxResults={size}: the resumed page must be the next slice, got {second:?}"
         );
     }
 }

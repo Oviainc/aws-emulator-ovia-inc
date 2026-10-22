@@ -124,6 +124,34 @@ fn decode_page_token(token: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
+/// The service-independent tail of the pagination framework's refusal message for
+/// a continuation token that is not a cursor the framework can decode. The whole
+/// message is a fixed template whose ONLY variable part is the operation name, so
+/// it is built here rather than written per call site.
+const PAGINATION_TOKEN_EXCEPTION_DETAIL: &str = "invalid payload wrapping schema 0";
+
+/// The refusal for a continuation token that satisfies the modelled `NextToken`
+/// `@length`/`@pattern` but does not decode as a cursor issued for this listing
+/// (never minted here, tampered with, or naming a position the catalog no longer
+/// has).
+///
+/// A cursor-decode failure comes from the pagination framework, not from member
+/// validation: it names no member path, so it carries no `fieldList`, and its
+/// message is the framework's fixed template parameterized by the operation name.
+/// That message is the only thing distinguishing a stale or corrupt cursor from an
+/// ordinary member-constraint violation, since both answer HTTP 400 with the
+/// modelled `ValidationException`.
+fn pagination_token_exception(operation: &str) -> ListServicesError {
+    ListServicesErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "Pagination token exception in operation '{operation}': \
+             {PAGINATION_TOKEN_EXCEPTION_DETAIL}"
+        ),
+        field_list: None,
+    })
+    .into()
+}
+
 /// The modelled `ValidationException` for one input member, carrying the member's
 /// path in `fieldList` the way the service's own boundary refusal does.
 fn invalid_member(path: &str, message: String) -> ListServicesError {
@@ -248,13 +276,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // no longer resolves to a resume point, so it is refused like any
                 // other token this service did not issue for this listing.
                 Some(offset) if offset <= catalog.len() => offset,
-                _ => {
-                    return Err(invalid_member(
-                        "nextToken",
-                        "Member must be a nextToken returned by a previous ListServices response"
-                            .to_string(),
-                    ))
-                }
+                // The token cleared the member's own constraints at the boundary,
+                // so what failed here is the cursor decode: answer with the
+                // pagination framework's message, not the member-constraint one.
+                _ => return Err(pagination_token_exception(Self::NAME)),
             },
         };
 

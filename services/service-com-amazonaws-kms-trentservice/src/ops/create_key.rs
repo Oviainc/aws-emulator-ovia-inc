@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a customer managed KMS key, persists it in [`crate::state`], and
+//! answers with the `KeyMetadata` computed from that record — the same metadata
+//! `DescribeKey` reports afterwards. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This slice mints symmetric encryption keys with KMS-generated material: the default
+//! `KeySpec` SYMMETRIC_DEFAULT, `KeyUsage` ENCRYPT_DECRYPT and `Origin` AWS_KMS. Any
+//! other combination is refused with the modelled `UnsupportedOperationException`
+//! rather than minting a key whose cryptographic operations (`Sign`, `GenerateMac`,
+//! `GetPublicKey`, `ImportKeyMaterial`) are not implemented, so that no caller holds a
+//! key it could never use.
+//!
+//! `BypassPolicyLockoutSafetyCheck` is accepted and has no effect: the lockout check
+//! asks whether the key policy lets the CALLING PRINCIPAL make a subsequent
+//! `PutKeyPolicy` request, which needs principal evaluation this emulator does not
+//! model (and `PutKeyPolicy` itself is not implemented). The policy is checked for
+//! syntactic validity instead, which is the part that can be decided here.
+//!
+//! The store this writes into is bounded: past `crate::state::MAX_KEYS` the request
+//! is refused with the modelled `LimitExceededException` and nothing is persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -326,18 +336,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        // "The KeySpec and CustomerMasterKeySpec parameters work the same way. Only
+        // the names differ."
+        // (`smithy_query(query="doc",shape="CreateKeyRequest",member="CustomerMasterKeySpec")`)
+        // Two names for one property cannot disagree within one request.
+        let key_spec = match (
+            input.key_spec.as_deref(),
+            input.customer_master_key_spec.as_deref(),
+        ) {
+            (Some(spec), Some(deprecated)) if spec != deprecated => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "KeySpec and CustomerMasterKeySpec name the same property and must \
+                     agree, but KeySpec is {spec} and CustomerMasterKeySpec is {deprecated}"
+                )));
+            }
+            (Some(spec), _) => spec.to_string(),
+            (None, Some(deprecated)) => deprecated.to_string(),
+            (None, None) => crate::state::KEY_SPEC_SYMMETRIC_DEFAULT.to_string(),
+        };
+        let key_usage = input
+            .key_usage
+            .clone()
+            .unwrap_or_else(|| crate::state::KEY_USAGE_ENCRYPT_DECRYPT.to_string());
+        let origin = input
+            .origin
+            .clone()
+            .unwrap_or_else(|| crate::state::ORIGIN_AWS_KMS.to_string());
+
+        // A custom key store has to exist before a key can be created in it, and
+        // `CreateCustomKeyStore` is not implemented, so no id can name one.
+        if let Some(custom_key_store_id) = input.custom_key_store_id.as_deref() {
+            return Err(CreateKeyErrorModeled::CustomKeyStoreNotFoundException(
+                CustomKeyStoreNotFoundException {
+                    message: Some(format!(
+                        "KMS cannot find a custom key store with the id {custom_key_store_id}."
+                    )),
+                },
+            )
+            .into());
+        }
+        // "This parameter is required for a KMS key with an Origin value of
+        // EXTERNAL_KEY_STORE. It is not valid for KMS keys with any other Origin
+        // value." (`smithy_query(query="doc",shape="CreateKeyRequest",member="XksKeyId")`)
+        if input.xks_key_id.is_some() {
+            return Err(unsupported(
+                "XksKeyId is valid only for a KMS key in an external key store, and this \
+                 emulator has no custom key stores.",
+            ));
+        }
+        if origin != crate::state::ORIGIN_AWS_KMS {
+            return Err(unsupported(format!(
+                "Origin {origin} is not supported: this emulator creates keys with \
+                 KMS-generated key material ({}).",
+                crate::state::ORIGIN_AWS_KMS
+            )));
+        }
+        if key_spec != crate::state::KEY_SPEC_SYMMETRIC_DEFAULT
+            || key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+        {
+            return Err(unsupported(format!(
+                "KeySpec {key_spec} with KeyUsage {key_usage} is not supported: this \
+                 emulator creates symmetric encryption keys ({} with {}).",
+                crate::state::KEY_SPEC_SYMMETRIC_DEFAULT,
+                crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+            )));
+        }
+
+        // A supplied key policy must be "syntactically or semantically correct"
+        // (`MalformedPolicyDocumentException`): an IAM policy document is a JSON
+        // object carrying a non-empty `Statement` list.
+        let policy = match input.policy.as_deref() {
+            None => crate::state::default_key_policy(),
+            Some(policy) => {
+                if let Err(reason) = validate_policy(policy) {
+                    return Err(CreateKeyErrorModeled::MalformedPolicyDocumentException(
+                        MalformedPolicyDocumentException {
+                            message: Some(reason),
+                        },
+                    )
+                    .into());
+                }
+                policy.to_string()
+            }
+        };
+
+        // "You cannot have more than one tag on a KMS key with the same tag key."
+        // (`smithy_query(query="doc",shape="CreateKeyRequest",member="Tags")`)
+        let requested_tags = input.tags.iter().flatten().count();
+        if requested_tags > crate::state::MAX_TAGS_PER_KEY {
+            return Err(quota_exceeded(format!(
+                "A KMS key can carry at most {} tags, but the request carried {requested_tags}.",
+                crate::state::MAX_TAGS_PER_KEY
+            )));
+        }
+        let mut tags = std::collections::BTreeMap::new();
+        for tag in input.tags.iter().flatten() {
+            if tags
+                .insert(tag.tag_key.clone(), tag.tag_value.clone())
+                .is_some()
+            {
+                return Err(CreateKeyErrorModeled::TagException(TagException {
+                    message: Some(format!(
+                        "One or more tags are not valid: the tag key {} appears more than once.",
+                        tag.tag_key
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let multi_region = input.multi_region.unwrap_or(false);
+        let mut state = state.lock();
+        // The store is bounded: past `MAX_KEYS` nothing is minted and nothing is
+        // persisted, so a loop of valid creates cannot grow the process without end.
+        if !state.has_room_for_another_key() {
+            return Err(quota_exceeded(format!(
+                "The request was rejected because a quota was exceeded: this emulator holds \
+                 at most {} KMS keys.",
+                crate::state::MAX_KEYS
+            )));
+        }
+
+        let Some(material) = crate::state::fresh_material() else {
+            // No entropy, no key: nothing is persisted and the caller sees a
+            // retryable server error rather than a key with predictable material.
+            return Err(CreateKeyErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the key material could not be generated".to_string()),
+            })
+            .into());
+        };
+
+        let key = crate::state::Cmk::new(
+            // "For a single-Region KMS key, omit this parameter or set it to False.
+            // The default value is False."
+            // (`smithy_query(query="doc",shape="CreateKeyRequest",member="MultiRegion")`)
+            crate::state::mint_key_id(multi_region),
+            crate::state::request_region(ctx),
+            input.description.clone().unwrap_or_default(),
+            key_usage,
+            key_spec,
+            origin,
+            multi_region,
+            policy,
+            tags,
+            material,
+        );
+
+        let metadata = key.metadata();
+        state.insert_key(key);
+
+        Ok(CreateKeyOutput {
+            key_metadata: Some(metadata),
+        })
+    }
+}
+
+/// Refuse a request that would exceed a quota, with the operation's modelled 400:
+/// "The request was rejected because a length constraint or quota was exceeded."
+fn quota_exceeded(message: impl Into<String>) -> CreateKeyError {
+    CreateKeyErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Refuse a key this emulator cannot create, with the operation's modelled 400.
+fn unsupported(message: impl Into<String>) -> CreateKeyError {
+    CreateKeyErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The state store is missing, which is a server fault rather than a bad request.
+fn store_unavailable() -> CreateKeyError {
+    CreateKeyErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some("the KMS state store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Whether `policy` is a syntactically valid key policy document, and why not when
+/// it is not.
+fn validate_policy(policy: &str) -> Result<(), String> {
+    let document: ::serde_json::Value = ::serde_json::from_str(policy)
+        .map_err(|error| format!("The key policy is not valid JSON: {error}."))?;
+    let Some(object) = document.as_object() else {
+        return Err("The key policy must be a JSON object.".to_string());
+    };
+    match object.get("Statement") {
+        Some(::serde_json::Value::Array(statements)) if !statements.is_empty() => Ok(()),
+        Some(_) => Err("The key policy's Statement must be a non-empty list.".to_string()),
+        None => Err("The key policy must contain a Statement list.".to_string()),
     }
 }

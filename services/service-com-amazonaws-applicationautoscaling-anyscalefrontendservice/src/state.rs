@@ -92,8 +92,9 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// Scheduled actions, ordered by (target, action name). `DeregisterScalableTarget`
     /// cascades into this map, so a deregistered target leaves none behind.
     ///
-    /// No writer until the scheduled-action slice: `PutScheduledAction` is still a 501,
-    /// so today only the cascade touches this map.
+    /// The modelled `ScheduledAction` is stored as-is rather than behind a record of its
+    /// own: every member of it is either part of the key or a value `PutScheduledAction`
+    /// persisted verbatim, so `DescribeScheduledActions` has nothing to rebuild.
     pub scheduled_actions: BTreeMap<ScheduledActionKey, ScheduledAction>,
 }
 
@@ -126,6 +127,10 @@ pub const MAX_SCALABLE_TARGETS: usize = 10_000;
 /// The same bound for scaling policies, whose records additionally carry the caller's
 /// whole policy configuration. See [`MAX_SCALABLE_TARGETS`].
 pub const MAX_SCALING_POLICIES: usize = 20_000;
+
+/// The same bound for scheduled actions, which hang off a target the same way a policy
+/// does and are keyed by a free-form name. See [`MAX_SCALABLE_TARGETS`].
+pub const MAX_SCHEDULED_ACTIONS: usize = 20_000;
 
 // ---------------------------------------------------------------------------
 // Request-derived values
@@ -172,7 +177,7 @@ pub fn scalable_target_arn(region: &str, key: &TargetKey) -> String {
 /// A scaling policy's ARN, in the shape Application Auto Scaling documents:
 /// `arn:aws:autoscaling:<region>:<account>:scalingPolicy:<id>:resource/<namespace>/<resource id>:policyName/<name>`.
 pub fn scaling_policy_arn(region: &str, key: &PolicyKey) -> String {
-    let digest = opaque_id(
+    let id = uuid_shaped_id(
         &[
             "scalingPolicy",
             &key.target.service_namespace,
@@ -181,15 +186,6 @@ pub fn scaling_policy_arn(region: &str, key: &PolicyKey) -> String {
             &key.policy_name,
         ]
         .join("\u{1f}"),
-        32,
-    );
-    let id = format!(
-        "{}-{}-{}-{}-{}",
-        &digest[0..8],
-        &digest[8..12],
-        &digest[12..16],
-        &digest[16..20],
-        &digest[20..32],
     );
     ::emulator_server::emulator_arn(
         "autoscaling",
@@ -198,6 +194,46 @@ pub fn scaling_policy_arn(region: &str, key: &PolicyKey) -> String {
             "scalingPolicy:{id}:resource/{}/{}:policyName/{}",
             key.target.service_namespace, key.target.resource_id, key.policy_name
         ),
+    )
+}
+
+/// A scheduled action's ARN, in the shape Application Auto Scaling documents:
+/// `arn:aws:autoscaling:<region>:<account>:scheduledAction:<id>:resource/<namespace>/<resource id>:scheduledActionName/<name>`.
+///
+/// Derived from the action's identity for the same reason the policy ARN is: re-putting
+/// the same scheduled action must not hand the caller a second ARN.
+pub fn scheduled_action_arn(region: &str, key: &ScheduledActionKey) -> String {
+    let id = uuid_shaped_id(
+        &[
+            "scheduledAction",
+            &key.target.service_namespace,
+            &key.target.resource_id,
+            &key.target.scalable_dimension,
+            &key.scheduled_action_name,
+        ]
+        .join("\u{1f}"),
+    );
+    ::emulator_server::emulator_arn(
+        "autoscaling",
+        region,
+        &format!(
+            "scheduledAction:{id}:resource/{}/{}:scheduledActionName/{}",
+            key.target.service_namespace, key.target.resource_id, key.scheduled_action_name
+        ),
+    )
+}
+
+/// The 8-4-4-4-12 identifier that sits inside an `autoscaling` sub-resource ARN,
+/// derived from `seed` so it is reproducible rather than per-run.
+fn uuid_shaped_id(seed: &str) -> String {
+    let digest = opaque_id(seed, 32);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &digest[0..8],
+        &digest[8..12],
+        &digest[12..16],
+        &digest[16..20],
+        &digest[20..32],
     )
 }
 
@@ -357,6 +393,24 @@ pub fn check_enum(member: &str, value: &str, allowed: &[&str]) -> Result<(), Str
          Member must satisfy enum value set: [{}]",
         allowed.join(", ")
     ))
+}
+
+/// `Ok` when a `Describe`'s dimension filter is accompanied by the resource it narrows.
+///
+/// The model documents the rule on the member itself: "If you specify a scalable
+/// dimension, you must also specify a resource ID." A dimension names a capacity
+/// property of ONE resource, so filtering on it alone is a filter with no subject.
+pub fn check_dimension_requires_resource_id(
+    resource_id: Option<&str>,
+    scalable_dimension: Option<&str>,
+) -> Result<(), String> {
+    match (resource_id, scalable_dimension) {
+        (None, Some(dimension)) => Err(format!(
+            "Value '{dimension}' at 'scalableDimension' failed to satisfy constraint: \
+             A resource ID must be specified when a scalable dimension is specified"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `Ok` when `scalable_dimension` belongs to `service_namespace`.

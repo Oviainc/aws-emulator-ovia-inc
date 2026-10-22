@@ -382,8 +382,14 @@ pub struct Analyzer {
     pub created_at: SystemTime,
     pub last_resource_analyzed: Option<String>,
     pub last_resource_analyzed_at: Option<SystemTime>,
-    /// Exactly the `tags` map the create carried, absent when it carried none.
-    pub tags: Option<HashMap<String, String>>,
+    /// The analyzer's tag set: exactly the `tags` map the create carried, EMPTY when it
+    /// carried none.
+    ///
+    /// A tagged resource always has a tag collection — an untagged one has an empty
+    /// collection, not a missing one — so this is a map and never an `Option`, and
+    /// [`Self::summary`] projects it as the (possibly empty) `TagsMap` the model
+    /// declares rather than suppressing the member.
+    pub tags: HashMap<String, String>,
     /// Exactly the `configuration` the create carried, absent when it carried none.
     pub configuration: Option<AnalyzerConfiguration>,
     /// This analyzer's archive rules, keyed by `ruleName` (ordered, for the same
@@ -483,7 +489,9 @@ impl Analyzer {
             last_resource_analyzed_at: self
                 .last_resource_analyzed_at
                 .map(::aws_smithy_types::DateTime::from),
-            tags: self.tags.clone(),
+            // Present even when empty: an untagged analyzer has an empty tag set, which
+            // is `{}` on the wire, not an absent member.
+            tags: Some(self.tags.clone()),
             status: self.status.clone(),
             status_reason: self.status_reason.clone(),
             configuration: self.configuration.clone(),
@@ -884,6 +892,33 @@ pub fn page_validation_exception(error: &PageError) -> ValidationException {
         ),
     };
     field_validation_exception(name, message)
+}
+
+/// This service's modelled `ValidationException` for the violations a modelled-constraint
+/// walk reported.
+///
+/// For a member whose constraint traits this service enforces ITSELF (so that the refusal
+/// carries the modelled `reason`, which the framework's pre-handler envelope cannot), the
+/// walk is [`::aws_smithy_schema_server::constraints::validate`] — the same code the
+/// boundary runs — so the clause and the envelope are worded identically whichever side
+/// refused. `fieldList` names every member that failed.
+pub fn constraint_validation_exception(
+    violations: &[::aws_smithy_schema_server::constraints::Violation],
+) -> ValidationException {
+    ValidationException {
+        message: ::aws_smithy_schema_server::envelope(violations)
+            .unwrap_or_else(|| "invalid request".to_string()),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(
+            violations
+                .iter()
+                .map(|violation| ValidationExceptionField {
+                    name: violation.path.clone(),
+                    message: violation.message(),
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// Encode a listing key as an opaque continuation token.

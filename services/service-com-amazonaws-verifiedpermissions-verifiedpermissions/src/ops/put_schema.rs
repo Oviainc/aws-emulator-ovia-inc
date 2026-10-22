@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates the ONE Cedar schema a policy store holds: the schema text
+//! is parsed by the real Cedar schema parser, persisted on the store, and the
+//! namespaces that parse found are reported back. A store's schema is what a
+//! later `CreatePolicy` validates against in `STRICT` mode and what types an
+//! `IsAuthorized` request's entities and context.
 //!
 //! ## Shape of an operation
 //!
@@ -102,12 +99,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // here — hence the `PutSchemaError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.verifiedpermissions#PutSchema")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.verifiedpermissions#PutSchema",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum PutSchemaErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,18 +162,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSchema"))
+        let not_found = || {
+            PutSchemaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "No policy store exists with the input ID: {}",
+                    input.policy_store_id
+                ),
+                resource_id: input.policy_store_id.clone(),
+                resource_type: "POLICY_STORE".to_string(),
+            })
+        };
+        let unavailable = || {
+            PutSchemaErrorModeled::InternalServerException(InternalServerException {
+                message: "the service state store is unavailable".to_string(),
+            })
+        };
+
+        let SchemaDefinition::cedarJson(definition) = &input.definition;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let mut state = state.lock();
+        // The store is resolved FIRST: a schema is placed in a policy store, so a
+        // reference that names no store is a missing resource whatever else the
+        // request carries.
+        let store_id = state
+            .resolve_store_id(&input.policy_store_id)
+            .ok_or_else(not_found)?;
+
+        // How much schema text one store may hold is bounded, and a size limit is
+        // what the modelled `ServiceQuotaExceededException` reports. This is the
+        // ONE place that owns [`crate::state::cedar::MAX_SCHEMA_BYTES`]: it is the
+        // only way schema text enters the service, so everything that re-parses a
+        // stored schema is parsing text this check already bounded.
+        if definition.len() > crate::state::cedar::MAX_SCHEMA_BYTES {
+            return Err(PutSchemaErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "definition.cedarJson is {} bytes, more than the {} bytes a policy \
+                         store's schema may hold",
+                        definition.len(),
+                        crate::state::cedar::MAX_SCHEMA_BYTES
+                    ),
+                    resource_id: Some(store_id.clone()),
+                    resource_type: "SCHEMA".to_string(),
+                    // `serviceCode`/`quotaCode` name a quota registered with the
+                    // Service Quotas service. This bound is the emulator's own,
+                    // not a registered quota, so there is no code to report and
+                    // both optional members are left absent.
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The namespaces are a property of the schema text, so they come from the
+        // real Cedar schema parser; text it refuses is refused here too, with its
+        // own diagnostics. `{}` is a well-formed schema that declares nothing,
+        // which is how the model documents clearing a store's definitions ("To
+        // delete the schema, run PutSchema with `{}` for this parameter"): it is
+        // stored, and reports no namespaces.
+        let parsed = crate::state::cedar::parse_schema(definition).map_err(|e| {
+            crate::scaffolded::Scaffolded::validation(format!("definition.cedarJson: {e}"))
+        })?;
+
+        let store = state
+            .policy_stores
+            .get_mut(&store_id)
+            .ok_or_else(not_found)?;
+
+        let now = crate::state::now();
+        // "The date and time that the schema was originally created": putting a
+        // schema over an existing one UPDATES it, so the creation stamp stays the
+        // first put's and only `lastUpdatedDate` moves.
+        let created_date = store
+            .schema
+            .as_ref()
+            .map_or(now, |existing| existing.created_date);
+        store.schema = Some(crate::state::StoredSchema {
+            cedar_json: definition.clone(),
+            namespaces: parsed.namespaces,
+            created_date,
+            last_updated_date: now,
+        });
+        // The store itself changed, so its own `lastUpdatedDate` moves too. What
+        // the store already holds is NOT re-validated: "Any changes to the schema
+        // validate only policies and templates submitted after the schema change.
+        // Existing policies and templates are not re-evaluated against the
+        // changed schema."
+        store.last_updated_date = now;
+
+        // Read the response back out of what was just persisted, so a value that
+        // did not reach state cannot appear on the wire.
+        let stored = state
+            .policy_stores
+            .get(&store_id)
+            .and_then(|store| store.schema.as_ref())
+            .ok_or_else(unavailable)?;
+        let output = PutSchemaOutput {
+            policy_store_id: store_id.clone(),
+            namespaces: stored.namespaces.clone(),
+            created_date: stored.created_date,
+            last_updated_date: stored.last_updated_date,
+        };
+        crate::ops::audit(ctx, "PutSchema", &output.policy_store_id, "schema stored");
+        Ok(output)
     }
 }

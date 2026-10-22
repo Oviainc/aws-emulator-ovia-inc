@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates-or-replaces the Quick Setup settings of the account and region this
+//! request was signed for, so a later `GetServiceSettings` for that region reports
+//! exactly what this call wrote. `@idempotent`: writing the same settings twice
+//! leaves the same record, and only the members the request carries are written.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceSettings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateServiceSettingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Quick Setup service settings store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // `IAMRoleArn` carries an `@arnReference` to `AWS::IAM::Role` and no modelled
+        // `@pattern`, so the boundary validator admits any text and what that reference
+        // says the value IS is checked here — the one place that rule lives for every
+        // `IAMRoleArn` member of this service.
+        let Some(role_arn) = input.explorer_enabling_role_arn else {
+            // Every member of this input is optional and only what the request carries
+            // is written, so an update naming nothing writes nothing: the region's
+            // stored settings are left exactly as they were, and a region that had none
+            // still has none. The same rule `UpdateConfigurationManager` applies to its
+            // own optional members.
+            return Ok(UpdateServiceSettingsOutput);
+        };
+        if let Some(why) =
+            crate::state::iam_role_arn_rejection("ExplorerEnablingRoleArn", &role_arn)
+        {
+            return Err(UpdateServiceSettingsErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The store is finite: an update for a region it holds no settings for yet is
+        // refused once the map is full, rather than growing it without bound on
+        // caller-supplied region text.
+        if !store.service_settings.contains_key(&region)
+            && store.service_settings.len() >= crate::state::MAX_SETTINGS_REGIONS
+        {
+            return Err(UpdateServiceSettingsErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "this account already holds service settings for the maximum of {} regions",
+                        crate::state::MAX_SETTINGS_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = store
+            .service_settings
+            .entry(region)
+            .or_insert_with(|| crate::state::ServiceSettingsRecord {
+                explorer_enabling_role_arn: None,
+                last_modified_at: now,
+            });
+        record.explorer_enabling_role_arn = Some(role_arn);
+        // Monotonic: the stamp never moves backwards, whatever the host clock does.
+        record.last_modified_at = now.max(record.last_modified_at);
+
+        Ok(UpdateServiceSettingsOutput)
     }
 }

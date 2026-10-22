@@ -191,6 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             policies: ::std::collections::BTreeMap::new(),
             next_id_seq: 0,
+            // A new store holds no schema: `PutSchema` is what puts one there.
+            schema: None,
         };
         state.policy_stores.insert(policy_store_id.clone(), store);
         if let Some(token) = input.client_token.as_deref() {

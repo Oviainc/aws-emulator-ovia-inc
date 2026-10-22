@@ -15,6 +15,8 @@
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]
 mod policy_store_authorization;
+#[path = "all/schema.rs"]
+mod schema;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging.rs"]

@@ -24,15 +24,18 @@
 //! instant whether or not anybody called, so applying it on a read never changes what a
 //! later caller sees.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AllowedMethods, CacheBehavior, CacheBehaviors, CustomErrorResponses, DefaultCacheBehavior,
-    Distribution, DistributionConfig, DistributionSummary, EntityAlreadyExists, EntityNotFound,
-    ForwardedValues, FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch,
-    KeyValueStore, LambdaFunctionAssociations, NoSuchDistribution, NoSuchInvalidation, Paths,
-    Restrictions, Tags, TrustedKeyGroups, TrustedSigners,
+    ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
+    CachedMethods, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
+    DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
+    EntityAlreadyExists, EntityNotFound, ForwardedValues, FunctionAssociations, GeoRestriction,
+    Invalidation, InvalidationBatch, KGKeyPairIds, KeyPairIds, KeyValueStore,
+    LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation, Origin,
+    OriginSslProtocols, Paths, Restrictions, Signer, Tags, TrustedKeyGroups, TrustedSigners,
+    ViewerCertificate,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -94,6 +97,32 @@ pub const MAX_DISTRIBUTIONS: usize = 10_000;
 /// requests, or invalidation objects."
 pub const MAX_INVALIDATIONS_PER_DISTRIBUTION: usize = 1_000;
 
+/// The most ordered cache behaviours ONE distribution's configuration may state.
+///
+/// CloudFront's published quota is 25 cache behaviours per distribution (the Amazon
+/// CloudFront Developer Guide's "Quotas", general quotas on distributions). It is also
+/// what bounds the per-request work a stored configuration costs: every `Distribution`
+/// payload walks the default cache behaviour and each ordered one, so a configuration
+/// cannot be stored with an unbounded number of them. Over it, the refusal is the modelled
+/// `TooManyCacheBehaviors`: "You cannot create more cache behaviors for the distribution."
+pub const MAX_CACHE_BEHAVIORS: usize = 25;
+
+/// The most trusted signers ONE distribution's configuration may state, counted across
+/// its cache behaviours.
+///
+/// CloudFront's published quota is 5 trusted signers (Amazon Web Services accounts) for a
+/// distribution, and the modelled refusal is per distribution too: "Your request contains
+/// more trusted signers than are allowed per distribution."
+pub const MAX_TRUSTED_SIGNERS: usize = 5;
+
+/// The most trusted key groups ONE distribution's configuration may state, counted across
+/// its cache behaviours.
+///
+/// CloudFront's published quota is 4 key groups associated with a single distribution, and
+/// the modelled refusal names the same scope: "The number of key groups referenced by this
+/// distribution is more than the maximum allowed."
+pub const MAX_TRUSTED_KEY_GROUPS: usize = 4;
+
 /// The most paths ONE invalidation batch may name.
 ///
 /// CloudFront's published quota for an invalidation request is 3,000 files, and the
@@ -148,6 +177,108 @@ pub const DEFAULT_HTTP_VERSION: &str = "http2";
 /// `GeoRestriction$RestrictionType`'s value for a distribution that restricts nothing,
 /// reported for a stored configuration that carries no `Restrictions`.
 pub const GEO_RESTRICTION_NONE: &str = "none";
+
+/// `IsIPV6Enabled` for a configuration that names none: a new distribution answers IPv6
+/// DNS requests with an IPv6 address ("Enable IPv6" is on for a new distribution — the
+/// Amazon CloudFront Developer Guide's distribution settings), which is what `true`
+/// means for `DistributionConfig$IsIPV6Enabled`.
+pub const DEFAULT_IS_IPV6_ENABLED: bool = true;
+
+/// `Staging` for a configuration that names none: a distribution a caller creates
+/// directly is the primary distribution, not the staging distribution of a continuous
+/// deployment policy.
+pub const DEFAULT_STAGING: bool = false;
+
+/// `Origin$ConnectionAttempts` for an origin that names none. `Origin$ConnectionAttempts`:
+/// "The minimum number is 1, the maximum is 3, and the default (if you don't specify
+/// otherwise) is 3."
+pub const DEFAULT_CONNECTION_ATTEMPTS: i32 = 3;
+
+/// `Origin$ConnectionTimeout` for an origin that names none, in seconds.
+/// `Origin$ConnectionTimeout`: "The minimum timeout is 1 second, the maximum is 10
+/// seconds, and the default (if you don't specify otherwise) is 10 seconds."
+pub const DEFAULT_CONNECTION_TIMEOUT: i32 = 10;
+
+/// `CustomOriginConfig$OriginReadTimeout` for a custom origin that names none, in
+/// seconds: "The minimum timeout is 1 second, the maximum is 120 seconds, and the default
+/// (if you don't specify otherwise) is 30 seconds."
+pub const DEFAULT_ORIGIN_READ_TIMEOUT: i32 = 30;
+
+/// `CustomOriginConfig$OriginKeepaliveTimeout` for a custom origin that names none, in
+/// seconds: "The minimum timeout is 1 second, the maximum is 120 seconds, and the default
+/// (if you don't specify otherwise) is 5 seconds."
+pub const DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT: i32 = 5;
+
+/// `CustomOriginConfig$OriginSslProtocols` for a custom origin that names none: the
+/// protocols CloudFront uses to connect to an origin over HTTPS when the configuration
+/// chooses none. `OriginSslProtocols$Items` is an `SslProtocol` list, whose values the
+/// member documents as "`SSLv3`, `TLSv1`, `TLSv1.1`, and `TLSv1.2`"; the three TLS ones
+/// are what a configuration that names none gets, in protocol order.
+pub const DEFAULT_ORIGIN_SSL_PROTOCOLS: [&str; 3] = ["TLSv1", "TLSv1.1", "TLSv1.2"];
+
+/// `AllowedMethods$Items` (and `CachedMethods$Items`) for a cache behaviour that names
+/// none: the read-only methods, which are the ones CloudFront forwards to the origin and
+/// caches the response of unless a configuration asks for more.
+pub const DEFAULT_ALLOWED_METHODS: [&str; 2] = ["HEAD", "GET"];
+
+/// `SmoothStreaming` for a cache behaviour that names none: Microsoft Smooth Streaming is
+/// something a configuration opts into.
+pub const DEFAULT_SMOOTH_STREAMING: bool = false;
+
+/// `Compress` for a cache behaviour that names none: automatic compression is something a
+/// configuration opts into.
+pub const DEFAULT_COMPRESS: bool = false;
+
+/// `MinTTL` for a cache behaviour that caches on `ForwardedValues` and names no minimum,
+/// in seconds: CloudFront forwards the next request to the origin as soon as the object is
+/// stale, which is what a zero minimum means.
+pub const DEFAULT_MIN_TTL: i64 = 0;
+
+/// `DefaultTTL` for a cache behaviour that caches on `ForwardedValues` and names none, in
+/// seconds: the one day the Amazon CloudFront Developer Guide documents as the default
+/// TTL applied when the origin adds no `Cache-Control` or `Expires` header.
+pub const DEFAULT_DEFAULT_TTL: i64 = 86_400;
+
+/// `MaxTTL` for a cache behaviour that caches on `ForwardedValues` and names none, in
+/// seconds: the one year the Amazon CloudFront Developer Guide documents as the default
+/// maximum TTL.
+pub const DEFAULT_MAX_TTL: i64 = 31_536_000;
+
+/// `CustomErrorResponse$ErrorCachingMinTTL` for a custom error response that names none,
+/// in seconds: the five minutes the Amazon CloudFront Developer Guide documents as how
+/// long CloudFront caches an error response from the origin by default
+/// ("Customizing error responses").
+pub const DEFAULT_ERROR_CACHING_MIN_TTL: i64 = 300;
+
+/// `ViewerCertificate$SSLSupportMethod` reported for a distribution served on CloudFront's
+/// own certificate: such a distribution "accepts HTTPS connections from all viewers
+/// including those that don't support SNI", which is what `vip` names.
+pub const SSL_SUPPORT_METHOD_VIP: &str = "vip";
+
+/// `ViewerCertificate$MinimumProtocolVersion` reported for a distribution served on
+/// CloudFront's own certificate: "If the distribution uses the CloudFront domain name such
+/// as `d111111abcdef8.cloudfront.net` (you set `CloudFrontDefaultCertificate` to `true`),
+/// CloudFront automatically sets the security policy to `TLSv1` regardless of the value
+/// that you set here."
+pub const MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE: &str = "TLSv1";
+
+/// `ViewerCertificate$CertificateSource` for a distribution served on CloudFront's own
+/// certificate, from the `CertificateSource` enum.
+pub const CERTIFICATE_SOURCE_CLOUDFRONT: &str = "cloudfront";
+
+/// `ViewerCertificate$CertificateSource` for a distribution served on an ACM certificate.
+pub const CERTIFICATE_SOURCE_ACM: &str = "acm";
+
+/// `ViewerCertificate$CertificateSource` for a distribution served on an IAM server
+/// certificate.
+pub const CERTIFICATE_SOURCE_IAM: &str = "iam";
+
+/// The single endpoint CloudFront's control API is served on.
+///
+/// CloudFront is a GLOBAL service with one API endpoint, so the fully qualified URI of a
+/// resource it just created is that resource's path under this host — it is not derived
+/// from the `Host` header of the request that created it.
+pub const SERVICE_ENDPOINT: &str = "cloudfront.amazonaws.com";
 
 /// The 501 message for the one case [`service_state`] answers `None`: this service is
 /// mounted on an engine that holds no per-service state, so there is no distribution
@@ -233,8 +364,10 @@ pub struct StoredDistribution {
     /// The version token the last mutation handed back, and the single source of truth
     /// for every `If-Match` check.
     pub etag: String,
-    /// The configuration as submitted, stored whole so a later read returns what was
-    /// created or updated rather than a re-derivation of it.
+    /// The configuration as submitted, with every member the service itself materialises
+    /// resolved into it ([`resolve_distribution_config`]), stored whole so a later read
+    /// returns the configuration the distribution actually runs under rather than a
+    /// re-derivation of it.
     pub config: DistributionConfig,
     /// Every invalidation created under this distribution, keyed by invalidation id.
     pub invalidations: BTreeMap<String, StoredInvalidation>,
@@ -277,16 +410,101 @@ impl StoredDistribution {
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
             in_progress_invalidation_batches: self.in_progress_invalidation_batches(),
             domain_name: self.domain_name.clone(),
-            // "ActiveTrustedSigners/ActiveTrustedKeyGroups: the key pairs that
-            // CloudFront can use to verify the signatures of signed URLs and cookies."
-            // Nothing in this slice activates a signer or a key group, so there is no
-            // active set to report.
-            active_trusted_signers: None,
-            active_trusted_key_groups: None,
+            active_trusted_signers: Some(self.active_trusted_signers()),
+            active_trusted_key_groups: Some(self.active_trusted_key_groups()),
             distribution_config: self.config.clone(),
             // An ICP recordal applies only to a distribution with alternate domain
             // names in the China partition, which this emulator does not serve.
             alias_icp_recordals: None,
+        }
+    }
+
+    /// Every cache behaviour of the stored configuration, as the view that names the list
+    /// wrappers they share: the default cache behaviour first, then the ordered ones.
+    ///
+    /// Bounded by [`MAX_CACHE_BEHAVIORS`], [`MAX_TRUSTED_SIGNERS`] and
+    /// [`MAX_TRUSTED_KEY_GROUPS`], which [`config_limit_exceeded`] refuses a configuration
+    /// over BEFORE it is stored — so the walks below cost a bounded amount of work on
+    /// every read, whatever a request asked to store.
+    fn behaviors(&self) -> Vec<BehaviorLists<'_>> {
+        behavior_views(&self.config)
+    }
+
+    /// "A list of Amazon Web Services accounts and the active CloudFront key pairs in each
+    /// account that CloudFront can use to verify the signatures of signed URLs and signed
+    /// cookies."
+    ///
+    /// Read from the stored configuration, which is what says who the trusted signers are:
+    /// `Enabled` is "true if any of the Amazon Web Services accounts in the list are
+    /// configured as trusted signers", `Quantity` is "the number of Amazon Web Services
+    /// accounts in the list", and the list itself is every account the distribution's cache
+    /// behaviours trust, each named once in the order they first appear.
+    ///
+    /// A signer's `KeyPairIds` are the ACTIVE CloudFront key pairs of that account. No call
+    /// in this emulator creates a CloudFront key pair (`CreatePublicKey` and the key-group
+    /// operations still answer 501), so no account has one and the reported set is empty.
+    pub fn active_trusted_signers(&self) -> ActiveTrustedSigners {
+        let behaviors = self.behaviors();
+        let accounts = first_seen(
+            behaviors
+                .iter()
+                .filter_map(|behavior| behavior.trusted_signers)
+                .flat_map(|signers| signers.items.as_deref().unwrap_or_default()),
+        );
+        ActiveTrustedSigners {
+            enabled: behaviors
+                .iter()
+                .any(|behavior| behavior.trusted_signers.is_some_and(|signers| signers.enabled)),
+            quantity: i32::try_from(accounts.len()).unwrap_or(i32::MAX),
+            items: (!accounts.is_empty()).then(|| {
+                accounts
+                    .into_iter()
+                    .map(|account| Signer {
+                        aws_account_number: Some(account),
+                        key_pair_ids: Some(KeyPairIds {
+                            quantity: 0,
+                            items: None,
+                        }),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// "A list of key groups, and the public keys in each key group, that CloudFront can
+    /// use to verify the signatures of signed URLs and signed cookies."
+    ///
+    /// Read from the stored configuration the same way [`StoredDistribution::active_trusted_signers`]
+    /// is: `Quantity` is "the number of key groups in the list" and the list is every key
+    /// group the distribution's cache behaviours trust, each named once. A key group's
+    /// public keys are empty for the same reason a signer's key pairs are — this emulator
+    /// mints no public key — so `Enabled` reports whether the configuration trusts any key
+    /// group at all.
+    pub fn active_trusted_key_groups(&self) -> ActiveTrustedKeyGroups {
+        let behaviors = self.behaviors();
+        let groups = first_seen(
+            behaviors
+                .iter()
+                .filter_map(|behavior| behavior.trusted_key_groups)
+                .flat_map(|groups| groups.items.as_deref().unwrap_or_default()),
+        );
+        ActiveTrustedKeyGroups {
+            enabled: behaviors
+                .iter()
+                .any(|behavior| behavior.trusted_key_groups.is_some_and(|groups| groups.enabled)),
+            quantity: i32::try_from(groups.len()).unwrap_or(i32::MAX),
+            items: (!groups.is_empty()).then(|| {
+                groups
+                    .into_iter()
+                    .map(|group| KGKeyPairIds {
+                        key_group_id: Some(group),
+                        key_pair_ids: Some(KeyPairIds {
+                            quantity: 0,
+                            items: None,
+                        }),
+                    })
+                    .collect()
+            }),
         }
     }
 
@@ -549,7 +767,8 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// Replace the configuration of the distribution `id` names, and report the record
     /// as it now stands.
     ///
-    /// The stored configuration becomes the one submitted, `LastModifiedTime` becomes
+    /// The stored configuration becomes the one submitted with the service's own members
+    /// resolved into it ([`resolve_distribution_config`]), `LastModifiedTime` becomes
     /// `now`, the version token is freshly minted, and the distribution goes back to
     /// [`STATUS_IN_PROGRESS`] with a new propagation deadline — the new configuration has
     /// to reach the edge locations before it is deployed again.
@@ -567,7 +786,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         let etag = self.next_etag();
         let stored = self.distributions.get_mut(id)?;
-        stored.config = config;
+        stored.config = resolve_distribution_config(config);
         stored.last_modified_time = now;
         stored.etag = etag;
         stored.status = STATUS_IN_PROGRESS.to_string();
@@ -631,41 +850,14 @@ pub fn key_value_store_path(name: &str) -> String {
     format!("/2020-05-31/key-value-store/{name}")
 }
 
-/// The fully qualified URI a `Location` header reports for `path`, built from the host
-/// the request was addressed to so it names the endpoint the caller is already talking
-/// to. Falls back to this service's own endpoint when the request carries no host.
-pub fn location_uri(parts: &::http::request::Parts, path: &str) -> String {
-    let host = parts
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|host| is_host_shaped(host))
-        .unwrap_or("cloudfront.amazonaws.com");
-    format!("https://{host}{path}")
-}
-
-/// Whether `value` has the shape of a host a URI can be built from.
+/// The fully qualified URI a `Location` header reports for `path`.
 ///
-/// The value is interpolated into a URI, so an arbitrary header value must not be able
-/// to shape one: only a name of host characters, with at most one numeric `:port`
-/// suffix, is accepted.
-fn is_host_shaped(value: &str) -> bool {
-    let (host, port) = match value.split_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (value, None),
-    };
-    let host_ok = !host.is_empty()
-        && host.len() <= 253
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
-    let port_ok = match port {
-        None => true,
-        Some(port) => {
-            !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
-        }
-    };
-    host_ok && port_ok
+/// CloudFront's control API is GLOBAL and served on one endpoint
+/// ([`SERVICE_ENDPOINT`]), so the URI of a resource it just created is that resource's
+/// path under that endpoint — the same URI for every caller, rather than one derived
+/// from the `Host` header the request happened to carry.
+pub fn location_uri(path: &str) -> String {
+    format!("https://{SERVICE_ENDPOINT}{path}")
 }
 
 /// Whether `value` has the shape of a distribution id this service mints (`E` followed
@@ -758,6 +950,294 @@ fn same_paths(left: &Paths, right: &Paths) -> bool {
 /// wrapper's `Quantity` must be zero.
 fn items_len<T>(items: &Option<Vec<T>>) -> usize {
     items.as_ref().map_or(0, Vec::len)
+}
+
+/// The values of `values`, each kept once, at the position it first appears.
+///
+/// Membership goes through a set rather than a scan of what has been kept, so the cost is
+/// linear in the number of entries (times the log of the distinct ones) however many
+/// entries a configuration states.
+fn first_seen<'a>(values: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut seen: BTreeSet<&'a str> = BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        if seen.insert(value.as_str()) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Resolving a submitted configuration into the one the distribution runs under
+// ---------------------------------------------------------------------------
+
+/// Resolve every member of a submitted `DistributionConfig` that the SERVICE supplies.
+///
+/// A `DistributionConfig` member a request leaves out is not unset on the distribution: it
+/// takes the value the service applies, and the distribution then runs under — and reports
+/// — the fully resolved configuration. So the resolution happens once, when the
+/// configuration is STORED (by `CreateDistribution` and by
+/// [`ComAmazonawsCloudfrontCloudfront20200531State::apply_config`]), and every later read,
+/// list and read-modify-write round trip answers from the resolved record rather than from
+/// the request that created it.
+///
+/// Three kinds of member are resolved, and nothing else:
+///
+/// * a LIST WRAPPER (`Aliases`, `CustomHeaders`, `OriginGroups`, `CacheBehaviors`,
+///   `CustomErrorResponses`, `TrustedSigners`, `TrustedKeyGroups`,
+///   `LambdaFunctionAssociations`, `FunctionAssociations`) — an absent wrapper means the
+///   list is empty, which is the wrapper stating `Quantity` 0;
+/// * a member with a DOCUMENTED default (the origin timeouts and attempts, the TTLs,
+///   `PriceClass`, `HttpVersion`, `Logging`'s four `@default` members, the geo restriction
+///   type, the allowed methods, the origin SSL protocols) — the documented value;
+/// * a member whose absence has exactly one meaning (`DefaultRootObject`, `OriginPath`,
+///   `OriginAccessControlId`, `WebACLId`, `FieldLevelEncryptionId` and
+///   `ContinuousDeploymentPolicyId` name nothing — the empty string; `OriginShield`,
+///   `GrpcConfig`, `SmoothStreaming`, `Compress` and `Staging` are off; `ViewerCertificate`
+///   is CloudFront's own certificate).
+///
+/// A member that is a CHOICE the configuration has not made (a cache policy id, a
+/// real-time log configuration, an anycast ip list, a tenant or connection-mode setting)
+/// is left absent: the service applies nothing to it.
+pub fn resolve_distribution_config(mut config: DistributionConfig) -> DistributionConfig {
+    config.aliases = Some(config.aliases.unwrap_or_default());
+    config.default_root_object = Some(config.default_root_object.unwrap_or_default());
+
+    let origins = std::mem::take(&mut config.origins.items);
+    config.origins.items = origins.into_iter().map(resolve_origin).collect();
+    config.origin_groups = Some(config.origin_groups.unwrap_or_default());
+
+    config.default_cache_behavior =
+        resolve_default_cache_behavior(std::mem::take(&mut config.default_cache_behavior));
+    let mut behaviors = config.cache_behaviors.take().unwrap_or_default();
+    if let Some(items) = behaviors.items.take() {
+        behaviors.items = Some(items.into_iter().map(resolve_cache_behavior).collect());
+    }
+    config.cache_behaviors = Some(behaviors);
+
+    let mut responses = config.custom_error_responses.take().unwrap_or_default();
+    if let Some(items) = responses.items.take() {
+        responses.items = Some(
+            items
+                .into_iter()
+                .map(resolve_custom_error_response)
+                .collect(),
+        );
+    }
+    config.custom_error_responses = Some(responses);
+
+    config.logging = Some(resolve_logging(config.logging.take()));
+    config.price_class = Some(
+        config
+            .price_class
+            .unwrap_or_else(|| DEFAULT_PRICE_CLASS.to_string()),
+    );
+    config.viewer_certificate = Some(resolve_viewer_certificate(config.viewer_certificate.take()));
+    config.restrictions = Some(config.restrictions.unwrap_or_else(|| Restrictions {
+        geo_restriction: GeoRestriction {
+            restriction_type: GEO_RESTRICTION_NONE.to_string(),
+            quantity: 0,
+            items: None,
+        },
+    }));
+    config.web_acl_id = Some(config.web_acl_id.unwrap_or_default());
+    config.http_version = Some(
+        config
+            .http_version
+            .unwrap_or_else(|| DEFAULT_HTTP_VERSION.to_string()),
+    );
+    config.is_ipv6_enabled = Some(config.is_ipv6_enabled.unwrap_or(DEFAULT_IS_IPV6_ENABLED));
+    config.continuous_deployment_policy_id =
+        Some(config.continuous_deployment_policy_id.unwrap_or_default());
+    config.staging = Some(config.staging.unwrap_or(DEFAULT_STAGING));
+    config
+}
+
+/// Resolve the members the service supplies on ONE origin.
+fn resolve_origin(mut origin: Origin) -> Origin {
+    origin.origin_path = Some(origin.origin_path.unwrap_or_default());
+    origin.custom_headers = Some(origin.custom_headers.unwrap_or_default());
+    origin.connection_attempts = Some(
+        origin
+            .connection_attempts
+            .unwrap_or(DEFAULT_CONNECTION_ATTEMPTS),
+    );
+    origin.connection_timeout = Some(
+        origin
+            .connection_timeout
+            .unwrap_or(DEFAULT_CONNECTION_TIMEOUT),
+    );
+    // "CloudFront Origin Shield" is off unless the configuration turns it on, and an
+    // origin shield that is off names no region.
+    origin.origin_shield = Some(origin.origin_shield.unwrap_or_default());
+    origin.origin_access_control_id = Some(origin.origin_access_control_id.unwrap_or_default());
+    origin.custom_origin_config = origin
+        .custom_origin_config
+        .map(resolve_custom_origin_config);
+    origin
+}
+
+/// Resolve the members the service supplies on a custom origin's configuration.
+fn resolve_custom_origin_config(mut custom: CustomOriginConfig) -> CustomOriginConfig {
+    custom.origin_ssl_protocols = Some(custom.origin_ssl_protocols.unwrap_or_else(|| {
+        OriginSslProtocols {
+            quantity: i32::try_from(DEFAULT_ORIGIN_SSL_PROTOCOLS.len()).unwrap_or(i32::MAX),
+            items: DEFAULT_ORIGIN_SSL_PROTOCOLS
+                .iter()
+                .map(|protocol| (*protocol).to_string())
+                .collect(),
+        }
+    }));
+    custom.origin_read_timeout = Some(
+        custom
+            .origin_read_timeout
+            .unwrap_or(DEFAULT_ORIGIN_READ_TIMEOUT),
+    );
+    custom.origin_keepalive_timeout = Some(
+        custom
+            .origin_keepalive_timeout
+            .unwrap_or(DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT),
+    );
+    custom
+}
+
+/// Resolve the members the service supplies on a cache behaviour.
+///
+/// `DefaultCacheBehavior` and `CacheBehavior` are two Smithy structures declaring the SAME
+/// members, so ONE macro resolves both — two copies of this walk would be two things to
+/// keep in step.
+macro_rules! resolve_behavior_members {
+    ($behavior:expr) => {{
+        let mut behavior = $behavior;
+        // An absent trusted-signer or trusted-key-group wrapper is a behaviour that
+        // requires no signed URL or cookie: not enabled, and nobody in the list.
+        behavior.trusted_signers = Some(behavior.trusted_signers.unwrap_or_default());
+        behavior.trusted_key_groups = Some(behavior.trusted_key_groups.unwrap_or_default());
+        behavior.allowed_methods = Some(resolve_allowed_methods(behavior.allowed_methods));
+        behavior.smooth_streaming = Some(behavior.smooth_streaming.unwrap_or(DEFAULT_SMOOTH_STREAMING));
+        behavior.compress = Some(behavior.compress.unwrap_or(DEFAULT_COMPRESS));
+        behavior.lambda_function_associations =
+            Some(behavior.lambda_function_associations.unwrap_or_default());
+        behavior.function_associations = Some(behavior.function_associations.unwrap_or_default());
+        behavior.field_level_encryption_id =
+            Some(behavior.field_level_encryption_id.unwrap_or_default());
+        // "The gRPC configuration for your cache behavior" is off unless it is asked for.
+        behavior.grpc_config = Some(behavior.grpc_config.unwrap_or_default());
+        // The legacy cache-key members travel as ONE group: a behaviour that states its
+        // cache key with `ForwardedValues` also gets the three TTLs resolved, while one
+        // that attaches a cache policy states none of them and gets none.
+        if let Some(forwarded) = behavior.forwarded_values {
+            behavior.forwarded_values = Some(resolve_forwarded_values(forwarded));
+            behavior.min_ttl = Some(behavior.min_ttl.unwrap_or(DEFAULT_MIN_TTL));
+            behavior.default_ttl = Some(behavior.default_ttl.unwrap_or(DEFAULT_DEFAULT_TTL));
+            behavior.max_ttl = Some(behavior.max_ttl.unwrap_or(DEFAULT_MAX_TTL));
+        }
+        behavior
+    }};
+}
+
+/// Resolve the members the service supplies on the default cache behaviour.
+fn resolve_default_cache_behavior(behavior: DefaultCacheBehavior) -> DefaultCacheBehavior {
+    resolve_behavior_members!(behavior)
+}
+
+/// Resolve the members the service supplies on one ordered cache behaviour.
+fn resolve_cache_behavior(behavior: CacheBehavior) -> CacheBehavior {
+    resolve_behavior_members!(behavior)
+}
+
+/// The methods a cache behaviour allows and caches: the ones it names, or
+/// [`DEFAULT_ALLOWED_METHODS`] when it names none. A behaviour that names the allowed
+/// methods but not the cached ones caches the same default set.
+fn resolve_allowed_methods(allowed: Option<AllowedMethods>) -> AllowedMethods {
+    let mut allowed = allowed.unwrap_or_else(|| AllowedMethods {
+        quantity: i32::try_from(DEFAULT_ALLOWED_METHODS.len()).unwrap_or(i32::MAX),
+        items: default_methods(),
+        cached_methods: None,
+    });
+    allowed.cached_methods = Some(allowed.cached_methods.unwrap_or_else(|| CachedMethods {
+        quantity: i32::try_from(DEFAULT_ALLOWED_METHODS.len()).unwrap_or(i32::MAX),
+        items: default_methods(),
+    }));
+    allowed
+}
+
+/// [`DEFAULT_ALLOWED_METHODS`] as a `MethodsList`.
+fn default_methods() -> Vec<String> {
+    DEFAULT_ALLOWED_METHODS
+        .iter()
+        .map(|method| (*method).to_string())
+        .collect()
+}
+
+/// Resolve the list wrappers inside a legacy `ForwardedValues`: an absent `Headers` or
+/// `QueryStringCacheKeys` forwards none and keys on none, which is the empty wrapper.
+fn resolve_forwarded_values(mut forwarded: ForwardedValues) -> ForwardedValues {
+    forwarded.headers = Some(forwarded.headers.unwrap_or_default());
+    forwarded.query_string_cache_keys = Some(forwarded.query_string_cache_keys.unwrap_or_default());
+    forwarded
+}
+
+/// Resolve the members the service supplies on one custom error response.
+fn resolve_custom_error_response(mut response: CustomErrorResponse) -> CustomErrorResponse {
+    response.error_caching_min_ttl = Some(
+        response
+            .error_caching_min_ttl
+            .unwrap_or(DEFAULT_ERROR_CACHING_MIN_TTL),
+    );
+    response
+}
+
+/// Resolve the access-logging configuration. Every member of `LoggingConfig` carries a
+/// Smithy `@default` — `Enabled` and `IncludeCookies` `false`, `Bucket` and `Prefix` the
+/// empty string — which is also what a configuration that names no `Logging` at all gets:
+/// "If you don't want to enable logging when you create a distribution ... specify `false`
+/// for `Enabled`, and specify empty `Bucket` and `Prefix` elements."
+fn resolve_logging(logging: Option<LoggingConfig>) -> LoggingConfig {
+    let mut logging = logging.unwrap_or_default();
+    logging.enabled = Some(logging.enabled.unwrap_or(false));
+    logging.include_cookies = Some(logging.include_cookies.unwrap_or(false));
+    logging.bucket = Some(logging.bucket.unwrap_or_default());
+    logging.prefix = Some(logging.prefix.unwrap_or_default());
+    logging
+}
+
+/// Resolve the distribution's viewer certificate.
+///
+/// A configuration that names no certificate of its own is served on CloudFront's own
+/// certificate: "If the distribution doesn't use `Aliases` ... set
+/// `CloudFrontDefaultCertificate` to `true` and leave all other fields empty." Under that
+/// certificate the security policy is fixed — "CloudFront automatically sets the security
+/// policy to `TLSv1` regardless of the value that you set here" — and the distribution
+/// accepts HTTPS from every viewer, SNI or not ([`SSL_SUPPORT_METHOD_VIP`]). The
+/// deprecated `Certificate` and `CertificateSource` members report which certificate is in
+/// use and where it is kept, so they follow from the certificate the configuration chose.
+fn resolve_viewer_certificate(certificate: Option<ViewerCertificate>) -> ViewerCertificate {
+    let mut resolved = certificate.unwrap_or_default();
+    let acm = resolved.acm_certificate_arn.clone();
+    let iam = resolved.iam_certificate_id.clone();
+    if acm.is_none() && iam.is_none() {
+        resolved.cloud_front_default_certificate =
+            Some(resolved.cloud_front_default_certificate.unwrap_or(true));
+    }
+    if resolved.cloud_front_default_certificate == Some(true) {
+        resolved.ssl_support_method = Some(
+            resolved
+                .ssl_support_method
+                .unwrap_or_else(|| SSL_SUPPORT_METHOD_VIP.to_string()),
+        );
+        resolved.minimum_protocol_version =
+            Some(MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE.to_string());
+        resolved.certificate_source = Some(CERTIFICATE_SOURCE_CLOUDFRONT.to_string());
+    } else if let Some(arn) = acm {
+        resolved.certificate = Some(arn);
+        resolved.certificate_source = Some(CERTIFICATE_SOURCE_ACM.to_string());
+    } else if let Some(id) = iam {
+        resolved.certificate = Some(id);
+        resolved.certificate_source = Some(CERTIFICATE_SOURCE_IAM.to_string());
+    }
+    resolved
 }
 
 /// The `InconsistentQuantities` message for one wrapper whose `Quantity` disagrees with
@@ -880,6 +1360,81 @@ impl BehaviorLists<'_> {
             }
         }
     }
+}
+
+/// A count in a submitted configuration that exceeds what this service stores, and the
+/// message that says so. Each variant names the modelled error the handler answers with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLimit {
+    /// More ordered cache behaviours than [`MAX_CACHE_BEHAVIORS`] —
+    /// `TooManyCacheBehaviors`.
+    CacheBehaviors(String),
+    /// More trusted signers than [`MAX_TRUSTED_SIGNERS`] — `TooManyTrustedSigners`.
+    TrustedSigners(String),
+    /// More trusted key groups than [`MAX_TRUSTED_KEY_GROUPS`] —
+    /// `TooManyKeyGroupsAssociatedToDistribution`.
+    TrustedKeyGroups(String),
+}
+
+/// The first count in `config` that exceeds this service's maximum, or `None` when every
+/// one of them is within it.
+///
+/// A stored configuration is walked on every `Distribution` payload — the default cache
+/// behaviour and each ordered one, and the trusted signers and key groups they name — so a
+/// configuration's counts bound the work every later read of that distribution does. They
+/// are therefore checked on the way IN, before anything is stored, against the published
+/// quotas ([`MAX_CACHE_BEHAVIORS`], [`MAX_TRUSTED_SIGNERS`], [`MAX_TRUSTED_KEY_GROUPS`]),
+/// and refused with the error CloudFront models for each.
+pub fn config_limit_exceeded(config: &DistributionConfig) -> Option<ConfigLimit> {
+    let behaviors = config
+        .cache_behaviors
+        .as_ref()
+        .map_or(0, |behaviors| items_len(&behaviors.items));
+    if behaviors > MAX_CACHE_BEHAVIORS {
+        return Some(ConfigLimit::CacheBehaviors(format!(
+            "This distribution states {behaviors} cache behaviors; at most \
+             {MAX_CACHE_BEHAVIORS} are allowed per distribution"
+        )));
+    }
+
+    let lists = behavior_views(config);
+    let signers: usize = lists
+        .iter()
+        .filter_map(|behavior| behavior.trusted_signers)
+        .map(|signers| items_len(&signers.items))
+        .sum();
+    if signers > MAX_TRUSTED_SIGNERS {
+        return Some(ConfigLimit::TrustedSigners(format!(
+            "This distribution states {signers} trusted signers; at most \
+             {MAX_TRUSTED_SIGNERS} are allowed per distribution"
+        )));
+    }
+
+    let key_groups: usize = lists
+        .iter()
+        .filter_map(|behavior| behavior.trusted_key_groups)
+        .map(|groups| items_len(&groups.items))
+        .sum();
+    if key_groups > MAX_TRUSTED_KEY_GROUPS {
+        return Some(ConfigLimit::TrustedKeyGroups(format!(
+            "This distribution references {key_groups} key groups; at most \
+             {MAX_TRUSTED_KEY_GROUPS} are allowed per distribution"
+        )));
+    }
+
+    None
+}
+
+/// Every cache behaviour of `config` as the view that names the list wrappers they share:
+/// the default cache behaviour first, then the ordered ones.
+fn behavior_views(config: &DistributionConfig) -> Vec<BehaviorLists<'_>> {
+    let mut out = vec![BehaviorLists::from(&config.default_cache_behavior)];
+    if let Some(behaviors) = &config.cache_behaviors {
+        for behavior in behaviors.items.as_deref().unwrap_or_default() {
+            out.push(BehaviorLists::from(behavior));
+        }
+    }
+    out
 }
 
 /// The modelled `InconsistentQuantities` message for the first list wrapper in `config`

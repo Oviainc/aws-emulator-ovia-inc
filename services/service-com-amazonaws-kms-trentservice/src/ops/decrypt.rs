@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Decrypt
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Decrypt`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: opens the ciphertext envelope `Encrypt` produced and returns the
+//! original plaintext. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Decrypt::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The envelope names the key that sealed it, so `Decrypt` needs no `KeyId`; when one
+//! is given it must name that same key. The AES-GCM tag is what distinguishes a
+//! ciphertext this service produced from a foreign or altered one, and a matching
+//! encryption context from a different one — both failures are
+//! `InvalidCiphertextException`.
+//!
+//! `Recipient` (returning the plaintext encrypted to a Nitro enclave's attested
+//! public key) is answered with the scaffold's 501: the capability is not
+//! implemented, and no response here may carry a plaintext in its place.
 //!
 //! ## Shape of an operation
 //!
@@ -286,18 +289,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Decrypt` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DecryptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Decrypt"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DecryptErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // A grant token is handed out by `CreateGrant`, which is not implemented, so
+        // no token presented here can be one KMS issued.
+        if input.grant_tokens.iter().flatten().next().is_some() {
+            return Err(DecryptErrorModeled::InvalidGrantTokenException(
+                InvalidGrantTokenException {
+                    message: Some("The specified grant token is not valid.".to_string()),
+                },
+            )
+            .into());
+        }
+        // `Recipient` asks KMS to return the plaintext encrypted under the public key
+        // in a Nitro enclave's attestation document. Nothing here can verify an
+        // attestation, so that capability is reported as not implemented rather than
+        // as a malformed request — and never answered with a plaintext the caller did
+        // not ask for.
+        if input.recipient.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "Decrypt with a Recipient (enclave attestation)",
+            ));
+        }
+
+        // The model does not mark `CiphertextBlob` required, so an absent one reaches
+        // the handler; it is a malformed request rather than an invalid ciphertext.
+        let Some(blob) = input.ciphertext_blob.as_deref() else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "CiphertextBlob is required and was not provided",
+            ));
+        };
+        let Some(envelope) = crate::state::parse_envelope(blob) else {
+            return Err(invalid_ciphertext());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let state = state.lock();
+        // The envelope names the key whose material sealed it. A key that no longer
+        // exists in this Region cannot decrypt anything.
+        let Some(key) = state.key_in(&region, &envelope.key_id) else {
+            return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "KMS cannot find the key with identifier {} in {region}.",
+                    envelope.key_id
+                )),
+            })
+            .into());
+        };
+
+        // "Specify the key ID ... of the KMS key" only when the caller wants KMS to
+        // check its assumption. A `KeyId` that names an EXISTING key other than the
+        // one which sealed the ciphertext is an `IncorrectKeyException`; one that
+        // names no key at all is the same `NotFoundException` any other operation
+        // answers for it (`Decrypt` models no `InvalidArnException`, so a malformed
+        // ARN is reported the same way).
+        if let Some(requested) = input.key_id.as_deref() {
+            match state.resolve(&region, requested) {
+                crate::state::KeyRef::Found(requested_key)
+                    if requested_key.key_id == key.key_id => {}
+                crate::state::KeyRef::Found(_) => {
+                    return Err(DecryptErrorModeled::IncorrectKeyException(
+                        IncorrectKeyException {
+                            message: Some(format!(
+                                "The key {requested} cannot decrypt the ciphertext, which \
+                                 was encrypted by {}.",
+                                key.arn
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                    return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "KMS cannot find the key with identifier {requested} in {region}."
+                        )),
+                    })
+                    .into());
+                }
+            }
+        }
+
+        if !key.is_usable() {
+            if key.key_state == crate::state::KEY_STATE_DISABLED {
+                return Err(DecryptErrorModeled::DisabledException(DisabledException {
+                    message: Some(format!("{} is disabled.", key.arn)),
+                })
+                .into());
+            }
+            return Err(DecryptErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(format!(
+                        "{} is not in a valid state for this operation. Its key state is {}.",
+                        key.arn, key.key_state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let algorithm = input
+            .encryption_algorithm
+            .clone()
+            .unwrap_or_else(|| crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string());
+        if algorithm != crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT {
+            return Err(DecryptErrorModeled::InvalidKeyUsageException(
+                InvalidKeyUsageException {
+                    message: Some(format!(
+                        "The encryption algorithm {algorithm} is incompatible with the key \
+                         spec {} of {}; it must be {}.",
+                        key.key_spec,
+                        key.arn,
+                        crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if input.dry_run == Some(true) {
+            return Err(DecryptErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was rejected because the DryRun parameter was specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The encryption context is authenticated, not stored: a context that differs
+        // from the one `Encrypt` was given fails the tag, exactly as a tampered
+        // ciphertext does.
+        let Some(plaintext) =
+            crate::state::unseal(key, &envelope, input.encryption_context.as_ref())
+        else {
+            return Err(invalid_ciphertext());
+        };
+
+        Ok(DecryptOutput {
+            key_id: Some(key.arn.clone()),
+            plaintext: Some(plaintext),
+            encryption_algorithm: Some(algorithm),
+            // Only a `Recipient` request has a ciphertext for one, and those are
+            // refused above.
+            ciphertext_for_recipient: None,
+            key_material_id: Some(key.current_key_material_id.clone()),
+        })
     }
+}
+
+/// The ciphertext is not one this service can open: it is not an envelope, or its
+/// authentication tag did not verify under the key and encryption context given.
+fn invalid_ciphertext() -> DecryptError {
+    DecryptErrorModeled::InvalidCiphertextException(InvalidCiphertextException {
+        message: Some(
+            "The request was rejected because the specified ciphertext, or additional \
+             authenticated data incorporated into the ciphertext, such as the encryption \
+             context, is corrupted, missing, or otherwise invalid."
+                .to_string(),
+        ),
+    })
+    .into()
 }

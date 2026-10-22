@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages over the keys this Region's endpoint holds, in creation order.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: it writes nothing. Pagination is derived from the stored
+//! creation order, so a `Marker` resumes exactly after the last entry the previous
+//! page returned, whatever has been created since.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKeys"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListKeysErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let state = state.lock();
+        let key_ids = state.key_ids_in(&region);
+
+        // "Set it to the value of NextMarker from the truncated response you just
+        // received" — so a marker resumes after the last key the previous page
+        // returned. Anything else "is not valid" (`InvalidMarkerException`).
+        let start = match input.marker.as_deref() {
+            None => 0,
+            Some(marker) => {
+                let resume_after = crate::state::decode_marker(marker)
+                    .and_then(|key_id| key_ids.iter().position(|id| *id == key_id));
+                match resume_after {
+                    Some(position) => position + 1,
+                    None => {
+                        return Err(ListKeysErrorModeled::InvalidMarkerException(
+                            InvalidMarkerException {
+                                message: Some(
+                                    "The marker that specifies where pagination should next \
+                                     begin is not valid."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // "If you do not include a value, it defaults to 100."
+        // (`smithy_query(query="doc",shape="ListKeysRequest",member="Limit")`)
+        // `LimitType`'s modelled range is 1..1000, so the boundary has already
+        // refused anything outside it; the floor of 1 keeps a page a paginating
+        // client can advance past even if that range ever widens.
+        let limit = usize::try_from(input.limit.unwrap_or(DEFAULT_LIMIT).max(1)).unwrap_or(1);
+        let page: Vec<KeyListEntry> = key_ids
+            .iter()
+            .skip(start)
+            .take(limit)
+            .filter_map(|key_id| state.key_in(&region, key_id))
+            .map(|key| KeyListEntry {
+                key_id: Some(key.key_id.clone()),
+                key_arn: Some(key.arn.clone()),
+            })
+            .collect();
+
+        let truncated = start + page.len() < key_ids.len();
+        let next_marker = truncated
+            .then(|| {
+                page.last()
+                    .and_then(|entry| entry.key_id.as_deref())
+                    .map(crate::state::encode_marker)
+            })
+            .flatten();
+
+        Ok(ListKeysOutput {
+            keys: Some(page),
+            next_marker,
+            truncated,
+        })
     }
 }
+
+/// The page size `ListKeys` uses when the request names none: "If you do not include
+/// a value, it defaults to 100."
+/// (`smithy_query(query="doc",shape="ListKeysRequest",member="Limit")`).
+const DEFAULT_LIMIT: i32 = 100;

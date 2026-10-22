@@ -23,7 +23,7 @@ pub struct GetNetworkOutput {
     pub network: Option<Network>,
 }
 
-// `Network` is one of the five shapes in this service whose schema is written out by
+// `Network` is one of the six shapes in this service whose schema is written out by
 // hand rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason
 // is a single trait the macro does not read: `@timestampFormat`.
 //

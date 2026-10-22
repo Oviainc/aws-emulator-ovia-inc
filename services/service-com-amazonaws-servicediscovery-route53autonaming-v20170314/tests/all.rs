@@ -23,6 +23,8 @@ mod instance_health_status;
 mod list_operations;
 #[path = "all/public_dns_namespace.rs"]
 mod public_dns_namespace;
+#[path = "all/service_attributes.rs"]
+mod service_attributes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging.rs"]

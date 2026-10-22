@@ -18,5 +18,13 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
+Nothing is currently declined for this service: `GetServiceSettings` and
+`ListQuickSetupTypes` were both declined for their Unit/absent input and have since
+been hand-authored in `src/ops/get_service_settings.rs` and
+`src/ops/list_quick_setup_types.rs`, which puts them in the service's
+`operations(...)` allow-list (`build.rs` derives that list from each ops file's
+`//! @op <Name>` header).
+
+// Declined when this service was scaffolded, now implemented:
 // SKIPPED: GetServiceSettings — unsupported shape construct: operation 'GetServiceSettings' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: ListQuickSetupTypes — unsupported shape construct: operation 'ListQuickSetupTypes' has a Unit/absent input, which the generator does not emit yet

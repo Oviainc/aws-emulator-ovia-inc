@@ -18,7 +18,7 @@ use aws_smithy_schema_server::{Violation, ViolationKind};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    CreateDashManifestConfiguration, CreateHlsManifestConfiguration,
+    CdnAuthConfiguration, CreateDashManifestConfiguration, CreateHlsManifestConfiguration,
     CreateLowLatencyHlsManifestConfiguration, CreateMssManifestConfiguration,
     ForceEndpointErrorConfiguration, GetDashManifestConfiguration, GetHlsManifestConfiguration,
     GetLowLatencyHlsManifestConfiguration, GetMssManifestConfiguration, IngestEndpoint,
@@ -173,6 +173,22 @@ pub struct OriginEndpoint {
     pub client_token: Option<String>,
     /// The fingerprint of the create request that minted this endpoint.
     pub fingerprint: String,
+    /// The resource policy attached to this origin endpoint, or `None` while none is.
+    ///
+    /// The policy is a sub-resource of the endpoint rather than a resource of its own —
+    /// `Put*` replaces it wholesale, `Get*` reports it and `Delete*` detaches it — so it
+    /// is persisted ON the endpoint: deleting the endpoint takes its policy with it, and
+    /// no second map can disagree about which policy an endpoint carries.
+    pub policy: Option<EndpointPolicy>,
+}
+
+/// A policy attached to an origin endpoint: the policy document, plus the optional CDN
+/// authorization settings submitted with it (the two travel together on every
+/// `PutOriginEndpointPolicy`/`GetOriginEndpointPolicy` pair).
+#[derive(Debug, Clone)]
+pub struct EndpointPolicy {
+    pub policy: String,
+    pub cdn_auth_configuration: Option<CdnAuthConfiguration>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

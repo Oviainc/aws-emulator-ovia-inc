@@ -102,6 +102,31 @@ pub async fn ok(router: &MultiServiceRouter, case: &str, operation: &str, body: 
     answer.body
 }
 
+/// A refused call: HTTP 400 with the wire error code `code`, or a panic naming the case
+/// and what came back instead. The refusal's body is returned for a caller that wants to
+/// look at its message.
+pub async fn refused(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+    code: &str,
+) -> Value {
+    let answer = call(router, operation, body).await;
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400 from {operation}, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code(),
+        code,
+        "case {case:?}: expected {code} from {operation}, got {:?}",
+        answer.body
+    );
+    answer.body
+}
+
 /// The same call as [`call`], made against `region`: the credential scope's region is
 /// the Region a request is made against, so a suite exercising regional behaviour picks
 /// it per call instead of taking [`REGION`].

@@ -9,7 +9,8 @@
 //!
 //! * a distribution is PERSISTED by the call that creates or updates it, so every later
 //!   read answers from that record: the configuration a read returns is the one that was
-//!   submitted (down to the members it left out), and the id, ARN and domain name it
+//!   submitted, with the members the service itself supplies resolved into it (see
+//!   `distribution_config_defaults.rs` for that rule), and the id, ARN and domain name it
 //!   reports never change;
 //! * a distribution carries a VERSION token (`ETag`) that changes on every mutation and
 //!   nothing else, and a mutation under `If-Match` lands only when the token it carries
@@ -35,7 +36,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    MAX_INVALIDATION_PATHS, MAX_ITEMS, PROPAGATION_DELAY,
+    DEFAULT_PRICE_CLASS, MAX_INVALIDATION_PATHS, MAX_ITEMS, PROPAGATION_DELAY,
 };
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -81,7 +82,7 @@ pub(crate) struct Node {
 
 impl Node {
     /// The first child element called `name`.
-    fn child(&self, name: &str) -> Option<&Node> {
+    pub(crate) fn child(&self, name: &str) -> Option<&Node> {
         self.children.iter().find(|child| child.name == name)
     }
 
@@ -95,8 +96,13 @@ impl Node {
         self.at(path).map(|node| node.text.as_str())
     }
 
+    /// This element's own text.
+    pub(crate) fn text(&self) -> &str {
+        self.text.as_str()
+    }
+
     /// Every child element called `name`.
-    fn children_named(&self, name: &str) -> Vec<&Node> {
+    pub(crate) fn children_named(&self, name: &str) -> Vec<&Node> {
         self.children
             .iter()
             .filter(|child| child.name == name)
@@ -279,7 +285,7 @@ pub(crate) async fn call(
     }
 }
 
-async fn create_distribution(router: &MultiServiceRouter, config: &str) -> Answer {
+pub(crate) async fn create_distribution(router: &MultiServiceRouter, config: &str) -> Answer {
     call(
         router,
         "POST",
@@ -290,7 +296,7 @@ async fn create_distribution(router: &MultiServiceRouter, config: &str) -> Answe
     .await
 }
 
-async fn get_distribution(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_distribution(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -301,7 +307,7 @@ async fn get_distribution(router: &MultiServiceRouter, id: &str) -> Answer {
     .await
 }
 
-async fn update_distribution(
+pub(crate) async fn update_distribution(
     router: &MultiServiceRouter,
     id: &str,
     config: &str,
@@ -396,7 +402,8 @@ struct Config {
     /// One of `ViewerProtocolPolicy`'s values (`allow-all` | `https-only` |
     /// `redirect-to-https`), from the model's enum.
     viewer_protocol_policy: &'static str,
-    /// One of `PriceClass`'s values, or `None` to leave the member out entirely.
+    /// One of `PriceClass`'s values, or `None` to leave the member out entirely (the
+    /// service then resolves it).
     price_class: Option<&'static str>,
 }
 
@@ -534,14 +541,14 @@ impl Config {
             "case {case} ({context}): expected aliases {:?}, got {aliases:?}",
             self.aliases
         );
-        // A member the request left out is still absent when the configuration is read
-        // back: the stored configuration is the one submitted, not one with service
-        // defaults written into it.
+        // A member the request left out is reported with the value the SERVICE applies:
+        // the stored configuration is the resolved one, so an unnamed `PriceClass` reads
+        // back as the class that covers every edge location.
+        let expected_price_class = self.price_class.unwrap_or(DEFAULT_PRICE_CLASS);
         assert_eq!(
             config.text_at("PriceClass"),
-            self.price_class,
-            "case {case} ({context}): expected PriceClass {:?}, got {:?}",
-            self.price_class,
+            Some(expected_price_class),
+            "case {case} ({context}): expected PriceClass {expected_price_class:?}, got {:?}",
             config.text_at("PriceClass")
         );
     }
