@@ -1,0 +1,143 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ivs.channel-lifecycle-create-get-delete ivs.get-channel-not-found ivs.delete-channel-removes-resource ivs.delete-channel-terminal-state ivs.create-stream-key-channel-not-found-rejected ivs.create-stream-key-resource-not-found-bad-channel ivs.multitrack-container-format-incompatible-rejected ivs.multitrack-requires-fragmented-mp4-rejected ivs.create-channel-invalid-name-rejected ivs.create-channel-invalid-name-pattern-rejected ivs.create-recording-configuration-invalid-bucket-name-rejected ivs.create-ad-configuration-empty-list-rejected ivs.create-channel-with-tags-at-creation-persists ivs.tag-and-untag-resource-roundtrip ivs.tag-resource-lifecycle ivs.tag-resource-list-tags-roundtrip ivs.list-tags-for-resource-not-found ivs.create-stream-key-quota-exceeded-rejected ivs.stream-key-quota-second-key-rejected ivs.create-channel-missing-permission-rejected ivs.put-metadata-channel-not-broadcasting ivs.stop-stream-channel-not-broadcasting ivs.start-viewer-session-revocation-channel-not-found-rejected ivs.start-viewer-session-revocation-resource-not-found ivs.start-viewer-session-revocation-ignores-broadcast-state ivs.rtmps-ingest-live-stream-lifecycle ivs.native-rtmps-live-stream-lifecycle
+Issue-Shape-Id: com.amazonaws.ivs#AmazonInteractiveVideoService
+Issue-Key: ivs|GetChannel|ResourceNotFoundException
+Issue-Key: ivs.get-channel-not-found|run#6|AssertionError|assert error["Message"] == f"Resource: {bogus_arn} not found", repr(error["Message"])
+Issue-Key: ivs.delete-channel-removes-resource|run#11|AssertionError|assert error["Message"] == f"Resource: {arn} not found", (
+Issue-Key: ivs.delete-channel-terminal-state|run#12|AssertionError|assert error["Message"] == f"Resource: {victim_arn} not found", (
+Issue-Key: ivs.create-stream-key-channel-not-found-rejected|run#8|AssertionError|assert read_error["Message"] == f"Resource: {ghost_arn} not found", (
+Issue-Key: ivs.create-stream-key-resource-not-found-bad-channel|run#6|AssertionError|assert error["Message"] == f"Resource: {bogus_arn} not found", (
+Issue-Key: ivs.multitrack-container-format-incompatible-rejected|run#5|AssertionError|assert error["Message"] == (
+Issue-Key: ivs.multitrack-requires-fragmented-mp4-rejected|run#6|AssertionError|assert error["Message"] == (
+Issue-Key: ivs.create-channel-invalid-name-rejected|run#5|AssertionError|assert error["Message"] == (
+Issue-Key: ivs.create-channel-invalid-name-pattern-rejected|run#6|AssertionError|assert error["Message"] == (
+Issue-Key: ivs.create-recording-configuration-invalid-bucket-name-rejected|run#6|AssertionError|assert error["Message"] == (
+Issue-Key: ivs.create-ad-configuration-empty-list-rejected|run#12|AssertionError|assert error["Message"] == (
+Issue-Key: ivs|ListTagsForResource|ValidationException
+Issue-Key: ivs.list-tags-for-resource-not-found|run#5|AssertionError|assert error["Code"] == "NotFoundException", (
+Issue-Key: ivs.create-stream-key-quota-exceeded-rejected|_client_error#7|AssertionError|raise AssertionError(f"expected a ClientError, but the call SUCCEEDED and returned {result!r}")
+Issue-Key: ivs.stream-key-quota-second-key-rejected|_error#7|AssertionError|raise AssertionError("expected the call to fail, but it succeeded")
+Issue-Key: ivs.create-channel-missing-permission-rejected|_client_error#13|AssertionError|raise AssertionError(
+Issue-Key: ivs.put-metadata-channel-not-broadcasting|run#6|AssertionError|assert error["Code"] == "ChannelNotBroadcasting", f"expected ChannelNotBroadcasting, got {error['Code']!r}"
+Issue-Key: ivs.stop-stream-channel-not-broadcasting|run#6|AssertionError|assert code == "ChannelNotBroadcasting", (
+Issue-Key: ivs.start-viewer-session-revocation-channel-not-found-rejected|run#6|AssertionError|assert error["Code"] == "ResourceNotFoundException", (
+Issue-Key: ivs.start-viewer-session-revocation-resource-not-found|run#5|AssertionError|assert error["Code"] == "ResourceNotFoundException", (
+Issue-Key: ivs.start-viewer-session-revocation-ignores-broadcast-state|run#7|AssertionError|assert before["Code"] == "ChannelNotBroadcasting", (
+Issue-Key: ivs.rtmps-ingest-live-stream-lifecycle|_poll_until_live#16|Timeout|time.sleep(interval_s)
+Issue-Key: ivs.native-rtmps-live-stream-lifecycle|run#14|AssertionError|assert code == "ChannelNotBroadcasting", f"expected ChannelNotBroadcasting before any ingest, got {code!r}"
+Issue-Commit: d6cf4ead3dce27ec3b8bcbc3d4a389da0fa571ea
+
+# IVS: 9 behavioral divergences — empty error Message on all modeled exceptions, wrong ValidationException phrasing, tagging rejects valid resource ARNs, stream-key quota unenforced, no authorization, and PutMetadata/StopStream/StartViewerSessionRevocation/native RTMPS ingest missing
+
+> _Note: this issue was identified against the code base at commit `d6cf4ead3dce27ec3b8bcbc3d4a389da0fa571ea`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetChannel
+
+## Description
+Nine distinct root causes found replaying the behavioral suite against the IVS emulator (suite result: 11/79 passed). They are bundled because they all belong to one service, `ivs` (crate `services/service-com-amazonaws-ivs-amazoninteractivevideoservice`). Each cause below is numbered and carries its own failing check ids; ALL NINE must be closed before this work item is submitted.
+
+Not filed here, and deliberately skipped as already covered by the scaffold-stub issues filed from the checkout: `ivs.get-stream-channel-not-broadcasting` (blocked by the unimplemented `GetStream`, ops/get_stream.rs) and `ivs.concurrent-import-playback-key-pair-race` (blocked by the unimplemented `ImportPlaybackKeyPair`, ops/import_playback_key_pair.rs). Several checks listed under causes 8 and 9 also touch `GetStream`, so they will only go green once that separately-filed stub is implemented too.
+
+=== Cause 1 of 9: every modeled IVS exception reaches the client with an EMPTY error message ===
+AWS: Smithy model com.amazonaws.ivs — `ResourceNotFoundException` (@error client, @httpError 404) and `ValidationException` (@error client, @httpError 400) each carry a member `exceptionMessage` targeting `com.amazonaws.ivs#errorMessage`; the member has NO `jsonName` trait in the model. On real AWS an SDK/botocore client reads a populated `Error.Message` for these: for a missing resource the message is built from the request ARN with a fixed template, `"Resource: <arn> not found"` (recorded identically for GetChannel, UpdateChannel, CreateStreamKey, GetPlaybackKeyPair across six checks), and for the multitrack cross-field rejection it names the offending member and the violated constraint, `"Request member: multitrack_input_configuration.enabled failed to satisfy the constraints: invalid value for multitrack input configuration enabled and container format"` (recorded behavior; the message text is an example, the RULE — a message naming the resource ARN / the offending member and constraint — is the requirement).
+Emulator: the correct error CODE and status are returned (`ResourceNotFoundException`, `ValidationException`), but `Error.Message` is the empty string `''` in every case. The handlers do populate the struct — ops/get_channel.rs:155-160 builds `ResourceNotFoundException { exception_message: Some(format!("channel {} does not exist", input.arn)), .. }` — yet the client sees `''`. Note that framework-level constraint failures (cause 2) DO arrive with a message, so only handler-constructed modeled exceptions lose it. Hypothesis: the error serializer emits the member under its model name `exceptionMessage` rather than the `message` key AWS SDK error parsers read, so the text is dropped on the floor; a second, independent defect is that the handler text itself (`"channel <arn> does not exist"`) is not AWS's `"Resource: <arn> not found"`.
+Why: clients that log, match or branch on the error message see nothing at all — no resource identification in a 404, no constraint explanation in a 400. Error-message-driven retry/diagnostic code and user-facing error reporting break.
+Fix: the IVS error-serialization path for modeled exceptions (how `exceptionMessage`/`errorMessage` is rendered into the error body) plus the per-operation message text in the handlers that construct these errors (ops/get_channel.rs, ops/update_channel.rs, ops/create_stream_key.rs, ops/create_channel.rs multitrack rejection).
+Traces: ivs.channel-lifecycle-create-get-delete, ivs.get-channel-not-found, ivs.delete-channel-removes-resource, ivs.delete-channel-terminal-state, ivs.create-stream-key-channel-not-found-rejected, ivs.create-stream-key-resource-not-found-bad-channel, ivs.multitrack-container-format-incompatible-rejected, ivs.multitrack-requires-fragmented-mp4-rejected.
+
+=== Cause 2 of 9: ValidationException for modeled constraint violations uses the generic cross-service phrasing instead of IVS's ===
+AWS: Smithy model — `CreateChannel.name` -> `ChannelName` @length 0..128 @pattern `^[a-zA-Z0-9-_]*$`; `ListChannels.filterByName` -> same pattern; `CreateRecordingConfiguration.destinationConfiguration.s3.bucketName` @pattern `^[a-z0-9-.]+$`; `CreateAdConfiguration.mediaTailorPlaybackConfigurations` @length min 1; all four operations declare `ValidationException` (@httpError 400). IVS phrases these messages from the request as `"<Operation>.<member path> does not match the required pattern <pattern>"` and `"<Operation>.<member> is required to have a minimum length of <min>, found <actual>"` (recorded consistently across four checks, with the dotted member path for nested members, e.g. `CreateRecordingConfiguration.destinationConfiguration.s3.bucketName`). Because the message is derived mechanically from the operation, the member path and the violated constraint, that derivation is the requirement — not any one recorded string.
+Emulator: status 400 and code `ValidationException` are right, but the message is the generic cross-service form, e.g. `"1 validation error detected: Value 'sim2real ivs chan!! 6eada436115c' at 'name' failed to satisfy constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9-_]*$"` and `"1 validation error detected: Value '0 items' at 'mediaTailorPlaybackConfigurations' failed to satisfy constraint: Member must have length greater than or equal to 1"`.
+Why: a client (or an operator reading logs) that parses IVS validation messages to learn which member and constraint failed gets a different shape of text than AWS produces; the member path is unqualified by operation and the constraint wording differs.
+Fix: the constraint-walk/validation stage that formats `ValidationException` messages for this service (the `validate` step of the request walk that runs before `handle`, as documented in ops/*.rs), so IVS renders `<Operation>.<member path>` phrasing.
+Traces: ivs.create-channel-invalid-name-rejected, ivs.create-channel-invalid-name-pattern-rejected, ivs.create-recording-configuration-invalid-bucket-name-rejected, ivs.create-ad-configuration-empty-list-rejected (that last check needs the separately-filed `CreateAdConfiguration` stub implemented before it can pass in full; it fails HERE, on the message).
+
+=== Cause 3 of 9: ListTagsForResource/TagResource/UntagResource reject every real IVS resource ARN with ValidationException ===
+AWS: Smithy model — `ResourceArn` @length 1..128 @pattern `^arn:aws:ivs:[a-z0-9-]+:[0-9]+:[a-z-]/[a-zA-Z0-9-]+$`; that pattern's resource-type group `[a-z-]` matches exactly ONE character, so taken literally no real IVS ARN (`channel/...`, `playback-key/...`, `stream-key/...`) can ever satisfy it. Real AWS does NOT enforce it that way: the recordings show ListTagsForResource/TagResource/UntagResource succeeding on a channel ARN and round-tripping tags, and a well-formed but non-existent `playback-key/...` ARN being answered with error code `NotFoundException`, HTTP 404, message `"Resource was not found"` (recorded behavior only — the model declares `ResourceNotFoundException` for these operations; note AWS's tagging plumbing uses the DISTINCT code `NotFoundException` here, not the `ResourceNotFoundException` the rest of IVS uses).
+Emulator: every call is refused before the handler runs with HTTP 400 `ValidationException`, message `"1 validation error detected: Value 'arn:aws:ivs:us-west-2:000000000000:channel/66526d55c951' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: ^arn:aws:ivs:[a-z0-9-]+:[0-9]+:[a-z-]/[a-zA-Z0-9-]+$"`. Tagging is therefore completely unusable, including reading tags set at CreateChannel.
+Why: no client can read or modify IVS resource tags at all; tag-driven inventory, cost allocation and IaC reconciliation all fail with a 400 on input real AWS accepts. It also masks the correct not-found behavior (`NotFoundException`/404) for a missing resource.
+Fix: the `ResourceArn` constraint enforcement for this service (relax the literal model pattern so multi-character resource types are accepted) and then the not-found path in ops/list_tags_for_resource.rs, ops/tag_resource.rs, ops/untag_resource.rs, which must answer `NotFoundException` (404) for an absent resource.
+Traces: ivs.create-channel-with-tags-at-creation-persists, ivs.tag-and-untag-resource-roundtrip, ivs.tag-resource-lifecycle, ivs.tag-resource-list-tags-roundtrip, ivs.list-tags-for-resource-not-found.
+
+=== Cause 4 of 9: CreateStreamKey does not enforce the one-stream-key-per-channel quota ===
+AWS: Smithy model — `CreateStreamKey` declares `ServiceQuotaExceededException` with @httpError 402 ("Request would cause a service quota to be exceeded"). A channel is created with one auto-generated stream key, and the quota is 1, so a second CreateStreamKey on the same channel is refused with code `ServiceQuotaExceededException`, HTTP 402, message `"Resource: stream-key quota exceeded limit: 1"` (message built from the quota being hit; recorded in two checks). Deleting the existing key frees the slot and a subsequent CreateStreamKey succeeds.
+Emulator: the second CreateStreamKey returns HTTP 200 and mints an additional key (e.g. `{'streamKey': {'arn': 'arn:aws:ivs:us-west-2:000000000000:stream-key/e2e851927837', ...}}`), so a channel ends up with two live stream keys — a state real AWS cannot reach.
+Why: overly permissive. Clients that treat 402/ServiceQuotaExceededException as the signal to rotate (delete-then-create) a key instead silently accumulate keys, and every ingest-credential invariant that assumes at most one key per channel is violated.
+Fix: the quota check in ops/create_stream_key.rs against the per-channel key set in src/state.rs.
+Traces: ivs.create-stream-key-quota-exceeded-rejected, ivs.stream-key-quota-second-key-rejected.
+
+=== Cause 5 of 9: no authorization — CreateChannel succeeds for a caller with no IVS permissions ===
+AWS: Smithy model — `CreateChannel` declares `AccessDeniedException` with @httpError 403 ("User does not have sufficient access to perform this action"). A caller using credentials from an assumed role that has no policy attached gets code `AccessDeniedException`, HTTP 403, with the message built from the request principal/action/resource: `"User: <assumed-role-arn> is not authorized to perform: ivs:CreateChannel on resource: arn:aws:ivs:<region>:<account>:channel/* because no identity-based policy allows the ivs:CreateChannel action"`, and nothing is created.
+Emulator: the call is accepted — HTTP 200 with a full channel+streamKey payload — for credentials issued by AssumeRole on a role with no permissions at all; the channel really exists afterwards.
+Why: overly permissive. Any test or client that relies on IVS to refuse unauthorized callers (least-privilege verification, negative IAM tests, guard rails) passes against the emulator and fails against AWS.
+Fix: an authorization check in the IVS request path (ops/create_channel.rs and the service's shared pre-handler authorization seam) that honours the caller identity carried by the signed request.
+Traces: ivs.create-channel-missing-permission-rejected.
+
+=== Cause 6 of 9: PutMetadata is an unimplemented scaffold stub (NOT covered by any filed issue) ===
+AWS: Smithy model — `PutMetadata` POST /PutMetadata, success 204, errors include `ChannelNotBroadcasting` (@httpError 404, "The stream is offline for the given channel ARN"), `ResourceNotFoundException` (404), `ThrottlingException` (429), `ValidationException` (400). On a channel that exists but has never gone live, AWS answers code `ChannelNotBroadcasting`, HTTP 404, message `"Channel: <channelArn> is not currently online"`.
+Emulator: HTTP 501, code `NotImplemented`, message "operation PutMetadata is scaffolded but not implemented in this emulator" — services/service-com-amazonaws-ivs-amazoninteractivevideoservice/src/ops/put_metadata.rs:188 returns `Err(crate::scaffolded::Scaffolded::not_implemented("PutMetadata"))` and the file still carries the SCAFFOLDED marker.
+Why: timed-metadata injection cannot be exercised at all, and clients that distinguish "channel offline" (404 ChannelNotBroadcasting) from a transport/server failure see a 501 they will treat as the emulator being broken.
+Fix: implement `handle` in ops/put_metadata.rs against the channel/stream state in src/state.rs and delete the SCAFFOLDED marker line.
+Traces: ivs.put-metadata-channel-not-broadcasting.
+
+=== Cause 7 of 9: StopStream is an unimplemented scaffold stub (NOT covered by any filed issue) ===
+AWS: Smithy model — `StopStream` POST /StopStream, success 200, errors `ChannelNotBroadcasting` (404), `ResourceNotFoundException` (404), `StreamUnavailable` (503), `ValidationException` (400), `AccessDeniedException` (403). On a channel with no active stream AWS answers code `ChannelNotBroadcasting`, HTTP 404 (recorded message example: `"Channel: <channelArn> is not currently online"`).
+Emulator: HTTP 501, code `NotImplemented` ("operation StopStream is scaffolded but not implemented in this emulator"), from ops/stop_stream.rs.
+Why: there is no way to force a channel offline, and the negative case (stopping a channel that is not broadcasting) returns the wrong status and a code outside the operation's modeled error set.
+Fix: implement `handle` in ops/stop_stream.rs against the stream state in src/state.rs and delete the SCAFFOLDED marker.
+Traces: ivs.stop-stream-channel-not-broadcasting.
+
+=== Cause 8 of 9: StartViewerSessionRevocation is an unimplemented scaffold stub (NOT covered by any filed issue) ===
+AWS: Smithy model — `StartViewerSessionRevocation` POST /StartViewerSessionRevocation, success 200 with an empty body, errors `ResourceNotFoundException` (404), `ValidationException` (400), `AccessDeniedException` (403), `PendingVerification` (403), `ThrottlingException` (429), `InternalServerException` (500); input `channelArn` (required) and `viewerId` (required, @length 1..40). Against a well-formed but non-existent or deleted channelArn AWS answers code `ResourceNotFoundException`, HTTP 404, message `"Resource: <arn> not found"`; against a real channel it returns HTTP 200 even when the channel has never broadcast (the operation acts on playback tokens, not on the live ingest) and does not change the channel's broadcast state.
+Emulator: HTTP 501, code `NotImplemented` ("operation StartViewerSessionRevocation is scaffolded but not implemented in this emulator"), from ops/start_viewer_session_revocation.rs, for both the missing-channel and the live-channel case.
+Why: viewer-session revocation — the control a client uses to cut off leaked playback tokens — is unavailable, and the not-found case returns 501 instead of a modeled 404.
+Fix: implement `handle` in ops/start_viewer_session_revocation.rs (resolve the channel in src/state.rs, 404 when absent, 200 otherwise, leaving stream state untouched) and delete the SCAFFOLDED marker.
+Traces: ivs.start-viewer-session-revocation-channel-not-found-rejected, ivs.start-viewer-session-revocation-resource-not-found, ivs.start-viewer-session-revocation-ignores-broadcast-state (this last one also needs the separately-filed `GetStream` stub to read the broadcast state).
+
+=== Cause 9 of 9: the ingest endpoint CreateChannel advertises serves no RTMPS ingest, so a pushed stream never goes LIVE ===
+AWS: recorded behavior only (no model coverage of the ingest data plane). CreateChannel returns `channel.ingestEndpoint` and `streamKey.value`; pushing FLV/H.264+AAC over RTMPS to `rtmps://<ingestEndpoint>:443/app/<streamKey>` makes the channel go live, after which `GetStream` reports `stream.state == "LIVE"` with `channelArn` equal to the channel, PutMetadata/StopStream are accepted, and after StopStream the channel reports `ChannelNotBroadcasting` again. The requirement is that the endpoint the emulator ANNOUNCES actually accepts the native ingest protocol for that channel's stream key (the specific hostname/port is environment-dependent and is not itself a requirement).
+Emulator: the advertised endpoint is not served by the emulator — nothing accepts the RTMPS push, the channel never becomes live, and the lifecycle check polling for LIVE ran to the harness limit (`Error: Check timed out after 60.0s`). No LIVE stream state is ever reachable, so the whole live-stream lifecycle (LIVE -> PutMetadata/InsertAdBreak -> StopStream -> ChannelNotBroadcasting) cannot be exercised.
+Why: a client cannot ingest video at all; every data-plane behavior that depends on a channel being live is unreachable, and a control-plane-only emulator that announces an ingest endpoint silently strands the publisher instead of failing fast.
+Fix: the service's native-protocol/data-plane listener plus the ingest endpoint the channel representation advertises (ops/create_channel.rs + the stream state in src/state.rs), so the announced endpoint accepts RTMPS ingest for a valid stream key and flips the channel's stream state to LIVE.
+Traces: ivs.rtmps-ingest-live-stream-lifecycle (timeout), ivs.native-rtmps-live-stream-lifecycle (both also depend on the separately-filed `GetStream` stub to observe LIVE).
+
+## Evidence
+Suite: simparity-behavioral-aws-v1, total 11/79 passed, all 68 failures in service `ivs` (crate services/service-com-amazonaws-ivs-amazoninteractivevideoservice, bootstrapped).
+
+Cause 1 — expected/actual:
+  expected Error.Message == "Resource: arn:aws:ivs:us-west-2:...:channel/<id> not found" (code ResourceNotFoundException, 404)
+  actual   code ResourceNotFoundException with Message == '' (AssertionError: unexpected GetChannel not-found message: '')
+  expected multitrack rejection Message == "Request member: multitrack_input_configuration.enabled failed to satisfy the constraints: invalid value for multitrack input configuration enabled and container format" (ValidationException, 400); actual: ValidationException with Message == ''
+  handler ops/get_channel.rs:155-160 does set exception_message: Some(format!("channel {} does not exist", input.arn)) — it never reaches the client.
+
+Cause 2 — expected/actual:
+  expected "CreateChannel.name does not match the required pattern ^[a-zA-Z0-9-_]*$"
+  actual   "1 validation error detected: Value 'sim2real ivs chan!! 6eada436115c' at 'name' failed to satisfy constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9-_]*$"
+  expected "CreateRecordingConfiguration.destinationConfiguration.s3.bucketName does not match the required pattern ^[a-z0-9-.]+$"
+  actual   "1 validation error detected: Value 'Invalid_Bucket_Name_x220e5705608b' at 'destinationConfiguration.s3.bucketName' failed to satisfy constraint: Member must satisfy regular expression pattern: ^[a-z0-9-.]+$"
+  expected "CreateAdConfiguration.mediaTailorPlaybackConfigurations is required to have a minimum length of 1, found 0"
+  actual   "1 validation error detected: Value '0 items' at 'mediaTailorPlaybackConfigurations' failed to satisfy constraint: Member must have length greater than or equal to 1"
+  (code ValidationException and status 400 matched in all four.)
+
+Cause 3 — actual: botocore.errorfactory.ValidationException: An error occurred (ValidationException) when calling the ListTagsForResource operation: 1 validation error detected: Value 'arn:aws:ivs:us-west-2:000000000000:channel/66526d55c951' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: ^arn:aws:ivs:[a-z0-9-]+:[0-9]+:[a-z-]/[a-zA-Z0-9-]+$ — expected HTTP 200 with the channel's tags; and for a fabricated playback-key ARN expected code NotFoundException / 404 / "Resource was not found", got ValidationException.
+
+Cause 4 — actual: second CreateStreamKey on a channel that already has its auto-created key returned HTTP 200: {'streamKey': {'arn': 'arn:aws:ivs:us-west-2:000000000000:stream-key/e2e851927837', 'value': 'sk_us-west-2_...', 'channelArn': 'arn:aws:ivs:us-west-2:000000000000:channel/0a4613a0270a'}} — expected ServiceQuotaExceededException, HTTP 402, "Resource: stream-key quota exceeded limit: 1".
+
+Cause 5 — actual: CreateChannel by an assumed role with NO attached policy returned HTTP 200 with a complete channel+streamKey ('arn': 'arn:aws:ivs:us-west-2:000000000000:channel/fd693794c669'); expected AccessDeniedException, HTTP 403, "User: <assumed-role-arn> is not authorized to perform: ivs:CreateChannel on resource: arn:aws:ivs:<region>:<account>:channel/* because no identity-based policy allows the ivs:CreateChannel action".
+
+Causes 6-8 — actual: ClientError (NotImplemented), HTTP 501, "operation <Op> is scaffolded but not implemented in this emulator" for PutMetadata, StopStream and StartViewerSessionRevocation; expected ChannelNotBroadcasting/404 (PutMetadata, StopStream) and ResourceNotFoundException/404 or HTTP 200 (StartViewerSessionRevocation). ops/put_metadata.rs:188 returns Scaffolded::not_implemented("PutMetadata") and the file retains the '//! SCAFFOLDED, NOT IMPLEMENTED:' marker.
+
+Cause 9 — actual: 'Error: Check timed out after 60.0s' while polling GetStream for state==LIVE after ffmpeg pushed FLV/H.264+AAC to rtmps://<advertised ingestEndpoint>:443/app/<streamKey>; expected stream.state == 'LIVE' within the poll window, then PutMetadata accepted and StopStream returning the channel to ChannelNotBroadcasting.
+
+## Steps to Reproduce
+Replay the listed behavioral checks against the emulator (suite simparity-behavioral-aws-v1, service ivs). Minimal manual repro per cause, with a botocore `ivs` client pointed at the emulator:
+1. Cause 1: arn = create_channel(name='c1')['channel']['arn']; delete_channel(arn=arn); get_channel(arn=arn) -> inspect e.response['Error']['Message'] (empty; expected "Resource: <arn> not found"). Same for update_channel(arn=arn, latencyMode='NORMAL') and create_stream_key(channelArn=arn). Also create_channel(name='c2', multitrackInputConfiguration={'enabled': True,'policy':'ALLOW','maximumResolution':'HD'}, containerFormat='TS') -> ValidationException with empty Message.
+2. Cause 2: create_channel(name='bad name!!') -> compare Error.Message with "CreateChannel.name does not match the required pattern ^[a-zA-Z0-9-_]*$"; list_channels(filterByName='bad name!!'); create_recording_configuration(name='r', destinationConfiguration={'s3':{'bucketName':'Invalid_Bucket_Name_x'}}); create_ad_configuration(name='a', mediaTailorPlaybackConfigurations=[]) with Config(parameter_validation=False).
+3. Cause 3: arn = create_channel(name='c3', tags={'team':'video'})['channel']['arn']; list_tags_for_resource(resourceArn=arn) -> 400 ValidationException instead of the tags. Then list_tags_for_resource(resourceArn='arn:aws:ivs:<region>:<acct>:playback-key/00000000-0000-0000-0000-000000000000') -> expected NotFoundException/404.
+4. Cause 4: created = create_channel(name='c4'); create_stream_key(channelArn=created['channel']['arn']) -> succeeds; expected ServiceQuotaExceededException (402).
+5. Cause 5: iam.create_role with a trust policy and NO permission policy; sts.assume_role; build an ivs client with those temporary credentials; create_channel(name='c5') -> succeeds; expected AccessDeniedException (403).
+6. Causes 6-8: arn = create_channel(name='c6')['channel']['arn']; put_metadata(channelArn=arn, metadata='x'); stop_stream(channelArn=arn); start_viewer_session_revocation(channelArn=arn, viewerId='v1') -> each answers 501 NotImplemented.
+7. Cause 9: created = create_channel(name='c7'); push with ffmpeg to rtmps://<created['channel']['ingestEndpoint']>:443/app/<created['streamKey']['value']> and poll get_stream(channelArn=...) for state=='LIVE' -> never becomes LIVE (nothing serves the advertised ingest endpoint).
