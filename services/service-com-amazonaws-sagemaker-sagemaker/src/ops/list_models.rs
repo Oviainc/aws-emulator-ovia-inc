@@ -123,27 +123,10 @@ impl<Eng> ListModels<Eng> {
     }
 }
 
-/// `SortBy`'s documented default ("Sorts the list of results. The default is
-/// `CreationTime`.").
-const DEFAULT_SORT_BY: &str = "CreationTime";
-
-/// `SortOrder`'s documented default ("The sort order for results. The default is
-/// `Descending`.").
-const DEFAULT_SORT_ORDER: &str = "Descending";
-
-/// A page boundary as an opaque `NextToken`: the hex of the last-returned `ModelName`.
-///
-/// The token names the item the page stopped at rather than an offset, so resuming
-/// lands exactly after it even though the token is opaque to the caller.
-fn encode_token(model_name: &str) -> String {
-    hex::encode(model_name.as_bytes())
-}
-
-/// The `ModelName` a `NextToken` names, or `None` when the token was not minted here.
-fn decode_token(token: &str) -> Option<String> {
-    String::from_utf8(hex::decode(token).ok()?).ok()
-}
-
+// `SortBy`'s documented default is `crate::state::DEFAULT_SORT_BY` and `SortOrder`'s is
+// `crate::state::DEFAULT_SORT_ORDER`; both live there because `ListEndpoints` documents
+// the same two, and the opaque page token is minted by `crate::state::encode_page_token`
+// so every listing in this service reads one token format.
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListModels<Eng>
 {
@@ -164,21 +147,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
-        let sort_by = input.sort_by.as_deref().unwrap_or(DEFAULT_SORT_BY);
-        if !matches!(sort_by, "Name" | "CreationTime") {
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !MODEL_SORT_KEY_VALUES.contains(&sort_by) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "SortBy must be one of Name, CreationTime; got \"{sort_by}\"."
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                MODEL_SORT_KEY_VALUES.join(", ")
             )));
         }
-        let descending = match input.sort_order.as_deref().unwrap_or(DEFAULT_SORT_ORDER) {
-            "Descending" => true,
-            "Ascending" => false,
-            other => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "SortOrder must be one of Ascending, Descending; got \"{other}\"."
-                )))
-            }
-        };
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !ORDER_KEY_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                ORDER_KEY_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
 
         let after = input.creation_time_after.map(crate::state::timestamp_key);
         let before = input.creation_time_before.map(crate::state::timestamp_key);
@@ -222,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
-                let resumed_after = decode_token(token)
+                let resumed_after = crate::state::decode_page_token(token)
                     .and_then(|name| matching.iter().position(|model| model.name == name))
                     .ok_or_else(|| {
                         crate::scaffolded::Scaffolded::validation(
@@ -250,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let next_token = match page.last() {
             // A token only where a further page exists, so a paginating client stops.
-            Some(last) if end < matching.len() => Some(encode_token(&last.name)),
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.name)),
             _ => None,
         };
 
