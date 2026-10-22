@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns tags to a retention rule. Implemented: it upserts the request's tags onto the
+//! rule the ARN addresses, which `ListTagsForResource` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -138,23 +132,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 201u16;
 
+    /// Assign tags to the retention rule the ARN addresses.
+    ///
+    /// Tagging is an UPSERT keyed by tag key: a key the rule already carries takes the
+    /// value this request gives it, and a key it does not carry is added, so the rule
+    /// never holds two tags for one key. The quota it is held to is the number of tags
+    /// the rule would carry AFTERWARDS, which is why replacing the value of a key the
+    /// rule already holds can never exceed it.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the rbin retention-rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        let Some(rule) = store.rule_by_arn_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Retention rule with ARN {} not found",
+                        input.resource_arn
+                    )),
+                    reason: Some("RULE_NOT_FOUND".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let projected = rule.tag_count_after(&input.tags);
+        if projected > crate::state::MAX_TAGS_PER_RULE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The request would leave the retention rule with {projected} tags, \
+                         exceeding the quota of {} tags per resource",
+                        crate::state::MAX_TAGS_PER_RULE
+                    )),
+                    reason: Some("SERVICE_QUOTA_EXCEEDED".to_string()),
+                },
+            )
+            .into());
+        }
+        rule.apply_tags(input.tags);
+        Ok(TagResourceOutput {})
     }
 }

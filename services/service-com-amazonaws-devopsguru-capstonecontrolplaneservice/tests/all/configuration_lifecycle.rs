@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use service_com_amazonaws_devopsguru_capstonecontrolplaneservice::state::{
-    MAX_COVERED_STACK_NAMES, MAX_COVERED_TAG_KEYS, MAX_NOTIFICATION_CHANNELS,
-    MAX_TAG_VALUES_PER_KEY, PAGE_SIZE,
+    ComAmazonawsDevopsguruCapstonecontrolplaneserviceState, InsightRecord, MAX_COVERED_STACK_NAMES,
+    MAX_COVERED_TAG_KEYS, MAX_NOTIFICATION_CHANNELS, MAX_TAG_VALUES_PER_KEY, PAGE_SIZE,
 };
 
 /// Host that routes a request to this service: `resolve_route_key` falls back to the
@@ -27,6 +27,9 @@ use service_com_amazonaws_devopsguru_capstonecontrolplaneservice::state::{
 const HOST: &str = "devops-guru.us-east-1.amazonaws.com";
 
 /// One reply, as a client sees it.
+///
+/// `pub(crate)` because the other suites in this test crate drive the service through
+/// the same harness rather than standing up a second one.
 pub(crate) struct Reply {
     pub(crate) status: u16,
     pub(crate) body: Value,
@@ -39,7 +42,7 @@ pub(crate) struct Reply {
 impl Reply {
     /// Whether the rendered error IS `code` — the parsed error name, not a substring of
     /// the body, so an error name quoted inside a message cannot satisfy it.
-    fn names_error(&self, code: &str) -> bool {
+    pub(crate) fn names_error(&self, code: &str) -> bool {
         self.error_name == code
     }
 
@@ -47,7 +50,7 @@ impl Reply {
         self.body.pointer(pointer)
     }
 
-    fn strings_at(&self, pointer: &str) -> Vec<String> {
+    pub(crate) fn strings_at(&self, pointer: &str) -> Vec<String> {
         self.at(pointer)
             .and_then(Value::as_array)
             .map(|items| {
@@ -63,6 +66,11 @@ impl Reply {
 /// A fresh emulator holding only this service, over its own engine.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine the registered service reads and writes, kept so a suite can
+    /// seed the records DevOps Guru's own analysis would write — no modelled
+    /// operation mints an insight, so this is the only way to drive the insight
+    /// reads over a non-empty store.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -73,10 +81,22 @@ impl Emulator {
         router.set_request_authentication(false);
         router.register_service(
             service_com_amazonaws_devopsguru_capstonecontrolplaneservice::EmulatedService::new(
-                engine,
+                Arc::clone(&engine),
             ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// Put `records` in the store's `insights` map, as the analysis that produces them
+    /// would. Keyed by `InsightRecord::id`, which is the map's key.
+    pub(crate) fn seed_insights(&self, records: Vec<InsightRecord>) {
+        let state = self
+            .engine
+            .state::<ComAmazonawsDevopsguruCapstonecontrolplaneserviceState>();
+        let mut guard = state.lock();
+        for record in records {
+            guard.insights.insert(record.id.clone(), record);
+        }
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
@@ -126,7 +146,11 @@ impl Emulator {
         }
     }
 
-    pub(crate) async fn update_resource_collection(&self, action: &str, collection: Value) -> Reply {
+    pub(crate) async fn update_resource_collection(
+        &self,
+        action: &str,
+        collection: Value,
+    ) -> Reply {
         self.call(
             "PUT",
             "/resource-collections",
@@ -135,7 +159,11 @@ impl Emulator {
         .await
     }
 
-    async fn get_resource_collection(&self, collection_type: &str, next: Option<&str>) -> Reply {
+    pub(crate) async fn get_resource_collection(
+        &self,
+        collection_type: &str,
+        next: Option<&str>,
+    ) -> Reply {
         let path = match next {
             Some(token) => format!("/resource-collections/{collection_type}?NextToken={token}"),
             None => format!("/resource-collections/{collection_type}"),
@@ -174,7 +202,7 @@ impl Emulator {
     }
 
     /// Every covered stack name, walking `GetResourceCollection`'s pages.
-    async fn all_stack_names(&self) -> Vec<String> {
+    pub(crate) async fn all_stack_names(&self) -> Vec<String> {
         let mut all = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -198,7 +226,7 @@ impl Emulator {
     }
 
     /// Every covered tag collection, walking `GetResourceCollection`'s pages.
-    async fn all_tag_collections(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) async fn all_tag_collections(&self) -> Vec<(String, Vec<String>)> {
         let mut all = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -272,11 +300,11 @@ fn reported_tag_collections(reply: &Reply) -> Vec<(String, Vec<String>)> {
         .unwrap_or_default()
 }
 
-fn cloud_formation(stack_names: &[&str]) -> Value {
+pub(crate) fn cloud_formation(stack_names: &[&str]) -> Value {
     json!({ "CloudFormation": { "StackNames": stack_names } })
 }
 
-fn tags(entries: &[(&str, &[&str])]) -> Value {
+pub(crate) fn tags(entries: &[(&str, &[&str])]) -> Value {
     let tags: Vec<Value> = entries
         .iter()
         .map(|(key, values)| json!({ "AppBoundaryKey": key, "TagValues": values }))
