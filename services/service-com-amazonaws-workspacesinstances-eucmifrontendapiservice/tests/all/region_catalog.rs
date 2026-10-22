@@ -23,26 +23,32 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The `X-Amz-Target` prefix from the crate's `OPERATIONS.md` wire-protocol section.
 const TARGET_PREFIX: &str = "EUCMIFrontendAPIService";
 
-/// The Region catalog this emulator reports, in the order `ListRegions` reports it.
+/// The Region catalog this service reports, in the order `ListRegions` reports it.
 ///
 /// Pinned here rather than read out of the crate, so the test measures what goes over
 /// the wire against the documented set instead of against itself. SOURCE: AWS's
-/// published Region availability for the Amazon WorkSpaces family in the commercial
+/// published Region availability for WorkSpaces Instances in the commercial
 /// partition, recorded on `crate::state::SUPPORTED_REGIONS` with the same note.
 const EXPECTED_REGIONS: &[&str] = &[
     "af-south-1",
+    "ap-east-1",
     "ap-northeast-1",
     "ap-northeast-2",
     "ap-south-1",
     "ap-southeast-1",
     "ap-southeast-2",
+    "ap-southeast-5",
     "ca-central-1",
     "eu-central-1",
+    "eu-south-2",
     "eu-west-1",
     "eu-west-2",
+    "eu-west-3",
     "il-central-1",
+    "me-central-1",
     "sa-east-1",
     "us-east-1",
+    "us-east-2",
     "us-west-2",
 ];
 
@@ -172,18 +178,18 @@ async fn list_regions_reports_the_whole_catalog_whatever_max_results_asks_for() 
             json!({ "MaxResults": 1 }),
         ),
         ("MaxResults 2", json!({ "MaxResults": 2 })),
-        ("MaxResults 7, half the catalog", json!({ "MaxResults": 7 })),
+        ("MaxResults 7, a third of the catalog", json!({ "MaxResults": 7 })),
         (
-            "MaxResults 13, one short of the catalog",
-            json!({ "MaxResults": 13 }),
+            "MaxResults 19, one short of the catalog",
+            json!({ "MaxResults": 19 }),
         ),
         (
-            "MaxResults 14, the catalog's own length",
-            json!({ "MaxResults": 14 }),
+            "MaxResults 20, the catalog's own length",
+            json!({ "MaxResults": 20 }),
         ),
         (
-            "MaxResults 15, one past the catalog",
-            json!({ "MaxResults": 15 }),
+            "MaxResults 21, one past the catalog",
+            json!({ "MaxResults": 21 }),
         ),
         (
             "MaxResults at the modelled maximum of 25",
