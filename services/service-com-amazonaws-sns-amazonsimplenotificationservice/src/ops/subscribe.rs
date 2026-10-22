@@ -261,14 +261,9 @@ fn endpoint_requirement(protocol: &str) -> &'static str {
 /// The refusal for a subscription record whose attribute map would cross the
 /// per-record byte ceiling, or `None` when it fits.
 fn oversized(attributes: &std::collections::HashMap<String, String>) -> Option<SubscribeError> {
-    let held = state::attribute_bytes(attributes);
-    (held > state::MAX_ATTRIBUTE_BYTES_PER_RECORD).then(|| {
+    state::attribute_bytes_refusal(state::SUBSCRIPTION_RECORD, attributes).map(|refusal| {
         SubscribeErrorModeled::InvalidParameterException(InvalidParameterException {
-            message: Some(format!(
-                "Invalid parameter: Attributes - a subscription holds at most {} bytes of \
-                 Attributes: {held}",
-                state::MAX_ATTRIBUTE_BYTES_PER_RECORD
-            )),
+            message: Some(refusal),
         })
         .into()
     })

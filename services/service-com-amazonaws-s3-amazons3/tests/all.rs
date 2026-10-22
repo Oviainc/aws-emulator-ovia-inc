@@ -23,5 +23,7 @@ mod head_object_read_back;
 mod object_and_tagging_roundtrip;
 #[path = "all/object_write_and_read_back.rs"]
 mod object_write_and_read_back;
+#[path = "all/objects.rs"]
+mod objects;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

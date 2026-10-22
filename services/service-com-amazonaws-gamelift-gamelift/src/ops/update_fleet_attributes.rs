@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFleetAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFleetAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes a fleet's mutable attributes into the stored fleet record, so every later
+//! describe of that fleet serves the updated values.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFleetAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "To update fleet attributes, specify the fleet ID and the property values that you
+//! want to change": a member the request omits is left as it was, and a member it carries
+//! replaces what the record held. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -190,20 +187,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFleetAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFleetAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFleetAttributes"))
+        use crate::state::FLEET_STATUS_DELETING;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFleetAttributesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        let fleet_id = state.resolve_fleet_id(&input.fleet_id);
+        let Some(fleet) = fleet_id
+            .as_ref()
+            .and_then(|fleet_id| state.fleets.get_mut(fleet_id))
+        else {
+            return Err(UpdateFleetAttributesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!("The fleet {} was not found.", input.fleet_id)),
+                },
+            )
+            .into());
+        };
+
+        // A fleet whose deletion is under way is being torn down — DeleteFleet "deletes
+        // all resources and information related to a fleet" — so there is no
+        // configuration left to reconfigure, which is the conflict
+        // `InvalidFleetStatusException` reports ("would cause a conflict with the current
+        // state of a resource associated with the request and/or the fleet").
+        if fleet.status == FLEET_STATUS_DELETING {
+            return Err(
+                UpdateFleetAttributesErrorModeled::InvalidFleetStatusException(
+                    InvalidFleetStatusException {
+                        message: Some(format!(
+                            "Fleet {} is in {} status and its attributes cannot be updated.",
+                            fleet.fleet_id, fleet.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each member the request carries replaces what the record held; each one it
+        // omits leaves that part of the record alone.
+        if let Some(name) = input.name.clone() {
+            fleet.name = name;
+        }
+        if let Some(description) = input.description.clone() {
+            fleet.description = Some(description);
+        }
+        if let Some(policy) = input.new_game_session_protection_policy.clone() {
+            fleet.new_game_session_protection_policy = policy;
+        }
+        if let Some(policy) = input.resource_creation_limit_policy.clone() {
+            fleet.resource_creation_limit_policy = Some(policy);
+        }
+        // "The name of a metric group to add this fleet to. […] A fleet can only be in
+        // one metric group at a time", and the list is modelled `len 0..1`: one name
+        // moves the fleet to that group, and the empty list takes it out of the group it
+        // was in.
+        if let Some(metric_groups) = input.metric_groups.clone() {
+            fleet.metric_groups = metric_groups;
+        }
+        if let Some(anywhere_configuration) = input.anywhere_configuration.clone() {
+            fleet.anywhere_configuration = Some(anywhere_configuration);
+        }
+
+        // "Amazon GameLift Servers returns the identifiers for the updated fleet", read
+        // back off the record this call just wrote.
+        Ok(UpdateFleetAttributesOutput {
+            fleet_id: Some(fleet.fleet_id.clone()),
+            fleet_arn: Some(fleet.fleet_arn.clone()),
+        })
     }
 }

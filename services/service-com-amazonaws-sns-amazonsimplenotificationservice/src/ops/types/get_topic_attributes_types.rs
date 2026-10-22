@@ -20,6 +20,10 @@ pub struct GetTopicAttributesInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.sns#GetTopicAttributesResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct GetTopicAttributesOutput {
-    pub attributes: Option<std::collections::HashMap<String, String>>,
+    /// Keyed by [`crate::state::TopicAttributeName`], whose ordering is the order SNS
+    /// reports a topic's attributes in: a `BTreeMap` of it serializes the entries in
+    /// that order, where a `HashMap<String, String>` would serialize the same topic's
+    /// entries in a different order on every call.
+    pub attributes: Option<std::collections::BTreeMap<crate::state::TopicAttributeName, String>>,
 }
 

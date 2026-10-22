@@ -98,7 +98,7 @@ use crate::state::{self, TopicRecord};
 use std::collections::HashMap;
 
 /// The attribute that asks for a FIFO topic.
-const FIFO_TOPIC_ATTRIBUTE: &str = "FifoTopic";
+const FIFO_TOPIC_ATTRIBUTE: &str = state::FIFO_TOPIC_ATTRIBUTE;
 
 /// The suffix a FIFO topic's name carries — shared with the ARN reader in
 /// [`crate::state`], which uses the same rule to tell a topic ARN from another SNS

@@ -147,6 +147,52 @@ pub fn attribute_bytes(attributes: &HashMap<String, String>) -> usize {
         .sum()
 }
 
+/// The refusal reason for an attribute map that would cross
+/// [`MAX_ATTRIBUTE_BYTES_PER_RECORD`], or `None` when it fits.
+///
+/// `holder` names the record the map belongs to ("a topic", "a subscription"), so ONE
+/// ceiling check serves every record this service stores and each caller lifts the
+/// reason into its own modelled error.
+pub fn attribute_bytes_refusal(
+    holder: &str,
+    attributes: &HashMap<String, String>,
+) -> Option<String> {
+    let held = attribute_bytes(attributes);
+    (held > MAX_ATTRIBUTE_BYTES_PER_RECORD).then(|| {
+        format!(
+            "Invalid parameter: Attributes - {holder} holds at most \
+             {MAX_ATTRIBUTE_BYTES_PER_RECORD} bytes of Attributes: {held}"
+        )
+    })
+}
+
+/// The same check for a write of ONE attribute: measured on the map the write WOULD
+/// produce (`value` of `None` clears the attribute), so a caller cannot grow one
+/// record past the ceiling by repeating the call with ever larger values.
+pub fn attribute_write_refusal(
+    holder: &str,
+    attributes: &HashMap<String, String>,
+    name: &str,
+    value: Option<&str>,
+) -> Option<String> {
+    let mut would_hold = attributes.clone();
+    match value {
+        Some(value) => {
+            would_hold.insert(name.to_string(), value.to_string());
+        }
+        None => {
+            would_hold.remove(name);
+        }
+    }
+    attribute_bytes_refusal(holder, &would_hold)
+}
+
+/// The name a refusal gives a topic record.
+pub const TOPIC_RECORD: &str = "a topic";
+
+/// The name a refusal gives a subscription record.
+pub const SUBSCRIPTION_RECORD: &str = "a subscription";
+
 /// Whether `name` is an attribute SNS defines for a topic.
 pub fn is_topic_attribute(name: &str) -> bool {
     TOPIC_ATTRIBUTE_NAMES.contains(&name)
@@ -200,6 +246,521 @@ pub struct TopicRecord {
     /// How many of this topic's subscriptions have been deleted — the
     /// `SubscriptionsDeleted` attribute, which outlives the subscription records.
     pub subscriptions_deleted: u64,
+}
+
+// =============================================================================
+// Topic attributes SNS gives a meaning of its own
+// =============================================================================
+
+/// The topic attribute a caller-set access control policy lives under.
+pub const POLICY_ATTRIBUTE: &str = "Policy";
+
+/// The topic attribute a caller-set delivery policy lives under.
+pub const DELIVERY_POLICY_ATTRIBUTE: &str = "DeliveryPolicy";
+
+/// The topic attribute a caller-set display name lives under.
+pub const DISPLAY_NAME_ATTRIBUTE: &str = "DisplayName";
+
+/// The topic attribute the server-side-encryption key id lives under:
+/// "The following attribute applies only to server-side-encryption: KmsMasterKeyId"
+/// (`SetTopicAttributesInput$AttributeName` doc).
+pub const KMS_MASTER_KEY_ID_ATTRIBUTE: &str = "KmsMasterKeyId";
+
+/// The attribute that asks `CreateTopic` for a FIFO topic. It is fixed for the life of
+/// the topic: a topic's kind is decided when it is created, so `SetTopicAttributes`
+/// refuses it.
+pub const FIFO_TOPIC_ATTRIBUTE: &str = "FifoTopic";
+
+/// The attributes SNS COMPUTES for a topic rather than storing: the account that owns
+/// it, its ARN, its subscription counts and the delivery policy it is effectively run
+/// under. None of them is settable, so none is in [`TOPIC_ATTRIBUTE_NAMES`].
+pub const OWNER_ATTRIBUTE: &str = "Owner";
+pub const TOPIC_ARN_ATTRIBUTE: &str = "TopicArn";
+pub const SUBSCRIPTIONS_PENDING_ATTRIBUTE: &str = "SubscriptionsPending";
+pub const SUBSCRIPTIONS_CONFIRMED_ATTRIBUTE: &str = "SubscriptionsConfirmed";
+pub const SUBSCRIPTIONS_DELETED_ATTRIBUTE: &str = "SubscriptionsDeleted";
+pub const EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE: &str = "EffectiveDeliveryPolicy";
+
+/// The order SNS reports a topic's attributes in, as recorded `GetTopicAttributes`
+/// responses carry it: the access policy, the owner, the pending-subscription count,
+/// the encryption key id of an encrypted topic, the ARN, the effective delivery
+/// policy, the confirmed count, the display name, the deleted count. Every other
+/// attribute a topic holds follows these, ordered by name.
+///
+/// SNS answers the same attribute set with the same entry order every time, so a
+/// client that reads the map positionally, or diffs two reads of one topic, sees one
+/// stable document — which is why the attribute map is keyed by
+/// [`TopicAttributeName`], whose ordering IS this order, rather than by a `String` in
+/// a `HashMap` (whose entries come out in a different order on every call).
+pub const REPORTED_TOPIC_ATTRIBUTE_ORDER: &[&str] = &[
+    POLICY_ATTRIBUTE,
+    OWNER_ATTRIBUTE,
+    SUBSCRIPTIONS_PENDING_ATTRIBUTE,
+    KMS_MASTER_KEY_ID_ATTRIBUTE,
+    TOPIC_ARN_ATTRIBUTE,
+    EFFECTIVE_DELIVERY_POLICY_ATTRIBUTE,
+    SUBSCRIPTIONS_CONFIRMED_ATTRIBUTE,
+    DISPLAY_NAME_ATTRIBUTE,
+    SUBSCRIPTIONS_DELETED_ATTRIBUTE,
+];
+
+/// A topic attribute name as the key of a reported attribute map: a string on the
+/// wire, ordered by [`REPORTED_TOPIC_ATTRIBUTE_ORDER`] rather than alphabetically, so
+/// a `BTreeMap` keyed by it serializes its entries in the order SNS reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicAttributeName(String);
+
+impl TopicAttributeName {
+    /// Where SNS reports this attribute: its place in
+    /// [`REPORTED_TOPIC_ATTRIBUTE_ORDER`], or past the end for a name that order does
+    /// not list (which then sorts by name).
+    fn reported_position(&self) -> usize {
+        REPORTED_TOPIC_ATTRIBUTE_ORDER
+            .iter()
+            .position(|name| *name == self.0)
+            .unwrap_or(REPORTED_TOPIC_ATTRIBUTE_ORDER.len())
+    }
+}
+
+impl Ord for TopicAttributeName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.reported_position()
+            .cmp(&other.reported_position())
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl PartialOrd for TopicAttributeName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl AsRef<str> for TopicAttributeName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for TopicAttributeName {
+    fn from(name: &str) -> Self {
+        Self(name.to_string())
+    }
+}
+
+impl From<String> for TopicAttributeName {
+    fn from(name: String) -> Self {
+        Self(name)
+    }
+}
+
+impl std::str::FromStr for TopicAttributeName {
+    type Err = std::convert::Infallible;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Ok(Self(name.to_string()))
+    }
+}
+
+/// The maximum-message-size bounds SNS documents: "Valid values are 1024 to 1048576
+/// (1 MiB). The default is 262144 (256 KiB)"
+/// (`SetTopicAttributesInput$AttributeName` doc).
+pub const MAXIMUM_MESSAGE_SIZE_ATTRIBUTE: &str = "MaximumMessageSize";
+pub const MIN_MAXIMUM_MESSAGE_SIZE: u64 = 1_024;
+pub const MAX_MAXIMUM_MESSAGE_SIZE: u64 = 1_048_576;
+
+// =============================================================================
+// The topic access policy document
+// =============================================================================
+
+/// One statement of a topic's access control policy.
+///
+/// The document is MODELLED rather than carried as opaque JSON for two reasons:
+/// `AddPermission` and `RemovePermission` edit it statement by statement, and the
+/// members of a document SNS itself produces come back in SNS's own order (`Sid`,
+/// `Effect`, `Principal`, `Action`, `Resource`, `Condition`), which a
+/// [`serde_json::Value`] object — sorted by key — cannot reproduce. Members this
+/// emulator gives no meaning to (`NotAction`, `NotPrincipal`, …) are kept in `other`
+/// so editing a caller's policy never drops part of it, and every member but `Effect`
+/// is optional: `Effect` is the one member a policy statement cannot be read without.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopicPolicyStatement {
+    #[serde(rename = "Sid", skip_serializing_if = "Option::is_none", default)]
+    pub sid: Option<String>,
+    #[serde(rename = "Effect")]
+    pub effect: String,
+    #[serde(rename = "Principal", skip_serializing_if = "Option::is_none", default)]
+    pub principal: Option<serde_json::Value>,
+    #[serde(rename = "Action", skip_serializing_if = "Option::is_none", default)]
+    pub action: Option<serde_json::Value>,
+    #[serde(rename = "Resource", skip_serializing_if = "Option::is_none", default)]
+    pub resource: Option<serde_json::Value>,
+    #[serde(rename = "Condition", skip_serializing_if = "Option::is_none", default)]
+    pub condition: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// A topic's access control policy: the JSON document the `Policy` attribute carries.
+///
+/// Top-level members this emulator gives no meaning to are kept in `other`, so editing
+/// a caller's document (a grant, a revoke) rewrites it without dropping part of it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopicPolicyDocument {
+    #[serde(rename = "Version", skip_serializing_if = "Option::is_none", default)]
+    pub version: Option<String>,
+    #[serde(rename = "Id", skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<String>,
+    #[serde(rename = "Statement", deserialize_with = "statements")]
+    pub statement: Vec<TopicPolicyStatement>,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Read a document's `Statement`: ONE statement or a list of them, both of which the
+/// policy grammar accepts. It is written back as a list, the form SNS answers with.
+fn statements<'de, D>(deserializer: D) -> Result<Vec<TopicPolicyStatement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        // Boxed: one statement is a far larger value than the vector of them, and an
+        // enum is as big as its largest variant.
+        One(Box<TopicPolicyStatement>),
+        Many(Vec<TopicPolicyStatement>),
+    }
+
+    Ok(match <OneOrMany as serde::Deserialize>::deserialize(deserializer)? {
+        OneOrMany::One(one) => vec![*one],
+        OneOrMany::Many(many) => many,
+    })
+}
+
+impl TopicPolicyDocument {
+    /// This document as the `Policy` attribute carries it.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// The statement labelled `label`, if the document holds one. A statement's `Sid`
+    /// IS the `Label` `AddPermission` gave it, which is what makes a label removable.
+    pub fn position_of(&self, label: &str) -> Option<usize> {
+        self.statement
+            .iter()
+            .position(|statement| statement.sid.as_deref() == Some(label))
+    }
+}
+
+/// One value as a bare string, several as an array — the shape SNS writes a policy
+/// statement's `Principal` and `Action` in.
+pub fn one_or_many(values: Vec<String>) -> serde_json::Value {
+    match <[String; 1]>::try_from(values) {
+        Ok([only]) => serde_json::Value::String(only),
+        Err(values) => serde_json::Value::Array(
+            values.into_iter().map(serde_json::Value::String).collect(),
+        ),
+    }
+}
+
+/// The access policy of a topic whose owner has set none: the one SNS generates, which
+/// allows the topic's own account every topic action.
+pub fn default_topic_policy(arn: &str, owner: &str) -> TopicPolicyDocument {
+    TopicPolicyDocument {
+        version: Some("2008-10-17".to_string()),
+        id: Some("__default_policy_ID".to_string()),
+        statement: vec![TopicPolicyStatement {
+            sid: Some("__default_statement_ID".to_string()),
+            effect: "Allow".to_string(),
+            principal: Some(serde_json::json!({ "AWS": "*" })),
+            action: Some(serde_json::json!([
+                "SNS:GetTopicAttributes",
+                "SNS:SetTopicAttributes",
+                "SNS:AddPermission",
+                "SNS:RemovePermission",
+                "SNS:DeleteTopic",
+                "SNS:Subscribe",
+                "SNS:ListSubscriptionsByTopic",
+                "SNS:Publish"
+            ])),
+            resource: Some(serde_json::Value::String(arn.to_string())),
+            condition: Some(serde_json::json!({
+                "StringEquals": { "AWS:SourceOwner": owner }
+            })),
+            other: std::collections::BTreeMap::new(),
+        }],
+        other: std::collections::BTreeMap::new(),
+    }
+}
+
+/// The statement `AddPermission` adds: an `Allow` of `SNS:<action>` for each named
+/// action, to the root principal of each named account, on this topic alone.
+///
+/// An account id is written as its root user's ARN, the principal form SNS stores a
+/// delegated account as.
+pub fn permission_statement(
+    label: &str,
+    account_ids: &[String],
+    action_names: &[String],
+    topic_arn: &str,
+) -> TopicPolicyStatement {
+    TopicPolicyStatement {
+        sid: Some(label.to_string()),
+        effect: "Allow".to_string(),
+        principal: Some(serde_json::json!({
+            "AWS": one_or_many(
+                account_ids
+                    .iter()
+                    .map(|account| format!("arn:aws:iam::{account}:root"))
+                    .collect(),
+            )
+        })),
+        action: Some(one_or_many(
+            action_names
+                .iter()
+                .map(|action| format!("SNS:{action}"))
+                .collect(),
+        )),
+        resource: Some(serde_json::Value::String(topic_arn.to_string())),
+        condition: None,
+        other: std::collections::BTreeMap::new(),
+    }
+}
+
+impl TopicRecord {
+    /// This topic's access control policy document: the one its owner set, or the
+    /// default SNS generates for a topic with none. `None` when the stored value is not
+    /// a policy document at all, which the write paths refuse to create.
+    pub fn policy_document(&self) -> Option<TopicPolicyDocument> {
+        match self.attributes.get(POLICY_ATTRIBUTE) {
+            Some(stored) => serde_json::from_str(stored).ok(),
+            None => Some(default_topic_policy(&self.arn, &self.owner)),
+        }
+    }
+
+    /// The `Policy` attribute value this topic reports: what its owner set, verbatim,
+    /// or the default document.
+    pub fn policy_attribute(&self) -> String {
+        match self.attributes.get(POLICY_ATTRIBUTE) {
+            Some(stored) => stored.clone(),
+            None => default_topic_policy(&self.arn, &self.owner).to_json(),
+        }
+    }
+
+    /// Write `policy` back as this topic's access control policy.
+    pub fn store_policy(&mut self, policy: &TopicPolicyDocument) {
+        self.attributes
+            .insert(POLICY_ATTRIBUTE.to_string(), policy.to_json());
+    }
+}
+
+// =============================================================================
+// The delivery policy document
+// =============================================================================
+
+/// A delivery policy document: how SNS retries a failed delivery to an HTTP/S
+/// endpoint.
+///
+/// Modelled as a struct rather than carried as a [`serde_json::Value`] so the
+/// document's members serialize in SNS's own order — a `Value` object is sorted by
+/// key, which no SNS response is. Members this emulator gives no meaning to (a
+/// throttle policy, a protocol SNS has added since) are carried in the `other` map of
+/// each level, so a document the topic holds is reported WITH them rather than
+/// silently shortened; they serialize after the modelled members of their level.
+///
+/// It lives here, beside [`TopicPolicyDocument`], because both the read that reports
+/// `EffectiveDeliveryPolicy` and the write that accepts a `DeliveryPolicy` are stated
+/// by it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeliveryPolicy {
+    pub http: HttpDeliveryPolicy,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpDeliveryPolicy {
+    pub default_healthy_retry_policy: HealthyRetryPolicy,
+    pub disable_subscription_overrides: bool,
+    pub default_request_policy: RequestPolicy,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthyRetryPolicy {
+    pub min_delay_target: i64,
+    pub max_delay_target: i64,
+    pub num_retries: i64,
+    pub num_max_delay_retries: i64,
+    pub num_no_delay_retries: i64,
+    pub num_min_delay_retries: i64,
+    pub backoff_function: String,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPolicy {
+    pub header_content_type: String,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl DeliveryPolicy {
+    /// SNS's own delivery policy — the "system defaults" an `EffectiveDeliveryPolicy`
+    /// is taken over (`GetTopicAttributesResponse$Attributes` doc). The numbers are
+    /// SNS's documented defaults for a topic no caller has given a `DeliveryPolicy`:
+    /// "the default delivery policy ... numRetries 3 ... minDelayTarget 20 ...
+    /// maxDelayTarget 20 ... backoffFunction linear" (SNS Developer Guide, "Amazon SNS
+    /// message delivery retries"), with the plain-text `defaultRequestPolicy` recorded
+    /// AWS responses carry.
+    pub fn system_default() -> Self {
+        Self {
+            http: HttpDeliveryPolicy {
+                default_healthy_retry_policy: HealthyRetryPolicy {
+                    min_delay_target: 20,
+                    max_delay_target: 20,
+                    num_retries: 3,
+                    num_max_delay_retries: 0,
+                    num_no_delay_retries: 0,
+                    num_min_delay_retries: 0,
+                    backoff_function: "linear".to_string(),
+                    other: std::collections::BTreeMap::new(),
+                },
+                disable_subscription_overrides: false,
+                default_request_policy: RequestPolicy {
+                    header_content_type: "text/plain; charset=UTF-8".to_string(),
+                    other: std::collections::BTreeMap::new(),
+                },
+                other: std::collections::BTreeMap::new(),
+            },
+            other: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// A delivery policy as a CALLER wrote it: every member optional, because a caller
+/// sets only the ones it wants to override. Laying one of these over
+/// [`DeliveryPolicy::system_default`] is what "taking system defaults into account"
+/// means.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConfiguredDeliveryPolicy {
+    pub http: Option<ConfiguredHttpPolicy>,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConfiguredHttpPolicy {
+    pub default_healthy_retry_policy: Option<ConfiguredRetryPolicy>,
+    pub disable_subscription_overrides: Option<bool>,
+    pub default_request_policy: Option<ConfiguredRequestPolicy>,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConfiguredRetryPolicy {
+    pub min_delay_target: Option<i64>,
+    pub max_delay_target: Option<i64>,
+    pub num_retries: Option<i64>,
+    pub num_max_delay_retries: Option<i64>,
+    pub num_no_delay_retries: Option<i64>,
+    pub num_min_delay_retries: Option<i64>,
+    pub backoff_function: Option<String>,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConfiguredRequestPolicy {
+    pub header_content_type: Option<String>,
+    #[serde(flatten)]
+    pub other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl ConfiguredDeliveryPolicy {
+    /// Overlay what the caller set onto `defaults`, member by member: a member the
+    /// caller left out keeps SNS's default.
+    pub fn overlay(self, defaults: &mut DeliveryPolicy) {
+        defaults.other.extend(self.other);
+        let Some(http) = self.http else { return };
+        defaults.http.other.extend(http.other);
+        if let Some(disable) = http.disable_subscription_overrides {
+            defaults.http.disable_subscription_overrides = disable;
+        }
+        if let Some(retry) = http.default_healthy_retry_policy {
+            let held = &mut defaults.http.default_healthy_retry_policy;
+            if let Some(value) = retry.min_delay_target {
+                held.min_delay_target = value;
+            }
+            if let Some(value) = retry.max_delay_target {
+                held.max_delay_target = value;
+            }
+            if let Some(value) = retry.num_retries {
+                held.num_retries = value;
+            }
+            if let Some(value) = retry.num_max_delay_retries {
+                held.num_max_delay_retries = value;
+            }
+            if let Some(value) = retry.num_no_delay_retries {
+                held.num_no_delay_retries = value;
+            }
+            if let Some(value) = retry.num_min_delay_retries {
+                held.num_min_delay_retries = value;
+            }
+            if let Some(value) = retry.backoff_function {
+                held.backoff_function = value;
+            }
+            held.other.extend(retry.other);
+        }
+        if let Some(request) = http.default_request_policy {
+            if let Some(value) = request.header_content_type {
+                defaults.http.default_request_policy.header_content_type = value;
+            }
+            defaults
+                .http
+                .default_request_policy
+                .other
+                .extend(request.other);
+        }
+    }
+}
+
+/// Why `value` is not a delivery policy document this emulator can lay over the system
+/// defaults, or `None` when it is one.
+///
+/// It is the SAME parse [`effective_delivery_policy`] performs, so the write path
+/// refuses exactly what the read could not honour: a document whose members are of the
+/// wrong type would otherwise be stored and then be left out of the effective policy.
+pub fn delivery_policy_refusal(value: &str) -> Option<String> {
+    serde_json::from_str::<ConfiguredDeliveryPolicy>(value)
+        .err()
+        .map(|error| format!("the value must be a delivery policy document: {error}"))
+}
+
+/// The effective delivery policy of a topic: the system defaults with the topic's own
+/// `DeliveryPolicy` laid over them, as the `EffectiveDeliveryPolicy` attribute carries
+/// it.
+pub fn effective_delivery_policy(topic: &TopicRecord) -> String {
+    let mut effective = DeliveryPolicy::system_default();
+    if let Some(configured) = topic
+        .attributes
+        .get(DELIVERY_POLICY_ATTRIBUTE)
+        .and_then(|raw| serde_json::from_str::<ConfiguredDeliveryPolicy>(raw).ok())
+    {
+        configured.overlay(&mut effective);
+    }
+    serde_json::to_string(&effective).unwrap_or_default()
 }
 
 /// One subscription of one topic, as `Subscribe` minted it.

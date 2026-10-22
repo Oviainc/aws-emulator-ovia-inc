@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVocabulary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVocabulary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVocabulary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored custom vocabulary, materialising the `PENDING` -> `READY`
+//! transition the clock already owed it (see [`GetVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +169,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVocabulary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVocabularyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVocabulary"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetVocabularyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Reporting only: the sole write is the state transition the clock already
+        // owed this vocabulary, which was due at its stored instant whether or not
+        // anybody called.
+        let Some(record) = store.vocabulary_mut(&input.vocabulary_name, now) else {
+            return Err(GetVocabularyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "The requested vocabulary {} couldn't be found. Check the vocabulary \
+                     name and try your request again.",
+                    input.vocabulary_name
+                )),
+            })
+            .into());
+        };
+
+        Ok(GetVocabularyOutput {
+            vocabulary_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            vocabulary_state: Some(record.state.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            failure_reason: record.failure_reason.clone(),
+            // Where the vocabulary's file is reported to live. Nothing is served
+            // there — see the `crate::state` header. This answer carries no terms:
+            // `GetVocabularyResponse` has no member for them, so the vocabulary's
+            // content is not reported by this operation at all.
+            download_uri: Some(record.download_uri()),
+            data_access_role_arn: record.data_access_role_arn.clone(),
+            encryption_configuration: record.encryption_configuration.clone(),
+        })
     }
 }
