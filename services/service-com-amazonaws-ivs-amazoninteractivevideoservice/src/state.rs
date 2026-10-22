@@ -608,6 +608,9 @@ pub const STREAM_KEY_PAGE: &str = "stream-key";
 /// [`CHANNEL_PAGE`].
 pub const RECORDING_CONFIGURATION_PAGE: &str = "recording-configuration";
 
+/// The stamp a `ListPlaybackKeyPairs` page token carries. See [`CHANNEL_PAGE`].
+pub const PLAYBACK_KEY_PAIR_PAGE: &str = "playback-key";
+
 /// The prefix of every ARN this service mints, and so of every page boundary a
 /// token may legitimately name.
 const ARN_PREFIX: &str = "arn:aws:ivs:";
