@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an application under an existing environment, mints its
+//! `^app-[0-9A-Za-z]{10}$` id and ARN, stores it under its parent, and answers out of the
+//! stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +197,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Refactor Spaces store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Apply any CREATING -> ACTIVE move the clock already owes before answering, so an
+        // idempotent replay reports the same state a GetApplication would.
+        state.materialise_due_states();
+
+        // The parent environment must exist: an application is created INSIDE one.
+        let Some(environment) = state.environment(&input.environment_identifier) else {
+            return Err(CreateApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "EnvironmentIdentifier {} does not name an environment",
+                        input.environment_identifier
+                    ),
+                    resource_id: input.environment_identifier.clone(),
+                    resource_type: crate::state::RESOURCE_TYPE_ENVIRONMENT.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `ClientToken` is `@idempotencyToken`: see `create_environment.rs`, including the
+        // refusal of a token reused for a DIFFERENT application.
+        if let Some(client_token) = input.client_token.as_deref() {
+            if let Some(existing) = environment.application_by_client_token(client_token) {
+                if !created_from(existing, &input) {
+                    return Err(CreateApplicationErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "ClientToken {client_token} already created application {} \
+                                 from different parameters",
+                                existing.application_id
+                            ),
+                            resource_id: existing.application_id.clone(),
+                            resource_type: crate::state::RESOURCE_TYPE_APPLICATION.to_string(),
+                        },
+                    )
+                    .into());
+                }
+                return Ok(output_of(existing));
+            }
+        }
+
+        // The environment grows by one application per call and lives for the life of the
+        // process, so the growth is capped; past the cap the service answers the quota
+        // error it models rather than accepting another entry.
+        if environment.applications.len() >= crate::state::MAX_APPLICATIONS_PER_ENVIRONMENT {
+            return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the number of applications in environment {} would exceed the \
+                         limit of {}",
+                        input.environment_identifier,
+                        crate::state::MAX_APPLICATIONS_PER_ENVIRONMENT
+                    ),
+                    // The parent environment is the resource whose capacity is
+                    // exhausted, so it is what this refusal names.
+                    resource_id: input.environment_identifier.clone(),
+                    resource_type: crate::state::RESOURCE_TYPE_ENVIRONMENT.to_string(),
+                    // AWS publishes no quota code for this limit, and this cap is the
+                    // emulator's own, so there is none to report.
+                    quota_code: None,
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let Some(application_id) = state.mint_id("app") else {
+            return Err(CreateApplicationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "could not mint a fresh application identifier".to_string(),
+                },
+            )
+            .into());
+        };
+        let environment_id = input.environment_identifier.clone();
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("environment/{environment_id}/application/{application_id}"),
+        );
+        let created_time = ::aws_smithy_types::DateTime::from(std::time::SystemTime::now());
+        let account_id = ::engine::emulator_account_id().to_string();
+        let application = crate::state::Application {
+            application_id,
+            environment_id,
+            name: input.name,
+            arn,
+            vpc_id: input.vpc_id,
+            proxy_type: input.proxy_type,
+            api_gateway_proxy: input.api_gateway_proxy.map(|proxy| {
+                crate::state::ApiGatewayProxy {
+                    // Both members carry a documented default when the request omits them.
+                    endpoint_type: proxy
+                        .endpoint_type
+                        .unwrap_or_else(|| crate::state::DEFAULT_ENDPOINT_TYPE.to_string()),
+                    stage_name: proxy
+                        .stage_name
+                        .unwrap_or_else(|| crate::state::DEFAULT_STAGE_NAME.to_string()),
+                }
+            }),
+            owner_account_id: account_id.clone(),
+            created_by_account_id: account_id,
+            // As with an environment, the real service answers CREATING and reaches
+            // ACTIVE on its own.
+            state: crate::state::STATE_CREATING.to_string(),
+            active_at: Some(std::time::Instant::now() + crate::state::PROVISIONING_SPAN),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_time,
+            last_updated_time: created_time,
+            client_token: input.client_token,
+        };
+
+        let parent = state
+            .environment_mut(&input.environment_identifier)
+            .expect("the parent environment was found above, under the same held lock");
+        parent.applications.push(application);
+        let stored = parent
+            .applications
+            .last()
+            .expect("the application just pushed is in the store");
+        Ok(output_of(stored))
+    }
+}
+
+/// Whether `application` is the one `input` asks for: every member the create persists, so
+/// a `ClientToken` replay is only treated as a replay of the SAME request.
+fn created_from(
+    application: &crate::state::Application,
+    input: &CreateApplicationInput,
+) -> bool {
+    let requested_proxy = input.api_gateway_proxy.as_ref().map(|proxy| {
+        (
+            proxy
+                .endpoint_type
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_ENDPOINT_TYPE.to_string()),
+            proxy
+                .stage_name
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_STAGE_NAME.to_string()),
+        )
+    });
+    let stored_proxy = application
+        .api_gateway_proxy
+        .as_ref()
+        .map(|proxy| (proxy.endpoint_type.clone(), proxy.stage_name.clone()));
+    application.name == input.name
+        && application.vpc_id == input.vpc_id
+        && application.proxy_type == input.proxy_type
+        && stored_proxy == requested_proxy
+        && application.tags
+            == input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<String, String>>()
+}
+
+/// Project a stored application onto this operation's output shape.
+fn output_of(application: &crate::state::Application) -> CreateApplicationOutput {
+    CreateApplicationOutput {
+        name: Some(application.name.clone()),
+        arn: Some(application.arn.clone()),
+        owner_account_id: Some(application.owner_account_id.clone()),
+        created_by_account_id: Some(application.created_by_account_id.clone()),
+        application_id: Some(application.application_id.clone()),
+        environment_id: Some(application.environment_id.clone()),
+        vpc_id: Some(application.vpc_id.clone()),
+        proxy_type: Some(application.proxy_type.clone()),
+        api_gateway_proxy: application
+            .api_gateway_proxy
+            .as_ref()
+            .map(|proxy| ApiGatewayProxyInput {
+                endpoint_type: Some(proxy.endpoint_type.clone()),
+                stage_name: Some(proxy.stage_name.clone()),
+            }),
+        state: Some(application.state.clone()),
+        tags: (!application.tags.is_empty())
+            .then(|| application.tags.clone().into_iter().collect()),
+        last_updated_time: Some(application.last_updated_time),
+        created_time: Some(application.created_time),
     }
 }

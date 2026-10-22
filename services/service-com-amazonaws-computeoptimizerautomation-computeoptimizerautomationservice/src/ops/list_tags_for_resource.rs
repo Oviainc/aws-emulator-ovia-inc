@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. A pure read (`@readonly` in the model): it looks the automation
+//! rule up by the ARN in `resourceArn` and reports exactly the tag list the store
+//! holds for that rule — the tags a create carried, as later changed by the
+//! tagging operations — so two consecutive calls on an unchanged rule answer the
+//! same thing and nothing is written. An ARN no rule has is
+//! `ResourceNotFoundException` (404); one that does not satisfy the modelled
+//! `RuleArn` pattern is refused at the boundary as `InvalidParameterValueException`
+//! (400) — see `src/service.rs`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // The only resource type this operation's `RuleArn` input can name is an
+        // automation rule, so the tags of the rule that ARN identifies are the
+        // whole answer.
+        let guard = state.lock();
+        let Some(rule) = guard.rules.get(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No automation rule found with ARN '{}'.",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Reported from the store, in the order the rule holds them; a rule with
+        // no tags reports an empty list rather than an absent member, so a caller
+        // never has to distinguish "no tags" from "not reported".
+        Ok(ListTagsForResourceOutput {
+            tags: Some(rule.tags.clone()),
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessPoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessPoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessPoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an access point and records it in this service's state, keyed by
+//! (account id, name), so `GetAccessPoint`, `ListAccessPoints`,
+//! `PutAccessPointPolicy`, `GetAccessPointPolicy` and `DeleteAccessPoint` all
+//! serve the one record this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +176,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessPoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessPointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessPoint"))
+        // `Scope` filters an access point to prefixes or API operations, and the
+        // model documents it as supported only for access points attached to a
+        // directory bucket. This emulator has no directory buckets, so a request
+        // carrying one is answered 501 rather than silently dropping the member.
+        if input.scope.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateAccessPoint with Scope (directory-bucket access points)",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let key = (input.account_id.clone(), input.name.clone());
+        let mut store = state.lock();
+        if store.access_points.contains_key(&key) {
+            // A name identifies one access point within an account, so a repeat
+            // create is a conflict, not a second record under the same key.
+            return Err(crate::state::access_point_already_owned_by_you(&input.name));
+        }
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record, so a caller cannot grow this process's state
+        // without end by varying the account id or the name.
+        if store.access_points.len() >= crate::state::ACCESS_POINT_QUOTA {
+            return Err(crate::state::too_many_access_points());
+        }
+
+        let region = crate::state::signing_region(ctx.parts());
+        let record = crate::state::AccessPointRecord {
+            name: input.name.clone(),
+            account_id: input.account_id.clone(),
+            bucket: input.bucket.clone(),
+            bucket_account_id: input.bucket_account_id.clone(),
+            arn: crate::state::access_point_arn(&region, &input.name),
+            alias: crate::state::access_point_alias(&input.account_id, &input.name),
+            network_origin: crate::state::network_origin(input.vpc_configuration.as_ref()),
+            vpc_configuration: input.vpc_configuration.clone(),
+            public_access_block_configuration: input.public_access_block_configuration.clone(),
+            creation_date: ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            tags: input.tags.clone().unwrap_or_default(),
+            // An access point is created with no policy on it; one arrives only
+            // through `PutAccessPointPolicy`.
+            policy: None,
+        };
+
+        let output = CreateAccessPointOutput {
+            access_point_arn: Some(record.arn.clone()),
+            alias: Some(record.alias.clone()),
+        };
+        store.access_points.insert(key, record);
+        Ok(output)
     }
 }

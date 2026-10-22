@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBenefitApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBenefitApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBenefitApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the benefit applications stored for one catalog in [`crate::state`], one
+//! `@paginated` page at a time, narrowed by the request's filters. A pure read: it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +124,21 @@ impl From<ListBenefitApplicationsErrorModeled> for ListBenefitApplicationsError 
     }
 }
 
+/// Why a `NextToken` that is not one this operation issued is refused.
+fn invalid_next_token() -> ListBenefitApplicationsError {
+    let message = "NextToken is not a pagination token issued by ListBenefitApplications";
+    ListBenefitApplicationsErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(crate::state::validation_field(
+            "NextToken",
+            message,
+            crate::state::VALIDATION_CODE_INVALID_VALUE,
+        )),
+    })
+    .into()
+}
+
 /// The `ListBenefitApplications` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +175,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBenefitApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBenefitApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBenefitApplications"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListBenefitApplicationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let resume_from = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(token, crate::state::APPLICATION_ID_PREFIX)
+                    .ok_or_else(invalid_next_token)?,
+            ),
+            None => None,
+        };
+
+        let store = state.lock();
+        let Some(catalog) = store.catalogs.get(&input.catalog) else {
+            return Err(
+                ListBenefitApplicationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("catalog {} does not exist", input.catalog),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `BenefitIdentifiers` accepts either form the modelled `BenefitId` allows, so
+        // each entry is resolved to the catalog's own benefit id before the comparison.
+        // A filter the caller DID supply whose entries name no benefit of this catalog
+        // therefore selects nothing — unlike an absent or empty filter, which selects
+        // everything.
+        let benefit_filter: Option<Vec<String>> =
+            input.benefit_identifiers.as_ref().and_then(|wanted| {
+                (!wanted.is_empty()).then(|| {
+                    wanted
+                        .iter()
+                        .filter_map(|identifier| {
+                            catalog.resolve_benefit_id(&input.catalog, identifier)
+                        })
+                        .collect()
+                })
+            });
+        // `AssociatedResources` is `@deprecated` ("This field is no longer used") in
+        // favour of `AssociatedResourceArns`, but a client may still send it, so the ARNs
+        // it carries filter alongside the newer member's.
+        let mut resource_arns: Vec<String> = input.associated_resource_arns.unwrap_or_default();
+        resource_arns.extend(
+            input
+                .associated_resources
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|resource| resource.resource_arn),
+        );
+
+        // The applications are keyed by id in a `BTreeMap`, so this walk is in one stable
+        // order and the token is simply the id to resume at — the range starts directly
+        // at that key rather than rescanning from the front. One extra matching record is
+        // taken to decide whether a further page exists, and is not reported.
+        let mut page: Vec<&crate::state::BenefitApplication> = catalog
+            .applications
+            .range(resume_from.unwrap_or_default()..)
+            .map(|(_, application)| application)
+            .filter(|application| {
+                crate::state::matches_any(input.programs.as_ref(), &application.programs)
+                    && crate::state::matches_any(
+                        input.fulfillment_types.as_ref(),
+                        &application.fulfillment_types,
+                    )
+                    && crate::state::matches_any(
+                        input.status.as_ref(),
+                        std::slice::from_ref(&application.status),
+                    )
+                    && benefit_filter
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&application.benefit_id))
+                    && crate::state::matches_any(
+                        input.stages.as_ref(),
+                        application.stage.as_slice(),
+                    )
+                    && application.matches_resource_arns(&resource_arns)
+            })
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = page
+            .get(page_size)
+            .map(|application| crate::state::encode_page_token(&application.id));
+        page.truncate(page_size);
+
+        Ok(ListBenefitApplicationsOutput {
+            benefit_application_summaries: Some(
+                page.into_iter()
+                    .map(|application| BenefitApplicationSummary {
+                        catalog: Some(application.catalog.clone()),
+                        name: application.name.clone(),
+                        id: Some(application.id.clone()),
+                        arn: Some(application.arn.clone()),
+                        benefit_id: Some(application.benefit_id.clone()),
+                        programs: crate::state::BenefitApplication::optional_list(
+                            &application.programs,
+                        ),
+                        fulfillment_types: crate::state::BenefitApplication::optional_list(
+                            &application.fulfillment_types,
+                        ),
+                        status: Some(application.status.clone()),
+                        stage: application.stage.clone(),
+                        created_at: Some(crate::state::timestamp(application.created_at_millis)),
+                        updated_at: Some(crate::state::timestamp(application.updated_at_millis)),
+                        benefit_application_details: application.summary_details(),
+                        associated_resources: crate::state::BenefitApplication::optional_list(
+                            &application.associated_resources,
+                        ),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

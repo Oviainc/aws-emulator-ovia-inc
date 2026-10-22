@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicationTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReplicationTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the three ARNs against the persisted endpoints and
+//! replication instance, mints a task and persists it in [`crate::state`], so
+//! `DescribeReplicationTasks`, `StartReplicationTask` and `DeleteReplicationTask` all
+//! read the same record. The notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +189,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicationTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicationTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicationTask"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        // "Must contain 1-255 alphanumeric characters or hyphens. First character must
+        // be a letter. Cannot end with a hyphen or contain two consecutive hyphens"
+        // (`ReplicationTaskIdentifier` doc).
+        let identifier = input.replication_task_identifier;
+        if let Some(refusal) = crate::state::identifier_refusal(
+            "ReplicationTaskIdentifier",
+            &identifier,
+            Some(crate::state::TASK_IDENTIFIER_MAX_LEN),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
+        if let Some(resource_identifier) = &input.resource_identifier {
+            if let Some(refusal) = crate::state::identifier_refusal(
+                "ResourceIdentifier",
+                resource_identifier,
+                Some(crate::state::RESOURCE_IDENTIFIER_MAX_LEN),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
+            }
+        }
+
+        // "Specifying both values results in an error" (`CdcStartPosition` doc).
+        if input.cdc_start_time.is_some() && input.cdc_start_position.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "CdcStartTime and CdcStartPosition must not both be specified",
+            ));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Each of the three ARNs must name a resource this emulator holds, and each
+        // endpoint must be of the type the member it was passed as names.
+        endpoint_of_type(
+            &store,
+            "SourceEndpointArn",
+            &input.source_endpoint_arn,
+            "source",
+        )?;
+        endpoint_of_type(
+            &store,
+            "TargetEndpointArn",
+            &input.target_endpoint_arn,
+            "target",
+        )?;
+
+        let Some(instance) = store.replication_instances.get(&input.replication_instance_arn)
+        else {
+            return Err(not_found(format!(
+                "ReplicationInstanceArn {} does not name a replication instance in this \
+                 account",
+                input.replication_instance_arn
+            )));
+        };
+        // A task runs on a provisioned instance: an instance that is still `creating`
+        // cannot carry one yet.
+        if instance.status != crate::state::INSTANCE_AVAILABLE {
+            return Err(invalid_state(format!(
+                "replication instance {} is {} and must be {} to carry a replication task",
+                instance.arn,
+                instance.status,
+                crate::state::INSTANCE_AVAILABLE
+            )));
+        }
+
+        if let Some(existing) = store.task_arn_by_identifier.get(&identifier) {
+            return Err(
+                CreateReplicationTaskErrorModeled::ResourceAlreadyExistsFault(
+                    ResourceAlreadyExistsFault {
+                        message: Some(format!(
+                            "replication task {identifier} already exists as {existing}"
+                        )),
+                        resource_arn: Some(existing.clone()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The emulator keeps every task in memory for the life of the process and this
+        // is the only operation that adds one, so the store keeps a ceiling on itself.
+        if store.replication_tasks.len() >= crate::state::MAX_REPLICATION_TASKS {
+            return Err(
+                CreateReplicationTaskErrorModeled::ResourceQuotaExceededFault(
+                    ResourceQuotaExceededFault {
+                        message: Some(format!(
+                            "this emulator already holds the maximum of {} replication tasks",
+                            crate::state::MAX_REPLICATION_TASKS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let resource_id = match input.resource_identifier {
+            Some(resource_identifier) => resource_identifier,
+            None => store.mint_resource_id("task"),
+        };
+        let arn = crate::state::dms_arn(&region, "task", &resource_id);
+        if store.replication_tasks.contains_key(&arn) {
+            return Err(
+                CreateReplicationTaskErrorModeled::ResourceAlreadyExistsFault(
+                    ResourceAlreadyExistsFault {
+                        message: Some(format!("{arn} already names a replication task")),
+                        resource_arn: Some(arn),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::ReplicationTaskRecord {
+            arn: arn.clone(),
+            identifier: identifier.clone(),
+            source_endpoint_arn: input.source_endpoint_arn,
+            target_endpoint_arn: input.target_endpoint_arn,
+            replication_instance_arn: input.replication_instance_arn,
+            migration_type: input.migration_type,
+            table_mappings: input.table_mappings,
+            replication_task_settings: input.replication_task_settings,
+            task_data: input.task_data,
+            status: crate::state::TASK_CREATING.to_string(),
+            stop_reason: None,
+            last_failure_message: None,
+            creation_date: now,
+            // Only `StartReplicationTask` schedules a task.
+            start_date: None,
+            // A `CdcStartTime` names the same instant a date-form `CdcStartPosition`
+            // does ("Date Example: --cdc-start-position '2018-03-08T12:12:12'"), and
+            // `ReplicationTask` models only the position, so a start time is recorded
+            // as one.
+            cdc_start_position: input.cdc_start_position.or_else(|| {
+                input
+                    .cdc_start_time
+                    .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+            }),
+            cdc_stop_position: input.cdc_stop_position,
+            tags: crate::state::tags_for(&arn, input.tags),
+            // `creating` is not terminal: the task is owed `ready`, so a caller that
+            // starts it straight away still sees the transient status.
+            pending: Some(crate::state::Pending::after(
+                now,
+                crate::state::Owed::ToStatus(crate::state::TASK_READY),
+            )),
+            sequence,
+        };
+
+        let replication_task = record.to_shape(false);
+        store.task_arn_by_identifier.insert(identifier, arn.clone());
+        store.replication_tasks.insert(arn, record);
+
+        Ok(CreateReplicationTaskOutput {
+            replication_task: Some(replication_task),
+        })
     }
+}
+
+/// The DMS model declares no server-side fault, and this emulator always mounts the
+/// in-memory engine, so the unreachable "no store" branch is answered with the state
+/// error the operation does model rather than a 501, which would claim the operation
+/// is unimplemented.
+fn store_unavailable() -> CreateReplicationTaskError {
+    invalid_state("the dms emulator is mounted on an engine that holds no state for it".to_string())
+}
+
+/// The error this operation models for an ARN that names nothing.
+fn not_found(message: String) -> CreateReplicationTaskError {
+    CreateReplicationTaskErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The error this operation models for a resource that cannot be used for a migration
+/// in the state it is in.
+fn invalid_state(message: String) -> CreateReplicationTaskError {
+    CreateReplicationTaskErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Resolve `arn` to a persisted endpoint of `endpoint_type`.
+///
+/// An ARN that names no endpoint is `ResourceNotFoundFault`; one that names an
+/// endpoint of the other type is refused, because `SourceEndpointArn` and
+/// `TargetEndpointArn` each name an endpoint of exactly one `EndpointType`.
+fn endpoint_of_type(
+    store: &crate::state::ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State,
+    member: &str,
+    arn: &str,
+    endpoint_type: &str,
+) -> Result<(), CreateReplicationTaskError> {
+    let Some(endpoint) = store.endpoints.get(arn) else {
+        return Err(not_found(format!(
+            "{member} {arn} does not name an endpoint in this account"
+        )));
+    };
+    if endpoint.endpoint_type != endpoint_type {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "{member} must name an endpoint whose EndpointType is {endpoint_type}, and \
+             {arn} is a {} endpoint",
+            endpoint.endpoint_type
+        )));
+    }
+    Ok(())
 }

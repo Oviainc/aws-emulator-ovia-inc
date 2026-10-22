@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOpportunity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOpportunity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOpportunity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the stored record's client-owned members, advances
+//! `LastModifiedDate`, and refuses a stale `LastModifiedDate` with
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +205,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOpportunity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOpportunityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOpportunity"))
+        use crate::state;
+
+        // Request metadata only; everything this operation writes comes from the body.
+        let _ = ctx;
+
+        state::check_catalog(&input.catalog)
+            .map_err(UpdateOpportunityErrorModeled::ValidationException)?;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(UpdateOpportunityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+        let key = (input.catalog.clone(), input.identifier.clone());
+        let Some(record) = store.opportunities.get_mut(&key) else {
+            return Err(UpdateOpportunityErrorModeled::ResourceNotFoundException(
+                state::opportunity_not_found(&input.catalog, &input.identifier),
+            )
+            .into());
+        };
+
+        // `LastModifiedDate` is required on the request: it is the record version the
+        // caller read, so a value other than the stored one means another writer moved
+        // the record since that read.
+        let expected = state::millis_of(&input.last_modified_date);
+        if expected != record.last_modified_date_ms {
+            return Err(UpdateOpportunityErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "LastModifiedDate ({expected} epoch ms) is stale for opportunity `{}`; \
+                         fetch the latest state with GetOpportunity and retry.",
+                        record.id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Only the statuses the `ReviewStatus` doc marks read-only refuse an edit;
+        // "Pending Submission" and "Approved" are editable there.
+        if let Some(status) = record.review_status() {
+            if state::READ_ONLY_REVIEW_STATUSES.contains(&status) {
+                return Err(UpdateOpportunityErrorModeled::ValidationException(
+                    state::invalid_resource_state(
+                        "Identifier",
+                        format!(
+                            "Opportunity `{}` is not editable while LifeCycle.ReviewStatus is \
+                             `{status}`.",
+                            record.id,
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let now = state::now_ms();
+        // "When you perform updates, include the entire payload with each request. If any
+        // field is omitted, the API assumes that the field is set to null." So each
+        // client-owned member is REPLACED by what the request carries, including absence.
+        record.life_cycle = updated_life_cycle(record.life_cycle.take(), input.life_cycle, now);
+        record.customer = input.customer;
+        record.project = input.project;
+        record.opportunity_type = input.opportunity_type;
+        record.marketing = input.marketing;
+        record.software_revenue = input.software_revenue;
+        record.primary_needs_from_aws = input.primary_needs_from_aws;
+        record.national_security = input.national_security;
+        record.partner_opportunity_identifier = input.partner_opportunity_identifier;
+        record.touch();
+
+        Ok(UpdateOpportunityOutput {
+            id: record.id.clone(),
+            last_modified_date: state::date_time(record.last_modified_date_ms),
+        })
     }
+}
+
+/// The lifecycle an updated opportunity carries.
+///
+/// The client-owned members follow the whole-payload rule above, while
+/// `ReviewStatus`, `ReviewComments` and `ReviewStatusReason` are service-owned ("This
+/// field is read-only") and keep their stored values whatever the request says.
+/// `NextStepsHistory` is the service's own chronological record, so a `NextSteps` that
+/// differs from the stored one appends an entry rather than replacing the history.
+fn updated_life_cycle(
+    stored: Option<LifeCycle>,
+    requested: Option<LifeCycle>,
+    now_ms: i64,
+) -> Option<LifeCycle> {
+    if stored.is_none() && requested.is_none() {
+        return None;
+    }
+    let stored = stored.unwrap_or_default();
+    let requested = requested.unwrap_or_default();
+
+    let mut history = stored.next_steps_history.unwrap_or_default();
+    if let Some(next_steps) = requested.next_steps.clone() {
+        if stored.next_steps.as_deref() != Some(next_steps.as_str()) {
+            history.push(NextStepsHistory {
+                value: next_steps,
+                time: crate::state::date_time(now_ms),
+            });
+        }
+    }
+    // Modelled `len ..50` on `NextStepsHistories`: keep the most recent entries.
+    if history.len() > crate::state::MAX_NEXT_STEPS_HISTORY {
+        let excess = history.len() - crate::state::MAX_NEXT_STEPS_HISTORY;
+        history.drain(..excess);
+    }
+
+    Some(LifeCycle {
+        stage: requested.stage,
+        closed_lost_reason: requested.closed_lost_reason,
+        next_steps: requested.next_steps,
+        target_close_date: requested.target_close_date,
+        review_status: stored.review_status,
+        review_comments: stored.review_comments,
+        review_status_reason: stored.review_status_reason,
+        next_steps_history: (!history.is_empty()).then_some(history),
+    })
 }

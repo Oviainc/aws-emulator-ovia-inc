@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives the opaque body of a minted environment/application identifier.
+sha2 = { workspace = true }
+# Codec for the opaque `NextToken` a paginated list emits and accepts.
+hex = { workspace = true }
+
+[dev-dependencies]
+# `time` is needed only by the test that waits past the provisioning span, so the feature
+# is enabled here rather than widening the runtime surface the service itself links.
+tokio = { workspace = true, features = ["time"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

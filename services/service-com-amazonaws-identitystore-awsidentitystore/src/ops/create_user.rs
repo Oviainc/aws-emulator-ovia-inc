@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a user in the identity store the request names, minting its `UserId`,
+//! `UserArn` and first `Revision` and persisting every profile member it was given, so
+//! a later `DescribeUser` reports exactly what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -154,13 +149,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `CreateUserError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#CreateUser")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#CreateUser",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateUserErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -212,20 +214,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateUserErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let mut state = state.lock();
+        // A create may bring an identity store into being (this API models no
+        // operation that creates one), but only while fewer than
+        // `MAX_IDENTITY_STORES` are held: `IdentityStoreId` is caller-chosen, so the
+        // vivification is capped rather than unbounded.
+        let store = state
+            .try_store_mut(&input.identity_store_id)
+            .ok_or_else(|| {
+                CreateUserErrorModeled::ServiceQuotaExceededException(crate::state::quota_exceeded(
+                    format!(
+                        "{} identity stores",
+                        crate::state::MAX_IDENTITY_STORES
+                    ),
+                ))
+            })?;
+
+        // The store holds a bounded number of users. The operation models
+        // `ServiceQuotaExceededException` for "the request would cause the number of
+        // users or groups in the identity store to exceed the maximum allowed", so the
+        // bound is reached through that error rather than by exhausting memory.
+        if !store.has_user_capacity() {
+            return Err(CreateUserErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(format!(
+                    "identity store {} already holds {} users",
+                    store.identity_store_id,
+                    store.users.len()
+                )),
+            )
+            .into());
+        }
+
+        // A `UserName` is a uniqueness claim within the identity store, so a second
+        // create naming one that is taken conflicts rather than storing a duplicate.
+        // The member is optional in the model, so a request without one claims nothing.
+        // The name itself is `@sensitive` and so stays out of the message.
+        if let Some(taken_by) = input
+            .user_name
+            .as_deref()
+            .and_then(|user_name| store.user_name_index.get(user_name))
+        {
+            return Err(CreateUserErrorModeled::ConflictException(
+                crate::state::uniqueness_conflict(format!(
+                    "a user with this UserName already exists in identity store {} (UserId {taken_by})",
+                    store.identity_store_id
+                )),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let user_id = store.mint_resource_id();
+        let user = crate::state::User {
+            user_arn: crate::state::resource_arn(crate::state::ResourceKind::User, &user_id),
+            user_id: user_id.clone(),
+            // A create is revision 1; an UpdateUser bumps it from there.
+            revision: 1,
+            user_name: input.user_name,
+            name: input.name,
+            display_name: input.display_name,
+            nick_name: input.nick_name,
+            profile_url: input.profile_url,
+            emails: input.emails.unwrap_or_default(),
+            addresses: input.addresses.unwrap_or_default(),
+            phone_numbers: input.phone_numbers.unwrap_or_default(),
+            user_type: input.user_type,
+            title: input.title,
+            preferred_language: input.preferred_language,
+            locale: input.locale,
+            timezone: input.timezone,
+            user_status: None,
+            photos: input.photos.unwrap_or_default(),
+            website: input.website,
+            birthdate: input.birthdate,
+            roles: input.roles.unwrap_or_default(),
+            external_ids: Vec::new(),
+            extensions: input.extensions.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+            created_by: None,
+            updated_by: None,
+        };
+
+        let output = CreateUserOutput {
+            identity_store_id: store.identity_store_id.clone(),
+            user_id: user.user_id.clone(),
+            user_arn: user.user_arn.clone(),
+            revision: user.revision(),
+        };
+        if let Some(user_name) = user.user_name.clone() {
+            store.user_name_index.insert(user_name, user_id.clone());
+        }
+        store.users.insert(user_id, user);
+        Ok(output)
     }
 }

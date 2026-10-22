@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWebFunctions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWebFunctions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWebFunctions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the stored web functions, in `functionName` order, optionally
+//! narrowed by the documented `state` filter. A read: the only write it makes is
+//! materialising the `Pending -> Active` transitions the clock had already made
+//! due.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWebFunctions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWebFunctionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWebFunctions"))
+        let _ = ctx;
+        // The only filter name the service supports is `state`, and each of its values
+        // must name a `FunctionState`; a function matches when its state is among the
+        // values of every filter supplied.
+        let mut wanted_states: Vec<Vec<crate::state::FunctionState>> = Vec::new();
+        for filter in input.filters.unwrap_or_default() {
+            if filter.name != crate::state::STATE_FILTER_NAME {
+                return Err(ListWebFunctionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Member must satisfy the supported filter names [{}]: filters.name",
+                            crate::state::STATE_FILTER_NAME
+                        ),
+                    },
+                )
+                .into());
+            }
+            let mut states = Vec::with_capacity(filter.values.len());
+            for value in &filter.values {
+                let Some(state) = crate::state::FunctionState::from_wire(value) else {
+                    return Err(ListWebFunctionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "Member must satisfy enum value set [{}]: filters.values",
+                                FUNCTION_STATE_VALUES.join(", ")
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                states.push(state);
+            }
+            wanted_states.push(states);
+        }
+
+        // `maxResults` is `@range(1..50)` with `@default(50)`, so a value outside that
+        // range is already refused at the boundary and a non-positive one here means
+        // the member was absent: the default page size applies.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size >= 1)
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+            .min(crate::state::MAX_MAX_RESULTS);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWebFunctionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        // The only write a read makes: the state transitions the clock already owed,
+        // which were due whether or not anybody listed.
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // `functions` is a `BTreeMap` keyed by `functionName`, so `values()` walks
+        // the stored functions in name order — one stable order for the page and for
+        // the cursor minted from it.
+        let matching: Vec<&crate::state::WebFunction> = state
+            .functions
+            .values()
+            .filter(|function| {
+                wanted_states
+                    .iter()
+                    .all(|states| states.contains(&function.state))
+            })
+            .collect();
+        let keys: Vec<&str> = matching
+            .iter()
+            .map(|function| function.function_name.as_str())
+            .collect();
+
+        // An absent token starts at the first matching function; a token this service
+        // minted names where to resume. Anything else is not a cursor at all.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_cursor(token) {
+                Some(cursor) => crate::state::resume_index(cursor, &keys),
+                None => {
+                    return Err(ListWebFunctionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "Member must be a nextToken returned by a previous \
+                                      ListWebFunctions call: nextToken"
+                                .to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // The resume point is clamped to the end of the current listing and the page
+        // is taken through `get`, so a cursor can never index past the matches —
+        // whether because functions were deleted between pages or because the token
+        // was minted from a listing narrowed by different filters. A resume point
+        // past the last match is an empty final page, never a panic.
+        let page: &[&crate::state::WebFunction] = matching
+            .get(start.min(matching.len())..)
+            .unwrap_or_default();
+        let functions: Vec<FunctionSummary> = page
+            .iter()
+            .take(page_size)
+            .map(|function| function.summary())
+            .collect();
+        // The cursor names the first function AFTER this page, so `nextToken` is
+        // present exactly when one remains.
+        let next_index = start.min(matching.len()) + functions.len();
+        let next_token = keys
+            .get(next_index)
+            .map(|key| crate::state::encode_cursor(key, next_index));
+
+        Ok(ListWebFunctionsOutput {
+            functions,
+            next_token,
+        })
     }
 }
