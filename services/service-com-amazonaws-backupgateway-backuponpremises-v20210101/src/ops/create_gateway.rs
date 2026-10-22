@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a backup gateway: mints a gateway record, persists it in
+//! [`crate::state`], and returns the ARN read back out of the store. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -83,9 +77,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `CreateGatewayError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#CreateGateway")]
+// `extra_errors` widens the set with the two errors this SERVICE models for every
+// operation (`smithy_query(query="service_info")` -> `common_errors`) but that
+// `CreateGateway` does not repeat in its own `errors` list; both shapes are declared in
+// `types::shared_types`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#CreateGateway",
+    extra_errors = ["ValidationException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateGatewayErrorModeled {
+    ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +142,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGatewayErrorModeled::InternalServerException(InternalServerException {
+                error_code: None,
+                message: Some("Backup gateway state is unavailable on this engine.".to_string()),
+            })
+        })?;
+
+        // Every modelled constraint on this input — `ActivationKey`'s length and
+        // pattern, `GatewayDisplayName`'s, and the `GatewayType` enum's single
+        // `BACKUP_VM` value — is refused by the boundary validator before `handle` runs,
+        // so reaching here means the input satisfies all of them. What the model does NOT
+        // express is the tag rules, which `tag_map` states and refuses.
+        let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or(&[])).map_err(
+            |message| {
+                CreateGatewayErrorModeled::ValidationException(ValidationException {
+                    error_code: None,
+                    message: Some(message),
+                })
+            },
+        )?;
+
+        // A gateway is regional, so its ARN carries the region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The record is read back OUT of the store after the insert, so the ARN below is
+        // the key the store now holds — not a string built from this request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGateway"))
+        // One guard spans the ceiling check and the insert, so two concurrent creates
+        // cannot both pass a check that only one of them should: this operation is the
+        // only thing that grows the store, so the store is bounded here.
+        let mut store = state.lock();
+        if store.gateway_count() >= crate::state::MAX_STORED_GATEWAYS {
+            return Err(CreateGatewayErrorModeled::ValidationException(ValidationException {
+                error_code: None,
+                message: Some(format!(
+                    "This emulator stores at most {} gateways and already holds that many; \
+                     delete one before creating another.",
+                    crate::state::MAX_STORED_GATEWAYS
+                )),
+            })
+            .into());
+        }
+        let created = store.create_gateway(
+            &region,
+            &input.activation_key,
+            &input.gateway_display_name,
+            &input.gateway_type,
+            tags,
+            ::std::time::SystemTime::now(),
+        );
+
+        Ok(CreateGatewayOutput {
+            gateway_arn: Some(created.arn),
+        })
     }
 }

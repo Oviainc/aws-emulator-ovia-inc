@@ -21,6 +21,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Codec for the opaque `ListGateways` pagination token (hex of the page boundary).
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -25,6 +25,28 @@ pub struct ResourceNotFoundException {
     pub message: Option<String>,
 }
 
+/// The service's common `ValidationException` (HTTP 400).
+///
+/// `smithy_query(query="service_info")` lists it in `common_errors`, so it is declared
+/// for EVERY operation even though no operation repeats it in its own `errors` list —
+/// which is why each handler widens it in with
+/// `#[operation_error(..., extra_errors = ["ValidationException"])]`.
+#[smithy_macros::smithy(shape = "com.amazonaws.backupgateway#ValidationException")]
+#[derive(Debug, Clone, Default)]
+pub struct ValidationException {
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+}
+
+/// The service's common `InternalServerException` (HTTP 500). A service-level error,
+/// widened in the same way as [`ValidationException`].
+#[smithy_macros::smithy(shape = "com.amazonaws.backupgateway#InternalServerException")]
+#[derive(Debug, Clone, Default)]
+pub struct InternalServerException {
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.backupgateway#ConflictException")]
 #[derive(Debug, Clone, Default)]
 pub struct ConflictException {
