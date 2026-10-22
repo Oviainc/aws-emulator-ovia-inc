@@ -170,6 +170,14 @@ pub(crate) fn schema_uri(registry: &str, schema: &str) -> String {
     format!("/v1/registries/name/{registry}/schemas/name/{schema}")
 }
 
+/// The `ExportSchema` URI of one schema, in one schema language.
+pub(crate) fn export_uri(registry: &str, schema: &str, export_type: &str) -> String {
+    format!(
+        "{}/export?type={export_type}",
+        schema_uri(registry, schema)
+    )
+}
+
 /// Create a registry, asserting it succeeded; the lifecycle cases start here.
 pub(crate) async fn create_registry(emulator: &Emulator, registry: &str) {
     let created = emulator
@@ -898,16 +906,16 @@ async fn a_name_prefix_selects_exactly_the_names_that_start_with_it() {
 /// is neither is refused.
 #[tokio::test]
 async fn scope_selects_between_custom_and_aws_managed_registries() {
-    use service_com_amazonaws_schemas_schemas::state::AWS_MANAGED_CATALOG;
+    use service_com_amazonaws_schemas_schemas::state::AWS_MANAGED_REGISTRIES;
 
     let emulator = Emulator::new();
     create_registry(&emulator, "mine").await;
 
-    // Source: `crate::state::AWS_MANAGED_CATALOG`, the service-owned catalogue every
-    // account sees.
-    let mut managed: Vec<String> = AWS_MANAGED_CATALOG
+    // Source: `crate::state::AWS_MANAGED_REGISTRIES`, the service-owned registries
+    // every account sees.
+    let mut managed: Vec<String> = AWS_MANAGED_REGISTRIES
         .iter()
-        .map(|(name, _)| (*name).to_string())
+        .map(|name| (*name).to_string())
         .collect();
     managed.sort();
     let mut everything = managed.clone();

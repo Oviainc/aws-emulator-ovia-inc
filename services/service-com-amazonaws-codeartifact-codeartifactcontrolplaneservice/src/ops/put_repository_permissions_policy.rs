@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRepositoryPermissionsPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRepositoryPermissionsPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRepositoryPermissionsPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a resource policy to a repository, under the optimistic-locking rules the
+//! whole `*PermissionsPolicy` family shares (`crate::state::policy_revision_matches`).
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +91,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The JSON type name of a `policyDocument` that parsed but is not a policy object, so
+/// the refusal says what the caller actually sent.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,20 +176,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRepositoryPermissionsPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRepositoryPermissionsPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRepositoryPermissionsPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutRepositoryPermissionsPolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `policyDocument` is documented as "A valid displayable JSON Aspen policy
+        // string", and the modelled pattern (`^[\P{C}\s]+$`) only forbids control
+        // characters — so JSON well-formedness is the service's own rule and is checked
+        // here, before anything is written. The document is parsed ONLY to check it: what
+        // gets stored and reported is the string the caller sent, never a re-serialised
+        // rendering of it.
+        match serde_json::from_str::<serde_json::Value>(&input.policy_document) {
+            Ok(serde_json::Value::Object(_)) => {}
+            Ok(other) => {
+                return Err(PutRepositoryPermissionsPolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "policyDocument must be a JSON policy object; got a JSON {}.",
+                            json_type_name(&other)
+                        ),
+                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    },
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(PutRepositoryPermissionsPolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("policyDocument is not valid JSON: {error}."),
+                        reason: Some("CANNOT_PARSE".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                PutRepositoryPermissionsPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Domain not found. Domain '{}' owned by account '{}' does not exist.",
+                            input.domain,
+                            input
+                                .domain_owner
+                                .as_deref()
+                                .unwrap_or(::engine::emulator_account_id())
+                        ),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some("domain".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Read before the repository lookup: a `let .. else` keeps the borrow its
+        // scrutinee takes alive through the `else` block, so the owner the refusal names
+        // cannot be read off `domain` there.
+        let owner = domain.owner.clone();
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(
+                PutRepositoryPermissionsPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Repository not found. Repository '{}' in domain '{}' owned by account '{owner}' does not exist.",
+                            input.repository, input.domain
+                        ),
+                        resource_id: Some(input.repository.clone()),
+                        resource_type: Some("repository".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The optimistic lock: a caller that named a revision is writing over the policy
+        // it read, so the write is refused unless that is still the revision held. A
+        // refused write leaves the stored policy exactly as it was.
+        if !crate::state::policy_revision_matches(
+            repository.policy.as_ref(),
+            input.policy_revision.as_deref(),
+        ) {
+            return Err(PutRepositoryPermissionsPolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The policyRevision '{}' is not the current revision of the resource policy on repository '{}' in domain '{}'.",
+                        input.policy_revision.as_deref().unwrap_or_default(),
+                        input.repository,
+                        input.domain
+                    ),
+                    resource_id: Some(input.repository.clone()),
+                    resource_type: Some("repository".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The response is the policy that was just STORED, so a later
+        // `GetRepositoryPermissionsPolicy` answers with the same document, ARN and
+        // revision.
+        let policy = crate::state::attached_policy(
+            &repository.arn,
+            input.policy_document,
+            repository.policy.as_ref(),
+        );
+        repository.policy = Some(policy.clone());
+
+        Ok(PutRepositoryPermissionsPolicyOutput {
+            policy: Some(policy),
+        })
     }
 }

@@ -6,11 +6,14 @@
 //! configuration onto the new record, stamps `creationTime` / `startTime` and persists it
 //! with `state.status` `initiating`.
 //!
-//! The move to `running` is owed to the clock, not to this call, so a caller reading the
-//! experiment immediately still sees it initiating; see
-//! [`crate::state::ExperimentRecord::settle`]. A template id naming no record answers
-//! `ResourceNotFoundException` (HTTP 404), and replaying the `@idempotencyToken` returns
-//! the experiment it already started rather than a second one.
+//! The move to `running`, and the terminal status the run earns after it, are owed to the
+//! clock rather than to this call, so a caller reading the experiment immediately still
+//! sees it initiating; see [`crate::state::ExperimentRecord::settle`]. A template id
+//! naming no record answers `ResourceNotFoundException` (HTTP 404); a template whose role
+//! does not let FIS assume it answers `ValidationException` (HTTP 400); a start beyond the
+//! published active-experiments quota answers `ServiceQuotaExceededException` (HTTP 402);
+//! and the `@idempotencyToken` either replays the experiment it already started or, when
+//! the request differs from the one it belongs to, answers `ConflictException` (HTTP 409).
 //!
 //! ## Shape of an operation
 //!
@@ -175,19 +178,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // A replayed `@idempotencyToken` reports the experiment the first call started.
-        if let Some(id) = store
-            .replayed(
-                crate::state::IdempotentResource::Experiment,
-                &input.client_token,
-            )
-            .cloned()
-        {
-            if let Some(record) = store.settled_experiment_mut(&id, now) {
-                return Ok(StartExperimentOutput {
-                    experiment: Some(record.to_experiment()),
-                });
+        // Settle first: an experiment whose run already elapsed is no longer active, so
+        // the quota below is taken against the experiments that are genuinely running
+        // and not against ones the clock finished before this call.
+        store.settle_experiments(now);
+
+        // The token is `@idempotencyToken`: replaying it with the SAME request reports
+        // the experiment the first call started, while reusing it for a different request
+        // is the parameter mismatch FIS answers with `ConflictException` rather than
+        // reporting another template's run.
+        let fingerprint = crate::state::start_experiment_fingerprint(&input);
+        match store.replayed(
+            crate::state::IdempotentResource::Experiment,
+            &input.client_token,
+            &fingerprint,
+        ) {
+            crate::state::TokenReplay::Replay(id) => {
+                if let Some(record) = store.experiments.get(&id) {
+                    return Ok(StartExperimentOutput {
+                        experiment: Some(record.to_experiment()),
+                    });
+                }
             }
+            crate::state::TokenReplay::Mismatch => {
+                return Err(StartExperimentErrorModeled::ConflictException(
+                    crate::state::token_conflict(&input.client_token),
+                )
+                .into())
+            }
+            crate::state::TokenReplay::Fresh => {}
         }
 
         // The experiment is built from the PERSISTED template, so it carries what that
@@ -202,6 +221,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // FIS runs the experiment as the template's role, so it checks up front that the
+        // role lets it: a start it could never carry out is refused here instead of
+        // producing an experiment id for a run that cannot happen. The IAM store is a
+        // different store in the same engine, and no IAM handler reads this one, so
+        // holding both guards cannot cycle.
+        let Some(iam) = crate::state::iam_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        let trust_refusal = crate::state::role_trust_refusal(&template.role_arn, &iam.lock());
+        if let Some(refusal) = trust_refusal {
+            return Err(StartExperimentErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The published active-experiments quota, which creates no experiment when it is
+        // reached.
+        if store.active_experiments() >= crate::state::MAX_ACTIVE_EXPERIMENTS {
+            return Err(StartExperimentErrorModeled::ServiceQuotaExceededException(
+                crate::state::active_quota_exceeded(),
+            )
+            .into());
+        }
 
         if store.experiments.len() >= crate::state::MAX_EXPERIMENTS {
             return Err(StartExperimentErrorModeled::ServiceQuotaExceededException(
@@ -226,6 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::IdempotentResource::Experiment,
             &input.client_token,
             &id,
+            &fingerprint,
         );
 
         Ok(StartExperimentOutput {

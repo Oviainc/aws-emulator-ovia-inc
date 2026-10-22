@@ -4,17 +4,19 @@
 //!
 //! One store holds every resource the service's operations share: identity-provider
 //! registrations, the product users subscribed through them, the EC2 instances that
-//! provide those subscriptions, and the tags written against a resource's ARN. The
-//! list/lookup/pagination/filter helpers live here
-//! too, so the operation handlers in `ops/` all resolve a resource the same way
-//! instead of each growing its own copy.
+//! provide those subscriptions, the users associated to those instances, the license
+//! server endpoints created for a registration, and the tags written against any of
+//! those resources' ARNs. The account's EC2 fleet — which this service authorizes an
+//! instance against but does not own — lives here too. The
+//! list/lookup/pagination/filter helpers live here as well, so the operation handlers in
+//! `ops/` all resolve a resource the same way instead of each growing its own copy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, LicenseServerEndpoint,
-    LicenseServerSettings, ProductUserSummary, ServerEndpoint, Settings,
+    Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, InstanceUserSummary,
+    LicenseServerEndpoint, LicenseServerSettings, ProductUserSummary, ServerEndpoint, Settings,
 };
 
 /// The status a registration carries while its VPC endpoints are being provisioned.
@@ -27,12 +29,29 @@ pub const STATUS_DEREGISTERING: &str = "DEREGISTERING";
 pub const STATUS_SUBSCRIBED: &str = "SUBSCRIBED";
 /// The status returned by `StopProductSubscription` for the subscription it ended.
 pub const STATUS_UNSUBSCRIBED: &str = "UNSUBSCRIBED";
+/// The status a user association carries while the instance is being configured.
+pub const STATUS_ASSOCIATING: &str = "ASSOCIATING";
+/// The status a user association carries once configuration completed.
+pub const STATUS_ASSOCIATED: &str = "ASSOCIATED";
+/// The status returned by `DisassociateUser` for the association it ended.
+pub const STATUS_DISASSOCIATING: &str = "DISASSOCIATING";
+/// The status an instance carries in this service's view while at least one user is
+/// associated with it.
+///
+/// `InstanceSummary.Status` is a free-form string in the model (no enum to honour), and
+/// the only thing this service knows about an instance is that a user association brought
+/// it into view; so the one writer records this one value rather than inventing a
+/// per-instance status nothing computes.
+pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// The `LicenseServerEndpointProvisioningStatus` an endpoint carries while its network
 /// endpoint is being provisioned.
 pub const PROVISIONING_STATUS_PROVISIONING: &str = "PROVISIONING";
 /// The `LicenseServerEndpointProvisioningStatus` an endpoint carries once provisioning
 /// completed.
 pub const PROVISIONING_STATUS_PROVISIONED: &str = "PROVISIONED";
+/// The `LicenseServerEndpointProvisioningStatus` returned by
+/// `DeleteLicenseServerEndpoint` for the endpoint it removed.
+pub const PROVISIONING_STATUS_DELETING: &str = "DELETING";
 
 /// How long after `RegisterIdentityProvider` the registration becomes `REGISTERED`.
 ///
@@ -43,6 +62,14 @@ pub const PROVISIONING_STATUS_PROVISIONED: &str = "PROVISIONED";
 /// clock already owed.
 const REGISTRATION_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after `AssociateUser` the association becomes `ASSOCIATED`.
+///
+/// A chosen span, on the same footing as [`REGISTRATION_SPAN`]: AWS documents no
+/// duration for it, the association is returned in the non-terminal `ASSOCIATING`
+/// status, and the span is inside the emulator's 250-750 ms window so a caller that
+/// reads straight back still observes the transient status.
+const ASSOCIATION_SPAN: Duration = Duration::from_millis(500);
+
 /// How long after `CreateLicenseServerEndpoint` the endpoint becomes `PROVISIONED`.
 ///
 /// A chosen span (AWS documents no duration for it), kept inside the emulator's
@@ -51,6 +78,45 @@ const REGISTRATION_SPAN: Duration = Duration::from_millis(500);
 /// observes that transient status, and a later read materialises the transition the
 /// clock already owed.
 const ENDPOINT_PROVISIONING_SPAN: Duration = Duration::from_millis(500);
+
+/// The most subnets one `UpdateSettings` payload may name in `AddSubnets` or in
+/// `RemoveSubnets`.
+///
+/// `Subnets` carries `@length(min: 1)` and NO maximum in the model, so the bound is the
+/// account's rather than the shape's: EC2's default quota is 200 subnets per VPC, so a
+/// payload naming more subnets than a VPC can hold could not be satisfied whatever the
+/// store holds. Bounding the payload is also what keeps the reconciliation in
+/// [`apply_update_settings`] — which runs with the service-state lock held — linear and
+/// bounded in the request.
+pub const MAX_SUBNETS_PER_UPDATE: usize = 200;
+
+/// The most resources of one kind (registrations, user associations, license server
+/// endpoints) this emulator holds for an account.
+///
+/// AWS bounds these resources per account and models the refusal:
+/// `RegisterIdentityProvider`, `AssociateUser` and `CreateLicenseServerEndpoint` all
+/// declare `ServiceQuotaExceededException` ("The request failed because a service quota
+/// is exceeded"). The NUMBER here is the emulator's own — AWS publishes its quotas
+/// separately and they change — chosen so that a caller minting distinct resources cannot
+/// grow the in-memory store without bound, and far above anything a test or a recorded
+/// fixture creates.
+pub const MAX_RESOURCES_PER_KIND: usize = 1_000;
+
+/// The most tags one of this service's resources carries.
+///
+/// The model bounds a tagging PAYLOAD (`Tags` has `@length(min: 0, max: 50)`) but says
+/// nothing about the ACCUMULATION of repeated writes, and AWS's own limit is 50 tags per
+/// resource — so 50 is the bound on the MERGED set too, enforced before a merge so a
+/// repeated `TagResource` cannot grow one resource's tag map without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// What the operations that RESOLVE an identity-provider reference say about one that
+/// resolves to no registration: the provider named is not a valid parameter value.
+///
+/// One sentence in one place, because it is one resolution: `CreateLicenseServerEndpoint`
+/// and `UpdateIdentityProviderSettings` both refuse an unresolvable reference with it,
+/// and neither models a not-found for this surface.
+pub const IDENTITY_PROVIDER_NOT_VALID: &str = "Identity provider is not valid";
 
 /// Why an operation could not be served from state.
 ///
@@ -143,6 +209,39 @@ pub struct ProductUserRecord {
     pub license_expiration_date: Option<String>,
 }
 
+/// A user association to an EC2 instance, as `AssociateUser` stored it.
+///
+/// An association is to a DIRECTORY, not to a product registration:
+/// `AssociateUser`/`DisassociateUser` carry an `IdentityProvider` and no `Product`
+/// (`smithy_query(query="operation", operation="AssociateUser")`), so the record is keyed
+/// by the same [`provider_key`] a registration is indexed under rather than by one
+/// registration's ARN.
+#[derive(Debug, Clone)]
+pub struct InstanceUserRecord {
+    /// The minted `InstanceUserArn`; the key of `instance_users`.
+    pub arn: String,
+    /// The user name from the identity provider.
+    pub username: String,
+    /// The EC2 instance the user was associated with.
+    pub instance_id: String,
+    /// The provider union exactly as the association named it.
+    pub identity_provider: IdentityProvider,
+    /// [`provider_key`] of `identity_provider`: what `instance_user_index` keys on.
+    pub provider_key: String,
+    /// `ASSOCIATING` until [`ASSOCIATION_SPAN`] has elapsed, then `ASSOCIATED`.
+    pub status: String,
+    /// Set only when the service has something to report; never fabricated.
+    pub status_message: Option<String>,
+    /// The Active Directory domain the user information came from.
+    pub domain: Option<String>,
+    /// ISO-8601 instant the association was created.
+    pub association_date: Option<String>,
+    /// ISO-8601 instant the association ended, once it has.
+    pub disassociation_date: Option<String>,
+    /// When the `ASSOCIATING` -> `ASSOCIATED` transition falls due.
+    pub associated_due_at: SystemTime,
+}
+
 /// A license server endpoint, as `CreateLicenseServerEndpoint` stored it.
 #[derive(Debug, Clone)]
 pub struct LicenseServerEndpointRecord {
@@ -160,7 +259,8 @@ pub struct LicenseServerEndpointRecord {
     /// The network address of the endpoint, reported only once it is `PROVISIONED`:
     /// there is no address to reach while it is still being provisioned.
     pub endpoint: String,
-    /// `PROVISIONING` until [`ENDPOINT_PROVISIONING_SPAN`] has elapsed, then `PROVISIONED`.
+    /// `PROVISIONING` until [`ENDPOINT_PROVISIONING_SPAN`] has elapsed, then
+    /// `PROVISIONED`; `DELETING` on the answer `DeleteLicenseServerEndpoint` returns.
     pub provisioning_status: String,
     /// Set only when the service has something to report; never fabricated.
     pub status_message: Option<String>,
@@ -171,7 +271,7 @@ pub struct LicenseServerEndpointRecord {
 }
 
 /// Per-service state for com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState {
     /// Registrations by `IdentityProviderArn`.
     pub identity_providers: HashMap<String, IdentityProviderRecord>,
@@ -201,8 +301,80 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     /// Tags by resource ARN, written by whichever operation accepted them, so a later
     /// tagging operation reads the same store.
     pub tags: HashMap<String, HashMap<String, String>>,
+    /// User associations by `InstanceUserArn`.
+    pub instance_users: HashMap<String, InstanceUserRecord>,
+    /// Association ARNs in association order, so a list is stable and pageable.
+    pub instance_user_order: Vec<String>,
+    /// `(provider key, InstanceId, Username) -> InstanceUserArn`, so a caller that
+    /// addresses an association by its identifier triple resolves the same record its
+    /// ARN does.
+    pub instance_user_index: HashMap<(String, String, String), String>,
+    /// The EC2 instances this account has, keyed by instance id.
+    ///
+    /// Whether the caller may associate a user with an instance is a fact about the
+    /// ACCOUNT's EC2 fleet, not about this service: this service models no operation
+    /// that launches an instance, so without a seed nothing could ever be authorized.
+    /// [`seed_account_instances`] is therefore a fixture standing in for EC2's own
+    /// `RunInstances`, exactly as `ec2instanceconnect`'s `seed_instances` is for its
+    /// instance registry, and it is the single place an EC2 emulator with an instance
+    /// store would publish instances for this service to read. A test registers its own
+    /// with [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::register_account_instance`].
+    pub account_instances: HashMap<String, String>,
+    /// The earliest instant at which a stored record owes the clock a status transition,
+    /// or `None` when no record is in a non-terminal status.
+    ///
+    /// [`materialise_due`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::materialise_due)
+    /// runs on EVERY request, so it must not sweep every stored record every time: this
+    /// is the O(1) guard that makes the sweep happen only when the clock actually owes
+    /// something. Every writer that stores a record in a non-terminal status calls
+    /// [`schedule_transition`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::schedule_transition)
+    /// with that record's due instant; forgetting to would delay the transition until
+    /// another record falls due, never corrupt a record.
+    pub pending_transition_due_at: Option<SystemTime>,
     /// Source of the resource ids this service mints.
     pub next_id: u64,
+}
+
+/// The EC2 instances the account starts with, as `(instance id, Availability Zone)`.
+///
+/// Three instances in the Region the emulator writes into the SDK shared config
+/// (`us-east-1`, see `vendor/server/src/lib.rs`), with ids of EC2's own
+/// `i-[0-9a-f]{17}` form. The set is deliberately small and fixed: it decides only
+/// whether an instance EXISTS, which is all this service's authorization gate reads.
+pub fn seed_account_instances() -> Vec<(String, String)> {
+    [
+        ("i-0f1e2d3c4b5a69788", "us-east-1a"),
+        ("i-0e2d3c4b5a6978899", "us-east-1b"),
+        ("i-0d3c4b5a697889900", "us-east-1c"),
+    ]
+    .into_iter()
+    .map(|(id, zone)| (id.to_string(), zone.to_string()))
+    .collect()
+}
+
+impl Default for ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState {
+    fn default() -> Self {
+        Self {
+            identity_providers: HashMap::new(),
+            identity_provider_order: Vec::new(),
+            identity_provider_index: HashMap::new(),
+            product_users: HashMap::new(),
+            product_user_order: Vec::new(),
+            product_user_index: HashMap::new(),
+            instances: HashMap::new(),
+            instance_order: Vec::new(),
+            tags: HashMap::new(),
+            instance_users: HashMap::new(),
+            instance_user_order: Vec::new(),
+            instance_user_index: HashMap::new(),
+            license_server_endpoints: HashMap::new(),
+            license_server_endpoint_order: Vec::new(),
+            license_server_endpoint_index: HashMap::new(),
+            account_instances: seed_account_instances().into_iter().collect(),
+            pending_transition_due_at: None,
+            next_id: 0,
+        }
+    }
 }
 
 impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState {
@@ -217,30 +389,160 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// Materialise every transition the clock already made due at `now`.
     ///
     /// Only transitions that were owed at `now` whether or not anybody called: a
-    /// registration whose [`REGISTRATION_SPAN`] has elapsed becomes `REGISTERED`.
-    /// Reporting operations call this so a read reflects the clock without the read
-    /// itself changing anything a later caller would not have seen anyway.
+    /// registration whose [`REGISTRATION_SPAN`] has elapsed becomes `REGISTERED`, a user
+    /// association whose [`ASSOCIATION_SPAN`] has elapsed becomes `ASSOCIATED`, and a
+    /// license server endpoint whose [`ENDPOINT_PROVISIONING_SPAN`] has elapsed becomes
+    /// `PROVISIONED`. Reporting operations call this so a read reflects the clock without
+    /// the read itself changing anything a later caller would not have seen anyway.
+    ///
+    /// Every request runs this, so the common case must not scale with how much the store
+    /// holds: `pending_transition_due_at` is the O(1) guard, and a record is visited only
+    /// on the one request that finds a transition due.
     pub fn materialise_due(&mut self, now: SystemTime) {
+        match self.pending_transition_due_at {
+            Some(due) if now >= due => {}
+            // Either nothing is in a non-terminal status, or the earliest transition is
+            // still in the future: there is nothing to materialise, and nothing to scan.
+            _ => return,
+        }
+
+        // The sweep also recomputes the guard, from the records that are still pending.
+        let mut next: Option<SystemTime> = None;
+        let still_pending = |due_at: SystemTime, next: &mut Option<SystemTime>| {
+            *next = Some(next.map_or(due_at, |earliest: SystemTime| earliest.min(due_at)));
+        };
         for record in self.identity_providers.values_mut() {
-            if record.status == STATUS_REGISTERING && now >= record.registered_due_at {
+            if record.status != STATUS_REGISTERING {
+                continue;
+            }
+            if now >= record.registered_due_at {
                 record.status = STATUS_REGISTERED.to_string();
+            } else {
+                still_pending(record.registered_due_at, &mut next);
+            }
+        }
+        for record in self.instance_users.values_mut() {
+            if record.status != STATUS_ASSOCIATING {
+                continue;
+            }
+            if now >= record.associated_due_at {
+                record.status = STATUS_ASSOCIATED.to_string();
+            } else {
+                still_pending(record.associated_due_at, &mut next);
             }
         }
         for record in self.license_server_endpoints.values_mut() {
-            if record.provisioning_status == PROVISIONING_STATUS_PROVISIONING
-                && now >= record.provisioned_due_at
-            {
-                record.provisioning_status = PROVISIONING_STATUS_PROVISIONED.to_string();
+            if record.provisioning_status != PROVISIONING_STATUS_PROVISIONING {
+                continue;
             }
+            if now >= record.provisioned_due_at {
+                record.provisioning_status = PROVISIONING_STATUS_PROVISIONED.to_string();
+            } else {
+                still_pending(record.provisioned_due_at, &mut next);
+            }
+        }
+        self.pending_transition_due_at = next;
+    }
+
+    /// Record that a stored resource owes the clock a status transition at `due_at`.
+    ///
+    /// Called by every writer that stores a record in a non-terminal status; keeping the
+    /// EARLIEST due instant is what lets [`materialise_due`](Self::materialise_due) skip
+    /// the sweep on a request that owes nothing.
+    pub fn schedule_transition(&mut self, due_at: SystemTime) {
+        self.pending_transition_due_at = Some(
+            self.pending_transition_due_at
+                .map_or(due_at, |earliest| earliest.min(due_at)),
+        );
+    }
+
+    /// Whether `count` stored resources of one kind is already this emulator's limit.
+    ///
+    /// The caller answers the modelled `ServiceQuotaExceededException` when it is; see
+    /// [`MAX_RESOURCES_PER_KIND`] for why there is a limit at all.
+    pub fn at_resource_limit(count: usize) -> bool {
+        count >= MAX_RESOURCES_PER_KIND
+    }
+
+    /// Register an EC2 instance the account has — the seam
+    /// [`seed_account_instances`] fills and a test adds to.
+    pub fn register_account_instance(
+        &mut self,
+        instance_id: impl Into<String>,
+        availability_zone: impl Into<String>,
+    ) -> Option<String> {
+        self.account_instances
+            .insert(instance_id.into(), availability_zone.into())
+    }
+
+    /// Whether the caller may be shown to own `instance_id`: true exactly when the
+    /// account's EC2 fleet holds it.
+    ///
+    /// The gate every operation that acts on an instance runs BEFORE it looks anything
+    /// else up, so a refusal discloses nothing about this service's own resources.
+    pub fn authorizes_instance(&self, instance_id: &str) -> bool {
+        self.account_instances.contains_key(instance_id)
+    }
+
+    /// Whether any registration in state is for the directory `key` names.
+    ///
+    /// `AssociateUser` carries no `Product`, so the registration it associates through is
+    /// addressed by directory alone: a directory with a registration for ANY product is
+    /// registered for the purposes of a user association.
+    pub fn provider_key_is_registered(&self, key: &str) -> bool {
+        self.identity_provider_index
+            .keys()
+            .any(|(indexed, _product)| indexed == key)
+    }
+
+    /// The user associations in association order.
+    pub fn instance_users_in_order(&self) -> Vec<InstanceUserRecord> {
+        self.instance_user_order
+            .iter()
+            .filter_map(|arn| self.instance_users.get(arn).cloned())
+            .collect()
+    }
+
+    /// Resolve a user association from the two ways `DisassociateUser` can address one:
+    /// its `InstanceUserArn`, or the `(IdentityProvider, InstanceId, Username)` triple it
+    /// was associated with, optionally narrowed by `Domain`.
+    ///
+    /// `None` when state holds no such association — the caller decides how to refuse,
+    /// because this surface fails CLOSED rather than reporting a not-found.
+    pub fn resolve_instance_user(
+        &self,
+        instance_user_arn: Option<&str>,
+        identity_provider: Option<&IdentityProvider>,
+        instance_id: Option<&str>,
+        username: Option<&str>,
+        domain: Option<&str>,
+    ) -> Option<&InstanceUserRecord> {
+        let record = if let Some(arn) = instance_user_arn {
+            self.instance_users.get(arn)?
+        } else {
+            let key = (
+                provider_key(identity_provider?).ok()?,
+                instance_id?.to_string(),
+                username?.to_string(),
+            );
+            let arn = self.instance_user_index.get(&key)?;
+            self.instance_users.get(arn)?
+        };
+        // `Domain` narrows the addressing rather than being ignored: an association from
+        // another domain is not the one the caller named.
+        match domain.filter(|d| !d.is_empty()) {
+            Some(domain) if record.domain.as_deref() != Some(domain) => None,
+            _ => Some(record),
         }
     }
 
-    /// The registrations in registration order.
-    pub fn identity_providers_in_order(&self) -> Vec<IdentityProviderRecord> {
-        self.identity_provider_order
-            .iter()
-            .filter_map(|arn| self.identity_providers.get(arn).cloned())
-            .collect()
+    /// Remove one user association from the store and from every index that reaches it.
+    pub fn remove_instance_user(&mut self, arn: &str) -> Option<InstanceUserRecord> {
+        let record = self.instance_users.remove(arn)?;
+        self.instance_user_order.retain(|a| a != arn);
+        self.instance_user_index.retain(|_, indexed| indexed != arn);
+        self.tags.remove(arn);
+        Some(record)
     }
 
     /// The license server endpoints in creation order.
@@ -248,6 +550,69 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         self.license_server_endpoint_order
             .iter()
             .filter_map(|arn| self.license_server_endpoints.get(arn).cloned())
+            .collect()
+    }
+
+    /// Remove one license server endpoint from the store, the order it is listed in and
+    /// the `(provider, server type)` index that reaches it.
+    pub fn remove_license_server_endpoint(
+        &mut self,
+        arn: &str,
+    ) -> Option<LicenseServerEndpointRecord> {
+        let record = self.license_server_endpoints.remove(arn)?;
+        self.license_server_endpoint_order.retain(|a| a != arn);
+        self.license_server_endpoint_index
+            .retain(|_, indexed| indexed != arn);
+        self.tags.remove(arn);
+        Some(record)
+    }
+
+    /// Whether `arn` names a resource THIS service holds — the one resolution the
+    /// tagging surface runs, whose `ResourceArn` may name any of this service's
+    /// resource kinds.
+    pub fn holds_resource(&self, arn: &str) -> bool {
+        self.identity_providers.contains_key(arn)
+            || self.product_users.contains_key(arn)
+            || self.instance_users.contains_key(arn)
+            || self.license_server_endpoints.contains_key(arn)
+    }
+
+    /// Merge `tags` into the tags held against `arn`.
+    ///
+    /// The merged set is bounded by [`MAX_TAGS_PER_RESOURCE`]: a request that would carry
+    /// a resource past it is refused WHOLE, leaving the stored map exactly as it was, so
+    /// repeated tagging of one resource cannot grow the store without limit. A key the
+    /// resource already carries is overwritten and does not count as growth, which is
+    /// also what the operation's `@idempotent` trait asks for.
+    pub fn merge_tags(
+        &mut self,
+        arn: &str,
+        tags: &HashMap<String, String>,
+    ) -> Result<(), StateError> {
+        let merged = match self.tags.get(arn) {
+            Some(held) => {
+                held.len() + tags.keys().filter(|key| !held.contains_key(*key)).count()
+            }
+            None => tags.len(),
+        };
+        if merged > MAX_TAGS_PER_RESOURCE {
+            return Err(StateError::Validation(format!(
+                "the resource would carry {merged} tags; a resource carries at most \
+                 {MAX_TAGS_PER_RESOURCE}"
+            )));
+        }
+        let held = self.tags.entry(arn.to_string()).or_default();
+        for (key, value) in tags {
+            held.insert(key.clone(), value.clone());
+        }
+        Ok(())
+    }
+
+    /// The registrations in registration order.
+    pub fn identity_providers_in_order(&self) -> Vec<IdentityProviderRecord> {
+        self.identity_provider_order
+            .iter()
+            .filter_map(|arn| self.identity_providers.get(arn).cloned())
             .collect()
     }
 
@@ -276,6 +641,72 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let record = self.instances.remove(instance_id)?;
         self.instance_order.retain(|id| id != instance_id);
         Some(record)
+    }
+
+    /// Recompute what the service's view says about one instance, from the associations
+    /// that still name it — or drop it from the view when none does.
+    ///
+    /// This is the writer [`InstanceRecord`] documents: an instance is not created by any
+    /// API of this service, it enters the view because a user was associated with it and
+    /// leaves with the last association that names it. Everything reported is a FUNCTION
+    /// of the state at the call: the products are the ones the naming associations'
+    /// DIRECTORIES are registered for (`AssociateUser` carries no `Product`, so they are
+    /// read from the registrations rather than taken from the request), so a product stops
+    /// being reported as soon as the last association or registration behind it is gone.
+    /// Nothing else is recorded: no status check has been performed, so none is reported.
+    pub fn refresh_instance_view(&mut self, instance_id: &str) {
+        let naming: Vec<InstanceUserRecord> = self
+            .instance_user_order
+            .iter()
+            .filter_map(|arn| self.instance_users.get(arn))
+            .filter(|association| association.instance_id == instance_id)
+            .cloned()
+            .collect();
+        let Some(first) = naming.first() else {
+            self.remove_instance(instance_id);
+            return;
+        };
+
+        let mut products: Vec<String> = Vec::new();
+        for association in &naming {
+            for product in self.products_registered_for(&association.provider_key) {
+                if !products.contains(&product) {
+                    products.push(product);
+                }
+            }
+        }
+        let last_status_check_at = self
+            .instances
+            .get(instance_id)
+            .and_then(|record| record.last_status_check_at);
+        self.upsert_instance(InstanceRecord {
+            instance_id: instance_id.to_string(),
+            status: STATUS_ACTIVE.to_string(),
+            products,
+            status_message: None,
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+            identity_provider: Some(first.identity_provider.clone()),
+            last_status_check_at,
+        });
+    }
+
+    /// Recompute the view of every instance an association names: what a registration's
+    /// removal changes is which PRODUCTS those instances provide.
+    pub fn refresh_every_instance_view(&mut self) {
+        let instances: Vec<String> = self.instance_order.clone();
+        for instance_id in instances {
+            self.refresh_instance_view(&instance_id);
+        }
+    }
+
+    /// The products the directory `key` names is registered for, in registration order.
+    pub fn products_registered_for(&self, key: &str) -> Vec<String> {
+        self.identity_provider_order
+            .iter()
+            .filter_map(|arn| self.identity_providers.get(arn))
+            .filter(|record| provider_key(&record.identity_provider).is_ok_and(|k| k == key))
+            .map(|record| record.product.clone())
+            .collect()
     }
 
     /// The product users of one registration (optionally one product), in subscription order.
@@ -390,7 +821,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Remove a registration, and with it the product users that were subscribed
-    /// through it (they are only reachable through their provider).
+    /// through it and the license server endpoints created for it (both are only
+    /// reachable through their provider).
+    ///
+    /// User ASSOCIATIONS are not removed: an association names a directory and no
+    /// product (`AssociateUser` carries no `Product`), so it outlives the registration
+    /// of any one product for that directory.
     pub fn remove_identity_provider(&mut self, arn: &str) -> Option<IdentityProviderRecord> {
         let record = self.identity_providers.remove(arn)?;
         self.identity_provider_order.retain(|a| a != arn);
@@ -405,6 +841,18 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         for user_arn in orphaned {
             self.remove_product_user(&user_arn);
         }
+        let orphaned: Vec<String> = self
+            .license_server_endpoints
+            .values()
+            .filter(|endpoint| endpoint.identity_provider_arn == arn)
+            .map(|endpoint| endpoint.arn.clone())
+            .collect();
+        for endpoint_arn in orphaned {
+            self.remove_license_server_endpoint(&endpoint_arn);
+        }
+        // Which products the instances in view provide is read from the registrations, so
+        // removing one changes those views.
+        self.refresh_every_instance_view();
         self.tags.remove(arn);
         Some(record)
     }
@@ -470,6 +918,82 @@ pub fn iso8601(at: SystemTime) -> String {
     ::aws_smithy_types::DateTime::from_secs(seconds)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// The settings a registration carries after an `UpdateSettings` payload is applied to
+/// them: the subnets it had, plus `AddSubnets`, minus `RemoveSubnets`, with
+/// `SecurityGroupId` replaced when the payload names one.
+///
+/// Two payloads cannot be applied at all, and both are refused as invalid rather than
+/// half-applied:
+///
+/// * a subnet in BOTH `AddSubnets` and `RemoveSubnets` asks for two contradictory things
+///   at once, so there is no resulting set;
+/// * a payload that would leave no subnet at all contradicts `Settings$Subnets`, which
+///   the model declares `@required` with `@length(min: 1)`.
+///
+/// Order is preserved and duplicates collapse, so the result is the SET the caller asked
+/// for however the payload spelled it; removing a subnet the registration does not carry
+/// is a no-op, which is what the operation's `@idempotent` trait asks for.
+///
+/// Every step is LINEAR in the lists involved, and each list is bounded by
+/// [`MAX_SUBNETS_PER_UPDATE`] before any of it runs: this function is called with the
+/// service-state lock held, so the caller must not be able to buy quadratic (or
+/// unbounded) work under it with one request.
+pub fn apply_update_settings(
+    settings: &Settings,
+    add_subnets: &[String],
+    remove_subnets: &[String],
+    security_group_id: Option<&str>,
+) -> Result<Settings, StateError> {
+    for (member, list) in [
+        ("AddSubnets", add_subnets),
+        ("RemoveSubnets", remove_subnets),
+    ] {
+        if list.len() > MAX_SUBNETS_PER_UPDATE {
+            return Err(StateError::Validation(format!(
+                "UpdateSettings.{member} names {} subnets; at most {MAX_SUBNETS_PER_UPDATE} \
+                 may be named in one update",
+                list.len()
+            )));
+        }
+    }
+
+    let removed: HashSet<&str> = remove_subnets.iter().map(String::as_str).collect();
+    let overlapping: Vec<&str> = add_subnets
+        .iter()
+        .map(String::as_str)
+        .filter(|subnet| removed.contains(subnet))
+        .collect();
+    if !overlapping.is_empty() {
+        return Err(StateError::Validation(format!(
+            "UpdateSettings.AddSubnets and UpdateSettings.RemoveSubnets both name {}; \
+             a subnet cannot be added and removed by one update",
+            overlapping.join(", ")
+        )));
+    }
+
+    let mut subnets: Vec<String> = Vec::new();
+    let mut kept: HashSet<&str> = HashSet::new();
+    for subnet in settings.subnets.iter().chain(add_subnets) {
+        if !removed.contains(subnet.as_str()) && kept.insert(subnet.as_str()) {
+            subnets.push(subnet.clone());
+        }
+    }
+    if subnets.is_empty() {
+        return Err(StateError::Validation(
+            "UpdateSettings would leave the registration with no subnet, and \
+             Settings.Subnets requires at least one"
+                .to_string(),
+        ));
+    }
+
+    Ok(Settings {
+        subnets,
+        security_group_id: security_group_id
+            .map(str::to_string)
+            .unwrap_or_else(|| settings.security_group_id.clone()),
+    })
 }
 
 /// The `IdentityProviderSummary` the model requires, built entirely from the stored
@@ -546,6 +1070,27 @@ pub fn resource_arn(signing_name: &str, region: &str, kind: &str, id: &str) -> S
 /// The instant a registration created at `created_at` becomes `REGISTERED`.
 pub fn registration_due_at(created_at: SystemTime) -> SystemTime {
     created_at + REGISTRATION_SPAN
+}
+
+/// The instant an association created at `created_at` becomes `ASSOCIATED`.
+pub fn association_due_at(created_at: SystemTime) -> SystemTime {
+    created_at + ASSOCIATION_SPAN
+}
+
+/// The `InstanceUserSummary` the model requires, built entirely from the stored
+/// association — every member is what the association persisted.
+pub fn instance_user_summary(record: &InstanceUserRecord) -> InstanceUserSummary {
+    InstanceUserSummary {
+        username: record.username.clone(),
+        instance_id: record.instance_id.clone(),
+        identity_provider: record.identity_provider.clone(),
+        status: record.status.clone(),
+        instance_user_arn: Some(record.arn.clone()),
+        status_message: record.status_message.clone(),
+        domain: record.domain.clone(),
+        association_date: record.association_date.clone(),
+        disassociation_date: record.disassociation_date.clone(),
+    }
 }
 
 /// The instant a license server endpoint created at `created_at` becomes `PROVISIONED`.

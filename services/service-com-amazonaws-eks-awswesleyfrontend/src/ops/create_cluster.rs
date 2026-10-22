@@ -563,6 +563,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }),
                 }
             }),
+            // A new cluster has no access entries yet: every entry a caller can read
+            // is one `CreateAccessEntry` wrote. (The creator's own admin access comes
+            // from `accessConfig.bootstrapClusterCreatorAdminPermissions` above, which
+            // is reported on the cluster rather than as an `AccessEntry` record.)
+            access_entries: ::std::collections::BTreeMap::new(),
             // A brand new cluster has run no asynchronous update yet; the
             // operations that start one (`AssociateEncryptionConfig` and friends)
             // write into this map.

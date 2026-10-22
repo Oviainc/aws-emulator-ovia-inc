@@ -45,6 +45,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code FIS answers a refused request with: its model declares
+/// `ValidationException` on every operation that takes caller input, and that is the code
+/// a client branches on.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
 /// The `com-amazonaws-fis-faultinjectionsimulator` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -97,16 +102,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // FIS states a value longer than its member's `@length` maximum as
+        // "Maximum length exceeded: <member>" — a message built from the request, naming
+        // the member that was too long and nothing else: the rejected value is NOT echoed
+        // back. Every other refusal class keeps the framework's wording, because FIS
+        // publishes no rule for how it words those.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        // The FIRST over-long member among the violations, wherever it is reported: a
+        // refusal that carries a length violation behind another class is still a length
+        // refusal to the caller.
+        let violation = violations.iter().find(|violation| {
+            matches!(
+                violation.kind,
+                smithy_server_runtime::ViolationKind::MaxLength(_)
+            )
+        })?;
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: format!("Maximum length exceeded: {}", member_of(&violation.path)),
+        })
     }
 
     fn override_routing_error(
@@ -136,4 +155,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The member a violation's dotted path names.
+///
+/// A path is the dotted position of the offending value — `id`, or
+/// `targets.web.member.resourceType` for one nested inside a collection. FIS's message
+/// names the MEMBER, so the trailing segments that describe the step into a collection
+/// (the literal `member`, and a list element's 1-based index) are dropped and the last
+/// named member is what is left.
+fn member_of(path: &str) -> &str {
+    path.split('.')
+        .rfind(|segment| *segment != "member" && !segment.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(path)
 }
