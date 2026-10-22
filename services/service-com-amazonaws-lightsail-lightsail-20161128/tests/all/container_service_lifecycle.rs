@@ -37,12 +37,16 @@ const ACCOUNT: &str = "000000000000";
 /// (`crate::state::DEFAULT_REGION`).
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// The suffix of every container service's default domain, from the modelled
-/// `serviceName` documentation.
-const DOMAIN_SUFFIX: &str = "cs.amazonlightsail.com";
+/// The endpoint every call in this suite reaches the emulator on, which is the
+/// address a container service's `url` must therefore be announced under.
+const ENDPOINT_HOST: &str = "127.0.0.1:9297";
 
-/// How many characters the per-service token of that domain carries, from the
-/// same documentation's example (`ur4EXAMPLE2uq`).
+/// The path space a container service's public URL is published under
+/// (`crate::state::CONTAINER_SERVICE_PUBLIC_PATH_PREFIX`).
+const PUBLIC_PATH_PREFIX: &str = "/lightsail-container-service";
+
+/// How many characters the per-service token of that URL carries, from the
+/// modelled `serviceName` documentation's example (`ur4EXAMPLE2uq`).
 const DOMAIN_TOKEN_LEN: usize = 13;
 
 /// One emulator with one Lightsail service mounted on one shared engine.
@@ -70,6 +74,7 @@ impl Emulator {
         let mut builder = ::http::Request::builder()
             .method("POST")
             .uri("/")
+            .header("host", ENDPOINT_HOST)
             .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
             .header("content-type", "application/x-amz-json-1.1");
         if let Some(region) = region {
@@ -475,20 +480,21 @@ fn create_body(row: &Row) -> Value {
     body
 }
 
-/// The per-service token of `service`'s default domain, taken out of the URL it
-/// reports, after checking the URL's whole documented form.
+/// The per-service token of `service`'s public URL, taken out of the URL it
+/// reports, after checking that URL's whole form: it is announced on the
+/// endpoint the request reached the emulator on, under the published path space,
+/// carrying the service's region and name.
 fn domain_token(case: &str, row: &Row, service: &Value) -> String {
     let url = service["url"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a url, got {service:?}"));
-    let prefix = format!("https://{}.", row.name);
-    let suffix = format!(".{}.{DOMAIN_SUFFIX}", row.region);
+    let prefix = format!(
+        "https://{ENDPOINT_HOST}{PUBLIC_PATH_PREFIX}/{}/{}/",
+        row.region, row.name
+    );
     let token = url
         .strip_prefix(&prefix)
-        .and_then(|rest| rest.strip_suffix(&suffix))
-        .unwrap_or_else(|| {
-            panic!("case {case}: expected a url '{prefix}<token>{suffix}', got {url:?}")
-        });
+        .unwrap_or_else(|| panic!("case {case}: expected a url '{prefix}<token>', got {url:?}"));
     assert_eq!(
         token.len(),
         DOMAIN_TOKEN_LEN,

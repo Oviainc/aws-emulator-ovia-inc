@@ -17,6 +17,11 @@
 //! issues. `ConsistentRead` needs no handling beyond its effect on
 //! `ConsumedCapacity`: this store has one copy of each item.
 //!
+//! A key-condition operand is held to the documented key-value limits
+//! ([`crate::state::Table::check_key_limits`]), and a table whose resource-based policy
+//! denies the caller `dynamodb:Query` is answered `AccessDeniedException` instead of
+//! its items.
+//!
 //! Every size a request can choose here is bounded: the expression's length, token
 //! count and parenthesis nesting (see [`tokenize`] and [`Parser`]), and the page the
 //! response carries ([`MAX_PAGE_BYTES`]), so one `Query` cannot drive unbounded work
@@ -358,6 +363,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
+        // A table whose resource-based policy denies the caller this action answers the
+        // denial, not its items.
+        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:Query", now) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
         let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
 
         // One partition's items are contiguous in the store and already in sort-key

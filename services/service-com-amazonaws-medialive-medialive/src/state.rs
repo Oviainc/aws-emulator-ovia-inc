@@ -74,6 +74,20 @@ pub use alarm_template_groups::{
 
 pub(crate) use alarm_template_groups::alarm_template_group_output;
 
+/// The multiplex slice: its record, its bounds, its refusals, the store's
+/// methods and its output projection, in one module of its own for the same
+/// reason as the alarm template group slice above. What stays in this file is
+/// the part the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`].
+pub mod multiplexes;
+
+pub use multiplexes::{
+    multiplex_state, MultiplexRecord, MultiplexRefusal, MAX_MULTIPLEXES, MAX_MULTIPLEX_TOKENS,
+    MULTIPLEX_AVAILABILITY_ZONES,
+};
+
+pub(crate) use multiplexes::multiplex_description_output;
+
 /// The eventbridge rule TEMPLATE slice: its record, its bounds, its refusal, the
 /// store's methods and its output projection, in one module of its own for the
 /// same reason as [`alarm_template_groups`]. What stays in this file is the part
@@ -709,6 +723,14 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `CreateSignalMap`'s `RequestId` (`@idempotencyToken`) -> the signal map it
     /// created.
     signal_map_tokens: IdempotencyTokens,
+    /// Every multiplex that exists, keyed by its minted `Id`, in id order for
+    /// the same reason as [`Self::channels`].
+    pub multiplexes: BTreeMap<String, MultiplexRecord>,
+    /// Mint counter behind the multiplex slice's `mint_multiplex_id`.
+    pub next_multiplex_id: u64,
+    /// `CreateMultiplex`'s `RequestId` (`@idempotencyToken`) -> the multiplex it
+    /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
+    multiplex_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -734,6 +756,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         for signal_map in self.signal_maps.values_mut() {
             signal_map.settle(now);
         }
+        self.settle_multiplexes(now);
     }
 
     /// Whether the store is full, so `CreateChannel` must refuse rather than mint

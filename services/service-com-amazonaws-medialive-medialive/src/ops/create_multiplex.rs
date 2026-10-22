@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMultiplex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMultiplex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMultiplex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the multiplex is minted into this service's store (the `multiplexes`
+//! slice of [`crate::state`]) and every value the response carries is read back out of
+//! the stored record, never built from the request in flight. A retry carrying the same
+//! `@idempotencyToken` `RequestId` answers with the multiplex the first call created.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMultiplex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMultiplexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMultiplex"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this create ran, so they are materialised before anything is read.
+        state.settle(now);
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must answer
+        // with the multiplex the first one created, not a second multiplex.
+        if let Some(existing) = state
+            .multiplex_for_token(&input.request_id)
+            .map(str::to_string)
+        {
+            let multiplex = state
+                .multiplex_description(&existing)
+                .ok_or_else(unavailable)?;
+            return Ok(CreateMultiplexOutput {
+                multiplex: Some(multiplex),
+            });
+        }
+
+        // The documented availability-zone count, the published settings ranges,
+        // the store's cap, the mint and the insert are one step in the state
+        // slice, so this handler cannot check one of them and write past
+        // another.
+        let id = state
+            .insert_multiplex(
+                &region,
+                input.name,
+                input.availability_zones,
+                input.multiplex_settings,
+                input.tags.unwrap_or_default(),
+                now,
+            )
+            .map_err(refused)?;
+        // Bounded, evicting write: a caller-chosen token can neither accumulate
+        // past the cap nor resolve to anything once the multiplex it created is
+        // gone (`multiplex_for_token` answers only for a multiplex that exists).
+        state.record_multiplex_token(input.request_id, &id);
+
+        let multiplex = state.multiplex_description(&id).ok_or_else(unavailable)?;
+        Ok(CreateMultiplexOutput {
+            multiplex: Some(multiplex),
+        })
     }
+}
+
+/// Turn a store refusal into this operation's own modelled error.
+///
+/// A request naming the wrong number of availability zones, or a settings value
+/// outside the range the model publishes for it, is a bad request, and the
+/// message names the member, the rule and the value the request carried, so the
+/// caller can fix the request from that text alone. A full store is this
+/// emulator's own ceiling — a throttle, not a fault in the request.
+fn refused(refusal: crate::state::MultiplexRefusal) -> CreateMultiplexError {
+    match refusal {
+        crate::state::MultiplexRefusal::AvailabilityZoneCount(count) => {
+            CreateMultiplexErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "availabilityZones must name exactly {} availability zones, got {count}",
+                    crate::state::MULTIPLEX_AVAILABILITY_ZONES
+                )),
+            })
+        }
+        crate::state::MultiplexRefusal::SettingOutOfRange {
+            member,
+            value,
+            min,
+            max,
+        } => CreateMultiplexErrorModeled::BadRequestException(BadRequestException {
+            message: Some(format!(
+                "multiplexSettings.{member} must be between {min} and {max}, got {value}"
+            )),
+        }),
+        crate::state::MultiplexRefusal::StoreFull => {
+            CreateMultiplexErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                message: Some(format!(
+                    "This emulator stores at most {} multiplexes; delete one before creating another",
+                    crate::state::MAX_MULTIPLEXES
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the multiplex in. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateMultiplexError {
+    CreateMultiplexErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

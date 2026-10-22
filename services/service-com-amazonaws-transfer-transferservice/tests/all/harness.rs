@@ -186,6 +186,13 @@ pub(crate) fn is_modelled_vpc_endpoint_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "vpce-", 17)
 }
 
+/// `ConnectorId` is modelled `len 19..19`, pattern `^c-([0-9a-f]{17})$`.
+pub(crate) fn is_modelled_connector_id(id: &str) -> bool {
+    id.len() == 19
+        && id.starts_with("c-")
+        && id[2..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
 /// `ProfileId` is modelled `len 19..19`, pattern `^p-([0-9a-f]{17})$`.
 pub(crate) fn is_modelled_profile_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "p-", 17)

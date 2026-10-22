@@ -338,10 +338,17 @@ pub fn constraint_clause(member_path: &str, requirement: &str) -> String {
     format!("Value at '{member_path}' failed to satisfy constraint: {requirement}")
 }
 
-/// [`constraint_clause`] for a member that was ABSENT. Reported as the null it was, which is
-/// a fact of the request's shape rather than a rendering of a value the caller sent.
+/// [`constraint_clause`] for a member that was ABSENT, whose requirement is that it be
+/// present.
+///
+/// Worded through the same builder as every other clause, with NO rendering of the absent
+/// value: the recorded refusal of a call that omits a `@required` `@httpQuery` member reads
+/// `1 validation error detected: Value at 'endTime' failed to satisfy constraint: Member
+/// must not be null` — the clause states the member and the requirement, and says nothing
+/// where a value would go. Reporting the absence as a `null` VALUE would describe a value
+/// the request never carried.
 pub fn absent_member_clause(member_path: &str) -> String {
-    format!("Value null at '{member_path}' failed to satisfy constraint: Member must not be null")
+    constraint_clause(member_path, "Member must not be null")
 }
 
 /// The `ValidationException` message over one or more clauses: the count of violated
