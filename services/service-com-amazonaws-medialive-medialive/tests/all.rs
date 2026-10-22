@@ -14,5 +14,8 @@
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 
+#[path = "all/input_lifecycle.rs"]
+mod input_lifecycle;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

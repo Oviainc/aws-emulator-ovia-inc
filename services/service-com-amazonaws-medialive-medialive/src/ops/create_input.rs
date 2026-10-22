@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +174,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInput"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The two rules the `Vpc` member's own doc states: "This property
+        // requires setting the roleArn property on Input creation. Not
+        // compatible with the inputSecurityGroups property." Both are refusals
+        // of the request, so they answer with this operation's modelled 400.
+        if input.vpc.is_some() {
+            if input
+                .input_security_groups
+                .as_ref()
+                .is_some_and(|groups| !groups.is_empty())
+            {
+                return Err(bad_request(
+                    "vpc is not compatible with the inputSecurityGroups property",
+                ));
+            }
+            if input.role_arn.as_deref().unwrap_or_default().is_empty() {
+                return Err(bad_request(
+                    "vpc requires setting the roleArn property on Input creation",
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut state = state.lock();
+        // The channel transitions the clock had already made due are what this
+        // input's `AttachedChannels` is derived from, so materialise them first;
+        // they were owed at that instant whether or not this create ran.
+        state.settle(::std::time::SystemTime::now());
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must return the
+        // input the first one created, not a second input.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.input_for_token(token))
+            .map(str::to_string)
+        {
+            let created = state.input_description(&existing).ok_or_else(unavailable)?;
+            return Ok(CreateInputOutput {
+                input: Some(created),
+            });
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit: once it is full the operation's own modelled throttle is
+        // the answer, not another input.
+        if state.inputs_are_full() {
+            return Err(CreateInputErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} inputs; delete one before creating another",
+                        crate::state::MAX_INPUTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_input_id();
+        let arn = ::engine::emulator_arn("medialive", &region, &format!("input:{id}"));
+        let mut record = crate::state::new_input(id.clone(), arn);
+
+        // Everything the request supplied is stored; the response is then read
+        // back out of the stored record, never from `input`.
+        record.name = input.name;
+        record.input_type = input.r#type;
+        if let Some(location) = input.input_network_location {
+            record.input_network_location = location;
+        }
+        record.role_arn = input.role_arn;
+        record.security_groups = input.input_security_groups.unwrap_or_default();
+        record.sources = input.sources.unwrap_or_default();
+        record.destinations = input.destinations.unwrap_or_default();
+        record.media_connect_flows = input.media_connect_flows.unwrap_or_default();
+        record.input_devices = input.input_devices.unwrap_or_default();
+        record.sdi_sources = input.sdi_sources.unwrap_or_default();
+        record.srt_settings = input.srt_settings;
+        record.multicast_settings = input.multicast_settings;
+        record.smpte2110_receiver_group_settings = input.smpte2110_receiver_group_settings;
+        record.router_settings = input.router_settings;
+        record.vpc = input.vpc;
+        record.tags = input.tags.unwrap_or_default();
+
+        state.inputs.insert(id.clone(), record);
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the input it created.
+            state.record_input_idempotency_token(token, &id);
+        }
+
+        let created = state.input_description(&id).ok_or_else(unavailable)?;
+        Ok(CreateInputOutput {
+            input: Some(created),
+        })
     }
+}
+
+/// A request this operation refuses, as its own modelled client error.
+fn bad_request(message: &str) -> CreateInputError {
+    CreateInputErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the input in. A modelled server error, never a
+/// fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateInputError {
+    CreateInputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
