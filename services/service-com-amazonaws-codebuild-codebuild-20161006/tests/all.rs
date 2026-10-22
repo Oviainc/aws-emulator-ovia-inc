@@ -15,6 +15,8 @@
 mod batch_delete_builds;
 #[path = "all/list_sandboxes.rs"]
 mod list_sandboxes;
+#[path = "all/list_sandboxes_for_project.rs"]
+mod list_sandboxes_for_project;
 #[path = "all/project_build_batch_lifecycle.rs"]
 mod project_build_batch_lifecycle;
 #[path = "all/project_build_lifecycle.rs"]
@@ -23,6 +25,8 @@ mod project_build_lifecycle;
 mod report_group_lifecycle;
 #[path = "all/sandbox_lifecycle.rs"]
 mod sandbox_lifecycle;
+#[path = "all/sandbox_sessions.rs"]
+mod sandbox_sessions;
 #[path = "all/source_credentials.rs"]
 mod source_credentials;
 #[path = "all/state_roundtrip.rs"]

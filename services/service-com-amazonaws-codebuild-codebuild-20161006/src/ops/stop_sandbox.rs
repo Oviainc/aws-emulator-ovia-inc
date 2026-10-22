@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopSandbox
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopSandbox`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Ends a live sandbox and persists the outcome: this is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopSandbox::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A sandbox runs until something ends it ([`crate::state::StoredSandbox::settle`]
+//! keeps it `RUNNING` until its own `timeoutInMinutes` elapses), and this is the call
+//! that ends it: the record it already holds takes the terminal `STOPPED` status and
+//! the instant it stopped. A sandbox the clock already ended keeps the outcome it
+//! reached, and an id no sandbox answers to is refused with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +138,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopSandbox` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopSandboxErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopSandbox"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StopSandbox (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let _ = ctx;
+        let now = crate::state::now_millis();
+        let mut guard = state.lock();
+
+        let Some(stored) = guard.sandboxes.get_mut(&input.id) else {
+            return Err(StopSandboxErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // Named by the id the request gave, exactly as given — the same
+                    // shape of refusal `StopBuild` reports for an absent build.
+                    message: Some(format!("Sandbox {} does not exist", input.id)),
+                },
+            )
+            .into());
+        };
+
+        // First materialise what the clock already owed this sandbox, so a sandbox
+        // that had already timed out keeps that outcome; `end` leaves a terminal
+        // record alone, so stopping one twice reports the same thing.
+        stored.settle(now);
+        stored.end(crate::state::SANDBOX_STATUS_STOPPED, now);
+
+        Ok(StopSandboxOutput {
+            sandbox: Some(stored.sandbox.clone()),
+        })
     }
 }
