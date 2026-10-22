@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a running instance of a paid container product for metering: on the
+//! first call for a (`ProductCode`, `PublicKeyVersion`, `Nonce`) it checks the
+//! caller's entitlement, mints the JWT signature and persists the registration; on
+//! every later call with the same key it reads the STORED signature back, so the
+//! value is stable per registration and no entitlement check is repeated (the model:
+//! "Subsequent calls from the same Amazon ECS task instance … will not throw a
+//! CustomerNotSubscribedException"). `PublicKeyRotationTimestamp` is reported only
+//! once the registered key version's rotation instant has passed, because the member
+//! is "(Optional) Only included when public key version has expired".
+//!
+//! The token itself is built by [`crate::state::registration_signature`], which
+//! documents why it is an unsecured JWT (RFC 7519 §6) rather than a signed one: the
+//! emulator publishes no verification key, so a MAC would claim a signature no client
+//! could check.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +201,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterUsage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterUsageErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the metering store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // The buyer's credentials sign this call, so the customer being registered is
+        // the caller's own account: the one canonical account this emulator vends.
+        let customer = ::engine::emulator_account_id().to_string();
+        let nonce = input.nonce.clone().unwrap_or_default();
+        let key = (input.product_code.clone(), input.public_key_version, nonce);
+
+        let product = state.products.get(&input.product_code).ok_or_else(|| {
+            RegisterUsageErrorModeled::InvalidProductCodeException(InvalidProductCodeException {
+                message: Some(format!(
+                    "The product code {} does not match the product code used for publishing the product",
+                    input.product_code
+                )),
+            })
+        })?;
+        let rotation_timestamp = product
+            .public_key_versions
+            .get(&input.public_key_version)
+            .map(|entry| entry.rotation_timestamp)
+            .ok_or_else(|| {
+                RegisterUsageErrorModeled::InvalidPublicKeyVersionException(
+                    InvalidPublicKeyVersionException {
+                        message: Some(format!(
+                            "Public key version {} is invalid",
+                            input.public_key_version
+                        )),
+                    },
+                )
+            })?;
+        let entitled = product.entitled_customers.contains(&customer);
+
+        let stored = state.registrations.get(&key).cloned();
+        let registration = match stored {
+            // A subsequent call for the same registration: the stored signature, and no
+            // fresh entitlement check.
+            Some(existing) => existing,
+            None => {
+                if !entitled {
+                    return Err(RegisterUsageErrorModeled::CustomerNotEntitledException(
+                        CustomerNotEntitledException {
+                            message: Some(format!(
+                                "Customer {customer} does not have a valid subscription for product {}",
+                                input.product_code
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let registered_at = ::std::time::SystemTime::now();
+                let registration = crate::state::Registration {
+                    signature: crate::state::registration_signature(
+                        &key.0,
+                        key.1,
+                        &key.2,
+                        &customer,
+                        crate::state::epoch_secs(registered_at),
+                    ),
+                    public_key_rotation_timestamp: rotation_timestamp,
+                    registered_at,
+                };
+                state.registrations.record(key, registration.clone());
+                registration
+            }
+        };
+
+        Ok(RegisterUsageOutput {
+            public_key_rotation_timestamp: (registration.public_key_rotation_timestamp
+                <= ::std::time::SystemTime::now())
+                .then(|| {
+                    ::aws_smithy_types::DateTime::from(registration.public_key_rotation_timestamp)
+                }),
+            signature: Some(registration.signature),
+        })
     }
 }

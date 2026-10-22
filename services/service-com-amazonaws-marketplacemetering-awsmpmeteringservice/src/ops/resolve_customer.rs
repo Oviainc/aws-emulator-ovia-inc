@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResolveCustomer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResolveCustomer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResolveCustomer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Looks the submitted `RegistrationToken` up in this service's token table and
+//! returns the registration the token was minted for — the same identity on every
+//! call, because the answer is the stored record rather than anything derived from
+//! the request. A token the table does not hold is an `InvalidTokenException`; one
+//! whose expiry has passed is an `ExpiredTokenException`. Tokens are minted out of
+//! band (a buyer's browser hands one to the seller's site), so this operation only
+//! ever READS the table: a lookup never creates a token, and a resolved token is not
+//! consumed.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +186,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResolveCustomer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResolveCustomerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResolveCustomer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ResolveCustomerErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the metering store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        // A token this service was never given is invalid — it is NOT created here, so
+        // two different tokens never resolve to the same invented identity and a
+        // garbage token can never succeed.
+        let token = state
+            .registration_tokens
+            .get(&input.registration_token)
+            .ok_or_else(|| {
+                ResolveCustomerErrorModeled::InvalidTokenException(InvalidTokenException {
+                    message: Some("Registration token is invalid".to_string()),
+                })
+            })?;
+
+        // An expiry the clock has already passed: reported, never written back. The
+        // token stays in the table, so the failure is stable for every later caller.
+        if token
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= ::std::time::SystemTime::now())
+        {
+            return Err(ResolveCustomerErrorModeled::ExpiredTokenException(
+                ExpiredTokenException {
+                    message: Some("The submitted registration token has expired".to_string()),
+                },
+            )
+            .into());
+        }
+
+        Ok(ResolveCustomerOutput {
+            // `ResolveCustomerResult$CustomerIdentifier` is not populated for a new SaaS
+            // integration, which identifies the customer by account id and license ARN
+            // instead; a token registered without one is stored with it empty and the
+            // member is left out of the response rather than returned blank.
+            customer_identifier: Some(token.customer_identifier.clone())
+                .filter(|identifier| !identifier.is_empty()),
+            product_code: Some(token.product_code.clone()),
+            customer_aws_account_id: Some(token.customer_aws_account_id.clone()),
+            license_arn: token.license_arn.clone(),
+            metadata: token.metadata.clone(),
+        })
     }
 }
