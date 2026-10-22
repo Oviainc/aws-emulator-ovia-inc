@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the request's tags, by key, onto the data store its `ResourceARN`
+//! names in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +131,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // `TagResource` models only `ResourceNotFoundException` and
+        // `ValidationException`, so a refusal is the only channel it has for a
+        // condition no modelled error names. This one is unreachable in the
+        // emulator — the engine is construction-time, not per request.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some("the HealthLake data store registry is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // The modelled `AmazonResourceName` pattern also admits a
+        // `dataTransformationProfile` ARN, which names a different resource;
+        // anything that is not a data store ARN resolves to no data store.
+        let Some(id) = crate::state::datastore_id_from_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Resource {} is not a HealthLake data store",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_lifecycle();
+        // The stored record's own ARN must equal the one the caller handed in,
+        // so an ARN naming another partition, region or account resolves to no
+        // data store even when its id segment happens to match a local one.
+        let Some(datastore) = store
+            .datastores
+            .get_mut(id)
+            .filter(|datastore| datastore.arn == input.resource_arn)
+        else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Resource {} does not exist", input.resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // Merging is all-or-nothing: the resulting tag set is bounded, so a
+        // stream of calls with fresh keys cannot grow the record without limit.
+        // The modelled `TagList` bound caps one request; this caps the resource.
+        let merged: ::std::collections::BTreeSet<&str> = datastore
+            .tags
+            .keys()
+            .map(String::as_str)
+            .chain(input.tags.iter().map(|tag| tag.key.as_str()))
+            .collect();
+        if merged.len() > crate::state::MAX_TAGS_PER_DATASTORE {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "A data store carries at most {} tags; this request would leave {}",
+                    crate::state::MAX_TAGS_PER_DATASTORE,
+                    merged.len()
+                )),
+            })
+            .into());
+        }
+        drop(merged);
+
+        for tag in input.tags {
+            datastore.tags.insert(tag.key, tag.value);
+        }
+        Ok(TagResourceOutput {})
     }
 }

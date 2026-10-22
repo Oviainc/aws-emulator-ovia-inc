@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRepository
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRepository`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRepository::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a repository into the public registry held in [`crate::state`] and reports
+//! what was inserted. The ARN, the URI and `createdAt` are all stored, so the
+//! `Repository` a later `DescribeRepositories` reports is the same object, not a
+//! recomputed one.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRepository` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRepositoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRepository"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+
+        // `TooManyTagsException` documents the limit: "the maximum number of tags that
+        // can be applied to a repository is 50". The modelled `TagList` length (0..200)
+        // is wider, so it is enforced here.
+        let requested_tags = input.tags.as_ref().map(Vec::len).unwrap_or(0);
+        if requested_tags > crate::state::MAX_TAGS_PER_REPOSITORY {
+            return Err(CreateRepositoryErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "Too many tags: {requested_tags} were supplied, and the maximum \
+                         number of tags that can be applied to a repository is {}",
+                        crate::state::MAX_TAGS_PER_REPOSITORY
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let tags = match crate::state::stored_tags(input.tags.as_ref()) {
+            Ok(tags) => tags,
+            Err(message) => {
+                return Err(CreateRepositoryErrorModeled::InvalidTagParameterException(
+                    InvalidTagParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let catalog_data =
+            crate::state::catalog_data_of(&input.repository_name, input.catalog_data.as_ref());
+        let created_at = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        if store.repositories.contains_key(&input.repository_name) {
+            return Err(
+                CreateRepositoryErrorModeled::RepositoryAlreadyExistsException(
+                    RepositoryAlreadyExistsException {
+                        message: Some(format!(
+                            "Repository with name '{}' already exists in the registry with id \
+                             '{}'",
+                            input.repository_name, store.registry_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store lives for the life of the process and this is the only operation
+        // that adds a repository to it, so the count is capped: a reader must still be
+        // able to answer what was stored, which rules out a TTL or an eviction policy.
+        if store.repositories.len() >= crate::state::MAX_REPOSITORIES {
+            return Err(CreateRepositoryErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The operation didn't succeed because it would have exceeded this \
+                         registry's limit of {} repositories",
+                        crate::state::MAX_REPOSITORIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let repository = crate::state::StoredRepository {
+            name: input.repository_name.clone(),
+            arn: store.repository_arn(&input.repository_name),
+            registry_id: store.registry_id.clone(),
+            uri: store.repository_uri(&input.repository_name),
+            created_at,
+            catalog_data,
+            tags,
+            images: ::std::collections::BTreeMap::new(),
+            tag_index: ::std::collections::BTreeMap::new(),
+        };
+        let output = CreateRepositoryOutput {
+            repository: Some(repository.as_repository()),
+            catalog_data: Some(repository.catalog_data.clone()),
+        };
+        store
+            .repositories
+            .insert(input.repository_name, repository);
+        drop(store);
+
+        Ok(output)
     }
+}
+
+/// The modelled server fault for a state store this service could not reach.
+fn server_error() -> CreateRepositoryError {
+    CreateRepositoryErrorModeled::ServerException(ServerException {
+        message: Some(
+            "The ECR Public emulator could not reach its state store.".to_string(),
+        ),
+    })
+    .into()
 }

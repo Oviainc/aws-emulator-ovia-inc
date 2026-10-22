@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a resource share in [`crate::state`] and reports the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The share is created `ACTIVE` — the status RAM answers this call with — and one
+//! association is materialised per entry of `resourceArns` (`RESOURCE`),
+//! `principals` (`PRINCIPAL`) and `sources` (`SOURCE`), each in `ASSOCIATING` until
+//! the move RAM owes it falls due. A repeat of the same request under the same
+//! `clientToken` creates nothing further and answers from the stored share.
 //!
 //! ## Shape of an operation
 //!
@@ -226,18 +224,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceShare"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateResourceShareErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        let resource_arns = input.resource_arns.clone().unwrap_or_default();
+        let principals = input.principals.clone().unwrap_or_default();
+        let sources = input.sources.clone().unwrap_or_default();
+        let permission_arns = input.permission_arns.clone().unwrap_or_default();
+        let supplied_tags = input.tags.clone().unwrap_or_default();
+
+        // The model constrains none of these members, so every rule below is applied
+        // here, each rendered as the modelled error RAM words that refusal with.
+        if let Some(why) = crate::state::name_rejection(&input.name)
+            .or_else(|| crate::state::entity_value_rejection("principals", &principals))
+            .or_else(|| crate::state::entity_value_rejection("sources", &sources))
+        {
+            return Err(CreateResourceShareErrorModeled::InvalidParameterException(
+                InvalidParameterException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = crate::state::resource_arn_rejection("resourceArns", &resource_arns)
+            .or_else(|| crate::state::resource_arn_rejection("permissionArns", &permission_arns))
+        {
+            return Err(CreateResourceShareErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = crate::state::entity_count_rejection("resourceArns", resource_arns.len())
+            .or_else(|| crate::state::entity_count_rejection("principals", principals.len()))
+            .or_else(|| crate::state::entity_count_rejection("sources", sources.len()))
+        {
+            return Err(
+                CreateResourceShareErrorModeled::ResourceShareLimitExceededException(
+                    ResourceShareLimitExceededException { message: why },
+                )
+                .into(),
+            );
+        }
+        match crate::state::tags_rejection(&supplied_tags) {
+            None => {}
+            Some(crate::state::TagRejection::Invalid(why)) => {
+                return Err(CreateResourceShareErrorModeled::InvalidParameterException(
+                    InvalidParameterException { message: why },
+                )
+                .into())
+            }
+            Some(crate::state::TagRejection::LimitExceeded(why)) => {
+                return Err(CreateResourceShareErrorModeled::TagLimitExceededException(
+                    TagLimitExceededException { message: why },
+                )
+                .into())
+            }
+            Some(crate::state::TagRejection::PolicyViolation(why)) => {
+                return Err(CreateResourceShareErrorModeled::TagPolicyViolationException(
+                    TagPolicyViolationException { message: why },
+                )
+                .into())
+            }
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(CreateResourceShareErrorModeled::InvalidClientTokenException(
+                InvalidClientTokenException { message: why },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let allow_external_principals = input
+            .allow_external_principals
+            .unwrap_or(crate::state::DEFAULT_ALLOW_EXTERNAL_PRINCIPALS);
+        let tags = crate::state::tag_map(&supplied_tags);
+        let rendered_tags = crate::state::fingerprint_map(&tags);
+        let rendered_configuration = match input
+            .resource_share_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.retain_sharing_on_account_leave_organization)
+        {
+            Some(true) => "retain=true",
+            Some(false) => "retain=false",
+            None => "retain=",
+        };
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        // Every parameter other than the token itself, so a retry of this request is
+        // told apart from a different request that reuses the token.
+        let fingerprint = crate::state::fingerprint(&[
+            &input.name,
+            if allow_external_principals {
+                "true"
+            } else {
+                "false"
+            },
+            &crate::state::fingerprint_list(&resource_arns),
+            &crate::state::fingerprint_list(&principals),
+            &crate::state::fingerprint_list(&sources),
+            &crate::state::fingerprint_list(&permission_arns),
+            &rendered_tags,
+            rendered_configuration,
+        ]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        CreateResourceShareErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: "clientToken was already used for a CreateResourceShare \
+                                          request with different parameters"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                let arn = record.resource_share_arn.clone();
+                if let Some(share) = store.share(&arn) {
+                    return Ok(CreateResourceShareOutput {
+                        resource_share: Some(share.view()),
+                        client_token: Some(token),
+                    });
+                }
+            }
+        }
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way RAM refuses one past its quota.
+        if store.resource_shares.len() >= crate::state::MAX_RESOURCE_SHARES {
+            return Err(
+                CreateResourceShareErrorModeled::ResourceShareLimitExceededException(
+                    ResourceShareLimitExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} resource shares",
+                            crate::state::MAX_RESOURCE_SHARES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = store.fresh_share_arn(&region);
+        let share = crate::state::ShareRecord {
+            arn: arn.clone(),
+            name: input.name,
+            owning_account_id: ::engine::emulator_account_id().to_string(),
+            allow_external_principals,
+            status: crate::state::SHARE_STATUS_ACTIVE.to_string(),
+            status_message: None,
+            tags,
+            creation_time: now,
+            last_updated_time: now,
+            feature_set: crate::state::FEATURE_SET_STANDARD.to_string(),
+            permission_arns,
+            resource_share_configuration: input.resource_share_configuration,
+        };
+        store.insert_share(share.clone());
+
+        for (association_type, entities) in [
+            (crate::state::ASSOCIATION_TYPE_RESOURCE, &resource_arns),
+            (crate::state::ASSOCIATION_TYPE_PRINCIPAL, &principals),
+            (crate::state::ASSOCIATION_TYPE_SOURCE, &sources),
+        ] {
+            for entity in entities {
+                store.associate(&share, association_type, entity, now);
+            }
+        }
+
+        // RAM generates a token when the request omits one and reports it either
+        // way, so a caller can repeat the call idempotently.
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(Self::NAME, &client_token, fingerprint, arn.clone());
+
+        let view = store
+            .share(&arn)
+            .map(crate::state::ShareRecord::view)
+            .ok_or_else(|| {
+                CreateResourceShareErrorModeled::ServerInternalException(ServerInternalException {
+                    message: "the resource share could not be read back after creation"
+                        .to_string(),
+                })
+            })?;
+        Ok(CreateResourceShareOutput {
+            resource_share: Some(view),
+            client_token: Some(client_token),
+        })
     }
 }

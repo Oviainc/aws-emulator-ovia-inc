@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Content-addressed ids: the git object encoding of a blob/tree/commit, and the
+# repositoryId, are hashed with this (both crates are already workspace deps, so
+# this adds nothing to Cargo.lock).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

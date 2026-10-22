@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProgramManagementAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProgramManagementAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProgramManagementAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `pma-` id, builds the catalog-scoped ARN, persists the account
+//! in [`crate::state`] and answers from what it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +157,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProgramManagementAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProgramManagementAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProgramManagementAccount"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateProgramManagementAccountErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the service is not mounted on a state-bearing engine".into(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `program` is modelled as the `Program` enum, so the boundary refuses a
+        // value outside the set before this runs — but a client that sends an
+        // unmodelled-but-well-formed string must still be refused rather than
+        // stored, so the value set is checked against the model's own list.
+        if !PROGRAM_VALUES.contains(&input.program.as_str()) {
+            return Err(
+                CreateProgramManagementAccountErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "program",
+                        format!(
+                            "Value '{}' at 'program' failed to satisfy constraint: Member must \
+                             satisfy enum value set: [{}]",
+                            input.program,
+                            PROGRAM_VALUES.join(", ")
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // The client-token ledger keys on the request WITHOUT its token, so a
+        // retry carrying the same token and the same parameters replays, and the
+        // same token with different parameters is a conflict.
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+        guard.advance_clock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same create: answer with the account the first call
+            // minted, read back out of the store, instead of minting a second.
+            crate::state::TokenOutcome::Replay(record) => {
+                if let Some(account) = record
+                    .resource_id
+                    .as_deref()
+                    .and_then(|id| guard.program_management_accounts.get(id))
+                {
+                    return Ok(output_for(account));
+                }
+                return Err(
+                    CreateProgramManagementAccountErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: "The program management account created with this client \
+                                      token no longer exists."
+                                .into(),
+                            resource_id: record.resource_id,
+                            resource_type: Some(
+                                crate::state::PROGRAM_MANAGEMENT_ACCOUNT_RESOURCE_TYPE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::ParameterMismatch
+            | crate::state::TokenOutcome::TokenInUse => {
+                return Err(
+                    CreateProgramManagementAccountErrorModeled::ConflictException(
+                        ConflictException {
+                            message: "The specified clientToken has already been used with \
+                                      different parameters."
+                                .into(),
+                            resource_id: client_token.unwrap_or_default().to_string(),
+                            resource_type: "ClientToken".to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // One AWS account holds at most one program management account per
+        // program in a catalog, so a second create for the same triple is a
+        // conflict rather than a second account.
+        if let Some(existing) = guard.program_management_accounts.find_duplicate(
+            &input.catalog,
+            &input.program,
+            &input.account_id,
+        ) {
+            let resource_id = existing.id.clone();
+            return Err(
+                CreateProgramManagementAccountErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "A program management account for account {} and program {} already \
+                         exists in catalog {}.",
+                        input.account_id, input.program, input.catalog
+                    ),
+                    resource_id,
+                    resource_type: crate::state::PROGRAM_MANAGEMENT_ACCOUNT_RESOURCE_TYPE
+                        .to_string(),
+                })
+                .into(),
+            );
+        }
+
+        // The store is in memory and this is the only operation that grows it, so
+        // the account count is capped and the modelled quota error is what a
+        // caller past the cap sees.
+        if guard.program_management_accounts.len() >= crate::state::MAX_PROGRAM_MANAGEMENT_ACCOUNTS
+        {
+            return Err(
+                CreateProgramManagementAccountErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the quota of {} program management \
+                             accounts.",
+                            crate::state::MAX_PROGRAM_MANAGEMENT_ACCOUNTS
+                        ),
+                        resource_id: input.account_id.clone(),
+                        resource_type: crate::state::PROGRAM_MANAGEMENT_ACCOUNT_RESOURCE_TYPE
+                            .to_string(),
+                        quota_code: crate::state::PROGRAM_MANAGEMENT_ACCOUNT_QUOTA_CODE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = guard.mint_id(crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX);
+        let arn = crate::state::program_management_account_arn(&region, &input.catalog, &id);
+        let created_at = crate::state::now();
+        guard
+            .program_management_accounts
+            .insert(crate::state::ProgramManagementAccount {
+                id: id.clone(),
+                arn,
+                catalog: input.catalog,
+                program: input.program,
+                display_name: input.display_name,
+                account_id: input.account_id,
+                // A created account is not usable yet: it reports the modelled
+                // non-terminal `PENDING`, and the clock owes it `ACTIVE`.
+                status: crate::state::STATUS_PENDING.to_string(),
+                revision: crate::state::INITIAL_REVISION,
+                created_at,
+                updated_at: created_at,
+                start_date: created_at,
+                tags: input.tags.unwrap_or_default(),
+                active_at: ::std::time::SystemTime::now() + crate::state::ACTIVATION_SPAN,
+            });
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(id.clone()),
+        );
+
+        // Answer from the store, not from the request struct.
+        let account = guard.program_management_accounts.get(&id).ok_or_else(|| {
+            CreateProgramManagementAccountError::from(
+                CreateProgramManagementAccountErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the program management account that was just stored could not \
+                                  be read back"
+                            .into(),
+                    },
+                ),
+            )
+        })?;
+        Ok(output_for(account))
+    }
+}
+
+/// The response for a stored account. The ONE place this operation's output is
+/// built, so a fresh create and an idempotent replay answer from the same stored
+/// fields.
+fn output_for(
+    account: &crate::state::ProgramManagementAccount,
+) -> CreateProgramManagementAccountOutput {
+    CreateProgramManagementAccountOutput {
+        program_management_account_detail: Some(CreateProgramManagementAccountDetail {
+            id: Some(account.id.clone()),
+            arn: Some(account.arn.clone()),
+        }),
     }
 }

@@ -1,0 +1,1132 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the Free Tier loop — plan state → upgrade → re-read →
+//! activity list → activity detail → usage list — driven over the wire
+//! (`awsJson1_0`, `POST /` with `X-Amz-Target: AWSFreeTierService.<Operation>`)
+//! through the same multi-service router the emulator boots.
+//!
+//! Every assertion is about a RULE over a table of inputs rather than one
+//! recorded call: what the store reports after a write, which rows a filter
+//! selects, where a page resumes, and that the detail view of an activity
+//! agrees with its list entry. Where the expectation is derivable, it is
+//! computed from what the service itself reports, so a test asserts the rule
+//! and not the catalog's contents.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use service_com_amazonaws_freetier_awsfreetierservice::state::{
+    ComAmazonawsFreetierAwsfreetierserviceState, ACTIVITY_STATUS_COMPLETED,
+    ACTIVITY_STATUS_IN_PROGRESS, PLAN_STATUS_ACTIVE, PLAN_STATUS_EXPIRED, PLAN_TYPE_FREE,
+    PLAN_TYPE_PAID,
+};
+use service_com_amazonaws_freetier_awsfreetierservice::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The model's `ActivityStatus` value set (`shared_types::ACTIVITY_STATUS_VALUES`,
+/// generated from the Smithy enum).
+use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
+    ACTIVITY_STATUS_VALUES, CURRENCY_CODE_VALUES, DIMENSION_VALUES, MATCH_OPTION_VALUES,
+};
+
+/// A router with only this service mounted, over one shared engine — the same
+/// assembly `core/router` performs, minus the other services. The engine comes
+/// back too, so a test can age the stored plan the way the clock would.
+fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // In-process tests sign with a placeholder key; signature verification is a
+    // front-door setting, not part of what these tests are about.
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+fn router() -> MultiServiceRouter {
+    harness().0
+}
+
+/// Call one operation and return its HTTP status and JSON body.
+async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://freetier.us-east-1.amazonaws.com/")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", format!("AWSFreeTierService.{operation}"))
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEMULATOR/20260101/us-east-1/freetier/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=0000",
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("the request builds");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, payload)
+}
+
+/// Call one operation, requiring success.
+async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+    let (status, payload) = call(router, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {operation} {body}: expected HTTP 200, got {status} with {payload}"
+    );
+    payload
+}
+
+/// The wire error code (`__type`) of an error body, without its namespace.
+fn error_code(payload: &Value) -> String {
+    payload["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .rsplit(['#', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Assert that one request is refused with `expected_status` and `expected_code`.
+async fn refused(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+    expected_status: u16,
+    expected_code: &str,
+) {
+    let (status, payload) = call(router, operation, body).await;
+    assert_eq!(
+        status, expected_status,
+        "case {operation} {body}: expected HTTP {expected_status}, got {status} with {payload}"
+    );
+    assert_eq!(
+        error_code(&payload),
+        expected_code,
+        "case {operation} {body}: expected error code {expected_code}, got {payload}"
+    );
+}
+
+/// The string at `member`, required to be present.
+fn text(payload: &Value, member: &str) -> String {
+    payload[member]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a string at {member}, got {payload}"))
+        .to_string()
+}
+
+/// Walk every page of a paginated operation at `page_size`, returning the items
+/// in the order they were reported.
+///
+/// Asserts the `@paginated` contract along the way: every page but the last
+/// holds exactly `page_size` items, the last page carries no `nextToken`, and
+/// the walk terminates.
+async fn walk(
+    router: &MultiServiceRouter,
+    operation: &str,
+    items_member: &str,
+    page_size: usize,
+    extra: &Value,
+) -> Vec<Value> {
+    let mut collected: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    for page_index in 0..64 {
+        let mut body = extra.clone();
+        body["maxResults"] = json!(page_size);
+        if let Some(token) = token.as_deref() {
+            body["nextToken"] = json!(token);
+        }
+        let payload = ok(router, operation, &body).await;
+        let items = payload[items_member]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {operation} page {page_index}: {items_member} must be a list, got {payload}")
+            })
+            .clone();
+        token = payload["nextToken"].as_str().map(str::to_string);
+        if token.is_some() {
+            assert_eq!(
+                items.len(),
+                page_size,
+                "case {operation} size {page_size} page {page_index}: a page that carries a \
+                 nextToken must be full, got {} items",
+                items.len()
+            );
+        }
+        assert!(
+            items.len() <= page_size,
+            "case {operation} size {page_size} page {page_index}: expected at most {page_size} \
+             items, got {}",
+            items.len()
+        );
+        collected.extend(items);
+        if token.is_none() {
+            return collected;
+        }
+    }
+    panic!("case {operation} size {page_size}: the pagination walk did not terminate");
+}
+
+// ---------------------------------------------------------------------------
+// GetAccountPlanState / UpgradeAccountPlan
+// ---------------------------------------------------------------------------
+
+/// The plan a never-upgraded account reports: the free plan, active, with the
+/// members the model marks required and the account id every emulator presents.
+/// Repeating the read reports exactly the same body — a `@readonly` operation
+/// changes nothing a later caller sees.
+#[tokio::test]
+async fn account_plan_state_reports_the_stored_plan_and_repeats_it() {
+    let router = router();
+
+    let first = ok(&router, "GetAccountPlanState", &json!({})).await;
+    let account_id = text(&first, "accountId");
+    assert_eq!(
+        account_id,
+        engine::emulator_account_id(),
+        "case first read: expected the emulator's account id, got {account_id}"
+    );
+    assert!(
+        account_id.len() == 12 && account_id.chars().all(|c| c.is_ascii_digit()),
+        "case first read: accountId must match ^[0-9]{{12}}$, got {account_id}"
+    );
+    assert_eq!(
+        text(&first, "accountPlanType"),
+        PLAN_TYPE_FREE,
+        "case first read: a never-upgraded account is on the free plan, got {first}"
+    );
+    assert_eq!(
+        text(&first, "accountPlanStatus"),
+        PLAN_STATUS_ACTIVE,
+        "case first read: the seeded free plan is active, got {first}"
+    );
+    let unit = text(&first["accountPlanRemainingCredits"], "unit");
+    assert!(
+        CURRENCY_CODE_VALUES.contains(&unit.as_str()),
+        "case first read: the credit unit must be a modelled CurrencyCode, got {unit}"
+    );
+    assert!(
+        first["accountPlanRemainingCredits"]["amount"]
+            .as_f64()
+            .is_some_and(|amount| amount >= 0.0),
+        "case first read: remaining credits carry an amount, got {first}"
+    );
+    assert!(
+        first["accountPlanExpirationDate"].as_f64().is_some(),
+        "case first read: a free plan expires, so it reports the instant, got {first}"
+    );
+
+    // Three further reads, to pin that reading does not move the plan.
+    for attempt in 1..=3 {
+        let again = ok(&router, "GetAccountPlanState", &json!({})).await;
+        assert_eq!(
+            again, first,
+            "case read {attempt}: a read must report exactly what the first read did, got {again}"
+        );
+    }
+}
+
+/// `UpgradeAccountPlan` stores the target plan type and the status that goes
+/// with it, and the following `GetAccountPlanState` reports what was stored —
+/// the response is computed from the store, not echoed from the request.
+#[tokio::test]
+async fn upgrade_account_plan_persists_the_target_plan() {
+    // Each row is one accepted target plan type, applied to a fresh account,
+    // and what the store must then report. The rows differ in the target type,
+    // including the one that asks for the plan the account is already on.
+    let cases: [(&str, &str, bool); 3] = [
+        // (requested plan type, expected stored type, expects an expiry)
+        (PLAN_TYPE_PAID, PLAN_TYPE_PAID, false),
+        (PLAN_TYPE_FREE, PLAN_TYPE_FREE, true),
+        (PLAN_TYPE_PAID, PLAN_TYPE_PAID, false),
+    ];
+
+    for (requested, expected_type, expects_expiry) in cases {
+        let router = router();
+        let before = ok(&router, "GetAccountPlanState", &json!({})).await;
+
+        let upgraded = ok(
+            &router,
+            "UpgradeAccountPlan",
+            &json!({"accountPlanType": requested}),
+        )
+        .await;
+        assert_eq!(
+            text(&upgraded, "accountId"),
+            text(&before, "accountId"),
+            "case upgrade to {requested}: the account is the caller's own, got {upgraded}"
+        );
+        assert_eq!(
+            text(&upgraded, "accountPlanType"),
+            expected_type,
+            "case upgrade to {requested}: expected the stored type {expected_type}, got {upgraded}"
+        );
+        assert_eq!(
+            text(&upgraded, "accountPlanStatus"),
+            PLAN_STATUS_ACTIVE,
+            "case upgrade to {requested}: the plan it moved to is active, got {upgraded}"
+        );
+
+        let after = ok(&router, "GetAccountPlanState", &json!({})).await;
+        assert_eq!(
+            text(&after, "accountPlanType"),
+            expected_type,
+            "case upgrade to {requested}: a later read must report the upgraded plan, got {after}"
+        );
+        assert_eq!(
+            text(&after, "accountPlanStatus"),
+            text(&upgraded, "accountPlanStatus"),
+            "case upgrade to {requested}: the read and the upgrade must agree on the status, \
+             got {after}"
+        );
+        assert_eq!(
+            after["accountPlanExpirationDate"].as_f64().is_some(),
+            expects_expiry,
+            "case upgrade to {requested}: only a free plan expires, got {after}"
+        );
+
+        // Asking for the same plan again is the same answer: the call stores a
+        // target, it does not advance anything.
+        let repeated = ok(
+            &router,
+            "UpgradeAccountPlan",
+            &json!({"accountPlanType": requested}),
+        )
+        .await;
+        assert_eq!(
+            repeated, upgraded,
+            "case upgrade to {requested} twice: expected the same stored plan, got {repeated}"
+        );
+    }
+}
+
+/// A plan type outside the modelled enum is a refused request, not a stored
+/// plan, and the refusal leaves the plan where it was.
+#[tokio::test]
+async fn upgrade_account_plan_refuses_a_plan_type_outside_the_enum() {
+    let router = router();
+    let before = ok(&router, "GetAccountPlanState", &json!({})).await;
+
+    // Rows differ in how they miss the enum: casing, an unknown word, an empty
+    // string, and padding.
+    for requested in ["free", "paid", "GOLD", "", "PAID "] {
+        refused(
+            &router,
+            "UpgradeAccountPlan",
+            &json!({"accountPlanType": requested}),
+            400,
+            "ValidationException",
+        )
+        .await;
+    }
+
+    let after = ok(&router, "GetAccountPlanState", &json!({})).await;
+    assert_eq!(
+        after, before,
+        "case after refusals: a refused upgrade must leave the plan untouched, got {after}"
+    );
+}
+
+/// The plan moves one way: an account on the paid plan cannot be put back onto
+/// the free plan, and the refusal leaves it on the paid plan.
+#[tokio::test]
+async fn upgrade_account_plan_refuses_a_move_back_to_the_free_plan() {
+    let router = router();
+    ok(
+        &router,
+        "UpgradeAccountPlan",
+        &json!({"accountPlanType": PLAN_TYPE_PAID}),
+    )
+    .await;
+
+    refused(
+        &router,
+        "UpgradeAccountPlan",
+        &json!({"accountPlanType": PLAN_TYPE_FREE}),
+        400,
+        "ValidationException",
+    )
+    .await;
+
+    let after = ok(&router, "GetAccountPlanState", &json!({})).await;
+    assert_eq!(
+        text(&after, "accountPlanType"),
+        PLAN_TYPE_PAID,
+        "case refused downgrade: the account stays on the paid plan, got {after}"
+    );
+}
+
+/// A free plan whose expiration instant has passed reports `EXPIRED` — the
+/// status follows the clock, not the call. A paid plan has no expiry and stays
+/// active.
+#[tokio::test]
+async fn a_free_plan_past_its_expiration_instant_reports_expired() {
+    // Rows differ in plan type and in where the stored expiration instant sits
+    // relative to now, including both sides of the boundary.
+    let cases: [(&str, i64, &str); 5] = [
+        // (stored plan type, expiration offset in seconds, expected status)
+        (PLAN_TYPE_FREE, -86_400, PLAN_STATUS_EXPIRED),
+        (PLAN_TYPE_FREE, -1, PLAN_STATUS_EXPIRED),
+        (PLAN_TYPE_FREE, 3_600, PLAN_STATUS_ACTIVE),
+        (PLAN_TYPE_FREE, 86_400, PLAN_STATUS_ACTIVE),
+        (PLAN_TYPE_PAID, -86_400, PLAN_STATUS_ACTIVE),
+    ];
+
+    for (plan_type, offset, expected_status) in cases {
+        let (router, engine) = harness();
+        {
+            let state = engine.state::<ComAmazonawsFreetierAwsfreetierserviceState>();
+            let mut store = state.lock();
+            let plan = store.plan_mut(engine::emulator_account_id());
+            plan.plan_type = plan_type.to_string();
+            plan.plan_status = PLAN_STATUS_ACTIVE.to_string();
+            plan.expiration_date = Some(aws_smithy_types::DateTime::from_secs(
+                aws_smithy_types::DateTime::from(std::time::SystemTime::now()).secs() + offset,
+            ));
+        }
+
+        let payload = ok(&router, "GetAccountPlanState", &json!({})).await;
+        assert_eq!(
+            text(&payload, "accountPlanStatus"),
+            expected_status,
+            "case {plan_type} expiring at now{offset:+}s: expected {expected_status}, got {payload}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ListAccountActivities / GetAccountActivity
+// ---------------------------------------------------------------------------
+
+/// Every activity the catalog holds, in catalog order, as (id, status) pairs.
+async fn catalog(router: &MultiServiceRouter) -> Vec<(String, String)> {
+    let payload = ok(router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+    payload["activities"]
+        .as_array()
+        .expect("activities is a list")
+        .iter()
+        .map(|activity| (text(activity, "activityId"), text(activity, "status")))
+        .collect()
+}
+
+/// Each summary carries the members the model marks required, and every
+/// activity id satisfies the modelled `ActivityId` constraints (exactly 32
+/// characters of `[a-zA-Z0-9]`).
+#[tokio::test]
+async fn listed_activities_satisfy_the_modelled_summary_shape() {
+    let router = router();
+    let payload = ok(&router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+    let activities = payload["activities"]
+        .as_array()
+        .expect("activities is a list");
+    assert!(
+        !activities.is_empty(),
+        "case full list: the account has an activity catalog, got {payload}"
+    );
+
+    for activity in activities {
+        let id = text(activity, "activityId");
+        assert!(
+            id.len() == 32 && id.chars().all(|c| c.is_ascii_alphanumeric()),
+            "case {id}: activityId must be 32 characters of [a-zA-Z0-9], got {id}"
+        );
+        assert!(
+            !text(activity, "title").is_empty(),
+            "case {id}: every summary carries a title, got {activity}"
+        );
+        let status = text(activity, "status");
+        assert!(
+            ACTIVITY_STATUS_VALUES.contains(&status.as_str()),
+            "case {id}: status must be a modelled ActivityStatus, got {status}"
+        );
+        let credit = &activity["reward"]["credit"];
+        assert!(
+            credit["amount"].as_f64().is_some_and(|amount| amount > 0.0),
+            "case {id}: the reward union carries a credit amount, got {activity}"
+        );
+        assert!(
+            CURRENCY_CODE_VALUES.contains(&text(credit, "unit").as_str()),
+            "case {id}: the credit unit must be a modelled CurrencyCode, got {activity}"
+        );
+    }
+}
+
+/// `filterActivityStatuses` selects exactly the activities whose status it
+/// lists, in catalog order; a request that lists no status expresses no filter.
+#[tokio::test]
+async fn activity_status_filter_selects_exactly_the_listed_statuses() {
+    let router = router();
+    let all = catalog(&router).await;
+
+    // Rows span the model's whole `ActivityStatus` value set: each status on
+    // its own, a pair, every status at once, the empty list, and a status no
+    // activity holds is covered by whichever single-status row selects nothing.
+    let mut cases: Vec<Vec<&str>> = ACTIVITY_STATUS_VALUES
+        .iter()
+        .map(|status| vec![*status])
+        .collect();
+    cases.push(vec![ACTIVITY_STATUS_COMPLETED, ACTIVITY_STATUS_IN_PROGRESS]);
+    cases.push(ACTIVITY_STATUS_VALUES.to_vec());
+    cases.push(Vec::new());
+
+    for wanted in cases {
+        let payload = ok(
+            &router,
+            "ListAccountActivities",
+            &json!({"maxResults": 1000, "filterActivityStatuses": wanted}),
+        )
+        .await;
+        let got: Vec<String> = payload["activities"]
+            .as_array()
+            .expect("activities is a list")
+            .iter()
+            .map(|activity| text(activity, "activityId"))
+            .collect();
+        let expected: Vec<String> = all
+            .iter()
+            .filter(|(_, status)| wanted.is_empty() || wanted.contains(&status.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "case filter {wanted:?}: expected {expected:?} in catalog order, got {got:?}"
+        );
+    }
+
+    // The filter is a filter: at least one status selects strictly fewer rows
+    // than the unfiltered list, so a passing table cannot mean "ignored".
+    let narrowed = ACTIVITY_STATUS_VALUES.iter().any(|status| {
+        all.iter().filter(|(_, held)| held == status).count() < all.len()
+    });
+    assert!(
+        narrowed,
+        "case filter narrowing: no single status selects fewer than all {} activities",
+        all.len()
+    );
+}
+
+/// Paging the catalog at any page size reports the catalog exactly once, in
+/// order, and the token resumes where the previous page stopped. Exercised over
+/// every page size from one to past the catalog's length, which is the whole
+/// space of page sizes the rule has to hold for here.
+#[tokio::test]
+async fn activity_pages_reassemble_the_catalog_at_every_page_size() {
+    let router = router();
+    let all: Vec<String> = catalog(&router).await.into_iter().map(|(id, _)| id).collect();
+
+    for page_size in 1..=all.len() + 2 {
+        let walked: Vec<String> = walk(
+            &router,
+            "ListAccountActivities",
+            "activities",
+            page_size,
+            &json!({}),
+        )
+        .await
+        .iter()
+        .map(|activity| text(activity, "activityId"))
+        .collect();
+        assert_eq!(
+            walked, all,
+            "case page size {page_size}: paging must reassemble the catalog in order, got \
+             {walked:?}"
+        );
+    }
+
+    // Paging a FILTERED list follows the same rule: the pages reassemble the
+    // filtered view, not the catalog.
+    for status in ACTIVITY_STATUS_VALUES {
+        let expected: Vec<String> = catalog(&router)
+            .await
+            .into_iter()
+            .filter(|(_, held)| held == status)
+            .map(|(id, _)| id)
+            .collect();
+        for page_size in 1..=expected.len() + 1 {
+            let walked: Vec<String> = walk(
+                &router,
+                "ListAccountActivities",
+                "activities",
+                page_size,
+                &json!({"filterActivityStatuses": [status]}),
+            )
+            .await
+            .iter()
+            .map(|activity| text(activity, "activityId"))
+            .collect();
+            assert_eq!(
+                walked, expected,
+                "case filter {status} at page size {page_size}: expected {expected:?}, got \
+                 {walked:?}"
+            );
+        }
+    }
+}
+
+/// A `nextToken` this service did not issue for this list is refused, not
+/// silently read as page one.
+#[tokio::test]
+async fn an_unissued_activity_token_is_refused() {
+    let router = router();
+
+    // A token issued by the OTHER paginated operation, to pin that a token is
+    // bound to its list.
+    let usage_page = ok(&router, "GetFreeTierUsage", &json!({"maxResults": 1})).await;
+    let foreign = text(&usage_page, "nextToken");
+
+    // Rows differ in how the token is wrong: not hex, hex of unrelated bytes,
+    // the right encoding with a non-numeric offset, and another list's token.
+    for token in [
+        "not-a-token".to_string(),
+        ::hex::encode("garbage"),
+        ::hex::encode("ftv1:activities:not-a-number"),
+        ::hex::encode("ftv1:freeTierUsages:1"),
+        foreign,
+    ] {
+        refused(
+            &router,
+            "ListAccountActivities",
+            &json!({"nextToken": token}),
+            400,
+            "ValidationException",
+        )
+        .await;
+    }
+}
+
+/// `GetAccountActivity` reads the SAME catalog the list pages over: for every
+/// activity, the detail view repeats its summary members and adds the detail
+/// ones, and the timestamps it reports are the ones the status allows
+/// (`startedAt` only for IN_PROGRESS or COMPLETED, `completedAt` only for
+/// COMPLETED).
+#[tokio::test]
+async fn activity_detail_agrees_with_its_summary() {
+    let router = router();
+    let listed = ok(&router, "ListAccountActivities", &json!({"maxResults": 1000})).await;
+
+    for summary in listed["activities"].as_array().expect("activities is a list") {
+        let id = text(summary, "activityId");
+        let detail = ok(&router, "GetAccountActivity", &json!({"activityId": id})).await;
+
+        for member in ["activityId", "title", "status"] {
+            assert_eq!(
+                detail[member], summary[member],
+                "case {id}: the detail view must repeat the summary's {member}, got {detail}"
+            );
+        }
+        assert_eq!(
+            detail["reward"], summary["reward"],
+            "case {id}: the detail view must repeat the summary's reward, got {detail}"
+        );
+        assert!(
+            !text(&detail, "description").is_empty(),
+            "case {id}: the detail view carries a description, got {detail}"
+        );
+        assert!(
+            text(&detail, "instructionsUrl").starts_with("https://"),
+            "case {id}: the detail view carries an instructions URL, got {detail}"
+        );
+
+        let status = text(&detail, "status");
+        let may_have_started =
+            status == ACTIVITY_STATUS_IN_PROGRESS || status == ACTIVITY_STATUS_COMPLETED;
+        assert!(
+            may_have_started || detail["startedAt"].is_null(),
+            "case {id} in {status}: startedAt appears only for IN_PROGRESS or COMPLETED, got \
+             {detail}"
+        );
+        assert!(
+            status == ACTIVITY_STATUS_COMPLETED || detail["completedAt"].is_null(),
+            "case {id} in {status}: completedAt appears only for COMPLETED, got {detail}"
+        );
+        if status == ACTIVITY_STATUS_COMPLETED {
+            assert!(
+                detail["completedAt"].as_f64().is_some() && detail["startedAt"].as_f64().is_some(),
+                "case {id}: a completed activity reports when it started and finished, got \
+                 {detail}"
+            );
+        }
+    }
+}
+
+/// An id that could name an activity but names none is a 404; an id that cannot
+/// be an `ActivityId` at all is a 400. The two failures are different claims.
+#[tokio::test]
+async fn unknown_and_malformed_activity_ids_are_told_apart() {
+    let router = router();
+    let known: BTreeSet<String> = catalog(&router).await.into_iter().map(|(id, _)| id).collect();
+
+    // Well-formed ids (exactly 32 of [a-zA-Z0-9]) that name no activity.
+    for id in [
+        "00000000000000000000000000000000",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "ffffffffffffffffffffffffffffffff",
+    ] {
+        assert!(
+            !known.contains(id),
+            "case {id}: the probe id must not be in the catalog"
+        );
+        refused(
+            &router,
+            "GetAccountActivity",
+            &json!({"activityId": id}),
+            404,
+            "ResourceNotFoundException",
+        )
+        .await;
+    }
+
+    // Rows differ in how the id misses the modelled constraint: too short, one
+    // short, one long, and an illegal character at length 32.
+    for id in [
+        "short",
+        "",
+        "0000000000000000000000000000000",
+        "000000000000000000000000000000000",
+        "0000000000000000000000000000000-",
+        "0000000000000000000000000000 000",
+    ] {
+        refused(
+            &router,
+            "GetAccountActivity",
+            &json!({"activityId": id}),
+            400,
+            "ValidationException",
+        )
+        .await;
+    }
+}
+
+/// A `languageCode` outside the modelled enum is refused on both activity
+/// readers; one the model declares is accepted.
+#[tokio::test]
+async fn activity_readers_check_the_language_code() {
+    let router = router();
+    let id = catalog(&router).await[0].0.clone();
+
+    for language_code in ["en-US", "ja-JP", "zh-TW"] {
+        ok(
+            &router,
+            "GetAccountActivity",
+            &json!({"activityId": id, "languageCode": language_code}),
+        )
+        .await;
+        ok(
+            &router,
+            "ListAccountActivities",
+            &json!({"languageCode": language_code}),
+        )
+        .await;
+    }
+
+    for language_code in ["en_US", "klingon", ""] {
+        refused(
+            &router,
+            "GetAccountActivity",
+            &json!({"activityId": id, "languageCode": language_code}),
+            400,
+            "ValidationException",
+        )
+        .await;
+        refused(
+            &router,
+            "ListAccountActivities",
+            &json!({"languageCode": language_code}),
+            400,
+            "ValidationException",
+        )
+        .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GetFreeTierUsage
+// ---------------------------------------------------------------------------
+
+/// A usage record's identity, for comparing sets of records.
+fn usage_key(record: &Value) -> String {
+    format!(
+        "{}|{}|{}",
+        text(record, "service"),
+        text(record, "usageType"),
+        text(record, "region")
+    )
+}
+
+/// Every usage record the account holds, in report order.
+async fn usages(router: &MultiServiceRouter) -> Vec<Value> {
+    ok(router, "GetFreeTierUsage", &json!({"maxResults": 1000}))
+        .await["freeTierUsages"]
+        .as_array()
+        .expect("freeTierUsages is a list")
+        .clone()
+}
+
+/// The value one `Dimension` takes on a reported record: text for every
+/// dimension but `USAGE_PERCENTAGE`, which is the share of the offer's limit
+/// the account has used.
+fn dimension_of(record: &Value, key: &str) -> Result<String, f64> {
+    match key {
+        "SERVICE" => Ok(text(record, "service")),
+        "OPERATION" => Ok(text(record, "operation")),
+        "USAGE_TYPE" => Ok(text(record, "usageType")),
+        "REGION" => Ok(text(record, "region")),
+        "FREE_TIER_TYPE" => Ok(text(record, "freeTierType")),
+        "DESCRIPTION" => Ok(text(record, "description")),
+        "USAGE_PERCENTAGE" => {
+            let actual = record["actualUsageAmount"].as_f64().unwrap_or_default();
+            let limit = record["limit"].as_f64().unwrap_or_default();
+            Err(if limit == 0.0 {
+                0.0
+            } else {
+                actual / limit * 100.0
+            })
+        }
+        other => panic!("{other} is not a modelled Dimension"),
+    }
+}
+
+/// The records a `Dimensions` filter must select, computed from the reported
+/// records by the rule the model documents: a record matches when its value for
+/// the dimension matches at least one of `Values` under the single match option.
+fn expected_for_dimension(
+    records: &[Value],
+    key: &str,
+    option: &str,
+    values: &[&str],
+) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter(|record| match dimension_of(record, key) {
+            Ok(value) => values.iter().any(|wanted| match option {
+                "EQUALS" => value == *wanted,
+                "STARTS_WITH" => value.starts_with(wanted),
+                "ENDS_WITH" => value.ends_with(wanted),
+                "CONTAINS" => value.contains(wanted),
+                other => panic!("{other} does not apply to a text dimension"),
+            }),
+            Err(number) => values.iter().any(|wanted| {
+                let wanted: f64 = wanted.parse().expect("a numeric probe value");
+                match option {
+                    "EQUALS" => (number - wanted).abs() < f64::EPSILON,
+                    "GREATER_THAN_OR_EQUAL" => number >= wanted,
+                    other => panic!("{other} does not apply to a numeric dimension"),
+                }
+            }),
+        })
+        .map(usage_key)
+        .collect()
+}
+
+/// Ask `GetFreeTierUsage` for every record a filter selects.
+async fn filtered(router: &MultiServiceRouter, filter: &Value) -> BTreeSet<String> {
+    let payload = ok(
+        router,
+        "GetFreeTierUsage",
+        &json!({"maxResults": 1000, "filter": filter}),
+    )
+    .await;
+    payload["freeTierUsages"]
+        .as_array()
+        .expect("freeTierUsages is a list")
+        .iter()
+        .map(usage_key)
+        .collect()
+}
+
+/// A `Dimensions` filter selects exactly the records whose value for that
+/// dimension matches one of `Values` under the given match option — for every
+/// dimension the model declares and every match option that applies to it.
+#[tokio::test]
+async fn a_dimensions_filter_selects_exactly_the_matching_records() {
+    let router = router();
+    let records = usages(&router).await;
+    assert!(
+        records.len() > 1,
+        "the account must hold several usage records for a filter to narrow, got {}",
+        records.len()
+    );
+
+    // Rows span every `Dimension` the model declares and every `MatchOption`
+    // that applies to it, with probe values of differing form (whole value,
+    // prefix, suffix, substring, several values at once, a value nothing holds).
+    let cases: [(&str, &str, &[&str], bool); 17] = [
+        // (dimension, match option, values, must select at least one record)
+        ("SERVICE", "EQUALS", &["AWSLambda"], true),
+        ("SERVICE", "EQUALS", &["AmazonEC2", "AmazonS3"], true),
+        ("SERVICE", "CONTAINS", &["Lambda"], true),
+        ("SERVICE", "STARTS_WITH", &["Amazon"], true),
+        ("SERVICE", "ENDS_WITH", &["EC2"], true),
+        ("SERVICE", "EQUALS", &["NoSuchService"], false),
+        ("OPERATION", "EQUALS", &["Invoke"], true),
+        ("OPERATION", "CONTAINS", &["Instance"], true),
+        ("USAGE_TYPE", "STARTS_WITH", &["TimedStorage"], true),
+        ("USAGE_TYPE", "ENDS_WITH", &["micro"], true),
+        ("USAGE_TYPE", "CONTAINS", &["Usage"], true),
+        ("REGION", "EQUALS", &["us-west-2"], true),
+        ("REGION", "STARTS_WITH", &["us-"], true),
+        ("FREE_TIER_TYPE", "EQUALS", &["Always Free"], true),
+        ("DESCRIPTION", "CONTAINS", &["free per month"], true),
+        ("USAGE_PERCENTAGE", "GREATER_THAN_OR_EQUAL", &["0"], true),
+        ("USAGE_PERCENTAGE", "GREATER_THAN_OR_EQUAL", &["75"], true),
+    ];
+
+    for (key, option, values, must_select) in cases {
+        assert!(
+            DIMENSION_VALUES.contains(&key) && MATCH_OPTION_VALUES.contains(&option),
+            "case {key} {option}: both must be values the model declares"
+        );
+        let expected = expected_for_dimension(&records, key, option, values);
+        assert_eq!(
+            expected.is_empty(),
+            !must_select,
+            "case {key} {option} {values:?}: the probe's own expectation is {} records",
+            expected.len()
+        );
+        let got = filtered(
+            &router,
+            &json!({"Dimensions": {"Key": key, "Values": values, "MatchOptions": [option]}}),
+        )
+        .await;
+        assert_eq!(
+            got, expected,
+            "case {key} {option} {values:?}: expected {expected:?}, got {got:?}"
+        );
+        assert!(
+            got.len() <= records.len(),
+            "case {key} {option} {values:?}: a filter cannot invent records, got {got:?}"
+        );
+    }
+}
+
+/// `And`, `Or` and `Not` combine their expressions the way the model documents
+/// them: all of them, any of them, and the negation.
+#[tokio::test]
+async fn and_or_and_not_combine_their_expressions() {
+    let router = router();
+    let records = usages(&router).await;
+    let all: BTreeSet<String> = records.iter().map(usage_key).collect();
+
+    let lambda = json!({"Dimensions": {"Key": "SERVICE", "Values": ["AWSLambda"], "MatchOptions": ["EQUALS"]}});
+    let east = json!({"Dimensions": {"Key": "REGION", "Values": ["us-east-1"], "MatchOptions": ["EQUALS"]}});
+    let always_free = json!({"Dimensions": {"Key": "FREE_TIER_TYPE", "Values": ["Always Free"], "MatchOptions": ["EQUALS"]}});
+
+    let lambda_rows = expected_for_dimension(&records, "SERVICE", "EQUALS", &["AWSLambda"]);
+    let east_rows = expected_for_dimension(&records, "REGION", "EQUALS", &["us-east-1"]);
+    let always_free_rows =
+        expected_for_dimension(&records, "FREE_TIER_TYPE", "EQUALS", &["Always Free"]);
+
+    let intersection: BTreeSet<String> = lambda_rows.intersection(&east_rows).cloned().collect();
+    let union: BTreeSet<String> = east_rows.union(&always_free_rows).cloned().collect();
+    let complement: BTreeSet<String> = all.difference(&lambda_rows).cloned().collect();
+
+    // Rows differ in the combinator and in how deeply it nests.
+    let cases: [(&str, Value, BTreeSet<String>); 5] = [
+        ("And", json!({"And": [lambda.clone(), east.clone()]}), intersection.clone()),
+        ("Or", json!({"Or": [east.clone(), always_free.clone()]}), union),
+        ("Not", json!({"Not": lambda.clone()}), complement.clone()),
+        (
+            "Not of And",
+            json!({"Not": {"And": [lambda.clone(), east.clone()]}}),
+            all.difference(&intersection).cloned().collect(),
+        ),
+        (
+            "And of Or and Not",
+            json!({"And": [{"Or": [lambda.clone(), east.clone()]}, {"Not": lambda.clone()}]}),
+            east_rows.difference(&lambda_rows).cloned().collect(),
+        ),
+    ];
+
+    for (name, filter, expected) in cases {
+        assert!(
+            !expected.is_empty(),
+            "case {name}: the probe's own expectation must select something"
+        );
+        let got = filtered(&router, &filter).await;
+        assert_eq!(
+            got, expected,
+            "case {name}: expected {expected:?}, got {got:?}"
+        );
+    }
+}
+
+/// A filter the service cannot evaluate is refused, never ignored: a match
+/// option that does not apply to the dimension's kind, more than one match
+/// option, no values, and an expression that states no condition.
+#[tokio::test]
+async fn an_unevaluable_filter_is_refused() {
+    let router = router();
+
+    // Rows differ in which part of the expression is wrong.
+    let cases: [(&str, Value); 8] = [
+        (
+            "GREATER_THAN_OR_EQUAL on a text dimension",
+            json!({"Dimensions": {"Key": "SERVICE", "Values": ["AWSLambda"], "MatchOptions": ["GREATER_THAN_OR_EQUAL"]}}),
+        ),
+        (
+            "CONTAINS on a numeric dimension",
+            json!({"Dimensions": {"Key": "USAGE_PERCENTAGE", "Values": ["50"], "MatchOptions": ["CONTAINS"]}}),
+        ),
+        (
+            "a non-numeric value on a numeric dimension",
+            json!({"Dimensions": {"Key": "USAGE_PERCENTAGE", "Values": ["half"], "MatchOptions": ["EQUALS"]}}),
+        ),
+        (
+            "two match options",
+            json!({"Dimensions": {"Key": "SERVICE", "Values": ["AWSLambda"], "MatchOptions": ["EQUALS", "CONTAINS"]}}),
+        ),
+        (
+            "no match option",
+            json!({"Dimensions": {"Key": "SERVICE", "Values": ["AWSLambda"], "MatchOptions": []}}),
+        ),
+        (
+            "a dimension outside the enum",
+            json!({"Dimensions": {"Key": "SERVICE_NAME", "Values": ["AWSLambda"], "MatchOptions": ["EQUALS"]}}),
+        ),
+        ("an expression that states no condition", json!({})),
+        (
+            "a nested expression that states no condition",
+            json!({"And": [{"Dimensions": {"Key": "SERVICE", "Values": ["AWSLambda"], "MatchOptions": ["EQUALS"]}}, {}]}),
+        ),
+    ];
+
+    for (name, filter) in cases {
+        let (status, payload) = call(
+            &router,
+            "GetFreeTierUsage",
+            &json!({"maxResults": 1000, "filter": filter}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {name}: expected HTTP 400, got {status} with {payload}"
+        );
+        assert_eq!(
+            error_code(&payload),
+            "ValidationException",
+            "case {name}: expected a ValidationException, got {payload}"
+        );
+    }
+}
+
+/// Paging the usage records at any page size reports them exactly once, in
+/// order — with and without a filter.
+#[tokio::test]
+async fn usage_pages_reassemble_the_records_at_every_page_size() {
+    let router = router();
+    let all: Vec<String> = usages(&router).await.iter().map(usage_key).collect();
+
+    for page_size in 1..=all.len() + 2 {
+        let walked: Vec<String> = walk(
+            &router,
+            "GetFreeTierUsage",
+            "freeTierUsages",
+            page_size,
+            &json!({}),
+        )
+        .await
+        .iter()
+        .map(usage_key)
+        .collect();
+        assert_eq!(
+            walked, all,
+            "case page size {page_size}: paging must reassemble the records in order, got \
+             {walked:?}"
+        );
+    }
+
+    // The same rule under a filter that selects a strict subset.
+    let filter = json!({"Dimensions": {"Key": "FREE_TIER_TYPE", "Values": ["Always Free"], "MatchOptions": ["EQUALS"]}});
+    let expected: Vec<String> = usages(&router)
+        .await
+        .iter()
+        .filter(|record| text(record, "freeTierType") == "Always Free")
+        .map(usage_key)
+        .collect();
+    assert!(
+        !expected.is_empty() && expected.len() < all.len(),
+        "case filtered paging: the probe filter must select a strict subset, got {expected:?}"
+    );
+    for page_size in 1..=expected.len() + 1 {
+        let walked: Vec<String> = walk(
+            &router,
+            "GetFreeTierUsage",
+            "freeTierUsages",
+            page_size,
+            &json!({"filter": filter}),
+        )
+        .await
+        .iter()
+        .map(usage_key)
+        .collect();
+        assert_eq!(
+            walked, expected,
+            "case filtered paging at size {page_size}: expected {expected:?}, got {walked:?}"
+        );
+    }
+}
+
+/// An absent `maxResults` is the page size the model declares as its default
+/// (10), not "every record".
+#[tokio::test]
+async fn an_absent_max_results_uses_the_modelled_default() {
+    let router = router();
+    let all = usages(&router).await;
+    let default_page = ok(&router, "GetFreeTierUsage", &json!({})).await;
+    let returned = default_page["freeTierUsages"]
+        .as_array()
+        .expect("freeTierUsages is a list")
+        .len();
+    assert_eq!(
+        returned,
+        all.len().min(10),
+        "case no maxResults: the page holds the modelled default of 10 (or every record when \
+         fewer are stored), got {returned}"
+    );
+
+    let activities = ok(&router, "ListAccountActivities", &json!({})).await["activities"]
+        .as_array()
+        .expect("activities is a list")
+        .len();
+    let catalog_len = catalog(&router).await.len();
+    assert_eq!(
+        activities,
+        catalog_len.min(10),
+        "case no maxResults: the activity page holds the modelled default of 10 (or the whole \
+         catalog when it is shorter), got {activities}"
+    );
+}
+
+/// A `nextToken` `GetFreeTierUsage` did not issue is refused, including one the
+/// other paginated operation issued.
+#[tokio::test]
+async fn an_unissued_usage_token_is_refused() {
+    let router = router();
+    let activity_page = ok(&router, "ListAccountActivities", &json!({"maxResults": 1})).await;
+    let foreign = text(&activity_page, "nextToken");
+
+    for token in [
+        "not-a-token".to_string(),
+        ::hex::encode("ftv1:freeTierUsages:"),
+        ::hex::encode("ftv1:activities:1"),
+        foreign,
+    ] {
+        refused(
+            &router,
+            "GetFreeTierUsage",
+            &json!({"nextToken": token}),
+            400,
+            "ValidationException",
+        )
+        .await;
+    }
+}

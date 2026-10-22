@@ -28,6 +28,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` for the integration test's wait on a status transition the clock owes.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCampaigns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCampaigns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCampaigns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the stored campaigns as `CampaignSummary` entries in creation order,
+//! honouring `filters.instanceIdFilter`, capping each page at `maxResults`, and emitting
+//! and consuming `nextToken` so a caller walks every campaign exactly once.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +76,10 @@ use super::types::*;
 // `ListCampaignsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connectcampaigns-amazonconnectcampaignservice.json");
 
+/// The largest page `maxResults` may ask for, from the model's `MaxResults` range
+/// (1..50) — and the page size used when a request names none.
+const MAX_PAGE_SIZE: i32 = 50;
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `ListCampaignsError` alias below. An operation that models no errors
@@ -146,18 +144,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCampaigns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCampaignsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCampaigns"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCampaignsError::from(ListCampaignsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            ))
+        })?;
+
+        // `instanceIdFilter` keeps the campaigns of one Amazon Connect instance. Its
+        // operator is an enum whose only value is `Eq`; anything else is a request this
+        // service cannot answer rather than an empty page.
+        let instance_filter = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.instance_id_filter.as_ref());
+        if let Some(filter) = instance_filter {
+            if !INSTANCE_ID_FILTER_OPERATOR_VALUES.contains(&filter.operator.as_str()) {
+                return Err(ListCampaignsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "filters.instanceIdFilter.operator must be one of [{}], got {}",
+                            INSTANCE_ID_FILTER_OPERATOR_VALUES.join(", "),
+                            filter.operator
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+        }
+        let wanted_instance = instance_filter.map(|filter| filter.value.as_str());
+
+        let guard = state.lock();
+        // Each matching campaign with the creation counter that orders it, so a page
+        // boundary can be named by POSITION rather than by the campaign that happens to
+        // sit at it.
+        let matching: Vec<(u64, CampaignSummary)> = guard
+            .campaigns_in_creation_order()
+            .into_iter()
+            .filter(|campaign| {
+                wanted_instance.is_none_or(|instance_id| campaign.connect_instance_id == instance_id)
+            })
+            .map(|campaign| {
+                (
+                    campaign.sequence,
+                    CampaignSummary {
+                        id: campaign.id.clone(),
+                        arn: campaign.arn.clone(),
+                        name: campaign.name.clone(),
+                        connect_instance_id: campaign.connect_instance_id.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        // A page token names the POSITION in the creation order the next page starts at,
+        // so a campaign created or deleted between two calls — including the very
+        // campaign the next page was going to start at — leaves the token resumable: the
+        // walk continues at the first campaign created no earlier than that position. A
+        // token this service never issued cannot be resumed from at all.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume_from = crate::state::page_token_sequence(token).ok_or_else(|| {
+                    ListCampaignsError::from(ListCampaignsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!("nextToken {token} is not a valid page token"),
+                            x_amz_error_type: None,
+                        },
+                    ))
+                })?;
+                matching
+                    .iter()
+                    .position(|(sequence, _)| *sequence >= resume_from)
+                    .unwrap_or(matching.len())
+            }
+            None => 0,
+        };
+
+        // The model declares no default page size, so a request that names none is
+        // answered with the largest page the model allows (`maxResults` range 1..50).
+        // The boundary validator already refuses a value outside that range; checking it
+        // here too means a future model change cannot turn into an empty page served
+        // beside a `nextToken`.
+        let requested = input.max_results.unwrap_or(MAX_PAGE_SIZE);
+        if !(1..=MAX_PAGE_SIZE).contains(&requested) {
+            return Err(ListCampaignsErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "maxResults must be between 1 and {MAX_PAGE_SIZE}, got {requested}"
+                ),
+                x_amz_error_type: None,
+            })
+            .into());
+        }
+        // In 1..=50 by the check above, so the conversion cannot fail — and a future
+        // change to the bound must fail loudly rather than quietly serve a short page.
+        let page_size = usize::try_from(requested).expect("maxResults is 1..=50 here");
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page: Vec<CampaignSummary> = matching[start..end]
+            .iter()
+            .map(|(_, summary)| summary.clone())
+            .collect();
+        // Another page follows only when a campaign is left to start it at, and the token
+        // names that campaign's position in the creation order.
+        let next_token = matching
+            .get(end)
+            .map(|(sequence, _)| crate::state::page_token(*sequence));
+
+        Ok(ListCampaignsOutput {
+            next_token,
+            campaign_summary_list: Some(page),
+        })
     }
 }

@@ -25,10 +25,99 @@ pub struct ListGraphsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.detective#Graph")]
+// `Graph` is written out by hand rather than produced by
+// `#[smithy_macros::smithy(shape = ...)]`, and the reason is a single trait the macro
+// does not read: `@timestampFormat`.
+//
+// `Graph$CreatedTime` targets `Timestamp`, which carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape",shape="Graph")` reports `"timestampFormat": "date-time"`
+// on it), and the member's own documentation says so too: "The value is an ISO8601
+// formatted string. For example, 2021-08-18T16:35:56.284Z." The vendored codegen never
+// emits `with_timestamp_format`, so a macro-built member schema reports no format and
+// the restJson1 JSON codec falls back to its protocol default, epoch seconds — a NUMBER
+// where the model (and every AWS SDK's generated deserializer for a `date-time` member)
+// requires an ISO-8601 string. The hand-written member schemas below differ from the
+// macro's output in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the member list), a `SCHEMA` naming them in
+// order, the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint
+// traits are deliberately absent: the validating walk runs on operation INPUTS only, and
+// `Graph` is an output shape, so the macro's captured constraints would be inert here too.
 #[derive(Debug, Clone, Default)]
 pub struct Graph {
     pub arn: Option<String>,
     pub created_time: Option<::aws_smithy_types::DateTime>,
+}
+
+#[allow(non_upper_case_globals)]
+impl Graph {
+    const SHAPE_ID: &'static str = "com.amazonaws.detective#Graph";
+    const NAMESPACE: &'static str = "com.amazonaws.detective";
+
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.detective#Graph$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        0,
+    );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATED_TIME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.detective#Graph$CreatedTime",
+                Self::NAMESPACE,
+                "CreatedTime",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreatedTime",
+            1,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "Graph"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_ARN, &Self::M_CREATED_TIME],
+    );
+}
+
+pub static GRAPH_SCHEMA: &::aws_smithy_schema::Schema = &Graph::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Graph {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.created_time.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIME, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for Graph {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(1) => out.created_time = Some(d.read_timestamp(&Self::M_CREATED_TIME)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

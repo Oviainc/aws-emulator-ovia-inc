@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored Profile and reports the removed record with
+//! `Status` `DELETING`; refuses with `ConflictException` while it still has
+//! associations.
 //!
 //! ## Shape of an operation
 //!
@@ -87,11 +81,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53profiles-route53
 // here — hence the `DeleteProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53profiles#DeleteProfile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53profiles#DeleteProfile",
+    extra_errors = ["InternalServiceErrorException"]
+)]
 #[derive(Debug)]
 pub enum DeleteProfileErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServiceErrorException(InternalServiceErrorException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -148,18 +146,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProfile"))
+        // Nothing here is derived from the request's region: the Profile's ARN was
+        // built once at create time and is read back off the stored record.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteProfileErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some(crate::state::NO_STORE.to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        if !store.profiles.contains_key(&input.profile_id) {
+            return Err(DeleteProfileErrorModeled::ResourceNotFoundException(
+                crate::state::profile_not_found(&input.profile_id),
+            )
+            .into());
+        }
+
+        // A Profile still associated with a resource cannot be deleted: the
+        // associations have to be removed first.
+        if store.profile_has_associations(&input.profile_id) {
+            return Err(DeleteProfileErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Profile {} still has resource associations and cannot be deleted.",
+                        input.profile_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Remove it, then report the record as it stood at removal: the Profile is
+        // gone from the store, so `Status` is `DELETING` and `ModificationTime` is the
+        // instant it was removed.
+        let mut removed = store
+            .profiles
+            .remove(&input.profile_id)
+            .expect("the Profile just found in the store");
+        store.tags.remove(&removed.arn);
+        // An idempotency token never outlives the Profile it minted, so the id is not
+        // resurrected by a replay of the create that minted it.
+        store.forget_client_tokens_for(&input.profile_id);
+        removed.status = crate::state::STATUS_DELETING.to_string();
+        removed.modification_time = ::std::time::SystemTime::now();
+        Ok(DeleteProfileOutput {
+            profile: Some(crate::state::profile_shape(&removed)),
+        })
     }
 }

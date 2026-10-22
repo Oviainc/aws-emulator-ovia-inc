@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePricingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePricingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints and PERSISTS a pricing plan: the `Arn` it answers with is stored, so
+//! `CreateBillingGroup` can decide whether a `ComputationPreference.PricingPlanArn`
+//! names a plan that exists.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePricingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SIMPLIFICATION: a `ClientToken` replay answers with the ARN the token's first
+//! call minted WITHOUT comparing the rest of the request, so a token reused with a
+//! different body is served the earlier plan rather than refused. The model
+//! declares no idempotent-parameter-mismatch error for this operation, and the
+//! documented contract it does state — a retry "completes successfully without
+//! performing any further actions" — is honoured either way.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +168,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePricingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePricingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePricingPlan"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePricingPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // "if the original request completes successfully, any subsequent retries
+        // complete successfully without performing any further actions" — the same
+        // ClientToken answers with the ARN the first call minted.
+        if let Some(arn) = state.replayed_idempotent_arn(Self::NAME, input.client_token.as_deref())
+        {
+            return Ok(CreatePricingPlanOutput { arn: Some(arn) });
+        }
+
+        // "The names must be unique to each pricing plan."
+        if let Some(existing) = state.pricing_plan_names.get(&input.name).cloned() {
+            return Err(CreatePricingPlanErrorModeled::ConflictException(ConflictException {
+                message: "a pricing plan with this name already exists".to_string(),
+                resource_id: existing,
+                resource_type: "pricingplan".to_string(),
+                reason: Some("RESOURCE_NAME_CONFLICT".to_string()),
+            })
+            .into());
+        }
+
+        // Nothing in this slice deletes a pricing plan, so the store is bounded by
+        // an explicit maximum and a create past it is refused rather than served by
+        // evicting a plan a later caller must still be able to read.
+        if state.pricing_plans.len() >= crate::state::MAX_PRICING_PLANS {
+            return Err(CreatePricingPlanErrorModeled::ServiceLimitExceededException(
+                ServiceLimitExceededException {
+                    message: format!(
+                        "the maximum number of pricing plans ({}) already exists",
+                        crate::state::MAX_PRICING_PLANS
+                    ),
+                    resource_id: None,
+                    resource_type: Some("pricingplan".to_string()),
+                    limit_code: "PricingPlansPerAccount".to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Exactly 10 characters: the customer-minted form of the `PricingPlanArn`
+        // pattern is `[a-zA-Z0-9]{10}`.
+        let id = state.mint_resource_id(10);
+        let arn = crate::state::pricing_plan_arn(&id);
+        let now = crate::state::now_millis();
+        let record = crate::state::PricingPlanRecord {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            pricing_rule_arns: input.pricing_rule_arns.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            creation_time_millis: now,
+            last_modified_time_millis: now,
+        };
+        state.pricing_plans.insert(arn.clone(), record);
+        state.pricing_plan_names.insert(input.name, arn.clone());
+        state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
+
+        Ok(CreatePricingPlanOutput { arn: Some(arn) })
     }
 }

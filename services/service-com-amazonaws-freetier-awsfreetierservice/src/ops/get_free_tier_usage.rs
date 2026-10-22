@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFreeTierUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFreeTierUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFreeTierUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the account's stored Free Tier usage records
+//! ([`crate::state::UsageRecord`]), narrowed by the `filter` `Expression`.
+//!
+//! The scaffold's guidance follows.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,262 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFreeTierUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFreeTierUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFreeTierUsage"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFreeTierUsageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Free Tier emulator is mounted on an engine that holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The token names the position the next page begins at, so a page
+        // resumes exactly where its predecessor stopped.
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(validation(
+                        "nextToken: the pagination token is not one GetFreeTierUsage issued",
+                    ))
+                }
+            },
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let store = state.lock();
+        let records = store.usages_for(crate::state::caller_account_id());
+
+        // Position in the stored order kept beside each selected row, so the
+        // token is an offset into the records and not into the filtered view.
+        let mut selected: Vec<(usize, &crate::state::UsageRecord)> = Vec::new();
+        for (position, record) in records.iter().enumerate().skip(offset) {
+            let keep = match input.filter.as_ref() {
+                None => true,
+                Some(filter) => matches_expression(record, filter, 0)?,
+            };
+            if keep {
+                selected.push((position, record));
+            }
+        }
+
+        let page = &selected[..page_size.min(selected.len())];
+        // Issued only when a record the filter selects is still unreported.
+        let next_token = match page.last() {
+            Some((position, _)) if selected.len() > page.len() => {
+                Some(crate::state::encode_page_token(PAGE_KIND, position + 1))
+            }
+            _ => None,
+        };
+
+        Ok(GetFreeTierUsageOutput {
+            free_tier_usages: page.iter().map(|(_, record)| render(record)).collect(),
+            next_token,
+        })
     }
+}
+
+/// The list a `nextToken` from this operation belongs to, so a token issued by
+/// `ListAccountActivities` is not accepted here.
+const PAGE_KIND: &str = "freeTierUsages";
+
+/// How deeply a `filter` may nest `And`/`Or`/`Not` before the emulator refuses
+/// it. A guard against an expression deep enough to exhaust the stack; AWS
+/// publishes no limit, so this is a chosen bound well above any filter a client
+/// writes.
+const MAX_FILTER_DEPTH: usize = 16;
+
+/// The `Dimension` whose value is a number rather than text, so it compares by
+/// magnitude (`shared_types::DIMENSION_VALUES` lists every dimension).
+const DIMENSION_USAGE_PERCENTAGE: &str = "USAGE_PERCENTAGE";
+
+/// `MatchOption` values, from the model's enum of the same name
+/// (`shared_types::MATCH_OPTION_VALUES`).
+const MATCH_EQUALS: &str = "EQUALS";
+const MATCH_STARTS_WITH: &str = "STARTS_WITH";
+const MATCH_ENDS_WITH: &str = "ENDS_WITH";
+const MATCH_CONTAINS: &str = "CONTAINS";
+const MATCH_GREATER_THAN_OR_EQUAL: &str = "GREATER_THAN_OR_EQUAL";
+
+/// The stored record as the modelled `FreeTierUsage`.
+fn render(record: &crate::state::UsageRecord) -> FreeTierUsage {
+    FreeTierUsage {
+        service: Some(record.service.clone()),
+        operation: Some(record.operation.clone()),
+        usage_type: Some(record.usage_type.clone()),
+        region: Some(record.region.clone()),
+        actual_usage_amount: record.actual_usage_amount,
+        forecasted_usage_amount: record.forecasted_usage_amount,
+        limit: record.limit,
+        unit: Some(record.unit.clone()),
+        description: Some(record.description.clone()),
+        free_tier_type: Some(record.free_tier_type.clone()),
+    }
+}
+
+/// Whether `record` satisfies `filter`.
+///
+/// Each member of an `Expression` is honoured as the model documents it: `And`
+/// matches all of its expressions, `Or` any of them, `Not` the negation of its
+/// expression, and `Dimensions` one dimension comparison. An expression that
+/// sets several of them must satisfy each, and one that sets none expresses no
+/// condition at all and is refused rather than ignored.
+fn matches_expression(
+    record: &crate::state::UsageRecord,
+    filter: &Expression,
+    depth: usize,
+) -> Result<bool, GetFreeTierUsageError> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(validation(format!(
+            "filter: the expression nests more than {MAX_FILTER_DEPTH} levels"
+        )));
+    }
+
+    let mut matched = true;
+    let mut members = 0;
+
+    if let Some(all) = filter.and.as_ref() {
+        members += 1;
+        for inner in all {
+            matched &= matches_expression(record, inner, depth + 1)?;
+        }
+    }
+
+    if let Some(any) = filter.or.as_ref() {
+        members += 1;
+        let mut or_matched = false;
+        for inner in any {
+            or_matched |= matches_expression(record, inner, depth + 1)?;
+        }
+        matched &= or_matched;
+    }
+
+    if let Some(inner) = filter.not.as_ref() {
+        members += 1;
+        matched &= !matches_expression(record, inner, depth + 1)?;
+    }
+
+    if let Some(dimensions) = filter.dimensions.as_ref() {
+        members += 1;
+        matched &= matches_dimension(record, dimensions)?;
+    }
+
+    if members == 0 {
+        return Err(validation(
+            "filter: an expression must set one of And, Or, Not or Dimensions",
+        ));
+    }
+
+    Ok(matched)
+}
+
+/// Whether `record`'s value for one dimension matches the filter's values.
+///
+/// The record matches when its value matches AT LEAST ONE of `Values` ("the
+/// results all match at least one of the specified values",
+/// `DimensionValues$Values`) under the single match option `MatchOptions`
+/// carries ("You can specify only one of these values in the array",
+/// `DimensionValues$MatchOptions`).
+fn matches_dimension(
+    record: &crate::state::UsageRecord,
+    dimensions: &DimensionValues,
+) -> Result<bool, GetFreeTierUsageError> {
+    let key = dimensions.key.as_str();
+    if !DIMENSION_VALUES.contains(&key) {
+        return Err(validation(format!(
+            "filter.Dimensions.Key: {key} is not a dimension; expected one of {}",
+            DIMENSION_VALUES.join(", ")
+        )));
+    }
+
+    if dimensions.values.is_empty() {
+        return Err(validation(
+            "filter.Dimensions.Values: at least one value is required",
+        ));
+    }
+
+    let [option] = dimensions.match_options.as_slice() else {
+        return Err(validation(format!(
+            "filter.Dimensions.MatchOptions: exactly one match option is allowed, got {}",
+            dimensions.match_options.len()
+        )));
+    };
+    let option = option.as_str();
+    if !MATCH_OPTION_VALUES.contains(&option) {
+        return Err(validation(format!(
+            "filter.Dimensions.MatchOptions: {option} is not a match option; expected one of {}",
+            MATCH_OPTION_VALUES.join(", ")
+        )));
+    }
+
+    let Some(value) = record.dimension_value(key) else {
+        return Err(validation(format!(
+            "filter.Dimensions.Key: {key} names no Free Tier usage member"
+        )));
+    };
+
+    match value {
+        crate::state::DimensionValue::Text(text) => {
+            if option == MATCH_GREATER_THAN_OR_EQUAL {
+                return Err(validation(format!(
+                    "filter.Dimensions.MatchOptions: {MATCH_GREATER_THAN_OR_EQUAL} compares \
+                     magnitudes, so it applies only to {DIMENSION_USAGE_PERCENTAGE}, not to \
+                     {key}"
+                )));
+            }
+            Ok(dimensions
+                .values
+                .iter()
+                .any(|wanted| matches_text(&text, wanted, option)))
+        }
+        crate::state::DimensionValue::Number(number) => {
+            if option != MATCH_EQUALS && option != MATCH_GREATER_THAN_OR_EQUAL {
+                return Err(validation(format!(
+                    "filter.Dimensions.MatchOptions: {key} is a number, so it compares with \
+                     {MATCH_EQUALS} or {MATCH_GREATER_THAN_OR_EQUAL}, not with {option}"
+                )));
+            }
+            for wanted in &dimensions.values {
+                let Ok(wanted) = wanted.trim().parse::<f64>() else {
+                    return Err(validation(format!(
+                        "filter.Dimensions.Values: {wanted} is not a number, and {key} compares \
+                         numbers"
+                    )));
+                };
+                let matched = if option == MATCH_EQUALS {
+                    (number - wanted).abs() < f64::EPSILON
+                } else {
+                    number >= wanted
+                };
+                if matched {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Whether a text dimension's value matches `wanted` under one match option.
+fn matches_text(value: &str, wanted: &str, option: &str) -> bool {
+    match option {
+        MATCH_STARTS_WITH => value.starts_with(wanted),
+        MATCH_ENDS_WITH => value.ends_with(wanted),
+        MATCH_CONTAINS => value.contains(wanted),
+        // EQUALS is the remaining option; the caller has already refused every
+        // value the enum does not declare, and the one it refuses for text.
+        _ => value == wanted,
+    }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400).
+fn validation(message: impl Into<String>) -> GetFreeTierUsageError {
+    GetFreeTierUsageErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
 }

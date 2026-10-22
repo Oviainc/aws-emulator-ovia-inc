@@ -159,7 +159,10 @@ pub struct RemoveAction {
     pub member_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#NetworkSummary")]
+// `NetworkSummary`'s schema is written out by hand for the same single reason as
+// `Network`'s — `@timestampFormat("date-time")` on `CreationDate`'s target shape, which
+// the vendored codegen does not emit — and mirrors the macro's output in every other
+// respect. See the note above `Network` in `get_network_types.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkSummary {
     pub id: Option<String>,
@@ -170,6 +173,178 @@ pub struct NetworkSummary {
     pub status: Option<String>,
     pub creation_date: Option<::aws_smithy_types::DateTime>,
     pub arn: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl NetworkSummary {
+    const SHAPE_ID: &'static str = "com.amazonaws.managedblockchain#NetworkSummary";
+    const NAMESPACE: &'static str = "com.amazonaws.managedblockchain";
+
+    pub const M_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NetworkSummary$Id",
+            Self::NAMESPACE,
+            "Id",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Id",
+        0,
+    );
+    pub const M_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NetworkSummary$Name",
+            Self::NAMESPACE,
+            "Name",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Name",
+        1,
+    );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#NetworkSummary$Description",
+                Self::NAMESPACE,
+                "Description",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "Description",
+            2,
+        );
+    pub const M_FRAMEWORK: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NetworkSummary$Framework",
+            Self::NAMESPACE,
+            "Framework",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Framework",
+        3,
+    );
+    pub const M_FRAMEWORK_VERSION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#NetworkSummary$FrameworkVersion",
+                Self::NAMESPACE,
+                "FrameworkVersion",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "FrameworkVersion",
+            4,
+        );
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NetworkSummary$Status",
+            Self::NAMESPACE,
+            "Status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Status",
+        5,
+    );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#NetworkSummary$CreationDate",
+                Self::NAMESPACE,
+                "CreationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreationDate",
+            6,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#NetworkSummary$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        7,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "NetworkSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_DESCRIPTION,
+            &Self::M_FRAMEWORK,
+            &Self::M_FRAMEWORK_VERSION,
+            &Self::M_STATUS,
+            &Self::M_CREATION_DATE,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static NETWORK_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &NetworkSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for NetworkSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, v.as_str())?;
+        }
+        if let Some(v) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
+        }
+        if let Some(v) = self.framework.as_ref() {
+            s.write_string(&Self::M_FRAMEWORK, v.as_str())?;
+        }
+        if let Some(v) = self.framework_version.as_ref() {
+            s.write_string(&Self::M_FRAMEWORK_VERSION, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for NetworkSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(1) => out.name = Some(d.read_string(&Self::M_NAME)?),
+                Some(2) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(3) => out.framework = Some(d.read_string(&Self::M_FRAMEWORK)?),
+                Some(4) => {
+                    out.framework_version = Some(d.read_string(&Self::M_FRAMEWORK_VERSION)?)
+                }
+                Some(5) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(6) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(7) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#IllegalActionException")]

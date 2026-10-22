@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteRollout
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteRollout`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteRollout::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +119,27 @@ impl From<CompleteRolloutErrorModeled> for CompleteRolloutError {
 /// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
 /// crate names no concrete engine type: a migrated service that needs state picks a
 /// concrete engine where it mounts the service, not here.
+/// The status an absent `Status` member means.
+///
+/// `Status` is optional in the model, and the operation's own documentation
+/// describes exactly one outcome — the trajectory is "sealed and eligible for
+/// reward submission via the UpdateReward operation" — which is the sentence the
+/// `ready` enum value carries ("Trajectory completed successfully; sealed and
+/// eligible for reward submission"), where `failed` is "a terminal state, no
+/// further processing". So an unspecified `Status` seals the trajectory `ready`.
+const DEFAULT_COMPLETION_STATUS: crate::state::CompletionStatus =
+    crate::state::CompletionStatus::Ready;
+
+/// This operation's own modelled 400 `ValidationException`.
+fn validation(message: String) -> CompleteRolloutError {
+    CompleteRolloutErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
+/// This operation's own modelled 409 `ConflictException`.
+fn conflict(message: String) -> CompleteRolloutError {
+    CompleteRolloutErrorModeled::ConflictException(ConflictException { message }).into()
+}
+
 pub struct CompleteRollout<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
@@ -158,18 +170,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteRollout` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteRolloutErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteRollout"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CompleteRolloutErrorModeled::InternalServiceError(
+                InternalServiceError {
+                    message: "the AgenticRFT runtime emulator has no state store".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `Status` targets the `CompletionStatus` enum, so only the two values the
+        // model declares can seal a trajectory.
+        let requested = match input.status.as_deref() {
+            None => DEFAULT_COMPLETION_STATUS,
+            Some(value) => match crate::state::CompletionStatus::from_wire(value) {
+                Some(status) => status,
+                None => {
+                    return Err(validation(format!(
+                        "Status {value} is not one of {}.",
+                        COMPLETION_STATUS_VALUES.join(", ")
+                    )))
+                }
+            },
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let Some(trajectory) = guard.trajectory_mut(&input.job_arn, &input.trajectory_id) else {
+            return Err(CompleteRolloutErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Trajectory {} was not found for job {}.",
+                        input.trajectory_id, input.job_arn
+                    ),
+                },
+            )
+            .into());
+        };
+
+        match trajectory.completion_status {
+            // Not sealed yet: seal it, recording the terminal status and the
+            // `ClientToken` the sealing call carried.
+            None => {
+                trajectory.status = crate::state::TrajectoryStatus::Complete;
+                trajectory.completion_status = Some(requested);
+                trajectory.complete_rollout_token = input.client_token.clone();
+                trajectory.updated_at = now;
+                Ok(CompleteRolloutOutput {})
+            }
+            // `@idempotent`: asking again for the status it is already sealed with
+            // changes nothing and succeeds.
+            Some(sealed) if sealed == requested => Ok(CompleteRolloutOutput {}),
+            // Anything that would CHANGE the sealed terminal status conflicts with
+            // the trajectory's current state.
+            Some(sealed) => Err(conflict(format!(
+                "Trajectory {} is already completed with Status {}; it cannot be completed with \
+                 Status {}.",
+                input.trajectory_id,
+                sealed.as_str(),
+                requested.as_str()
+            ))),
+        }
     }
 }

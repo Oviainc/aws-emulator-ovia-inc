@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSteps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSteps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSteps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the persisted steps of one cluster, newest first, honouring the
+//! `StepStates` and `StepIds` filters and paginating with `Marker`. Every entry is a
+//! projection of a [`crate::state::StepRecord`]; nothing is synthesised here.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSteps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStepsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSteps"))
+        use crate::state::{LIST_STEPS_MAX_STEP_IDS, LIST_STEPS_PAGE_SIZE};
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // "You can specify a maximum of 10 stepIDs." (ListSteps doc.)
+        if let Some(ids) = input.step_ids.as_ref() {
+            if ids.len() > LIST_STEPS_MAX_STEP_IDS {
+                return Err(ListStepsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        error_code: None,
+                        message: Some(format!(
+                            "StepIds carries {} ids; a maximum of {LIST_STEPS_MAX_STEP_IDS} \
+                             stepIDs may be specified.",
+                            ids.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListStepsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the EMR cluster store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(ListStepsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster id '{}' is not valid or does not exist.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Provides a list of steps for the cluster in reverse order" (ListSteps doc):
+        // the records are held in submission order, so the newest is reported first.
+        let matched: Vec<&crate::state::StepRecord> = cluster
+            .steps
+            .iter()
+            .rev()
+            .filter(|step| {
+                input
+                    .step_states
+                    .as_ref()
+                    .is_none_or(|states| states.contains(&step.state))
+            })
+            .filter(|step| {
+                input
+                    .step_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&step.id))
+            })
+            .collect();
+
+        // The marker is the id of the first step the previous page did not report, so a
+        // page boundary survives steps being added between calls.
+        let start = match input.marker.as_ref() {
+            Some(marker) => match matched.iter().position(|step| step.id == *marker) {
+                Some(at) => at,
+                None => {
+                    return Err(ListStepsErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            error_code: None,
+                            message: Some(format!("Marker '{marker}' is not valid.")),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => 0,
+        };
+        let end = matched.len().min(start + LIST_STEPS_PAGE_SIZE);
+        let steps: Vec<StepSummary> = matched[start..end]
+            .iter()
+            .map(|step| step.to_summary())
+            .collect();
+        let marker = matched.get(end).map(|step| step.id.clone());
+
+        Ok(ListStepsOutput {
+            steps: Some(steps),
+            marker,
+        })
     }
 }

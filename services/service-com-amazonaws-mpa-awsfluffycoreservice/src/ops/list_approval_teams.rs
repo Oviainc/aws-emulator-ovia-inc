@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApprovalTeams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApprovalTeams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the stored approval teams from [`crate::state`], in creation order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApprovalTeams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `NextToken` is the creation-order sequence number of the last team the previous page
+//! returned, so the next page is every stored team ordered after it: a client paging with
+//! any `MaxResults` sees each team exactly once. A token that is not one this service
+//! issued earns `ValidationException` (400).
+//!
+//! `@readonly`: see the note in `get_approval_team.rs` for why
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] is not a write of this handler's own.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +155,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApprovalTeams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApprovalTeamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApprovalTeams"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApprovalTeamsError::Modeled(ListApprovalTeamsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        // The token is this service's own: the creation-order position the next page
+        // starts after. Anything else never came from here.
+        let after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => 0u64,
+            Some(token) => token.parse::<u64>().map_err(|_| {
+                ListApprovalTeamsError::Modeled(ListApprovalTeamsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "NextToken is not a token this service issued.".to_string(),
+                    },
+                ))
+            })?,
+        };
+        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
+        // validator has already closed it; the clamp only keeps the slice width sane.
+        let page_size = usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE))
+            .unwrap_or(1);
+
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let ordered = state.teams_in_creation_order();
+        let remaining: Vec<&crate::state::ApprovalTeam> = ordered
+            .into_iter()
+            .filter(|team| team.seq > after)
+            .collect();
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = page
+            .last()
+            .filter(|_| remaining.len() > page.len())
+            .map(|team| team.seq.to_string());
+
+        Ok(ListApprovalTeamsOutput {
+            approval_teams: Some(page.iter().copied().map(summary).collect()),
+            next_token,
+        })
+    }
+}
+
+/// One `ListApprovalTeams` entry for a stored team.
+fn summary(team: &crate::state::ApprovalTeam) -> ListApprovalTeamsResponseApprovalTeam {
+    let crate::state::StoredApprovalStrategy::MofN {
+        min_approvals_required,
+    } = team.approval_strategy;
+    ListApprovalTeamsResponseApprovalTeam {
+        arn: Some(team.arn.clone()),
+        name: Some(team.name.clone()),
+        description: Some(team.description.clone()),
+        creation_time: Some(::aws_smithy_types::DateTime::from(team.creation_time)),
+        approval_strategy: Some(ApprovalStrategyResponse::MofN(MofNApprovalStrategy {
+            min_approvals_required,
+        })),
+        number_of_approvers: Some(team.number_of_approvers()),
+        status: Some(team.status.as_wire().to_string()),
+        status_code: team.status_code.map(|code| code.as_wire().to_string()),
+        status_message: team.status_message.clone(),
     }
 }

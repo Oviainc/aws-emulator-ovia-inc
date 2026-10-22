@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes/decodes the opaque `nextToken` the paginated reads hand out.
+hex = { workspace = true }
+# Digests the parameters of an idempotent call, so a repeated `clientToken` with
+# different parameters is told apart from a retry of the same request.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

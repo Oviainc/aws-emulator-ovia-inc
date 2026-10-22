@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the response is read out of this service's store, so it reports exactly
+//! what the matching `PutBot` persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +117,39 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::BotRecord;
+
+impl From<&BotRecord> for GetBotOutput {
+    /// The `GetBot` body for a stored bot revision: every member read off the record, so
+    /// a read can only report what a write persisted. `GetBotResponse` models no
+    /// `createVersion` and no `tags` — a bot's tags are reported by
+    /// `ListTagsForResource`, which is a separate operation.
+    fn from(record: &BotRecord) -> Self {
+        Self {
+            name: Some(record.name.clone()),
+            description: record.description.clone(),
+            intents: (!record.intents.is_empty()).then(|| record.intents.clone()),
+            enable_model_improvements: record.enable_model_improvements,
+            nlu_intent_confidence_threshold: record.nlu_intent_confidence_threshold,
+            clarification_prompt: record.clarification_prompt.clone(),
+            abort_statement: record.abort_statement.clone(),
+            status: Some(record.status.clone()),
+            failure_reason: record.failure_reason.clone(),
+            last_updated_date: Some(record.last_updated_date),
+            created_date: Some(record.created_date),
+            idle_session_ttl_in_seconds: Some(record.idle_session_ttl_in_seconds),
+            voice_id: record.voice_id.clone(),
+            checksum: Some(record.checksum.clone()),
+            version: Some(record.version.clone()),
+            locale: Some(record.locale.clone()),
+            child_directed: Some(record.child_directed),
+            detect_sentiment: Some(record.detect_sentiment),
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -195,18 +221,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+        // The one write a report may make: a build the CLOCK has already made due is
+        // finished here, because it was owed at this instant whether or not anybody
+        // called. Nothing else about the record moves.
+        store.materialise_due_builds(SystemTime::now());
+
+        // `versionOrAlias` names a version (`$LATEST` or a number) or a bot alias. No
+        // alias can exist yet — `PutBotAlias` is still a stub, so nothing writes one —
+        // so a name that is not a stored version resolves to nothing.
+        let record = store
+            .bots
+            .get(&input.name)
+            .and_then(|entry| entry.versions.get(&input.version_or_alias))
+            .ok_or_else(|| {
+                GetBotErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_bot(
+                        &input.name,
+                        &input.version_or_alias,
+                    )),
+                })
+            })?;
+        Ok(GetBotOutput::from(record))
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes a stored node from its network in [`crate::state`] — "All data
+//! on the node is lost and cannot be recovered" — so a later `GetNode` answers
+//! `ResourceNotFoundException` and `ListNodes` no longer reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNode"))
+        // The deletion is driven entirely by stored state; the request carries no
+        // region-dependent value to mint.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteNodeErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(DeleteNodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "network {} does not exist on this account",
+                        input.network_id
+                    )),
+                    resource_name: Some(input.network_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // `MemberId` "Applies only to Hyperledger Fabric and is required for Hyperledger
+        // Fabric": on a Fabric network the owning member scopes which node is deleted.
+        if network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
+            && input.member_id.is_none()
+        {
+            return Err(DeleteNodeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "memberId is required on a {} network",
+                        crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let found = network.nodes.get(&input.node_id).filter(|node| {
+            input
+                .member_id
+                .as_deref()
+                .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
+        });
+        let Some(node) = found else {
+            return Err(DeleteNodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "node {} does not exist on network {}",
+                        input.node_id, input.network_id
+                    )),
+                    resource_name: Some(input.node_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`): a node still being created cannot be
+        // deleted yet.
+        if node.status != crate::state::STATUS_AVAILABLE {
+            return Err(DeleteNodeErrorModeled::ResourceNotReadyException(
+                ResourceNotReadyException {
+                    message: Some(format!(
+                        "node {} is {} and cannot be deleted until it is {}",
+                        node.id,
+                        node.status,
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+            return Err(DeleteNodeErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        // "All data on the node is lost and cannot be recovered": the record goes, so
+        // every later read of it is a `ResourceNotFoundException`.
+        network.nodes.remove(&input.node_id);
+        // And so does the idempotency record of the create that minted it: replaying
+        // that token could only hand back an id nothing holds, and the ledger must not
+        // outlive the resources it describes.
+        guard.forget_node_token(&input.node_id);
+
+        Ok(DeleteNodeOutput {})
     }
 }

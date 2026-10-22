@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Minting a `pma-`/`rs-` id (13 chars of `[a-z0-9]`), fingerprinting a request for
+# the client-token ledger and encoding an opaque `nextToken` are all digests or hex.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

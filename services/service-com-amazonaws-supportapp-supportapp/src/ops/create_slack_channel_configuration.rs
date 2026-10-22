@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSlackChannelConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSlackChannelConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSlackChannelConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a Slack channel configuration in this service's store, keyed by the
+//! `(teamId, channelId)` pair that identifies it. The output shape has no members, so
+//! the persisted record is the operation's only effect — and the only thing
+//! `ListSlackChannelConfigurations` and `UpdateSlackChannelConfiguration` read.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +179,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSlackChannelConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSlackChannelConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSlackChannelConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSlackChannelConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Support App store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The documented default for the three notification flags: "If you don't
+        // specify these parameters in your request, they default to false."
+        // (`notifyOnCaseSeverity`). The configuration therefore HOLDS a boolean for
+        // each of them, which is what every later read reports.
+        let notify_on_create_or_reopen_case = input.notify_on_create_or_reopen_case.unwrap_or(false);
+        let notify_on_add_correspondence_to_case =
+            input.notify_on_add_correspondence_to_case.unwrap_or(false);
+        let notify_on_resolve_case = input.notify_on_resolve_case.unwrap_or(false);
+
+        // The severity/flag combination rule documented on `notifyOnCaseSeverity`. The
+        // model cannot express it, so the boundary validator passed it.
+        if let Some(message) = crate::state::notification_rule_violation(
+            &input.notify_on_case_severity,
+            notify_on_create_or_reopen_case,
+            notify_on_add_correspondence_to_case,
+            notify_on_resolve_case,
+        ) {
+            return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let key = (input.team_id.clone(), input.channel_id.clone());
+        // A channel configuration is identified by its `(teamId, channelId)` pair:
+        // configuring a channel that is already configured is a conflict, not a
+        // second configuration and not an overwrite.
+        if store.slack_channel_configurations.contains_key(&key) {
+            return Err(CreateSlackChannelConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a Slack channel configuration already exists for channel {} in \
+                         workspace {}",
+                        input.channel_id, input.team_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The documented quota: "You can add up to 20 Slack channels for your
+        // account". Checked after the conflict above, because reconfiguring a channel
+        // that is already configured adds nothing to the account; only a NEW
+        // configuration counts against the quota. This is also what keeps the store
+        // from growing without bound on repeated calls.
+        if store.slack_channel_configurations.len() >= crate::state::MAX_SLACK_CHANNEL_CONFIGURATIONS
+        {
+            return Err(
+                CreateSlackChannelConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already has the maximum of {} Slack channel \
+                             configurations",
+                            crate::state::MAX_SLACK_CHANNEL_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.slack_channel_configurations.insert(
+            key,
+            crate::state::SlackChannelConfig {
+                team_id: input.team_id,
+                channel_id: input.channel_id,
+                channel_name: input.channel_name,
+                notify_on_create_or_reopen_case: Some(notify_on_create_or_reopen_case),
+                notify_on_add_correspondence_to_case: Some(notify_on_add_correspondence_to_case),
+                notify_on_resolve_case: Some(notify_on_resolve_case),
+                notify_on_case_severity: input.notify_on_case_severity,
+                channel_role_arn: input.channel_role_arn,
+            },
+        );
+
+        Ok(CreateSlackChannelConfigurationOutput {})
     }
 }

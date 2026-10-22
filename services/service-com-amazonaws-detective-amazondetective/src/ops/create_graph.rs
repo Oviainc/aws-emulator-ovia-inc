@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a behavior graph and stores it: the ARN this returns is the key the graph
+//! lives under in [`crate::state`], so `ListGraphs`, `CreateMembers`, `ListMembers`,
+//! `GetMembers` and `DeleteGraph` all resolve it.
+//!
+//! IMPLEMENTED: a graph minted here is stored under the ARN this returns.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGraph"))
+        // `Tags` is the only input member. Its 1..50 length, and every tag key's and
+        // value's own length and pattern, are modelled constraints, so the
+        // centralized walk has already refused anything outside them with a 400
+        // before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGraphErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let created_time_millis = crate::state::now_epoch_millis();
+
+        let mut store = state.lock();
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way the service refuses one past its quota.
+        if store.graphs.len() >= crate::state::MAX_GRAPHS {
+            return Err(CreateGraphErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} behavior graphs",
+                        crate::state::MAX_GRAPHS
+                    )),
+                    resources: None,
+                },
+            )
+            .into());
+        }
+
+        let arn = store.fresh_graph_arn(&region);
+        store.insert_graph(crate::state::Graph {
+            arn: arn.clone(),
+            created_time_millis,
+            // "sets that account as the administrator account": the graph records who
+            // administers it, which is what every `MemberDetail` of this graph later
+            // reports as its `AdministratorId`.
+            administrator_id: crate::state::administrator_account_id(),
+            // Stored on the graph now even though the three tagging operations are
+            // still scaffolded: they key off this same graph ARN.
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            members: ::std::collections::BTreeMap::new(),
+        });
+
+        Ok(CreateGraphOutput {
+            graph_arn: Some(arn),
+        })
     }
 }

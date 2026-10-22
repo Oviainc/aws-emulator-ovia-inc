@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateResourceShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateResourceShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates more entities with a resource share held in [`crate::state`] and
+//! reports the association records it stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateResourceShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each new association is stored in `ASSOCIATING`, the status RAM answers this call
+//! with, and reaches `ASSOCIATED` when the move the clock owes it falls due. An
+//! entity already associated with the share is left as it stands, so repeating the
+//! call neither duplicates it nor moves its timestamps.
 //!
 //! ## Shape of an operation
 //!
@@ -205,18 +203,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateResourceShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateResourceShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateResourceShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateResourceShareErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        let resource_arns = input.resource_arns.clone().unwrap_or_default();
+        let principals = input.principals.clone().unwrap_or_default();
+        let sources = input.sources.clone().unwrap_or_default();
+
+        if let Some(why) =
+            crate::state::share_arn_rejection("resourceShareArn", &input.resource_share_arn)
+                .or_else(|| crate::state::resource_arn_rejection("resourceArns", &resource_arns))
+        {
+            return Err(AssociateResourceShareErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = crate::state::entity_value_rejection("principals", &principals)
+            .or_else(|| crate::state::entity_value_rejection("sources", &sources))
+            .or_else(|| {
+                (resource_arns.is_empty() && principals.is_empty() && sources.is_empty()).then(
+                    || {
+                        "at least one of resourceArns, principals or sources must name an entity \
+                         to associate"
+                            .to_string()
+                    },
+                )
+            })
+        {
+            return Err(
+                AssociateResourceShareErrorModeled::InvalidParameterException(
+                    InvalidParameterException { message: why },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = crate::state::entity_count_rejection("resourceArns", resource_arns.len())
+            .or_else(|| crate::state::entity_count_rejection("principals", principals.len()))
+            .or_else(|| crate::state::entity_count_rejection("sources", sources.len()))
+        {
+            return Err(
+                AssociateResourceShareErrorModeled::ResourceShareLimitExceededException(
+                    ResourceShareLimitExceededException { message: why },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(
+                AssociateResourceShareErrorModeled::InvalidClientTokenException(
+                    InvalidClientTokenException { message: why },
+                )
+                .into(),
+            );
+        }
+
+        // The entities this call associates, in the order the response reports them:
+        // resources, then principals, then sources.
+        let requested: Vec<(&str, &String)> = [
+            (crate::state::ASSOCIATION_TYPE_RESOURCE, &resource_arns),
+            (crate::state::ASSOCIATION_TYPE_PRINCIPAL, &principals),
+            (crate::state::ASSOCIATION_TYPE_SOURCE, &sources),
+        ]
+        .into_iter()
+        .flat_map(|(association_type, entities)| {
+            entities.iter().map(move |entity| (association_type, entity))
+        })
+        .collect();
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        let fingerprint = crate::state::fingerprint(&[
+            &input.resource_share_arn,
+            &crate::state::fingerprint_list(&resource_arns),
+            &crate::state::fingerprint_list(&principals),
+            &crate::state::fingerprint_list(&sources),
+        ]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        AssociateResourceShareErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: "clientToken was already used for an \
+                                          AssociateResourceShare request with different parameters"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // A repeat associates nothing further: the stored records answer it.
+                let associations = requested
+                    .iter()
+                    .filter_map(|(association_type, entity)| {
+                        store
+                            .associations
+                            .get(&(
+                                input.resource_share_arn.clone(),
+                                (*association_type).to_string(),
+                                (*entity).clone(),
+                            ))
+                            .map(crate::state::AssociationRecord::view)
+                    })
+                    .collect();
+                return Ok(AssociateResourceShareOutput {
+                    resource_share_associations: Some(associations),
+                    client_token: Some(token),
+                });
+            }
+        }
+
+        let share = store
+            .live_share(&input.resource_share_arn)
+            .cloned()
+            .ok_or_else(|| {
+                AssociateResourceShareErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: format!(
+                            "no resource share with the ARN '{}' exists",
+                            input.resource_share_arn
+                        ),
+                    },
+                )
+            })?;
+
+        // The store is finite: a call that would take one share past its cap is
+        // refused rather than growing it.
+        let already = store.association_count(&share.arn);
+        let arriving = requested
+            .iter()
+            .filter(|(association_type, entity)| {
+                !store.associations.contains_key(&(
+                    share.arn.clone(),
+                    (*association_type).to_string(),
+                    (*entity).clone(),
+                ))
+            })
+            .count();
+        if already + arriving > crate::state::MAX_ASSOCIATIONS_PER_SHARE {
+            return Err(
+                AssociateResourceShareErrorModeled::ResourceShareLimitExceededException(
+                    ResourceShareLimitExceededException {
+                        message: format!(
+                            "this resource share already holds {already} associations, and one \
+                             share accepts at most {}",
+                            crate::state::MAX_ASSOCIATIONS_PER_SHARE
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let associations = requested
+            .iter()
+            .map(|(association_type, entity)| {
+                store
+                    .associate(&share, association_type, entity.as_str(), now)
+                    .view()
+            })
+            .collect();
+
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(Self::NAME, &client_token, fingerprint, share.arn.clone());
+
+        Ok(AssociateResourceShareOutput {
+            resource_share_associations: Some(associations),
+            client_token: Some(client_token),
+        })
     }
 }

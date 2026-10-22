@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRepositories
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRepositories`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRepositories::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: lists the live repositories held in `crate::state`, ordered by
+//! the requested sort key and direction, one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +71,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// `SortByEnum` values, and the default CodeCommit sorts by when `sortBy` is absent.
+const SORT_BY_NAME: &str = "repositoryName";
+const SORT_BY_LAST_MODIFIED: &str = "lastModifiedDate";
+
+/// `OrderEnum` values, and the default direction when `order` is absent.
+const ORDER_ASCENDING: &str = "ascending";
+const ORDER_DESCENDING: &str = "descending";
+
+/// Repositories per page. CodeCommit pages `ListRepositories` and returns a
+/// `nextToken` while more remain; the page size is not documented, so this is the
+/// emulator's own and the paging contract (token in, token out) is what matters.
+const PAGE_SIZE: usize = 1000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +155,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRepositories` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRepositoriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRepositories"))
+        let _ = ctx;
+        // `SortByEnum` / `OrderEnum` values, and the defaults CodeCommit applies
+        // when the member is absent
+        // (`smithy_query(query="shape",shape="SortByEnum,OrderEnum")`). A value
+        // outside either enum is already refused at the boundary (as
+        // `InvalidSortByException` / `InvalidOrderException`, see `crate::service`);
+        // the checks below keep this handler's own invariant explicit.
+        let sort_by = input.sort_by.clone().unwrap_or_else(|| SORT_BY_NAME.to_string());
+        if sort_by != SORT_BY_NAME && sort_by != SORT_BY_LAST_MODIFIED {
+            return Err(ListRepositoriesErrorModeled::InvalidSortByException(
+                InvalidSortByException {
+                    message: Some(format!(
+                        "the sortBy value {sort_by} is not valid: expected {SORT_BY_NAME} or {SORT_BY_LAST_MODIFIED}"
+                    )),
+                },
+            )
+            .into());
+        }
+        let order = input.order.clone().unwrap_or_else(|| ORDER_ASCENDING.to_string());
+        if order != ORDER_ASCENDING && order != ORDER_DESCENDING {
+            return Err(ListRepositoriesErrorModeled::InvalidOrderException(
+                InvalidOrderException {
+                    message: Some(format!(
+                        "the order value {order} is not valid: expected {ORDER_ASCENDING} or {ORDER_DESCENDING}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+
+        // Order the live repositories by the requested key. The name is unique, so
+        // it also breaks a tie between two repositories modified in the same instant
+        // and keeps paging stable.
+        let mut ordered: Vec<&crate::state::Repository> = store.repositories.values().collect();
+        ordered.sort_by(|left, right| match sort_by.as_str() {
+            SORT_BY_LAST_MODIFIED => left
+                .last_modified_date
+                .cmp(&right.last_modified_date)
+                .then_with(|| left.name.cmp(&right.name)),
+            _ => left.name.cmp(&right.name),
+        });
+        if order == ORDER_DESCENDING {
+            ordered.reverse();
+        }
+
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token
+                .parse::<usize>()
+                .ok()
+                .filter(|offset| *offset <= ordered.len())
+                .ok_or_else(|| {
+                    ListRepositoriesErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(format!(
+                                "the continuation token {token} is not valid"
+                            )),
+                        },
+                    )
+                })?,
+        };
+        let end = ordered.len().min(start.saturating_add(PAGE_SIZE));
+        let repositories: Vec<RepositoryNameIdPair> = ordered[start..end]
+            .iter()
+            .map(|repository| RepositoryNameIdPair {
+                repository_name: Some(repository.name.clone()),
+                repository_id: Some(repository.repository_id.clone()),
+            })
+            .collect();
+
+        Ok(ListRepositoriesOutput {
+            repositories: Some(repositories),
+            next_token: (end < ordered.len()).then(|| end.to_string()),
+        })
     }
 }

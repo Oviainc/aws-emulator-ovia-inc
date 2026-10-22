@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMonitors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMonitors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMonitors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the monitor records [`crate::state`] holds, in `monitorName` order,
+//! filtered by the `state` query parameter when one is given. `nextToken` is an
+//! opaque cursor naming the first monitor of the NEXT page, and is absent on the
+//! final page.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +109,18 @@ impl From<ListMonitorsErrorModeled> for ListMonitorsError {
     }
 }
 
+/// This service's `ValidationException` (HTTP 400), carrying `message`.
+///
+/// `state` is modelled as a plain `string`, so the framework cannot refuse a
+/// value outside the `MonitorState` enum, and `nextToken` as a length-bounded
+/// one, so it cannot refuse a cursor this service never vended.
+fn validation(message: String) -> ListMonitorsError {
+    ListMonitorsErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `ListMonitors` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +157,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMonitors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMonitorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMonitors"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMonitorsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // `state` targets a plain `string`, so the framework admits any text;
+        // the service filters on `MonitorState`, so anything outside that enum
+        // names no state a monitor can be in.
+        if let Some(requested) = input.state.as_deref() {
+            if !MONITOR_STATE_VALUES.contains(&requested) {
+                return Err(validation(format!(
+                    "state must be one of {MONITOR_STATE_VALUES:?}, got {requested:?}"
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+        // What a monitor's state IS at the instant of this call, including the
+        // activation the clock already made due — so the `state` filter and the
+        // reported `state` can never disagree.
+        store.settle_all_monitors(now);
+
+        // `monitors` is a `BTreeMap` keyed by `monitorName`, so this walk is
+        // already in name order — which is what makes the name-valued cursor
+        // below resolve to the same position on every request.
+        let matching: Vec<&crate::state::Monitor> = store
+            .monitors
+            .values()
+            .filter(|monitor| {
+                input
+                    .state
+                    .as_deref()
+                    .is_none_or(|requested| monitor.state == requested)
+            })
+            .collect();
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let key = crate::state::decode_page_token(token);
+                let position = key.and_then(|key| {
+                    matching
+                        .iter()
+                        .position(|monitor| monitor.monitor_name == key)
+                });
+                let Some(position) = position else {
+                    return Err(validation(
+                        "nextToken does not name a page of this result set".to_string(),
+                    ));
+                };
+                position
+            }
+        };
+        // No `maxResults` means one page: the model's own maximum. The model's
+        // `@range(1..25)` is refused by the framework before this handler runs;
+        // the clamp keeps the page size inside that range even so, because a
+        // zero page size would vend a cursor that never advances.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_size).min(matching.len());
+        // Absent on the final page: there is no monitor after `end` to resume
+        // from.
+        let next_token = matching
+            .get(end)
+            .map(|monitor| crate::state::encode_page_token(&monitor.monitor_name));
+
+        let monitors: Vec<MonitorSummary> = matching[start..end]
+            .iter()
+            .map(|monitor| MonitorSummary {
+                monitor_arn: monitor.monitor_arn.clone(),
+                monitor_name: monitor.monitor_name.clone(),
+                state: monitor.state.clone(),
+                aggregation_period: Some(monitor.aggregation_period),
+                tags: Some(
+                    monitor
+                        .tags
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ),
+            })
+            .collect();
+
+        Ok(ListMonitorsOutput {
+            monitors,
+            next_token,
+        })
     }
 }

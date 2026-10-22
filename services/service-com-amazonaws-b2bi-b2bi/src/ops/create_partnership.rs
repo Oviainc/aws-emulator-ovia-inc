@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePartnership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePartnership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePartnership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a partnership under an existing profile, persists it, and answers with the
+//! STORED record so a later `GetPartnership` returns exactly what was created. An
+//! unknown `profileId` is refused with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +155,47 @@ impl From<CreatePartnershipErrorModeled> for CreatePartnershipError {
     }
 }
 
+/// The modelled refusal for a store already holding
+/// [`crate::state::MAX_RECORDS_PER_STORE`] partnerships: this emulator will not grow
+/// its partnership store further, so the request is refused rather than served by
+/// allocating more.
+///
+/// `quotaCode` and `serviceCode` name the limit that was actually reached — this
+/// emulator's own storage bound and this service's own code — rather than an AWS quota
+/// code, which only AWS can assign.
+fn store_full() -> CreatePartnershipError {
+    CreatePartnershipErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: format!(
+            "this emulator stores at most {} partnerships",
+            crate::state::MAX_RECORDS_PER_STORE
+        ),
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: "partnership".to_string(),
+        service_code: "b2bi".to_string(),
+        quota_code: "PartnershipsPerAccount".to_string(),
+    })
+    .into()
+}
+
+/// The response for a stored partnership — every member read back off the record, so a
+/// create and a later `GetPartnership` cannot disagree.
+fn stored_partnership_response(
+    partnership: &crate::state::Partnership,
+) -> CreatePartnershipOutput {
+    CreatePartnershipOutput {
+        profile_id: partnership.profile_id.clone(),
+        partnership_id: partnership.partnership_id.clone(),
+        partnership_arn: partnership.partnership_arn.clone(),
+        name: Some(partnership.name.clone()),
+        email: Some(partnership.email.clone()),
+        phone: partnership.phone.clone(),
+        capabilities: Some(partnership.capabilities.clone()),
+        capability_options: partnership.capability_options.clone(),
+        trading_partner_id: Some(partnership.trading_partner_id.clone()),
+        created_at: partnership.created_at,
+    }
+}
+
 /// The `CreatePartnership` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -197,18 +232,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePartnership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePartnershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePartnership"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePartnershipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
+        // same token answers with the resource the first call created, not a second one.
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key("partnership", token));
+        if let Some(key) = idempotency_key.as_deref() {
+            if let Some(existing) = state
+                .idempotency
+                .get(key)
+                .and_then(|id| state.partnerships.get(id))
+            {
+                return Ok(stored_partnership_response(existing));
+            }
+        }
+
+        // A partnership is created UNDER a profile, so the profile it names has to
+        // exist: an unknown id is the modelled 404, never a success.
+        if !state.profiles.contains_key(&input.profile_id) {
+            return Err(CreatePartnershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Could not find profile with ID {}", input.profile_id),
+                },
+            )
+            .into());
+        }
+
+        // Residency bound: this store holds at most `MAX_RECORDS_PER_STORE`
+        // partnerships, so repeated creates cannot grow the emulator's memory without
+        // limit. Checked AFTER the idempotency replay, so a replay still answers from a
+        // full store.
+        if !state.accepts_another_partnership() {
+            return Err(store_full());
+        }
+
+        let mut partnership_id = crate::state::new_resource_id("ps");
+        while state.partnerships.contains_key(&partnership_id) {
+            partnership_id = crate::state::new_resource_id("ps");
+        }
+        let region = crate::state::request_region(ctx.parts());
+        let partnership = crate::state::Partnership {
+            partnership_arn: ::engine::emulator_arn(
+                "b2bi",
+                &region,
+                &format!("partnership/{partnership_id}"),
+            ),
+            partnership_id,
+            profile_id: input.profile_id,
+            name: input.name,
+            email: input.email,
+            phone: input.phone,
+            capabilities: input.capabilities,
+            capability_options: input.capability_options,
+            trading_partner_id: crate::state::new_resource_id("tp"),
+            created_at: crate::state::now(),
+            modified_at: None,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let response = stored_partnership_response(&partnership);
+        let partnership_id = partnership.partnership_id.clone();
+        state
+            .partnerships
+            .insert(partnership_id.clone(), partnership);
+        state.partnership_order.push(partnership_id.clone());
+        if let Some(key) = idempotency_key {
+            state.record_idempotency(key, &partnership_id);
+        }
+        Ok(response)
     }
 }

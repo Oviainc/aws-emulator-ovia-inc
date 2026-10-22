@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNamedShadowsForThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNamedShadowsForThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNamedShadowsForThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the NAMED shadows stored for the thing, in stable key order, paged by
+//! `pageSize` and `nextToken`. The unnamed (classic) shadow is not a named shadow, so
+//! it is never listed; a thing with no stored shadow at all is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNamedShadowsForThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNamedShadowsForThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNamedShadowsForThing"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListNamedShadowsForThingErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the thing-shadow store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `nextToken` is this service's own offset into the thing's ordered shadow
+        // names, so a token that is not one is an invalid request rather than an
+        // empty page.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                ListNamedShadowsForThingErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!("the nextToken '{token}' is not valid")),
+                    },
+                )
+            })?,
+        };
+        let page_size = input
+            .page_size
+            .map_or(crate::state::DEFAULT_SHADOW_PAGE_SIZE, |size| {
+                size.max(0) as usize
+            });
+
+        let guard = state.lock();
+        if !guard.has_any_shadow(&input.thing_name) {
+            return Err(ListNamedShadowsForThingErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no shadow exists for thing '{}'",
+                        input.thing_name
+                    )),
+                },
+            )
+            .into());
+        }
+        let names = guard.named_shadows_for_thing(&input.thing_name);
+        drop(guard);
+
+        let page: Vec<String> = names.iter().skip(offset).take(page_size).cloned().collect();
+        let consumed = offset.saturating_add(page.len());
+        let next_token = if consumed < names.len() {
+            Some(consumed.to_string())
+        } else {
+            None
+        };
+
+        Ok(ListNamedShadowsForThingOutput {
+            results: Some(page),
+            next_token,
+            timestamp: crate::state::now_secs(),
+        })
     }
 }

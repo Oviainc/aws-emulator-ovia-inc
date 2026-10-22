@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPlace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPlace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPlace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the place a `PlaceId` names, read out of the seeded catalog in
+//! [`crate::state`] — the same record Geocode, ReverseGeocode, SearchText and
+//! SearchNearby hand out, so an id from any of them resolves here to the same
+//! `Title`, `Position` and `Address`.
 //!
 //! ## Shape of an operation
 //!
@@ -235,18 +230,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPlace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPlaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPlace"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPlaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Geo Places catalog is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Modeled input constraints, enforced here too so an in-process caller is
+        // held to the same contract as a client on the wire.
+        for invalid in [
+            crate::state::check_language(input.language.as_deref()),
+            crate::state::check_political_view(input.political_view.as_deref()),
+        ] {
+            if let Err(invalid) = invalid {
+                return Err(GetPlaceErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
+        // A `PlaceId` is opaque: one this service never issued names no place, and
+        // the operation models no not-found error, so it is a client-input failure.
+        // The id is `@sensitive`, so the refusal names the member, not the value.
+        let Some(place) = state.place(input.place_id.trim()) else {
+            return Err(GetPlaceErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    crate::state::REASON_CANNOT_PARSE,
+                    "PlaceId",
+                    "PlaceId is not a place identifier issued by this service",
+                ),
+            )
+            .into());
+        };
+
+        let features = input.additional_features.as_deref().unwrap_or_default();
+        let wants = |feature: &str| features.iter().any(|asked| asked == feature);
+        let political_view = match state.political_view(input.political_view.as_deref()) {
+            Ok(political_view) => political_view,
+            Err(invalid) => {
+                return Err(GetPlaceErrorModeled::ValidationException(invalid).into())
+            }
+        };
+
+        Ok(GetPlaceOutput {
+            place_id: place.place_id.clone(),
+            place_type: place.place_type.clone(),
+            title: place.title.clone(),
+            pricing_bucket: state.pricing_bucket(Self::NAME, input.intended_use.as_deref()),
+            address: Some(place.address.to_modeled()),
+            position: Some(place.position_modeled()),
+            map_view: Some(place.map_view_modeled()),
+            categories: place.categories_modeled(),
+            food_types: place.food_types_modeled(),
+            business_chains: place.business_chains_modeled(),
+            opening_hours: place.opening_hours_modeled(),
+            // An additional feature is reported only when the request asks for it.
+            contacts: wants(crate::state::FEATURE_CONTACT)
+                .then(|| place.contacts_modeled())
+                .flatten(),
+            access_points: wants(crate::state::FEATURE_ACCESS)
+                .then(|| place.access_points_modeled())
+                .flatten(),
+            time_zone: wants(crate::state::FEATURE_TIME_ZONE)
+                .then(|| place.time_zone_modeled())
+                .flatten(),
+            political_view,
+            ..GetPlaceOutput::default()
+        })
     }
 }

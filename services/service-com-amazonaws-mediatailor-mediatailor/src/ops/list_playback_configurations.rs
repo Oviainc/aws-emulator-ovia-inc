@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPlaybackConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPlaybackConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPlaybackConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored playback configurations, one page at a time, in `Name`
+//! order. Nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +73,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::PlaybackConfigurationView;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -86,14 +81,33 @@ use super::types::*;
 // `ListPlaybackConfigurationsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListPlaybackConfigurationsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#ListPlaybackConfigurations")]
+/// This operation's modelled failures.
+///
+/// The model lists no error on `ListPlaybackConfigurations` itself, so
+/// `BadRequestException` — the one client error this SERVICE declares ("A
+/// request contains unexpected data", HTTP 400) — is widened in with
+/// `extra_errors` to refuse a `NextToken` this service never issued.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#ListPlaybackConfigurations",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum ListPlaybackConfigurationsErrorModeled {
+    BadRequestException(BadRequestException),
+}
+
+/// A page boundary travels as an opaque token. It encodes the `Name` of the last
+/// item of the page just served, so the next page resumes at the first stored
+/// name after it — the store is ordered by name, so the boundary needs nothing
+/// else. Hex keeps the token opaque to a caller and total over every name.
+fn encode_token(name: &str) -> String {
+    hex::encode(name.as_bytes())
+}
+
+/// The name a continuation token resumes after, or `None` when the token is not
+/// one this service issued.
+fn decode_token(token: &str) -> Option<String> {
+    String::from_utf8(hex::decode(token).ok()?).ok()
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -145,20 +159,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPlaybackConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPlaybackConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPlaybackConfigurations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store there is nothing to report, so answer the scaffold's 501
+            // rather than a response nothing backs.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListPlaybackConfigurations",
+            ));
+        };
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match decode_token(token) {
+                Some(name) => Some(name),
+                None => {
+                    return Err(ListPlaybackConfigurationsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "NextToken is not a pagination token this service issued."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // The page size is clamped HERE, not left to the boundary validator
+        // alone: `MaxResults`' modelled range is 1..100 and its documented
+        // default is 100, and the handler bounds the work and the response size
+        // it will produce itself.
+        let page_size = input.max_results.map_or(crate::state::MAX_PAGE_SIZE, |max| {
+            max.clamp(1, crate::state::MAX_PAGE_SIZE as i32) as usize
+        });
+
+        let store = state.lock();
+        let mut remaining = store
+            .playback_configurations
+            .values()
+            .filter(|record| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|boundary| record.name.as_str() > boundary)
+            })
+            .peekable();
+
+        let mut items: Vec<PlaybackConfiguration> = Vec::new();
+        while items.len() < page_size {
+            let Some(record) = remaining.next() else { break };
+            let tags = store.tags_of(&record.arn);
+            items.push(PlaybackConfiguration::from_record(record, tags));
+        }
+
+        // A token is issued only when a configuration is left to report, so the
+        // last page carries none and a caller knows it has them all.
+        let next_token = if remaining.peek().is_some() {
+            items
+                .last()
+                .and_then(|last| last.name.as_deref())
+                .map(encode_token)
+        } else {
+            None
+        };
+
+        Ok(ListPlaybackConfigurationsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

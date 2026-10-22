@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHsm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHsm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHsm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored [`crate::state::Hsm`] record the `HsmArn` names, so the ARN
+//! disappears from `ListHsms` and a later `DescribeHsm` or `DeleteHsm` on it fails.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +138,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHsm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHsmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHsm"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteHsmErrorModeled::CloudHsmInternalException(CloudHsmInternalException {
+                message: Some("the CloudHSM store is unavailable".to_string()),
+                retryable: false,
+            })
+        })?;
+        let mut state = state.lock();
+
+        // A well-formed ARN no stored HSM answers to is a service exception — which is
+        // also what a second delete of the same ARN gets, since the first one removed
+        // the record.
+        if state.remove_hsm(&input.hsm_arn).is_none() {
+            return Err(DeleteHsmErrorModeled::CloudHsmServiceException(
+                CloudHsmServiceException {
+                    message: Some("no HSM matches the identifier in the request".to_string()),
+                    retryable: false,
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteHsmOutput {
+            status: crate::state::HSM_STATUS_DELETED.to_string(),
+        })
     }
 }

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApprovalTeam
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApprovalTeam`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an approval team and STORES it in [`crate::state`]: the response is read back
+//! out of the stored record, so a following `GetApprovalTeam` reports exactly what this
+//! call returned.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApprovalTeam::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules this handler enforces beyond the modelled constraints:
+//!
+//! * `ClientToken` (`@idempotencyToken`) replay returns the team the first call minted —
+//!   same `Arn`, same `VersionId`, no second team.
+//! * A `Name` a live team already holds earns `ConflictException` (409).
+//! * An `MofN` strategy asking for more approvals (M) than the team has approvers (N)
+//!   can never be satisfied, so it earns `ValidationException` (400). The model bounds M
+//!   at `min: 1` but cannot relate it to the approver count.
+//! * `Approvers` naming one identity twice earns `ValidationException` (400): a repeat
+//!   inflates N without adding anyone who can approve.
+//! * The store holds at most [`crate::state::MAX_APPROVAL_TEAMS`] teams; past that the
+//!   call earns the modelled `ServiceQuotaExceededException` (402), so a caller looping
+//!   on create cannot grow this process's memory without end.
+//!
+//! A new team is `PENDING` / `PENDING_ACTIVATION` until its approvers have answered their
+//! invitations; see [`crate::state`] for who materialises that.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +185,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApprovalTeam` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApprovalTeamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApprovalTeam"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApprovalTeamError::Modeled(
+                CreateApprovalTeamErrorModeled::InternalServerException(InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                }),
+            )
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        // `@idempotencyToken` replay: the same token answers with the team the first
+        // call minted, rather than minting a second one.
+        let client_token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(ToString::to_string);
+        if let Some(token) = client_token.as_deref() {
+            if let Some(arn) = state.idempotency_tokens.get(token).cloned() {
+                if let Some(team) = state.team(&arn) {
+                    return Ok(created(team));
+                }
+            }
+        }
+
+        if state.name_index.contains_key(&input.name) {
+            return Err(CreateApprovalTeamErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "An approval team named '{}' already exists in this account.",
+                    input.name
+                ),
+            })
+            .into());
+        }
+
+        // The store is bounded, so a caller looping on create cannot grow this process's
+        // memory without end. The model declares `ServiceQuotaExceededException` for
+        // exactly this.
+        if state.approval_teams.len() >= crate::state::MAX_APPROVAL_TEAMS {
+            return Err(CreateApprovalTeamErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The account has reached its quota of {} approval teams. Delete a team \
+                         or request a quota increase.",
+                        crate::state::MAX_APPROVAL_TEAMS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let approval_strategy = match &input.approval_strategy {
+            ApprovalStrategy::MofN(strategy) => crate::state::StoredApprovalStrategy::MofN {
+                min_approvals_required: strategy.min_approvals_required,
+            },
+        };
+        let approver_count = i32::try_from(input.approvers.len()).unwrap_or(i32::MAX);
+        if let Some(repeated) = crate::state::repeated_identity(
+            input
+                .approvers
+                .iter()
+                .map(|a| (a.primary_identity_id.as_str(), a.primary_identity_source_arn.as_str())),
+        ) {
+            return Err(CreateApprovalTeamErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Approvers names the same identity more than once ({repeated}); each \
+                     approver must be a distinct identity."
+                ),
+            })
+            .into());
+        }
+        if approval_strategy.min_approvals_required() > approver_count {
+            return Err(CreateApprovalTeamErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "ApprovalStrategy.MofN.MinApprovalsRequired ({}) must not exceed the number \
+                     of Approvers ({approver_count}).",
+                    approval_strategy.min_approvals_required()
+                ),
+            })
+            .into());
+        }
+
+        let approvers: Vec<crate::state::Approver> = input
+            .approvers
+            .iter()
+            .map(|requested| {
+                let approver_id = state.mint_approver_id();
+                crate::state::Approver::invited(
+                    approver_id,
+                    requested.primary_identity_id.clone(),
+                    requested.primary_identity_source_arn.clone(),
+                    now,
+                )
+            })
+            .collect();
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::team_arn(&region, &input.name);
+        let seq = state.next_team_seq();
+        let team = crate::state::ApprovalTeam {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            approval_strategy,
+            approvers,
+            policies: input
+                .policies
+                .iter()
+                .map(|policy| policy.policy_arn.clone())
+                .collect(),
+            version_id: FIRST_VERSION.to_string(),
+            version: FIRST_VERSION,
+            status: crate::state::TeamStatus::Pending,
+            status_code: Some(crate::state::TeamStatusCode::PendingActivation),
+            status_message: None,
+            creation_time: now,
+            last_update_time: None,
+            deletion_start_time: None,
+            deletion_completion_time: None,
+            tags: input
+                .tags
+                .as_ref()
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            seq,
+        };
+        state.insert_team(team);
+        if let Some(token) = client_token {
+            state.idempotency_tokens.insert(token, arn.clone());
+        }
+
+        // Read the answer back out of the store, so the response can only ever
+        // describe a team that was really recorded.
+        let Some(team) = state.team(&arn) else {
+            return Err(CreateApprovalTeamErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval team could not be read back after being stored"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(created(team))
+    }
+}
+
+/// Version a newly minted team carries.
+const FIRST_VERSION: u64 = 1;
+
+/// The `CreateApprovalTeam` response for a stored team.
+fn created(team: &crate::state::ApprovalTeam) -> CreateApprovalTeamOutput {
+    CreateApprovalTeamOutput {
+        arn: Some(team.arn.clone()),
+        name: Some(team.name.clone()),
+        version_id: Some(team.version_id.clone()),
+        creation_time: Some(::aws_smithy_types::DateTime::from(team.creation_time)),
     }
 }

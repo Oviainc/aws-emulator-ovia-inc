@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stream with this ARN from [`crate::state`] — its status,
+//! view type, key schema and shards — paged by `Limit` / `ExclusiveStartShardId` and
+//! narrowed by `ShardFilter`. An ARN no stream is registered under is
+//! `ResourceNotFoundException`, never a success with an empty description.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStream"))
+        // Reporting only: the description is read out of the store, and the one
+        // clock-driven value in it (`StreamStatus`) is DERIVED from the registration
+        // instant rather than written back.
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeStreamErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the DynamoDB Streams store is unavailable".to_string()),
+            })
+        })?;
+        let guard = state.lock();
+
+        let stream = guard.stream(&input.stream_arn).ok_or_else(|| {
+            DescribeStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "Requested resource not found: Stream: {} not found",
+                    input.stream_arn
+                )),
+            })
+        })?;
+
+        // `ShardFilter` currently has exactly one type, `CHILD_SHARDS`: "Contains the
+        // shardId of the parent shard for which you are requesting child shards."
+        // Neither member is `@required`, so a filter missing one is refused here.
+        let shards: Vec<&crate::state::StoredShard> = match &input.shard_filter {
+            Some(filter) => {
+                let Some(filter_type) = filter.r#type.as_deref() else {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "ShardFilter.Type is required when ShardFilter is present; the only \
+                         supported value is CHILD_SHARDS",
+                    ));
+                };
+                if filter_type != "CHILD_SHARDS" {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "ShardFilter.Type {filter_type} is not supported; the only supported \
+                         value is CHILD_SHARDS"
+                    )));
+                }
+                let Some(parent_shard_id) = filter.shard_id.as_deref() else {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "ShardFilter.ShardId is required when ShardFilter.Type is CHILD_SHARDS",
+                    ));
+                };
+                stream
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.parent_shard_id.as_deref() == Some(parent_shard_id))
+                    .collect()
+            }
+            None => stream.shards.iter().collect(),
+        };
+
+        let start_at = match &input.exclusive_start_shard_id {
+            Some(shard_id) => {
+                let Some(position) = shards.iter().position(|shard| &shard.shard_id == shard_id)
+                else {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "ExclusiveStartShardId {shard_id} does not identify a shard of stream {}",
+                        input.stream_arn
+                    )));
+                };
+                position + 1
+            }
+            None => 0,
+        };
+        // `Limit`'s declared range (1..) is enforced at the boundary; the documented
+        // ceiling of 100 shard objects is not modelled, so it is applied here.
+        let limit = usize::try_from(
+            input
+                .limit
+                .unwrap_or(crate::state::MAX_PAGE_LIMIT)
+                .clamp(1, crate::state::MAX_PAGE_LIMIT),
+        )
+        .unwrap_or(1);
+
+        let remaining = &shards[start_at.min(shards.len())..];
+        let page = &remaining[..remaining.len().min(limit)];
+        let last_evaluated_shard_id = (remaining.len() > page.len())
+            .then(|| page.last().map(|shard| shard.shard_id.clone()))
+            .flatten();
+
+        let shards_out: Vec<Shard> = page
+            .iter()
+            .map(|shard| Shard {
+                shard_id: Some(shard.shard_id.clone()),
+                parent_shard_id: shard.parent_shard_id.clone(),
+                sequence_number_range: Some(SequenceNumberRange {
+                    starting_sequence_number: Some(shard.starting_sequence_number.clone()),
+                    // Absent while the shard is open (able to receive more records).
+                    ending_sequence_number: shard.ending_sequence_number.clone(),
+                }),
+            })
+            .collect();
+
+        Ok(DescribeStreamOutput {
+            stream_description: Some(StreamDescription {
+                stream_arn: Some(stream.stream_arn.clone()),
+                stream_label: Some(stream.stream_label.clone()),
+                stream_status: Some(stream.status_at(now).as_str().to_string()),
+                stream_view_type: Some(stream.stream_view_type.as_str().to_string()),
+                creation_request_date_time: Some(::aws_smithy_types::DateTime::from_millis(
+                    crate::state::epoch_millis(stream.creation_request_date_time),
+                )),
+                table_name: Some(stream.table_name.clone()),
+                key_schema: Some(stream.key_schema.clone()),
+                shards: Some(shards_out),
+                last_evaluated_shard_id,
+            }),
+        })
     }
 }

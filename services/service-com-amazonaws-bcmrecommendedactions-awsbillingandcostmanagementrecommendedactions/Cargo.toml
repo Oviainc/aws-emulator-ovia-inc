@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Fingerprints the effective query a `nextToken` resumes, so a token cannot
+# resume a listing of a different filter/maxResults combination.
+sha2 = { workspace = true }
+# Renders that fingerprint (and the resume offset) as the token's hex text.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

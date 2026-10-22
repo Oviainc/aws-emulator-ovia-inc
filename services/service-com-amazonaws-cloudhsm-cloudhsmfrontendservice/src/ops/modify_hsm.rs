@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyHsm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyHsm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyHsm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Overwrites on the stored [`crate::state::Hsm`] record ONLY the members the request
+//! supplied; a member the request omits is left exactly as it was. Answers with the
+//! ARN of the HSM it modified.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyHsm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyHsmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyHsm"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ModifyHsmErrorModeled::CloudHsmInternalException(CloudHsmInternalException {
+                message: Some("the CloudHSM store is unavailable".to_string()),
+                retryable: false,
+            })
+        })?;
+
+        // The model's `IpAddress` pattern bounds each octet's DIGIT COUNT only, so an
+        // out-of-range address reaches the handler; refuse it before touching state so a
+        // rejected request changes nothing.
+        for (member, value) in [("EniIp", &input.eni_ip), ("SyslogIp", &input.syslog_ip)] {
+            if let Some(value) = value.as_deref() {
+                if !crate::state::is_ipv4_address(value) {
+                    return Err(ModifyHsmErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!("{member} must be a valid IPv4 address")),
+                            retryable: false,
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // A well-formed ARN no stored HSM answers to is a service exception, not a
+        // silent success on a resource that does not exist.
+        let hsm = state
+            .hsms
+            .get_mut(&input.hsm_arn)
+            .ok_or_else(unknown_hsm)?;
+
+        // Only the supplied members move. Each `if let` is the whole rule: `None` means
+        // "not supplied", which leaves the stored value untouched rather than clearing
+        // it.
+        if let Some(subnet_id) = input.subnet_id {
+            // Moving the HSM to another subnet moves it to that subnet's VPC and zone,
+            // because both are properties of the subnet.
+            if subnet_id != hsm.subnet_id {
+                let placement = crate::state::subnet_placement(&subnet_id, &region);
+                hsm.vpc_id = placement.vpc_id;
+                hsm.availability_zone = placement.availability_zone;
+            }
+            hsm.subnet_id = subnet_id;
+        }
+        if let Some(eni_ip) = input.eni_ip {
+            hsm.eni_ip = Some(eni_ip);
+        }
+        if let Some(iam_role_arn) = input.iam_role_arn {
+            hsm.iam_role_arn = iam_role_arn;
+        }
+        if let Some(external_id) = input.external_id {
+            hsm.external_id = Some(external_id);
+        }
+        if let Some(syslog_ip) = input.syslog_ip {
+            hsm.syslog_ip = Some(syslog_ip);
+        }
+
+        Ok(ModifyHsmOutput {
+            hsm_arn: Some(hsm.hsm_arn.clone()),
+        })
     }
+}
+
+/// The modelled refusal for an `HsmArn` that is well formed but names no stored HSM.
+fn unknown_hsm() -> ModifyHsmError {
+    ModifyHsmErrorModeled::CloudHsmServiceException(CloudHsmServiceException {
+        message: Some("no HSM matches the identifier in the request".to_string()),
+        retryable: false,
+    })
+    .into()
 }

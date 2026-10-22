@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRepository
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRepository`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRepository::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: persists a new repository in `crate::state` and answers with the
+//! stored repository's metadata.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +192,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRepository` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRepositoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRepository"))
+        // `repositoryName`'s length and pattern are modeled, so the boundary
+        // validator already refused anything outside them. What is left is the
+        // documented rule the model cannot express: "The suffix .git is prohibited."
+        if input.repository_name.to_ascii_lowercase().ends_with(".git") {
+            return Err(CreateRepositoryErrorModeled::InvalidRepositoryNameException(
+                InvalidRepositoryNameException {
+                    message: Some(format!(
+                        "the repository name {} is not valid: the suffix .git is prohibited",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The specified tag is not valid. Key names cannot be prefixed with aws:."
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+        if let Some(key) = tags.keys().find(|key| key.starts_with("aws:")) {
+            return Err(CreateRepositoryErrorModeled::InvalidSystemTagUsageException(
+                InvalidSystemTagUsageException {
+                    message: Some(format!(
+                        "the tag key {key} is not valid: key names cannot be prefixed with aws:"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure: every handler in this crate refuses it the same
+            // way, with the scaffold's `ValidationException`, rather than claiming
+            // a KMS integrity check failed.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        if store.repositories.contains_key(&input.repository_name) {
+            return Err(CreateRepositoryErrorModeled::RepositoryNameExistsException(
+                RepositoryNameExistsException {
+                    message: Some(format!(
+                        "the repository name {} already exists",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store holds at most `REPOSITORY_QUOTA` repositories: a caller can
+        // create one per request, so this is what bounds the map. Each is released
+        // by DeleteRepository.
+        if store.repositories.len() >= crate::state::REPOSITORY_QUOTA {
+            return Err(CreateRepositoryErrorModeled::RepositoryLimitExceededException(
+                RepositoryLimitExceededException {
+                    message: Some(format!(
+                        "a repository resource limit was exceeded: this account already holds {} repositories",
+                        crate::state::REPOSITORY_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let repository = crate::state::Repository::new(
+            &input.repository_name,
+            input.repository_description.clone(),
+            input.kms_key_id.clone(),
+            tags,
+            &crate::state::region_of(ctx.parts()),
+            std::time::SystemTime::now(),
+        );
+        let metadata = repository.metadata();
+        store
+            .repositories
+            .insert(input.repository_name.clone(), repository);
+
+        Ok(CreateRepositoryOutput {
+            repository_metadata: Some(metadata),
+        })
     }
 }

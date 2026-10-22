@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the stored member records for exactly the accounts asked about; an
+//! account with no membership in the graph is reported as unprocessed, never
+//! fabricated as a member.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMembers"))
+        let _ = ctx;
+        // `GraphArn`'s pattern, `AccountIds`' 1..50 length and each entry's 12-digit
+        // `AccountId` pattern are modelled constraints, so the centralized walk has
+        // already refused anything outside them with a 400 before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMembersErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            GetMembersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("behavior graph {} does not exist", input.graph_arn)),
+            })
+        })?;
+        // The ONLY write a report makes: each member's verification was due at an
+        // instant the clock has already passed, so it is materialised here rather than
+        // reported as still outstanding. See `crate::state::Member::settle`.
+        graph.settle_members(now);
+
+        let mut member_details = Vec::with_capacity(input.account_ids.len());
+        let mut unprocessed_accounts = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+
+        for account_id in &input.account_ids {
+            // An account named twice is one account: it is reported once, in the
+            // position it was first asked about.
+            if !seen.insert(account_id.clone()) {
+                continue;
+            }
+            match graph.members.get(account_id) {
+                Some(member) => member_details.push(member.detail()),
+                // No membership is stored for this account in this graph, so there is
+                // nothing to report about it: it goes in `UnprocessedAccounts` with
+                // the reason, rather than being invented as a member.
+                None => unprocessed_accounts.push(crate::state::unprocessed(
+                    account_id,
+                    "The account is not a member account in the behavior graph.".to_string(),
+                )),
+            }
+        }
+
+        Ok(GetMembersOutput {
+            member_details: Some(member_details),
+            unprocessed_accounts: Some(unprocessed_accounts),
+        })
     }
 }

@@ -96,17 +96,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // ECR Public states an input it will not accept as `InvalidParameterException`
+        // ("The specified parameter is invalid. Review the available parameters for the
+        // API request.") — the one client-input error every operation in this model
+        // declares; the model carries no `ValidationException` at all. So a request the
+        // framework refuses before a handler runs (an absent `repositoryName`, a name
+        // outside 2..205 or `^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*$`,
+        // a `maxResults` outside 1..1000, an `imageIds` list longer than 100) is
+        // reworded to that code, keeping the framework's description of WHAT was refused
+        // as the message. The status stays with the protocol: awsJson1_1 renders a
+        // refusal as HTTP 400, which is `InvalidParameterException`'s modelled status.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidParameterException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
+                    "The specified parameter is invalid. Review the available parameters for \
+                     the API request."
+                        .to_string()
+                }),
+            }),
+            // Authentication is not this service's concern; the framework's 403 wording
+            // is already what a caller needs.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

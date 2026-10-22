@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored association of the (ProfileId, ResourceId) pair and
+//! reports the removed record with `Status` `DELETING`.
 //!
 //! ## Shape of an operation
 //!
@@ -88,10 +81,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53profiles-route53
 // here — hence the `DisassociateProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53profiles#DisassociateProfile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53profiles#DisassociateProfile",
+    extra_errors = ["InternalServiceErrorException"]
+)]
 #[derive(Debug)]
 pub enum DisassociateProfileErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServiceErrorException(InternalServiceErrorException),
     InvalidParameterException(InvalidParameterException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -150,18 +147,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateProfile"))
+        // Nothing here is derived from the request's region: the association's ARN was
+        // built once at create time and is read back off the stored record, so its tag
+        // entry is removed whatever region this request is signed for.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateProfileErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some(crate::state::NO_STORE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The path names the pair, not the association id, so the stored association
+        // is resolved through the pair it holds. A pair that is not associated — which
+        // is what a retry of a call that already succeeded names — is not found.
+        let association_id = store
+            .association_id_for_pair(&input.profile_id, &input.resource_id)
+            .ok_or_else(|| {
+                DisassociateProfileErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Profile {} is not associated with resource {}.",
+                            input.profile_id, input.resource_id
+                        )),
+                        resource_type: Some(
+                            crate::state::PROFILE_ASSOCIATION_RESOURCE_TYPE.to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        // Remove it, then report the record as it stood at removal: the association is
+        // gone from the store, so `Status` is `DELETING` and `ModificationTime` is the
+        // instant it was removed.
+        let mut removed = store
+            .profile_associations
+            .remove(&association_id)
+            .expect("the id just resolved from the stored pair");
+        store.tags.remove(&removed.arn);
+        removed.status = crate::state::STATUS_DELETING.to_string();
+        removed.modification_time = ::std::time::SystemTime::now();
+        Ok(DisassociateProfileOutput {
+            profile_association: Some(crate::state::profile_association_shape(&removed)),
+        })
     }
 }

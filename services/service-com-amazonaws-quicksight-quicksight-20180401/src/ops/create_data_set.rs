@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +207,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataSetErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+
+        // `ImportMode` is a modelled enum: only a member of it names an import mode.
+        // The catalog is the generated one, straight from the model.
+        if !DATA_SET_IMPORT_MODE_VALUES.contains(&input.import_mode.as_str()) {
+            return Err(CreateDataSetErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "ImportMode must be one of {}; got {}.",
+                        DATA_SET_IMPORT_MODE_VALUES.join(", "),
+                        input.import_mode
+                    )),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        if input.data_set_id.is_empty() {
+            return Err(CreateDataSetErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some("DataSetId must not be empty.".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::data_set_arn(&region, &input.aws_account_id, &input.data_set_id);
+        let now = std::time::SystemTime::now();
+        let created_time = crate::state::now_timestamp(now);
+
+        let mut store = state.lock();
+        let key = (input.aws_account_id.clone(), input.data_set_id.clone());
+        if store.data_sets.contains_key(&key) {
+            return Err(CreateDataSetErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The data set with ID {} already exists.",
+                        input.data_set_id
+                    )),
+                    resource_type: Some("DATA_SET".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The store key is `(AwsAccountId, DataSetId)` and BOTH halves come from the
+        // request, so a per-account ceiling alone would be reset by varying the account
+        // id. The total-records ceilings are what bound this process — the ingestion one
+        // explicitly, so that map's bound does not rest on reasoning about this one —
+        // and the per-account ceiling is the fidelity limit on top of them.
+        if store.data_sets.len() >= crate::state::MAX_DATA_SETS
+            || store.ingestions.len() >= crate::state::MAX_INGESTIONS
+        {
+            return Err(CreateDataSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} data sets.",
+                        crate::state::MAX_DATA_SETS
+                    )),
+                    resource_type: Some("DATA_SET".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        if store.data_set_count(&input.aws_account_id) >= crate::state::MAX_DATA_SETS_PER_ACCOUNT {
+            return Err(CreateDataSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} data sets.",
+                        crate::state::MAX_DATA_SETS_PER_ACCOUNT
+                    )),
+                    resource_type: Some("DATA_SET".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // Every physical table reads a data source, named by ARN. A table naming an
+        // ARN no stored data source in this account has is a reference to a resource
+        // that does not exist.
+        let mut table_keys: Vec<&String> = input.physical_table_map.keys().collect();
+        table_keys.sort();
+        for table_key in table_keys {
+            let Some(table) = input.physical_table_map.get(table_key) else {
+                continue;
+            };
+            let data_source_arn = crate::state::physical_table_data_source_arn(table);
+            if store
+                .data_source_by_arn(&input.aws_account_id, data_source_arn)
+                .is_none()
+            {
+                return Err(CreateDataSetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "PhysicalTableMap entry {table_key} names data source {data_source_arn}, which does not exist."
+                        )),
+                        resource_type: Some("DATA_SOURCE".to_string()),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let output_columns = crate::state::derive_output_columns(&input.physical_table_map);
+
+        store.data_sets.insert(
+            key,
+            crate::state::DataSetRecord {
+                arn: arn.clone(),
+                data_set_id: input.data_set_id.clone(),
+                name: input.name,
+                created_time,
+                last_updated_time: created_time,
+                import_mode: input.import_mode.clone(),
+                physical_table_map: input.physical_table_map,
+                logical_table_map: input.logical_table_map,
+                output_columns,
+                column_groups: input.column_groups,
+                field_folders: input.field_folders,
+                row_level_permission_data_set: input.row_level_permission_data_set,
+                row_level_permission_tag_configuration: input
+                    .row_level_permission_tag_configuration,
+                column_level_permission_rules: input.column_level_permission_rules,
+                data_set_usage_configuration: input.data_set_usage_configuration,
+                dataset_parameters: input.dataset_parameters,
+                performance_configuration: input.performance_configuration,
+                use_as: input.use_as,
+                data_prep_configuration: input.data_prep_configuration,
+                semantic_model_configuration: input.semantic_model_configuration,
+                permissions: input.permissions.unwrap_or_default(),
+                tags: input.tags.unwrap_or_default(),
+                // Nothing has been loaded into SPICE yet.
+                consumed_spice_capacity_in_bytes: 0,
+            },
+        );
+
+        // A SPICE data set is loaded into SPICE, so creating one starts an ingestion
+        // and reports its id; a DIRECT_QUERY data set queries its source in place and
+        // has none.
+        let (ingestion_id, ingestion_arn) = if input.import_mode
+            == crate::state::IMPORT_MODE_SPICE
+        {
+            let ingestion_id = crate::state::next_ingestion_id();
+            let ingestion_arn = crate::state::ingestion_arn(
+                &region,
+                &input.aws_account_id,
+                &input.data_set_id,
+                &ingestion_id,
+            );
+            store.ingestions.insert(
+                (
+                    input.aws_account_id.clone(),
+                    input.data_set_id.clone(),
+                    ingestion_id.clone(),
+                ),
+                crate::state::IngestionRecord {
+                    arn: ingestion_arn.clone(),
+                    ingestion_id: ingestion_id.clone(),
+                    ingestion_status: crate::state::INGESTION_STATUS_INITIALIZED.to_string(),
+                    created_time,
+                    request_source: crate::state::INGESTION_REQUEST_SOURCE_MANUAL.to_string(),
+                    completes_at: now + crate::state::INGESTION_DURATION,
+                },
+            );
+            (Some(ingestion_id), Some(ingestion_arn))
+        } else {
+            (None, None)
+        };
+
+        Ok(CreateDataSetOutput {
+            arn: Some(arn),
+            data_set_id: Some(input.data_set_id),
+            ingestion_arn,
+            ingestion_id,
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

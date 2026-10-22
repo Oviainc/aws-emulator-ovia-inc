@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBranches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBranches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBranches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -84,16 +75,23 @@ use super::types::*;
 // `ListBranchesError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplify-amplify.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListBranchesError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplify#ListBranches")]
+// The operation's MODELED errors, widened by `NotFoundException`.
+//
+// `extra_errors` is deliberate: `ListBranches` takes `appId` as an @httpLabel, so a
+// request can name an app that does not exist, and the only honest answer is the
+// same 404 every other app-scoped operation gives. The model's error union for THIS
+// operation omits the shape (the service declares it, and `GetBranch`,
+// `CreateBranch`, `GetApp` and `DeleteApp` all list it), so the widening keeps one
+// rule across the resource instead of inventing a second one here.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplify#ListBranches",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ListBranchesErrorModeled {
     BadRequestException(BadRequestException),
     InternalFailureException(InternalFailureException),
+    NotFoundException(NotFoundException),
     UnauthorizedException(UnauthorizedException),
 }
 
@@ -146,20 +144,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBranches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBranchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBranches"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBranchesErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // Every `nextToken` this operation issues is a `branchName`, so a token that
+        // could not be one was never issued by this service: refuse it instead of
+        // serving an arbitrary suffix of the collection for it.
+        if let Some(token) = input.next_token.as_deref() {
+            if !is_branch_name(token) {
+                return Err(ListBranchesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some("Invalid nextToken".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A pure read, scoped to ONE app: the branches are read out of that app's own
+        // map, so no other app's branch can appear in the page.
+        let store = state.lock();
+        let app = store.apps.get(&input.app_id).ok_or_else(|| {
+            ListBranchesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("App {} not found", input.app_id)),
+            })
+        })?;
+
+        let (branches, next_token) = crate::state::page(
+            app.branches
+                .iter()
+                .map(|(branch_name, branch)| (branch_name.clone(), branch.clone())),
+            input.next_token.as_deref(),
+            crate::state::page_size(input.max_results, MAX_RESULTS),
+        );
+
+        Ok(ListBranchesOutput {
+            branches,
+            next_token,
+        })
     }
+}
+
+/// The largest page `ListBranches` serves, and the page it serves a caller that set
+/// no bound: `maxResults` is modelled `range 0..50`
+/// (`smithy_query(query="operation",operation="ListBranches")`).
+const MAX_RESULTS: usize = 50;
+
+/// Could `value` be a `branchName`? `BranchName` is modelled `length 1..255,
+/// pattern ^(?s).+$` (`smithy_query(query="shape",shape="Branch")`), which admits any
+/// non-empty text up to 255 characters.
+///
+/// A token naming a branch that has since been DELETED still satisfies this and is
+/// still honoured — the scan resumes at the next name — so a page boundary survives
+/// a concurrent delete, which is the behaviour a paging client depends on.
+fn is_branch_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 255
 }

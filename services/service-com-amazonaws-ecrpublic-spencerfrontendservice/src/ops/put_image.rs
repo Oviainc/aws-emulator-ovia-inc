@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a manifest under a repository held in [`crate::state`], keyed by the
+//! `sha256:` digest of the manifest bytes, and reports the image that was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +179,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutImage"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutImageErrorModeled::ServerException(ServerException {
+                message: Some(
+                    "The ECR Public emulator could not reach its state store.".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        // An image's identity is the sha256 digest of its manifest, so a digest the
+        // caller supplied is a claim about the bytes it sent and is checked against them.
+        let digest = crate::state::manifest_digest(&input.image_manifest);
+        if let Some(claimed) = input
+            .image_digest
+            .as_deref()
+            .filter(|claimed| !claimed.is_empty())
+        {
+            if claimed != digest {
+                return Err(PutImageErrorModeled::ImageDigestDoesNotMatchException(
+                    ImageDigestDoesNotMatchException {
+                        message: Some(format!(
+                            "The image digest '{claimed}' does not match the digest of the \
+                             supplied manifest ('{digest}')"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The manifest carries its own media types: `mediaType` is the manifest's, and
+        // `config.mediaType` is the artifact's. A request that declares
+        // `imageManifestMediaType` overrides the former; neither is invented when the
+        // manifest does not state it.
+        let manifest_json: Option<serde_json::Value> =
+            serde_json::from_str(&input.image_manifest).ok();
+        let media_type_of = |value: Option<&serde_json::Value>| -> Option<String> {
+            value
+                .and_then(|value| value.get("mediaType"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        let manifest_media_type = input
+            .image_manifest_media_type
+            .clone()
+            .or_else(|| media_type_of(manifest_json.as_ref()));
+        let artifact_media_type = media_type_of(manifest_json.as_ref().and_then(|m| m.get("config")));
+
+        let image_tag = input.image_tag.as_deref().filter(|tag| !tag.is_empty());
+        let pushed_at = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        if let Some(registry_id) = input.registry_id.as_deref() {
+            if !store.is_this_registry(registry_id) {
+                return Err(PutImageErrorModeled::RegistryNotFoundException(
+                    RegistryNotFoundException {
+                        message: Some(format!(
+                            "The registry with id or alias '{registry_id}' does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let registry_id = store.registry_id.clone();
+        let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            return Err(PutImageErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(format!(
+                        "The repository with name '{}' does not exist in the registry with id \
+                         '{registry_id}'",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Re-pushing a manifest already in the repository is only a success when it
+        // brings a tag the stored image does not carry yet: a tag is mutable, so it
+        // moves onto this digest. Pushing the same digest with nothing new is a
+        // duplicate.
+        if let Some(stored) = repository.images.get(&digest) {
+            let brings_new_tag = image_tag.is_some_and(|tag| !stored.tags.contains(tag));
+            if !brings_new_tag {
+                return Err(PutImageErrorModeled::ImageAlreadyExistsException(
+                    ImageAlreadyExistsException {
+                        message: Some(match image_tag {
+                            Some(tag) => format!(
+                                "Image with digest '{digest}' and tag '{tag}' already exists \
+                                 in the repository with name '{}' in the registry with id \
+                                 '{registry_id}'",
+                                repository.name
+                            ),
+                            None => format!(
+                                "Image with digest '{digest}' already exists in the repository \
+                                 with name '{}' in the registry with id '{registry_id}'",
+                                repository.name
+                            ),
+                        }),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store lives for the life of the process and this is the only operation
+        // that adds an image to it, so both counts it grows are capped: a reader must
+        // still be able to answer what was stored, which rules out a TTL or an eviction
+        // policy. The manifest cap matters most — `imageManifest` is modelled up to
+        // 4 MiB of caller-supplied text.
+        let new_image = !repository.images.contains_key(&digest);
+        let new_tag = image_tag.is_some_and(|tag| !repository.tag_index.contains_key(tag));
+        let over_limit = if new_image
+            && repository.images.len() >= crate::state::MAX_IMAGES_PER_REPOSITORY
+        {
+            Some(format!(
+                "it would have exceeded this repository's limit of {} images",
+                crate::state::MAX_IMAGES_PER_REPOSITORY
+            ))
+        } else if new_tag
+            && repository.tag_index.len() >= crate::state::MAX_IMAGE_TAGS_PER_REPOSITORY
+        {
+            Some(format!(
+                "it would have exceeded this repository's limit of {} image tags",
+                crate::state::MAX_IMAGE_TAGS_PER_REPOSITORY
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = over_limit {
+            return Err(PutImageErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!("The operation didn't succeed because {reason}")),
+                },
+            )
+            .into());
+        }
+
+        // A tag names exactly one digest, so pushing a tag that currently points at
+        // another manifest moves it; the manifest it left keeps its remaining tags.
+        if let Some(tag) = image_tag {
+            if let Some(previous) = repository.tag_index.insert(tag.to_string(), digest.clone()) {
+                if previous != digest {
+                    if let Some(image) = repository.images.get_mut(&previous) {
+                        image.tags.remove(tag);
+                    }
+                }
+            }
+        }
+
+        let stored = repository
+            .images
+            .entry(digest.clone())
+            .or_insert_with(|| crate::state::StoredImage {
+                digest: digest.clone(),
+                manifest: input.image_manifest.clone(),
+                manifest_media_type: manifest_media_type.clone(),
+                artifact_media_type,
+                size_in_bytes: input.image_manifest.len() as i64,
+                pushed_at,
+                tags: ::std::collections::BTreeSet::new(),
+            });
+        if let Some(tag) = image_tag {
+            stored.tags.insert(tag.to_string());
+        }
+        let image = Image {
+            registry_id: Some(registry_id),
+            repository_name: Some(input.repository_name.clone()),
+            image_id: Some(ImageIdentifier {
+                image_digest: Some(stored.digest.clone()),
+                image_tag: image_tag.map(ToString::to_string),
+            }),
+            image_manifest: Some(stored.manifest.clone()),
+            image_manifest_media_type: stored.manifest_media_type.clone(),
+        };
+        drop(store);
+
+        Ok(PutImageOutput { image: Some(image) })
     }
 }

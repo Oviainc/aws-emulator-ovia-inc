@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Looks the cluster up in the shared engine and answers with the
+//! [`crate::state::ClusterRecord`] `RunJobFlow` persisted, projected to the modelled
+//! `Cluster` shape. An id no cluster carries is refused with `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +134,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCluster"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Reporting only: `cluster_mut` materialises the transitions the clock already
+        // made due (STARTING -> RUNNING/WAITING, TERMINATING -> TERMINATED), which were
+        // owed at this instant whether or not anybody described the cluster.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(DescribeClusterErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster id '{}' is not valid or does not exist.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeClusterOutput {
+            cluster: Some(cluster.to_cluster()),
+        })
     }
 }

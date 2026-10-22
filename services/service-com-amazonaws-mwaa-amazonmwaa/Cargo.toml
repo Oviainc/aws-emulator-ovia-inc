@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Content-derived identifiers: the environment-id segment of the Apache Airflow web
+# server host and the vpce-svc id of each VPC endpoint service name are digests of the
+# environment's own ARN, so they are stable across reads and unique per environment.
+sha2 = { workspace = true }
+# Opaque pagination cursors: hex-encode the internal list cursor so `NextToken` is a
+# single-token string a client only ever echoes back.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

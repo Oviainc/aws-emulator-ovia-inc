@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +202,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApp"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAppErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // One instant for both stamps: an app Amplify has only just created has not
+        // been updated since, so `createTime` and `updateTime` are equal.
+        let created = crate::state::now();
+
+        let mut store = state.lock();
+
+        // The quota is enforced BEFORE anything is minted or stored, so a refused
+        // create leaves the store exactly as it was and the number of records one
+        // caller can accumulate is bounded.
+        if store.apps.len() >= MAX_APPS {
+            return Err(CreateAppErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(format!(
+                    "Number of apps exceeds the limit of {MAX_APPS} for this account and Region"
+                )),
+            })
+            .into());
+        }
+
+        let app_id = store.mint_app_id();
+
+        let app = App {
+            app_arn: ::emulator_server::emulator_arn("amplify", &region, &format!("apps/{app_id}")),
+            // `defaultDomain` is the hostname Amplify serves the app on; every app
+            // gets `<appId>.amplifyapp.com`, which is why the modelled member is
+            // @required and never empty.
+            default_domain: format!("{app_id}.amplifyapp.com"),
+            app_id,
+            name: input.name,
+            tags: input.tags,
+            // The @required members below have no value in a request that omits
+            // them, so the record carries the empty value of the member's type.
+            description: input.description.unwrap_or_default(),
+            repository: input.repository.unwrap_or_default(),
+            platform: input.platform.unwrap_or_else(|| DEFAULT_PLATFORM.to_string()),
+            create_time: created,
+            update_time: created,
+            compute_role_arn: input.compute_role_arn,
+            iam_service_role_arn: input.iam_service_role_arn,
+            environment_variables: input.environment_variables.unwrap_or_default(),
+            enable_branch_auto_build: input.enable_branch_auto_build.unwrap_or(false),
+            enable_branch_auto_deletion: input.enable_branch_auto_deletion,
+            enable_basic_auth: input.enable_basic_auth.unwrap_or(false),
+            basic_auth_credentials: input.basic_auth_credentials,
+            custom_rules: input.custom_rules,
+            // A production branch is a property of a DEPLOYED branch, and a new app
+            // has no branches at all.
+            production_branch: None,
+            build_spec: input.build_spec,
+            custom_headers: input.custom_headers,
+            enable_auto_branch_creation: input.enable_auto_branch_creation,
+            auto_branch_creation_patterns: input.auto_branch_creation_patterns,
+            auto_branch_creation_config: input.auto_branch_creation_config,
+            // `repositoryCloneMethod` is documented "for internal use": Amplify sets
+            // it from the credential kind it used to reach the repository, and this
+            // emulator reaches no repository.
+            repository_clone_method: None,
+            // App$cacheConfig: "If you don't specify the cache configuration type,
+            // Amplify uses the default AMPLIFY_MANAGED setting."
+            cache_config: Some(input.cache_config.unwrap_or_else(|| CacheConfig {
+                r#type: DEFAULT_CACHE_CONFIG_TYPE.to_string(),
+            })),
+            // Set when Amplify creates a webhook in the connected Git repository,
+            // which creating an app does not do.
+            webhook_create_time: None,
+            waf_configuration: None,
+            job_config: input.job_config,
+        };
+
+        // `accessToken` / `oauthToken` are deliberately NOT persisted: both members
+        // document "The token is not stored.", and neither appears on `App`.
+        store
+            .apps
+            .insert(app.app_id.clone(), crate::state::AmplifyApp::new(app.clone()));
+
+        Ok(CreateAppOutput { app })
     }
 }
+
+/// The platform an app created without one carries.
+///
+/// `Platform` is modelled `WEB | WEB_COMPUTE | WEB_DYNAMIC` and `App$platform` is
+/// @required, so an app created without one still has to carry a value: `WEB`, the
+/// static app, is the case the member's own documentation describes as the plain one
+/// ("For a static app, set the platform type to WEB").
+const DEFAULT_PLATFORM: &str = "WEB";
+
+/// The cache configuration an app created without one gets, per `App$cacheConfig`:
+/// "If you don't specify the cache configuration `type`, Amplify uses the default
+/// `AMPLIFY_MANAGED` setting."
+const DEFAULT_CACHE_CONFIG_TYPE: &str = "AMPLIFY_MANAGED";
+
+/// How many apps may exist at once, past which `CreateApp` answers the modelled
+/// `LimitExceededException` (HTTP 429, "A resource could not be created because
+/// service quotas were exceeded").
+///
+/// AWS Amplify's published service quotas give "Apps per Region" a default of 25
+/// (an adjustable quota), so that is the bound this emulator enforces: it keeps the
+/// store from growing without limit on repeated creates, and it is the same refusal
+/// a real account past its quota gets.
+const MAX_APPS: usize = 25;

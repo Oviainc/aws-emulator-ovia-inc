@@ -21,6 +21,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes/decodes the opaque `NextToken` ListGraphs and ListMembers hand out.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

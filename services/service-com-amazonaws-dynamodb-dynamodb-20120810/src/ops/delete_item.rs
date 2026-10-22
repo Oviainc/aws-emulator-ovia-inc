@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the item named by `Key` from the stored table, so a later
+//! `GetItem` reports it gone and `Query` no longer lists it. `ReturnValues=ALL_OLD`
+//! reports the removed attributes; deleting a key that holds no item is a success
+//! with nothing to report (DynamoDB's delete is idempotent). An unknown — or not yet
+//! `ACTIVE` — table is `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Conditional deletes (`ConditionExpression`, the legacy `Expected`) are refused
+//! with the scaffold's 501 and filed as their own gap issue.
 //!
 //! ## Shape of an operation
 //!
@@ -261,18 +260,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteItem"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+
+        if input.condition_expression.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteItem with ConditionExpression",
+            ));
+        }
+        if input.expected.as_ref().is_some_and(|map| !map.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteItem with Expected",
+            ));
+        }
+        // The other two condition-path members are refused the same way rather than
+        // accepted and dropped, so this handler is no more permissive than the real
+        // service on a path it does not serve.
+        if input.conditional_operator.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteItem with ConditionalOperator",
+            ));
+        }
+        if input.return_values_on_condition_check_failure.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteItem with ReturnValuesOnConditionCheckFailure",
+            ));
+        }
+        // Like PutItem, DeleteItem accepts only NONE and ALL_OLD
+        // (`DeleteItem$ReturnValues`).
+        let return_old = match input.return_values.as_deref() {
+            None | Some("NONE") => false,
+            Some("ALL_OLD") => true,
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ReturnValues can only be ALL_OLD or NONE for DeleteItem, got {other}"
+                )))
+            }
+        };
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let key = {
+            let table = store.active_table(&name, now).map_err(lift)?;
+            table.key_of_key_map(&input.key).map_err(lift)?
+        };
+        let removed = store.delete_item(&name, now, &key).map_err(lift)?;
+
+        let size = removed.as_ref().map_or(0, crate::state::item_size);
+        Ok(DeleteItemOutput {
+            attributes: if return_old { removed } else { None },
+            consumed_capacity: crate::state::consumed_capacity(
+                input.return_consumed_capacity.as_deref(),
+                &name,
+                crate::state::write_capacity_units(size),
+            ),
+            // ItemCollectionMetrics is reported only for a table that has a local
+            // secondary index, which this slice does not create.
+            item_collection_metrics: None,
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> DeleteItemError {
+    DeleteItemErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> DeleteItemError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            DeleteItemErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

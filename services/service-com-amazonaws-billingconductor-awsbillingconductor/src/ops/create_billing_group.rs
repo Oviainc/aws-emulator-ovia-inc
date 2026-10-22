@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBillingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBillingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints and PERSISTS a billing group: the membership, the computation preference
+//! and the account-association index the list operations read back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBillingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SIMPLIFICATION: a `ClientToken` replay answers with the ARN the token's first
+//! call minted WITHOUT comparing the rest of the request, so a token reused with a
+//! different body is served the earlier group rather than refused. The model
+//! declares no idempotent-parameter-mismatch error for this operation, and the
+//! documented contract it does state — a retry completes without performing any
+//! further actions — is honoured either way.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +134,16 @@ impl From<CreateBillingGroupErrorModeled> for CreateBillingGroupError {
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`,
+/// naming the `ValidationExceptionReason` the model enumerates and the member at
+/// fault.
+fn validation(reason: &str, field: &str, message: String) -> CreateBillingGroupError {
+    CreateBillingGroupErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
+}
+
 /// The `CreateBillingGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +180,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBillingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBillingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBillingGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateBillingGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // An idempotent retry answers with the ARN the first call minted and creates
+        // no second group.
+        if let Some(arn) = state.replayed_idempotent_arn(Self::NAME, input.client_token.as_deref())
+        {
+            return Ok(CreateBillingGroupOutput { arn: Some(arn) });
+        }
+
+        // "The billing group name. The names must be unique."
+        if let Some(existing) = state.billing_group_names.get(&input.name).cloned() {
+            return Err(CreateBillingGroupErrorModeled::ConflictException(ConflictException {
+                message: "a billing group with this name already exists".to_string(),
+                resource_id: existing,
+                resource_type: "billinggroup".to_string(),
+                reason: Some("RESOURCE_NAME_CONFLICT".to_string()),
+            })
+            .into());
+        }
+
+        // The computation preference must name a pricing plan that exists. This
+        // operation models no `ResourceNotFoundException`, so the modelled answer is
+        // `ValidationException` with the reason the model enumerates for it.
+        let plan_arn =
+            crate::state::normalize_pricing_plan_arn(&input.computation_preference.pricing_plan_arn);
+        if !state.pricing_plan_exists(&plan_arn) {
+            return Err(validation(
+                "MISSING_PRICINGPLAN",
+                "ComputationPreference.PricingPlanArn",
+                format!("the pricing plan {plan_arn} does not exist"),
+            ));
+        }
+
+        let linked_account_ids = input
+            .account_grouping
+            .linked_account_ids
+            .clone()
+            .unwrap_or_default();
+
+        // One request may not name the same account twice.
+        if let Some(duplicate) = crate::state::first_duplicate(&linked_account_ids) {
+            return Err(validation(
+                "DUPLICATE_ACCOUNT",
+                "AccountGrouping.LinkedAccountIds",
+                format!("account {duplicate} is listed more than once"),
+            ));
+        }
+
+        // "Account IDs must be ... not associated with another billing group." The
+        // same state method `AssociateAccounts` uses decides it, so the
+        // one-account-one-group rule lives in one place; the group being created has
+        // no ARN yet, so EVERY existing association of one of its accounts conflicts.
+        // The refusal is permanent — it is the other group's membership that has to
+        // change — so the message names the group that owns the account.
+        for account_id in &linked_account_ids {
+            if let Some(owner) = state
+                .conflicting_association(account_id, "")
+                .map(str::to_string)
+            {
+                return Err(CreateBillingGroupErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "the account is already associated with billing group {owner}"
+                        ),
+                        resource_id: account_id.clone(),
+                        resource_type: "account".to_string(),
+                        // No `Reason`: none of the values `ConflictExceptionReason`
+                        // enumerates describes an account that belongs to another
+                        // billing group, and `WRITE_CONFLICT_RETRY` would promise a
+                        // retry that can never succeed — the other group's
+                        // membership has to change first. The member is optional in
+                        // the model, so the honest answer is to omit it.
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Nothing in this slice deletes a pricing plan and a group is deleted only
+        // when the caller asks, so both stores are bounded by an explicit maximum
+        // and a create past it is refused rather than served by evicting a resource
+        // a later caller must still be able to read.
+        if state.billing_groups.len() >= crate::state::MAX_BILLING_GROUPS {
+            return Err(CreateBillingGroupErrorModeled::ServiceLimitExceededException(
+                ServiceLimitExceededException {
+                    message: format!(
+                        "the maximum number of billing groups ({}) already exists",
+                        crate::state::MAX_BILLING_GROUPS
+                    ),
+                    resource_id: None,
+                    resource_type: Some("billinggroup".to_string()),
+                    limit_code: "BillingGroupsPerAccount".to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // 12 characters, within the `[a-zA-Z0-9]{10,12}` the `BillingGroupArn`
+        // pattern allows.
+        let id = state.mint_resource_id(12);
+        let arn = crate::state::billing_group_arn(&id);
+        let now = crate::state::now_millis();
+        let record = crate::state::BillingGroupRecord {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            primary_account_id: input.primary_account_id.clone(),
+            pricing_plan_arn: plan_arn,
+            linked_account_ids: linked_account_ids.clone(),
+            auto_associate: input.account_grouping.auto_associate,
+            responsibility_transfer_arn: input.account_grouping.responsibility_transfer_arn.clone(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            creation_time_millis: now,
+            last_modified_time_millis: now,
+        };
+        state.billing_groups.insert(arn.clone(), record);
+        state.billing_group_names.insert(input.name, arn.clone());
+        for account_id in linked_account_ids {
+            state.account_associations.insert(account_id, arn.clone());
+        }
+        // The primary account belongs to the consolidated billing family whether or
+        // not it is a member of this group. When it is not a member it is in no
+        // billing group, which is what `UNMONITORED` reports.
+        if let Some(primary) = input.primary_account_id {
+            if !state.account_associations.contains_key(&primary) {
+                state.note_unassociated_account(&primary);
+            }
+        }
+        state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
+
+        Ok(CreateBillingGroupOutput { arn: Some(arn) })
     }
 }

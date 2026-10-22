@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartActiveApprovalTeamDeletion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartActiveApprovalTeamDeletion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts the pending-window deletion of an ACTIVE approval team: the stored team moves
+//! to `DELETING` / `DELETE_PENDING_APPROVAL`, its `DeletionStartTime` is recorded and its
+//! `DeletionCompletionTime` is set `PendingWindowDays` days later. Both are returned, and
+//! a following `GetApprovalTeam` reports `DELETING`. Once the window elapses the team is
+//! gone, so `GetApprovalTeam` answers 404 and `ListApprovalTeams` omits it — see
+//! [`crate::state`] for who materialises that.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartActiveApprovalTeamDeletion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! * An ARN no stored team carries earns `ResourceNotFoundException` (404).
+//! * A team that is not ACTIVE cannot have its ACTIVE deletion started:
+//!   `ConflictException` (409). An inactive team's versions go through
+//!   `DeleteInactiveApprovalTeamVersion` instead.
+//! * `@idempotent`: a repeat call on a team already `DELETING` answers with the recorded
+//!   window, changing nothing.
+//! * `PendingWindowDays` is a count of days, so a value below one names no window, and a
+//!   value past [`crate::state::MAX_PENDING_WINDOW_DAYS`] names a completion instant this
+//!   service could not report: `ValidationException` (400). The model gives the member no
+//!   `range` to close either end. The whole window is computed with checked arithmetic
+//!   before anything is mutated, so no request can panic the handler or leave a team
+//!   half-moved into `DELETING`.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +166,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartActiveApprovalTeamDeletion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartActiveApprovalTeamDeletionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartActiveApprovalTeamDeletion"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartActiveApprovalTeamDeletionError::Modeled(
+                StartActiveApprovalTeamDeletionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the approval-team store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        // The whole window is computed BEFORE anything is mutated, with checked
+        // arithmetic throughout, so a request can neither panic this handler nor leave a
+        // team half-moved into DELETING.
+        let days = input
+            .pending_window_days
+            .unwrap_or(crate::state::DEFAULT_PENDING_WINDOW_DAYS);
+        let Some(completion) = crate::state::deletion_completion(now, days) else {
+            return Err(
+                StartActiveApprovalTeamDeletionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "PendingWindowDays ({days}) must be between 1 and {} days.",
+                            crate::state::MAX_PENDING_WINDOW_DAYS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let Some(team) = state.team_mut(&input.arn) else {
+            return Err(
+                StartActiveApprovalTeamDeletionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("No approval team found for ARN '{}'.", input.arn),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        match team.status {
+            // Already in the pending window: answer with what was recorded.
+            crate::state::TeamStatus::Deleting => {}
+            crate::state::TeamStatus::Active => {
+                team.status = crate::state::TeamStatus::Deleting;
+                team.status_code = Some(crate::state::TeamStatusCode::DeletePendingApproval);
+                team.deletion_start_time = Some(now);
+                team.deletion_completion_time = Some(completion);
+            }
+            other => {
+                return Err(StartActiveApprovalTeamDeletionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Approval team '{}' is {} and not ACTIVE, so its deletion cannot be \
+                             started.",
+                            input.arn,
+                            other.as_wire()
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(StartActiveApprovalTeamDeletionOutput {
+            deletion_start_time: team
+                .deletion_start_time
+                .map(::aws_smithy_types::DateTime::from),
+            deletion_completion_time: team
+                .deletion_completion_time
+                .map(::aws_smithy_types::DateTime::from),
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRelationship
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRelationship`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRelationship::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mutates the stored relationship in [`crate::state`], bumping its
+//! `revision` and `updatedAt`, and refuses a stale `revision` with `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +156,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRelationship` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRelationshipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRelationship"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRelationshipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service is not mounted on a state-bearing engine".into(),
+                },
+            )
+            .into());
+        };
+
+        let Some(id) =
+            crate::state::resolve_identifier(&input.identifier, crate::state::RELATIONSHIP_ID_PREFIX)
+                .map(str::to_string)
+        else {
+            return Err(refusal(
+                "identifier",
+                format!(
+                    "Value '{}' at 'identifier' failed to satisfy constraint: Member must be a \
+                     relationship id or ARN",
+                    input.identifier
+                ),
+            ));
+        };
+        let Some(parent_id) = crate::state::resolve_identifier(
+            &input.program_management_account_identifier,
+            crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
+        )
+        .map(str::to_string)
+        else {
+            return Err(refusal(
+                "programManagementAccountIdentifier",
+                format!(
+                    "Value '{}' at 'programManagementAccountIdentifier' failed to satisfy \
+                     constraint: Member must be a program management account id or ARN",
+                    input.program_management_account_identifier
+                ),
+            ));
+        };
+
+        let mut guard = state.lock();
+        guard.advance_clock();
+
+        // Addressed by (catalog, parent account, id), the same way the read is.
+        let addressed = guard.relationships.get(&id).is_some_and(|relationship| {
+            relationship.catalog == input.catalog
+                && relationship.program_management_account_id == parent_id
+        });
+        if !addressed {
+            return Err(UpdateRelationshipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Relationship {id} was not found under program management account \
+                         {parent_id} in catalog {}.",
+                        input.catalog
+                    ),
+                    resource_id: Some(id.clone()),
+                    resource_type: Some(crate::state::RELATIONSHIP_RESOURCE_TYPE.into()),
+                },
+            )
+            .into());
+        }
+
+        // `revision` is the optimistic-concurrency token: an update that names a
+        // revision other than the current one is refused, and the store is left
+        // alone. An update that names none skips the check.
+        let current_revision = guard
+            .relationships
+            .get(&id)
+            .map(|relationship| relationship.revision)
+            .unwrap_or_default();
+        if let Some(requested) = input.revision.as_deref() {
+            if requested != current_revision.to_string() {
+                return Err(UpdateRelationshipErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Relationship {id} is at revision {current_revision}, not \
+                             {requested}."
+                        ),
+                        resource_id: id.clone(),
+                        resource_type: crate::state::RELATIONSHIP_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(relationship) = guard.relationships.get_mut(&id) else {
+            return Err(UpdateRelationshipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the relationship that was just addressed could not be read back"
+                        .into(),
+                },
+            )
+            .into());
+        };
+        // Only the members the request carries change; an absent one is left as
+        // stored, so an update is a patch and not a replace.
+        if let Some(display_name) = input.display_name {
+            relationship.display_name = display_name;
+        }
+        if let Some(support_plan) = input.requested_support_plan {
+            relationship.requested_support_plan = Some(support_plan);
+        }
+        relationship.revision = relationship.revision.saturating_add(1);
+        relationship.updated_at = crate::state::now();
+
+        // Answer from the store, not from the request struct.
+        Ok(UpdateRelationshipOutput {
+            relationship_detail: Some(UpdateRelationshipDetail {
+                arn: Some(relationship.arn.clone()),
+                id: Some(relationship.id.clone()),
+                revision: Some(relationship.revision.to_string()),
+                display_name: Some(relationship.display_name.clone()),
+            }),
+        })
     }
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400).
+fn refusal(member: &str, message: String) -> UpdateRelationshipError {
+    UpdateRelationshipErrorModeled::ValidationException(crate::state::validation_exception(
+        member, message,
+    ))
+    .into()
 }

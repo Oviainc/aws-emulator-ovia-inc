@@ -45,6 +45,16 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `::emulator_server::service_from_target` reads out of a
+/// DynamoDB STREAMS request's `X-Amz-Target` header. That service signs as
+/// `dynamodb` too, so this key is what tells its traffic apart from ours: the
+/// shared reader takes the segment before the `.`, strips the `_<version>`
+/// suffix and lower-cases it, so `DynamoDBStreams_20120810.<Op>` normalises to
+/// this key while `DynamoDB_20120810.<Op>` normalises to `dynamodb`. The streams
+/// crate's own `can_handle` compares against the same key, so one discriminator
+/// is read one way on both sides.
+const STREAMS_TARGET_SERVICE_KEY: &str = "dynamodbstreams";
+
 /// The `com-amazonaws-dynamodb-dynamodb-20120810` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +84,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // DynamoDB and DynamoDB Streams are two services behind ONE SigV4 signing
+        // name (`dynamodb`), which the model cannot express, so the default
+        // signing-name match makes BOTH claim every DynamoDB-signed request and the
+        // router answers `500 AmbiguousService` for all of it. On awsJson1_0 the
+        // request names its service in `X-Amz-Target`, so a
+        // `DynamoDBStreams_20120810.*` target belongs to the streams service and is
+        // declined here.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                ::emulator_server::service_from_target(&parts.headers).as_deref()
+                    != Some(STREAMS_TARGET_SERVICE_KEY)
+            }
+            _ => false,
         }
     }
 

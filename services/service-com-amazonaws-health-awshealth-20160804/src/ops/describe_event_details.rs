@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves each requested event ARN against this service's stored event catalog:
+//! a hit joins `successfulSet`, a miss joins `failedSet`. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +109,11 @@ impl From<DescribeEventDetailsErrorModeled> for DescribeEventDetailsError {
     }
 }
 
+/// The `errorName` this operation reports for an event ARN the catalog does not
+/// hold. `DescribeEventDetailsErrorItem.errorName` is an unconstrained string in the
+/// model, so the value is the service's own name for "no such event".
+const EVENT_NOT_FOUND: &str = "EventNotFound";
+
 /// The `DescribeEventDetails` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +150,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventDetails"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        if !crate::state::locale_supported(input.locale.as_deref()) {
+            return Err(DescribeEventDetailsErrorModeled::UnsupportedLocale(
+                UnsupportedLocale {
+                    message: Some(format!(
+                        "The locale {} is not supported. The only supported locale is {}.",
+                        input.locale.as_deref().unwrap_or_default(),
+                        crate::state::SUPPORTED_LOCALE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::require_state::<_, DescribeEventDetailsErrorModeled>(
+            &*self.engine,
+            Self::NAME,
+        )?;
+
+        let mut successful_set: Vec<EventDetails> = Vec::new();
+        let mut failed_set: Vec<EventDetailsErrorItem> = Vec::new();
+        {
+            let store = state.lock();
+            let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            for event_arn in &input.event_arns {
+                // The two output sets are keyed by event ARN — `successfulSet` carries
+                // one `EventDetails` per event and `failedSet` one error per
+                // `eventArn` — so a request that names the same ARN twice describes
+                // one event and gets one entry. The model's `eventArnList` is a plain
+                // list (no @uniqueItems), so a repeat is accepted rather than refused.
+                if !seen.insert(event_arn.as_str()) {
+                    continue;
+                }
+
+                match store.events.get(event_arn) {
+                    // The SAME projection `DescribeEvents` returns, from the same stored
+                    // record, plus the description and metadata this operation adds.
+                    Some(event) => successful_set.push(EventDetails {
+                        event: Some(event.to_event()),
+                        event_description: Some(EventDescription {
+                            latest_description: Some(event.description.clone()),
+                        }),
+                        event_metadata: Some(
+                            event
+                                .event_metadata
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        ),
+                    }),
+                    // An ARN the catalog does not hold is reported per item, not as a
+                    // top-level failure: the rest of the batch still resolves.
+                    None => failed_set.push(EventDetailsErrorItem {
+                        event_arn: Some(event_arn.clone()),
+                        error_name: Some(EVENT_NOT_FOUND.to_string()),
+                        error_message: Some(format!(
+                            "Event with ARN {event_arn} could not be found."
+                        )),
+                    }),
+                }
+            }
+        }
+
+        Ok(DescribeEventDetailsOutput {
+            successful_set: Some(successful_set),
+            failed_set: Some(failed_set),
+        })
     }
 }

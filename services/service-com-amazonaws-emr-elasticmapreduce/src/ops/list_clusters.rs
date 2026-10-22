@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with a `ClusterSummary` for every persisted cluster, newest first, filtered
+//! by `ClusterStates` and the `CreatedAfter`/`CreatedBefore` window and paginated with
+//! `Marker`. Each summary is a projection of a [`crate::state::ClusterRecord`].
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusters"))
+        use crate::state::LIST_CLUSTERS_PAGE_SIZE;
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListClustersErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // Reporting only: the listing filters on state, so every transition the clock
+        // already made due is materialised first. Each was owed at this instant whether
+        // or not anybody listed the clusters.
+        store.advance_all(now);
+
+        let created_after = input.created_after.as_ref().map(|at| at.as_secs_f64());
+        let created_before = input.created_before.as_ref().map(|at| at.as_secs_f64());
+
+        // Newest first: ids are minted from a monotonic sequence, so reverse key order
+        // is reverse creation order.
+        let matched: Vec<&crate::state::ClusterRecord> = store
+            .clusters
+            .values()
+            .rev()
+            .filter(|cluster| {
+                input
+                    .cluster_states
+                    .as_ref()
+                    .is_none_or(|states| states.contains(&cluster.status.state))
+            })
+            .filter(|cluster| {
+                let created =
+                    crate::state::timestamp(cluster.status.creation_date_time).as_secs_f64();
+                created_after.is_none_or(|from| created >= from)
+                    && created_before.is_none_or(|until| created <= until)
+            })
+            .collect();
+
+        // The marker is the id of the first cluster the previous page did not report.
+        let start = match input.marker.as_ref() {
+            Some(marker) => match matched.iter().position(|cluster| cluster.id == *marker) {
+                Some(at) => at,
+                None => {
+                    return Err(ListClustersErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            error_code: None,
+                            message: Some(format!("Marker '{marker}' is not valid.")),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => 0,
+        };
+        let end = matched.len().min(start + LIST_CLUSTERS_PAGE_SIZE);
+        let clusters: Vec<ClusterSummary> = matched[start..end]
+            .iter()
+            .map(|cluster| cluster.to_summary())
+            .collect();
+        let marker = matched.get(end).map(|cluster| cluster.id.clone());
+
+        Ok(ListClustersOutput {
+            clusters: Some(clusters),
+            marker,
+        })
     }
 }

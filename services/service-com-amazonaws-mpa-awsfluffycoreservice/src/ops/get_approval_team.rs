@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApprovalTeam
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApprovalTeam`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one stored approval team, looked up by ARN in [`crate::state`]. An ARN no
+//! stored team carries earns `ResourceNotFoundException` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApprovalTeam::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@readonly`: this handler writes nothing of its own. It calls
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first, which applies only what the
+//! CLOCK already owed at this instant (an invitation response that has come due, a
+//! pending deletion window that has run out) — changes a caller who never polled would
+//! have seen anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +171,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApprovalTeam` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApprovalTeamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApprovalTeam"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetApprovalTeamError::Modeled(GetApprovalTeamErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let Some(team) = state.team(&input.arn) else {
+            return Err(GetApprovalTeamErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No approval team found for ARN '{}'.", input.arn),
+                },
+            )
+            .into());
+        };
+
+        let crate::state::StoredApprovalStrategy::MofN {
+            min_approvals_required,
+        } = team.approval_strategy;
+        Ok(GetApprovalTeamOutput {
+            arn: Some(team.arn.clone()),
+            name: Some(team.name.clone()),
+            description: Some(team.description.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(team.creation_time)),
+            last_update_time: team.last_update_time.map(::aws_smithy_types::DateTime::from),
+            approval_strategy: Some(ApprovalStrategyResponse::MofN(MofNApprovalStrategy {
+                min_approvals_required,
+            })),
+            number_of_approvers: Some(team.number_of_approvers()),
+            approvers: Some(
+                team.approvers
+                    .iter()
+                    .map(|approver| GetApprovalTeamResponseApprover {
+                        approver_id: Some(approver.approver_id.clone()),
+                        primary_identity_id: Some(approver.primary_identity_id.clone()),
+                        primary_identity_source_arn: Some(
+                            approver.primary_identity_source_arn.clone(),
+                        ),
+                        primary_identity_status: Some(
+                            approver.primary_identity_status.as_wire().to_string(),
+                        ),
+                        response_time: approver
+                            .response_time
+                            .map(::aws_smithy_types::DateTime::from),
+                        last_activity: approver
+                            .last_activity
+                            .map(|activity| activity.as_wire().to_string()),
+                        last_activity_time: approver
+                            .last_activity_time
+                            .map(::aws_smithy_types::DateTime::from),
+                        // No baseline session is minted until `StartApprovalTeamBaseline`
+                        // is implemented, and this service stores no MFA devices.
+                        pending_baseline_session_arn: None,
+                        mfa_methods: None,
+                    })
+                    .collect(),
+            ),
+            policies: Some(
+                team.policies
+                    .iter()
+                    .map(|policy_arn| PolicyReference {
+                        policy_arn: policy_arn.clone(),
+                    })
+                    .collect(),
+            ),
+            version_id: Some(team.version_id.clone()),
+            status: Some(team.status.as_wire().to_string()),
+            status_code: team.status_code.map(|code| code.as_wire().to_string()),
+            status_message: team.status_message.clone(),
+            // An update is applied in place by `UpdateApprovalTeam`, so no update
+            // session is ever outstanding and there is never a pending update to report.
+            update_session_arn: None,
+            pending_update: None,
+        })
     }
 }

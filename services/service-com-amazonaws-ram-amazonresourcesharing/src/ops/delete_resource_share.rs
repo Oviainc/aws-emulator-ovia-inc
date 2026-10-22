@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourceShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourceShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a resource share held in [`crate::state`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourceShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The share's record is kept as a `DELETED` tombstone — so its ARN can never be
+//! reused and a read that asks for `DELETED` can still see it — and its associations
+//! are dropped: it stops sharing anything. The resources themselves are untouched,
+//! which this operation's own documentation states.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +177,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourceShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourceShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourceShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourceShareErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        if let Some(why) =
+            crate::state::share_arn_rejection("resourceShareArn", &input.resource_share_arn)
+        {
+            return Err(DeleteResourceShareErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(DeleteResourceShareErrorModeled::InvalidClientTokenException(
+                InvalidClientTokenException { message: why },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        let fingerprint = crate::state::fingerprint(&[&input.resource_share_arn]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        DeleteResourceShareErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: "clientToken was already used for a \
+                                          DeleteResourceShare request with different parameters"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // A repeat of the delete that already happened deletes nothing
+                // further and reports the same success.
+                return Ok(DeleteResourceShareOutput {
+                    return_value: Some(true),
+                    client_token: Some(token),
+                });
+            }
+        }
+
+        // A share already deleted is gone, so a second delete under a different (or
+        // no) client token finds nothing to delete.
+        if store.live_share(&input.resource_share_arn).is_none() {
+            return Err(DeleteResourceShareErrorModeled::UnknownResourceException(
+                UnknownResourceException {
+                    message: format!(
+                        "no resource share with the ARN '{}' exists",
+                        input.resource_share_arn
+                    ),
+                },
+            )
+            .into());
+        }
+        store.delete_share(&input.resource_share_arn, now);
+
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(
+            Self::NAME,
+            &client_token,
+            fingerprint,
+            input.resource_share_arn,
+        );
+
+        Ok(DeleteResourceShareOutput {
+            return_value: Some(true),
+            client_token: Some(client_token),
+        })
     }
 }
