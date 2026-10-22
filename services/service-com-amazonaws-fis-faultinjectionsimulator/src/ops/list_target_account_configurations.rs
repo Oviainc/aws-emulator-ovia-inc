@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(template) = store.experiment_templates.get(&input.experiment_template_id) else {
             return Err(
                 ListTargetAccountConfigurationsErrorModeled::ResourceNotFoundException(
-                    crate::state::template_not_found(&input.experiment_template_id),
+                    crate::state::template_not_found(),
                 )
                 .into(),
             );

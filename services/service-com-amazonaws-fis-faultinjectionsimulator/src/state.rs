@@ -170,6 +170,17 @@ pub const TARGET_ACCOUNT_ID_CEILING: usize = 48;
 /// `roleArn`, which the model types as a plain `RoleArn` string.
 pub const ACCOUNT_ID_DIGITS: usize = 12;
 
+/// The message FIS answers for an experiment template reference that resolves to no
+/// record, whichever operation resolved it.
+///
+/// A constant rather than a request-derived string: the identical text is recorded for
+/// different (and differently shaped) `experimentTemplateId` values, so the requested
+/// identifier does NOT appear in it. `ResourceNotFoundException$message` is modelled only
+/// as `ExceptionMessage @length(0..1024)` ("The specified resource cannot be found."), so
+/// the text itself is a server-side rule, named here once for every resolver of a
+/// template id.
+pub const EXPERIMENT_TEMPLATE_NOT_FOUND: &str = "ExperimentTemplate not found.";
+
 /// The message FIS answers for a target account configuration the named experiment
 /// TEMPLATE does not hold.
 ///
@@ -1276,9 +1287,18 @@ pub fn invalid_next_token() -> ValidationException {
 
 /// The `ResourceNotFoundException` payload for an experiment template id that names no
 /// record — "the specified resource cannot be found".
-pub fn template_not_found(id: &str) -> ResourceNotFoundException {
+///
+/// FIS answers the CONSTANT [`EXPERIMENT_TEMPLATE_NOT_FOUND`] here, so this takes NO
+/// argument: the message neither names nor echoes the identifier the request asked for,
+/// whether that id was never minted, is malformed-but-well-typed, or named a template
+/// that has since been deleted. Every operation of this service that resolves an
+/// `experimentTemplateId` (`GetExperimentTemplate`, `DeleteExperimentTemplate`,
+/// `StartExperiment`, `CreateTargetAccountConfiguration`,
+/// `ListTargetAccountConfigurations`) refuses the miss through here, so they cannot
+/// disagree.
+pub fn template_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("No experiment template found with id {id}")),
+        message: Some(EXPERIMENT_TEMPLATE_NOT_FOUND.to_string()),
     }
 }
 

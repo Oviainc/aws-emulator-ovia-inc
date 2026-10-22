@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 CreateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::template_not_found(&input.experiment_template_id),
+                    crate::state::template_not_found(),
                 )
                 .into(),
             );
