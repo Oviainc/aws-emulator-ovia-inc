@@ -137,7 +137,7 @@ pub(crate) fn string_member(body: &Value, member: &str, case: &str) -> String {
 }
 
 /// The `items` of a paginated collection. The member's `jsonName` is `item`.
-fn page_items(body: &Value, case: &str) -> Vec<Value> {
+pub(crate) fn page_items(body: &Value, case: &str) -> Vec<Value> {
     body["item"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected an item array, got {body:?}"))

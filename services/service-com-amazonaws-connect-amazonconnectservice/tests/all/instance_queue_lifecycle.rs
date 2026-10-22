@@ -9,116 +9,19 @@
 //! and `List*` walks the store in a deterministic order one `MaxResults` page at a time.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use engine::{InMemoryEngine, EMULATOR_ACCOUNT_ID};
+use engine::EMULATOR_ACCOUNT_ID;
 use serde_json::{json, Value};
 use service_com_amazonaws_connect_amazonconnectservice::state::{
     INSTANCE_ACTIVATION_DELAY, INSTANCE_QUOTA, QUEUES_PER_INSTANCE_QUOTA,
 };
-use service_com_amazonaws_connect_amazonconnectservice::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// One answered request: the HTTP status, the `x-amzn-errortype` error code restJson1
-/// names a modelled error shape with (empty on a success), and the parsed JSON body.
-pub(crate) struct Answer {
-    pub(crate) status: u16,
-    pub(crate) error_code: String,
-    pub(crate) body: Value,
-}
+// The emulator fixture and the helpers the contact-flow suites share with this one.
+use super::harness::{connect_managed, ids_of, looks_like_a_uuid, query, Connect};
 
-/// One emulator, one region, with the Connect service mounted — the fixture every suite
-/// builds. The region travels in the SigV4 credential scope, which is also how the
-/// handlers learn which region to mint ARNs in.
-///
-/// `pub(crate)` so a sibling suite in this test crate drives the same fixture rather
-/// than standing up a second copy of it.
-pub(crate) struct Connect {
-    router: MultiServiceRouter,
-    region: String,
-}
-
+/// The instance and queue calls this suite drives, on the shared fixture.
 impl Connect {
-    pub(crate) fn in_region(region: &str) -> Self {
-        let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self {
-            router,
-            region: region.to_string(),
-        }
-    }
-
-    pub(crate) fn new() -> Self {
-        Self::in_region("us-east-1")
-    }
-
-    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
-        let answer = self.send_answer(method, uri, body).await;
-        (answer.status, answer.body)
-    }
-
-    /// The same call as [`Connect::send`], keeping the `x-amzn-errortype` header a
-    /// suite needs to tell two modelled errors of the same status apart.
-    pub(crate) async fn send_answer(
-        &self,
-        method: &str,
-        uri: &str,
-        body: Option<Value>,
-    ) -> Answer {
-        let payload = body.map_or_else(Bytes::new, |value| {
-            Bytes::from(serde_json::to_vec(&value).expect("serialize the request body"))
-        });
-        let request = http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", "connect.amazonaws.com")
-            .header("content-type", "application/json")
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=TESTKEY/20240101/{}/connect/aws4_request, \
-                     SignedHeaders=host, Signature=abc",
-                    self.region
-                ),
-            )
-            .body(payload)
-            .expect("a well-formed test request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_code = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        Answer {
-            status,
-            error_code,
-            body: parsed,
-        }
-    }
-
-    /// `CreateInstance`, asserting success and handing back `(Id, Arn)`.
-    pub(crate) async fn create_instance(&self, body: Value) -> (String, String) {
-        let (status, out) = self.send("PUT", "/instance", Some(body.clone())).await;
-        assert_eq!(status, 200, "CreateInstance {body}: got {out}");
-        (
-            out["Id"].as_str().expect("Id").to_string(),
-            out["Arn"].as_str().expect("Arn").to_string(),
-        )
-    }
-
     async fn describe_instance(&self, id: &str) -> (u16, Value) {
         self.send("GET", &format!("/instance/{id}"), None).await
     }
@@ -128,8 +31,12 @@ impl Connect {
     }
 
     async fn list_instances(&self, max_results: Option<i32>, token: Option<&str>) -> (u16, Value) {
-        self.send("GET", &format!("/instance{}", query(max_results, token, &[])), None)
-            .await
+        self.send(
+            "GET",
+            &format!("/instance{}", query(max_results, token, "", &[])),
+            None,
+        )
+        .await
     }
 
     /// `CreateQueue`, returning the raw status and body so a suite can assert a refusal.
@@ -158,64 +65,15 @@ impl Connect {
     ) -> (u16, Value) {
         let uri = format!(
             "/queues-summary/{instance_id}{}",
-            query(max_results, token, queue_types)
+            query(max_results, token, "queueTypes", queue_types)
         );
         self.send("GET", &uri, None).await
     }
 }
 
-/// Build the `maxResults`/`nextToken`/`queueTypes` query string the models bind.
-fn query(max_results: Option<i32>, token: Option<&str>, queue_types: &[&str]) -> String {
-    let mut params: Vec<String> = Vec::new();
-    if let Some(max) = max_results {
-        params.push(format!("maxResults={max}"));
-    }
-    if let Some(token) = token {
-        params.push(format!("nextToken={token}"));
-    }
-    for queue_type in queue_types {
-        params.push(format!("queueTypes={queue_type}"));
-    }
-    if params.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", params.join("&"))
-    }
-}
-
-/// A minimal valid `CreateInstance` body.
-pub(crate) fn connect_managed(alias: &str) -> Value {
-    json!({
-        "IdentityManagementType": "CONNECT_MANAGED",
-        "InstanceAlias": alias,
-        "InboundCallsEnabled": true,
-        "OutboundCallsEnabled": true,
-    })
-}
-
 /// A minimal valid `CreateQueue` body.
 fn queue_named(name: &str) -> Value {
     json!({ "Name": name, "HoursOfOperationId": "hop-1" })
-}
-
-/// `8-4-4-4-12` lowercase hex: the shape of the v4 UUIDs Connect mints.
-pub(crate) fn looks_like_a_uuid(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && [8usize, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(len, group)| {
-                group.len() == *len && group.chars().all(|c| c.is_ascii_hexdigit())
-            })
-}
-
-fn ids_of(list: &Value, key: &str) -> Vec<String> {
-    list.as_array()
-        .expect("a summary list")
-        .iter()
-        .map(|entry| entry[key].as_str().expect("an id").to_string())
-        .collect()
 }
 
 /// RULE: every member `CreateInstance` accepts is persisted and reported verbatim by
