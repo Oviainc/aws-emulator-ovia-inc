@@ -22,8 +22,9 @@
 //! * a fixture appears only when it satisfies EVERY filter, and a filter is satisfied
 //!   by any one of its values matching any one of the fixture's competitors,
 //!   regardless of case;
-//! * a `fixtureId` no fixture has is `ResourceNotFoundException` (HTTP 404), and one
-//!   past the modelled length is `ValidationException` (HTTP 400).
+//! * a `fixtureId` no fixture has is `ValidationException` (HTTP 400) — the recorded
+//!   refusal for an id that names no fixture — and so is one past the modelled
+//!   length, which the boundary refuses before the handler runs.
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
@@ -601,56 +602,104 @@ async fn filters_narrow_the_results_to_matching_competitors() {
 }
 
 /// A `fixtureId` no fixture has, and one past the modelled length.
+///
+/// Both are HTTP 400 `ValidationException`: the recorded behaviour of `GetFixture` for
+/// an id that names no fixture is a validation refusal (corpus unit
+/// `elementalinference.get-fixture-not-found`), because a `fixtureId` is an opaque
+/// reference the service itself hands out, and an id past the modelled `FixtureId`
+/// length never reaches the handler at all — the boundary refuses it with the same
+/// status and code.
 #[tokio::test]
 async fn get_fixture_refuses_an_id_no_fixture_has() {
     let router = router();
 
-    // Each row: an id, and the status it answers with. 404 is "no such fixture";
-    // 400 is the modelled `FixtureId` length (1..128) refusing the id outright.
-    let cases: Vec<(&str, String, u16)> = vec![
-        ("an index the day does not have", "basketball-20260314-99".to_string(), 404),
-        ("index zero", "basketball-20260314-00".to_string(), 404),
-        ("a day that is not a date", "basketball-20260230-01".to_string(), 404),
-        ("a sport the model does not declare", "cricket-20260314-01".to_string(), 404),
-        ("a one-digit index", "basketball-20260314-1".to_string(), 404),
-        ("a short day", "basketball-2026031-01".to_string(), 404),
-        ("no structure at all", "nonsense".to_string(), 404),
-        ("the modelled maximum length", "a".repeat(128), 404),
-        ("one past the modelled maximum length", "a".repeat(129), 400),
-    ];
+    // The catalogued id this table takes its near misses from.
+    let (status, found) =
+        search(&router, json!({"sport": "basketball", "startDate": "2026-03-14"})).await;
+    assert_eq!(status, 200, "a search answers 200, got {found}");
+    let catalogued = text(&fixtures_of(&found)[0], "fixtureId");
 
-    for (case, id, expected) in cases {
+    // Each row: an id no fixture has, differing in form, length and in how near it is
+    // to an id the catalog does have.
+    let mut cases: Vec<(String, String)> = vec![
+        (
+            "an index the day does not have".to_string(),
+            "basketball-20260314-99".to_string(),
+        ),
+        ("index zero".to_string(), "basketball-20260314-00".to_string()),
+        (
+            "a day that is not a date".to_string(),
+            "basketball-20260230-01".to_string(),
+        ),
+        (
+            "a sport the model does not declare".to_string(),
+            "cricket-20260314-01".to_string(),
+        ),
+        (
+            "a one-digit index".to_string(),
+            "basketball-20260314-1".to_string(),
+        ),
+        ("a short day".to_string(), "basketball-2026031-01".to_string()),
+        ("no structure at all".to_string(), "nonsense".to_string()),
+        ("a single character".to_string(), "x".to_string()),
+        ("digits only".to_string(), "12345".to_string()),
+        ("the modelled maximum length".to_string(), "a".repeat(128)),
+        (
+            "one past the modelled maximum length".to_string(),
+            "a".repeat(129),
+        ),
+        (
+            "a catalogued id in upper case".to_string(),
+            catalogued.to_uppercase(),
+        ),
+        (
+            "a catalogued id with a suffix".to_string(),
+            format!("{catalogued}0"),
+        ),
+        (
+            "a catalogued id with its last character dropped".to_string(),
+            catalogued[..catalogued.len() - 1].to_string(),
+        ),
+    ];
+    // And a row per fixture the day's card does hold, each a near miss on its index,
+    // so the refusal is not keyed to one shape of id.
+    for fixture in fixtures_of(&found) {
+        cases.push((
+            format!("a near miss on {}", text(&fixture, "fixtureId")),
+            format!("{}9", text(&fixture, "fixtureId")),
+        ));
+    }
+
+    for (case, id) in cases {
         let (status, error) = get_fixture(&router, &id).await;
         assert_eq!(
-            status, expected,
-            "case {case:?}: GetFixture on {id:?} answers {expected}, got {status} with {error}"
+            status, 400,
+            "case {case:?}: GetFixture on {id:?} answers 400, got {status} with {error}"
         );
-        let expected_type = if expected == 404 {
-            "ResourceNotFoundException"
-        } else {
-            "ValidationException"
-        };
         assert_eq!(
             error["__type"],
-            json!(expected_type),
-            "case {case:?}: that {expected} is a {expected_type}, got {error}"
+            json!("ValidationException"),
+            "case {case:?}: that 400 is a ValidationException, got {error}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fixtureId"),
+            "case {case:?}: the refusal names the member at fault, got {error}"
         );
     }
 
     // A fixture that IS in the catalog is unaffected by the refusals above.
-    let (status, found) =
-        search(&router, json!({"sport": "basketball", "startDate": "2026-03-14"})).await;
-    assert_eq!(status, 200, "a search still answers 200, got {found}");
-    let id = text(&fixtures_of(&found)[0], "fixtureId");
-    let (status, fetched) = get_fixture(&router, &id).await;
+    let (status, fetched) = get_fixture(&router, &catalogued).await;
     assert_eq!(
         status, 200,
-        "case {id:?}: a catalogued fixture still answers 200, got {status} with {fetched}"
+        "case {catalogued:?}: a catalogued fixture still answers 200, got {status} with {fetched}"
     );
     assert_eq!(
         fetched["fixtureId"],
-        json!(id),
-        "case {id:?}: GetFixture reports the id that was asked for, got {fetched}"
+        json!(catalogued),
+        "case {catalogued:?}: GetFixture reports the id that was asked for, got {fetched}"
     );
 }
 
