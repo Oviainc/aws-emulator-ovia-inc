@@ -221,6 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
                 BadRequestException {
                     invalid_parameter: Some("ClusterArn".to_string()),
+                    // NOT `state::RESOURCE_NOT_FOUND_MESSAGE`, which the readers that
+                    // model `NotFoundException` share: this operation models
+                    // none, so it refuses the ARN as a bad PARAMETER and its
+                    // message says what is wrong with that parameter rather
+                    // than announcing a resource-not-found this error is not.
                     message: Some(format!(
                         "No cluster exists in {region} with the ARN {}",
                         input.cluster_arn
