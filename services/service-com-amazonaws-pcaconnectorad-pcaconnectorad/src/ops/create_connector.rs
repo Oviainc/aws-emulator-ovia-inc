@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new connector and returns only its ARN. The connector store is
+//! bounded at [`crate::state::MAX_CONNECTORS`] and the idempotency store at
+//! [`crate::state::MAX_IDEMPOTENCY_RECORDS`]; past the connector cap the create
+//! is refused with the modelled `ServiceQuotaExceededException` rather than
+//! growing the store.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +168,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConnectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the pca-connector-ad state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // @idempotencyToken: a retry carrying the ClientToken of an earlier call
+        // names the connector that call minted, instead of minting a second one.
+        let token_key = input
+            .client_token
+            .as_ref()
+            .map(|token| format!("{}:{token}", Self::NAME));
+        if let Some(arn) = token_key.as_ref().and_then(|key| store.idempotency.get(key)) {
+            return Ok(CreateConnectorOutput {
+                connector_arn: Some(arn.clone()),
+            });
+        }
+
+        // The store is bounded: past the cap the create is refused with the
+        // modelled quota error rather than growing the map, so no number of
+        // requests grows this process without limit.
+        if store.connectors.len() >= crate::state::MAX_CONNECTORS {
+            return Err(CreateConnectorErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this connector store has reached its bound of {} connectors",
+                        crate::state::MAX_CONNECTORS
+                    ),
+                    resource_id: crate::state::connector_collection_arn(&region),
+                    resource_type: "Connector".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                    quota_code: crate::state::QUOTA_CODE_CONNECTORS_PER_STORE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let connector_id = crate::state::new_resource_id();
+        let arn = crate::state::connector_arn(&region, &connector_id);
+        let seq = store.next_seq();
+        let record = crate::state::ConnectorRecord {
+            arn: arn.clone(),
+            certificate_authority_arn: input.certificate_authority_arn,
+            directory_id: input.directory_id,
+            vpc_information: input.vpc_information,
+            certificate_enrollment_policy_server_endpoint:
+                crate::state::enrollment_policy_server_endpoint(&connector_id, &region),
+            // A connector AWS answers 202 for is not ready yet; the clock owes it
+            // the move to ACTIVE at `active_at`.
+            status: crate::state::CONNECTOR_STATUS_CREATING.to_string(),
+            status_reason: None,
+            created_at: now,
+            updated_at: now,
+            active_at: now + crate::state::CONNECTOR_ACTIVATION_DELAY,
+            tags: input.tags.unwrap_or_default(),
+            seq,
+        };
+        store.connectors.insert(arn.clone(), record);
+        if let Some(key) = token_key {
+            store.record_idempotency(key, arn.clone());
+        }
+
+        Ok(CreateConnectorOutput {
+            connector_arn: Some(arn),
+        })
     }
 }
