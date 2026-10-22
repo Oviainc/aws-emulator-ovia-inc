@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProtection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProtection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProtection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Looks a protection up in [`crate::state`] by either address — its `ProtectionId` or
+//! the ARN of the resource it protects — and reports the STORED record, not the
+//! request's own values.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProtection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProtectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProtection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeProtectionErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the shield emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Both members are optional in the model, but the pair is not: each doc says
+        // "You must provide either the ResourceArn of the protected resource or the
+        // ProtectionID of the protection, but not both."
+        let address = match (input.protection_id.as_deref(), input.resource_arn.as_deref()) {
+            (Some(protection_id), None) => Address::ProtectionId(protection_id),
+            (None, Some(resource_arn)) => Address::ResourceArn(resource_arn),
+            (Some(_), Some(_)) => {
+                return Err(invalid_parameter(
+                    "You must provide either the ResourceArn of the protected resource or \
+                     the ProtectionID of the protection, but not both.",
+                ));
+            }
+            (None, None) => {
+                return Err(invalid_parameter(
+                    "You must provide either the ResourceArn of the protected resource or \
+                     the ProtectionID of the protection.",
+                ));
+            }
+        };
+
+        // A pure read: whichever address was given, the answer is the stored record.
+        let guard = state.lock();
+        let found = match address {
+            Address::ProtectionId(protection_id) => guard.protection_by_id(protection_id),
+            Address::ResourceArn(resource_arn) => guard.protection_by_resource_arn(resource_arn),
+        };
+        let Some(entry) = found else {
+            return Err(DescribeProtectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(match address {
+                        Address::ProtectionId(protection_id) => {
+                            format!("The protection {protection_id} does not exist.")
+                        }
+                        Address::ResourceArn(resource_arn) => {
+                            format!("The resource {resource_arn} has no protection.")
+                        }
+                    }),
+                    resource_type: Some(crate::state::PROTECTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeProtectionOutput {
+            protection: Some(entry.to_modeled()),
+        })
     }
+}
+
+/// How this call addresses the protection it describes: exactly one of the two members
+/// the model declares.
+#[derive(Debug, Clone, Copy)]
+enum Address<'a> {
+    ProtectionId(&'a str),
+    ResourceArn(&'a str),
+}
+
+/// The modelled `InvalidParameterException` (HTTP 400) this operation refuses a request
+/// with, naming the two members whose combination was wrong.
+fn invalid_parameter(message: &str) -> DescribeProtectionError {
+    DescribeProtectionErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![
+            ValidationExceptionField {
+                name: "ProtectionId".to_string(),
+                message: message.to_string(),
+            },
+            ValidationExceptionField {
+                name: "ResourceArn".to_string(),
+                message: message.to_string(),
+            },
+        ]),
+    })
+    .into()
 }

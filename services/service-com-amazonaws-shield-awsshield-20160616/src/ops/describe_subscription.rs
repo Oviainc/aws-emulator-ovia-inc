@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the subscription `CreateSubscription` persisted in [`crate::state`] — the
+//! stored activation instant, commitment and limits, never a fresh reading.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +128,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeSubscriptionErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the shield emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A pure read: the subscription is reported exactly as it was stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSubscription"))
+        // "Exists" is the one predicate every reader of the account's subscription uses
+        // (`SubscriptionRecord::is_active_at`, shared with GetSubscriptionState,
+        // CreateProtection and ListProtections), so a subscription that has run past
+        // its end is absent here too rather than describable while the rest of the
+        // service treats the account as unsubscribed.
+        let guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let Some(subscription) = guard
+            .subscription
+            .as_ref()
+            .filter(|subscription| subscription.is_active_at(now))
+        else {
+            return Err(DescribeSubscriptionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The subscription does not exist.".to_string()),
+                    resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeSubscriptionOutput {
+            subscription: Some(subscription.to_modeled()),
+        })
     }
 }

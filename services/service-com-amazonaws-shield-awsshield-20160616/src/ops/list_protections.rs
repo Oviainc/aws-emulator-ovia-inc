@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProtections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProtections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProtections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the protections persisted in [`crate::state`] in creation order,
+//! honouring `MaxResults` as the page size and issuing a `NextToken` for the place the
+//! page stopped at. `InclusionFilters` narrows the set before it is paged.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProtections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProtectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProtections"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListProtectionsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the shield emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `MaxResults` is the greatest number of protections to report; the model
+        // documents the default as 20, which is also what a caller naming no page size
+        // gets. A `MaxResults` of 0 — which the member's `@range(0..10000)` admits — is
+        // read the same way rather than as an empty page: a page of nothing plus a
+        // `NextToken` is an iteration that can never advance, so "no greatest number
+        // asked for" is the only reading that terminates.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results > 0 => max_results,
+            _ => crate::state::DEFAULT_LIST_PROTECTIONS_MAX_RESULTS,
+        } as usize;
+
+        // A token names the place the previous page stopped at: the page that follows it
+        // holds the protections created after that one.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_token(token) {
+                Some(sequence) => Some(sequence),
+                None => {
+                    return Err(ListProtectionsErrorModeled::InvalidPaginationTokenException(
+                        InvalidPaginationTokenException {
+                            message: Some(
+                                "The NextToken specified in the request is invalid. Submit the \
+                                 request using the NextToken value that was returned in the \
+                                 prior response."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // A pure read of the store, in the creation order it keeps.
+        let guard = state.lock();
+
+        // Protections are what a Shield Advanced subscription grants, so there is no
+        // set to list for an account that holds none.
+        if guard.subscription_state_at(::std::time::SystemTime::now())
+            != crate::state::SUBSCRIPTION_STATE_ACTIVE
+        {
+            return Err(ListProtectionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The subscription does not exist.".to_string()),
+                    resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let remaining: Vec<&crate::state::ProtectionEntry> = guard
+            .protections_in_creation_order()
+            .into_iter()
+            .filter(|entry| resume_after.is_none_or(|last| entry.sequence > last))
+            .filter(|entry| matches_filters(entry, input.inclusion_filters.as_ref()))
+            .collect();
+
+        let page = &remaining[..remaining.len().min(page_size)];
+        let protections: Vec<Protection> = page.iter().map(|entry| entry.to_modeled()).collect();
+
+        Ok(ListProtectionsOutput {
+            protections: Some(protections),
+            // Omitted on the last page: the `@paginated` contract is that an absent
+            // token ends the iteration.
+            next_token: (remaining.len() > page.len())
+                .then(|| page.last().map(|entry| encode_token(entry.sequence)))
+                .flatten(),
+        })
     }
+}
+
+/// Whether this protection satisfies every criterion the call provided.
+///
+/// `InclusionProtectionFilters`' own documentation: "You can provide up to one criteria
+/// per filter type. Shield Advanced returns protections that exactly match all of the
+/// filter criteria that you provide." So an absent filter type constrains nothing, and
+/// the types that are present must all hold. Each filter list is modelled `len 1..1`,
+/// so a present type always carries exactly one criterion: the framework refuses an
+/// empty list before this runs, and this never has to choose what an empty one means.
+fn matches_filters(
+    entry: &crate::state::ProtectionEntry,
+    filters: Option<&InclusionProtectionFilters>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    let matches_any = |criteria: Option<&Vec<String>>, value: Option<&str>| match criteria {
+        None => true,
+        Some(criteria) => value.is_some_and(|value| criteria.iter().any(|want| want == value)),
+    };
+
+    matches_any(filters.resource_arns.as_ref(), Some(&entry.resource_arn))
+        && matches_any(filters.protection_names.as_ref(), Some(&entry.name))
+        && matches_any(
+            filters.resource_types.as_ref(),
+            entry.resource_type.as_deref(),
+        )
+}
+
+/// The version marker an issued token carries, so a token from elsewhere — or from a
+/// future encoding — is refused rather than half-understood.
+const TOKEN_PREFIX: &str = "protections/v1:";
+
+/// Encode the place a page stopped at (the creation-order position of the last
+/// protection it reported) as the opaque token the next call passes back.
+fn encode_token(sequence: u64) -> String {
+    ::hex::encode(format!("{TOKEN_PREFIX}{sequence}"))
+}
+
+/// The creation-order position a token resumes after, or `None` when the token is not
+/// one [`encode_token`] produced.
+fn decode_token(token: &str) -> Option<u64> {
+    let decoded = ::hex::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded.strip_prefix(TOKEN_PREFIX)?.parse().ok()
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProtection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProtection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProtection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `ProtectionId` and PERSISTS the protection in [`crate::state`]: the response
+//! carries only that id, so every other value a later `DescribeProtection` /
+//! `ListProtections` returns must be derived and stored here.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +177,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProtection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProtectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProtection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateProtectionErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the shield emulator is mounted on an engine that holds no state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // Shield Advanced protections exist only under a subscription, so without one
+        // there is no subscription to add this protection to.
+        if guard.subscription_state_at(now) != crate::state::SUBSCRIPTION_STATE_ACTIVE {
+            return Err(CreateProtectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The subscription does not exist.".to_string()),
+                    resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One resource is covered by one protection: a second protection for an ARN
+        // that already has one is a conflict.
+        if guard
+            .protection_by_resource_arn(&input.resource_arn)
+            .is_some()
+        {
+            return Err(CreateProtectionErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "The resource {} already has a protection.",
+                        input.resource_arn
+                    )),
+                    resource_type: Some(crate::state::PROTECTION_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The subscription grants a finite number of protections; a create beyond the
+        // limit is refused with the limit it would exceed.
+        if guard.protections.len() as i64 >= crate::state::MAX_PROTECTIONS_PER_ACCOUNT {
+            return Err(CreateProtectionErrorModeled::LimitsExceededException(
+                LimitsExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} protections.",
+                        crate::state::MAX_PROTECTIONS_PER_ACCOUNT
+                    )),
+                    r#type: Some(crate::state::PROTECTION_LIMIT_TYPE.to_string()),
+                    limit: crate::state::MAX_PROTECTIONS_PER_ACCOUNT,
+                },
+            )
+            .into());
+        }
+
+        let Some(protection_id) = guard.mint_protection_id() else {
+            return Err(CreateProtectionErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("could not mint a unique protection id".to_string()),
+                },
+            )
+            .into());
+        };
+
+        guard.insert_protection(crate::state::ProtectionEntry {
+            id: protection_id.clone(),
+            name: input.name.clone(),
+            resource_arn: input.resource_arn.clone(),
+            protection_arn: crate::state::protection_arn(&protection_id),
+            resource_type: crate::state::protected_resource_type(&input.resource_arn)
+                .map(str::to_string),
+            // A protection is created with no health check associated and no
+            // application-layer automatic response; `AssociateHealthCheck` and
+            // `EnableApplicationLayerAutomaticResponse` are what change those.
+            health_check_ids: Vec::new(),
+            application_layer_automatic_response: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            // Assigned by the store, which owns the creation order.
+            sequence: 0,
+        });
+
+        Ok(CreateProtectionOutput {
+            protection_id: Some(protection_id),
+        })
     }
 }
