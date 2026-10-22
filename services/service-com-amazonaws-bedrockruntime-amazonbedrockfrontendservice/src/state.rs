@@ -706,6 +706,14 @@ pub fn body_input_tokens(body: &[u8]) -> u32 {
 /// A Smithy document as JSON. The walk stops at [`MAX_DOCUMENT_DEPTH`], past
 /// which a branch renders as `null`, so a deeply nested caller document cannot
 /// drive unbounded recursion.
+///
+/// Object members are emitted in SORTED key order. `Document::Object` is a
+/// `HashMap`, whose iteration order differs between two instances holding the
+/// same keys, and `serde_json::Map` preserves insertion order whenever anything
+/// in the workspace enables `serde_json/preserve_order`. Without the sort, two
+/// renderings of the same document can differ — which would make
+/// [`async_invoke_fingerprint`] non-deterministic and turn an idempotent retry
+/// into a `ConflictException`.
 pub fn document_to_json(document: &::aws_smithy_types::Document) -> serde_json::Value {
     fn walk(document: &::aws_smithy_types::Document, depth: usize) -> serde_json::Value {
         use ::aws_smithy_types::{Document, Number};
@@ -713,12 +721,16 @@ pub fn document_to_json(document: &::aws_smithy_types::Document) -> serde_json::
             return serde_json::Value::Null;
         }
         match document {
-            Document::Object(members) => serde_json::Value::Object(
-                members
-                    .iter()
-                    .map(|(name, member)| (name.clone(), walk(member, depth + 1)))
-                    .collect(),
-            ),
+            Document::Object(members) => {
+                let mut pairs: Vec<(&String, &Document)> = members.iter().collect();
+                pairs.sort_unstable_by_key(|(name, _)| *name);
+                serde_json::Value::Object(
+                    pairs
+                        .into_iter()
+                        .map(|(name, member)| (name.clone(), walk(member, depth + 1)))
+                        .collect(),
+                )
+            }
             Document::Array(items) => {
                 serde_json::Value::Array(items.iter().map(|item| walk(item, depth + 1)).collect())
             }

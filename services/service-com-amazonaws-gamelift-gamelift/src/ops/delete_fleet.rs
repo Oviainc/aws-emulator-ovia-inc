@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a stored fleet, and with it the game sessions placed on it and the player
+//! slots reserved in those sessions.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "During the deletion process, the fleet status is changed to DELETING": the call
+//! moves the fleet there and stamps its termination time, and the fleet leaves state
+//! when the deletion comes due (see `crate::state::WORKFLOW_DELAY`), after which a
+//! describe of it raises `NotFoundException`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +176,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFleet"))
+        use crate::state::{FLEET_STATUS_DELETING, WORKFLOW_DELAY};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFleetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
+            return Err(DeleteFleetErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("The fleet {} was not found.", input.fleet_id)),
+            })
+            .into());
+        };
+        let Some(fleet) = state.fleets.get_mut(&fleet_id) else {
+            return Err(DeleteFleetErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("The fleet {} was not found.", input.fleet_id)),
+            })
+            .into());
+        };
+
+        // A fleet already being deleted keeps the deletion it is in the middle of: the
+        // call neither fails nor restarts the clock.
+        if fleet.status != FLEET_STATUS_DELETING {
+            fleet.status = FLEET_STATUS_DELETING.to_string();
+            fleet.active_at = None;
+            fleet.termination_time = Some(now);
+            fleet.purge_at = Some(now + WORKFLOW_DELAY);
+            for location in &mut fleet.locations {
+                location.status = FLEET_STATUS_DELETING.to_string();
+            }
+        }
+
+        Ok(DeleteFleetOutput)
     }
 }

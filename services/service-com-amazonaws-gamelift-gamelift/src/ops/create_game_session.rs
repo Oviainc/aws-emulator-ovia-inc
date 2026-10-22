@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGameSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGameSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Places a game session on a stored fleet and persists it, so that the describes and
+//! `CreatePlayerSession` all read the same record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGameSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The target fleet must be `ACTIVE`. The new session is returned `ACTIVATING` and
+//! carries connection information only once it is `ACTIVE`, which the model's own doc
+//! pins: "When the game session status is ACTIVE, it is updated with connection
+//! information and you can create player sessions for the game session."
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -244,20 +243,252 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGameSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGameSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGameSession"))
+        use crate::state::{
+            FLEET_STATUS_ACTIVE, GAME_SESSION_STATUS_ACTIVATING, MAX_PLAYERS_PER_GAME_SESSION,
+            PLAYER_SESSION_CREATION_POLICY_ACCEPT_ALL, WORKFLOW_DELAY,
+        };
+
+        let invalid = |message: String| -> Self::Error {
+            CreateGameSessionErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+        let not_found = |message: String| -> Self::Error {
+            CreateGameSessionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGameSessionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // "To create a game session on an instance in a fleet's home Region, provide a
+        // fleet or alias ID": exactly one of the two names the target.
+        let fleet_reference = match (&input.fleet_id, &input.alias_id) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "Specify either FleetId or AliasId to name the target fleet, not both."
+                        .to_string(),
+                ))
+            }
+            (None, None) => {
+                return Err(invalid(
+                    "Either FleetId or AliasId is required to name the target fleet.".to_string(),
+                ))
+            }
+            // An alias is a separate slice that still answers 501, so no alias can have
+            // been created: no stored alias resolves to a fleet.
+            (None, Some(alias_id)) => {
+                return Err(not_found(format!("The alias {alias_id} was not found.")))
+            }
+            (Some(fleet_id), None) => fleet_id.clone(),
+        };
+
+        // CreatePlayerSession's doc: "The maximum number of players per game session is
+        // 200. It is not adjustable." The model bounds the member only below.
+        if input.maximum_player_session_count > MAX_PLAYERS_PER_GAME_SESSION {
+            return Err(invalid(format!(
+                "MaximumPlayerSessionCount must be at most {MAX_PLAYERS_PER_GAME_SESSION}; \
+                 the request asked for {}.",
+                input.maximum_player_session_count
+            )));
+        }
+
+        let Some(fleet_id) = state.resolve_fleet_id(&fleet_reference) else {
+            return Err(not_found(format!(
+                "The fleet {fleet_reference} was not found."
+            )));
+        };
+        let Some(fleet) = state.fleets.get(&fleet_id) else {
+            return Err(not_found(format!(
+                "The fleet {fleet_reference} was not found."
+            )));
+        };
+
+        // "The target fleet must be in ACTIVE status."
+        if fleet.status != FLEET_STATUS_ACTIVE {
+            return Err(CreateGameSessionErrorModeled::InvalidFleetStatusException(
+                InvalidFleetStatusException {
+                    message: Some(format!(
+                        "The target fleet must be in ACTIVE status; fleet {} is in {} status.",
+                        fleet.fleet_id, fleet.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A session is placed in the fleet's home Region unless the request names one of
+        // the fleet's other locations.
+        let location = input
+            .location
+            .clone()
+            .unwrap_or_else(|| fleet.home_location.clone());
+        if !fleet.has_location(&location) {
+            return Err(invalid(format!(
+                "Location {location} is not a location of fleet {}.",
+                fleet.fleet_id
+            )));
+        }
+        let fleet_arn = fleet.fleet_arn.clone();
+        let region = fleet.region.clone();
+        let home_location = fleet.home_location.clone();
+        let capacity = fleet.game_session_capacity();
+
+        // A caller-supplied `GameSessionId` and an `IdempotencyToken` are the same
+        // custom string: either one makes a repeat of the request return the session the
+        // first one created, and makes a DIFFERENT request carrying it a mismatch. The
+        // string is scoped to ONE fleet, per `IdempotentParameterMismatchException`'s own
+        // doc ("A game session with this custom ID string already exists in this
+        // fleet"), so the same string against another fleet creates a fresh session.
+        let custom_id = input
+            .game_session_id
+            .clone()
+            .or_else(|| input.idempotency_token.clone());
+        if let Some(token) = &custom_id {
+            let key = (fleet_id.clone(), token.clone());
+            if let Some(existing_id) = state.idempotency_tokens.get(&key).cloned() {
+                let Some(existing) = state.game_sessions.get(&existing_id) else {
+                    return Err(not_found(format!(
+                        "The game session {existing_id} was not found."
+                    )));
+                };
+                let same_request = existing.maximum_player_session_count
+                    == input.maximum_player_session_count
+                    && existing.name == input.name
+                    && existing.creator_id == input.creator_id
+                    && existing.game_session_data == input.game_session_data
+                    && existing.location == location
+                    && game_properties_match(&existing.game_properties, &input.game_properties);
+                if !same_request {
+                    return Err(
+                        CreateGameSessionErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: Some(format!(
+                                    "A game session with the custom ID string {token} already \
+                                     exists in fleet {fleet_id}, and its configuration does not \
+                                     match the request."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                return Ok(CreateGameSessionOutput {
+                    game_session: Some(existing.to_modelled()),
+                });
+            }
+        }
+
+        // Each running server process hosts one game session at a time, so a fleet whose
+        // processes are all hosting one has no instance left to fulfil the request. This
+        // is also what bounds the stored session set.
+        if state.live_game_sessions_on(&fleet_id) >= capacity {
+            return Err(
+                CreateGameSessionErrorModeled::FleetCapacityExceededException(
+                    FleetCapacityExceededException {
+                        message: Some(format!(
+                            "Fleet {fleet_id} has no available instances to fulfil a \
+                             CreateGameSession request: all {capacity} of its server processes \
+                             are hosting a game session."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `GameSession$GameSessionId` doc: "The value is always a full ARN in the
+        // following format: For Home Region game session -
+        // arn:aws:gamelift:<home_region>::gamesession/<fleet ID>/<ID string>. For Remote
+        // Location game session - arn:aws:gamelift:<home_region>::gamesession/<fleet
+        // ID>/<location>/<ID string>."
+        let id_string = custom_id
+            .clone()
+            .unwrap_or_else(|| crate::state::mint_uuid(&mut state.minted_ids, "game-session"));
+        // The modelled patterns (`IdStringModel` `^[a-zA-Z0-9-]+$`, `LocationStringModel`
+        // `^[A-Za-z0-9\-]+$`) already exclude a separator, and this id is the record's
+        // primary key, so do not let its SHAPE rest on an upstream constraint alone.
+        if id_string.contains('/') || location.contains('/') {
+            return Err(invalid(
+                "GameSessionId, IdempotencyToken and Location must not contain '/'.".to_string(),
+            ));
+        }
+        let resource = if location == home_location {
+            format!("gamesession/{fleet_id}/{id_string}")
+        } else {
+            format!("gamesession/{fleet_id}/{location}/{id_string}")
+        };
+        let game_session_id = crate::state::gamelift_arn(&region, &resource);
+
+        let record = crate::state::GameSessionRecord {
+            game_session_id: game_session_id.clone(),
+            name: input.name.clone(),
+            fleet_id: fleet_id.clone(),
+            fleet_arn,
+            status: GAME_SESSION_STATUS_ACTIVATING.to_string(),
+            active_at: Some(now + WORKFLOW_DELAY),
+            creation_time: now,
+            termination_time: None,
+            current_player_session_count: 0,
+            maximum_player_session_count: input.maximum_player_session_count,
+            game_properties: input.game_properties.clone().unwrap_or_default(),
+            game_session_data: input.game_session_data.clone(),
+            creator_id: input.creator_id.clone(),
+            location,
+            // "By default, newly created game sessions are open to new players."
+            player_session_creation_policy: PLAYER_SESSION_CREATION_POLICY_ACCEPT_ALL.to_string(),
+            ip_address: None,
+            port: None,
+            dns_name: None,
+        };
+        state
+            .game_sessions
+            .insert(game_session_id.clone(), record);
+        if let Some(token) = custom_id {
+            state
+                .idempotency_tokens
+                .insert((fleet_id, token), game_session_id.clone());
+        }
+
+        // Report the STORED record, so this response and every later describe of the
+        // same session can only agree.
+        let Some(stored) = state.game_sessions.get(&game_session_id) else {
+            return Err(CreateGameSessionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new game session could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateGameSessionOutput {
+            game_session: Some(stored.to_modelled()),
+        })
     }
+}
+
+/// Whether a stored game session's properties are the ones a repeated request carries.
+///
+/// `GameProperty` is a modelled structure without `PartialEq`, so the comparison is
+/// written out over its two members.
+fn game_properties_match(stored: &[GameProperty], requested: &Option<Vec<GameProperty>>) -> bool {
+    let requested = requested.as_deref().unwrap_or(&[]);
+    stored.len() == requested.len()
+        && stored
+            .iter()
+            .zip(requested)
+            .all(|(left, right)| left.key == right.key && left.value == right.value)
 }

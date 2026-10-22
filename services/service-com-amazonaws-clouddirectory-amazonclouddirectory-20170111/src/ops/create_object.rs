@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an object in a directory from the facets of the directory's APPLIED schema,
+//! stores its attribute values, and records the parent -> child link when a
+//! `ParentReference` and a `LinkName` are supplied.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +177,353 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateObjectErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Cloud Directory state store is unavailable".to_string()),
+            })
+        })?;
+
+        let facet_validation = |message: String| -> CreateObjectError {
+            CreateObjectErrorModeled::FacetValidationException(FacetValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+        let limit_exceeded = |message: String| -> CreateObjectError {
+            CreateObjectErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // ---- bound the caller-sized request BEFORE the store lock is taken ------
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateObject"))
+        // Both lists below are caller-sized and the work this handler does is their
+        // PRODUCT (each named facet is read against each supplied attribute, and each
+        // facet's own attribute list is walked), so both factors are capped here —
+        // outside the critical section, so an oversized request is refused without
+        // holding the shared store lock at all.
+        if input.schema_facets.is_empty() {
+            return Err(facet_validation(
+                "SchemaFacets must name at least one facet of a schema applied to this \
+                 directory"
+                    .to_string(),
+            ));
+        }
+        if input.schema_facets.len() > crate::state::SCHEMA_FACETS_PER_OBJECT_QUOTA {
+            return Err(limit_exceeded(format!(
+                "SchemaFacets names {} facets; an object carries at most {}",
+                input.schema_facets.len(),
+                crate::state::SCHEMA_FACETS_PER_OBJECT_QUOTA
+            )));
+        }
+        let supplied_attribute_count = input.object_attribute_list.as_ref().map_or(0, Vec::len);
+        if supplied_attribute_count > crate::state::ATTRIBUTES_PER_OBJECT_QUOTA {
+            return Err(limit_exceeded(format!(
+                "ObjectAttributeList carries {supplied_attribute_count} values; one \
+                 CreateObject carries at most {}",
+                crate::state::ATTRIBUTES_PER_OBJECT_QUOTA
+            )));
+        }
+        // A parent and a link name are only meaningful together, so the pair is resolved
+        // ONCE here into a single `Option`; the locked section below reads that binding
+        // rather than re-matching the two members, so no unreachable combination is left
+        // for a later edit to mishandle.
+        let requested_link: Option<(&ObjectReference, &str)> =
+            match (input.parent_reference.as_ref(), input.link_name.as_deref()) {
+                (None, None) => None,
+                (Some(reference), Some(link_name)) => Some((reference, link_name)),
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "ParentReference and LinkName are only meaningful together: give \
+                         both or neither",
+                    ))
+                }
+            };
+
+        let mut store = state.lock();
+
+        // ---- resolve and validate against stored state -------------------------
+        let Some(directory) = store.directories.get(&input.directory_arn) else {
+            return Err(CreateObjectErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no directory exists at {}", input.directory_arn)),
+                },
+            )
+            .into());
+        };
+        if directory.state != crate::state::DirectoryLifecycle::Enabled {
+            return Err(CreateObjectErrorModeled::DirectoryNotEnabledException(
+                DirectoryNotEnabledException {
+                    message: Some(format!(
+                        "directory {} is {} and does not serve data operations",
+                        directory.arn,
+                        directory.state.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+        // A directory's object graph is bounded: it holds state for the life of the
+        // process and every request may add to it.
+        if directory.objects.len() >= crate::state::OBJECTS_PER_DIRECTORY_QUOTA {
+            return Err(limit_exceeded(format!(
+                "directory {} already holds the maximum of {} objects",
+                directory.arn,
+                crate::state::OBJECTS_PER_DIRECTORY_QUOTA
+            )));
+        }
+
+        // Each DISTINCT facet is resolved once and BORROWED from the store, never
+        // deep-copied, so naming the same facet N times costs nothing extra. The map
+        // also makes the attribute lookup below logarithmic rather than a linear scan
+        // of the caller's facet list.
+        let mut facets: std::collections::BTreeMap<
+            (&str, &str),
+            &crate::state::FacetRecord,
+        > = std::collections::BTreeMap::new();
+        for requested in &input.schema_facets {
+            let (Some(schema_arn), Some(facet_name)) = (
+                requested.schema_arn.as_deref(),
+                requested.facet_name.as_deref(),
+            ) else {
+                return Err(facet_validation(
+                    "every SchemaFacets entry must carry both SchemaArn and FacetName"
+                        .to_string(),
+                ));
+            };
+            if facets.contains_key(&(schema_arn, facet_name)) {
+                continue;
+            }
+            if !directory
+                .applied_schema_arns
+                .iter()
+                .any(|applied| applied == schema_arn)
+            {
+                return Err(facet_validation(format!(
+                    "schema {schema_arn} is not applied to directory {}",
+                    input.directory_arn
+                )));
+            }
+            let Some(facet) = store
+                .schemas
+                .get(schema_arn)
+                .and_then(|schema| schema.facets.get(facet_name))
+            else {
+                return Err(facet_validation(format!(
+                    "schema {schema_arn} defines no facet named {facet_name}"
+                )));
+            };
+            facets.insert((schema_arn, facet_name), facet);
+        }
+
+        // ---- the attribute values, checked against the facets' definitions -----
+        let mut attributes: std::collections::BTreeMap<
+            (String, String, String),
+            TypedAttributeValue,
+        > = std::collections::BTreeMap::new();
+        for supplied in input.object_attribute_list.iter().flatten() {
+            let key = &supplied.key;
+            let Some(facet) = facets
+                .get(&(key.schema_arn.as_str(), key.facet_name.as_str()))
+                .copied()
+            else {
+                return Err(facet_validation(format!(
+                    "attribute {}: facet {}/{} is not one of this object's SchemaFacets",
+                    key.name, key.schema_arn, key.facet_name
+                )));
+            };
+            let Some(definition) = facet.attribute(&key.name) else {
+                return Err(facet_validation(format!(
+                    "facet {} defines no attribute named {}",
+                    key.facet_name, key.name
+                )));
+            };
+            if let Some(declared) = definition.attribute_definition.as_ref() {
+                if !value_matches_type(&supplied.value, &declared.r#type) {
+                    return Err(facet_validation(format!(
+                        "attribute {}: facet {} declares type {}, which the supplied value \
+                         is not",
+                        key.name, key.facet_name, declared.r#type
+                    )));
+                }
+            }
+            attributes.insert(
+                (
+                    key.schema_arn.clone(),
+                    key.facet_name.clone(),
+                    key.name.clone(),
+                ),
+                supplied.value.clone(),
+            );
+        }
+        // An attribute left out takes its facet's declared default; one that is required
+        // always and has no default cannot be left out. This walk is bounded by
+        // SCHEMA_FACETS_PER_OBJECT_QUOTA x ATTRIBUTES_PER_FACET_QUOTA.
+        for ((schema_arn, facet_name), facet) in &facets {
+            for attribute in &facet.attributes {
+                let slot = (
+                    (*schema_arn).to_string(),
+                    (*facet_name).to_string(),
+                    attribute.name.clone(),
+                );
+                if attributes.contains_key(&slot) {
+                    continue;
+                }
+                if let Some(default) = attribute
+                    .attribute_definition
+                    .as_ref()
+                    .and_then(|definition| definition.default_value.clone())
+                {
+                    attributes.insert(slot, default);
+                    continue;
+                }
+                if attribute.required_behavior.as_deref() == Some("REQUIRED_ALWAYS") {
+                    return Err(facet_validation(format!(
+                        "facet {facet_name} requires attribute {}, which was not supplied \
+                         and has no default value",
+                        attribute.name
+                    )));
+                }
+            }
+        }
+
+        // The object's own facet list, deduplicated: naming one facet twice carries it
+        // once.
+        let stored_facets: Vec<SchemaFacet> = facets
+            .keys()
+            .map(|(schema_arn, facet_name)| SchemaFacet {
+                schema_arn: Some((*schema_arn).to_string()),
+                facet_name: Some((*facet_name).to_string()),
+            })
+            .collect();
+
+        // ---- the parent link ---------------------------------------------------
+        let parent = match requested_link {
+            None => None,
+            Some((reference, link_name)) => {
+                let Some(selector) = reference.selector.as_deref() else {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "ParentReference.Selector is required when ParentReference is given",
+                    ));
+                };
+                let parent_id = match directory.resolve_selector(selector) {
+                    Ok(identifier) => identifier,
+                    Err(crate::state::SelectorError::Malformed(message)) => {
+                        return Err(crate::scaffolded::Scaffolded::validation(message))
+                    }
+                    Err(crate::state::SelectorError::NotFound(message)) => {
+                        return Err(CreateObjectErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                            },
+                        )
+                        .into())
+                    }
+                };
+                if directory
+                    .objects
+                    .get(&parent_id)
+                    .is_some_and(|parent| parent.children.contains_key(link_name))
+                {
+                    return Err(CreateObjectErrorModeled::LinkNameAlreadyInUseException(
+                        LinkNameAlreadyInUseException {
+                            message: Some(format!(
+                                "link name {link_name} is already in use under parent object \
+                                 {parent_id}"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // Only a NODE holds children, so a leaf node, a policy or an index
+                // cannot be a parent. `CreateObject` models no `NotNodeException`, so
+                // the request is refused as invalid rather than recording a link
+                // `ListObjectChildren` would then refuse to report.
+                if directory
+                    .objects
+                    .get(&parent_id)
+                    .is_some_and(|parent| !crate::state::object_is_node(&store.schemas, parent))
+                {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "ParentReference: object {parent_id} is not a NODE and cannot hold \
+                         children"
+                    )));
+                }
+                Some((parent_id, link_name.to_string()))
+            }
+        };
+
+        // ---- store the object --------------------------------------------------
+        let object_identifier = store.mint_identifier();
+        let Some(directory) = store.directories.get_mut(&input.directory_arn) else {
+            return Err(CreateObjectErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the directory could not be reopened for writing".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let mut record = crate::state::ObjectRecord {
+            object_identifier: object_identifier.clone(),
+            schema_facets: stored_facets,
+            attributes,
+            ..Default::default()
+        };
+        if let Some((parent_id, link_name)) = parent.as_ref() {
+            record.parents.insert(parent_id.clone(), link_name.clone());
+        }
+        directory.objects.insert(object_identifier.clone(), record);
+        if let Some((parent_id, link_name)) = parent {
+            // The parent was resolved under this same lock, so a missing one here would
+            // mean a half-recorded link — refused rather than answered with a 200.
+            let Some(parent_object) = directory.objects.get_mut(&parent_id) else {
+                directory.objects.remove(&object_identifier);
+                return Err(CreateObjectErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(format!(
+                            "parent object {parent_id} could not be linked to the new object"
+                        )),
+                    },
+                )
+                .into());
+            };
+            parent_object
+                .children
+                .insert(link_name, object_identifier.clone());
+        }
+
+        // The identifier is read back out of the stored record, so the response can only
+        // name an object this directory holds.
+        let stored = directory.objects.get(&object_identifier).ok_or_else(|| {
+            CreateObjectErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the new object could not be read back".to_string()),
+            })
+        })?;
+        Ok(CreateObjectOutput {
+            object_identifier: Some(stored.object_identifier.clone()),
+        })
     }
+}
+
+/// Whether `value` is of the `FacetAttributeType` a facet declared for the attribute.
+///
+/// The six values of `FacetAttributeType` map one-to-one onto the members of the
+/// `TypedAttributeValue` union, except `VARIANT`, which a facet uses to accept a value
+/// of any of the other types.
+fn value_matches_type(value: &TypedAttributeValue, declared: &str) -> bool {
+    if declared == "VARIANT" {
+        return true;
+    }
+    matches!(
+        (declared, value),
+        ("STRING", TypedAttributeValue::StringValue(_))
+            | ("BINARY", TypedAttributeValue::BinaryValue(_))
+            | ("BOOLEAN", TypedAttributeValue::BooleanValue(_))
+            | ("NUMBER", TypedAttributeValue::NumberValue(_))
+            | ("DATETIME", TypedAttributeValue::DatetimeValue(_))
+    )
 }

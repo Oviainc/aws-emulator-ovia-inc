@@ -21,13 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the opaque UUID-shaped ids the GameLift resources carry (`fleet-<uuid>`,
+# `psess-<uuid>`, a game session's id string), as `state::mint_uuid` does it.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

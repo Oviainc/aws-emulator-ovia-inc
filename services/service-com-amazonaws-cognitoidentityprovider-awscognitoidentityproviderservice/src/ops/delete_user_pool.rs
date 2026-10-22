@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUserPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUserPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a stored user pool with the clients and users it owns, so a later
+//! `CreateUserPoolClient` or `AdminCreateUser` for it answers
+//! `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUserPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUserPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUserPool"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // "When you try to delete a protected user pool in a DeleteUserPool API
+        // request, Amazon Cognito returns an InvalidParameterException error."
+        // (`UserPoolType.DeletionProtection` in this service's model).
+        if pool.deletion_protection == "ACTIVE" {
+            return Err(invalid_parameter(format!(
+                "User pool {} cannot be deleted while deletion protection is active.",
+                input.user_pool_id
+            )));
+        }
+        guard.user_pools.remove(&input.user_pool_id);
+        // The pool's sessions and tokens go with the pool they belong to.
+        guard.forget_pool_credentials(&input.user_pool_id);
+        Ok(DeleteUserPoolOutput)
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DeleteUserPoolError {
+    DeleteUserPoolErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> DeleteUserPoolError {
+    DeleteUserPoolErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DeleteUserPoolError {
+    DeleteUserPoolErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

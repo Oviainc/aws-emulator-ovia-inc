@@ -45,6 +45,14 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `emulator_server::service_from_target` reads out of the
+/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
+/// the segment before the `.`, strips an `_<digits>` version suffix and lower-cases it,
+/// so `AWSMPEntitlementService.<OperationName>` (`OPERATIONS.md`, "Request routing")
+/// normalises to this key — while each Marketplace sibling's own target normalises to a
+/// different one (`AWSMPMeteringService.…`, `AWSMPCommerceService_v20200301.…`).
+const TARGET_SERVICE_KEY: &str = "awsmpentitlementservice";
+
 /// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
 /// first segment (`"/"`, `""`).
 fn first_path_segment(path: &str) -> Option<&str> {
@@ -71,6 +79,30 @@ fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> 
     match first_path_segment(parts.uri.path()) {
         Some(segment) => path_segments.contains(&segment),
         None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
+    }
+}
+
+/// The Smithy service shape's own name — the part of a shape id after the `#`. That is
+/// the `{Service}` label an `rpcv2Cbor` request carries in its path.
+fn service_shape_name(shape_id: &str) -> &str {
+    shape_id.split_once('#').map_or(shape_id, |(_, name)| name)
+}
+
+/// The `{Service}` label of an `rpcv2Cbor` request path, or `None` when `path` is not
+/// one. Every rpcv2Cbor request is `POST /service/{Service}/operation/{Operation}`.
+fn rpcv2_cbor_service_label(path: &str) -> Option<&str> {
+    let (service, operation) = path.strip_prefix("/service/")?.split_once("/operation/")?;
+    (!service.is_empty() && !operation.is_empty() && !service.contains('/')).then_some(service)
+}
+
+/// Whether `parts` addresses THIS service's RPC surface rather than a sibling's that
+/// shares the signing name: an awsJson request names its service in `X-Amz-Target`, and
+/// an rpcv2Cbor request (which carries no such header) names it in the `{Service}` label
+/// of its path.
+fn claims_own_rpc_surface(parts: &http::request::Parts, shape_id: &str) -> bool {
+    match emulator_server::service_from_target(&parts.headers) {
+        Some(target) => target == TARGET_SERVICE_KEY,
+        None => rpcv2_cbor_service_label(parts.uri.path()) == Some(service_shape_name(shape_id)),
     }
 }
 
@@ -116,10 +148,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // signing-name collisions: the signing name must match AND the request must
         // address this service's own modeled URI path space (see `claims_modeled_path`),
         // which for this RPC service is the root path it posts every operation to plus
-        // the `rpcv2Cbor` path its cbor clients use.
+        // the `rpcv2Cbor` path its cbor clients use. Those two paths are shared with its
+        // RPC peers (Agreement, Metering) rather than owned, so the request must ALSO
+        // name this service out of band — `X-Amz-Target:
+        // AWSMPEntitlementService.<OperationName>` on awsJson1_1 (`OPERATIONS.md`), or
+        // the `{Service}` label of an rpcv2Cbor path.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) if key == self.entry.identity().signing_name() => {
                 claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
+                    && claims_own_rpc_surface(parts, self.entry.identity().shape_id())
             }
             _ => false,
         }

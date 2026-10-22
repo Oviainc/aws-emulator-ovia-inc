@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRegistryPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRegistryPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRegistryPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or replaces the permissions policy of this emulator's registry: the document
+//! is validated as a resource-based IAM policy and then persisted in [`crate::state`]
+//! exactly as it arrived, so `GetRegistryPolicy` reads it back byte for byte and a later
+//! put replaces it. A document that is not a usable registry policy is refused with
+//! `InvalidParameterException` and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +108,14 @@ impl From<PutRegistryPolicyErrorModeled> for PutRegistryPolicyError {
     }
 }
 
+/// The policy document is validated by [`crate::state::validate_registry_policy`], whose
+/// refusal is reported as this operation's own modelled `InvalidParameterException`.
+fn invalid_parameter(fault: crate::state::Fault) -> PutRegistryPolicyErrorModeled {
+    PutRegistryPolicyErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(fault.message().to_string()),
+    })
+}
+
 /// The `PutRegistryPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +152,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRegistryPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRegistryPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRegistryPolicy"))
+        // `PutRegistryPolicyRequest` carries only `policyText`; one registry is served
+        // here, so there is no registry to resolve.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRegistryPolicyErrorModeled::ServerException(ServerException {
+                message: Some("the ecr registry store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // The modelled length bound is already enforced at the boundary; what the model
+        // cannot express is that the text has to be a usable registry policy document.
+        crate::state::validate_registry_policy("policyText", &input.policy_text)
+            .map_err(invalid_parameter)?;
+
+        // Stored verbatim — not reserialised — so every later read returns the caller's
+        // own bytes, and a second put replaces the first (last writer wins).
+        let policy_text = input.policy_text;
+        state.lock().registry_policy = Some(policy_text.clone());
+
+        Ok(PutRegistryPolicyOutput {
+            registry_id: Some(crate::state::registry_id().to_string()),
+            policy_text: Some(policy_text),
+        })
     }
 }

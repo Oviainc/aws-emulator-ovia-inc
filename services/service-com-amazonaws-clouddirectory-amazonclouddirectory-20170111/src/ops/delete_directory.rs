@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Marks a DISABLED directory DELETED. A directory still serving requests must be
+//! disabled first, and a directory already deleted cannot be deleted again.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +158,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDirectory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDirectoryErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Cloud Directory state store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let Some(directory) = store.directories.get_mut(&input.directory_arn) else {
+            return Err(DeleteDirectoryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no directory exists at {}", input.directory_arn)),
+                },
+            )
+            .into());
+        };
+        match directory.state {
+            crate::state::DirectoryLifecycle::Deleted => {
+                return Err(DeleteDirectoryErrorModeled::DirectoryDeletedException(
+                    DirectoryDeletedException {
+                        message: Some(format!(
+                            "directory {} has already been deleted",
+                            input.directory_arn
+                        )),
+                    },
+                )
+                .into())
+            }
+            crate::state::DirectoryLifecycle::Enabled => {
+                return Err(DeleteDirectoryErrorModeled::DirectoryNotDisabledException(
+                    DirectoryNotDisabledException {
+                        message: Some(format!(
+                            "directory {} must be disabled before it can be deleted",
+                            input.directory_arn
+                        )),
+                    },
+                )
+                .into())
+            }
+            crate::state::DirectoryLifecycle::Disabled => {
+                directory.state = crate::state::DirectoryLifecycle::Deleted;
+            }
+        }
+
+        // Deleting releases what the directory no longer serves: its object graph and
+        // the per-directory copies of its applied schemas. What remains is the
+        // tombstone `GetDirectory` projects.
+        let released_schema_arns = directory.release();
+        let directory_arn = directory.arn.clone();
+        for schema_arn in released_schema_arns {
+            store.schemas.remove(&schema_arn);
+        }
+
+        Ok(DeleteDirectoryOutput { directory_arn })
     }
 }

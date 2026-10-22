@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints and PERSISTS an `IdentityId` in a stored pool, and is idempotent per federated
+//! login: the same `Logins` entry resolves to the identity already linked to it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this slice does not resolve yet: AccountId
+//!
+//! `AccountId` is documented as "A standard Amazon Web Services account ID (9+ digits)"
+//! (`smithy_query(query="doc", shape="GetIdInput", member="AccountId")`) — the account the
+//! pool belongs to, not an identifier of a user, so it cannot select one identity over
+//! another. What it does reach in the real service is the standard (classic) flow's
+//! developer-provider linking, which `Lookup`/`Merge`/`UnlinkDeveloperIdentity` and
+//! `GetOpenIdTokenForDeveloperIdentity` own — all still scaffolded (HTTP 501). This slice
+//! therefore keys an identity on its pool and its `Logins` only; sending `AccountId`
+//! changes nothing, exactly as sending it to a pool in the caller's own account does.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +169,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetId"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetIdErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some("the identity-pool store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let logins = input.logins.unwrap_or_default();
+        let mut store = state.lock();
+
+        let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
+            return Err(GetIdErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "IdentityPool '{}' not found.",
+                        input.identity_pool_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // An unauthenticated call is one with no `Logins`; the pool decides whether it
+        // may have an identity at all.
+        if logins.is_empty() && !pool.allow_unauthenticated_identities {
+            return Err(GetIdErrorModeled::NotAuthorizedException(NotAuthorizedException {
+                message: Some(format!(
+                    "Unauthenticated access is not supported for the identity pool '{}'.",
+                    input.identity_pool_id
+                )),
+            })
+            .into());
+        }
+
+        // One identity per federated login, and every login presented together names the
+        // one account: a `Logins` entry already linked to an identity resolves to that
+        // identity, and the entries presented beside it are linked to it too — the
+        // implicit linked account the operation documents. Two entries already linked to
+        // DIFFERENT identities cannot be the same account, which is exactly what
+        // `ResourceConflictException` states ("a login which is already linked to another
+        // account").
+        let presented: Vec<(String, String)> = logins
+            .iter()
+            .map(|(provider, login)| (provider.clone(), login.clone()))
+            .collect();
+        let mut already_linked: Vec<String> = Vec::new();
+        for (provider, login) in &presented {
+            let linked = store.linked_identity(&input.identity_pool_id, provider, login);
+            if let Some(identity_id) = linked {
+                if !already_linked.contains(identity_id) {
+                    already_linked.push(identity_id.clone());
+                }
+            }
+        }
+        if already_linked.len() > 1 {
+            return Err(GetIdErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    message: Some(format!(
+                        "The supplied logins are already linked to {} different identities.",
+                        already_linked.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut providers: Vec<String> = logins.keys().cloned().collect();
+        providers.sort();
+
+        let resolved = already_linked.into_iter().next();
+
+        // Both caller-driven stores this call grows have this emulator's own ceiling, and
+        // both are checked before anything is written — whether the identity is resolved
+        // or minted.
+        if store.pool_login_index_would_overflow(&input.identity_pool_id, &presented) {
+            return Err(GetIdErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of logins ({}) for the identity pool '{}' has been reached.",
+                        crate::state::MAX_LOGINS_PER_POOL, input.identity_pool_id
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(identity_id) = &resolved {
+            if store.identity_providers_would_overflow(identity_id, &providers) {
+                return Err(GetIdErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "The maximum number of linked login providers ({}) for the identity '{identity_id}' has been reached.",
+                            crate::state::MAX_LOGIN_PROVIDERS_PER_IDENTITY
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let identity_id = match &resolved {
+            Some(identity_id) => identity_id.clone(),
+            None => {
+                // One identity per unauthenticated call means the per-pool store grows
+                // with the callers; it has this emulator's own ceiling, refused with the
+                // operation's modelled `LimitExceededException`.
+                if store.pool_identity_store_is_full(&input.identity_pool_id) {
+                    return Err(GetIdErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "The maximum number of identities ({}) for the identity pool '{}' has been reached.",
+                                crate::state::MAX_IDENTITIES_PER_POOL, input.identity_pool_id
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // An identity lives in its pool's region, which the pool's own id names.
+                let region = crate::state::region_of(&input.identity_pool_id).to_string();
+                let identity_id = store.new_identity_id(&region);
+                store.identities.insert(
+                    identity_id.clone(),
+                    crate::state::Identity {
+                        identity_id: identity_id.clone(),
+                        identity_pool_id: input.identity_pool_id.clone(),
+                        logins: providers.clone(),
+                        creation_date: now,
+                        last_modified_date: now,
+                    },
+                );
+                store
+                    .identities_by_pool
+                    .entry(input.identity_pool_id.clone())
+                    .or_default()
+                    .push(identity_id.clone());
+                identity_id
+            }
+        };
+
+        // Every presented login now resolves to this identity, however it was reached.
+        for (provider, login) in &presented {
+            store.link_login(&input.identity_pool_id, provider, login, &identity_id);
+        }
+
+        // A provider this identity had not been linked to before is a change to the
+        // identity, so it is recorded with the instant it happened.
+        if resolved.is_some() {
+            if let Some(identity) = store.identities.get_mut(&identity_id) {
+                let linked_before = identity.logins.len();
+                for provider in providers {
+                    if !identity.logins.contains(&provider) {
+                        identity.logins.push(provider);
+                    }
+                }
+                if identity.logins.len() != linked_before {
+                    identity.logins.sort();
+                    identity.last_modified_date = now;
+                }
+            }
+        }
+
+        Ok(GetIdOutput {
+            identity_id: Some(identity_id),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSavingsPlansOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSavingsPlansOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSavingsPlansOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the seeded offering catalog in [`crate::state`]: every supplied
+//! filter narrows it, and `maxResults`/`nextToken` page the result.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +151,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSavingsPlansOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSavingsPlansOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSavingsPlansOfferings"))
+        /// Which paginator minted a token: see [`crate::state::encode_page_token`].
+        const PAGE_KIND: &str = "offerings";
+
+        let offset = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
+                validation("nextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        // `maxResults` is `@required` with `@default: 0`, and 0 is "no page size
+        // asked for": the whole result set comes back in one page.
+        let limit = usize::try_from(input.max_results).ok().filter(|n| *n > 0);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSavingsPlansOfferingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the savingsplans store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let matched: Vec<SavingsPlanOffering> = {
+            let store = state.lock();
+            store
+                .offerings()
+                .iter()
+                .filter(|offering| admits(&input, offering))
+                .map(project)
+                .collect()
+        };
+
+        let (page, next) = crate::state::paginate(&matched, offset, limit);
+        Ok(DescribeSavingsPlansOfferingsOutput {
+            search_results: Some(page),
+            next_token: next.map(|offset| crate::state::encode_page_token(PAGE_KIND, offset)),
+        })
+    }
+}
+
+/// A 400 `ValidationException`, the error this operation models for a request
+/// whose values the model's own constraints cannot refuse.
+fn validation(message: String) -> DescribeSavingsPlansOfferingsError {
+    DescribeSavingsPlansOfferingsErrorModeled::ValidationException(ValidationException { message })
+        .into()
+}
+
+/// Whether every filter the request supplied admits `offering`.
+///
+/// Each list-shaped filter admits the values it names and, when absent or
+/// empty, constrains nothing; `productType` matches an offering that covers
+/// that product; `filters` match the offering's own properties.
+fn admits(
+    input: &DescribeSavingsPlansOfferingsInput,
+    offering: &crate::state::Offering,
+) -> bool {
+    use crate::state::filter_admits;
+
+    if !filter_admits(input.offering_ids.as_ref(), &offering.offering_id)
+        || !filter_admits(input.payment_options.as_ref(), &offering.payment_option)
+        || !filter_admits(input.plan_types.as_ref(), &offering.plan_type)
+        || !filter_admits(input.currencies.as_ref(), &offering.currency)
+        || !filter_admits(input.descriptions.as_ref(), &offering.description)
+        || !filter_admits(input.service_codes.as_ref(), &offering.service_code)
+        || !filter_admits(input.usage_types.as_ref(), &offering.usage_type)
+        || !filter_admits(input.operations.as_ref(), &offering.operation)
+    {
+        return false;
+    }
+    if let Some(durations) = input.durations.as_ref().filter(|d| !d.is_empty()) {
+        if !durations.contains(&offering.duration_seconds) {
+            return false;
+        }
+    }
+    if let Some(product_type) = input.product_type.as_deref() {
+        if !offering.product_types.iter().any(|p| p == product_type) {
+            return false;
+        }
+    }
+    for filter in input.filters.iter().flatten() {
+        let Some(name) = filter.name.as_deref() else {
+            continue;
+        };
+        let admitted = match offering.property(name) {
+            Some(value) => crate::state::filter_admits(filter.values.as_ref(), value),
+            // An offering that does not carry the property cannot satisfy a
+            // filter on it, unless that filter names no value at all.
+            None => filter.values.as_ref().is_none_or(Vec::is_empty),
+        };
+        if !admitted {
+            return false;
+        }
+    }
+    true
+}
+
+/// Project a stored catalog entry onto the wire shape.
+fn project(offering: &crate::state::Offering) -> SavingsPlanOffering {
+    SavingsPlanOffering {
+        offering_id: Some(offering.offering_id.clone()),
+        product_types: Some(offering.product_types.clone()),
+        plan_type: Some(offering.plan_type.clone()),
+        description: Some(offering.description.clone()),
+        payment_option: Some(offering.payment_option.clone()),
+        duration_seconds: offering.duration_seconds,
+        currency: Some(offering.currency.clone()),
+        service_code: Some(offering.service_code.clone()),
+        usage_type: Some(offering.usage_type.clone()),
+        operation: Some(offering.operation.clone()),
+        properties: Some(
+            offering
+                .properties
+                .iter()
+                .map(|(name, value)| SavingsPlanOfferingProperty {
+                    name: Some(name.clone()),
+                    value: Some(value.clone()),
+                })
+                .collect(),
+        ),
     }
 }

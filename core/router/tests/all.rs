@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/appconfig_signing_name_routing.rs"]
 mod appconfig_signing_name_routing;
+#[path = "all/aws_marketplace_signing_name_routing.rs"]
+mod aws_marketplace_signing_name_routing;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
 #[path = "all/connect_signing_name_routing.rs"]

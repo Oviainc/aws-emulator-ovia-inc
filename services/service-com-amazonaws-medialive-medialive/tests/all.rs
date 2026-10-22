@@ -20,5 +20,12 @@ mod input_lifecycle;
 #[path = "all/input_security_group.rs"]
 mod input_security_group;
 
+#[path = "all/sdi_source_lifecycle.rs"]
+mod sdi_source_lifecycle;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+/// The shared restJson1 harness the suites above drive the service through.
+#[path = "all/wire.rs"]
+mod wire;

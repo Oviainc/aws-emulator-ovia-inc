@@ -247,13 +247,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if store.name_index.contains_key(&name_key) {
-            return Err(CreateApplicationErrorModeled::ConflictException(ConflictException {
-                error_code: Some("409".to_string()),
-                message: Some(format!(
-                    "An application with the name {} already exists.",
-                    input.name
-                )),
-            })
+            // The condition is "this name is already published", so that is what the
+            // body's `errorCode` names — not the 409 the status line already carries.
+            return Err(CreateApplicationErrorModeled::ConflictException(crate::state::conflict(
+                crate::state::ErrorCode::ApplicationAlreadyExists,
+                format!("Application with id {application_id} already exists."),
+            ))
             .into());
         }
         // The store grows once per create and is released only by a caller's delete, so
@@ -368,21 +367,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The 500 this operation answers when the shared store cannot be reached. Never a
 /// panic: the framework renders a panic as a retryable 500 the real service never gives.
 fn internal_error(message: &str) -> CreateApplicationError {
-    CreateApplicationErrorModeled::InternalServerErrorException(InternalServerErrorException {
-        error_code: Some("500".to_string()),
-        message: Some(message.to_string()),
-    })
+    CreateApplicationErrorModeled::InternalServerErrorException(
+        crate::state::internal_server_error(message),
+    )
     .into()
 }
 
 /// The 400 this operation answers for a parameter the model does not constrain but the
 /// service documents.
 fn bad_request(message: String) -> CreateApplicationError {
-    CreateApplicationErrorModeled::BadRequestException(BadRequestException {
-        error_code: Some("400".to_string()),
-        message: Some(message),
-    })
-    .into()
+    CreateApplicationErrorModeled::BadRequestException(crate::state::bad_request(message)).into()
 }
 
 /// `Name`: "Minimum length=1. Maximum length=140 Pattern: \"[a-zA-Z0-9\\-]+\""

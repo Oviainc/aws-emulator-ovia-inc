@@ -21,13 +21,38 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex codec for the opaque ListPolicies pagination cursor.
+hex = { workspace = true }
+# The Cedar policy language itself: parses the Cedar policy text this service
+# stores and evaluates authorization requests against it. Verified Permissions IS
+# Cedar, so the real parser/authorizer is the only faithful implementation; a
+# hand-written subset would answer every input it was not sized for wrongly.
+#
+# Capability classes this acquisition brings in, named deliberately:
+#  * cedar-policy itself evaluates CALLER-SUPPLIED text. The language has no
+#    network, filesystem, process or FFI primitive, and it has no loops,
+#    recursion or calls, so an evaluation cannot escape the process and always
+#    terminates. Size, count and depth are bounded in `src/state/cedar.rs`.
+#  * BUILD-TIME CODE GENERATION: cedar-policy-core builds its grammar with
+#    `lalrpop`, a parser generator that runs from a build script with the
+#    builder's authority. It reads only the grammar files inside its own crate
+#    and writes only into OUT_DIR, and the same class of build script already
+#    runs in this workspace (every service crate has a `build.rs`).
+#  * NATIVE CODE: cedar-policy-core depends on `stacker`, which grows the stack
+#    so a deeply nested policy cannot overflow the request thread; `stacker`
+#    compiles `psm` (hand-written assembly) through `cc`. That is unsafe code in
+#    a dependency, which the workspace's `forbid(unsafe_code)` does not and
+#    cannot cover — it binds authored code. It is accepted here because it is
+#    precisely the mitigation for the stack-depth risk this dependency would
+#    otherwise carry, and because it is confined to stack management.
+# `cargo_audit` checks every locked version of all of the above.
+cedar-policy = "4"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

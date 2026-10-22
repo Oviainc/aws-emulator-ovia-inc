@@ -72,6 +72,7 @@ pub mod get_restore_job_metadata_types;
 pub mod get_restore_testing_inferred_metadata_types;
 pub mod get_restore_testing_plan_types;
 pub mod get_restore_testing_selection_types;
+pub mod get_supported_resource_types_types;
 pub mod get_tiering_configuration_types;
 pub mod list_backup_access_points_by_recovery_point_types;
 pub mod list_backup_access_points_by_resource_types;
@@ -246,6 +247,8 @@ pub use get_restore_testing_inferred_metadata_types::*;
 pub use get_restore_testing_plan_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_restore_testing_selection_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_supported_resource_types_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_tiering_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

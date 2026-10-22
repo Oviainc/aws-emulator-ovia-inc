@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a fleet of compute resources to host game servers, and persists it so the
+//! describes, `CreateGameSession` and `DeleteFleet` all read the same record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An Anywhere fleet is created `ACTIVE`; a managed EC2 fleet is placed in `NEW` and
+//! becomes `ACTIVE` when the fleet-creation workflow the call started comes due (see
+//! `crate::state::WORKFLOW_DELAY`).
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -337,18 +336,242 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFleet"))
+        use crate::state::{
+            COMPUTE_TYPE_ANYWHERE, COMPUTE_TYPE_EC2, FLEET_STATUS_ACTIVE, FLEET_STATUS_NEW,
+            FLEET_TYPE_ON_DEMAND, PROTECTION_POLICY_NO_PROTECTION, WORKFLOW_DELAY,
+        };
+
+        let invalid = |message: &str| -> Self::Error {
+            CreateFleetErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message.to_string()),
+            })
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFleetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        let region = crate::state::request_region(ctx);
+        // `ComputeType` doc: "EC2 - ... This is the default setting."
+        let compute_type = input
+            .compute_type
+            .clone()
+            .unwrap_or_else(|| COMPUTE_TYPE_EC2.to_string());
+
+        // The documented required parameters per compute type. EC2InboundPermissions and
+        // RuntimeConfiguration are NOT enforced: their own member docs say a fleet may be
+        // created without them ("You can leave this parameter empty when creating the
+        // fleet, but you must call ... UpdateFleetPortSettings to set it before players
+        // can connect"). A named `BuildId`/`ScriptId` is NOT checked for existence
+        // either, deliberately: CreateBuild and CreateScript are still 501 in this
+        // emulator, so no build or script can have been stored and every EC2 fleet would
+        // be unreachable. Once that slice lands, an unknown build or script becomes the
+        // modelled `NotFoundException` here.
+        if compute_type == COMPUTE_TYPE_ANYWHERE {
+            if input.locations.as_ref().is_none_or(Vec::is_empty) {
+                return Err(invalid(
+                    "Locations with a custom location is required to create a fleet with ComputeType ANYWHERE.",
+                ));
+            }
+        } else {
+            match (&input.build_id, &input.script_id) {
+                (Some(_), Some(_)) => {
+                    return Err(invalid("BuildId and ScriptId cannot both be specified."))
+                }
+                (None, None) => {
+                    return Err(invalid(
+                        "Either BuildId or ScriptId is required to create a fleet with ComputeType EC2.",
+                    ))
+                }
+                _ => {}
+            }
+            if input.ec2_instance_type.is_none() {
+                return Err(invalid(
+                    "EC2InstanceType is required to create a fleet with ComputeType EC2.",
+                ));
+            }
+        }
+
+        // `IpPermission$FromPort` doc: "For fleets using Linux builds, only ports 22 and
+        // 1026-60000 are valid. For fleets using Windows builds, only ports 1026-60000
+        // are valid." `ToPort`: "This value must be equal to or greater than FromPort."
+        // The modelled `PortNumber` range (1-60000) is refused by the boundary walk
+        // before this handler runs; the valid SET and the ordering are the service's own
+        // rules, enforced here — so a stored fleet only ever holds a range its game
+        // sessions' ports can be drawn from.
+        for permission in input.ec2_inbound_permissions.iter().flatten() {
+            let (from, to) = (permission.from_port, permission.to_port);
+            if !crate::state::valid_port_range(from, to) {
+                return Err(invalid(&format!(
+                    "EC2InboundPermissions port range {from}-{to} is not valid: a range must run \
+                     forwards and lie within {}-{}, or be port {} alone.",
+                    crate::state::DEFAULT_PORT_RANGE.0,
+                    crate::state::DEFAULT_PORT_RANGE.1,
+                    crate::state::REMOTE_ACCESS_PORT,
+                )));
+            }
+        }
+
+        // `CreateFleet` mints a fleet that lives until it is deleted, so the quota is
+        // what keeps the store bounded as well as what makes the modelled error
+        // reachable. The store is account-wide in this emulator (see
+        // `MAX_FLEETS_PER_ACCOUNT`), so the message does not claim a per-Region count.
+        if state.fleets.len() >= crate::state::MAX_FLEETS_PER_ACCOUNT {
+            return Err(CreateFleetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already has the maximum of {} fleets.",
+                        crate::state::MAX_FLEETS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `RuntimeConfiguration` doc: "An Amazon GameLift Servers instance is limited to
+        // 50 processes running concurrently. To calculate the total number of processes
+        // defined in a runtime configuration, add the values of the ConcurrentExecutions
+        // parameter for each server process."
+        let configured_processes = input
+            .runtime_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.server_processes.as_ref())
+            .map_or(0, |processes| {
+                processes.iter().fold(0_i32, |total, process| {
+                    total.saturating_add(process.concurrent_executions)
+                })
+            });
+        if configured_processes > crate::state::MAX_SERVER_PROCESSES_PER_INSTANCE {
+            return Err(invalid(&format!(
+                "RuntimeConfiguration asks for {configured_processes} concurrent server \
+                 processes; an instance is limited to {}.",
+                crate::state::MAX_SERVER_PROCESSES_PER_INSTANCE
+            )));
+        }
+
+        // `FleetId` matches the modelled `^[a-z]*fleet-[a-zA-Z0-9\-]+$`, and the ARN the
+        // format `FleetAttributes$FleetArn` documents.
+        let fleet_id = format!(
+            "fleet-{}",
+            crate::state::mint_uuid(&mut state.minted_ids, "fleet")
+        );
+        let fleet_arn = crate::state::gamelift_arn(&region, &format!("fleet/{fleet_id}"));
+
+        let (build_id, build_arn) = match &input.build_id {
+            Some(build) => {
+                let (id, arn) = crate::state::id_and_arn(build, &region, "build");
+                (Some(id), Some(arn))
+            }
+            None => (None, None),
+        };
+        let (script_id, script_arn) = match &input.script_id {
+            Some(script) => {
+                let (id, arn) = crate::state::id_and_arn(script, &region, "script");
+                (Some(id), Some(arn))
+            }
+            None => (None, None),
+        };
+
+        // An Anywhere fleet is placed in ACTIVE status on creation; a managed EC2 fleet
+        // is placed in NEW "while Amazon GameLift Servers initiates the fleet creation
+        // workflow", and is ACTIVE once that workflow comes due.
+        let (status, active_at) = if compute_type == COMPUTE_TYPE_ANYWHERE {
+            (FLEET_STATUS_ACTIVE, None)
+        } else {
+            (FLEET_STATUS_NEW, Some(now + WORKFLOW_DELAY))
+        };
+
+        // `CreateFleetOutput$LocationStates` doc: "This list includes an entry for the
+        // fleet's home Region. For fleets with no remote locations, only one entry,
+        // representing the home Region, is returned."
+        let mut locations = vec![crate::state::FleetLocation {
+            location: region.clone(),
+            status: status.to_string(),
+        }];
+        for configured in input.locations.iter().flatten() {
+            if !locations
+                .iter()
+                .any(|known| known.location == configured.location)
+            {
+                locations.push(crate::state::FleetLocation {
+                    location: configured.location.clone(),
+                    status: status.to_string(),
+                });
+            }
+        }
+
+        let ip_address = state.next_instance_address();
+        let fleet = crate::state::Fleet {
+            fleet_id: fleet_id.clone(),
+            fleet_arn,
+            name: input.name.clone(),
+            description: input.description.clone(),
+            status: status.to_string(),
+            active_at,
+            purge_at: None,
+            // `FleetType` doc: "By default, this property is set to ON_DEMAND."
+            fleet_type: input
+                .fleet_type
+                .clone()
+                .unwrap_or_else(|| FLEET_TYPE_ON_DEMAND.to_string()),
+            instance_type: input.ec2_instance_type.clone(),
+            compute_type,
+            build_id,
+            build_arn,
+            script_id,
+            script_arn,
+            server_launch_path: input.server_launch_path.clone(),
+            server_launch_parameters: input.server_launch_parameters.clone(),
+            log_paths: input.log_paths.clone(),
+            runtime_configuration: input.runtime_configuration.clone(),
+            resource_creation_limit_policy: input.resource_creation_limit_policy.clone(),
+            certificate_configuration: input.certificate_configuration.clone(),
+            anywhere_configuration: input.anywhere_configuration.clone(),
+            player_gateway_mode: input.player_gateway_mode.clone(),
+            player_gateway_configuration: input.player_gateway_configuration.clone(),
+            instance_role_arn: input.instance_role_arn.clone(),
+            instance_role_credentials_provider: input.instance_role_credentials_provider.clone(),
+            ec2_inbound_permissions: input.ec2_inbound_permissions.clone().unwrap_or_default(),
+            // `NewGameSessionProtectionPolicy` doc: "By default, this property is set to
+            // NoProtection."
+            new_game_session_protection_policy: input
+                .new_game_session_protection_policy
+                .clone()
+                .unwrap_or_else(|| PROTECTION_POLICY_NO_PROTECTION.to_string()),
+            metric_groups: input.metric_groups.clone().unwrap_or_default(),
+            locations,
+            home_location: region.clone(),
+            region,
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: now,
+            termination_time: None,
+            ip_address,
+            port_cursor: 0,
+        };
+        state.fleets.insert(fleet_id.clone(), fleet);
+
+        // Report the STORED record, so this response and every later describe of the
+        // same fleet can only agree.
+        let Some(stored) = state.fleets.get(&fleet_id) else {
+            return Err(CreateFleetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new fleet could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateFleetOutput {
+            fleet_attributes: Some(stored.attributes()),
+            location_states: Some(stored.location_states()),
+        })
     }
 }

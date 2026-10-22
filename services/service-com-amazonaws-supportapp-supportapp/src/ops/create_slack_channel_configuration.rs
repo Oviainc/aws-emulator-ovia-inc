@@ -200,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The severity/flag combination rule documented on `notifyOnCaseSeverity`. The
         // model cannot express it, so the boundary validator passed it.
         if let Some(message) = crate::state::notification_rule_violation(
+            Self::NAME,
             &input.notify_on_case_severity,
             notify_on_create_or_reopen_case,
             notify_on_add_correspondence_to_case,
@@ -221,10 +222,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.slack_channel_configurations.contains_key(&key) {
             return Err(CreateSlackChannelConfigurationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "a Slack channel configuration already exists for channel {} in \
-                         workspace {}",
-                        input.channel_id, input.team_id
+                    message: Some(crate::state::slack_channel_configuration_exists(
+                        &input.team_id,
+                        &input.channel_id,
                     )),
                 },
             )

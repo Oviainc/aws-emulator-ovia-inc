@@ -143,9 +143,7 @@ fn encode_next_token(last_id: &str) -> String {
 /// Decode a `nextToken` back into the feed id a page resumes after.
 ///
 /// `None` for a token that is not the hex encoding of a feed id, which the handler
-/// refuses as a `ValidationException`. A token that does decode names a position in
-/// the id order rather than a feed that must still exist, so paging survives a feed
-/// deleted between two pages: the next page simply resumes at the next id.
+/// refuses as a `ValidationException`. See [`crate::state::decode_page_token`].
 fn decode_next_token(token: &str) -> Option<String> {
     crate::state::decode_page_token(token)
 }

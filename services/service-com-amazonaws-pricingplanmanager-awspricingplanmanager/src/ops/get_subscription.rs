@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored subscription an `arn` names, with its current `ETag`. A reporting
+//! operation: the only write it makes is to materialise a scheduled change the clock had
+//! already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSubscription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSubscriptionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Bring the store up to the clock before reporting: a change whose effective
+        // instant has passed has already happened, with or without this call.
+        store.apply_due_changes(crate::state::now());
+        let Some(record) = store.subscription(&input.arn) else {
+            return Err(GetSubscriptionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no subscription with ARN {}", input.arn),
+                    resource_id: input.arn.clone(),
+                },
+            )
+            .into());
+        };
+        Ok(GetSubscriptionOutput {
+            subscription: record.to_subscription(),
+            e_tag: record.etag(),
+        })
     }
 }

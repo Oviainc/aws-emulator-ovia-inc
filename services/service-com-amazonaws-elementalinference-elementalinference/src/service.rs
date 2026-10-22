@@ -41,9 +41,65 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The member that carries a role this service is asked to pass on the caller's
+/// behalf (`CreateFeedRequest$accessRoleArn`, `UpdateFeedRequest$accessRoleArn`:
+/// "The ARN of an IAM role that Elemental Inference assumes to access resources in
+/// your account on your behalf").
+const PASS_ROLE_MEMBER: &str = "accessRoleArn";
+
+/// Whether this refused value is a role this service may not pass, rather than a
+/// member that merely failed its own syntax rules.
+///
+/// True for a violation of the pass-role member whose value names an account other
+/// than the one this emulator serves: the service reaches the pass-role authorization
+/// decision before the member's offline rules, so the account in the ARN decides the
+/// answer even when the rest of the ARN would not satisfy the member's `@pattern` or
+/// `@length`.
+///
+/// The framework pins a pre-handler refusal at HTTP 400, so this classification
+/// changes the error code and the message; the same decision taken on a value that
+/// satisfies the member's rules reaches the handler and is answered there with the
+/// modelled `AccessDeniedException` and its own HTTP 403.
+fn denies_a_cross_account_pass_role(violation: &Violation) -> bool {
+    let names_pass_role_member = violation
+        .path
+        .split('.')
+        .next_back()
+        .is_some_and(|member| member == PASS_ROLE_MEMBER);
+    names_pass_role_member
+        && violation
+            .value
+            .as_deref()
+            .is_some_and(crate::state::names_another_account)
+}
+
+/// The same violation with a `@pattern` stripped of its anchors.
+///
+/// A constraint-violation message names the member and the constraint it failed, and
+/// this service renders a regular-expression constraint as the expression ALONE: the
+/// leading `^` and trailing `$` of an anchored modelled pattern are not part of the
+/// rendering. Every other violation kind is returned unchanged.
+fn without_pattern_anchors(violation: &Violation) -> Violation {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return violation.clone();
+    };
+    let mut stripped: &str = pattern.strip_prefix('^').unwrap_or(pattern);
+    // A trailing `$` that is ESCAPED (`\$`) matches a literal dollar sign and is not
+    // an anchor, so it stays.
+    if let Some(body) = stripped.strip_suffix('$') {
+        if !body.ends_with('\\') {
+            stripped = body;
+        }
+    }
+    Violation {
+        kind: ViolationKind::Pattern(stripped.to_string()),
+        ..violation.clone()
+    }
+}
 
 /// The `com-amazonaws-elementalinference-elementalinference` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -99,14 +155,44 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording.
+        //
+        // Two things this service states differently from the default, both about
+        // values the model constrains:
+        //
+        // 1. a role ARN naming another account is an AUTHORIZATION refusal, not a
+        //    malformed request: Elemental Inference does not resolve a passed role
+        //    offline, it evaluates the role by attempting to pass it, so that check
+        //    is reached before the member's own syntax rules are. Both the code and
+        //    the message change together, which is what a client branches on.
+        // 2. a `@pattern` renders into a constraint-violation message WITHOUT its
+        //    anchors, for every anchored pattern member of this service.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        if violations.iter().any(denies_a_cross_account_pass_role) {
+            return Some(Refused {
+                code: "AccessDeniedException".to_string(),
+                message: crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
+            });
+        }
+        // Nothing else this service words differently, so a refusal with no pattern
+        // violation keeps the framework's own rendering rather than being re-rendered
+        // here: the blast radius stays on the one rule above.
+        if !violations
+            .iter()
+            .any(|violation| matches!(violation.kind, ViolationKind::Pattern(_)))
+        {
+            return None;
+        }
+        let reworded: Vec<Violation> = violations.iter().map(without_pattern_anchors).collect();
+        Some(Refused {
+            code: "ValidationException".to_string(),
+            // The same envelope the framework renders (`1 validation error detected:
+            // …`), built from the reworded violations so the clause wording stays in
+            // the one place that owns it.
+            message: aws_smithy_schema_server::constraints::envelope(&reworded)?,
+        })
     }
 
     fn override_routing_error(

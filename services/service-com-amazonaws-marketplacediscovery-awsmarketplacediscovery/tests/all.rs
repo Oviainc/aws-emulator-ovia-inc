@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/catalog_drilldown.rs"]
 mod catalog_drilldown;
+#[path = "all/signing_name_claims.rs"]
+mod signing_name_claims;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the persisted instance record, detaches it from its cluster's
+//! member list, and answers with that record's `DBInstance` view in status `deleting`.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +165,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBInstance"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state as st;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(Scaffolded::not_implemented("DeleteDBInstance"));
+        };
+        let mut state = state.lock();
+        state.settle();
+
+        let not_found = || {
+            DeleteDBInstanceErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
+                message: Some(format!(
+                    "DBInstance {} not found.",
+                    input.db_instance_identifier
+                )),
+            })
+        };
+        // The resource is resolved FIRST, so a request naming an instance that does not
+        // exist always reports the modelled not-found fault rather than a parameter
+        // complaint about an instance the caller cannot have.
+        let Some(key) = state.resolve_instance_key(&input.db_instance_identifier) else {
+            return Err(not_found().into());
+        };
+
+        // The resource and its STATE come first, so an instance that cannot be deleted at
+        // all reports the modelled state fault rather than a parameter complaint about a
+        // snapshot the delete was never going to reach.
+        if state
+            .instances
+            .get(&key)
+            .is_some_and(|instance| instance.deletion_protection)
+        {
+            // "You can't delete a DB instance if it has deletion protection enabled."
+            return Err(DeleteDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "Cannot delete protected DB Instance {key}, please disable deletion protection and try again."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The FinalDBSnapshotIdentifier parameter must be specified if SkipFinalSnapshot
+        // is false", whose documented default is false.
+        if !input.skip_final_snapshot.unwrap_or(false) {
+            match input.final_db_snapshot_identifier.as_deref() {
+                None => {
+                    return Err(Scaffolded::validation(
+                        "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is set to true",
+                    ))
+                }
+                Some(_) => {
+                    // Taking the final DB snapshot is this service's snapshot surface,
+                    // which is not implemented: say so rather than delete the instance
+                    // and report a snapshot nothing created.
+                    return Err(Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+                        message: "DeleteDBInstance cannot take the final DB snapshot this \
+                                  request asks for: DB snapshot operations are not \
+                                  implemented in this emulator. Retry with \
+                                  SkipFinalSnapshot=true."
+                            .to_string(),
+                    }));
+                }
+            }
+        }
+
+        let Some(record) = state.instances.remove(&key) else {
+            return Err(not_found().into());
+        };
+
+        if let Some(cluster) = state.clusters.get_mut(&record.cluster_identifier) {
+            let was_writer = cluster
+                .members
+                .iter()
+                .any(|member| member.db_instance_identifier == key && member.is_cluster_writer);
+            cluster
+                .members
+                .retain(|member| member.db_instance_identifier != key);
+            if was_writer {
+                // The cluster keeps exactly one writer: the remaining member with the
+                // lowest promotion tier takes over (ties broken by identifier).
+                if let Some(promoted) = cluster.members.iter_mut().min_by(|a, b| {
+                    a.promotion_tier.cmp(&b.promotion_tier).then_with(|| {
+                        a.db_instance_identifier.cmp(&b.db_instance_identifier)
+                    })
+                }) {
+                    promoted.is_cluster_writer = true;
+                }
+            }
+        }
+
+        let db_instance = st::instance_view(
+            &record,
+            state.clusters.get(&record.cluster_identifier),
+            st::STATUS_DELETING,
+        );
+        Ok(DeleteDBInstanceOutput {
+            db_instance: Some(db_instance),
+        })
     }
 }

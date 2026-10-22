@@ -19,6 +19,7 @@ pub mod batch_is_authorized_types;
 pub mod batch_is_authorized_with_token_types;
 pub mod create_identity_source_types;
 pub mod create_policy_store_alias_types;
+pub mod create_policy_store_types;
 pub mod create_policy_template_types;
 pub mod create_policy_types;
 pub mod delete_identity_source_types;
@@ -28,6 +29,7 @@ pub mod delete_policy_template_types;
 pub mod delete_policy_types;
 pub mod get_identity_source_types;
 pub mod get_policy_store_alias_types;
+pub mod get_policy_store_types;
 pub mod get_policy_template_types;
 pub mod get_policy_types;
 pub mod get_schema_types;
@@ -59,6 +61,8 @@ pub use create_identity_source_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_policy_store_alias_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use create_policy_store_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_policy_template_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_policy_types::*;
@@ -76,6 +80,8 @@ pub use delete_policy_types::*;
 pub use get_identity_source_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_policy_store_alias_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_policy_store_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_policy_template_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

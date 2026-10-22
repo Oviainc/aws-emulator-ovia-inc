@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminInitiateAuth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminInitiateAuth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Signs a user in as an administrator. `AuthFlow=ADMIN_USER_PASSWORD_AUTH` (and
+//! the legacy `ADMIN_NO_SRP_AUTH`) verifies the password stored by
+//! `AdminSetUserPassword` / `AdminCreateUser` and issues the token triple;
+//! a user that still has to change its password gets the
+//! `NEW_PASSWORD_REQUIRED` challenge with a persisted `Session`. Every other
+//! `AuthFlow` answers 501 until it is implemented.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminInitiateAuth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -295,18 +293,258 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminInitiateAuth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminInitiateAuthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminInitiateAuth"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // `AuthFlow` is an enumerated member, so the boundary validator has
+        // already refused any value outside `AuthFlowType`. Only the admin
+        // username-password flow is implemented so far; the rest say so rather
+        // than answering a sign-in nothing performed.
+        if !matches!(
+            input.auth_flow.as_str(),
+            "ADMIN_USER_PASSWORD_AUTH" | "ADMIN_NO_SRP_AUTH"
+        ) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "AdminInitiateAuth with AuthFlow={}",
+                input.auth_flow
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let auth_parameters = input.auth_parameters.unwrap_or_default();
+        let username = auth_parameters
+            .get("USERNAME")
+            .ok_or_else(|| missing_auth_parameter("USERNAME", &input.auth_flow))?
+            .clone();
+        let password = auth_parameters
+            .get("PASSWORD")
+            .ok_or_else(|| missing_auth_parameter("PASSWORD", &input.auth_flow))?
+            .clone();
+
+        let mut guard = state.lock();
+        let outcome = {
+            let pool = guard
+                .pool(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            let client = pool
+                .clients
+                .get(&input.client_id)
+                .ok_or_else(|| client_not_found(&input.client_id))?;
+            if !client.allows_admin_password_auth() {
+                return Err(invalid_parameter(format!(
+                    "{} is not enabled for the client {}",
+                    input.auth_flow, input.client_id
+                )));
+            }
+            let hides_user_existence = client.hides_user_existence();
+            let session_validity = client.auth_session_validity();
+            let temporary_password_validity = pool.temporary_password_validity();
+
+            let user = pool.user(&username).ok_or_else(|| {
+                // `PreventUserExistenceErrors=ENABLED` "suppresses messages that
+                // might indicate a valid user exists"; `LEGACY` answers
+                // `UserNotFoundException`.
+                if hides_user_existence {
+                    incorrect_credentials()
+                } else {
+                    user_not_found(&username)
+                }
+            })?;
+            if !user.enabled {
+                return Err(not_authorized("User is disabled."));
+            }
+            match user.status {
+                crate::state::UserStatus::ResetRequired => {
+                    return Err(password_reset_required());
+                }
+                crate::state::UserStatus::Unconfirmed => {
+                    return Err(user_not_confirmed());
+                }
+                _ => {}
+            }
+            // The stored credential, actually checked.
+            if user.password.as_deref() != Some(password.as_str()) {
+                return Err(incorrect_credentials());
+            }
+            if user.temporary_password_expired(temporary_password_validity, now) {
+                return Err(not_authorized(
+                    "Temporary password has expired and must be reset by an administrator.",
+                ));
+            }
+
+            if user.status == crate::state::UserStatus::ForceChangePassword {
+                Outcome::Challenge {
+                    username: user.username.clone(),
+                    required_attributes: pool.missing_required_attributes(user),
+                    user_attributes: user.attributes.clone(),
+                    session_validity,
+                }
+            } else {
+                Outcome::Authenticate {
+                    username: user.username.clone(),
+                }
+            }
+        };
+
+        match outcome {
+            Outcome::Challenge {
+                username,
+                required_attributes,
+                user_attributes,
+                session_validity,
+            } => {
+                let session = guard.start_session(
+                    now,
+                    crate::state::AuthSession {
+                        user_pool_id: input.user_pool_id.clone(),
+                        client_id: input.client_id.clone(),
+                        username: username.clone(),
+                        challenge_name: NEW_PASSWORD_REQUIRED.to_string(),
+                        expires_at: now + session_validity,
+                    },
+                );
+                let mut challenge_parameters = ::std::collections::HashMap::new();
+                challenge_parameters.insert("USER_ID_FOR_SRP".to_string(), username);
+                challenge_parameters.insert(
+                    "requiredAttributes".to_string(),
+                    serde_json::Value::Array(
+                        required_attributes
+                            .into_iter()
+                            .map(|name| serde_json::Value::String(format!("userAttributes.{name}")))
+                            .collect(),
+                    )
+                    .to_string(),
+                );
+                challenge_parameters.insert(
+                    "userAttributes".to_string(),
+                    serde_json::Value::Object(
+                        user_attributes
+                            .into_iter()
+                            .map(|(name, value)| (name, serde_json::Value::String(value)))
+                            .collect(),
+                    )
+                    .to_string(),
+                );
+                Ok(AdminInitiateAuthOutput {
+                    challenge_name: Some(NEW_PASSWORD_REQUIRED.to_string()),
+                    session: Some(session),
+                    challenge_parameters: Some(challenge_parameters),
+                    authentication_result: None,
+                    available_challenges: None,
+                })
+            }
+            Outcome::Authenticate { username } => {
+                let authentication_result = guard
+                    .issue_tokens(&input.user_pool_id, &input.client_id, &username, now)
+                    .ok_or_else(internal_error)?;
+                Ok(AdminInitiateAuthOutput {
+                    challenge_name: None,
+                    session: None,
+                    challenge_parameters: None,
+                    authentication_result: Some(authentication_result),
+                    available_challenges: None,
+                })
+            }
+        }
     }
+}
+
+/// The challenge a user that must change its password is answered with
+/// (`ChallengeNameType` in this service's model).
+const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
+
+/// What the stored state decided this sign-in is, read under the state lock
+/// before anything is written.
+enum Outcome {
+    /// The password is right but the user must change it first.
+    Challenge {
+        username: String,
+        required_attributes: Vec<String>,
+        user_attributes: ::std::collections::BTreeMap<String, String>,
+        session_validity: ::std::time::Duration,
+    },
+    /// The password is right and the user may sign in.
+    Authenticate { username: String },
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for an absent app client.
+fn client_not_found(client_id: &str) -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user.
+fn user_not_found(username: &str) -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(format!("User {username} does not exist.")),
+    })
+    .into()
+}
+
+/// The refusal for a wrong password: `NotAuthorizedException`, which is also
+/// what an absent user gets when the client hides user existence.
+fn incorrect_credentials() -> AdminInitiateAuthError {
+    not_authorized("Incorrect username or password.")
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `PasswordResetRequiredException` for a user in
+/// `RESET_REQUIRED`.
+fn password_reset_required() -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::PasswordResetRequiredException(PasswordResetRequiredException {
+        message: Some("Password reset required for the user.".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `UserNotConfirmedException` for a user in `UNCONFIRMED`.
+fn user_not_confirmed() -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::UserNotConfirmedException(UserNotConfirmedException {
+        message: Some("User is not confirmed.".to_string()),
+    })
+    .into()
+}
+
+/// The refusal for an `AuthParameters` entry this flow requires and the request
+/// did not carry.
+fn missing_auth_parameter(parameter: &str, auth_flow: &str) -> AdminInitiateAuthError {
+    invalid_parameter(format!(
+        "Missing required parameter {parameter} in AuthParameters for AuthFlow {auth_flow}"
+    ))
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminInitiateAuthError {
+    AdminInitiateAuthErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

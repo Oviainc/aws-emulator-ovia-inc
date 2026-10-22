@@ -15,3 +15,5 @@
 mod cloud_map_core;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_http_namespace.rs"]
+mod update_http_namespace;

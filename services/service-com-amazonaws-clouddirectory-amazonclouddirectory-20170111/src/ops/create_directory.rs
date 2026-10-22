@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a directory from a PUBLISHED schema: mints the directory ARN, records an
+//! APPLIED copy of the schema under it, and creates the directory's implicit root
+//! object. Every member of the response is read back out of those records.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +169,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDirectory"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDirectoryErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Cloud Directory state store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let Some(published) = store.schemas.get(&input.schema_arn) else {
+            return Err(CreateDirectoryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no schema exists at {}", input.schema_arn)),
+                },
+            )
+            .into());
+        };
+        if published.stage != crate::state::SchemaStage::Published {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{} is not a published schema; only a published schema can be applied to a \
+                 directory",
+                input.schema_arn
+            )));
+        }
+        let schema_name = published.name.clone();
+        let schema_version = published.version.clone().unwrap_or_default();
+        let schema_minor_version = published.minor_version.clone();
+        let schema_facets = published.facets.clone();
+
+        // A directory name is unique per account and Region among the directories that
+        // still exist: a deleted one no longer holds its name, and a name live in another
+        // Region does not collide, because the ARN this call mints is Region-scoped.
+        let region_prefix = crate::state::directory_arn(&region, "");
+        if store.directories.values().any(|dir| {
+            dir.name == input.name
+                && dir.state != crate::state::DirectoryLifecycle::Deleted
+                && dir.arn.starts_with(&region_prefix)
+        }) {
+            return Err(CreateDirectoryErrorModeled::DirectoryAlreadyExistsException(
+                DirectoryAlreadyExistsException {
+                    message: Some(format!(
+                        "a directory named {} already exists in this account and Region",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+        // Both stores this call grows are bounded: they hold state for the life of the
+        // process and every request may add to them. A deleted directory does not count
+        // against the directory bound, and the oldest tombstones beyond their own bound
+        // are evicted here, the one moment the store grows.
+        store.prune_directory_tombstones();
+        if store.live_directory_count() >= crate::state::DIRECTORY_QUOTA {
+            return Err(CreateDirectoryErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} directories; delete \
+                         a directory before creating another",
+                        crate::state::DIRECTORY_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.schemas.len() >= crate::state::SCHEMA_QUOTA {
+            return Err(CreateDirectoryErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} schemas, so no \
+                         further schema can be applied to a directory",
+                        crate::state::SCHEMA_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let directory_id = store.mint_identifier();
+        let directory_arn = crate::state::directory_arn(&region, &directory_id);
+        let applied_schema_arn =
+            crate::state::applied_schema_arn(&directory_arn, &schema_name, &schema_version);
+        let root_object_id = store.mint_identifier();
+
+        store.schemas.insert(
+            applied_schema_arn.clone(),
+            crate::state::SchemaRecord {
+                arn: applied_schema_arn.clone(),
+                name: schema_name,
+                stage: crate::state::SchemaStage::Applied,
+                version: Some(schema_version),
+                minor_version: schema_minor_version,
+                facets: schema_facets,
+            },
+        );
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(
+            root_object_id.clone(),
+            crate::state::ObjectRecord {
+                object_identifier: root_object_id.clone(),
+                ..Default::default()
+            },
+        );
+        store.directories.insert(
+            directory_arn.clone(),
+            crate::state::DirectoryRecord {
+                arn: directory_arn.clone(),
+                name: input.name.clone(),
+                state: crate::state::DirectoryLifecycle::Enabled,
+                creation_date_time: crate::state::now(),
+                applied_schema_arns: vec![applied_schema_arn.clone()],
+                root_object_id: root_object_id.clone(),
+                objects,
+            },
+        );
+
+        // Read every response member back out of the record just stored, so the response
+        // can only ever name state this service holds.
+        let stored = store.directories.get(&directory_arn).ok_or_else(|| {
+            CreateDirectoryErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the new directory could not be read back".to_string()),
+            })
+        })?;
+        Ok(CreateDirectoryOutput {
+            directory_arn: stored.arn.clone(),
+            name: stored.name.clone(),
+            object_identifier: stored.root_object_id.clone(),
+            applied_schema_arn: stored
+                .applied_schema_arns
+                .first()
+                .cloned()
+                .unwrap_or(applied_schema_arn),
+        })
     }
 }

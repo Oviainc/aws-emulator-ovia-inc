@@ -152,32 +152,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetApplicationErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    error_code: Some("500".to_string()),
-                    message: Some("the service state is unavailable".to_string()),
-                },
+                crate::state::internal_server_error("the service state is unavailable"),
             )
             .into());
         };
 
         let store = state.lock();
         let Some(application) = store.applications.get(&input.application_id) else {
-            return Err(not_found(format!(
-                "No application exists with the id {}.",
-                input.application_id
-            )));
+            return Err(not_found(
+                crate::state::ErrorCode::ApplicationNotFound,
+                crate::state::application_not_found_message(&input.application_id),
+            ));
         };
 
         // A named version that this application does not have is as absent as an
-        // application that was never created.
+        // application that was never created — a different condition, so a different
+        // `errorCode`, under the same modelled shape and status.
         let version = match input.semantic_version.as_deref() {
             Some(semantic_version) => match application.version_named(semantic_version) {
                 Some(version) => Some(version),
                 None => {
-                    return Err(not_found(format!(
-                        "No version {semantic_version} exists for application {}.",
-                        input.application_id
-                    )))
+                    return Err(not_found(
+                        crate::state::ErrorCode::VersionNotFound,
+                        format!(
+                            "Version {semantic_version} could not be found for application {}.",
+                            input.application_id
+                        ),
+                    ))
                 }
             },
             None => application.latest(),
@@ -203,11 +204,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The 404 this operation answers for an application, or a version of one, that the
-/// store does not hold.
-fn not_found(message: String) -> GetApplicationError {
-    GetApplicationErrorModeled::NotFoundException(NotFoundException {
-        error_code: Some("404".to_string()),
-        message: Some(message),
-    })
-    .into()
+/// store does not hold. `code` names WHICH of the two was absent: the body's `errorCode`
+/// carries the condition, never the status the status line already carries.
+fn not_found(code: crate::state::ErrorCode, message: String) -> GetApplicationError {
+    GetApplicationErrorModeled::NotFoundException(crate::state::not_found(code, message)).into()
 }

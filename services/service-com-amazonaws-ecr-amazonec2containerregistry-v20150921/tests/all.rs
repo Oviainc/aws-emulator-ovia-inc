@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/pull_time_update_exclusions.rs"]
 mod pull_time_update_exclusions;
+#[path = "all/registry_policy.rs"]
+mod registry_policy;
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
 #[path = "all/resource_tags.rs"]
@@ -23,3 +25,5 @@ mod scanning_configuration;
 mod signing_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire.rs"]
+mod wire;
