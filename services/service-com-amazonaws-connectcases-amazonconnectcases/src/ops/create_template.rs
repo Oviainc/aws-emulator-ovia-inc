@@ -254,12 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `rules` names case rules and `layoutConfiguration.defaultLayout` names a
-        // layout. Neither resource exists in this emulator yet — `CreateCaseRule`
-        // and `CreateLayout` are still scaffolded 501s — so a template cannot
+        // `rules` names case rules, which this emulator has no resource for yet
+        // — `CreateCaseRule` is still a scaffolded 501 — so a template cannot
         // record a reference to one. The refusal says exactly that rather than
-        // claiming a lookup it did not perform; when those creates land it
-        // becomes a lookup against the domain's own rules and layouts.
+        // claiming a lookup it did not perform; when that create lands it
+        // becomes a lookup against the domain's own rules, as the
+        // `layoutConfiguration.defaultLayout` lookup below now is.
         let rule_ids: Vec<String> = input
             .rules
             .unwrap_or_default()
@@ -278,20 +278,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // `layoutConfiguration.defaultLayout` names a layout of this domain, so
+        // it is resolved against the domain's stored layouts before anything is
+        // written: a template never records a reference that cannot be followed.
         if let Some(layout_id) = input
             .layout_configuration
             .as_ref()
             .and_then(|configuration| configuration.default_layout.as_deref())
         {
-            return Err(
-                CreateTemplateErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "layoutConfiguration.defaultLayout names layout {layout_id}, and this \
-                         emulator supports no layouts yet, so none can be referenced"
-                    ),
-                })
-                .into(),
-            );
+            if domain.layout(layout_id).is_err() {
+                return Err(
+                    CreateTemplateErrorModeled::ValidationException(ValidationException {
+                        message: format!(
+                            "layoutConfiguration.defaultLayout names layout {layout_id}, which \
+                             does not exist in domain {}",
+                            input.domain_id
+                        ),
+                    })
+                    .into(),
+                );
+            }
         }
 
         let template_id = crate::state::new_id();

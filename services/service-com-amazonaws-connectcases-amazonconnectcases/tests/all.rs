@@ -15,5 +15,7 @@
 mod case_event_configuration;
 #[path = "all/case_lifecycle.rs"]
 mod case_lifecycle;
+#[path = "all/layout_lifecycle.rs"]
+mod layout_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

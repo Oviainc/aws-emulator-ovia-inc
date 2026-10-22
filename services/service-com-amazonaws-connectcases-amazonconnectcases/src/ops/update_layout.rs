@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLayout
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLayout`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the name and/or the content of a stored layout. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLayout::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
+//! A 501 from this operation would mean "nobody has written it yet", never "the
+//! emulator is broken". It is written, so the SCAFFOLDED marker line is gone from the
+//! top of this file: that line is the machine-readable record of
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
@@ -161,18 +160,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLayout` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLayoutErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLayout"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateLayoutErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // Pure input validation, done BEFORE the store lock is taken, as on the
+        // create path: the model's section and field-group caps are re-checked
+        // here so the pass over the content is bounded by this code.
+        if let Some(message) = input
+            .content
+            .as_ref()
+            .and_then(crate::state::layout_content_too_long)
+        {
+            return Err(
+                UpdateLayoutErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(UpdateLayoutErrorModeled::ResourceNotFoundException)?;
+
+        // The layout has to exist before anything is written, and a DELETED one
+        // cannot be updated: per `DeleteLayout`'s documentation, "You cannot
+        // update a deleted layout by calling UpdateLayout; it throws a
+        // ValidationException".
+        let deleted = domain
+            .layout(&input.layout_id)
+            .map_err(UpdateLayoutErrorModeled::ResourceNotFoundException)?
+            .deleted;
+        if deleted {
+            return Err(
+                UpdateLayoutErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "layout {} in domain {} has been deleted and cannot be updated",
+                        input.layout_id, input.domain_id
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // A layout name identifies the layout within its domain, so a rename
+        // onto a name another live layout already holds is refused — the same
+        // rule the create path applies. Renaming a layout to the name it
+        // already has is not a conflict with itself.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(existing) = domain.layouts.values().find(|layout| {
+                !layout.deleted && layout.name == name && layout.layout_id != input.layout_id
+            }) {
+                return Err(
+                    UpdateLayoutErrorModeled::ConflictException(ConflictException {
+                        message: format!(
+                            "a layout named {} already exists in domain {} (layoutId {})",
+                            name, input.domain_id, existing.layout_id
+                        ),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // Every field id the new content references is resolved against the
+        // domain BEFORE anything is written, as on the create path: "A
+        // ValidationException is returned when you add non-existent fieldIds to
+        // a layout."
+        if let Some(content) = input.content.as_ref() {
+            let referenced = crate::state::layout_field_ids(content);
+            let unknown = domain.unknown_field_ids(referenced.iter().map(String::as_str));
+            if !unknown.is_empty() {
+                return Err(
+                    UpdateLayoutErrorModeled::ValidationException(ValidationException {
+                        message: format!(
+                            "content names field ids that do not exist in domain {}: {}",
+                            input.domain_id,
+                            crate::state::name_ids(&unknown)
+                        ),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // Only the members the request carries are written: an absent `name` or
+        // `content` leaves the stored one as it was.
+        let Some(layout) = domain.layouts.get_mut(&input.layout_id) else {
+            return Err(UpdateLayoutErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Layout", &input.layout_id),
+            )
+            .into());
+        };
+        let mut changed = false;
+        if let Some(name) = input.name {
+            changed |= layout.name != name;
+            layout.name = name;
+        }
+        if let Some(content) = input.content {
+            changed = true;
+            // The replacement is stored in the same complete form a create
+            // stores, so an update cannot leave a layout spelled differently
+            // from one created with the same content.
+            layout.content = crate::state::normalized_layout_content(content);
+        }
+        // `lastModifiedTime` is "Timestamp at which the resource was created or
+        // last modified", so it moves only when this call modified something.
+        if changed {
+            layout.last_modified_time = now;
+        }
+
+        // The documented success: HTTP 200 with an empty body.
+        Ok(UpdateLayoutOutput {})
     }
 }
