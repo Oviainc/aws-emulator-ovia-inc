@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the version `CreateImageVersion` stored for this `ImageName`,
+//! selected by `Version`, by `Alias`, or — when the request names neither — the latest
+//! one, refusing a selection that matches nothing with the modelled `ResourceNotFound`,
+//! and materialising the `CREATING` -> `CREATED` transition the clock already owes it.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +172,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageVersion"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `Version` and `Alias` are two ways to name ONE version, so a request carrying
+        // both states no single selection. The model cannot express the exclusion, so the
+        // refusal is a 400 naming both members rather than a guess at which one wins.
+        if input.version.is_some() && input.alias.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Version and Alias both select a single image version, so at most one of \
+                 them may be specified.",
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // The selection: an explicit `Version`, the version an `Alias` is attached to,
+        // or — the model's documented default — the latest version of the image.
+        let selected = if let Some(version) = input.version {
+            store
+                .image_versions
+                .contains_key(&(input.image_name.clone(), version))
+                .then_some(version)
+        } else if let Some(alias) = input.alias.as_deref() {
+            store
+                .versions_of(&input.image_name)
+                .find(|version| version.aliases.iter().any(|held| held == alias))
+                .map(|version| version.version)
+        } else {
+            store
+                .latest_version_of(&input.image_name)
+                .map(|version| version.version)
+        };
+
+        let Some(selected) = selected else {
+            // Whether the image itself is unknown or it holds no version matching the
+            // selection, the resource being accessed is not found.
+            let image_arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "image",
+                &input.image_name,
+            );
+            let selector = match (input.version, input.alias.as_deref()) {
+                (Some(version), _) => format!("version {version}"),
+                (None, Some(alias)) => format!("alias \"{alias}\""),
+                (None, None) => "any version".to_string(),
+            };
+            return Err(DescribeImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Could not find {selector} of image \"{image_arn}\"."
+                )),
+            })
+            .into());
+        };
+
+        let version = store
+            .image_versions
+            .get_mut(&(input.image_name.clone(), selected))
+            .ok_or_else(|| {
+                // Unreachable: the key was just resolved from this same locked store.
+                crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE)
+            })?;
+
+        // The only write a reporting call makes: the transition the clock already owed.
+        // It was due at the stored instant whether or not anybody described the version.
+        let settled = version.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeImageVersionOutput {
+            base_image: Some(version.base_image.clone()),
+            // `ContainerImage` is the registry path the service RESOLVED the base image
+            // to. This emulator resolves nothing in a registry, so the member is omitted
+            // rather than echoing `BaseImage` back as if it had been resolved.
+            container_image: None,
+            creation_time: Some(crate::state::timestamp(version.creation_time)),
+            failure_reason: version.failure_reason.clone(),
+            image_arn: Some(version.image_arn.clone()),
+            image_version_arn: Some(version.arn.clone()),
+            image_version_status: Some(version.status.clone()),
+            last_modified_time: Some(crate::state::timestamp(version.last_modified_time)),
+            version: Some(version.version),
+            vendor_guidance: Some(version.vendor_guidance.clone()),
+            job_type: version.job_type.clone(),
+            ml_framework: version.ml_framework.clone(),
+            programming_lang: version.programming_lang.clone(),
+            processor: version.processor.clone(),
+            horovod: version.horovod,
+            release_notes: version.release_notes.clone(),
+        };
+        let version_arn = version.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &version_arn, ctx);
+        }
+        Ok(output)
     }
 }
