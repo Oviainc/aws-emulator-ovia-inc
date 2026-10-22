@@ -15,5 +15,7 @@
 mod domain_repository_lifecycle;
 #[path = "all/external_connection.rs"]
 mod external_connection;
+#[path = "all/repository_endpoint.rs"]
+mod repository_endpoint;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
