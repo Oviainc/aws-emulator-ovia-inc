@@ -391,7 +391,57 @@ pub fn is_live_application_state(state: &str) -> bool {
 ///
 /// Source: that operation's own documentation — "An application has to be in a stopped
 /// or created state in order to be updated."
+///
+/// That precondition is the one a WHOLE-application update is judged against. An
+/// application that is RUNNING admits the documented subset of members in
+/// [`STARTED_UPDATABLE_MEMBER_PATHS`] as well, so the precondition is judged per NAMED
+/// member rather than per request.
 pub const UPDATABLE_APPLICATION_STATES: &[&str] = &["CREATED", "STOPPED"];
+
+/// The `ApplicationState` an application holding capacity is in — the state the
+/// running-application carve-out below applies to.
+pub const STARTED_APPLICATION_STATE: &str = "STARTED";
+
+/// The configuration member PATHS `UpdateApplication` accepts while the application it
+/// names is `STARTED`.
+///
+/// The operation's model documentation states only the general precondition above, and
+/// EMR Serverless carves a fixed subset out of it: an update that names any OTHER
+/// configuration member of a running application is refused with a
+/// `ValidationException` that ENUMERATES this subset, which is where both this catalog
+/// and [`started_update_refusal_message`] come from —
+///
+/// > Only the following configurations can be updated when an application is in STARTED
+/// > state: schedulerConfiguration.maxConcurrentRuns, extendedSupportConfiguration,
+/// > imageConfiguration, workerTypeSpecifications.imageConfiguration, maximumCapacity.
+///
+/// A path naming a SUB-member (`schedulerConfiguration.maxConcurrentRuns`) is updatable
+/// only in that member: the rest of the block it belongs to keeps what the application
+/// has stored. `extendedSupportConfiguration` is part of the set the service
+/// enumerates, and this service's model declares no such member on
+/// `UpdateApplicationRequest`
+/// (`smithy_query(query="operation",operation="UpdateApplication")`), so no request
+/// reaching this emulator can name it — it is kept here because the refusal states the
+/// service's set, not this emulator's reading of it.
+pub const STARTED_UPDATABLE_MEMBER_PATHS: &[&str] = &[
+    "schedulerConfiguration.maxConcurrentRuns",
+    "extendedSupportConfiguration",
+    "imageConfiguration",
+    "workerTypeSpecifications.imageConfiguration",
+    "maximumCapacity",
+];
+
+/// The `ValidationException` message an update naming a member a running application
+/// does not admit is refused with: the enumeration of
+/// [`STARTED_UPDATABLE_MEMBER_PATHS`], which is the rule itself rather than a sentence
+/// about one request — so it names no member, id or value the request carried.
+pub fn started_update_refusal_message() -> String {
+    format!(
+        "Only the following configurations can be updated when an application is in \
+         {STARTED_APPLICATION_STATE} state: {}.",
+        STARTED_UPDATABLE_MEMBER_PATHS.join(", ")
+    )
+}
 
 /// The prefix a pagination cursor carries, so a token this service did not mint is
 /// refused rather than read as a resume point.

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRetentionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRetentionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRetentionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates the single retention configuration this account holds in this
+//! Region, in
+//! `crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState::retention_configurations`.
+//! Config names the object `default` and a later call modifies that same object, so
+//! the write is an upsert keyed by that name; the response reports the stored object.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +143,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRetentionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRetentionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // The API "creates the RetentionConfiguration object and names the object as
+        // default", and a later call "modifies the default object" — so the name is
+        // Config's, never the caller's, and the write is an upsert under it.
+        let name = crate::state::DEFAULT_NAME;
+        let mut store = state.lock();
+
+        // The quota is per account per Region, which is what one store stands for: a
+        // write that would hold more objects than the quota allows is refused rather
+        // than silently replacing one under another name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRetentionConfiguration"))
+        // With today's quota of one object under one Config-assigned name this cannot
+        // trigger from the API alone — it is the quota guard, so that raising
+        // `RETENTION_CONFIGURATIONS_QUOTA`, or a later Config release letting the
+        // caller name the object, refuses the over-quota write instead of overwriting
+        // an object the caller did not name.
+        if !store.retention_configurations.contains_key(name)
+            && store.retention_configurations.len() >= crate::state::RETENTION_CONFIGURATIONS_QUOTA
+        {
+            return Err(
+                PutRetentionConfigurationErrorModeled::MaxNumberOfRetentionConfigurationsExceededException(
+                    MaxNumberOfRetentionConfigurationsExceededException {
+                        message: Some(crate::state::retention_configurations_quota_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = crate::state::RetentionConfigurationEntry {
+            name: name.to_string(),
+            retention_period_in_days: input.retention_period_in_days,
+        };
+        store
+            .retention_configurations
+            .insert(name.to_string(), entry.clone());
+
+        Ok(PutRetentionConfigurationOutput {
+            retention_configuration: Some(entry.to_shape()),
+        })
     }
 }

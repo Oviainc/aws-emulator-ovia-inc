@@ -14,6 +14,10 @@
 //! `platformVersion`) are optional on the record, because a connected cluster
 //! reports none of them — it reports [`ClusterRecord::connector_config`] instead.
 //!
+//! It also holds the managed-capability slice that hangs off a cluster:
+//! `CreateCapability` writes a [`CapabilityRecord`], and `DescribeCapability`,
+//! `ListCapabilities` and `DeleteCapability` compute their responses from it.
+//!
 //! It also holds the access-entry slice, as part of the cluster record rather than
 //! beside it: an access entry belongs to exactly one cluster, so
 //! [`ClusterRecord::access_entries`] is where `CreateAccessEntry` writes and
@@ -53,6 +57,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccessConfigResponse, AccessEntry, AccessScope, AssociatedAccessPolicy, Cancellation,
+    Capability, CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue,
+    CapabilitySummary,
     Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
@@ -124,6 +130,38 @@ pub const UPDATE_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 /// errors that go with it), short enough to be worth waiting for. The due
 /// instant is stored on the record; nothing sleeps for it.
 pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `CapabilityStatus` members this slice uses. The model's enum
+/// (`smithy_query query="shape" shape="CapabilityStatus"`) is
+/// `CREATING | CREATE_FAILED | UPDATING | DELETING | DELETE_FAILED | ACTIVE |
+/// DEGRADED`; `Capability$status` is stored as the wire token, as the cluster
+/// status is.
+pub const CAPABILITY_STATUS_CREATING: &str = "CREATING";
+/// See [`CAPABILITY_STATUS_CREATING`].
+pub const CAPABILITY_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`CAPABILITY_STATUS_CREATING`].
+pub const CAPABILITY_STATUS_DELETING: &str = "DELETING";
+
+/// How long a newly created capability reports `CREATING` before the clock owes it
+/// `ACTIVE`.
+///
+/// `CreateCapability` publishes no duration for the provisioning it starts ("Amazon
+/// EKS provisions and manages the infrastructure required to run the capability
+/// outside of your cluster"), so this span is CHOSEN rather than cited, and matches
+/// [`CLUSTER_ACTIVATION_DELAY`]: long enough that a caller which describes the
+/// capability straight after creating it still observes `CREATING`, short enough to
+/// be worth waiting for. The due instant is stored on the record; nothing sleeps for
+/// it.
+pub const CAPABILITY_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `CapabilityType` members whose `configuration` this service maps from the
+/// request shape to the response shape. The model's enum
+/// (`smithy_query query="shape" shape="CapabilityType"`) is `ACK | ARGOCD | KRO`,
+/// and `CapabilityConfigurationRequest` carries a member for exactly these two:
+/// `KRO` takes no configuration.
+pub const CAPABILITY_TYPE_ACK: &str = "ACK";
+/// See [`CAPABILITY_TYPE_ACK`].
+pub const CAPABILITY_TYPE_ARGOCD: &str = "ARGOCD";
 
 /// How long a connected cluster has to apply its connector manifest before the
 /// registration lapses.
@@ -251,8 +289,19 @@ pub const VERSION_ROLLBACK_NODE_PHASE: Duration = Duration::from_millis(250);
 
 /// The number of clusters `ListClusters` returns when the caller gives no
 /// `maxResults`. The model bounds `maxResults` at 1..100, so the full page is the
-/// natural default.
+/// natural default. `ListCapabilities` bounds `maxResults` the same way and shares
+/// this default.
 pub const DEFAULT_LIST_PAGE_SIZE: i32 = 100;
+
+/// The number of capabilities one cluster can hold.
+///
+/// It is not a separate quota: `CreateCapability` documents "You can only create one
+/// Capability of each type on a given Amazon EKS cluster", so the per-type
+/// uniqueness rule the handler enforces caps a cluster at one capability per
+/// `CapabilityType`. Named here so the bound on the store is stated where the store
+/// is, and so a test can assert it: with clusters bounded by
+/// [`MAX_STORED_CLUSTERS`], the capability map is bounded too.
+pub const MAX_CAPABILITIES_PER_CLUSTER: usize = crate::ops::types::CAPABILITY_TYPE_VALUES.len();
 
 /// The message the access-entry operations report when the cluster or the access
 /// entry a request names does not exist.
@@ -1020,6 +1069,98 @@ impl ClusterRecord {
     }
 }
 
+/// One managed capability of one cluster, as this service stores it.
+///
+/// Everything a [`Capability`] reports is held here — including the
+/// server-generated `arn`, `createdAt` and `modifiedAt` — so `DescribeCapability`
+/// and `ListCapabilities` return exactly what `CreateCapability` wrote rather than
+/// recomputing anything per request.
+#[derive(Debug, Clone)]
+pub struct CapabilityRecord {
+    pub capability_name: String,
+    pub cluster_name: String,
+    pub arn: String,
+    /// A `CapabilityType` wire token (`ACK | ARGOCD | KRO`).
+    pub r#type: String,
+    pub role_arn: String,
+    /// A [`CAPABILITY_STATUS_CREATING`]-family wire token.
+    pub status: String,
+    /// When set, the instant at which the clock owes this capability the move from
+    /// `CREATING` to `ACTIVE`. Cleared once the move is materialised.
+    pub active_at: Option<SystemTime>,
+    pub configuration: Option<CapabilityConfigurationResponse>,
+    pub tags: BTreeMap<String, String>,
+    /// The capability's open health issues. This emulator runs no capability
+    /// infrastructure, so nothing adds to it yet and a healthy capability reports
+    /// an EMPTY issue list rather than an absent one.
+    pub health_issues: Vec<CapabilityIssue>,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    /// A `CapabilityDeletePropagationPolicy` wire token (only `RETAIN` is modelled).
+    pub delete_propagation_policy: String,
+    pub client_request_token: Option<String>,
+}
+
+impl CapabilityRecord {
+    /// Materialise the status move the clock already owes at `now`.
+    ///
+    /// The only write a reporting operation may make: the transition was due at
+    /// `active_at` whether or not anybody called, so applying it on read does not
+    /// change what a later caller sees.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.active_at.is_some_and(|due| now >= due) {
+            self.status = CAPABILITY_STATUS_ACTIVE.to_string();
+            self.active_at = None;
+        }
+    }
+
+    /// This record as the modelled `Capability` shape.
+    pub fn to_capability(&self) -> Capability {
+        Capability {
+            capability_name: Some(self.capability_name.clone()),
+            arn: Some(self.arn.clone()),
+            cluster_name: Some(self.cluster_name.clone()),
+            r#type: Some(self.r#type.clone()),
+            role_arn: Some(self.role_arn.clone()),
+            status: Some(self.status.clone()),
+            configuration: self.configuration.clone(),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            health: Some(CapabilityHealth {
+                issues: Some(self.health_issues.clone()),
+            }),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            delete_propagation_policy: Some(self.delete_propagation_policy.clone()),
+            // `version` is "the version of the capability software that is
+            // currently running" — software this emulator does not run and AWS
+            // publishes no version list for, so it is left unset rather than
+            // reporting a version nothing is running. [`to_summary`] omits it for
+            // the same reason.
+            version: None,
+        }
+    }
+
+    /// This record as the modelled `CapabilitySummary` shape `ListCapabilities`
+    /// returns: the same identity, type, status and timestamps, without the
+    /// configuration, tags and health detail `DescribeCapability` carries.
+    pub fn to_summary(&self) -> CapabilitySummary {
+        CapabilitySummary {
+            capability_name: Some(self.capability_name.clone()),
+            arn: Some(self.arn.clone()),
+            r#type: Some(self.r#type.clone()),
+            status: Some(self.status.clone()),
+            version: None,
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+        }
+    }
+}
+
 /// The fixed prefix of an EKS Pod Identity association id.
 ///
 /// Every association id AWS publishes — in the `CreatePodIdentityAssociation`
@@ -1538,6 +1679,16 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// call name a cluster in any region. It holds exactly one entry per stored
     /// cluster, so [`MAX_STORED_CLUSTERS`] bounds it too.
     pub arn_index: BTreeMap<String, (String, String)>,
+    /// Managed capabilities by `(region, cluster name, capability name)`.
+    ///
+    /// A capability name is unique within its CLUSTER ("The name must be unique
+    /// within your cluster", `CreateCapability$capabilityName`), and a cluster name
+    /// is unique within a region, so the key is the triple. A `BTreeMap` so
+    /// `ListCapabilities` walks a stable, sorted order within one cluster and a
+    /// page token can name the capability to resume after. Bounded by
+    /// [`MAX_CAPABILITIES_PER_CLUSTER`] per cluster and so, with
+    /// [`MAX_STORED_CLUSTERS`] clusters, bounded overall.
+    pub capabilities: BTreeMap<(String, String, String), CapabilityRecord>,
     /// EKS Pod Identity associations by `(region, clusterName, associationId)`.
     ///
     /// An association belongs to exactly one cluster and a cluster name only
@@ -1580,6 +1731,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
         Self {
             clusters: BTreeMap::new(),
             arn_index: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
             pod_identity_associations: BTreeMap::new(),
             minted_associations: 0,
             cluster_versions: seed_cluster_versions(),
@@ -1604,6 +1756,9 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         for cluster in self.clusters.values_mut() {
             cluster.materialize_due_transitions(now);
+        }
+        for capability in self.capabilities.values_mut() {
+            capability.materialize_due_transitions(now);
         }
     }
 
@@ -1632,6 +1787,32 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .keys()
             .filter(move |(key_region, _)| key_region == region)
             .map(|(_, name)| name.as_str())
+    }
+
+    /// The capabilities one cluster holds, in capability-name order.
+    ///
+    /// The map is keyed `(region, cluster, capability)`, so one cluster's
+    /// capabilities are a contiguous, name-sorted RANGE of it: the walk starts at
+    /// that cluster's first possible key and stops at its last, the way
+    /// [`Self::pod_identity_associations_in`] does for its own child resource.
+    pub fn capabilities_of<'a>(
+        &'a self,
+        region: &'a str,
+        cluster_name: &'a str,
+    ) -> impl Iterator<Item = &'a CapabilityRecord> + 'a {
+        self.capabilities
+            .range((
+                std::ops::Bound::Included((
+                    region.to_string(),
+                    cluster_name.to_string(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |((key_region, key_cluster, _), _)| {
+                key_region == region && key_cluster == cluster_name
+            })
+            .map(|(_, record)| record)
     }
 
     /// The names `ListClusters` projects for `region`, in sorted order.
@@ -1676,6 +1857,19 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                 key_region == region && key_cluster == cluster_name
             })
             .map(|(_, record)| record)
+    }
+
+    /// Drop every capability of one cluster, for a caller that is removing the
+    /// cluster itself.
+    ///
+    /// A capability only exists inside a cluster — its ARN and its key both name
+    /// one — so a cluster that leaves the store takes its capabilities with it.
+    /// Without this, a later cluster created with the same name in the same region
+    /// would inherit the dead cluster's capabilities.
+    pub fn remove_capabilities_of(&mut self, region: &str, cluster_name: &str) {
+        self.capabilities.retain(|(key_region, key_cluster, _), _| {
+            key_region != region || key_cluster != cluster_name
+        });
     }
 
     /// Mint an association id that no association of this cluster already holds.
@@ -1949,6 +2143,8 @@ pub const PAGE_TOKEN_TAG_LEN: usize = 4;
 pub const CLUSTERS_LISTING: &str = "";
 /// The scope `ListAccessPolicies`'s tokens carry. See [`CLUSTERS_LISTING`].
 pub const ACCESS_POLICIES_LISTING: &str = "access-policies";
+/// The scope `ListCapabilities`'s tokens carry. See [`CLUSTERS_LISTING`].
+pub const CAPABILITIES_LISTING: &str = "capabilities";
 /// The scope `ListPodIdentityAssociations`'s tokens carry, whose key is an
 /// association id. See [`CLUSTERS_LISTING`].
 pub const POD_IDENTITY_ASSOCIATIONS_LISTING: &str = "pod-identity-associations";
@@ -2036,6 +2232,33 @@ pub fn encode_page_token(last_returned: &str) -> String {
 /// one `ListClusters` issued.
 pub fn decode_page_token(token: &str) -> Option<String> {
     decode_scoped_page_token(CLUSTERS_LISTING, token)
+}
+
+/// The ARN of one managed capability of one cluster.
+///
+/// A capability is a child of its cluster, so the resource part names both, the
+/// way every nested EKS resource ARN does. It is computed once, when the
+/// capability is created, and stored on the record; no read recomputes it.
+pub fn capability_arn(region: &str, cluster_name: &str, capability_name: &str) -> String {
+    ::engine::emulator_arn(
+        "eks",
+        region,
+        &format!("capability/{cluster_name}/{capability_name}"),
+    )
+}
+
+/// Whether `name` is a capability name `CreateCapability` accepts.
+///
+/// The rule is the one the model states for the member: "A unique name for the
+/// capability. The name must be unique within your cluster and can contain
+/// alphanumeric characters, hyphens, and underscores"
+/// (`CreateCapability$capabilityName`). The shape carries no `@pattern`, so the
+/// boundary validator does not enforce it and the handler does.
+pub fn is_valid_capability_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

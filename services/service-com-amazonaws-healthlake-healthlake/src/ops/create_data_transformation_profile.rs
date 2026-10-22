@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataTransformationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataTransformationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataTransformationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a data transformation profile in DRAFT state (version 0) and PERSISTS it
+//! in [`crate::state`], so `GetDataTransformationProfile` reads back the content
+//! this call stored.
+//!
+//! Two of the four modelled source variants carry their content with the request or
+//! name content this service already holds, and both are served here:
+//! `ProfileMapping` (raw content) and `ExistingVersionedProfileId` (a clone of a
+//! stored version). The other two name content that lives OUTSIDE this emulator —
+//! `StarterProfile` names an entry in AWS's built-in starter profile library, whose
+//! content AWS does not publish, and `SampleData` asks the service to infer a
+//! mapping from a sample file in Amazon S3 — so neither can be served faithfully
+//! and each answers the 501 `NotImplemented` channel AFTER the source-format rule
+//! the model documents for it is enforced. Nothing is invented and nothing is
+//! persisted for them.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +186,304 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataTransformationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataTransformationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation profile registry is unavailable",
+            ));
+        };
+
+        // `SourceFormat` is a modelled enum, so the boundary validator has already
+        // refused anything else; this re-states the rule rather than trusting it,
+        // because a format this service cannot convert from must never be recorded
+        // on a profile.
+        if !SOURCE_FORMAT_VALUES.contains(&input.source_format.as_str()) {
+            return Err(validation(format!(
+                "SourceFormat must be one of {}, got '{}'",
+                SOURCE_FORMAT_VALUES.join(", "),
+                input.source_format
+            )));
+        }
+        // The modelled `TargetFormat` enum declares exactly one value, which this
+        // operation documents as "Always FHIR_R4"; it is read from the model rather
+        // than written out here, so this service reports what the model says.
+        let Some(target_format) = TARGET_FORMAT_VALUES.first().map(|format| format.to_string())
+        else {
+            return Err(internal_server(
+                "the model declares no TargetFormat this service could convert to",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = request_fingerprint(&region, &input);
+        let mut store = state.lock();
+
+        // `ClientToken` is this operation's `@idempotencyToken`: a repeat of the SAME
+        // call carrying a token already seen resolves to the profile that token
+        // minted instead of minting a second one, and answers what that create
+        // answered. A token reused with a DIFFERENT request is a different request,
+        // and is refused rather than answered with the earlier profile.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataTransformationProfile"))
+        // The refusal is this operation's `ValidationException`, not the
+        // `ConflictException` it also models: the model documents that one as "The
+        // data store is in a transition state and the user requested action cannot be
+        // performed", a RESOURCE-state conflict, while a token carried on two
+        // different requests is a bad request and nothing here is in transition.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.profile_client_tokens.get(token))
+            .cloned()
+        {
+            if recorded.fingerprint != fingerprint {
+                return Err(validation(
+                    "ClientToken was already used for a different \
+                     CreateDataTransformationProfile request",
+                ));
+            }
+            if let Some(existing) = store.profiles.get(&recorded.profile_id) {
+                return Ok(CreateDataTransformationProfileOutput {
+                    profile_id: existing.id.clone(),
+                    version: crate::state::DRAFT_PROFILE_VERSION,
+                    source_format: existing.source_format.clone(),
+                    target_format: existing.target_format.clone(),
+                    profile_name: existing.name.clone(),
+                    last_updated_at: existing.created_at,
+                });
+            }
+        }
+
+        // The initial DRAFT content, resolved from the one source variant the request
+        // carries. Resolved BEFORE the profile is minted, so a source that does not
+        // resolve leaves no half-built profile behind.
+        let mapping = initial_mapping(&store, &input)?;
+        crate::state::validate_profile_mapping(&mapping).map_err(validation)?;
+
+        // The store holds a bounded number of profiles; past the ceiling this
+        // operation answers with the quota refusal it models.
+        if store.profiles.len() >= crate::state::MAX_PROFILES {
+            return Err(
+                CreateDataTransformationProfileErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "The maximum number of data transformation profiles ({}) \
+                             already exists",
+                            crate::state::MAX_PROFILES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let created_at = ::aws_smithy_types::DateTime::from(now);
+        let id = store.next_profile_id(now);
+        let profile = crate::state::DataTransformationProfile {
+            arn: crate::state::profile_arn(&region, &id),
+            id: id.clone(),
+            name: input.profile_name,
+            description: input.profile_description,
+            source_format: input.source_format,
+            target_format,
+            kms_key_id: input.kms_key_id,
+            created_at,
+            // "Creates a data transformation profile in DRAFT state": the DRAFT is
+            // version 0 and it exists from this instant, so the profile owes the
+            // clock no transition and is readable immediately.
+            draft: crate::state::ProfileVersionRecord {
+                version: crate::state::DRAFT_PROFILE_VERSION,
+                mapping,
+                // Nothing has changed yet — this version IS the profile's first
+                // content — so there is no change description to report.
+                change_description: None,
+                last_updated_at: created_at,
+            },
+            published: ::std::collections::BTreeMap::new(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let output = CreateDataTransformationProfileOutput {
+            profile_id: profile.id.clone(),
+            version: profile.draft.version,
+            source_format: profile.source_format.clone(),
+            target_format: profile.target_format.clone(),
+            profile_name: profile.name.clone(),
+            last_updated_at: profile.created_at,
+        };
+        store.profiles.insert(id.clone(), profile);
+        if let Some(token) = input.client_token {
+            store.record_profile_client_token(token, &id, fingerprint);
+        }
+        Ok(output)
+    }
+}
+
+/// The DRAFT content the request's `Source` resolves to.
+///
+/// One variant carries the content, one names content this service already holds,
+/// and two name content that lives outside this emulator — see the module docs.
+fn initial_mapping(
+    store: &crate::state::ComAmazonawsHealthlakeHealthlakeState,
+    input: &CreateDataTransformationProfileInput,
+) -> Result<::std::collections::BTreeMap<String, String>, CreateDataTransformationProfileError> {
+    match &input.source {
+        // Raw content, for the CI/CD workflows this variant is documented for: it is
+        // the profile's DRAFT content verbatim.
+        CreateDataTransformationProfileSource::ProfileMapping(source) => Ok(source
+            .profile_mapping
+            .iter()
+            .map(|(path, content)| (path.clone(), content.clone()))
+            .collect()),
+        // A clone of a stored version: the new profile starts life with exactly the
+        // content that version holds, which is what makes a rollback possible.
+        CreateDataTransformationProfileSource::ExistingVersionedProfileId(source) => {
+            if !crate::state::is_profile_id(&source.profile_id) {
+                return Err(validation(
+                    "Source.ExistingVersionedProfileId.ProfileId must be 32 lowercase \
+                     hexadecimal characters",
+                ));
+            }
+            if !(crate::state::DRAFT_PROFILE_VERSION..=crate::state::MAX_PROFILE_VERSION)
+                .contains(&source.version)
+            {
+                return Err(validation(format!(
+                    "Source.ExistingVersionedProfileId.Version must be between {} and {}",
+                    crate::state::DRAFT_PROFILE_VERSION,
+                    crate::state::MAX_PROFILE_VERSION
+                )));
+            }
+            // The two lookups answer with their own sentence, so a clone naming an
+            // id no profile holds is not told its VERSION is missing — the same
+            // distinction `GetDataTransformationProfile` makes.
+            let Some(profile) = store.profiles.get(&source.profile_id) else {
+                return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+            };
+            let Some(version) = profile.version(source.version) else {
+                return Err(not_found(crate::state::PROFILE_VERSION_NOT_FOUND_MESSAGE));
+            };
+            Ok(version.mapping.clone())
+        }
+        // Documented: "Valid only when the source format is Consolidated Clinical
+        // Document Architecture (C-CDA)".
+        CreateDataTransformationProfileSource::StarterProfile(_) => {
+            require_source_format(&input.source_format, "CCDA", "Source.StarterProfile")?;
+            Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDataTransformationProfile from a StarterProfile source (AWS does not \
+                 publish the content of its built-in starter profiles, so this emulator holds \
+                 none)",
+            ))
+        }
+        // Documented: "Valid only when the source format is Comma-separated values
+        // (CSV)".
+        CreateDataTransformationProfileSource::SampleData(_) => {
+            require_source_format(&input.source_format, "CSV", "Source.SampleData")?;
+            Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDataTransformationProfile from a SampleData source (inferring a profile \
+                 mapping from a sample data file is not something this emulator can do)",
+            ))
+        }
+    }
+}
+
+/// Enforce the source format a source variant is documented to be valid for.
+fn require_source_format(
+    source_format: &str,
+    required: &str,
+    member: &str,
+) -> Result<(), CreateDataTransformationProfileError> {
+    if source_format == required {
+        Ok(())
+    } else {
+        Err(validation(format!(
+            "{member} is valid only when SourceFormat is {required}"
+        )))
+    }
+}
+
+/// This operation's 400 refusal, as the modelled `ValidationException` it declares.
+fn validation(message: impl Into<String>) -> CreateDataTransformationProfileError {
+    CreateDataTransformationProfileErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's 404, worded without quoting the requested identifier — the
+/// wording this service's not-found text uses.
+fn not_found(message: &str) -> CreateDataTransformationProfileError {
+    CreateDataTransformationProfileErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> CreateDataTransformationProfileError {
+    CreateDataTransformationProfileErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// A fingerprint of everything this request asks for, so one `ClientToken`
+/// resolves to its profile only for a repeat of the SAME request.
+///
+/// Built from the members that define the profile — never from the token itself —
+/// with the region included because it is what the minted ARN is built from. Every
+/// field is rendered in a CANONICAL form: the modelled maps (`Tags`, and the raw
+/// profile content) deserialize into a `HashMap`, whose iteration order differs per
+/// instance, so they are ordered by key before they are folded in. Folding itself
+/// is [`crate::state::request_fingerprint`], shared with the other creates that
+/// honour an idempotency token.
+fn request_fingerprint(region: &str, input: &CreateDataTransformationProfileInput) -> String {
+    let mut fields = vec![
+        region.to_string(),
+        input.profile_name.clone(),
+        crate::state::optional_field("ProfileDescription", input.profile_description.as_deref()),
+        crate::state::optional_field("KmsKeyId", input.kms_key_id.as_deref()),
+        input.source_format.clone(),
+    ];
+    let tags: ::std::collections::BTreeMap<&String, &String> =
+        input.tags.iter().flatten().collect();
+    fields.push(format!("Tags={}", tags.len()));
+    for (key, value) in tags {
+        fields.push(key.clone());
+        fields.push(value.clone());
+    }
+    fields.extend(source_fields(&input.source));
+    crate::state::request_fingerprint(fields)
+}
+
+/// The request's `Source` as canonical fingerprint fields: which variant it is,
+/// then that variant's own members, with the content map ordered by key.
+fn source_fields(source: &CreateDataTransformationProfileSource) -> Vec<String> {
+    match source {
+        CreateDataTransformationProfileSource::ProfileMapping(source) => {
+            let content: ::std::collections::BTreeMap<&String, &String> =
+                source.profile_mapping.iter().collect();
+            let mut fields = vec![
+                "Source=ProfileMapping".to_string(),
+                format!("ProfileMapping={}", content.len()),
+            ];
+            for (path, entry) in content {
+                fields.push(path.clone());
+                fields.push(entry.clone());
+            }
+            fields
+        }
+        CreateDataTransformationProfileSource::ExistingVersionedProfileId(source) => vec![
+            "Source=ExistingVersionedProfileId".to_string(),
+            source.profile_id.clone(),
+            source.version.to_string(),
+        ],
+        CreateDataTransformationProfileSource::StarterProfile(source) => vec![
+            "Source=StarterProfile".to_string(),
+            source.starter_profile_name.clone(),
+        ],
+        CreateDataTransformationProfileSource::SampleData(source) => {
+            vec!["Source=SampleData".to_string(), source.s3_uri.clone()]
+        }
     }
 }

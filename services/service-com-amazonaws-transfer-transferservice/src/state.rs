@@ -339,9 +339,13 @@ pub const RESOURCE_TYPE_WEB_APP: &str = "WebApp";
 
 /// A `WebAppId` nothing in the store answers to. Its own entry in the not-found
 /// table, like every other kind.
+///
+/// The text names the web app resource as the service's own recorded wording does —
+/// the camel-case resource name, as [`NOT_FOUND_SECURITY_POLICY`] also spells it —
+/// rather than a prose rendering of it.
 pub const NOT_FOUND_WEB_APP: NotFoundResource = NotFoundResource {
     resource_type: RESOURCE_TYPE_WEB_APP,
-    message: "Unknown web app",
+    message: "Unknown WebApp",
 };
 
 /// `ResourceType` for the AS2 profile resource, addressed by its `ProfileId`. Same

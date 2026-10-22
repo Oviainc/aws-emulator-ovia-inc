@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one attribute of one VPC from this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::vpc_attributes`]), which
+//! `ModifyVpcAttribute` writes.
 //!
 //! ## Shape of an operation
 //!
@@ -142,20 +137,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcAttribute"))
+        use crate::state;
+
+        // "You can specify only one attribute at a time" — `Attribute` is one
+        // `VpcAttributeName`, and the response carries only the member it names.
+        let attribute = input.attribute.as_str();
+        if !VPC_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({attribute}) for parameter attribute is invalid. \
+                 Unknown attribute."
+            )));
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let store = store.lock();
+        let Some(attributes) = store.vpc_attributes_of(&input.vpc_id) else {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        };
+        let Some(value) = attributes.value_of(attribute) else {
+            // Unreachable: the catalog check above admits only the three members
+            // `VpcAttributes` carries a field for.
+            return Err(state::internal_error(format!(
+                "'{attribute}' is a VPC attribute this emulator holds no value for"
+            )));
+        };
+        // A `DryRun` request that would have succeeded stops HERE, having written
+        // nothing: "If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let reported = AttributeBooleanValue { value: Some(value) };
+        Ok(DescribeVpcAttributeOutput {
+            vpc_id: Some(input.vpc_id.clone()),
+            enable_dns_hostnames: (attribute == state::VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES)
+                .then(|| reported.clone()),
+            enable_dns_support: (attribute == state::VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT)
+                .then(|| reported.clone()),
+            enable_network_address_usage_metrics: (attribute
+                == state::VPC_ATTRIBUTE_ENABLE_NETWORK_ADDRESS_USAGE_METRICS)
+                .then_some(reported),
+        })
     }
 }

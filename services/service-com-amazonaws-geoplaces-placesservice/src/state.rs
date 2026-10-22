@@ -25,7 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccessPoint, Address, BusinessChain, Category, ContactDetails, Contacts, Country, FoodType,
-    OpeningHours, Region, SubRegion, TimeZone, ValidationException, ValidationExceptionField,
+    OpeningHours, Region, StreetComponents, SubRegion, TimeZone, ValidationException,
+    ValidationExceptionField,
 };
 
 // ---------------------------------------------------------------------------
@@ -39,11 +40,103 @@ pub const PLACE_TYPE_POINT_OF_INTEREST: &str = "PointOfInterest";
 pub const PLACE_TYPE_POINT_ADDRESS: &str = "PointAddress";
 /// See [`PLACE_TYPE_POINT_OF_INTEREST`].
 pub const PLACE_TYPE_LOCALITY: &str = "Locality";
+/// See [`PLACE_TYPE_POINT_OF_INTEREST`].
+pub const PLACE_TYPE_DISTRICT: &str = "District";
+/// See [`PLACE_TYPE_POINT_OF_INTEREST`].
+pub const PLACE_TYPE_SUB_REGION: &str = "SubRegion";
+/// See [`PLACE_TYPE_POINT_OF_INTEREST`].
+pub const PLACE_TYPE_REGION: &str = "Region";
+/// See [`PLACE_TYPE_POINT_OF_INTEREST`].
+pub const PLACE_TYPE_COUNTRY: &str = "Country";
+
+/// `TypePlacement` values, from the model's enum of the same name: where a street
+/// type sits relative to the street's base name.
+pub const TYPE_PLACEMENT_BEFORE: &str = "BeforeBaseName";
+/// See [`TYPE_PLACEMENT_BEFORE`].
+pub const TYPE_PLACEMENT_AFTER: &str = "AfterBaseName";
 
 /// The `IntendedUse` value that says the caller will persist the results. The
 /// per-operation docs state such requests "will be charged at a higher rate", i.e.
 /// they fall in a different pricing bucket than the default `SingleUse`.
 pub const INTENDED_USE_STORAGE: &str = "Storage";
+
+/// The pricing TIER a Places query is charged in by default.
+///
+/// `PricingBucket` is "the pricing bucket for which the query is charged at"
+/// (`GeocodeResponse$PricingBucket`), bound to `x-amz-geo-pricing-bucket` and
+/// `@required` on every Places response. The model enumerates no values; recorded
+/// behavior is that every Places response — whichever operation served it —
+/// carries this same tier token, so the bucket names a TIER and never the
+/// operation.
+pub const PRICING_BUCKET_CORE: &str = "Core";
+
+/// The tier a query that declares `IntendedUse: Storage` is charged in: the
+/// per-operation docs say such requests "will be charged at a higher rate", so
+/// they are a tier of their own rather than the default [`PRICING_BUCKET_CORE`].
+pub const PRICING_BUCKET_STORAGE: &str = "Storage";
+
+/// `ParsedQueryComponent$QueryComponent` for a span of a FREE-FORM query: the text
+/// was recognized inside `QueryText` rather than supplied under a named
+/// `QueryComponents` member.
+pub const QUERY_COMPONENT_FREE_TEXT: &str = "Query";
+
+/// The address components a query is matched and parsed against, COARSEST FIRST:
+/// the `GeocodeQueryComponents` members, which are also the members
+/// `MatchScores.Components.Address` scores and `ParsedQuery.Address` keys.
+pub const ADDRESS_COMPONENTS: [&str; 8] = [
+    "Country",
+    "Region",
+    "SubRegion",
+    "Locality",
+    "District",
+    "PostalCode",
+    "Street",
+    "AddressNumber",
+];
+
+/// `MatchScores.Components.Title` / `ParsedQuery.Title`, as
+/// [`PlaceRecord::explain_match`] names the place's own name.
+pub const TITLE_COMPONENT: &str = "Title";
+
+/// Each [`ADDRESS_COMPONENTS`] entry with the `PlaceType`s a structured query
+/// resolving at that level answers with.
+///
+/// A `GeocodeQueryComponents` member names an address LEVEL, so a structured query
+/// resolves at the granularity of the finest member it supplies: the place that
+/// satisfies "country X, region Y, locality Z" is the locality itself, not the
+/// streets and businesses inside it.
+pub const COMPONENT_GRANULARITY: [(&str, &[&str]); 8] = [
+    ("Country", &[PLACE_TYPE_COUNTRY]),
+    ("Region", &[PLACE_TYPE_REGION]),
+    ("SubRegion", &[PLACE_TYPE_SUB_REGION]),
+    ("Locality", &[PLACE_TYPE_LOCALITY]),
+    ("District", &[PLACE_TYPE_DISTRICT]),
+    ("PostalCode", &["PostalCode"]),
+    ("Street", &["Street", PLACE_TYPE_POINT_ADDRESS]),
+    (
+        "AddressNumber",
+        &[
+            PLACE_TYPE_POINT_ADDRESS,
+            "InterpolatedAddress",
+            "SecondaryAddress",
+        ],
+    ),
+];
+
+/// The `PlaceType`s a structured query answers with: those of the finest component
+/// it supplied, or `None` when it supplied no component the model names.
+pub fn granularity_place_types(
+    components: &[(&'static str, String)],
+) -> Option<&'static [&'static str]> {
+    COMPONENT_GRANULARITY
+        .iter()
+        .rfind(|(component, _)| {
+            components
+                .iter()
+                .any(|(supplied, _)| supplied == component)
+        })
+        .map(|(_, place_types)| *place_types)
+}
 
 /// `AdditionalFeatures` values this emulator can answer, from the per-operation
 /// `*AdditionalFeature` enums in the model.
@@ -162,17 +255,301 @@ pub fn normalize_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// How well an indexed term answers a piece of a query: 1 when they are the same,
-/// half when one abbreviates the other (either is a prefix of the other, which is
-/// what makes "Pennsylvania Ave" and "Pennsylvania Avenue" the same street), and
+/// Street-type words with their standard abbreviations: the pairs a query may use
+/// interchangeably, so "Pennsylvania Avenue" and "Pennsylvania Ave" are one street,
+/// and the words [`AddressRecord::street_components_modeled`] splits a street name
+/// on. The English rows are USPS Publication 28 Appendix C1 standard suffix
+/// abbreviations; the French rows are the equivalent La Poste abbreviations, for
+/// this catalog's French addresses.
+const STREET_TYPES: [(&str, &str); 23] = [
+    ("aly", "alley"),
+    ("av", "avenue"),
+    ("ave", "avenue"),
+    ("bd", "boulevard"),
+    ("blvd", "boulevard"),
+    ("cir", "circle"),
+    ("ct", "court"),
+    ("cv", "cove"),
+    ("dr", "drive"),
+    ("expy", "expressway"),
+    ("fwy", "freeway"),
+    ("hwy", "highway"),
+    ("imp", "impasse"),
+    ("ln", "lane"),
+    ("pkwy", "parkway"),
+    ("pl", "place"),
+    ("plz", "plaza"),
+    ("r", "rue"),
+    ("rd", "road"),
+    ("sq", "square"),
+    ("st", "street"),
+    ("ter", "terrace"),
+    ("trl", "trail"),
+];
+
+/// Directional identifiers with their written-out forms (USPS Publication 28
+/// Appendix B). A directional that leads or trails a street name locates the street
+/// but is "not included in the base name" (`StreetComponents$Prefix`/`$Suffix`).
+const DIRECTIONALS: [(&str, &str); 8] = [
+    ("n", "north"),
+    ("s", "south"),
+    ("e", "east"),
+    ("w", "west"),
+    ("ne", "northeast"),
+    ("nw", "northwest"),
+    ("se", "southeast"),
+    ("sw", "southwest"),
+];
+
+/// Is `short` the standard abbreviation of the whole word `long`?
+fn abbreviates(short: &str, long: &str) -> bool {
+    STREET_TYPES
+        .iter()
+        .chain(DIRECTIONALS.iter())
+        .any(|(abbreviation, word)| *abbreviation == short && *word == long)
+}
+
+/// Is this normalized word a street type, written out or abbreviated?
+fn is_street_type(word: &str) -> bool {
+    STREET_TYPES
+        .iter()
+        .any(|(abbreviation, written)| *abbreviation == word || *written == word)
+}
+
+/// Is this normalized word a directional identifier, written out or abbreviated?
+fn is_directional(word: &str) -> bool {
+    DIRECTIONALS
+        .iter()
+        .any(|(abbreviation, written)| *abbreviation == word || *written == word)
+}
+
+/// How well an indexed term answers a piece of a query: 1 when they are the same
+/// word or standard abbreviations of each other ([`STREET_TYPES`],
+/// [`DIRECTIONALS`]), half when the query word is a leading part of the term (a
+/// partially typed word, which is what a free-form query member documents), and
 /// `None` when they are unrelated.
+///
+/// The half match is ONE-DIRECTIONAL on purpose. A shorter indexed term is not a
+/// match for a longer query word unless the two are a known abbreviation pair, or
+/// every street type in the catalog ("St") would half-match any query word that
+/// happens to start with it ("Starbucks"), and a text search would answer with
+/// places that have nothing to do with the query.
 fn affinity(term: &str, wanted: &str) -> Option<f64> {
-    if term == wanted {
-        Some(1.0)
-    } else if term.starts_with(wanted) || wanted.starts_with(term) {
-        Some(0.5)
-    } else {
-        None
+    if term.is_empty() || wanted.is_empty() {
+        return None;
+    }
+    if term == wanted || abbreviates(term, wanted) || abbreviates(wanted, term) {
+        return Some(1.0);
+    }
+    term.starts_with(wanted).then_some(0.5)
+}
+
+/// How well a multi-word value answers a multi-word piece of a place's text, or
+/// `None` when any of its words answers none of the text's.
+///
+/// The score is the share of the LONGER of the two that was accounted for, word by
+/// word, so "Broad Street" answers the street "Broad St" in full (the street type
+/// is a standard abbreviation of the word) while "King" answers the sub-region
+/// "King County" by half: it names part of it.
+fn text_affinity(terms: &[String], wanted: &[String]) -> Option<f64> {
+    if terms.is_empty() || wanted.is_empty() {
+        return None;
+    }
+    let mut matched = 0.0;
+    for word in wanted {
+        matched += terms
+            .iter()
+            .filter_map(|term| affinity(term, word))
+            .fold(f64::NAN, f64::max);
+        if matched.is_nan() {
+            return None;
+        }
+    }
+    Some(matched / terms.len().max(wanted.len()) as f64)
+}
+
+/// One token of a query text, with the span it occupies in that text as CHAR
+/// indices — the indices `ParsedQueryComponent$StartIndex`/`$EndIndex` report —
+/// and as BYTE offsets, so the text of a span is sliced in constant time rather
+/// than rescanned.
+#[derive(Debug, Clone)]
+struct QueryToken {
+    text: String,
+    start: usize,
+    end: usize,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+/// A free-form query tokenized ONCE: the text and its tokens, so a request that
+/// explains its match against many candidates does the tokenizing a single time.
+///
+/// The number of tokens is bounded by [`QUERY_TEXT_MAX`], which every operation
+/// taking a free-form query enforces ([`check_query_text`]), so the matching work
+/// one request can ask for has a fixed ceiling.
+#[derive(Debug, Clone)]
+pub struct QueryTokens<'a> {
+    text: &'a str,
+    tokens: Vec<QueryToken>,
+}
+
+impl<'a> QueryTokens<'a> {
+    /// Tokenize a query text: [`normalize_tokens`] with the positions kept, so a
+    /// parsed component can point back into the text the caller sent.
+    pub fn new(text: &'a str) -> Self {
+        let mut tokens: Vec<QueryToken> = Vec::new();
+        let mut current = String::new();
+        let mut start = 0;
+        let mut byte_start = 0;
+        for (char_index, (byte_index, character)) in text.char_indices().enumerate() {
+            if character.is_alphanumeric() {
+                if current.is_empty() {
+                    start = char_index;
+                    byte_start = byte_index;
+                }
+                current.extend(character.to_lowercase());
+            } else if !current.is_empty() {
+                tokens.push(QueryToken {
+                    text: std::mem::take(&mut current),
+                    start,
+                    end: char_index,
+                    byte_start,
+                    byte_end: byte_index,
+                });
+            }
+        }
+        if !current.is_empty() {
+            tokens.push(QueryToken {
+                text: current,
+                start,
+                end: text.chars().count(),
+                byte_start,
+                byte_end: text.len(),
+            });
+        }
+        Self { text, tokens }
+    }
+
+    /// Did the caller send any query text at all?
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
+/// Where a piece of a place's text was recognized inside a query, and how well.
+#[derive(Debug, Clone)]
+struct Located {
+    score: f64,
+    start_index: i32,
+    end_index: i32,
+    value: String,
+}
+
+/// Locate a place's own text (its name, or one of its address components) inside a
+/// tokenized query: the best consecutive run of query tokens that answers it word
+/// for word, scored as the mean [`affinity`] over those words, and reported with
+/// the span and the text AS THE CALLER TYPED IT.
+///
+/// The span's text is built ONCE, for the run that is kept, and sliced by the byte
+/// offsets the tokens carry: scanning the query again per candidate run would make
+/// the work grow with the SQUARE of the query's length.
+fn locate(query: &QueryTokens<'_>, text: &str) -> Option<Located> {
+    let wanted = normalize_tokens(text);
+    let tokens = query.tokens.as_slice();
+    if wanted.is_empty() || wanted.len() > tokens.len() {
+        return None;
+    }
+    let mut best: Option<(f64, usize)> = None;
+    for (offset, window) in tokens.windows(wanted.len()).enumerate() {
+        let mut total = 0.0;
+        for (token, word) in window.iter().zip(&wanted) {
+            match affinity(word, &token.text) {
+                Some(score) => total += score,
+                None => {
+                    total = f64::NAN;
+                    break;
+                }
+            }
+        }
+        if total.is_nan() {
+            continue;
+        }
+        let score = total / wanted.len() as f64;
+        if best.is_none_or(|(kept, _)| score > kept) {
+            best = Some((score, offset));
+        }
+    }
+    let (score, offset) = best?;
+    let first = &tokens[offset];
+    let last = &tokens[offset + wanted.len() - 1];
+    Some(Located {
+        score,
+        start_index: first.start as i32,
+        end_index: last.end as i32,
+        value: query.text[first.byte_start..last.byte_end].to_string(),
+    })
+}
+
+/// One component of a place that a query matched: how well, and the span of the
+/// query it was recognized in.
+#[derive(Debug, Clone)]
+pub struct ComponentMatch {
+    /// The component matched: a [`ADDRESS_COMPONENTS`] entry, or
+    /// [`TITLE_COMPONENT`].
+    pub component: &'static str,
+    /// `MatchScore`: 1 when every word was recognized in full (modeled `range
+    /// 0..1`).
+    pub score: f64,
+    /// `ParsedQueryComponent$StartIndex`.
+    pub start_index: i32,
+    /// `ParsedQueryComponent$EndIndex`.
+    pub end_index: i32,
+    /// `ParsedQueryComponent$Value`: the text as the caller sent it.
+    pub value: String,
+    /// `ParsedQueryComponent$QueryComponent`: the request member the text came
+    /// from — a `QueryComponents` member's name, or
+    /// [`QUERY_COMPONENT_FREE_TEXT`].
+    pub query_component: String,
+}
+
+/// How a query matched one place, component by component: the data behind a
+/// geocode result's `MatchScores` and `ParsedQuery`.
+#[derive(Debug, Clone, Default)]
+pub struct MatchExplanation {
+    /// `MatchScoreDetails$Overall`.
+    pub overall: f64,
+    /// The place's own name, where the query named it.
+    pub title: Option<ComponentMatch>,
+    /// The address components the query named, coarsest first.
+    pub components: Vec<ComponentMatch>,
+}
+
+impl MatchExplanation {
+    /// The best score recorded for one component, or 0 when the query never named
+    /// it: `MatchScore` carries a modeled `@default` of 0, which is "no tokens were
+    /// matched" (`ComponentMatchScores`).
+    pub fn score_of(&self, component: &str) -> f64 {
+        self.components
+            .iter()
+            .filter(|matched| matched.component == component)
+            .map(|matched| matched.score)
+            .fold(0.0, f64::max)
+    }
+
+    /// The parsed spans recorded for one component, in the order they were parsed,
+    /// or `None` when the query never named it.
+    pub fn spans_of(&self, component: &str) -> Option<Vec<&ComponentMatch>> {
+        let spans: Vec<&ComponentMatch> = self
+            .components
+            .iter()
+            .filter(|matched| matched.component == component)
+            .collect();
+        (!spans.is_empty()).then_some(spans)
+    }
+
+    /// Did the query name anything at all about this place?
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.components.is_empty()
     }
 }
 
@@ -193,9 +570,11 @@ pub struct Scored {
 // ---------------------------------------------------------------------------
 
 /// A place's address, as every operation that reports an `Address` renders it.
+///
+/// The `Label` is NOT stored: it is assembled from these components on the way out
+/// ([`assemble_label`]), which is what `Address$Label` documents it to be.
 #[derive(Debug, Clone)]
 pub struct AddressRecord {
-    pub label: String,
     pub country_code2: String,
     pub country_code3: String,
     pub country_name: String,
@@ -207,39 +586,101 @@ pub struct AddressRecord {
     pub postal_code: String,
     pub street: Option<String>,
     pub address_number: Option<String>,
+    /// The BCP 47 language this record's text is written in, reported as the
+    /// street components' `Language`: "If there is no data for the result in the
+    /// requested language, data will be returned in the default language for the
+    /// entry" (`StreetComponents$Language`), and this catalog holds one language
+    /// per entry.
+    pub language: String,
 }
 
 impl AddressRecord {
-    /// This address as the modeled `Address` structure.
-    pub fn to_modeled(&self) -> Address {
+    /// This address as the modeled `Address` structure, with the assembled `Label`
+    /// the place computed and the street split into `StreetComponents`.
+    ///
+    /// A component this catalog does not hold is ABSENT, not an empty string:
+    /// every `Address` member is optional, so "this place has no postal code" is a
+    /// missing member and `""` would be a postal code of no characters.
+    pub fn to_modeled(&self, label: String) -> Address {
+        let present = |value: &str| (!value.is_empty()).then(|| value.to_string());
+        let country = Country {
+            code2: present(&self.country_code2),
+            code3: present(&self.country_code3),
+            name: present(&self.country_name),
+        };
+        let region = Region {
+            code: present(&self.region_code),
+            name: present(&self.region_name),
+        };
+        let sub_region = SubRegion {
+            code: None,
+            name: present(&self.sub_region_name),
+        };
         Address {
-            label: Some(self.label.clone()),
-            country: Some(Country {
-                code2: Some(self.country_code2.clone()),
-                code3: Some(self.country_code3.clone()),
-                name: Some(self.country_name.clone()),
-            }),
-            region: Some(Region {
-                code: Some(self.region_code.clone()),
-                name: Some(self.region_name.clone()),
-            }),
-            sub_region: Some(SubRegion {
-                code: None,
-                name: Some(self.sub_region_name.clone()),
-            }),
-            locality: Some(self.locality.clone()),
+            label: present(&label),
+            country: (country.code2.is_some() || country.name.is_some()).then_some(country),
+            region: (region.code.is_some() || region.name.is_some()).then_some(region),
+            sub_region: sub_region.name.is_some().then_some(sub_region),
+            locality: present(&self.locality),
             district: self.district.clone(),
-            postal_code: Some(self.postal_code.clone()),
+            postal_code: present(&self.postal_code),
             street: self.street.clone(),
+            street_components: self.street_components_modeled(),
             address_number: self.address_number.clone(),
             ..Address::default()
         }
     }
 
+    /// `Address.StreetComponents` — "Components of the street" — parsed out of the
+    /// street name: the base name, the street type and the side of the base name
+    /// the regional convention places it on (after it in English, before it in
+    /// French), the separator between them, and the directional prefix or suffix
+    /// that is not part of the base name.
+    pub fn street_components_modeled(&self) -> Option<Vec<StreetComponents>> {
+        let street = self.street.as_deref().filter(|street| !street.is_empty())?;
+        let mut words: Vec<&str> = street.split_whitespace().collect();
+        let normalized = |word: &str| normalize_tokens(word).join("");
+
+        let mut prefix = None;
+        let mut suffix = None;
+        if words.len() > 1 && is_directional(&normalized(words[0])) {
+            prefix = Some(words.remove(0).to_string());
+        }
+        if words.len() > 1 && words.last().is_some_and(|word| is_directional(&normalized(word))) {
+            suffix = words.pop().map(str::to_string);
+        }
+
+        let mut street_type = None;
+        let mut type_placement = None;
+        if words.len() > 1 && words.last().is_some_and(|word| is_street_type(&normalized(word))) {
+            street_type = words.pop().map(str::to_string);
+            type_placement = Some(TYPE_PLACEMENT_AFTER.to_string());
+        } else if words.len() > 1 && is_street_type(&normalized(words[0])) {
+            street_type = Some(words.remove(0).to_string());
+            type_placement = Some(TYPE_PLACEMENT_BEFORE.to_string());
+        }
+
+        let base_name = words.join(" ");
+        // The modeled `TypeSeparator` is `""` or `" "`; this catalog's street
+        // names separate the type from the base name with a space.
+        let type_separator = street_type.as_ref().map(|_| " ".to_string());
+        Some(vec![StreetComponents {
+            base_name: (!base_name.is_empty()).then_some(base_name),
+            r#type: street_type,
+            type_placement,
+            type_separator,
+            prefix,
+            suffix,
+            direction: None,
+            language: (!self.language.is_empty()).then(|| self.language.clone()),
+        }])
+    }
+
     /// The texts a `GeocodeQueryComponents` member may match against, named by that
-    /// member. A component the catalog does not carry matches nothing.
+    /// member. A component the catalog does not carry matches nothing — an absent
+    /// component holds no text, so it cannot answer a query word.
     pub fn component_texts(&self, component: &str) -> Vec<&str> {
-        match component {
+        let texts = match component {
             "Country" => vec![
                 self.country_code2.as_str(),
                 self.country_code3.as_str(),
@@ -253,8 +694,123 @@ impl AddressRecord {
             "AddressNumber" => self.address_number.as_deref().into_iter().collect(),
             "PostalCode" => vec![self.postal_code.as_str()],
             _ => Vec::new(),
-        }
+        };
+        texts.into_iter().filter(|text| !text.is_empty()).collect()
     }
+
+    /// How well a supplied structured component answers this address's own
+    /// component, or `None` when it does not answer it at all.
+    pub fn component_affinity(&self, component: &str, value: &str) -> Option<f64> {
+        let wanted = normalize_tokens(value);
+        if wanted.is_empty() {
+            return None;
+        }
+        self.component_texts(component)
+            .iter()
+            .filter_map(|text| text_affinity(&normalize_tokens(text), &wanted))
+            .fold(None, |best: Option<f64>, score| {
+                Some(best.map_or(score, |best| best.max(score)))
+            })
+    }
+
+    /// `[address number] [street]`, the street line of a postal address, or `None`
+    /// when the address names no street.
+    fn street_line(&self) -> Option<String> {
+        let street = self.street.as_deref().filter(|street| !street.is_empty())?;
+        Some(
+            match self
+                .address_number
+                .as_deref()
+                .filter(|number| !number.is_empty())
+            {
+                Some(number) => format!("{number} {street}"),
+                None => street.to_string(),
+            },
+        )
+    }
+}
+
+/// The assembled `Address$Label`: "Assembled address value built out of the address
+/// components, according to the regional postal rules. This is the correctly
+/// formatted address", led by the place's own `name` where it has one, as a point
+/// of interest does.
+///
+/// Two conventions, chosen by the address's country:
+///
+/// * US — the state abbreviation and the ZIP code ride the settlement line:
+///   `[name, ][number street, ]settlement, STATE[ ZIP], country`. The ZIP belongs
+///   to a street address, so a city reads "Seattle, WA, United States" while an
+///   address in it reads "400 Broad St, Seattle, WA 98109, United States".
+/// * Elsewhere — the postal code precedes the settlement, and the region is named
+///   only where the address has no street line:
+///   `[name, ][number street, ][postal ]settlement, country`.
+///
+/// Either convention skips a component the address does not hold rather than
+/// rendering it empty, so a place reads at its OWN level: a country as "France", a
+/// sub-region as "King County, WA, United States". The district is part of the
+/// label only for a place that IS a district — for a business or an address it is
+/// finer detail than the postal address needs.
+fn assemble_label(address: &AddressRecord, name: Option<&str>, place_type: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        parts.push(name.to_string());
+    }
+    let street_line = address.street_line();
+    if let Some(line) = street_line.clone() {
+        parts.push(line);
+    }
+
+    // The settlement: the finest level at or above this place's own granularity
+    // that the address names, below the region.
+    let mut settlement: Vec<&str> = Vec::new();
+    if place_type == PLACE_TYPE_DISTRICT {
+        settlement.extend(address.district.as_deref());
+    }
+    settlement.extend(
+        [address.locality.as_str(), address.sub_region_name.as_str()]
+            .into_iter()
+            .find(|level| !level.is_empty()),
+    );
+    settlement.retain(|level| !level.is_empty());
+
+    let us_style = address.country_code2 == "US";
+    let settlement_line = if us_style {
+        // Beside a finer level the region is written as its code, as its full name
+        // where the region is the finest level the address names.
+        let region = if settlement.is_empty() {
+            address.region_name.as_str()
+        } else {
+            address.region_code.as_str()
+        };
+        let mut line = settlement
+            .iter()
+            .copied()
+            .chain([region])
+            .filter(|level| !level.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if street_line.is_some() && !address.postal_code.is_empty() && !line.is_empty() {
+            line = format!("{line} {}", address.postal_code);
+        }
+        line
+    } else if street_line.is_some() && !address.postal_code.is_empty() && !settlement.is_empty() {
+        format!("{} {}", address.postal_code, settlement.join(", "))
+    } else {
+        settlement
+            .iter()
+            .copied()
+            .chain([address.region_name.as_str()])
+            .filter(|level| !level.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !settlement_line.is_empty() {
+        parts.push(settlement_line);
+    }
+    if !address.country_name.is_empty() {
+        parts.push(address.country_name.clone());
+    }
+    parts.join(", ")
 }
 
 /// One of a place's categories: the modeled `Category`.
@@ -378,6 +934,33 @@ impl PlaceRecord {
         self
     }
 
+    /// The place's OWN name, for a place that has one: a point of interest is a
+    /// named business or landmark. An address or an administrative area has no
+    /// name of its own — what names it is its assembled address label.
+    pub fn name(&self) -> Option<&str> {
+        (self.place_type == PLACE_TYPE_POINT_OF_INTEREST).then_some(self.title.as_str())
+    }
+
+    /// This place's assembled address label: see [`assemble_label`].
+    pub fn assembled_label(&self) -> String {
+        assemble_label(&self.address, self.name(), &self.place_type)
+    }
+
+    /// `Title`: "The localized display name of this result item"
+    /// (`GeocodeResultItem$Title`) — the place's own name, or, for an address or an
+    /// administrative area, the assembled address label that names it. A client
+    /// shows this as the single display line for the place, so a bare address
+    /// component is not one.
+    pub fn title_modeled(&self) -> String {
+        self.name()
+            .map_or_else(|| self.assembled_label(), str::to_string)
+    }
+
+    /// `Address`, with the assembled `Label` this place renders.
+    pub fn address_modeled(&self) -> Address {
+        self.address.to_modeled(self.assembled_label())
+    }
+
     /// `Position`, as a modeled `Position` list.
     pub fn position_modeled(&self) -> Vec<f64> {
         self.position.to_vec()
@@ -430,12 +1013,15 @@ impl PlaceRecord {
         if self.business_chains.is_empty() {
             return None;
         }
+        // The `Id` is the chain identifier AS STORED. Case-folding it would hand
+        // out an id that no longer compares equal to the one the catalog holds,
+        // and chain filtering compares ids as strings.
         Some(
             self.business_chains
                 .iter()
                 .map(|name| BusinessChain {
                     name: Some(name.clone()),
-                    id: Some(normalize_tokens(name).join("_")),
+                    id: Some(name.clone()),
                 })
                 .collect(),
         )
@@ -548,21 +1134,79 @@ impl PlaceRecord {
         }
         let mut matched = 0.0;
         for (component, value) in components {
-            let wanted = normalize_tokens(value).join(" ");
-            if wanted.is_empty() {
-                return None;
-            }
-            matched += self
-                .address
-                .component_texts(component)
-                .iter()
-                .filter_map(|text| affinity(&normalize_tokens(text).join(" "), &wanted))
-                .fold(f64::NAN, f64::max);
-            if matched.is_nan() {
-                return None;
-            }
+            matched += self.address.component_affinity(component, value)?;
         }
         Some(matched / components.len() as f64)
+    }
+
+    /// How one geocode query matched this place, component by component: the
+    /// free-form text is located inside the place's own name and address
+    /// components, and every structured component the caller supplied is scored
+    /// against the address component it names and echoed as parsed.
+    ///
+    /// The query arrives already tokenized ([`QueryTokens`]), so a request
+    /// explaining its match against many candidates tokenizes it once.
+    ///
+    /// This is the data behind `MatchScores` ("Indicates how well the entire input
+    /// matches the returned. It is equal to 1 if all input tokens are recognized
+    /// and matched") and `ParsedQuery` ("Parsed components in the provided
+    /// QueryText"): a component recognized in full scores 1, one recognized from a
+    /// leading part of a word scores half, and a component the query never named is
+    /// absent, which `MatchScore`'s modeled default reports as 0.
+    pub fn explain_match(
+        &self,
+        overall: f64,
+        query: &QueryTokens<'_>,
+        components: &[(&'static str, String)],
+    ) -> MatchExplanation {
+        let mut explanation = MatchExplanation {
+            overall,
+            ..MatchExplanation::default()
+        };
+        if !query.is_empty() {
+            if let Some(found) = self.name().and_then(|name| locate(query, name)) {
+                explanation.title = Some(ComponentMatch {
+                    component: TITLE_COMPONENT,
+                    score: found.score,
+                    start_index: found.start_index,
+                    end_index: found.end_index,
+                    value: found.value,
+                    query_component: QUERY_COMPONENT_FREE_TEXT.to_string(),
+                });
+            }
+            for component in ADDRESS_COMPONENTS {
+                let best = self
+                    .address
+                    .component_texts(component)
+                    .into_iter()
+                    .filter_map(|text| locate(query, text))
+                    .max_by(|left, right| left.score.total_cmp(&right.score));
+                if let Some(found) = best {
+                    explanation.components.push(ComponentMatch {
+                        component,
+                        score: found.score,
+                        start_index: found.start_index,
+                        end_index: found.end_index,
+                        value: found.value,
+                        query_component: QUERY_COMPONENT_FREE_TEXT.to_string(),
+                    });
+                }
+            }
+        }
+        for (component, value) in components {
+            let Some(score) = self.address.component_affinity(component, value) else {
+                continue;
+            };
+            explanation.components.push(ComponentMatch {
+                component,
+                score,
+                start_index: 0,
+                end_index: value.chars().count() as i32,
+                value: value.clone(),
+                query_component: (*component).to_string(),
+            });
+        }
+        explanation
     }
 
     /// Is this place in one of `codes` (alpha-2 or alpha-3 country codes)?
@@ -639,9 +1283,10 @@ fn synthesize_place_id(title: &str, position: [f64; 2]) -> String {
 /// The normalized tokens a record is found by: its title, its address, its
 /// categories, its food types and its business chains.
 fn index_terms(place: &PlaceRecord) -> Vec<String> {
+    let label = place.assembled_label();
     let mut sources: Vec<&str> = vec![
         place.title.as_str(),
-        place.address.label.as_str(),
+        label.as_str(),
         place.address.locality.as_str(),
         place.address.region_code.as_str(),
         place.address.region_name.as_str(),
@@ -736,6 +1381,32 @@ pub fn check_query_radius(radius: Option<i64>) -> Result<(), ValidationException
                 ),
             ))
         }
+        _ => Ok(()),
+    }
+}
+
+/// The inclusive maximum number of characters a free-form query may carry.
+///
+/// `SearchTextRequest$QueryText` is modeled `@length 1..200`; Geocode's
+/// `QueryText` is a `SensitiveString` with no length trait, so the service applies
+/// its sibling's published ceiling to it: a free-form query longer than that is
+/// refused rather than matched. That also BOUNDS the matching work one request can
+/// ask for — the tokens a query produces, and so the runs each candidate's text is
+/// located in, cannot grow past this ceiling.
+pub const QUERY_TEXT_MAX: usize = 200;
+
+/// Refuse a free-form query longer than [`QUERY_TEXT_MAX`] characters, naming the
+/// member it was supplied under.
+pub fn check_query_text(
+    query_text: Option<&str>,
+    member: &str,
+) -> Result<(), ValidationException> {
+    match query_text {
+        Some(text) if text.chars().count() > QUERY_TEXT_MAX => Err(validation_exception(
+            REASON_FIELD_VALIDATION_FAILED,
+            member,
+            format!("{member} must be at most {QUERY_TEXT_MAX} characters"),
+        )),
         _ => Ok(()),
     }
 }
@@ -858,7 +1529,8 @@ pub struct ComAmazonawsGeoplacesPlacesserviceState {
     /// `PlaceId` to its index in [`Self::places`], for GetPlace's lookup.
     pub place_index: BTreeMap<String, usize>,
     /// The `PricingBucket` each operation reports, keyed by operation name and —
-    /// for the storage-priced variant — `"<operation>/Storage"`.
+    /// for the storage-priced variant — `"<operation>/Storage"`. The values are
+    /// pricing TIERS ([`PRICING_BUCKET_CORE`], [`PRICING_BUCKET_STORAGE`]).
     pub pricing_buckets: BTreeMap<String, String>,
 }
 
@@ -878,9 +1550,11 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
 
     /// The `PricingBucket` for one call.
     ///
-    /// Each operation has its own bucket, and a request that declares
-    /// `IntendedUse: Storage` falls in that operation's storage bucket, because the
-    /// model documents such requests as "charged at a higher rate".
+    /// The bucket is a pricing TIER, not the operation that served the request:
+    /// every Places operation is charged in the same default tier
+    /// ([`PRICING_BUCKET_CORE`]), and a request that declares `IntendedUse:
+    /// Storage` falls in the storage tier, because the model documents such
+    /// requests as "charged at a higher rate".
     pub fn pricing_bucket(&self, operation: &str, intended_use: Option<&str>) -> String {
         let storage = intended_use.is_some_and(|value| value == INTENDED_USE_STORAGE);
         let key = if storage {
@@ -888,10 +1562,13 @@ impl ComAmazonawsGeoplacesPlacesserviceState {
         } else {
             operation.to_string()
         };
-        self.pricing_buckets
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| operation.to_string())
+        self.pricing_buckets.get(&key).cloned().unwrap_or_else(|| {
+            if storage {
+                PRICING_BUCKET_STORAGE.to_string()
+            } else {
+                PRICING_BUCKET_CORE.to_string()
+            }
+        })
     }
 
     /// The `PoliticalView` to report, in the alpha-3 form the result items model
@@ -1040,8 +1717,20 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// `MapView` extent for a point place (an address or a point of interest).
 const POINT_EXTENT_M: f64 = 150.0;
 
+/// `MapView` extent for a district, which covers a neighbourhood.
+const DISTRICT_EXTENT_M: f64 = 3_000.0;
+
 /// `MapView` extent for a locality, which covers a whole settlement.
 const LOCALITY_EXTENT_M: f64 = 12_000.0;
+
+/// `MapView` extent for a sub-region (a county).
+const SUB_REGION_EXTENT_M: f64 = 60_000.0;
+
+/// `MapView` extent for a region (a state).
+const REGION_EXTENT_M: f64 = 350_000.0;
+
+/// `MapView` extent for a country.
+const COUNTRY_EXTENT_M: f64 = 2_000_000.0;
 
 /// The operations whose `PricingBucket` this service seeds. Every one of the
 /// service's modeled operations declares the member as `@required`.
@@ -1056,15 +1745,21 @@ const PRICED_OPERATIONS: [&str; 7] = [
 ];
 
 /// Build the catalog: a deterministic set of places in Washington DC, Seattle and
-/// Paris, spanning point addresses, points of interest and localities, in two
+/// Paris, spanning the administrative hierarchy (country, region, sub-region,
+/// locality, district) down to points of interest and point addresses, in two
 /// countries, with and without categories, food types, business chains, contacts,
 /// opening hours, access points and time zones.
+///
+/// The administrative levels are seeded because a structured query resolves at the
+/// granularity of the component it supplies ([`COMPONENT_GRANULARITY`]): a query
+/// for a country must be able to answer with that country. The catalog holds no
+/// place at postal-code granularity, so a structured postal-code query answers with
+/// no items rather than with a place of the wrong granularity.
 ///
 /// The category ids and names are this catalog's own: the model carries no
 /// enumeration of AWS's place categories, only the `Category` structure shape.
 fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
     let washington = AddressRecord {
-        label: String::new(),
         country_code2: "US".to_string(),
         country_code3: "USA".to_string(),
         country_name: "United States".to_string(),
@@ -1073,15 +1768,18 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         sub_region_name: "District of Columbia".to_string(),
         locality: "Washington".to_string(),
         district: None,
-        postal_code: String::new(),
+        // The locality's primary postal code: the central ZIP of the city.
+        postal_code: "20001".to_string(),
         street: None,
         address_number: None,
+        language: "en".to_string(),
     };
     let seattle = AddressRecord {
         region_code: "WA".to_string(),
         region_name: "Washington".to_string(),
         sub_region_name: "King County".to_string(),
         locality: "Seattle".to_string(),
+        postal_code: "98104".to_string(),
         ..washington.clone()
     };
     let paris = AddressRecord {
@@ -1092,7 +1790,26 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
         region_name: "Ile-de-France".to_string(),
         sub_region_name: "Paris".to_string(),
         locality: "Paris".to_string(),
+        postal_code: "75001".to_string(),
+        language: "fr".to_string(),
         ..washington.clone()
+    };
+    // The administrative levels above a locality name no settlement of their own.
+    let united_states = AddressRecord {
+        region_code: String::new(),
+        region_name: String::new(),
+        sub_region_name: String::new(),
+        locality: String::new(),
+        postal_code: String::new(),
+        ..washington.clone()
+    };
+    let france = AddressRecord {
+        region_code: String::new(),
+        region_name: String::new(),
+        sub_region_name: String::new(),
+        locality: String::new(),
+        postal_code: String::new(),
+        ..paris.clone()
     };
 
     let eastern = ("America/New_York", "-05:00", -18_000);
@@ -1105,7 +1822,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-77.036_560, 38.897_957],
             AddressRecord {
-                label: "1600 Pennsylvania Ave NW, Washington, DC 20500, United States".to_string(),
                 postal_code: "20500".to_string(),
                 street: Some("Pennsylvania Ave NW".to_string()),
                 address_number: Some("1600".to_string()),
@@ -1126,7 +1842,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_ADDRESS,
             [-77.036_530, 38.897_680],
             AddressRecord {
-                label: "1600 Pennsylvania Ave NW, Washington, DC 20500, United States".to_string(),
                 postal_code: "20500".to_string(),
                 street: Some("Pennsylvania Ave NW".to_string()),
                 address_number: Some("1600".to_string()),
@@ -1141,7 +1856,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-77.019_912, 38.888_100],
             AddressRecord {
-                label: "600 Independence Ave SW, Washington, DC 20560, United States".to_string(),
                 postal_code: "20560".to_string(),
                 street: Some("Independence Ave SW".to_string()),
                 address_number: Some("600".to_string()),
@@ -1158,7 +1872,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-77.050_143, 38.889_248],
             AddressRecord {
-                label: "2 Lincoln Memorial Cir NW, Washington, DC 20037, United States".to_string(),
                 postal_code: "20037".to_string(),
                 street: Some("Lincoln Memorial Cir NW".to_string()),
                 address_number: Some("2".to_string()),
@@ -1173,7 +1886,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-77.044_230, 38.900_800],
             AddressRecord {
-                label: "1924 Pennsylvania Ave NW, Washington, DC 20006, United States".to_string(),
                 postal_code: "20006".to_string(),
                 street: Some("Pennsylvania Ave NW".to_string()),
                 address_number: Some("1924".to_string()),
@@ -1190,10 +1902,7 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             "Washington",
             PLACE_TYPE_LOCALITY,
             [-77.036_871, 38.907_192],
-            AddressRecord {
-                label: "Washington, DC, United States".to_string(),
-                ..washington.clone()
-            },
+            washington.clone(),
             LOCALITY_EXTENT_M,
         )
         .with_time_zone(eastern.0, eastern.1, eastern.2),
@@ -1202,7 +1911,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.349_358, 47.620_506],
             AddressRecord {
-                label: "400 Broad St, Seattle, WA 98109, United States".to_string(),
                 postal_code: "98109".to_string(),
                 street: Some("Broad St".to_string()),
                 address_number: Some("400".to_string()),
@@ -1224,7 +1932,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_ADDRESS,
             [-122.349_300, 47.620_400],
             AddressRecord {
-                label: "400 Broad St, Seattle, WA 98109, United States".to_string(),
                 postal_code: "98109".to_string(),
                 street: Some("Broad St".to_string()),
                 address_number: Some("400".to_string()),
@@ -1239,7 +1946,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.340_810, 47.608_849],
             AddressRecord {
-                label: "85 Pike St, Seattle, WA 98101, United States".to_string(),
                 postal_code: "98101".to_string(),
                 street: Some("Pike St".to_string()),
                 address_number: Some("85".to_string()),
@@ -1257,7 +1963,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [-122.327_290, 47.614_040],
             AddressRecord {
-                label: "1124 Pike St, Seattle, WA 98101, United States".to_string(),
                 postal_code: "98101".to_string(),
                 street: Some("Pike St".to_string()),
                 address_number: Some("1124".to_string()),
@@ -1276,10 +1981,7 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             "Seattle",
             PLACE_TYPE_LOCALITY,
             [-122.330_062, 47.603_832],
-            AddressRecord {
-                label: "Seattle, WA, United States".to_string(),
-                ..seattle.clone()
-            },
+            seattle.clone(),
             LOCALITY_EXTENT_M,
         )
         .with_time_zone(pacific.0, pacific.1, pacific.2),
@@ -1288,7 +1990,6 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             PLACE_TYPE_POINT_OF_INTEREST,
             [2.294_481, 48.858_370],
             AddressRecord {
-                label: "5 Av. Anatole France, 75007 Paris, France".to_string(),
                 postal_code: "75007".to_string(),
                 street: Some("Av. Anatole France".to_string()),
                 address_number: Some("5".to_string()),
@@ -1309,13 +2010,89 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             "Paris",
             PLACE_TYPE_LOCALITY,
             [2.352_222, 48.856_613],
-            AddressRecord {
-                label: "Paris, Ile-de-France, France".to_string(),
-                ..paris.clone()
-            },
+            paris.clone(),
             LOCALITY_EXTENT_M,
         )
         .with_time_zone(central_european.0, central_european.1, central_european.2),
+        // The administrative levels a structured query resolves at: a district, a
+        // sub-region (county), the regions (states) and the countries.
+        PlaceRecord::new(
+            "Capitol Hill",
+            PLACE_TYPE_DISTRICT,
+            [-122.312_440, 47.623_100],
+            AddressRecord {
+                district: Some("Capitol Hill".to_string()),
+                postal_code: "98102".to_string(),
+                ..seattle.clone()
+            },
+            DISTRICT_EXTENT_M,
+        )
+        .with_time_zone(pacific.0, pacific.1, pacific.2),
+        PlaceRecord::new(
+            "King County",
+            PLACE_TYPE_SUB_REGION,
+            [-121.837_000, 47.491_000],
+            AddressRecord {
+                locality: String::new(),
+                postal_code: String::new(),
+                ..seattle.clone()
+            },
+            SUB_REGION_EXTENT_M,
+        )
+        .with_time_zone(pacific.0, pacific.1, pacific.2),
+        PlaceRecord::new(
+            "Washington",
+            PLACE_TYPE_REGION,
+            [-120.740_135, 47.751_076],
+            AddressRecord {
+                sub_region_name: String::new(),
+                locality: String::new(),
+                postal_code: String::new(),
+                ..seattle.clone()
+            },
+            REGION_EXTENT_M,
+        )
+        .with_time_zone(pacific.0, pacific.1, pacific.2),
+        PlaceRecord::new(
+            "District of Columbia",
+            PLACE_TYPE_REGION,
+            [-77.016_389, 38.904_722],
+            AddressRecord {
+                sub_region_name: String::new(),
+                locality: String::new(),
+                postal_code: String::new(),
+                ..washington.clone()
+            },
+            LOCALITY_EXTENT_M,
+        )
+        .with_time_zone(eastern.0, eastern.1, eastern.2),
+        PlaceRecord::new(
+            "Ile-de-France",
+            PLACE_TYPE_REGION,
+            [2.521_000, 48.849_000],
+            AddressRecord {
+                sub_region_name: String::new(),
+                locality: String::new(),
+                postal_code: String::new(),
+                ..paris.clone()
+            },
+            REGION_EXTENT_M,
+        )
+        .with_time_zone(central_european.0, central_european.1, central_european.2),
+        PlaceRecord::new(
+            "United States",
+            PLACE_TYPE_COUNTRY,
+            [-98.579_500, 39.828_300],
+            united_states,
+            COUNTRY_EXTENT_M,
+        ),
+        PlaceRecord::new(
+            "France",
+            PLACE_TYPE_COUNTRY,
+            [2.209_667, 46.232_193],
+            france,
+            COUNTRY_EXTENT_M,
+        ),
     ];
 
     for place in &mut places {
@@ -1330,10 +2107,10 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
 
     let mut pricing_buckets = BTreeMap::new();
     for operation in PRICED_OPERATIONS {
-        pricing_buckets.insert(operation.to_string(), operation.to_string());
+        pricing_buckets.insert(operation.to_string(), PRICING_BUCKET_CORE.to_string());
         pricing_buckets.insert(
             format!("{operation}/{INTENDED_USE_STORAGE}"),
-            format!("{operation}{INTENDED_USE_STORAGE}"),
+            PRICING_BUCKET_STORAGE.to_string(),
         );
     }
 

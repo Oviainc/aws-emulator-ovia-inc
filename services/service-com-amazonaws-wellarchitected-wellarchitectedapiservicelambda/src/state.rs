@@ -75,25 +75,51 @@ pub const DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS: &str = "DISABLED";
 pub const FRAMEWORK_LENS_ALIAS: &str = "wellarchitected";
 
 /// The AWS Well-Architected Framework lens's pillars, in the order the framework
-/// presents them, each with the number of questions that pillar asks.
+/// presents them: the id each is named by on the wire, the name the framework publishes
+/// for it, and the number of questions that pillar asks.
 ///
 /// `PillarId` is how a pillar is named on the wire (`smithy_query(query="shape",
-/// shape="PillarId")`: "The ID used to identify a pillar, for example, `security`").
-/// The question counts are the framework's published question numbering —
+/// shape="PillarId")`: "The ID used to identify a pillar, for example, `security`"), and
+/// `PillarName` is its display name (`smithy_query(query="shape",
+/// shape="PillarReviewSummary")`) — the six pillar names the Well-Architected Framework
+/// publishes. The question counts are the framework's published question numbering —
 /// operational excellence OPS 1-11, security SEC 1-11, reliability REL 1-13,
 /// performance efficiency PERF 1-5, cost optimization COST 1-11 and sustainability
 /// SUS 1-6 — 57 questions in all. This table is the pillar ORDER (it is what a workload
-/// without priorities is reviewed in); the questions themselves are
-/// [`FRAMEWORK_LENS_QUESTIONS`], and a test pins the two against each other so the
-/// counts restated here cannot drift from the catalog.
-pub const FRAMEWORK_LENS_PILLARS: &[(&str, usize)] = &[
-    ("operationalExcellence", 11),
-    ("security", 11),
-    ("reliability", 13),
-    ("performance", 5),
-    ("costOptimization", 11),
-    ("sustainability", 6),
+/// without priorities is reviewed in, and the order a lens review reports its pillar
+/// summaries in); the questions themselves are [`FRAMEWORK_LENS_QUESTIONS`], and a test
+/// pins the two against each other so the counts restated here cannot drift from the
+/// catalog.
+pub const FRAMEWORK_LENS_PILLARS: &[(&str, &str, usize)] = &[
+    ("operationalExcellence", "Operational Excellence", 11),
+    ("security", "Security", 11),
+    ("reliability", "Reliability", 13),
+    ("performance", "Performance Efficiency", 5),
+    ("costOptimization", "Cost Optimization", 11),
+    ("sustainability", "Sustainability", 6),
 ];
+
+/// The `LensName` of the AWS-official Well-Architected Framework lens: the name AWS
+/// publishes for the lens [`FRAMEWORK_LENS_ALIAS`] names, which is the one lens this
+/// emulator ships content for.
+pub const FRAMEWORK_LENS_NAME: &str = "Well-Architected Framework";
+
+/// The `LensVersion` the framework lens content in this file is: the revision of the
+/// Well-Architected Framework lens whose published question numbering
+/// [`FRAMEWORK_LENS_QUESTIONS`] carries (OPS 1-11, SEC 1-11, REL 1-13, PERF 1-5,
+/// COST 1-11, SUS 1-6). It names THIS catalog's version, so a change to the catalog
+/// changes it; `LensVersion` is `@length(min: 1, max: 32)`
+/// (`smithy_query(query="shape", shape="LensReview")`).
+pub const FRAMEWORK_LENS_VERSION: &str = "2023-10-03";
+
+/// `LensStatus$CURRENT`: the lens review is against the lens's latest version
+/// (`smithy_query(query="shape", shape="LensStatus")` publishes `CURRENT`,
+/// `NOT_CURRENT`, `DEPRECATED`, `DELETED` and `UNSHARED`). The framework lens content
+/// here has exactly one version ([`FRAMEWORK_LENS_VERSION`]), and the operations that
+/// could move a review off it — `CreateLensVersion`, `DeleteLens`, `CreateLensShare` and
+/// `UpgradeLensReview` — are still stubs, each with its own issue, so a review of a lens
+/// this emulator holds content for is on that lens's current version.
+pub const LENS_STATUS_CURRENT: &str = "CURRENT";
 
 /// One question of the AWS-official framework lens, as this emulator's lens content:
 /// the pillar it belongs to, the id it is named by on the wire and its title.
@@ -564,6 +590,17 @@ impl WorkloadRecord {
         self.answers.get(lens_alias(lens))?.get(question_id)
     }
 
+    /// Whether this workload has a lens review of the named lens.
+    ///
+    /// A lens review exists only while that lens is associated with the workload, and a
+    /// lens is the same lens however the request named it ([`lens_alias`]) — so a lens
+    /// the workload does not carry has no review to report.
+    pub fn reviews_lens(&self, lens: &str) -> bool {
+        self.lenses
+            .iter()
+            .any(|attached| lens_alias(attached) == lens_alias(lens))
+    }
+
     /// This workload's risk roll-up: one entry for every `Risk` the enum publishes, so
     /// a caller that reads a bucket to report review progress always finds it.
     ///
@@ -573,25 +610,62 @@ impl WorkloadRecord {
     /// and the stored answers on every read and never stored, so it moves when either
     /// does.
     pub fn risk_counts(&self) -> BTreeMap<String, i32> {
-        let mut counts: BTreeMap<String, i32> = RISK_VALUES
-            .iter()
-            .map(|risk| ((*risk).to_string(), 0))
-            .collect();
+        let mut counts = empty_risk_counts();
         // A lens is attached once however many ways the request named it, so resolve
         // each name to its lens and count that lens's questions once.
         let attached: std::collections::BTreeSet<&str> =
             self.lenses.iter().map(|lens| lens_alias(lens)).collect();
         for lens in attached {
-            for question in lens_questions(lens) {
-                let risk = match self.answer(lens, question.question_id) {
-                    Some(answer) => answer.risk(),
-                    None => RISK_UNANSWERED,
-                };
+            for (risk, count) in self.lens_risk_counts(lens) {
                 counts
-                    .entry(risk.to_string())
-                    .and_modify(|count| *count = count.saturating_add(1))
-                    .or_insert(1);
+                    .entry(risk)
+                    .and_modify(|total| *total = total.saturating_add(count))
+                    .or_insert(count);
             }
+        }
+        counts
+    }
+
+    /// The risk roll-up of ONE lens review of this workload: the same buckets as
+    /// [`Self::risk_counts`], counted over the questions that ONE lens asks rather than
+    /// over every attached lens's.
+    ///
+    /// `lens` is a lens as a request names it (an alias or an ARN). A lens this emulator
+    /// holds no question set for asks nothing ([`lens_questions`]), so every bucket is 0.
+    pub fn lens_risk_counts(&self, lens: &str) -> BTreeMap<String, i32> {
+        self.risk_counts_over(lens, lens_questions(lens).iter())
+    }
+
+    /// The risk roll-up of ONE pillar of one lens review: [`Self::lens_risk_counts`]
+    /// narrowed to the questions that pillar asks, which is what a pillar review summary
+    /// of a lens review reports.
+    pub fn pillar_risk_counts(&self, lens: &str, pillar_id: &str) -> BTreeMap<String, i32> {
+        self.risk_counts_over(
+            lens,
+            lens_questions(lens)
+                .iter()
+                .filter(|question| question.pillar_id == pillar_id),
+        )
+    }
+
+    /// The risk roll-up over an arbitrary set of ONE lens's questions — the one place a
+    /// risk is counted, so the workload's roll-up, a lens review's and a pillar's cannot
+    /// disagree about what a question counts as.
+    fn risk_counts_over<'question>(
+        &self,
+        lens: &str,
+        questions: impl Iterator<Item = &'question FrameworkQuestion>,
+    ) -> BTreeMap<String, i32> {
+        let mut counts = empty_risk_counts();
+        for question in questions {
+            let risk = match self.answer(lens, question.question_id) {
+                Some(answer) => answer.risk(),
+                None => RISK_UNANSWERED,
+            };
+            counts
+                .entry(risk.to_string())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
         }
         counts
     }
@@ -682,7 +756,18 @@ impl WorkloadRecord {
     }
 }
 
-fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32> {
+/// A risk roll-up with one entry for every `Risk` the enum publishes, all zero: what
+/// every roll-up here starts from, so a caller that reads a bucket to report review
+/// progress always finds it.
+fn empty_risk_counts() -> BTreeMap<String, i32> {
+    RISK_VALUES
+        .iter()
+        .map(|risk| ((*risk).to_string(), 0))
+        .collect()
+}
+
+/// A risk roll-up as the modelled `RiskCounts` map a response carries.
+pub fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32> {
     counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
 }
 
@@ -1332,8 +1417,52 @@ pub fn official_lens_arn(region: &str, lens: &str) -> String {
 pub fn default_pillar_priorities() -> Vec<String> {
     FRAMEWORK_LENS_PILLARS
         .iter()
-        .map(|(pillar_id, _)| (*pillar_id).to_string())
+        .map(|(pillar_id, _, _)| (*pillar_id).to_string())
         .collect()
+}
+
+/// The pillars the named lens is organized into, in the lens's own order, each with its
+/// `PillarName` — the pillar half of [`lens_questions`].
+///
+/// Only the AWS-official Well-Architected Framework lens has content here
+/// ([`FRAMEWORK_LENS_PILLARS`]); any other lens carries no question set in this emulator
+/// yet (see [`lens_questions`] for why), so it is organized into no pillars.
+pub fn lens_pillars(lens: &str) -> &'static [(&'static str, &'static str, usize)] {
+    if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
+        FRAMEWORK_LENS_PILLARS
+    } else {
+        &[]
+    }
+}
+
+/// What this emulator knows ABOUT a lens, as a lens review reports it: the members that
+/// describe the LENS itself rather than the answers recorded against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LensMetadata {
+    /// `LensReview$LensName`.
+    pub name: &'static str,
+    /// `LensReview$LensVersion`.
+    pub version: &'static str,
+    /// `LensReview$LensStatus`.
+    pub status: &'static str,
+}
+
+/// The named lens's own metadata, when this emulator holds that lens's content.
+///
+/// `None` for any lens but the AWS-official framework lens: a lens's name, version and
+/// status are lens CONTENT, and this emulator ships one lens definition (see
+/// [`lens_questions`] for why), so for another lens there is nothing to report and the
+/// optional members are omitted rather than guessed at.
+pub fn lens_metadata(lens: &str) -> Option<LensMetadata> {
+    if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
+        Some(LensMetadata {
+            name: FRAMEWORK_LENS_NAME,
+            version: FRAMEWORK_LENS_VERSION,
+            status: LENS_STATUS_CURRENT,
+        })
+    } else {
+        None
+    }
 }
 
 /// What a `CreateWorkload` idempotency token resolves to: the workload the original
@@ -1596,6 +1725,23 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     pub fn lens_by_alias(&self, alias: &str) -> Option<&LensRecord> {
         let record = self.lenses.get(lens_alias(alias))?;
         alias_names_lens(alias, record).then_some(record)
+    }
+
+    /// The `LensArn` the lens a request named is reported by, in the Region the request
+    /// was signed for.
+    ///
+    /// An AWS-official lens's ARN carries no owner account and is built from the alias
+    /// ([`official_lens_arn`]), while a custom lens's is the one its import minted and
+    /// this store holds. A custom lens this store does not hold is reported by the ARN
+    /// the caller named it with: a custom lens cannot be reviewed until
+    /// `CreateLensVersion` publishes it — its own stub — so this emulator has no other
+    /// ARN for it.
+    pub fn lens_arn_of(&self, lens: &str, region: &str) -> String {
+        if is_aws_official_lens(lens) {
+            return official_lens_arn(region, lens);
+        }
+        self.lens_by_alias(lens)
+            .map_or_else(|| lens.to_string(), |record| record.lens_arn.clone())
     }
 
     /// [`Self::lens_by_alias`] for a caller that is about to write to the lens.

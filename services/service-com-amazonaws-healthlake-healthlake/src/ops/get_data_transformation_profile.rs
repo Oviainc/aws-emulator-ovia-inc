@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataTransformationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataTransformationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataTransformationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one version of a stored data transformation profile: the version the
+//! caller named, the DRAFT at version 0, or — when the caller names none — the
+//! latest version published from that DRAFT. A reporting operation: it reads
+//! [`crate::state`] and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataTransformationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataTransformationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataTransformationProfile"))
+        // This operation reports; `ctx` carries nothing it needs, because a profile
+        // version is the same for every caller.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDataTransformationProfileErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the HealthLake data transformation profile registry is unavailable"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A read: the handler only reads under the lock and writes nothing, so
+        // what a later caller sees is exactly what this one saw.
+        let store = state.lock();
+        let Some(profile) = store.profiles.get(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
+
+        // "Specify 0 to retrieve the DRAFT version. If you omit this parameter, the
+        // service returns the latest published version" — and a profile that has
+        // never been published has no latest published version to return.
+        let version = match input.profile_version {
+            Some(version) => profile.version(version),
+            None => profile.latest_published(),
+        };
+        let Some(version) = version else {
+            return Err(not_found(crate::state::PROFILE_VERSION_NOT_FOUND_MESSAGE));
+        };
+
+        Ok(GetDataTransformationProfileOutput {
+            profile_id: profile.id.clone(),
+            version: version.version,
+            source_format: profile.source_format.clone(),
+            target_format: profile.target_format.clone(),
+            profile_mapping: version.profile_mapping(),
+            profile_name: Some(profile.name.clone()),
+            profile_description: profile.description.clone(),
+            change_description: version.change_description.clone(),
+            last_updated_at: version.last_updated_at,
+        })
     }
+}
+
+/// This operation's 404, worded without quoting the requested identifier — the
+/// wording this service's not-found text uses.
+fn not_found(message: &str) -> GetDataTransformationProfileError {
+    GetDataTransformationProfileErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
 }

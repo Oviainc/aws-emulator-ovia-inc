@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVpcAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVpcAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVpcAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets one attribute of one VPC in this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::vpc_attributes`]), where
+//! `DescribeVpcAttribute` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +151,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVpcAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVpcAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVpcAttribute"))
+        use crate::state;
+
+        // "You cannot modify the DNS resolution and DNS hostnames attributes in the same
+        // request. Use separate requests for each attribute"
+        // (`ModifyVpcAttributeRequest$EnableDnsSupport` and `$EnableDnsHostnames`).
+        if input.enable_dns_support.is_some() && input.enable_dns_hostnames.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "You cannot modify enableDnsSupport and enableDnsHostnames in the same \
+                 request. Use separate requests for each attribute.",
+            ));
+        }
+        // Every member of this request names one attribute to set, so the request itself
+        // is the list of modifications to apply.
+        let requested: Vec<(&str, bool)> = [
+            (
+                state::VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT,
+                input.enable_dns_support.as_ref(),
+            ),
+            (
+                state::VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES,
+                input.enable_dns_hostnames.as_ref(),
+            ),
+            (
+                state::VPC_ATTRIBUTE_ENABLE_NETWORK_ADDRESS_USAGE_METRICS,
+                input.enable_network_address_usage_metrics.as_ref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, member)| member.map(|member| (name, member)))
+        // An `AttributeBooleanValue` carries one optional `Value`: an attribute named
+        // without one says nothing about what to set it to.
+        .map(|(name, member)| {
+            member.value.map(|value| (name, value)).ok_or_else(|| {
+                state::missing_parameter(format!("The parameter {name} must have a value"))
+            })
+        })
+        .collect::<Result<_, Self::Error>>()?;
+        if requested.is_empty() {
+            return Err(state::missing_parameter(format!(
+                "The request must name an attribute to modify: {support}, {hostnames} or \
+                 {metrics}",
+                support = state::VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT,
+                hostnames = state::VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES,
+                metrics = state::VPC_ATTRIBUTE_ENABLE_NETWORK_ADDRESS_USAGE_METRICS,
+            )));
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+        // The attributes as they stand, which is also the answer to "does this VPC
+        // exist?" — the store holds one entry per VPC it holds.
+        let Some(mut attributes) = store.vpc_attributes_of(&input.vpc_id) else {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        };
+
+        for (name, value) in &requested {
+            match *name {
+                state::VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT => attributes.enable_dns_support = *value,
+                state::VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES => {
+                    // "You can only enable DNS hostnames if you've enabled DNS support"
+                    // (`ModifyVpcAttributeRequest$EnableDnsHostnames`).
+                    if *value && !attributes.enable_dns_support {
+                        return Err(state::invalid_parameter_combination(format!(
+                            "You cannot enable {hostnames} for VPC '{vpc}' while \
+                             {support} is disabled for it",
+                            hostnames = state::VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES,
+                            support = state::VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT,
+                            vpc = input.vpc_id,
+                        )));
+                    }
+                    attributes.enable_dns_hostnames = *value;
+                }
+                state::VPC_ATTRIBUTE_ENABLE_NETWORK_ADDRESS_USAGE_METRICS => {
+                    attributes.enable_network_address_usage_metrics = *value;
+                }
+                // The three arms above are every `VpcAttributeName` member, and the list
+                // is built from this request's own members, so nothing else reaches here.
+                other => {
+                    return Err(state::internal_error(format!(
+                        "'{other}' is not an attribute of a VPC"
+                    )))
+                }
+            }
+        }
+
+        // One write, after every refusal: a request this operation refuses leaves the
+        // VPC's attributes exactly as they were.
+        store
+            .vpc_attributes
+            .insert(input.vpc_id.clone(), attributes);
+        Ok(ModifyVpcAttributeOutput)
     }
 }

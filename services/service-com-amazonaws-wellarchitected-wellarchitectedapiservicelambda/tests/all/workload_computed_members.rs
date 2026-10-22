@@ -142,7 +142,7 @@ async fn risk_roll_up_counts_the_questions_of_the_attached_lenses() {
 async fn the_framework_lens_catalog_matches_its_published_question_numbering() {
     let total: usize = state::FRAMEWORK_LENS_PILLARS
         .iter()
-        .map(|(_, count)| *count)
+        .map(|(_, _, count)| *count)
         .sum();
     assert_eq!(
         i64::try_from(total).unwrap_or(-1),
@@ -158,8 +158,8 @@ async fn the_framework_lens_catalog_matches_its_published_question_numbering() {
     assert_eq!(
         state::FRAMEWORK_LENS_PILLARS
             .iter()
-            .find(|(pillar, _)| *pillar == "sustainability")
-            .map(|(_, count)| *count),
+            .find(|(pillar, _, _)| *pillar == "sustainability")
+            .map(|(_, _, count)| *count),
         Some(6),
         "the sustainability pillar asks SUS 1-6, catalog says {:?}",
         state::FRAMEWORK_LENS_PILLARS

@@ -11,6 +11,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::{
+    AnswerRecord, ChoiceAnswerRecord,
+};
+
 /// A client over one emulator: one engine, one mounted service, so every request in a
 /// test observes the state the previous one wrote.
 pub(crate) struct Client {
@@ -356,6 +360,49 @@ pub(crate) fn encode_path_segment(value: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
+}
+
+/// An `AnswerRecord` that records `selected` as the best practices in place, `choices` as
+/// the status of each choice it speaks about, whether the question applies and the reason
+/// it does not — the one answer builder the suites in this crate share.
+pub(crate) fn answered(
+    selected: &[&str],
+    choices: &[(&str, &str)],
+    is_applicable: bool,
+    reason: Option<&str>,
+) -> AnswerRecord {
+    AnswerRecord {
+        selected_choices: selected.iter().map(ToString::to_string).collect(),
+        choice_answers: choices
+            .iter()
+            .map(|(choice_id, status)| {
+                (
+                    (*choice_id).to_string(),
+                    ChoiceAnswerRecord {
+                        status: (*status).to_string(),
+                        reason: None,
+                    },
+                )
+            })
+            .collect(),
+        is_applicable,
+        reason: reason.map(ToString::to_string),
+    }
+}
+
+/// The ARN an AWS-OFFICIAL lens carries: "the lens ARN, such as
+/// `arn:aws:wellarchitected:us-east-1::lens/serverless`" (`LensAlias` doc) — the account
+/// segment is EMPTY, because AWS publishes the lens rather than an account owning it.
+/// Spelled out here (rather than read back out of the code under test) with the account
+/// placeholder taken from the emulator's one source of truth, so a caller would fail if
+/// an owner account appeared in it.
+pub(crate) fn official_lens_arn(region: &str, alias: &str) -> String {
+    let arn = format!("arn:aws:wellarchitected:{region}::lens/{alias}");
+    assert!(
+        !arn.contains(engine::emulator_account_id()),
+        "an AWS-official lens ARN names no owner account, got {arn:?}"
+    );
+    arn
 }
 
 /// A minimal valid `CreateWorkload` request; callers override the members their case

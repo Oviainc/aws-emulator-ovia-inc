@@ -350,8 +350,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 SearchNearbyResultItem {
                     place_id: place.place_id.clone(),
                     place_type: place.place_type.clone(),
-                    title: place.title.clone(),
-                    address: Some(place.address.to_modeled()),
+                    title: place.title_modeled(),
+                    address: Some(place.address_modeled()),
                     position: Some(place.position_modeled()),
                     distance: candidate.distance,
                     map_view: Some(place.map_view_modeled()),
