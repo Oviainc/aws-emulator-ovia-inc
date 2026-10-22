@@ -27,10 +27,74 @@
 //! could disagree. For the same reason `resourcesAggregates` is never stored:
 //! [`aggregates_for`](ComAmazonawsTrustedadvisorTrustedadvisorState::aggregates_for)
 //! counts the recommendation's own resources on every read.
+//!
+//! Beside the three maps the store holds the calling account's
+//! [`SupportPlan`] — the whole input to the support-level authorization stage
+//! [`support_level_refusal`], which every operation applies before it resolves
+//! an identifier or writes anything. An operation whose input names an AWS
+//! resource in ANOTHER account answers for that resource first
+//! ([`foreign_resource_refusal`]): no support plan grants an account access to
+//! another account's resources.
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::RecommendationResourcesAggregates;
+use crate::ops::types::{AccessDeniedException, RecommendationResourcesAggregates};
+
+/// What this service answers a caller whose account's support plan does not
+/// include the Trusted Advisor API: the support-level gate's refusal, carried by
+/// the modelled `AccessDeniedException` — HTTP 403, documented "Exception that
+/// access has been denied due to insufficient access"
+/// (`smithy_query(query="doc",shape="AccessDeniedException")`).
+///
+/// The gate is an account-level authorization stage, not a per-request
+/// computation, so its wording is ONE fixed sentence rather than something built
+/// from the request: what a client branches on is the 403 and the
+/// `AccessDeniedException` code, and this is the sentence the service states them
+/// with.
+pub const ACCESS_DENIED_SUPPORT_LEVEL: &str = "Access denied due to support level";
+
+/// The AWS Support plan an account holds — what decides whether the Trusted
+/// Advisor API answers that account at all.
+///
+/// The five plans AWS offers (AWS Support plans: Basic, Developer, Business,
+/// Enterprise On-Ramp, Enterprise). `Basic` is what an account holds until it
+/// subscribes to one of the others, and no modelled operation of this service
+/// reads or changes the plan — it is an account property, not a resource of this
+/// API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportPlan {
+    Basic,
+    Developer,
+    Business,
+    EnterpriseOnRamp,
+    Enterprise,
+}
+
+impl SupportPlan {
+    /// Every plan, in the order AWS publishes them (least to most support), so
+    /// anything that spans "every plan" reads the set from here rather than
+    /// writing it out again.
+    pub const ALL: &'static [Self] = &[
+        Self::Basic,
+        Self::Developer,
+        Self::Business,
+        Self::EnterpriseOnRamp,
+        Self::Enterprise,
+    ];
+
+    /// Whether this plan's entitlement covers the Trusted Advisor API.
+    ///
+    /// AWS states the requirement for the API as a whole — a Business,
+    /// Enterprise On-Ramp or Enterprise Support plan is required to use the
+    /// Trusted Advisor API — so an account on Basic or Developer is refused
+    /// whatever it asks for, and no operation of this service is exempt.
+    pub fn includes_trusted_advisor_api(self) -> bool {
+        matches!(
+            self,
+            Self::Business | Self::EnterpriseOnRamp | Self::Enterprise
+        )
+    }
+}
 
 /// The `ExclusionStatus` value a resource carries unless a caller excluded it.
 /// `RecommendationResourceSummary$exclusionStatus` declares
@@ -186,9 +250,38 @@ pub struct ComAmazonawsTrustedadvisorTrustedadvisorState {
     pub recommendations: BTreeMap<String, RecommendationEntry>,
     /// Keyed by recommendation-resource ARN.
     pub recommendation_resources: BTreeMap<String, ResourceEntry>,
+    /// The AWS Support plan the calling account holds — the whole input to the
+    /// support-level gate [`support_level_refusal`] applies ahead of every
+    /// operation.
+    ///
+    /// [`SupportPlan::Basic`] at state init, and deliberately so: a support
+    /// subscription is a property of an account that this API cannot establish —
+    /// it models no operation that reads, buys or changes a plan — so no caller
+    /// is entitled until something outside the API records one. Seeding an
+    /// entitled plan here would make the gate unobservable, which is the defect
+    /// this field exists to close.
+    support_plan: SupportPlan,
 }
 
 impl ComAmazonawsTrustedadvisorTrustedadvisorState {
+    /// The support plan the calling account holds, which is what the gate admits
+    /// a request on.
+    pub fn support_plan(&self) -> SupportPlan {
+        self.support_plan
+    }
+
+    /// Record the support plan of the calling account, so the gate admits — or
+    /// goes on refusing — its requests.
+    ///
+    /// No modelled operation reaches this: the Trusted Advisor API has none that
+    /// subscribes an account to a support plan, so a plan arrives from OUTSIDE
+    /// the API — which in this emulator means an in-process caller holding the
+    /// shared engine (a test standing in for a subscribed account). Nothing on
+    /// the wire can grant itself the entitlement.
+    pub fn set_support_plan(&mut self, plan: SupportPlan) {
+        self.support_plan = plan;
+    }
+
     /// The resources of one recommendation, in ARN order.
     ///
     /// A RANGE over the resource map, not a scan of it: every resource of a
@@ -599,6 +692,7 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
             checks: BTreeMap::new(),
             recommendations: BTreeMap::new(),
             recommendation_resources: BTreeMap::new(),
+            support_plan: SupportPlan::Basic,
         };
         for (index, row) in SEED.iter().enumerate() {
             let recommendation_id = format!("{}-recommendation", row.check_id);
@@ -669,6 +763,59 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
         }
         state
     }
+}
+
+/// The support-level gate: `Some(..)` when the calling account's support plan
+/// does not include the Trusted Advisor API, so the request must be refused with
+/// the modelled `AccessDeniedException` (HTTP 403) instead of being served.
+///
+/// Every operation applies this BEFORE it resolves an identifier and before it
+/// writes anything, so an unentitled caller learns it lacks access rather than
+/// whether a recommendation exists, and a mutation it may not make changes
+/// nothing. The modelled constraints are refused earlier still, by the
+/// centralized request walk, so a malformed request is a `ValidationException`
+/// whether the caller is entitled or not.
+///
+/// The emulator presents exactly one account (`engine::EMULATOR_ACCOUNT_ID`), so
+/// that is the account every request is made from and the only one the gate can
+/// be asked about. A store that cannot be reached answers `None` — unknown is
+/// not "denied", and the handler's own store check turns it into the modelled
+/// server error.
+pub fn support_level_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<AccessDeniedException> {
+    let state = service_state(engine)?;
+    let entitled = state.lock().support_plan().includes_trusted_advisor_api();
+    (!entitled).then(|| AccessDeniedException {
+        message: ACCESS_DENIED_SUPPORT_LEVEL.to_string(),
+    })
+}
+
+/// The account segment of an AWS resource ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for a
+/// string with fewer segments than that. The segment is EMPTY for a resource type
+/// whose ARNs carry no account (an S3 bucket, a Trusted Advisor check), which is
+/// not another account's resource.
+pub fn arn_account(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4)
+}
+
+/// The resource-authorization refusal: `Some(..)` when `aws_resource_arn` names a
+/// resource in an account other than the caller's, so the request is refused for
+/// THAT resource — 403 `AccessDeniedException`, whatever the caller's support
+/// plan, because no support plan grants an account access to another account's
+/// resources.
+///
+/// The message is built from the request: it names the resource that was refused,
+/// which is the only thing the service knows about the refusal and the only way a
+/// caller passing several ARNs learns which one was denied.
+pub fn foreign_resource_refusal(aws_resource_arn: &str) -> Option<AccessDeniedException> {
+    let account = arn_account(aws_resource_arn)?;
+    (!account.is_empty() && account != ::engine::emulator_account_id()).then(|| {
+        AccessDeniedException {
+            message: format!("Access denied to resource: {aws_resource_arn}"),
+        }
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

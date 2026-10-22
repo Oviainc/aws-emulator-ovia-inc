@@ -23,17 +23,23 @@
 //! The expected catalog below is written out by hand (its source is the seed in
 //! `src/state.rs`), so a response is compared against stated values rather than
 //! against the store it came from.
+//!
+//! Every call here is made as an account whose support plan includes the Trusted
+//! Advisor API: the service refuses every request from an account whose plan does
+//! not, ahead of each handler, and that gate is pinned in
+//! `tests/all/support_level_gate.rs`.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_trustedadvisor_trustedadvisor::state::{service_state, SupportPlan};
 use service_com_amazonaws_trustedadvisor_trustedadvisor::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A SigV4 `Authorization` header whose credential scope names this service, so
 /// the router's `can_handle` claims the request. Request authentication is off
 /// in these tests, so the signature itself is never verified.
-const SIGV4: &str = "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR0000000/20260101/us-east-1/\
+pub(crate) const SIGV4: &str = "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR0000000/20260101/us-east-1/\
                      trustedadvisor/aws4_request, SignedHeaders=host, Signature=00";
 
 /// The seeded check ids, in the order the store keys them (check id order).
@@ -46,22 +52,59 @@ const CHECK_IDS: &[&str] = &[
 
 /// A mounted emulator with its own engine, so each test starts from the seeded
 /// store and sees only its own writes.
+///
+/// The account is put on a support plan that includes the Trusted Advisor API:
+/// the service's support-level gate refuses EVERY request from an account whose
+/// plan does not, and no operation changes a plan (the API models none), so the
+/// plan is recorded in process here. The gate itself is pinned in
+/// `tests/all/support_level_gate.rs`.
 fn emulator() -> MultiServiceRouter {
+    emulator_on_plan(SupportPlan::Business).0
+}
+
+/// A mounted emulator whose account holds `plan`, together with the engine it
+/// was built on so a caller can move that plan and watch the gate's answer
+/// change over one store.
+pub(crate) fn emulator_on_plan(plan: SupportPlan) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
+{
     let engine = Arc::new(engine::InMemoryEngine::new());
+    set_support_plan(&engine, plan);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// Put the emulator's account on `plan`, the way something outside the API would
+/// (nothing on the wire changes a support plan).
+pub(crate) fn set_support_plan(engine: &engine::InMemoryEngine, plan: SupportPlan) {
+    service_state(engine)
+        .expect("the in-memory engine carries this service's state")
+        .lock()
+        .set_support_plan(plan);
 }
 
 /// Drive one request through the router and read its status and JSON body (a
 /// `Unit` output answers 200 with an empty body, reported as `Value::Null`).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path_and_query: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    let (status, _errortype, json) = dispatch(router, method, path_and_query, body).await;
+    (status, json)
+}
+
+/// Drive one request through the router and read its status, the
+/// `x-amzn-errortype` header restJson1 resolves an error SHAPE from, and its
+/// JSON body.
+pub(crate) async fn dispatch(
+    router: &MultiServiceRouter,
+    method: &str,
+    path_and_query: &str,
+    body: Option<Value>,
+) -> (u16, Option<String>, Value) {
     let payload = body.map_or_else(bytes::Bytes::new, |value| {
         bytes::Bytes::from(serde_json::to_vec(&value).expect("a serializable request body"))
     });
@@ -76,13 +119,18 @@ async fn call(
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let errortype = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let bytes = response.into_body();
     let json = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).expect("a JSON response body")
     };
-    (status, json)
+    (status, errortype, json)
 }
 
 /// One ARN or `nextToken` as it goes into a request URI, path label or query
@@ -97,7 +145,7 @@ async fn call(
 /// other byte either alphabet can hold is already safe in both positions. `%`
 /// itself is escaped first so the function stays total on input outside those
 /// alphabets; there is no general escaping rule to implement here.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value
         .replace('%', "%25")
         .replace('/', "%2F")
@@ -114,7 +162,7 @@ fn check_arn(check_id: &str) -> String {
 /// `arn:aws:trustedadvisor::<account>:recommendation/<id>` — the ARN pattern
 /// `AccountRecommendationArn` declares. Each seeded check produced the
 /// recommendation `<check id>-recommendation`.
-fn recommendation_arn(check_id: &str) -> String {
+pub(crate) fn recommendation_arn(check_id: &str) -> String {
     format!(
         "arn:aws:trustedadvisor::{}:recommendation/{check_id}-recommendation",
         engine::EMULATOR_ACCOUNT_ID
@@ -123,7 +171,7 @@ fn recommendation_arn(check_id: &str) -> String {
 
 /// `arn:aws:trustedadvisor::<account>:recommendation-resource/<rec>/<resource>`
 /// — the ARN pattern `RecommendationResourceArn` declares.
-fn resource_arn(check_id: &str, resource_id: &str) -> String {
+pub(crate) fn resource_arn(check_id: &str, resource_id: &str) -> String {
     format!(
         "arn:aws:trustedadvisor::{}:recommendation-resource/{check_id}-recommendation/{resource_id}",
         engine::EMULATOR_ACCOUNT_ID
@@ -147,7 +195,7 @@ fn field_of_each(body: &Value, list: &str, field: &str) -> Vec<String> {
 
 /// The wire error code of a failure response (`__type`, which restJson1 carries
 /// in the error body).
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body["__type"]
         .as_str()
         .unwrap_or_else(|| panic!("error body carries no __type: {body}"))

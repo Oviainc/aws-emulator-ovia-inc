@@ -15,3 +15,5 @@
 mod recommendation_loop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support_level_gate.rs"]
+mod support_level_gate;

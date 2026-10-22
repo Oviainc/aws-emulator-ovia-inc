@@ -177,6 +177,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; this operation reads nothing from it.
         let _ = ctx;
+        // The support-level gate, ahead of everything else this handler does —
+        // ahead of applying any exclusion, so a batch this account may not make
+        // changes nothing and reports nothing about which resources exist. See
+        // [`crate::state::support_level_refusal`].
+        if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
+            return Err(
+                BatchUpdateRecommendationResourceExclusionErrorModeled::AccessDeniedException(
+                    denied,
+                )
+                .into(),
+            );
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 BatchUpdateRecommendationResourceExclusionErrorModeled::InternalServerException(

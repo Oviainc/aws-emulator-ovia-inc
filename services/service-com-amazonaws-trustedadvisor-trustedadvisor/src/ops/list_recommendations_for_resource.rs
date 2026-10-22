@@ -164,6 +164,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
         let _ = (&input, ctx, &self.engine);
+        // This operation's input names an ARBITRARY AWS resource, so the resource it
+        // targets is authorized FIRST: an ARN in another account is refused for that
+        // resource, whatever the caller's support plan, because no plan grants an
+        // account access to another account's resources. See
+        // [`crate::state::foreign_resource_refusal`].
+        if let Some(denied) = crate::state::foreign_resource_refusal(&input.aws_resource_arn) {
+            return Err(
+                ListRecommendationsForResourceErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+        // The support-level gate is a service-wide stage, so it sits ahead of this
+        // (unwritten) body too: a caller whose account's support plan does not include
+        // the Trusted Advisor API is refused with the modelled `AccessDeniedException`,
+        // which is the WHOLE answer the service gives such a request — no unimplemented
+        // behaviour is involved. An entitled caller still gets the 501 below. See
+        // [`crate::state::support_level_refusal`].
+        if let Some(denied) = crate::state::support_level_refusal(&*self.engine) {
+            return Err(
+                ListRecommendationsForResourceErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
         // Implement `ListRecommendationsForResource` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(ListRecommendationsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
