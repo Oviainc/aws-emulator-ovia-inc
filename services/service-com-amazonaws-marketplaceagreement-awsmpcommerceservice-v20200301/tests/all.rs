@@ -15,3 +15,5 @@
 mod agreement_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_envelope.rs"]
+mod validation_envelope;

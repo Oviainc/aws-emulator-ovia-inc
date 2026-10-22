@@ -39,11 +39,186 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## How a refused request is stated
+//!
+//! This service models its own `ValidationException`, and that shape carries
+//! `reason` (a `ValidationExceptionReason`) and `fields` (entries of
+//! `{name, message}`) beside `message`. The framework validates every modelled
+//! constraint — `DescribeAgreementInput$agreementId` has a pattern and a length,
+//! `MaxResults` a range, `FilterList` a length, … — BEFORE any handler runs, and
+//! renders a violation in the protocol's generic refusal body, which carries
+//! `message` alone: `Service::override_refusal` chooses only a code and a
+//! message, so the modelled members cannot be stated through it at all.
+//!
+//! [`ModelledValidation`] is therefore interposed in front of EVERY modelled
+//! operation: it reads the violations the boundary walk would find and, when
+//! there are any, answers them as this service's own `ValidationException`
+//! through [`crate::state::validation_exception_for`] — the same rendering the
+//! handlers' own refusals use, so one refused member reads alike wherever it was
+//! found. A request with no violation is handed to the generated walk unchanged.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused, Service,
+    Violation,
 };
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+/// The wire error code (`__type`) and HTTP status this service's modelled
+/// `ValidationException` carries (`smithy_query(query="shape",
+/// shape="ValidationException")`: `errorKind=client`, `httpError=400`).
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+/// See [`VALIDATION_EXCEPTION_CODE`].
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// Serves one modelled operation, stating a refused input in this service's own
+/// modelled `ValidationException` instead of the framework's generic refusal
+/// body.
+///
+/// WHY this is a seam and not a line in each handler: the boundary walk refuses a
+/// request BEFORE `handle` runs, and the only seam it offers
+/// (`Service::override_refusal` -> `Refused`) carries a code and a message —
+/// there is nowhere in it to put the modelled `reason` and `fields`. So the
+/// violations are read here, where they are still structured, and rendered
+/// through [`crate::state::validation_exception_for`].
+///
+/// Generic over the OPERATION, so the same wrapper serves every one of them and
+/// nothing about a particular operation's input is spelled out here: the schema
+/// it validates against and the routing key it delegates under are read off the
+/// operation's own `impl Operation`.
+struct ModelledValidation<Op> {
+    /// The operation this wrapper fronts. `fn() -> Op` rather than `Op`, so the
+    /// wrapper is `Send + Sync` for the operation's sake alone and owns nothing.
+    operation: PhantomData<fn() -> Op>,
+}
+
+impl<Op: Operation> ModelledValidation<Op> {
+    const fn new() -> Self {
+        Self {
+            operation: PhantomData,
+        }
+    }
+
+    /// The violations in `req`, read the way the framework's own walk reads them:
+    /// deserialize the input against the operation's schema, then validate the
+    /// built value against it. `None` means the request carries no structured
+    /// refusal — either it is valid, or it failed in a way that has no
+    /// member-level form (a body the codec cannot read at all), which the
+    /// generated walk renders itself.
+    fn violations(
+        protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Option<Vec<Violation>> {
+        let schema = Op::INPUT_SCHEMA;
+        let error = match protocol.deserialize_input(req, schema) {
+            Ok(mut deser) => match <Op::Input as DeserializableStruct>::deserialize(&mut *deser) {
+                // A built input: every modelled constraint, in one walk.
+                Ok(input) => {
+                    let violations =
+                        aws_smithy_schema_server::constraints::validate(&input, schema);
+                    return (!violations.is_empty()).then_some(violations);
+                }
+                // Absence is found while READING the request, so it arrives as a
+                // codec error; `refusal_of` gives it the same structured form a
+                // constraint violation has.
+                Err(e) => aws_smithy_schema_server::ProtocolError::Serde(e),
+            },
+            Err(e) => e,
+        };
+        match smithy_server_runtime::refusal_of(&error) {
+            Some(Refusal::Invalid(violations)) if !violations.is_empty() => Some(violations),
+            _ => None,
+        }
+    }
+}
+
+impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            let protocol = svc.definition().protocol();
+            if let Some(violations) = Self::violations(protocol, req) {
+                let refused = crate::state::validation_exception_for(&violations);
+                return protocol
+                    .serialize_error(
+                        &refused,
+                        &crate::ops::types::SCHEMA_VALIDATION_EXCEPTION,
+                        VALIDATION_EXCEPTION_CODE,
+                        VALIDATION_EXCEPTION_STATUS,
+                    )
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e));
+            }
+            // Nothing to restate: run the generated deserialize -> validate ->
+            // handle -> serialize walk. Reached through the routing table rather
+            // than through `override_operation`, which would route straight back
+            // here. The walk reads and validates the body again — the price of
+            // answering a refusal in the modelled shape, paid once per request on
+            // a body the transport has already bounded.
+            match svc.definition().routing_table().get(Op::NAME) {
+                Some(op) => op.run(svc, req, ctx).await,
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+}
+
+/// One [`ModelledValidation`] per modelled operation, keyed by the routing key
+/// the model names that operation by.
+///
+/// EVERY operation is wrapped: `ValidationException` is a service-common error
+/// (`smithy_query(query="digest")` lists it under `common_errors`), so a refused
+/// input is stated in the modelled envelope whichever operation the request
+/// named — not only the ones whose refusals happen to have been observed.
+macro_rules! modelled_validation_table {
+    ($($module:ident :: $operation:ident),* $(,)?) => {
+        fn modelled_validation_table<Eng: Send + Sync + 'static>()
+            -> HashMap<&'static str, Box<dyn ErasedOperation>>
+        {
+            let mut table: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+            $(
+                table.insert(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(ModelledValidation::<crate::ops::$module::$operation<Eng>>::new()),
+                );
+            )*
+            table
+        }
+    };
+}
+
+modelled_validation_table!(
+    accept_agreement_cancellation_request::AcceptAgreementCancellationRequest,
+    accept_agreement_payment_request::AcceptAgreementPaymentRequest,
+    accept_agreement_request::AcceptAgreementRequest,
+    batch_create_billing_adjustment_request::BatchCreateBillingAdjustmentRequest,
+    cancel_agreement::CancelAgreement,
+    cancel_agreement_cancellation_request::CancelAgreementCancellationRequest,
+    cancel_agreement_payment_request::CancelAgreementPaymentRequest,
+    create_agreement_request::CreateAgreementRequest,
+    describe_agreement::DescribeAgreement,
+    get_agreement_cancellation_request::GetAgreementCancellationRequest,
+    get_agreement_entitlements::GetAgreementEntitlements,
+    get_agreement_payment_request::GetAgreementPaymentRequest,
+    get_agreement_terms::GetAgreementTerms,
+    get_billing_adjustment_request::GetBillingAdjustmentRequest,
+    list_agreement_cancellation_requests::ListAgreementCancellationRequests,
+    list_agreement_charges::ListAgreementCharges,
+    list_agreement_invoice_line_items::ListAgreementInvoiceLineItems,
+    list_agreement_payment_requests::ListAgreementPaymentRequests,
+    list_billing_adjustment_requests::ListBillingAdjustmentRequests,
+    reject_agreement_cancellation_request::RejectAgreementCancellationRequest,
+    reject_agreement_payment_request::RejectAgreementPaymentRequest,
+    search_agreements::SearchAgreements,
+    send_agreement_cancellation_request::SendAgreementCancellationRequest,
+    send_agreement_payment_request::SendAgreementPaymentRequest,
+    update_purchase_orders::UpdatePurchaseOrders,
+);
 
 /// The `com-amazonaws-marketplaceagreement-awsmpcommerceservice-v20200301` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +227,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// States a refused input in this service's own modelled
+    /// `ValidationException`, one entry per modelled operation; see
+    /// [`ModelledValidation`].
+    modelled_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +240,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            modelled_validation: modelled_validation_table::<Eng>(),
         }
     }
 }
@@ -104,24 +284,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every modelled operation is served through `ModelledValidation`, so a
+        // refused input is stated in this service's own modelled
+        // `ValidationException` — with the modelled `reason` and `fields` — rather
+        // than in the framework's generic refusal body. See that type for why it
+        // cannot be done from inside `handle`. The operation names come from the
+        // model (each operation's own `Operation::NAME`), and a request naming no
+        // modelled operation is left to the generated routing table, which refuses
+        // it.
+        let routing_key = self.definition().protocol().routing_key(req).ok()?;
+        self.modelled_validation
+            .get(routing_key)
+            .map(|wrapped| wrapped.as_ref())
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // Nothing to reword here: a refusal of a modelled constraint never reaches
+        // this seam, because `ModelledValidation` answers it BEFORE the framework
+        // renders it. The words are not the problem — the generic refusal body
+        // cannot carry the modelled `reason`/`fields` members at all, and
+        // `Refused` is only a code and a message.
         let _ = refusal;
         None
     }

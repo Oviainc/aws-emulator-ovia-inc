@@ -177,11 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(offset) => offset,
                 None => {
                     return Err(GetAgreementTermsErrorModeled::ValidationException(
-                        crate::state::validation_exception(
-                            "INVALID_NEXT_TOKEN",
-                            "nextToken",
-                            "not a token GetAgreementTerms returned for this agreement",
-                        ),
+                        crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
                     )
                     .into());
                 }
@@ -197,11 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The offset is past the end of this agreement's terms, which no
             // token this operation minted ever named.
             return Err(GetAgreementTermsErrorModeled::ValidationException(
-                crate::state::validation_exception(
-                    "INVALID_NEXT_TOKEN",
-                    "nextToken",
-                    "names a page past the end of this agreement's accepted terms",
-                ),
+                crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
             )
             .into());
         };

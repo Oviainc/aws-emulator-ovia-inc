@@ -169,15 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .sort_by
             .unwrap_or_else(|| crate::state::DEFAULT_SORT_BY.to_string());
         if !crate::state::SORT_BY_VALUES.contains(&sort_by.as_str()) {
+            // `Sort$sortBy` is a plain string in the model, so the documented
+            // value set is this service's rule rather than a modelled
+            // constraint; it is refused in the same envelope either way, naming
+            // the member inside `sort` that carried it.
             return Err(SearchAgreementsErrorModeled::ValidationException(
-                crate::state::validation_exception(
-                    "INVALID_SORT_BY",
-                    "sort.sortBy",
-                    format!(
-                        "{sort_by:?} is not one of {}",
-                        crate::state::SORT_BY_VALUES.join(", ")
-                    ),
-                ),
+                crate::state::validation_exception("INVALID_SORT_BY", "sort.sortBy"),
             )
             .into());
         }
@@ -194,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store happens to hold — including nothing at all.
         if let Err(refusal) = crate::state::validate_filters(&filters) {
             return Err(SearchAgreementsErrorModeled::ValidationException(
-                crate::state::validation_exception(refusal.reason, "filters", refusal.detail),
+                crate::state::validation_exception(refusal.reason, refusal.path),
             )
             .into());
         }
@@ -246,12 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => match crate::state::page_offset(&scope, token) {
                 Some(offset) => offset,
                 None => {
+                    // Not a token SearchAgreements returned for this same
+                    // search: a token is bound to the query it was minted for.
                     return Err(SearchAgreementsErrorModeled::ValidationException(
-                        crate::state::validation_exception(
-                            "INVALID_NEXT_TOKEN",
-                            "nextToken",
-                            "not a token SearchAgreements returned for this same search",
-                        ),
+                        crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
                     )
                     .into());
                 }
@@ -271,11 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The offset is past the end of what this search selects, which no
             // token this operation minted for it ever named.
             return Err(SearchAgreementsErrorModeled::ValidationException(
-                crate::state::validation_exception(
-                    "INVALID_NEXT_TOKEN",
-                    "nextToken",
-                    "names a page past the end of what this search selects",
-                ),
+                crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
             )
             .into());
         };

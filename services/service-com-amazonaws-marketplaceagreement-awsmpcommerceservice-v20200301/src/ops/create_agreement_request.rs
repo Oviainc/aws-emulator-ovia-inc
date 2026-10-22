@@ -192,11 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::validation_exception(
                     "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
                     "agreementProposalIdentifier",
-                    format!(
-                        "required when intent is {}, because the request has no source \
-                         agreement to take its terms from",
-                        input.intent
-                    ),
                 ),
             )
             .into());
@@ -206,15 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // non-NEW intents (i.e., AMEND or REPLACE). Don't provide this parameter
         // if the intent is NEW."
         match input.source_agreement_identifier.as_deref() {
-            Some(source) if input.intent == crate::state::INTENT_NEW => {
+            Some(_) if input.intent == crate::state::INTENT_NEW => {
                 return Err(CreateAgreementRequestErrorModeled::ValidationException(
                     crate::state::validation_exception(
                         "INVALID_SOURCE_AGREEMENT_IDENTIFIER",
                         "sourceAgreementIdentifier",
-                        format!(
-                            "must not be provided when intent is {}, but names {source}",
-                            crate::state::INTENT_NEW
-                        ),
                     ),
                 )
                 .into());
@@ -224,10 +215,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::validation_exception(
                         "MISSING_SOURCE_AGREEMENT_IDENTIFIER",
                         "sourceAgreementIdentifier",
-                        format!(
-                            "required when intent is {}, which acts upon an existing agreement",
-                            input.intent
-                        ),
                     ),
                 )
                 .into());

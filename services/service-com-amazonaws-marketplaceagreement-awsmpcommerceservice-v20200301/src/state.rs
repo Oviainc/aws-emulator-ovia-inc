@@ -686,11 +686,40 @@ pub fn accepted_term_kind(term: &AcceptedTerm) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Why a `SearchAgreements` filter was refused: the `ValidationException`
-/// `reason` to report, and the member it is about.
+/// `reason` to report, and the dotted request path of the member it is about —
+/// which element of `filters` carried it, and which member of that element.
 #[derive(Debug)]
 pub struct FilterRefusal {
     pub reason: &'static str,
-    pub detail: String,
+    pub path: String,
+}
+
+/// The dotted request path of one member of the `index`-th element of the
+/// request's `filters` list — `filters.1.member.name` for the FIRST filter's
+/// `name`.
+///
+/// Spelled through the framework's own path rule
+/// ([`::aws_smithy_schema_server::constraints::path`]), so a path this service
+/// builds for a rule the model cannot express reads exactly like one the
+/// boundary validator builds for a modelled constraint: the list member, the
+/// element's 1-based position, the step into the element, then the member of it
+/// that failed.
+fn filter_member_path(index: usize, member: &str) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[
+        path::member("filters"),
+        path::element(index + 1),
+        path::member(member),
+    ])
+}
+
+/// The dotted request path of the single value one filter carries —
+/// `filters.1.member.values.1.member`. `FilterValueList` is modelled
+/// `@length(min: 1, max: 1)`, so the offending value is always that list's
+/// first element.
+fn filter_value_path(index: usize) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[filter_member_path(index, "values"), path::element(1)])
 }
 
 /// The instant a filter value names, parsed as the RFC-3339 timestamp the
@@ -783,10 +812,10 @@ fn matches_filter(agreement: &Agreement, name: &str, value: &str) -> bool {
 /// `FilterValueList` is modelled `@length(min: 1, max: 1)`, so a filter that
 /// carries values carries exactly one; both members are optional, and a filter
 /// missing either names nothing to select on.
-fn filter_parts(filter: &Filter) -> Result<(&str, &str), FilterRefusal> {
+fn filter_parts(index: usize, filter: &Filter) -> Result<(&str, &str), FilterRefusal> {
     let name = filter.name.as_deref().ok_or_else(|| FilterRefusal {
         reason: "MISSING_FILTER_NAME",
-        detail: "every filter must name the attribute it selects on".to_string(),
+        path: filter_member_path(index, "name"),
     })?;
     let value = filter
         .values
@@ -794,7 +823,7 @@ fn filter_parts(filter: &Filter) -> Result<(&str, &str), FilterRefusal> {
         .and_then(|values| values.first())
         .ok_or_else(|| FilterRefusal {
             reason: "MISSING_FILTER_VALUES",
-            detail: format!("filter {name} must carry a value"),
+            path: filter_member_path(index, "values"),
         })?;
     Ok((name, value))
 }
@@ -802,24 +831,22 @@ fn filter_parts(filter: &Filter) -> Result<(&str, &str), FilterRefusal> {
 /// Refuse a filter list this service cannot interpret, BEFORE any agreement is
 /// scanned — so a bad filter is refused the same way whatever the store holds,
 /// including when it holds nothing.
+/// Each refusal names the element that carried the offending member and the
+/// member of it that failed, so a caller with several filters can tell WHICH one
+/// was rejected ([`filter_member_path`]).
 pub fn validate_filters(filters: &[Filter]) -> Result<(), FilterRefusal> {
-    for filter in filters {
-        let (name, value) = filter_parts(filter)?;
+    for (index, filter) in filters.iter().enumerate() {
+        let (name, value) = filter_parts(index, filter)?;
         if !SEARCH_FILTER_NAMES.contains(&name) {
             return Err(FilterRefusal {
                 reason: "INVALID_FILTER_NAME",
-                detail: format!(
-                    "filter {name:?} is not one of {}",
-                    SEARCH_FILTER_NAMES.join(", ")
-                ),
+                path: filter_member_path(index, "name"),
             });
         }
         if name == "PartyType" && !matches!(value, PARTY_TYPE_ACCEPTOR | PARTY_TYPE_PROPOSER) {
             return Err(FilterRefusal {
                 reason: "INVALID_PARTY_TYPE",
-                detail: format!(
-                    "filter PartyType accepts {PARTY_TYPE_PROPOSER} or {PARTY_TYPE_ACCEPTOR}, not {value:?}"
-                ),
+                path: filter_value_path(index),
             });
         }
         // Every `Before…`/`After…` filter selects on an instant, so its value
@@ -829,7 +856,7 @@ pub fn validate_filters(filters: &[Filter]) -> Result<(), FilterRefusal> {
         {
             return Err(FilterRefusal {
                 reason: "INVALID_FILTER_VALUES",
-                detail: format!("filter {name} needs a date and time, not {value:?}"),
+                path: filter_value_path(index),
             });
         }
     }
@@ -842,8 +869,8 @@ pub fn validate_filters(filters: &[Filter]) -> Result<(), FilterRefusal> {
 /// (`AgreementType` + `Status`, …) select. Call [`validate_filters`] first: a
 /// filter it would refuse matches nothing here.
 pub fn matches_filters(agreement: &Agreement, filters: &[Filter]) -> bool {
-    filters.iter().all(|filter| {
-        filter_parts(filter).is_ok_and(|(name, value)| matches_filter(agreement, name, value))
+    filters.iter().enumerate().all(|(index, filter)| {
+        filter_parts(index, filter).is_ok_and(|(name, value)| matches_filter(agreement, name, value))
     })
 }
 
@@ -893,25 +920,230 @@ pub fn search_scope(
 // Modelled failures
 // ---------------------------------------------------------------------------
 
-/// A `ValidationException` naming the member that was wrong and why.
+/// The `ValidationExceptionReason` for a refusal this service cannot place on a
+/// named member of the request: the modelled catch-all.
+pub const REASON_OTHER: &str = "OTHER";
+
+/// `ValidationException`'s own documentation, which is what the envelope states
+/// when the reason names no member ("The input fails to satisfy the constraints
+/// specified by the service.", `smithy_query(query="shape",
+/// shape="ValidationException")`).
+pub const VALIDATION_MESSAGE_FALLBACK: &str =
+    "The input fails to satisfy the constraints specified by the service.";
+
+/// What a `ValidationExceptionField` states about the member it names.
+///
+/// Both sentences are fixed: `name` already says WHICH member failed and
+/// `reason` says what about it was wrong, and a refusal must not echo a
+/// request-chosen value back into the response (the boundary validator caps its
+/// own echo for the same reason). So the entry states only that the member is
+/// not acceptable — invalid when it carried a value, absent when it carried
+/// none, which is the distinction `ValidationExceptionReason`'s own
+/// `INVALID_…`/`MISSING_…` pairs draw.
+pub const FIELD_INVALID: &str = "Member is invalid.";
+/// See [`FIELD_INVALID`].
+pub const FIELD_MISSING: &str = "Member must not be null.";
+
+/// How a member was wrong: it carried a value the service does not accept, or
+/// it carried none at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The member carried a value outside what is accepted.
+    Invalid,
+    /// The member was absent from the request.
+    Missing,
+}
+
+impl RefusalKind {
+    /// The `ValidationExceptionReason` prefix this kind reports under.
+    fn reason_prefix(self) -> &'static str {
+        match self {
+            Self::Invalid => "INVALID",
+            Self::Missing => "MISSING",
+        }
+    }
+
+    /// The `ValidationExceptionField$message` this kind states.
+    fn field_message(self) -> &'static str {
+        match self {
+            Self::Invalid => FIELD_INVALID,
+            Self::Missing => FIELD_MISSING,
+        }
+    }
+
+    /// The kind `reason` reports, read back off the reason a handler chose, so a
+    /// refusal raised with an explicit reason states the same field message a
+    /// refusal derived from a violation does.
+    fn of_reason(reason: &str) -> Self {
+        if reason.starts_with("MISSING_") {
+            Self::Missing
+        } else {
+            Self::Invalid
+        }
+    }
+}
+
+/// `lowerCamel` as the `SCREAMING_SNAKE` word a `ValidationExceptionReason`
+/// value is spelled in.
+fn screaming_snake(member: &str) -> String {
+    let mut out = String::with_capacity(member.len() + 4);
+    for (position, character) in member.char_indices() {
+        if character.is_uppercase() && position > 0 {
+            out.push('_');
+        }
+        out.extend(character.to_uppercase());
+    }
+    out
+}
+
+/// A container member named in the singular, which is how a reason names the
+/// element of a list (`filters` -> `FILTER_NAME`, not `FILTERS_NAME`).
+fn singular(member: &str) -> &str {
+    member.strip_suffix('s').unwrap_or(member)
+}
+
+/// The member-name segments of a dotted request path, dropping the positions and
+/// collection steps the path spells between them
+/// ([`::aws_smithy_schema_server::constraints::path`]).
+fn path_members(path: &str) -> Vec<&str> {
+    path.split('.')
+        .filter(|segment| *segment != "member" && !segment.chars().all(|c| c.is_ascii_digit()))
+        .collect()
+}
+
+/// The `ValidationExceptionReason` that names the member at `path` failing in
+/// `kind`.
+///
+/// `ValidationExceptionReason` names its members: every value is
+/// `INVALID_<MEMBER>` or `MISSING_<MEMBER>` for a member of some operation's
+/// input (`INVALID_AGREEMENT_ID`, `MISSING_FILTER_VALUES`,
+/// `INVALID_SORT_BY`, …, `smithy_query(query="shape",
+/// shape="ValidationExceptionReason")`). So the reason for a refused member is
+/// resolved FROM the member: the longest tail of the path's member names that
+/// spells a modelled value wins — which is what distinguishes the `name` of a
+/// `filters` element (`INVALID_FILTER_NAME`) from a top-level `name`
+/// (`INVALID_NAME`) — and a member no value names reports the modelled
+/// catch-all [`REASON_OTHER`].
+pub fn member_reason(path: &str, kind: RefusalKind) -> String {
+    let members = path_members(path);
+    let prefix = kind.reason_prefix();
+    for take in (1..=members.len()).rev() {
+        let tail = &members[members.len() - take..];
+        // A container is named in the singular by a reason, so both spellings
+        // are tried, the singular first: `filters.1.member.name` is
+        // `INVALID_FILTER_NAME`, while `filters` alone is `INVALID_FILTERS`.
+        for shorten_containers in [true, false] {
+            let stem: Vec<String> = tail
+                .iter()
+                .enumerate()
+                .map(|(position, member)| {
+                    let container = position + 1 < tail.len();
+                    screaming_snake(if shorten_containers && container {
+                        singular(member)
+                    } else {
+                        member
+                    })
+                })
+                .collect();
+            let candidate = format!("{prefix}_{}", stem.join("_"));
+            if crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES
+                .contains(&candidate.as_str())
+            {
+                return candidate;
+            }
+        }
+    }
+    REASON_OTHER.to_string()
+}
+
+/// The `message` a `ValidationException` carrying `reason` states.
+///
+/// One sentence per reason, built from the reason itself — so the member the
+/// request got wrong is what the sentence names, and every refusal of the same
+/// member reads alike whether the boundary validator or a handler found it. A
+/// reason that names no member states `ValidationException`'s own
+/// documentation.
+pub fn validation_message(reason: &str) -> String {
+    /// `INVALID_AGREEMENT_ID` → `agreement id`.
+    fn words(stem: &str) -> String {
+        stem.to_lowercase().replace('_', " ")
+    }
+
+    if let Some(stem) = reason.strip_prefix("INVALID_") {
+        format!("Provided {} is invalid.", words(stem))
+    } else if let Some(stem) = reason.strip_prefix("MISSING_") {
+        format!("Provided {} is missing.", words(stem))
+    } else {
+        VALIDATION_MESSAGE_FALLBACK.to_string()
+    }
+}
+
+/// A `ValidationException` naming the member that was wrong and why: the
+/// modelled `reason` a client branches on, and one `fields` entry naming the
+/// offending member's dotted request path.
 ///
 /// `reason` is one of `ValidationExceptionReason`'s values
-/// (`VALIDATION_EXCEPTION_REASON_VALUES` in `types`), which is what a client
-/// branches on.
-pub fn validation_exception(
-    reason: &str,
-    member: &str,
-    detail: impl Into<String>,
-) -> ValidationException {
-    let detail = detail.into();
+/// (`VALIDATION_EXCEPTION_REASON_VALUES` in `types`); `path` is the member's
+/// path, which for a member of a list element carries the element's position
+/// (`filters.1.member.name`).
+pub fn validation_exception(reason: &str, path: impl Into<String>) -> ValidationException {
     ValidationException {
         request_id: None,
-        message: Some(format!("{member}: {detail}")),
+        message: Some(validation_message(reason)),
         reason: Some(reason.to_string()),
         fields: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            message: detail,
+            name: path.into(),
+            message: RefusalKind::of_reason(reason).field_message().to_string(),
         }]),
+    }
+}
+
+/// The `ValidationException` for constraint violations the boundary validator
+/// found in the request, BEFORE any handler ran.
+///
+/// Every modelled constraint — a required member left out, a value outside a
+/// declared length, range, pattern or value set, at any depth of the input —
+/// arrives here as a [`::smithy_server_runtime::Violation`] carrying the
+/// offending member's dotted path, and is stated in this service's own modelled
+/// envelope: `reason` from the FIRST violation's member (the exception carries
+/// one reason, and that is the member it is about) and one `fields` entry per
+/// offending MEMBER. A member that misses two constraints at once (an empty
+/// string is both shorter than its minimum and outside its pattern) is one
+/// member and is named once: the entry says which member to fix, so a second
+/// identical entry carries nothing. The count is already bounded by the
+/// validator's own walk, which stops collecting at its `MAX_VIOLATIONS`.
+pub fn validation_exception_for(
+    violations: &[::smithy_server_runtime::Violation],
+) -> ValidationException {
+    let reason = violations
+        .first()
+        .map(|violation| member_reason(&violation.path, violation_kind(violation)))
+        .unwrap_or_else(|| REASON_OTHER.to_string());
+    let mut named: Vec<&str> = Vec::with_capacity(violations.len());
+    let mut fields: Vec<ValidationExceptionField> = Vec::with_capacity(violations.len());
+    for violation in violations {
+        if named.contains(&violation.path.as_str()) {
+            continue;
+        }
+        named.push(&violation.path);
+        fields.push(ValidationExceptionField {
+            name: violation.path.clone(),
+            message: violation_kind(violation).field_message().to_string(),
+        });
+    }
+    ValidationException {
+        request_id: None,
+        message: Some(validation_message(&reason)),
+        reason: Some(reason),
+        fields: Some(fields),
+    }
+}
+
+/// Whether a violation is about a member that carried no value at all.
+fn violation_kind(violation: &::smithy_server_runtime::Violation) -> RefusalKind {
+    match violation.kind {
+        ::smithy_server_runtime::ViolationKind::MissingRequiredMember => RefusalKind::Missing,
+        _ => RefusalKind::Invalid,
     }
 }
 
