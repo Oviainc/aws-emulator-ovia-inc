@@ -2,12 +2,12 @@
 
 //! Engine state for the com-amazonaws-verifiedpermissions-verifiedpermissions service.
 //!
-//! Everything a handler persists lives here: policy stores, the policies and
-//! identity sources inside them, the alias table and the idempotency-token
-//! ledger. The Cedar-specific
-//! helpers (parsing a policy's scope out of its statement, evaluating an
-//! authorization request) live beside it in [`cedar`], so every operation reaches
-//! one implementation rather than re-deriving the policy language.
+//! Everything a handler persists lives here: policy stores, the policies,
+//! policy templates and identity sources inside them, the alias table and the
+//! idempotency-token ledger. The Cedar-specific helpers (parsing a policy's
+//! scope out of its statement, parsing a template, evaluating an authorization
+//! request) live beside it in [`cedar`], so every operation reaches one
+//! implementation rather than re-deriving the policy language.
 
 pub mod cedar;
 
@@ -59,7 +59,22 @@ pub const ALIAS_STATE_PENDING_DELETION: &str = "PendingDeletion";
 /// 10 KB-per-policy limit would be gigabytes. Chosen so one request's parse stays
 /// in the low milliseconds; a store that reaches it refuses further policies with
 /// the `ServiceQuotaExceededException` `CreatePolicy` already models.
+///
+/// It bounds the store's Cedar text as a whole — [`PolicyStore::cedar_bytes`] —
+/// so a policy template's statement counts against it exactly as a policy's
+/// does: a template is Cedar text a caller stores in the same store, and the
+/// policies linked to it re-use that same text.
 pub const MAX_POLICY_BYTES_PER_STORE: usize = 1024 * 1024;
+
+/// How many policy templates one policy store may hold. This is this emulator's
+/// MEMORY bound and not a figure quoted from AWS: `policy_templates` is a
+/// structure a caller grows by an entry per `CreatePolicyTemplate` request, so
+/// without a cap a loop of them grows host memory without limit. The Cedar text
+/// those entries hold is bounded alongside the store's policies by
+/// [`MAX_POLICY_BYTES_PER_STORE`]. A store that reaches either refuses further
+/// templates with the `ServiceQuotaExceededException` `CreatePolicyTemplate`
+/// models.
+pub const MAX_POLICY_TEMPLATES_PER_STORE: usize = 10_000;
 
 /// This emulator's MEMORY bound on identity sources per policy store:
 /// `identity_sources` is a structure a caller grows by an entry per
@@ -234,12 +249,18 @@ pub struct PolicyStore {
     pub tags: BTreeMap<String, String>,
     /// The store's policies, keyed by `policyId`.
     pub policies: BTreeMap<String, Policy>,
+    /// The store's policy templates, keyed by `policyTemplateId`. A `BTreeMap`
+    /// so `ListPolicyTemplates` enumerates in a stable order and a pagination
+    /// cursor resumes where the previous page stopped.
+    pub policy_templates: BTreeMap<String, PolicyTemplate>,
     /// The store's identity sources, keyed by `identitySourceId`. A `BTreeMap`
     /// so `ListIdentitySources` enumerates in a stable order once it is
     /// implemented.
     pub identity_sources: BTreeMap<String, IdentitySource>,
-    /// Strictly increasing, so every id minted inside this store — a `policyId`
-    /// or an `identitySourceId` — is distinct.
+    /// Strictly increasing, so every id minted inside this store — a `policyId`,
+    /// a `policyTemplateId` or an `identitySourceId` — is distinct. ONE counter
+    /// serves them all, so the minters can never be advanced out of step with
+    /// each other.
     pub next_id_seq: u64,
     /// The Cedar schema `PutSchema` stored, when one has been stored. A store
     /// holds at most ONE schema — `PutSchema` "creates or updates" it — so this
@@ -504,6 +525,23 @@ pub struct Policy {
     pub last_updated_date: DateTime,
 }
 
+/// One policy template in a store. `statement` is the Cedar template text
+/// exactly as it arrived — placeholders (`?principal`, `?resource`) included —
+/// and it is parsed by [`cedar::parse_policy_template`] before it is stored, so
+/// a store never holds a template that is not valid Cedar.
+#[derive(Debug, Clone)]
+pub struct PolicyTemplate {
+    pub policy_template_id: String,
+    pub policy_store_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// The Cedar template text, byte-identical to what `CreatePolicyTemplate`
+    /// was given.
+    pub statement: String,
+    pub created_date: DateTime,
+    pub last_updated_date: DateTime,
+}
+
 /// Why a `policyStoreId` request member named no store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreLookupMiss {
@@ -646,6 +684,33 @@ impl PolicyStore {
         format!("SP{}", base62(scramble(self.next_id_seq)))
     }
 
+    /// Mint the next `policyTemplateId` for this store. `PT` + 22 base62
+    /// characters, the shape AWS publishes (`PTEXAMPLEabcdefg111111`), and well
+    /// inside `PolicyTemplateId`'s `^[a-zA-Z0-9-/_]*$`, length 1..200.
+    pub fn mint_policy_template_id(&mut self) -> String {
+        self.next_id_seq += 1;
+        format!("PT{}", base62(scramble(self.next_id_seq)))
+    }
+
+    /// Resolve a `policyTemplateId` request member: either a template id, or
+    /// `name/<policyTemplateName>` naming one, which `GetPolicyTemplate`
+    /// documents as interchangeable with the id ("You can use the policy
+    /// template name in place of the policy template ID. When using a name,
+    /// prefix it with name/").
+    pub fn resolve_policy_template_id(&self, reference: &str) -> Option<String> {
+        match reference.strip_prefix("name/") {
+            Some(name) => self
+                .policy_templates
+                .values()
+                .find(|template| template.name.as_deref() == Some(name))
+                .map(|template| template.policy_template_id.clone()),
+            None => self
+                .policy_templates
+                .contains_key(reference)
+                .then(|| reference.to_string()),
+        }
+    }
+
     /// Mint the next `identitySourceId` for this store. `IS` + 22 base62
     /// characters, the shape AWS publishes (`ISEXAMPLEabcdefg111111`) and well
     /// inside `IdentitySourceId`'s `^[a-zA-Z0-9-]*$`, length 1..200. It draws on
@@ -673,12 +738,17 @@ impl PolicyStore {
         }
     }
 
-    /// The total bytes of Cedar text this store holds — the quantity
-    /// [`MAX_POLICY_BYTES_PER_STORE`] bounds.
-    pub fn policy_bytes(&self) -> usize {
+    /// The total bytes of Cedar text this store holds — its policies AND its
+    /// policy templates, the quantity [`MAX_POLICY_BYTES_PER_STORE`] bounds.
+    pub fn cedar_bytes(&self) -> usize {
         self.policies
             .values()
             .map(|policy| policy.statement.len())
+            .chain(
+                self.policy_templates
+                    .values()
+                    .map(|template| template.statement.len()),
+            )
             .sum()
     }
 }
@@ -748,6 +818,21 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// `CreatePolicyStore` mints, it carries no region segment.
 pub fn alias_arn(alias_name: &str) -> String {
     ::engine::emulator_arn("verifiedpermissions", "", alias_name)
+}
+
+/// A canonical, UNAMBIGUOUS rendering of the parameters one `clientToken` was
+/// first used with, for the [`IdempotencyRecord::parameters`] field: a later
+/// call carrying the same token but a different rendering is the
+/// `ConflictException` the model documents.
+///
+/// Every value is written through `{:?}`, which quotes and escapes it, so a
+/// member whose value contains the `=` or `;` separators cannot make two
+/// different requests render alike.
+pub fn idempotency_parameters(members: &[(&str, Option<&str>)]) -> String {
+    members
+        .iter()
+        .map(|(name, value)| format!("{name}={value:?};"))
+        .collect()
 }
 
 /// `SystemTime::now()` as the model's `date-time` timestamp.

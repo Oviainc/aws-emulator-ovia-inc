@@ -3,10 +3,8 @@
 //! End-to-end suite for the policy-store-alias lifecycle: create, read back,
 //! resolve as a `policyStoreId`, soft-delete and hard-delete.
 //!
-//! Every assertion goes over the wire: an awsJson1_0 `POST /` with
-//! `X-Amz-Target: VerifiedPermissions.<Operation>`, dispatched through the same
-//! `MultiServiceRouter` the emulator binary serves, over ONE shared engine — so a
-//! write made by one request is only visible to the next if it really reached
+//! Every assertion goes over the wire through the shared [`super::harness`], so
+//! a write made by one request is only visible to the next if it really reached
 //! state.
 
 use std::sync::Arc;

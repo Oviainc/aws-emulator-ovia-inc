@@ -73,6 +73,74 @@ pub const MAX_COLLECTION_LEN: usize = 1_000;
 /// policy, so the response needs its own output cap.
 pub const MAX_REPORTED_EVALUATION_ERRORS: usize = 100;
 
+/// Parse one Cedar POLICY TEMPLATE, refusing text the parser rejects. `Err`
+/// carries the parser's diagnostics, for a `ValidationException`.
+///
+/// A template is Cedar's own notion, not a variant of a static policy:
+/// `?principal` and `?resource` are slots, which [`parse_static_policy`]'s
+/// `Policy::parse` refuses by design. So the template text goes to the real
+/// template parser rather than being pattern-matched or parsed as a policy — and
+/// that parser is also what refuses text with NO slot at all, which is a static
+/// policy and not a template.
+///
+/// Refuses a statement past [`MAX_STATEMENT_BYTES`] BEFORE handing it to the
+/// parser, so an over-long payload costs a length check rather than a parse.
+pub fn parse_policy_template(statement: &str) -> Result<(), String> {
+    parse_template(statement).map(|_| ())
+}
+
+/// The parsed Cedar template, for the two callers that need it: the parse check
+/// above and the schema validation below.
+fn parse_template(statement: &str) -> Result<cedar_policy::Template, String> {
+    if statement.len() > MAX_STATEMENT_BYTES {
+        return Err(format!(
+            "statement is {} bytes, more than the {MAX_STATEMENT_BYTES} bytes a policy \
+             template may carry",
+            statement.len()
+        ));
+    }
+    cedar_policy::Template::parse(None, statement)
+        .map_err(|e| format!("the policy template statement is not valid Cedar: {e}"))
+}
+
+/// Validate one POLICY TEMPLATE's Cedar text against a policy store's schema, as
+/// Cedar's own STRICT validation mode does — the template counterpart of
+/// [`validate_static_policy`], which `ValidationSettings` documents together with
+/// it ("Cedar performs validation on all submitted new or updated static policies
+/// and policy templates").
+///
+/// `schema_json` is the text the store holds (already accepted by
+/// [`parse_schema`]); `Err` carries the validator's diagnostics, for a
+/// `ValidationException`.
+pub fn validate_policy_template(schema_json: &str, statement: &str) -> Result<(), String> {
+    let parsed = parse_schema(schema_json)?;
+    let template = parse_template(statement)?;
+    let mut set = cedar_policy::PolicySet::new();
+    set.add_template(template)
+        .map_err(|e| format!("the policy template statement could not be loaded: {e}"))?;
+
+    let result = cedar_policy::Validator::new(parsed.schema)
+        .validate(&set, cedar_policy::ValidationMode::Strict);
+    if result.validation_passed() {
+        return Ok(());
+    }
+    let mut diagnostics: Vec<String> = result
+        .validation_errors()
+        .take(MAX_REPORTED_EVALUATION_ERRORS)
+        .map(ToString::to_string)
+        .collect();
+    if diagnostics.is_empty() {
+        // Defensive: `validation_passed()` is false only when there is at least
+        // one error, but a caller must still get a reason rather than an empty
+        // message.
+        diagnostics.push("the policy template does not validate against the schema".to_string());
+    }
+    Err(format!(
+        "the policy template does not validate against the schema in this policy store: {}",
+        diagnostics.join("; ")
+    ))
+}
+
 /// How many authorization requests one batch call may carry, from
 /// `BatchIsAuthorized`'s own model documentation: "The requests of a
 /// BatchIsAuthorized API request can contain up to 30 requests." The model's
@@ -318,8 +386,8 @@ pub fn load_policies(
     let mut parsed_count = 0usize;
     for (policy_id, policy) in policies {
         if policy.policy_type != "STATIC" {
-            // Template-linked policies are not part of this slice: the templates
-            // they instantiate cannot be created yet, so a store never holds one.
+            // Template-linked policies are not part of this slice: `CreatePolicy`
+            // does not instantiate a template yet, so a store never holds one.
             continue;
         }
         parsed_bytes += policy.statement.len();

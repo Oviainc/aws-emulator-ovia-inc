@@ -221,8 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The union arm is chosen by the stored `policyType`, so the detail always
 /// agrees with the `policyType` reported beside it. `None` for a
 /// `TEMPLATE_LINKED` policy: its detail needs the `policyTemplateId` it was
-/// instantiated from, and `CreatePolicyTemplate` does not create templates yet,
-/// so no store holds such a policy. Shared with `BatchGetPolicy`, which reports
+/// instantiated from, and `CreatePolicy`'s `templateLinked` arm — its own slice
+/// — does not instantiate a template yet, so no store holds such a policy.
+/// Shared with `BatchGetPolicy`, which reports
 /// the same union for the same stored policies.
 pub fn policy_definition_detail(policy: &crate::state::Policy) -> Option<PolicyDefinitionDetail> {
     match policy.policy_type.as_str() {

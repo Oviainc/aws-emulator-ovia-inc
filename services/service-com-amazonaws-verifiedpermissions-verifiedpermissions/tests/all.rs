@@ -27,6 +27,8 @@ mod policy_store_alias;
 mod policy_store_authorization;
 #[path = "all/policy_store_settings.rs"]
 mod policy_store_settings;
+#[path = "all/policy_templates.rs"]
+mod policy_templates;
 #[path = "all/schema.rs"]
 mod schema;
 #[path = "all/state_roundtrip.rs"]

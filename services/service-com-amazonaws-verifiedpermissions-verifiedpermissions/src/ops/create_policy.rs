@@ -8,8 +8,9 @@
 //! ([`crate::state::cedar::parse_static_policy`]), never pattern-matched out of
 //! the text, and every response field is read back out of what was persisted.
 //!
-//! The `templateLinked` arm needs `CreatePolicyTemplate`, which is a later slice,
-//! so it answers the scaffold's 501 rather than a fabricated policy.
+//! The `templateLinked` arm instantiates a policy template, which is its own
+//! operation slice, so it answers the scaffold's 501 rather than a fabricated
+//! policy.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -188,9 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
 
-        // Only the `static` arm is served here: a template-linked policy needs a
-        // policy template, and `CreatePolicyTemplate` is still scaffolded, so
-        // there is nothing to link and nothing honest to return.
+        // Only the `static` arm is served here: instantiating a template into a
+        // policy (resolving its `?principal`/`?resource` slots and linking the
+        // policy to the template) is its own slice, so there is nothing honest to
+        // return for `templateLinked` yet.
         let definition = match &input.definition {
             PolicyDefinition::Static(def) => def.clone(),
             PolicyDefinition::templateLinked(_) => {
@@ -208,10 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@idempotencyToken` replay: the same token answers with the policy the
         // first call created; the same token with different parameters conflicts.
-        let parameters = format!(
-            "store={store_id};name={:?};statement={};description={:?}",
-            input.name, definition.statement, definition.description
-        );
+        let parameters = crate::state::idempotency_parameters(&[
+            ("store", Some(store_id.as_str())),
+            ("name", input.name.as_deref()),
+            ("statement", Some(definition.statement.as_str())),
+            ("description", definition.description.as_deref()),
+        ]);
         if let Some(token) = input.client_token.as_deref() {
             if let Some(record) = state.idempotency_replay("CreatePolicy", token) {
                 if record.parameters != parameters {
@@ -270,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.policies.len() >= crate::state::MAX_POLICIES_PER_STORE
-            || store.policy_bytes() + definition.statement.len()
+            || store.cedar_bytes() + definition.statement.len()
                 > crate::state::MAX_POLICY_BYTES_PER_STORE
         {
             return Err(CreatePolicyErrorModeled::ServiceQuotaExceededException(
