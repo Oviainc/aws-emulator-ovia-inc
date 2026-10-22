@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+mod validation;
+
 /// The `com-amazonaws-osis-amazonopensearchingestionservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -96,17 +98,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // OpenSearch Ingestion reports a member that is a COLLECTION of
+        // constrained scalars once per MEMBER, not once per offending element:
+        // the entry names the collection member's own path, renders the refused
+        // values as a bracketed list and enumerates the element shape's whole
+        // constraint set. Every other refusal keeps the framework's wording,
+        // which already matches. See `validation` for the rule and where its
+        // constraints come from; it answers `None` for everything it does not
+        // reword, and returns the framework's own error code with the message it
+        // does.
+        validation::refusal(refusal)
     }
 
     fn override_routing_error(
