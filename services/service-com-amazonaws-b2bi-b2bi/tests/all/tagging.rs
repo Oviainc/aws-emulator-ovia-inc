@@ -19,8 +19,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The request harness is shared with the onboarding suite — same router, same signing.
 use crate::onboarding_loop::{
-    b2bi_router, call, call_signed_for, capability_configuration, error_code, text, ACCOUNT,
-    SIGNING_REGION,
+    b2bi_router, call, call_signed_for, capability_configuration, error_code, given_transformer,
+    text, ACCOUNT, SIGNING_REGION,
 };
 
 /// A `tags` list for a create request, from `(key, value)` pairs. Member names are
@@ -121,7 +121,13 @@ async fn given_tagged_resource(
             json!({
                 "name": name,
                 "type": "edi",
-                "configuration": capability_configuration("X12_850", "VERSION_4010")
+                // A capability resolves its `transformerId`, so each one gets a real
+                // transformer to name.
+                "configuration": capability_configuration(
+                    &given_transformer(router, &format!("{name}-transformer")).await,
+                    "X12_850",
+                    "VERSION_4010",
+                )
             }),
             "capabilityArn",
         ),
@@ -214,7 +220,11 @@ async fn list_tags_reports_the_tags_each_resource_was_created_with() {
             json!({
                 "name": "partnership capability",
                 "type": "edi",
-                "configuration": capability_configuration("X12_850", "VERSION_4010")
+                "configuration": capability_configuration(
+                    &given_transformer(&router, "partnership-transformer").await,
+                    "X12_850",
+                    "VERSION_4010",
+                )
             }),
         )
         .await

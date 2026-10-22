@@ -1463,6 +1463,25 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![quota("Scaling plans per Region", 5.0)],
         ),
         service(
+            "b2bi",
+            "AWS B2B Data Interchange",
+            // The VALUE is documented: b2bi's own `CreateProfile` states "You can have
+            // up to five customer profiles, each representing a distinct private
+            // network", and the b2bi emulator enforces exactly this number. No
+            // cross-crate dependency links the two, so keep it in step with
+            // `MAX_PROFILES_PER_ACCOUNT` in
+            // `services/service-com-amazonaws-b2bi-b2bi/src/state.rs` (each side has a
+            // test pinning it).
+            //
+            // The CODE is carried here rather than derived: b2bi publishes no `L-…`
+            // code in its model, and its own `ServiceQuotaExceededException` reports
+            // `quotaCode` `ProfilesPerAccount`, so a client that reads the refusal and
+            // then looks the limit up here finds it under the code the refusal named.
+            // It satisfies the modelled `QuotaCode` pattern
+            // `^[a-zA-Z][a-zA-Z0-9-]{1,128}$`.
+            vec![quota("Customer profiles per account", 5.0).code("ProfilesPerAccount")],
+        ),
+        service(
             "backup",
             "AWS Backup",
             vec![

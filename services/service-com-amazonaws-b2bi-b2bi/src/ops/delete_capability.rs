@@ -186,10 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.capabilities.contains_key(&input.capability_id) {
             return Err(DeleteCapabilityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Could not find capability with ID {}",
-                        input.capability_id
-                    ),
+                    message: crate::state::capability_not_found(&input.capability_id),
                 },
             )
             .into());

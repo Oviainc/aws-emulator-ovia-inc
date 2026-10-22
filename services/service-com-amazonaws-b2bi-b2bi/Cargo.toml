@@ -10,6 +10,10 @@ build = "build.rs"
 engine = { workspace = true }
 # Hex codec for the opaque `nextToken` the @paginated List operations issue.
 hex = { workspace = true }
+# The CloudWatch Logs client CreateProfile provisions a logging-ENABLED profile's log
+# group with, over the in-process callback into this same emulator (no network client
+# feature is enabled: the transport is the emulator's own).
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -36,6 +40,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The b2bi tests mount the CloudWatch Logs service beside b2bi on one engine, because
+# CreateProfile provisions a logging-ENABLED profile's log group by calling it.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [lints]
 workspace = true

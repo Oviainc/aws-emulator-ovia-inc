@@ -184,10 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(partnership) = state.partnerships.get(&input.partnership_id) else {
             return Err(GetPartnershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Could not find partnership with ID {}",
-                        input.partnership_id
-                    ),
+                    message: crate::state::partnership_not_found(&input.partnership_id),
                 },
             )
             .into());

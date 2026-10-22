@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.profiles.contains_key(&input.profile_id) {
             return Err(DeleteProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Could not find profile with ID {}", input.profile_id),
+                    message: crate::state::profile_not_found(&input.profile_id),
                 },
             )
             .into());
@@ -211,6 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         state.profiles.remove(&input.profile_id);
         state.profile_order.retain(|id| *id != input.profile_id);
+        // The profile's CloudWatch Logs log group is deliberately NOT deleted: a log
+        // group outlives the resource that asked for it (its events stay readable until
+        // its own retention or a `logs:DeleteLogGroup` removes them), and nothing
+        // documents b2bi deleting the customer's logs. `CreateProfile` releases a group
+        // only when it provisioned one for a profile it then did not store.
+        //
         // Release path for the idempotency map: a token that minted this profile is
         // worth nothing once the profile is gone, so it is not kept.
         state.forget_idempotency_for(&input.profile_id);
