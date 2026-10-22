@@ -186,18 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The modelled `^[A-Z]{3}$` is refused before this handler runs; what is left
         // to refuse is a well-formed ISO-4217 code the Price List API does not publish
-        // price lists in at all. The accepted set belongs to the API rather than to
-        // this catalog's contents, so a supported currency the requested service has
-        // no list in is a legitimate empty page, not a bad parameter.
+        // price lists in at all. AWS answers that as an AUTHORIZATION outcome — the
+        // caller is not entitled to a price list in a currency the API does not
+        // publish — rather than as a bad parameter, with a fixed sentence carrying no
+        // request data. The accepted set belongs to the API rather than to this
+        // catalog's contents, so a supported currency the requested service has no
+        // list in is a legitimate empty page, neither refusal.
         if !crate::state::PricingState::publishes_currency(&input.currency_code) {
-            return Err(ListPriceListsErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "CurrencyCode '{}' is not a currency this API publishes price \
-                         lists in; supported currencies are {}",
-                        input.currency_code,
-                        crate::state::SUPPORTED_CURRENCY_CODES.join(", ")
-                    )),
+            return Err(ListPriceListsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::CURRENCY_NOT_AUTHORIZED_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -241,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|_| {
             ListPriceListsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-                message: Some("the pagination token is invalid".to_string()),
+                message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
             })
         })?;
 

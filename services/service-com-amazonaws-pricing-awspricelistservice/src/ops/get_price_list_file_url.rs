@@ -161,44 +161,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The ARN is the identity of a stored price list — the one ListPriceLists
-        // reported — so an ARN the catalog does not hold names no resource. The lock is
-        // scoped to this read: opening the file listener below awaits.
-        let (known_arn, file_path, file_formats) = {
+        // The (ARN, FileFormat) pair is the identity of a price-list FILE — the ARN
+        // ListPriceLists reported, published in one of the formats it listed. The lock
+        // is scoped to this read: opening the file listener below awaits.
+        let file_path = {
             let state = state_handle.lock();
-            match state.price_lists.get(&input.price_list_arn) {
-                Some(record) => (
-                    true,
-                    record
-                        .path_for_format(&input.file_format)
-                        .map(str::to_string),
-                    record.file_formats.join(", "),
-                ),
-                None => (false, None, String::new()),
-            }
+            state
+                .price_lists
+                .get(&input.price_list_arn)
+                .and_then(|record| record.path_for_format(&input.file_format))
+                .map(str::to_string)
         };
 
-        if !known_arn {
-            return Err(GetPriceListFileUrlErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no price list with ARN '{}'",
-                        input.price_list_arn
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // A known price list published in other formats than the one asked for is a bad
-        // parameter, not a missing resource.
+        // A pair that resolves to no file — an ARN the catalog does not hold, or a
+        // format the price list it names is not published in — is refused with the
+        // modelled NotFoundException (HTTP 400), not the 404 ResourceNotFoundException
+        // this operation also models: the message names the ARN and the format asked
+        // for, so a caller can tell which half of the pair it got wrong.
         let Some(file_path) = file_path else {
-            return Err(GetPriceListFileUrlErrorModeled::InvalidParameterException(
-                InvalidParameterException {
+            return Err(GetPriceListFileUrlErrorModeled::NotFoundException(
+                NotFoundException {
                     message: Some(format!(
-                        "FileFormat '{}' is not published for this price list; available \
-                         formats are {file_formats}",
-                        input.file_format
+                        "Price list file with arn {} and file format {} is not found.",
+                        input.price_list_arn, input.file_format
                     )),
                 },
             )

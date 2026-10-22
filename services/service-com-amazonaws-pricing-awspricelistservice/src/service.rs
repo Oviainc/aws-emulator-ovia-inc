@@ -45,6 +45,15 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code this service answers an input-constraint violation with.
+///
+/// The Price List API models `InvalidParameterException` (HTTP 400, "One or more
+/// parameters had an invalid value") as a common error on every operation and models
+/// NO `ValidationException` shape at all, so that is the only code a client written
+/// against this API can catch for a bad input. Restated here because
+/// `override_refusal` replaces the code and the message together.
+const INVALID_PARAMETER_EXCEPTION: &str = "InvalidParameterException";
+
 /// The `com-amazonaws-pricing-awspricelistservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +107,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Every input-constraint violation this API refuses is an
+        // `InvalidParameterException` (HTTP 400 — the status the framework would
+        // also have answered, so only the code and the wording change): the
+        // service models that shape as a common error on every operation and
+        // models no `ValidationException` at all, so answering the framework's
+        // generic code would hand a client an error its own model cannot name.
+        // The MESSAGE keeps the framework's `<N> validation error(s) detected: `
+        // envelope, which is already the sentence AWS builds from the request —
+        // the offending value, the member it sat at, and the constraint it failed.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_PARAMETER_EXCEPTION.to_string(),
+                message: aws_smithy_schema_server::envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

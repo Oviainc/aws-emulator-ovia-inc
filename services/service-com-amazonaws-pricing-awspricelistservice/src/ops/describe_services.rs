@@ -187,27 +187,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // With a ServiceCode, exactly that service — a code the catalog does not hold is
-        // NotFound, never an empty list. Without one, every service in catalog order.
-        let selected: Vec<&crate::state::ServiceCatalog> = match input.service_code.as_deref() {
-            Some(service_code) => {
-                let Some(catalog) = state.catalog(service_code) else {
-                    return Err(DescribeServicesErrorModeled::NotFoundException(
-                        NotFoundException {
-                            message: Some(format!("service code '{service_code}' not found")),
-                        },
-                    )
-                    .into());
-                };
-                vec![catalog]
-            }
+        // `ServiceCode` is an unconstrained optional FILTER on this listing — the
+        // member's own doc says "To retrieve a list of all services, leave this
+        // blank", and the operation models no not-found error of its own. So a code
+        // the catalog does not hold selects NOTHING and the answer is an empty
+        // `Services` list, exactly as any other filter that matches no item; a blank
+        // code is the same as none at all.
+        let service_code = input
+            .service_code
+            .as_deref()
+            .filter(|service_code| !service_code.is_empty());
+        let selected: Vec<&crate::state::ServiceCatalog> = match service_code {
+            Some(service_code) => state.catalog(service_code).into_iter().collect(),
             None => state.services.values().collect(),
         };
 
-        let fingerprint = crate::state::query_fingerprint(&[
-            Self::NAME,
-            input.service_code.as_deref().unwrap_or(""),
-        ]);
+        let fingerprint =
+            crate::state::query_fingerprint(&[Self::NAME, service_code.unwrap_or("")]);
         let (page, next_token) = crate::state::paginate(
             &selected,
             &fingerprint,
@@ -216,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|_| {
             DescribeServicesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-                message: Some("the pagination token is invalid".to_string()),
+                message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
             })
         })?;
 
