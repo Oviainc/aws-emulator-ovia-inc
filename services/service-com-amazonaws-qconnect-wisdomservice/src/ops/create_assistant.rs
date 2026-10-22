@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssistant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssistant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssistant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an assistant, stores it, and answers out of the STORED record, so what this
+//! call reports is what every later `GetAssistant`/`ListAssistants` reports. A fresh
+//! assistant is `CREATE_IN_PROGRESS` and the clock owes it `ACTIVE`
+//! ([`crate::state::CREATE_TRANSITION`]); a replayed `clientToken` answers with the
+//! assistant that token already created; a second live assistant under one name is the
+//! conflict `ConflictException` describes.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssistant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssistantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssistant"))
+        // Modeled constraints (`name`'s length and pattern, `type`'s enum) are already
+        // refused BEFORE this handler runs, so reaching here means the input satisfies
+        // every one of them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("CreateAssistant")
+        })?;
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut store = state.lock();
+
+        // A replayed `@idempotencyToken` answers with the assistant it already created
+        // rather than creating a second one. The token is scoped to this operation, so
+        // the same token on another create is another resource.
+        let replay_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key("CreateAssistant", token));
+        if let Some(created) = replay_key
+            .as_ref()
+            .and_then(|key| store.idempotency.get(key).cloned())
+        {
+            if let Some(assistant) = store.assistant(&created) {
+                return Ok(CreateAssistantOutput {
+                    assistant: Some(assistant.to_assistant_data()),
+                });
+            }
+        }
+
+        if let Some(existing) = store.assistant_id_with_name(&input.name) {
+            let existing = existing.to_string();
+            return Err(CreateAssistantErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "An assistant named {} already exists ({existing}).",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The account's assistant quota: a create beyond it is refused, which is also
+        // what keeps the store finite — a record is released only by `DeleteAssistant`.
+        if store.assistants.len() >= crate::state::MAX_ASSISTANTS {
+            return Err(CreateAssistantErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} assistants.",
+                        crate::state::MAX_ASSISTANTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(assistant_id) = store.mint_assistant_id() else {
+            return Err(CreateAssistantErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "could not mint a unique assistantId; retry the request".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::Instant::now();
+        let assistant = crate::state::Assistant {
+            assistant_arn: crate::state::assistant_arn(&region, &assistant_id),
+            assistant_id: assistant_id.clone(),
+            name: input.name.clone(),
+            r#type: input.r#type.clone(),
+            // Creation is asynchronous: the assistant reports the transient status until
+            // the transition the clock owes it falls due.
+            status: crate::state::ASSISTANT_STATUS_CREATE_IN_PROGRESS.to_string(),
+            description: input.description.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            server_side_encryption_configuration: input
+                .server_side_encryption_configuration
+                .clone(),
+            created_at: ::std::time::SystemTime::now(),
+            active_due_at: now + crate::state::CREATE_TRANSITION,
+            sessions: ::std::collections::HashMap::new(),
+        };
+        store.insert_assistant(assistant);
+        if let Some(key) = replay_key {
+            store.idempotency.insert(key, assistant_id.clone());
+        }
+
+        // Render out of the INSERTED record rather than out of the request: what this
+        // call answers is what a later read of the assistant answers.
+        let Some(stored) = store.assistant(&assistant_id) else {
+            // Unreachable: the insert above put this id in the map while the lock is
+            // held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssistant"));
+        };
+        Ok(CreateAssistantOutput {
+            assistant: Some(stored.to_assistant_data()),
+        })
     }
 }

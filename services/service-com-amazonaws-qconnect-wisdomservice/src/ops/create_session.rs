@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the parent assistant first (unknown parent -> `ResourceNotFoundException`),
+//! then mints a session, stores it UNDER that assistant, and answers out of the stored
+//! record. A session created through this API carries `origin` = `CUSTOMER`, which is
+//! what the model documents for it. A replayed `clientToken` answers with the session
+//! that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +172,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("CreateSession")
+        })?;
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The parent is resolved first: a session exists only inside an assistant, so an
+        // unknown parent is reported before anything is minted.
+        let Some(assistant_id) = store
+            .assistant(&input.assistant_id)
+            .map(|assistant| assistant.assistant_id.clone())
+        else {
+            return Err(CreateSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No assistant {} exists in this account.",
+                        input.assistant_id
+                    )),
+                    resource_name: Some(input.assistant_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // A replayed `@idempotencyToken` answers with the session it already created
+        // under THIS assistant rather than creating a second one. The token is scoped to
+        // this operation and this parent, so the same token on another create is another
+        // resource.
+        let replay_key = input.client_token.as_deref().map(|token| {
+            crate::state::idempotency_key(&format!("CreateSession/{assistant_id}"), token)
+        });
+        let replayed = replay_key
+            .as_ref()
+            .and_then(|key| store.idempotency.get(key).cloned());
+        // Taken before the parent is borrowed for mutation: every mint owns its own
+        // block of id candidates.
+        let seq = store.next_seq();
+
+        let Some(assistant) = store.assistant_mut(&assistant_id) else {
+            // Unreachable: the id was just resolved out of this map while the lock is
+            // held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"));
+        };
+        if let Some(session) = replayed.and_then(|created| assistant.sessions.get(&created)) {
+            return Ok(CreateSessionOutput {
+                session: Some(session.to_session_data()),
+            });
+        }
+
+        // The assistant's session bound, which is what keeps the store finite. The
+        // operation models no quota error, so the refusal is its `ValidationException`.
+        if assistant.sessions.len() >= crate::state::MAX_SESSIONS_PER_ASSISTANT {
+            return Err(CreateSessionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Assistant {assistant_id} already holds the maximum of {} sessions.",
+                        crate::state::MAX_SESSIONS_PER_ASSISTANT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(session_id) = assistant.mint_session_id(seq) else {
+            return Err(CreateSessionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "could not mint a unique sessionId; retry the request".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let session = crate::state::Session {
+            session_arn: crate::state::session_arn(&region, &assistant_id, &session_id),
+            session_id: session_id.clone(),
+            assistant_id: assistant_id.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            tag_filter: input.tag_filter.clone(),
+            ai_agent_configuration: input.ai_agent_configuration.clone().unwrap_or_default(),
+            contact_arn: input.contact_arn.clone(),
+            origin: crate::state::SESSION_ORIGIN_CUSTOMER.to_string(),
+            created_at: now,
+        };
+        assistant.sessions.insert(session_id.clone(), session);
+
+        // Render out of the INSERTED record, so what this call answers is what a later
+        // `GetSession` answers.
+        let Some(stored) = assistant.sessions.get(&session_id) else {
+            // Unreachable: the insert above put this id in the map while the lock is
+            // held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"));
+        };
+        let output = CreateSessionOutput {
+            session: Some(stored.to_session_data()),
+        };
+        if let Some(key) = replay_key {
+            store.idempotency.insert(key, session_id);
+        }
+        Ok(output)
     }
 }
