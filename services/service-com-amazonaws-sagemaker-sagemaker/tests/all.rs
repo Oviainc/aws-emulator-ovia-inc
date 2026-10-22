@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/artifact_lineage.rs"]
 mod artifact_lineage;
+#[path = "all/code_repositories.rs"]
+mod code_repositories;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
 #[path = "all/model_package_group_lifecycle.rs"]

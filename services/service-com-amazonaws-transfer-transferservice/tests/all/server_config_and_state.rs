@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{assert_members, member_of, Emulator, PAST_START_SPAN};
+use crate::harness::{assert_members, generated_host_key, member_of, Emulator, PAST_START_SPAN};
 
 /// `SERVER_STOP_SPAN` in `src/state.rs` is 500 ms; wait past it. It is kept HERE, next
 /// to the only suite that stops a server, rather than in the shared harness beside
@@ -301,20 +301,6 @@ async fn a_host_key_fingerprint_is_minted_per_server_and_stable_across_reads() {
         );
         seen.push((name.to_string(), first));
     }
-}
-
-/// An OpenSSH Ed25519 private key and the SHA256 fingerprint `ssh-keygen -l` prints
-/// for it, both produced here by the OpenSSH key-format crate — so the expectation
-/// comes from the key, not from the handler under test.
-fn generated_host_key() -> (String, String) {
-    let keypair = ssh_key::private::Ed25519Keypair::random(&mut ssh_key::rand_core::OsRng);
-    let key = ssh_key::PrivateKey::from(keypair);
-    let material = key
-        .to_openssh(ssh_key::LineEnding::LF)
-        .expect("the generated key encodes as an OpenSSH private key")
-        .to_string();
-    let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
-    (material, fingerprint)
 }
 
 /// RULE: a host key the caller supplies IS the server's host key, so the fingerprint

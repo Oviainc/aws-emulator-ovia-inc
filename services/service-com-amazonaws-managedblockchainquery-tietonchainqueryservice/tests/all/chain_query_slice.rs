@@ -52,10 +52,6 @@ fn scaffolded_operations(network: &str, address: &str) -> Vec<(&'static str, Val
             }]}),
         ),
         (
-            "/get-asset-contract",
-            json!({"contractIdentifier": {"network": network, "contractAddress": address}}),
-        ),
-        (
             "/list-asset-contracts",
             json!({"contractFilter": {
                 "network": network,
@@ -76,13 +72,13 @@ fn scaffolded_operations(network: &str, address: &str) -> Vec<(&'static str, Val
 
 /// A router with only this service mounted — one emulator "session" — plus the engine
 /// it was built on, so a test can read the ledger it serves.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -91,7 +87,7 @@ impl Emulator {
     }
 
     /// POST `path` with a JSON body; returns the status and the parsed body.
-    async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("http://localhost{path}"))
@@ -110,7 +106,7 @@ impl Emulator {
     }
 
     /// POST and require HTTP 200.
-    async fn ok(&self, path: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, path: &str, body: &Value) -> Value {
         let (status, parsed) = self.post(path, body).await;
         assert_eq!(
             status, 200,
@@ -120,7 +116,7 @@ impl Emulator {
     }
 
     /// POST and require `status` with the wire error code `code`.
-    async fn fails(&self, path: &str, body: &Value, status: u16, code: &str) -> Value {
+    pub(crate) async fn fails(&self, path: &str, body: &Value, status: u16, code: &str) -> Value {
         let (got, parsed) = self.post(path, body).await;
         assert_eq!(
             got, status,
@@ -210,7 +206,7 @@ impl NetworkFixture {
 }
 
 /// The wire error code of a failure response: the last segment of its `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
