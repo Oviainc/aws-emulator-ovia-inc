@@ -275,6 +275,17 @@ fn stated(violations: &[Violation]) -> Option<String> {
 
 /// One violation as this service states it.
 ///
+/// A value outside the SPACE its member's ids are drawn from is stated as MALFORMED —
+/// `AccessorId parameter <value> is malformed` — whatever modelled constraint it also
+/// happens to break, because that is the fault: a value the service could never have
+/// issued for that member. Wording it from the constraint it tripped over instead would
+/// tell a caller to shorten a 36-character UUID, when no 32-character UUID is an id of
+/// that space either. The decision and the wording are both
+/// [`crate::state::malformed_id_sentence`]'s — the same function the handler that looks
+/// such an id up refuses through — so the boundary and the handler cannot disagree, and
+/// this stays a formatter: it asks whether there is a malformed-id sentence to say and
+/// otherwise words the violation as the class it is.
+///
 /// A value outside an ENUMERATED set gets the sentence alone: the permitted set is in
 /// the model, and so in every generated client, and spelling the whole set into prose
 /// would say nothing the caller cannot already read. Every other class failed a BOUND or
@@ -285,12 +296,17 @@ fn stated(violations: &[Violation]) -> Option<String> {
 /// has never seen cannot arrive with a second spelling of its requirement.
 fn sentence(violation: &Violation) -> String {
     let member = as_modelled(&violation.path);
-    match (&violation.kind, &violation.value) {
-        // A member the request omitted has no value to echo, so its sentence states the
-        // requirement instead.
-        (_, None) => format!("{member} is required."),
-        (ViolationKind::EnumValue(_), Some(value)) => format!("{member} {value} is not valid."),
-        (_, Some(value)) => format!("{member} {value} is not valid. {}", violation.message()),
+    // A member the request omitted has no value to echo, so its sentence states the
+    // requirement instead.
+    let Some(value) = violation.value.as_deref() else {
+        return format!("{member} is required.");
+    };
+    if let Some(malformed) = crate::state::malformed_id_sentence(&member, value) {
+        return malformed;
+    }
+    match &violation.kind {
+        ViolationKind::EnumValue(_) => format!("{member} {value} is not valid."),
+        _ => format!("{member} {value} is not valid. {}", violation.message()),
     }
 }
 

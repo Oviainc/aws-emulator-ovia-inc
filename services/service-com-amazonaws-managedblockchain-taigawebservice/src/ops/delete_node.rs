@@ -162,16 +162,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        let network = guard.networks.get(&input.network_id);
+        // `DELETE /networks/{NetworkId}/nodes/{NodeId}` nests the node INSIDE the
+        // network, so the path labels resolve left to right: a `NetworkId` this service
+        // does not hold is itself the missing resource, and nothing inside it is reached.
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(DeleteNodeErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
+            )
+            .into());
+        };
 
         // `MemberId` "Applies only to Hyperledger Fabric and is required for Hyperledger
         // Fabric": on a Fabric network the owning member scopes which node is deleted.
-        // Which framework a network runs is a property of the stored network, so this
-        // refusal is only reachable for a network this service holds.
+        // Which framework a network runs is a property of the stored network, which is
+        // why this refusal comes after the network resolved.
         if input.member_id.is_none()
-            && network.is_some_and(|network| {
-                network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
-            })
+            && network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
         {
             return Err(DeleteNodeErrorModeled::InvalidRequestException(
                 InvalidRequestException {
@@ -184,17 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The NODE is the resource this operation was asked to delete; the network and
-        // the member only scope the lookup, so the failure names the node whenever that
-        // node cannot be read — including when the network id names nothing stored.
-        let found = network
-            .and_then(|network| network.nodes.get(&input.node_id))
-            .filter(|node| {
-                input
-                    .member_id
-                    .as_deref()
-                    .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
-            });
+        // The network resolved, so the leaf label is next: the NODE is the resource this
+        // operation was asked to delete, and `MemberId` — a query member, not a path
+        // label — only scopes that lookup.
+        let found = network.nodes.get(&input.node_id).filter(|node| {
+            input
+                .member_id
+                .as_deref()
+                .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
+        });
         let Some(node) = found else {
             return Err(DeleteNodeErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NODE, &input.node_id),

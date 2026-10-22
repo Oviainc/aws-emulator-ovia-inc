@@ -47,7 +47,10 @@ fn tags(count: usize) -> Value {
 }
 
 /// Create one accessor and return what the emulator answered.
-async fn create_accessor(
+///
+/// `pub(crate)` so a sibling suite in this target drives a create through this one helper
+/// rather than a second copy of the request.
+pub(crate) async fn create_accessor(
     router: &MultiServiceRouter,
     token: &str,
     network_type: Option<&str>,
@@ -319,8 +322,10 @@ async fn a_repeated_client_request_token_replays_its_first_accessor() {
     }
 }
 
-/// An accessor id nothing minted is not found: `GetAccessor` models
-/// `ResourceNotFoundException` (HTTP 404) for "a requested resource doesn't exist".
+/// An accessor id IN the accessor-id space that nothing minted is not found:
+/// `GetAccessor` models `ResourceNotFoundException` (HTTP 404) for "a requested resource
+/// doesn't exist". An id OUTSIDE that space is a different answer, pinned by
+/// [`crate::not_found_and_malformed_ids`].
 #[tokio::test]
 async fn get_accessor_refuses_an_id_nothing_holds() {
     let router = new_router();
@@ -330,14 +335,14 @@ async fn get_accessor_refuses_an_id_nothing_holds() {
     let answer = create_accessor(&router, "the-one-accessor", Some("ETHEREUM_MAINNET"), 0).await;
     let existing = answer.text(&["AccessorId"]);
 
-    // Rows span the id shapes a caller can name: an unminted accessor id, another
-    // resource family's id, a one-character id and `ResourceIdString`'s 32-character
-    // maximum.
+    // Rows span the well-formed accessor ids a caller can name that nothing minted: the
+    // first and last id of the space (`ac-` plus 26 characters of the base-32 alphabet
+    // `A`-`Z`, `2`-`7`), one in the middle of it, and the stored id with one suffix
+    // character changed.
     let unknown_ids: &[String] = &[
         "ac-AAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-        format!("n-{}", "B".repeat(26)),
-        "x".to_string(),
-        "a".repeat(32),
+        "ac-77777777777777777777777777".to_string(),
+        "ac-ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_string(),
         // The stored id with its first suffix character changed to something else names
         // nothing stored either, whatever that character happened to be.
         format!(

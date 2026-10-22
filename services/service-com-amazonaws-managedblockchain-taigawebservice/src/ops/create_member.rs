@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The invitation is named by id, so — exactly as for the network above —
                 // `ResourceName` is left absent rather than defaulted to the ARN of some
                 // other resource (the path-bound network, which exists).
-                crate::state::not_found(crate::state::RESOURCE_INVITATION, &input.invitation_id),
+                crate::state::not_found(crate::state::MEMBER_INVITATION_ID, &input.invitation_id),
             )
             .into());
         };

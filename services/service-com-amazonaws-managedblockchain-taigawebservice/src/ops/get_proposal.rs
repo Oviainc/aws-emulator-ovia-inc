@@ -163,16 +163,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        // The PROPOSAL is the resource this operation was asked for; the network id only
-        // scopes the lookup, so the failure names the proposal whenever that proposal
-        // cannot be read — including when the network id names nothing stored.
-        let found = guard.networks.get(&input.network_id).and_then(|network| {
-            network
-                .proposals
-                .get(&input.proposal_id)
-                .map(|proposal| (network, proposal))
-        });
-        let Some((network, proposal)) = found else {
+        // `GET /networks/{NetworkId}/proposals/{ProposalId}` nests the proposal INSIDE
+        // the network, so the path labels resolve left to right: a `NetworkId` this
+        // service does not hold is itself the missing resource, and the proposal inside
+        // it is never reached.
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(GetProposalErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
+            )
+            .into());
+        };
+
+        // The network resolved, so the leaf label is next: a proposal that network does
+        // not hold is the resource the request asked for and did not get.
+        let Some(proposal) = network.proposals.get(&input.proposal_id) else {
             return Err(GetProposalErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_PROPOSAL, &input.proposal_id),
             )

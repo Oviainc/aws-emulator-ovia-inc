@@ -124,7 +124,10 @@ fn tags_of(tag_count: usize) -> Value {
 
 /// Create one proposal on `network_id` as `member_id` and return what the emulator
 /// answered.
-async fn create_proposal(
+///
+/// `pub(crate)` so a sibling suite in this target drives a create through this one helper
+/// rather than a second copy of the request.
+pub(crate) async fn create_proposal(
     router: &smithy_server_runtime::MultiServiceRouter,
     network_id: &str,
     member_id: &str,

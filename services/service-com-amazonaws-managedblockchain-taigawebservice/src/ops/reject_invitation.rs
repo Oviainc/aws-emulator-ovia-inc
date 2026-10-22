@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(RejectInvitationErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(
-                    crate::state::RESOURCE_INVITATION,
+                    crate::state::MEMBER_INVITATION_ID,
                     &input.invitation_id,
                 ),
             )

@@ -150,6 +150,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // state — so this reports exactly what the create persisted.
         let _ = ctx;
 
+        // An `AccessorId` outside the accessor-id space is an id this service could never
+        // have issued, so it is a request to FIX rather than a resource to look up: it is
+        // refused with the modelled `InvalidRequestException` (400) before any state is
+        // read, naming the member and the value the request held. A WELL-FORMED id
+        // nothing holds falls through to the `ResourceNotFoundException` below — the two
+        // answers are what tell a caller "you handed me a bad id" (non-retryable, fix the
+        // input) from "that accessor is gone" (re-create or ignore) apart.
+        if let Some(refusal) =
+            crate::state::malformed_id(crate::state::MEMBER_ACCESSOR_ID, &input.accessor_id)
+        {
+            return Err(GetAccessorErrorModeled::InvalidRequestException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAccessorErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},

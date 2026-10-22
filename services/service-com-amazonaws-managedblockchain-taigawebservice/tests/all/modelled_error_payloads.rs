@@ -6,11 +6,14 @@
 //! Two rules are pinned here, each over a table that spans the class it generalises
 //! over rather than the one request that exposed it:
 //!
-//! 1. A not-found failure names the resource the operation was ASKED FOR — the resource
-//!    the request identifies, not an ancestor id present only to scope its lookup — in
-//!    `Message`, and leaves `ResourceNotFoundException$ResourceName` unset, because that
-//!    member targets `ArnString` (`@length(1, 1011)`, `@pattern ^arn:.+:.+:.+:.+:.+$`)
-//!    and a resource this service does not hold has no ARN to name.
+//! 1. A not-found failure names the resource the request's path labels failed to resolve
+//!    FIRST — the labels resolve left to right, so a nested read whose parent id names
+//!    nothing is a failure about the PARENT and never about the child inside it — in
+//!    `Message`, labelled as this service labels that resource (`Network`, `Node`,
+//!    `InvitationId`), and leaves `ResourceNotFoundException$ResourceName` unset, because
+//!    that member targets `ArnString` (`@length(1, 1011)`,
+//!    `@pattern ^arn:.+:.+:.+:.+:.+$`) and a resource this service does not hold has no
+//!    ARN to name.
 //! 2. A request outside a constraint the MODEL declares is refused with a shape the
 //!    model declares — `InvalidRequestException`, HTTP 400, which the model binds to the
 //!    service so every operation lists it — with prose in its `Message` member naming
@@ -31,14 +34,14 @@ use super::network_and_node_lifecycle::{
 /// prefix, a hyphen and 26 base-32 characters, within `ResourceIdString`'s
 /// `@length(1, 32)`. Taking the shape seriously matters — a malformed id would be
 /// refused as a constraint violation (rule 2) long before any lookup (rule 1).
-fn unknown_id(prefix: &str, filler: char) -> String {
+pub(crate) fn unknown_id(prefix: &str, filler: char) -> String {
     format!("{prefix}-{}", std::iter::repeat_n(filler, 26).collect::<String>())
 }
 
 /// Assert `answer` is the modelled `ResourceNotFoundException` for `resource_type`
 /// `id`: HTTP 404, the modelled shape named in both the body and the error-type header,
 /// the resource named in `Message`, and NO `ResourceName` member.
-fn assert_not_found(case: &str, answer: &Answer, resource_type: &str, id: &str) {
+pub(crate) fn assert_not_found(case: &str, answer: &Answer, resource_type: &str, id: &str) {
     assert_eq!(
         (answer.status, answer.error_type.as_str()),
         (404, "ResourceNotFoundException"),
@@ -70,7 +73,7 @@ fn assert_not_found(case: &str, answer: &Answer, resource_type: &str, id: &str) 
 /// Assert `answer` is the modelled `InvalidRequestException` refusing `member`: HTTP
 /// 400, the modelled shape named in both the body and the error-type header, and a
 /// `Message` naming the member and `expected_in_message`.
-fn assert_invalid_request(
+pub(crate) fn assert_invalid_request(
     case: &str,
     answer: &Answer,
     member: &str,
@@ -131,10 +134,10 @@ struct RefusalCase {
     rule_in_message: Option<&'static str>,
 }
 
-/// A lookup that finds nothing names the resource the operation was asked for, and
-/// never puts a non-ARN id in `ResourceName` — over a table spanning the operations
-/// that look a resource up, the resource types they name, and whether it is the leaf or
-/// an ancestor of the request's path that is missing.
+/// A lookup that finds nothing names the FIRST resource of the request's path it could
+/// not resolve, and never puts a non-ARN id in `ResourceName` — over a table spanning the
+/// operations that look a resource up, the resource types they name, and whether it is
+/// the leaf or the parent of the request's path that is missing.
 #[tokio::test]
 async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
     let router = new_router();
@@ -182,12 +185,23 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             resource_type: "Member",
             id: gone_member.clone(),
         },
+        // The PARENT rows are the point of the rule: `GET
+        // /networks/{NetworkId}/members/{MemberId}` nests the member inside the network,
+        // so a network nothing holds is itself the missing resource and the member inside
+        // it is never reached.
         NotFoundCase {
             case: "GetMember/unknown-network",
             method: "GET",
             path: format!("/networks/{gone_network}/members/{member_id}"),
-            resource_type: "Member",
-            id: member_id.clone(),
+            resource_type: "Network",
+            id: gone_network.clone(),
+        },
+        NotFoundCase {
+            case: "GetMember/unknown-network-and-member",
+            method: "GET",
+            path: format!("/networks/{other_gone_network}/members/{gone_member}"),
+            resource_type: "Network",
+            id: other_gone_network.clone(),
         },
         NotFoundCase {
             case: "GetNode/unknown-node",
@@ -200,8 +214,8 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             case: "GetNode/unknown-network",
             method: "GET",
             path: format!("/networks/{gone_network}/nodes/{node_id}?memberId={member_id}"),
-            resource_type: "Node",
-            id: node_id.clone(),
+            resource_type: "Network",
+            id: gone_network.clone(),
         },
         NotFoundCase {
             case: "GetNode/other-member",
@@ -221,8 +235,8 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             case: "DeleteNode/unknown-network",
             method: "DELETE",
             path: format!("/networks/{gone_network}/nodes/{node_id}?memberId={member_id}"),
-            resource_type: "Node",
-            id: node_id.clone(),
+            resource_type: "Network",
+            id: gone_network.clone(),
         },
         NotFoundCase {
             case: "GetProposal/unknown-proposal",
@@ -235,8 +249,8 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             case: "GetProposal/unknown-network",
             method: "GET",
             path: format!("/networks/{gone_network}/proposals/{gone_proposal}"),
-            resource_type: "Proposal",
-            id: gone_proposal.clone(),
+            resource_type: "Network",
+            id: gone_network.clone(),
         },
         // A resource that is not part of the network tree at all, to show the rule is
         // about the exception shape and not about one resource hierarchy: an invitation
@@ -247,7 +261,7 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             case: "RejectInvitation/unknown",
             method: "DELETE",
             path: format!("/invitations/{gone_invitation}"),
-            resource_type: "Invitation",
+            resource_type: "InvitationId",
             id: gone_invitation.clone(),
         },
         NotFoundCase {
@@ -295,22 +309,24 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
     }
 
     // The rows that carry a request BODY, so the table above can stay bodyless. An
-    // `UpdateNode` of a node nothing holds names the node, exactly as the reads do — the
-    // rule is about which resource the request identifies, not about the method.
-    for (case, path, id) in [
+    // `UpdateNode` resolves its path labels in the same order the reads do — the rule is
+    // about the request's path, not about the method.
+    for (case, path, resource_type, id) in [
         (
             "UpdateNode/unknown-node",
             format!("/networks/{network_id}/nodes/{gone_node}"),
+            "Node",
             gone_node.clone(),
         ),
         (
             "UpdateNode/unknown-network",
             format!("/networks/{gone_network}/nodes/{node_id}"),
-            node_id.clone(),
+            "Network",
+            gone_network.clone(),
         ),
     ] {
         let answer = call(&router, "PATCH", &path, Some(json!({}))).await;
-        assert_not_found(case, &answer, "Node", &id);
+        assert_not_found(case, &answer, resource_type, &id);
     }
 
     // A create does not act on the resource it is about to mint — that one does not
@@ -357,14 +373,14 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             "CreateMember/unknown-invitation",
             network_id.clone(),
             gone_invitation.clone(),
-            "Invitation",
+            "InvitationId",
             gone_invitation.clone(),
         ),
         (
             "CreateMember/another-unknown-invitation",
             network_id.clone(),
             unknown_id("i", 'H'),
-            "Invitation",
+            "InvitationId",
             unknown_id("i", 'H'),
         ),
         (

@@ -15,9 +15,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Accessor, AccessorSummary, Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
-    MemberLogPublishingConfiguration, MemberSummary, Network, NetworkEthereumAttributes,
-    NetworkFabricAttributes, NetworkFrameworkAttributes, NetworkSummary, Node,
+    Accessor, AccessorSummary, InvalidRequestException, Invitation, Member,
+    MemberFabricAttributes, MemberFrameworkAttributes, MemberLogPublishingConfiguration,
+    MemberSummary, Network, NetworkEthereumAttributes, NetworkFabricAttributes,
+    NetworkFrameworkAttributes, NetworkSummary, Node,
     NodeEthereumAttributes, NodeFabricAttributes, NodeFrameworkAttributes,
     NodeLogPublishingConfiguration, NodeSummary, Proposal, ProposalActions, ProposalSummary,
     ResourceNotFoundException, VotingPolicy,
@@ -279,6 +280,22 @@ pub const DEFAULT_ACCESSOR_NETWORK_TYPE: &str = "ETHEREUM_MAINNET_AND_GOERLI";
 /// How many characters an `AccessorBillingTokenString` has: its `@length(42, 42)` fixes
 /// the length exactly.
 pub const BILLING_TOKEN_LEN: usize = 42;
+
+/// The prefix an accessor id is written with (`ac-NGQ6QNKXKRGRPCLQ3ZDVZYRWRA` is the id
+/// AWS's own `CreateAccessor` reference prints), and the prefix
+/// [`ComAmazonawsManagedblockchainTaigawebserviceState::mint_accessor_id`] mints one
+/// with.
+pub const ACCESSOR_ID_PREFIX: &str = "ac";
+
+/// How many base-32 characters follow the prefix and hyphen in a Managed Blockchain
+/// resource id: `ac-NGQ6QNKXKRGRPCLQ3ZDVZYRWRA` and `n-ABCDEFGHIJKLMNOPQRSTUVWXYZ` are
+/// both the prefix, a hyphen and 26 characters, which is what
+/// [`ComAmazonawsManagedblockchainTaigawebserviceState::mint_id`] writes.
+pub const ID_BODY_LEN: usize = 26;
+
+/// The `GetAccessor` / `DeleteAccessor` input member that carries an accessor id, as the
+/// model names it.
+pub const MEMBER_ACCESSOR_ID: &str = "AccessorId";
 
 /// How many accessors this emulator will hold, for the same reason as [`MAX_NETWORKS`];
 /// `CreateAccessor` models `ResourceLimitExceededException` for exceeding the account's
@@ -1192,21 +1209,26 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         }
     }
 
-    /// Mint a fresh resource id: `prefix`, a hyphen, then 26 characters of the base-32
-    /// alphabet, the shape every Managed Blockchain id takes (`n-` for a network, `m-`
-    /// for a member, `nd-` for a node, `i-` for an invitation), and within
-    /// `ResourceIdString`'s `@length(1, 32)`.
+    /// Mint a fresh resource id: `prefix`, a hyphen, then [`ID_BODY_LEN`] characters of
+    /// the base-32 alphabet, the shape every Managed Blockchain id takes (`n-` for a
+    /// network, `m-` for a member, `nd-` for a node, `i-` for an invitation, `ac-` for an
+    /// accessor), and within `ResourceIdString`'s `@length(1, 32)`.
+    ///
+    /// The body length is read from [`ID_BODY_LEN`], the same constant
+    /// [`id_in_minted_space`] tests a caller's id against, so minting and validating
+    /// cannot drift apart.
     ///
     /// Drawn from a counter the state advances (seeded from the clock on first use),
     /// never from the request, so two identical creates mint two different ids.
     pub fn mint_id(&mut self, prefix: &str) -> String {
-        let high = self.advance();
-        let low = self.advance();
-        let mut id = String::from(prefix);
-        id.push('-');
-        id.push_str(&base32_13(high));
-        id.push_str(&base32_13(low));
-        id
+        let mut drawn = String::new();
+        while drawn.chars().count() < ID_BODY_LEN {
+            drawn.push_str(&base32_13(self.advance()));
+        }
+        // Taken by CHARACTER, so the body is exactly `ID_BODY_LEN` characters of the
+        // alphabet whatever width the draw above happens to have.
+        let body: String = drawn.chars().take(ID_BODY_LEN).collect();
+        format!("{prefix}-{body}")
     }
 
     /// Mint a network id no stored network holds.
@@ -1233,11 +1255,12 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         }
     }
 
-    /// Mint an accessor id no stored accessor holds (`ac-` is the prefix Managed
-    /// Blockchain writes an accessor id with).
+    /// Mint an accessor id no stored accessor holds, in the space
+    /// [`id_in_minted_space`] tests an `AccessorId` against ([`ACCESSOR_ID_PREFIX`] is
+    /// the prefix Managed Blockchain writes an accessor id with).
     pub fn mint_accessor_id(&mut self) -> String {
         loop {
-            let id = self.mint_id("ac");
+            let id = self.mint_id(ACCESSOR_ID_PREFIX);
             if !self.accessors.contains_key(&id) {
                 return id;
             }
@@ -1579,26 +1602,36 @@ pub fn invitation_arn(region: &str, invitation_id: &str) -> String {
     )
 }
 
-/// How this service names the resource type of a network in the prose of a failure.
+/// How this service labels a network it could not resolve in the prose of a failure.
 pub const RESOURCE_NETWORK: &str = "Network";
 
-/// How this service names the resource type of a member in the prose of a failure.
+/// How this service labels a member it could not resolve in the prose of a failure.
 pub const RESOURCE_MEMBER: &str = "Member";
 
-/// How this service names the resource type of a node in the prose of a failure.
+/// How this service labels a node it could not resolve in the prose of a failure.
 pub const RESOURCE_NODE: &str = "Node";
 
-/// How this service names the resource type of an invitation in the prose of a failure.
-pub const RESOURCE_INVITATION: &str = "Invitation";
+/// How this service labels an invitation it could not resolve in the prose of a failure:
+/// the INPUT MEMBER that carried the id, `InvitationId`, not a bare resource noun — which
+/// is why it is named like [`MEMBER_ACCESSOR_ID`] rather than like the `RESOURCE_*`
+/// labels above.
+///
+/// Managed Blockchain is recorded answering `InvitationId <value> not found.` for an
+/// invitation id it cannot resolve, whatever that id looks like. The not-found prose is
+/// the only place the service echoes back WHICH input member it failed to resolve, so an
+/// invitation lookup names that member: `Invitation <value> not found.` would be
+/// indistinguishable from a failure to resolve some other invitation-shaped entity.
+pub const MEMBER_INVITATION_ID: &str = "InvitationId";
 
-/// How this service names the resource type of a proposal in the prose of a failure.
+/// How this service labels a proposal it could not resolve in the prose of a failure.
 pub const RESOURCE_PROPOSAL: &str = "Proposal";
 
-/// How this service names the resource type of an accessor in the prose of a failure.
+/// How this service labels an accessor it could not resolve in the prose of a failure.
 pub const RESOURCE_ACCESSOR: &str = "Accessor";
 
 /// The `ResourceNotFoundException` for a resource the request named and this service does
-/// not hold: `Network n-… not found.`, `Node nd-… not found.`
+/// not hold: `Network n-… not found.`, `Node nd-… not found.`, `InvitationId … not
+/// found.`
 ///
 /// `ResourceNotFoundException$ResourceName` targets `ArnString` — `@length(1, 1011)` and
 /// `@pattern ^arn:.+:.+:.+:.+:.+$` — so the member can only ever carry an ARN. A lookup
@@ -1614,11 +1647,83 @@ pub const RESOURCE_ACCESSOR: &str = "Accessor";
 /// (`TagResource`/`UntagResource`/`ListTagsForResource` take a `ResourceArn`) does have
 /// an ARN to name, so a handler of one of those sets `ResourceName` to that ARN instead
 /// of calling this.
-pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
+pub fn not_found(label: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("{resource_type} {id} not found.")),
+        message: Some(format!("{label} {id} not found.")),
         resource_name: None,
     }
+}
+
+/// Whether `value` is an id of the space this service MINTS ids of `prefix` from:
+/// `prefix`, a hyphen and exactly [`ID_BODY_LEN`] characters of the base-32 alphabet
+/// Managed Blockchain writes an id in — the shape
+/// [`ComAmazonawsManagedblockchainTaigawebserviceState::mint_id`] produces and the one
+/// AWS's own reference prints (`ac-NGQ6QNKXKRGRPCLQ3ZDVZYRWRA`).
+///
+/// This is a FORMAT test on the id space, not a lookup: a well-formed id nothing holds is
+/// a resource that is not found, which is a different answer from an id that could never
+/// have been issued.
+pub fn id_in_minted_space(prefix: &str, value: &str) -> bool {
+    let Some(body) = value
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    body.len() == ID_BODY_LEN && body.bytes().all(|byte| ID_ALPHABET.contains(&byte))
+}
+
+/// Whether the values of input member `member` are drawn from a resource-id SPACE this
+/// service validates against, and which prefix that space writes its ids with. `None` for
+/// a member with no space to test a value against, which is every member but
+/// [`MEMBER_ACCESSOR_ID`]: nothing is claimed about those, and a value the service does
+/// not hold for one of them is simply not found.
+///
+/// Managed Blockchain is recorded rejecting an `AccessorId` outside the accessor-id space
+/// with `InvalidRequestException` — for a 36-character UUID and for a bare 32-character
+/// id alike, so the rejection is about the id SPACE and not about `ResourceIdString`'s
+/// `@length(1, 32)` bound — while an id of another resource family that resolves to
+/// nothing is recorded as a `ResourceNotFoundException` (an `InvitationId` of any shape, a
+/// `NetworkId` of this service's own shape). This is the one table that says which members
+/// those two recordings separate.
+fn id_space_of(member: &str) -> Option<&'static str> {
+    if member == MEMBER_ACCESSOR_ID {
+        Some(ACCESSOR_ID_PREFIX)
+    } else {
+        None
+    }
+}
+
+/// How this service words a value outside the id space its member is drawn from:
+/// `AccessorId parameter <value> is malformed`, naming the input member that carried it
+/// and the value the request held, so the caller can see which of its inputs to fix. A
+/// value the request left EMPTY has nothing to echo, so the sentence states the member
+/// alone rather than reading as a double space.
+///
+/// `None` when there is nothing to refuse: the member has no id space (see
+/// [`id_space_of`]) or the value lies inside it. The two places that can answer such a
+/// request — the service's boundary refusal and the handler that would look the id up —
+/// both word it from here, so they cannot disagree.
+pub fn malformed_id_sentence(member: &str, value: &str) -> Option<String> {
+    let prefix = id_space_of(member)?;
+    if id_in_minted_space(prefix, value) {
+        return None;
+    }
+    if value.is_empty() {
+        return Some(format!("{member} parameter is malformed"));
+    }
+    Some(format!("{member} parameter {value} is malformed"))
+}
+
+/// The `InvalidRequestException` ("The action or operation requested is invalid", HTTP
+/// 400) for a value outside the id space its member is drawn from, worded by
+/// [`malformed_id_sentence`]; `None` when there is nothing to refuse. Raised BEFORE any
+/// lookup: an id the service could never have issued is a request to fix, not a resource
+/// to re-create.
+pub fn malformed_id(member: &str, value: &str) -> Option<InvalidRequestException> {
+    malformed_id_sentence(member, value).map(|message| InvalidRequestException {
+        message: Some(message),
+    })
 }
 
 /// The `ResourceNotFoundException` for a resource the request named BY ARN and this
@@ -1915,15 +2020,19 @@ fn splitmix64(state: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// The base-32 alphabet Managed Blockchain ids are written in (RFC 4648: `A`-`Z` and
+/// `2`-`7`). Single-homed: both the minting of an id ([`base32_13`]) and the test of
+/// whether a caller's id lies in that space ([`id_in_minted_space`]) read it.
+const ID_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
 /// `value` as 13 characters of the base-32 alphabet Managed Blockchain ids are written
 /// in (RFC 4648: `A`-`Z` and `2`-`7`).
 fn base32_13(value: u64) -> String {
-    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     (0..13)
         .map(|i| {
             let shift = 5 * (12 - i);
             let digit = (value >> shift) & 0x1f;
-            char::from(ALPHABET[digit as usize])
+            char::from(ID_ALPHABET[digit as usize])
         })
         .collect()
 }

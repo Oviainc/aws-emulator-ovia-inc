@@ -25,6 +25,8 @@ mod list_members;
 mod modelled_error_payloads;
 #[path = "all/network_and_node_lifecycle.rs"]
 mod network_and_node_lifecycle;
+#[path = "all/not_found_and_malformed_ids.rs"]
+mod not_found_and_malformed_ids;
 #[path = "all/proposal_lifecycle.rs"]
 mod proposal_lifecycle;
 #[path = "all/public_networks_and_membership.rs"]
