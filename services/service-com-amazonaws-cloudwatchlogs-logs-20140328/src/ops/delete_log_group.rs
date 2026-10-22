@@ -181,14 +181,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "When enabled on a log group, deletion protection blocks all deletion
-        // operations until it is explicitly disabled."
+        // operations until it is explicitly disabled." A protected group is refused with
+        // the error the service answers a delete of a protected resource with: a 400
+        // `InvalidParameterException`, the deletion-protection state being the parameter
+        // that makes the request impossible.
         if group.deletion_protection_enabled {
-            return Err(DeleteLogGroupErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    "deletion protection is enabled for this log group and must be disabled before it can be deleted"
-                        .to_string(),
-                ),
-            })
+            return Err(DeleteLogGroupErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "LogGroup has delete protection enabled. Disable delete protection before attempting to delete the resource."
+                            .to_string(),
+                    ),
+                },
+            )
             .into());
         }
 
