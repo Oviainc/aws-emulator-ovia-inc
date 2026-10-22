@@ -259,9 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // nothing to replay.
                 return Err(CreateAutomationRuleErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(
-                            "The rule created with this client token no longer exists.".into(),
-                        ),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -271,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     CreateAutomationRuleErrorModeled::IdempotentParameterMismatchException(
                         IdempotentParameterMismatchException {
                             message: Some(
-                                "The same client token was used with different parameters.".into(),
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
                             ),
                         },
                     )
@@ -382,20 +380,25 @@ fn output_for(rule: &crate::state::StoredRule) -> CreateAutomationRuleOutput {
 ///   after the decimal point)"; the member is a plain `String`.
 fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
     if input.name.is_empty() {
-        return Some("Value '' at 'name' failed to satisfy constraint: Member must have length greater than or equal to 1".to_string());
+        return Some(crate::state::constraint_report(
+            "name",
+            "Member must have length greater than or equal to 1",
+        ));
     }
     if input.rule_type == "OrganizationRule" && input.organization_configuration.is_none() {
-        return Some(
-            "Value null at 'organizationConfiguration' failed to satisfy constraint: Member is \
-             required for the OrganizationRule rule type"
-                .to_string(),
-        );
+        return Some(crate::state::constraint_report(
+            "organizationConfiguration",
+            "Member is required for the OrganizationRule rule type",
+        ));
     }
     match input.priority.as_deref() {
-        Some(priority) if !crate::state::priority_is_valid(priority) => Some(format!(
-            "Value '{priority}' at 'priority' failed to satisfy constraint: Member must be a \
-             decimal number between 0 and 1 with up to 30 digits after the decimal point"
-        )),
+        Some(priority) if !crate::state::priority_is_valid(priority) => {
+            Some(crate::state::constraint_report(
+                "priority",
+                "Member must be a decimal number between 0 and 1 with up to 30 digits after the \
+                 decimal point",
+            ))
+        }
         _ => None,
     }
 }
