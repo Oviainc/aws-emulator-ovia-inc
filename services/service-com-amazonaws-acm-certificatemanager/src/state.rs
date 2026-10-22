@@ -61,6 +61,12 @@ pub const STATUS_ISSUED: &str = "ISSUED";
 /// (`CertificateDetail$Status` doc).
 pub const STATUS_FAILED: &str = "FAILED";
 
+/// `CertificateStatus` of a certificate whose revocation ACM has recorded:
+/// `RevokedAt` and `RevocationReason` "exist only when the certificate status is
+/// REVOKED" (`CertificateDetail$RevokedAt` / `$RevocationReason` docs), so the two
+/// are written beside this status and nowhere else.
+pub const STATUS_REVOKED: &str = "REVOKED";
+
 /// `DomainStatus` of a domain whose ownership has not been proven yet.
 pub const DOMAIN_STATUS_PENDING_VALIDATION: &str = "PENDING_VALIDATION";
 
@@ -124,6 +130,14 @@ pub const KEY_PAIR_ORIGIN_AWS_MANAGED: &str = "AWS_MANAGED";
 /// `CertificateExport` when `Options.Export` is absent: export is opt-in
 /// (`CertificateOptions$Export` doc).
 pub const EXPORT_DISABLED: &str = "DISABLED";
+
+/// `CertificateExport` of a certificate whose owner opted in to export: "You can opt
+/// in to allow the export of your certificates by specifying ENABLED. You cannot
+/// update the value of Export after the the certificate is created"
+/// (`CertificateOptions$Export` doc) — so this is fixed when the certificate is
+/// created and is what decides whether it may ever be exported, and therefore
+/// revoked.
+pub const EXPORT_ENABLED: &str = "ENABLED";
 
 /// `RecordType` of the DNS validation record: "Currently this can be `CNAME`"
 /// (`ResourceRecord$Type` doc).
@@ -344,8 +358,17 @@ pub struct Certificate {
     /// The `ExtendedKeyUsageName` values of the certificate's X.509 Extended Key
     /// Usage extensions, with the same lifecycle as [`Self::key_usages`].
     pub extended_key_usages: Vec<String>,
-    /// Whether the certificate has ever been exported.
+    /// Whether the certificate has ever been exported. Only an exported certificate
+    /// may be revoked (`RevokeCertificate` doc: "You can only revoke certificates
+    /// that have been previously exported").
     pub exported: bool,
+    /// When the certificate was revoked, which "exists only when the certificate
+    /// status is REVOKED" (`CertificateDetail$RevokedAt` doc).
+    pub revoked_at: Option<SystemTime>,
+    /// A `RevocationReason` value — the reason the caller gave `RevokeCertificate` —
+    /// which "exists only when the certificate status is REVOKED"
+    /// (`CertificateDetail$RevocationReason` doc).
+    pub revocation_reason: Option<String>,
     pub created_at: SystemTime,
     pub issued_at: Option<SystemTime>,
     pub not_before: Option<SystemTime>,
@@ -376,6 +399,41 @@ impl Certificate {
                 self.fail(FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED);
             }
         }
+    }
+
+    /// Whether export was allowed for this certificate when it was created: "You can
+    /// opt in to allow the export of your certificates by specifying ENABLED. You
+    /// cannot update the value of Export after the the certificate is created"
+    /// (`CertificateOptions$Export` doc).
+    pub fn export_allowed(&self) -> bool {
+        export_option(self) == EXPORT_ENABLED
+    }
+
+    /// Whether this certificate is in the state `RevokeCertificate` applies to.
+    ///
+    /// "Revokes a public ACM certificate. You can only revoke certificates that have
+    /// been previously exported" and "revoking a certificate is permanent"
+    /// (`RevokeCertificate` doc): the export is what put the private key outside ACM,
+    /// and a certificate whose revocation is already recorded has nothing left to
+    /// revoke.
+    pub fn is_revocable(&self) -> bool {
+        self.export_allowed() && self.exported && !self.is_revoked()
+    }
+
+    /// Whether this certificate's revocation is already recorded.
+    pub fn is_revoked(&self) -> bool {
+        self.status == STATUS_REVOKED || self.revoked_at.is_some()
+    }
+
+    /// Record this certificate as revoked at `at` for `reason`.
+    ///
+    /// The validity window and the issuance members stay as issued — the certificate
+    /// was issued and still carries those facts; what changes is its status and the
+    /// two members that exist only beside it.
+    pub fn revoke(&mut self, at: SystemTime, reason: &str) {
+        self.status = STATUS_REVOKED.to_string();
+        self.revoked_at = Some(at);
+        self.revocation_reason = Some(reason.to_string());
     }
 
     /// Record this certificate as issued at `at`: every domain is proven, the
@@ -552,6 +610,21 @@ pub fn invalid_arn_message(certificate_arn: &str) -> String {
 /// template cannot drift between the lookup paths.
 pub fn certificate_not_found_message(certificate_arn: &str) -> String {
     format!("Could not find certificate {certificate_arn}.")
+}
+
+/// The `ValidationException` message for an operation asked of a certificate export
+/// was never allowed for, built from the ARN the request asked for.
+///
+/// Export is opt-in at creation (`CertificateOptions$Export` doc), and an operation
+/// that only applies to an exported certificate — `RevokeCertificate`: "You can only
+/// revoke certificates that have been previously exported" — cannot apply to one that
+/// may not be exported at all. `ValidationException` carries one modelled member
+/// (`message: String`) and the model documents no text for it, so the sentence comes
+/// from ACM's recorded behaviour: `Export not allowed for certificate` followed by the
+/// requested ARN. Rendered here so every export-eligibility path reports the same
+/// sentence.
+pub fn export_not_allowed_message(certificate_arn: &str) -> String {
+    format!("Export not allowed for certificate {certificate_arn}")
 }
 
 /// A wall-clock instant as the modelled `TStamp`.
@@ -743,6 +816,11 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
         // "This value exists only when the certificate status is FAILED"
         // (`CertificateDetail$FailureReason` doc), which is what the record stores.
         failure_reason: cert.failure_reason.clone(),
+        // Both "exist only when the certificate status is REVOKED"
+        // (`CertificateDetail$RevokedAt` / `$RevocationReason` docs), and the record
+        // only ever carries them together with that status.
+        revoked_at: cert.revoked_at.map(to_date_time),
+        revocation_reason: cert.revocation_reason.clone(),
         options: cert.options.clone(),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
         ..CertificateDetail::default()
@@ -780,6 +858,8 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         not_after: cert.not_after.map(to_date_time),
         created_at: Some(to_date_time(cert.created_at)),
         issued_at: cert.issued_at.map(to_date_time),
+        // Present only for a revoked certificate, as on `CertificateDetail`.
+        revoked_at: cert.revoked_at.map(to_date_time),
         managed_by: cert.managed_by.clone(),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
         ..CertificateSummary::default()

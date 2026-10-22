@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the revocation of the certificate named by `CertificateArn`
+//! on the stored record — `REVOKED`, with the instant it happened and the reason the
+//! caller gave — so `DescribeCertificate` and `ListCertificates` report it, and
+//! refuses any certificate the store shows is not in the state this operation
+//! applies to.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the acm certificate store is unavailable",
+            ));
+        };
+
+        // An ARN that does not name an ACM certificate at all is classified before any
+        // lookup, exactly as on every other operation that resolves `CertificateArn`.
+        if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
+            return Err(RevokeCertificateErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
+                },
+            )
+            .into());
+        }
+
+        // ONE instant answers the whole request: it materialises whatever the clock
+        // already owed and dates the revocation this call records.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // Materialise what the clock already owes before deciding whether this
+        // certificate may be revoked, so the decision is made on the record a caller
+        // would see rather than a stale one.
+        store.materialize_due(now);
+
+        let Some(certificate) = store.certificates.get_mut(&input.certificate_arn) else {
+            return Err(RevokeCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::certificate_not_found_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "You can only revoke certificates that have been previously exported" and
+        // "revoking a certificate is permanent" (`RevokeCertificate` doc). A
+        // certificate outside that state is a request this operation does not apply
+        // to, which is what `ValidationException` reports ("the supplied input failed
+        // to satisfy constraints of an Amazon Web Services service"). Three conditions
+        // put a certificate outside it, each reported with its own sentence so a
+        // caller can tell them apart:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeCertificate"))
+        // * export was never allowed for the certificate, which is fixed at creation
+        //   (`CertificateOptions$Export`) — so it can never have been exported, and
+        //   this is the sentence ACM answers (`export_not_allowed_message`);
+        // * export is allowed but the certificate has not been exported yet, so there
+        //   is no copy of it outside ACM to revoke;
+        // * its revocation is already recorded, and revocation is permanent.
+        if !certificate.is_revocable() {
+            let message = if !certificate.export_allowed() {
+                crate::state::export_not_allowed_message(&input.certificate_arn)
+            } else if certificate.is_revoked() {
+                format!(
+                    "Certificate {} has already been revoked",
+                    input.certificate_arn
+                )
+            } else {
+                format!(
+                    "Certificate {} has not been exported; only a certificate that has been \
+                     exported can be revoked",
+                    input.certificate_arn
+                )
+            };
+            return Err(RevokeCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "The certificate is in use by another Amazon Web Services service in the
+        // caller's account. Remove the association and try again."
+        // (`ResourceInUseException` doc) — revoking a certificate another service is
+        // serving would break that service, so ACM refuses it.
+        //
+        // `in_use_by` is only ever populated by the service that associates a
+        // certificate with a load balancer, distribution or API, and no operation in
+        // this emulator does that yet, so this refusal cannot fire today. It is the
+        // modelled answer for the real condition and is kept here, as on
+        // `DeleteCertificate`, for whichever gap issue adds that association.
+        if !certificate.in_use_by.is_empty() {
+            let in_use_by = certificate.in_use_by.join(", ");
+            return Err(RevokeCertificateErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Certificate {} is in use by {in_use_by}",
+                        input.certificate_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The revocation is recorded on the stored record, so every later read of this
+        // certificate reports it. `RevocationReason` is the caller's own
+        // `RevocationReason` value, whose membership of the enum the request walk
+        // already checked.
+        certificate.revoke(now, &input.revocation_reason);
+
+        Ok(RevokeCertificateOutput {
+            certificate_arn: Some(input.certificate_arn.clone()),
+        })
     }
 }
