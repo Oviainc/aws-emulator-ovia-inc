@@ -65,6 +65,99 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
+/// The SigV4 credential-scope terminator every signing flavour ends its scope with.
+const SCOPE_TERMINATOR: &str = "aws4_request";
+
+/// The prefix of every SigV4-family signing algorithm: `AWS4-HMAC-SHA256` (SigV4) and
+/// `AWS4-ECDSA-P256-SHA256` (SigV4A) today.
+const SIGV4_ALGORITHM_PREFIX: &str = "AWS4-";
+
+/// The label an AWS endpoint host may carry AHEAD of the service name, as this
+/// service's own endpoint rules publish it
+/// (`https://api.sustainability.{Region}.{dualStackDnsSuffix}` — see
+/// `smithy_query(query="service_info")`, `endpointResolution.urlTemplates`).
+const ENDPOINT_HOST_PREFIX: &str = "api";
+
+/// The FIPS marker an endpoint host appends to the service name
+/// (`https://sustainability-fips.global.{dualStackDnsSuffix}`, same source).
+const FIPS_SUFFIX: &str = "-fips";
+
+/// The signing name the SigV4 credential scope of `parts` names, for ANY signing
+/// flavour of the SigV4 family — lower-cased, as the framework's own route keys are.
+///
+/// A credential scope is `<access key id>/<date>[/<region>]/<signing name>/aws4_request`:
+/// the SigV4A form (`AWS4-ECDSA-P256-SHA256`) omits the region segment, because a
+/// SigV4A signature is valid across a SET of regions, which the request carries in
+/// `X-Amz-Region-Set` instead. The signing name is therefore read as the field BEFORE
+/// the `aws4_request` terminator rather than as a fixed fourth field, which reads both
+/// forms and is what makes a SigV4A-signed request routable at all.
+///
+/// The scope is read from the `Authorization` header, and failing that from a presigned
+/// URL's `X-Amz-Credential` query parameter (whose `/` separators arrive percent-encoded),
+/// so the reader does not depend on WHERE the protocol carries the scope.
+fn credential_scope_signing_name(parts: &http::request::Parts) -> Option<String> {
+    let scope = authorization_scope(&parts.headers).or_else(|| presigned_scope(&parts.uri))?;
+    let mut fields = scope.split('/').rev();
+    let terminator = fields.next()?;
+    let signing_name = fields.next()?;
+    // `[access key id, date]` for SigV4A, `[access key id, date, region]` for SigV4:
+    // the region is optional, the other two are not, and no flavour carries more.
+    let leading = fields.count();
+    if terminator != SCOPE_TERMINATOR || signing_name.is_empty() || !(2..=3).contains(&leading) {
+        return None;
+    }
+    Some(signing_name.trim().to_ascii_lowercase())
+}
+
+/// The credential scope of an `Authorization` header signed by any SigV4-family
+/// algorithm: the value of its `Credential=` field.
+fn authorization_scope(headers: &http::HeaderMap) -> Option<String> {
+    let header = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+    let (algorithm, fields) = header.split_once(' ')?;
+    if !algorithm.starts_with(SIGV4_ALGORITHM_PREFIX) {
+        return None;
+    }
+    let field = fields
+        .split(',')
+        .find_map(|field| field.trim().strip_prefix("Credential="))?;
+    Some(field.trim().to_string())
+}
+
+/// The credential scope of a presigned URL, whose `X-Amz-Credential` query parameter
+/// carries the same scope with its `/` separators percent-encoded.
+fn presigned_scope(uri: &http::Uri) -> Option<String> {
+    let encoded = uri.query()?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "X-Amz-Credential").then_some(value)
+    })?;
+    Some(encoded.replace("%2F", "/").replace("%2f", "/"))
+}
+
+/// The service name the host-style endpoint of `parts` addresses, lower-cased.
+///
+/// An AWS endpoint host names its service in the first label, optionally behind the
+/// `api.` prefix its endpoint rules publish, and optionally with the `-fips` marker of
+/// a FIPS endpoint appended; the remaining labels name the region and the DNS suffix.
+/// The framework's own host reader takes the FIRST label only, so a request addressed
+/// to a host of the `api.<service>.…` form resolves to `api` and names no service.
+fn endpoint_host_service_name(parts: &http::request::Parts) -> Option<String> {
+    let host = match parts.headers.get(http::header::HOST) {
+        Some(host) => host.to_str().ok()?,
+        None => parts.uri.host()?,
+    };
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let mut labels = host.split('.');
+    let first = labels.next()?;
+    let named = if first.eq_ignore_ascii_case(ENDPOINT_HOST_PREFIX) {
+        labels.next()?
+    } else {
+        first
+    };
+    let named = named.strip_suffix(FIPS_SUFFIX).unwrap_or(named);
+    (!named.is_empty()).then(|| named.to_ascii_lowercase())
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -74,13 +167,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service's model lists `aws.auth#sigv4a` FIRST, so an SDK configured for
+        // it signs with SigV4A (`AWS4-ECDSA-P256-SHA256`), whose credential scope has
+        // no region segment; and it is addressed on `api.sustainability.<region>.…`,
+        // whose FIRST host label is the `api` prefix rather than the service. The
+        // framework's `resolve_route_key` reads a plain `AWS4-HMAC-SHA256` scope, then
+        // `X-Amz-Target` (which `restJson1` never sends), then the first host label, so
+        // a SigV4A-signed request to this service resolves to NO key at all and is left
+        // unclaimed — which the router answers `404 UnknownService` in its own
+        // awsJson1_1 envelope, an error code this service's model does not declare.
+        //
+        // So the claim is widened by the two signals the model does publish, each
+        // naming this service's own signing name: a credential scope of ANY
+        // SigV4-family flavour, and a host-style endpoint of the forms this service's
+        // endpoint rules resolve to. Both name one service, so neither can make a peer
+        // claim the same request.
+        let signing_name = self.entry.identity().signing_name();
+        let names_this_service =
+            |name: &String| name.trim().eq_ignore_ascii_case(signing_name.trim());
+        smithy_server_runtime::resolve_route_key(parts)
+            .as_ref()
+            .is_some_and(names_this_service)
+            || credential_scope_signing_name(parts)
+                .as_ref()
+                .is_some_and(names_this_service)
+            || endpoint_host_service_name(parts)
+                .as_ref()
+                .is_some_and(names_this_service)
     }
 
     fn override_operation(
