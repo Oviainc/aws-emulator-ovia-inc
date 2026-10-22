@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a stream record and persists it in [`crate::state`]. The stream is returned
+//! in the non-terminal `CREATING` status — the model calls `CreateStream` "an
+//! asynchronous operation" — and the clock owes it `ACTIVE` after
+//! [`crate::state::STREAM_ACTIVATION_SPAN`]. A create past
+//! [`crate::state::MAX_STREAMS`], the emulator's own ceiling on the stream index, is
+//! refused with the modeled `AccountStreamLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +190,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStream"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateStreamErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("The stream store is unavailable. Try again later.".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        // The stream name is the per-account, per-region identifier, so a create
+        // under a name already in the store is a conflict, never an update.
+        if store.streams.contains_key(&input.stream_name) {
+            return Err(CreateStreamErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "The stream {} already exists in this account and region.",
+                        input.stream_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store grows by one record per create and shrinks only on an explicit
+        // delete, so the index carries the emulator's own ceiling and a create past
+        // it is refused with the error the model declares for exactly this case.
+        if store.streams.len() >= crate::state::MAX_STREAMS {
+            return Err(
+                CreateStreamErrorModeled::AccountStreamLimitExceededException(
+                    AccountStreamLimitExceededException {
+                        message: Some(format!(
+                            "The number of streams created for the account is too high. \
+                             This account and region already holds {} streams; \
+                             delete a stream before creating another.",
+                            crate::state::MAX_STREAMS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let creation_time_millis = crate::state::now_millis();
+        let stream_arn =
+            crate::state::stream_arn(&region, &input.stream_name, creation_time_millis);
+        let version = store.mint_version();
+        let stream = crate::state::Stream {
+            stream_name: input.stream_name.clone(),
+            stream_arn: stream_arn.clone(),
+            device_name: input.device_name,
+            media_type: input.media_type,
+            // "If no key ID is specified, the default, Kinesis Video-managed key
+            // (aws/kinesisvideo) is used."
+            kms_key_id: input
+                .kms_key_id
+                .unwrap_or_else(|| crate::state::default_kms_key_id(&region)),
+            version,
+            status: crate::state::STATUS_CREATING.to_string(),
+            creation_time_millis,
+            // "The default value is 0, indicating that the stream does not persist data."
+            data_retention_in_hours: input.data_retention_in_hours.unwrap_or(0),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            default_storage_tier: input
+                .stream_storage_configuration
+                .map(|config| config.default_storage_tier),
+            activates_at: Some(::std::time::Instant::now() + crate::state::STREAM_ACTIVATION_SPAN),
+        };
+
+        store
+            .stream_arn_index
+            .insert(stream_arn.clone(), input.stream_name.clone());
+        store.streams.insert(input.stream_name, stream);
+
+        Ok(CreateStreamOutput {
+            stream_arn: Some(stream_arn),
+        })
     }
 }

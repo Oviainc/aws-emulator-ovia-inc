@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDataEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDataEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the data-plane base URL for a stored stream. Reporting only: the single
+//! write it performs is
+//! [`crate::state::ComAmazonawsKinesisvideoKinesisvideo20170930State::settle_clock`],
+//! which materialises status moves the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDataEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDataEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDataEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDataEndpointErrorModeled::ClientLimitExceededException(
+                ClientLimitExceededException {
+                    message: Some("The stream store is unavailable. Try again later.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `APIName` is a modeled enum, so the boundary already refuses a value outside
+        // its set; this re-states the same rule from the one list the model publishes.
+        if !A_P_I_NAME_VALUES.contains(&input.api_name.as_str()) {
+            return Err(GetDataEndpointErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "APIName must be one of {}.",
+                        A_P_I_NAME_VALUES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        store.settle_clock();
+
+        // The endpoint is reported only for a stream that is actually in the store.
+        store
+            .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
+            .map_err(lookup_error)?;
+
+        Ok(GetDataEndpointOutput {
+            data_endpoint: Some(crate::state::request_endpoint(ctx.parts(), &region)),
+        })
     }
+}
+
+/// State the failure to resolve a `StreamName`/`StreamARN` pair as this service's
+/// own modeled error: absent or contradictory identifiers are a bad argument (400),
+/// a well-formed identifier for no stored stream is a missing resource (404).
+fn lookup_error(error: crate::state::StreamLookupError) -> GetDataEndpointError {
+    match error {
+        crate::state::StreamLookupError::NoIdentifier => {
+            GetDataEndpointErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some("Either StreamName or StreamARN must be specified.".to_string()),
+            })
+        }
+        crate::state::StreamLookupError::Mismatch => {
+            GetDataEndpointErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some("StreamName and StreamARN refer to different streams.".to_string()),
+            })
+        }
+        crate::state::StreamLookupError::NotFound => {
+            GetDataEndpointErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some("The specified stream does not exist.".to_string()),
+            })
+        }
+    }
+    .into()
 }
