@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgentRuntime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgentRuntime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgentRuntime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored agent runtime version: what `CreateAgentRuntime` /
+//! `UpdateAgentRuntime` persisted in [`crate::state`], never anything echoed from
+//! this request. `@readonly`, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +188,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgentRuntime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgentRuntimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgentRuntime"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAgentRuntimeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the agent runtime store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        let not_found = || {
+            GetAgentRuntimeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "no agent runtime {} in this account",
+                    input.agent_runtime_id
+                )),
+            })
+        };
+        let record = store
+            .agent_runtimes
+            .get(&input.agent_runtime_id)
+            .ok_or_else(not_found)?;
+        // A `version` no stored version matches is as absent as an unknown id.
+        let version = record
+            .version_for(input.agent_runtime_version.as_deref())
+            .ok_or_else(not_found)?;
+
+        Ok(GetAgentRuntimeOutput {
+            agent_runtime_arn: record.agent_runtime_arn.clone(),
+            agent_runtime_name: record.agent_runtime_name.clone(),
+            agent_runtime_id: record.agent_runtime_id.clone(),
+            agent_runtime_version: version.version_string(),
+            created_at: crate::state::timestamp(record.created_at),
+            last_updated_at: crate::state::timestamp(version.last_updated_at),
+            role_arn: version.role_arn.clone(),
+            network_configuration: version.network_configuration.clone(),
+            status: version.status_at(now).to_string(),
+            lifecycle_configuration: version.lifecycle_configuration.clone(),
+            failure_reason: version.failure_reason.clone(),
+            description: version.description.clone(),
+            workload_identity_details: record.workload_identity_details.clone(),
+            agent_runtime_artifact: Some(version.agent_runtime_artifact.clone()),
+            protocol_configuration: version.protocol_configuration.clone(),
+            environment_variables: (!version.environment_variables.is_empty()).then(|| {
+                version
+                    .environment_variables
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }),
+            authorizer_configuration: version.authorizer_configuration.clone(),
+            request_header_configuration: version.request_header_configuration.clone(),
+            metadata_configuration: version.metadata_configuration.clone(),
+            filesystem_configurations: (!version.filesystem_configurations.is_empty())
+                .then(|| version.filesystem_configurations.clone()),
+            capacity_provider_configuration: version.capacity_provider_configuration.clone(),
+            platform_version: version.platform_version.clone(),
+        })
     }
 }
