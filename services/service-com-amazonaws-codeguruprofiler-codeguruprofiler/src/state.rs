@@ -242,6 +242,41 @@ impl ProfilingGroup {
         true
     }
 
+    /// The span the retained profiles inside `[start, end]` cover, as (earliest receipt
+    /// time, latest receipt time), or `None` when this group retains no profile in that
+    /// window. Both bounds are inclusive, and the answer is derived from the stored
+    /// receipt times alone — this is what `GetRecommendations` reports as the span its
+    /// analysis is about.
+    ///
+    /// Instants are compared through [`instant_key`], so two receipt times a fraction of
+    /// a microsecond apart still order exactly.
+    pub fn profile_span_in(&self, start: DateTime, end: DateTime) -> Option<(DateTime, DateTime)> {
+        let (lower, upper) = (instant_key(start), instant_key(end));
+        let mut span: Option<(DateTime, DateTime)> = None;
+        for profile in &self.profiles {
+            let at = instant_key(profile.received_at);
+            if at < lower || at > upper {
+                continue;
+            }
+            span = Some(match span {
+                None => (profile.received_at, profile.received_at),
+                Some((earliest, latest)) => (
+                    if at < instant_key(earliest) {
+                        profile.received_at
+                    } else {
+                        earliest
+                    },
+                    if at > instant_key(latest) {
+                        profile.received_at
+                    } else {
+                        latest
+                    },
+                ),
+            });
+        }
+        span
+    }
+
     /// This group's recorded findings reports that a listing of `[start, end]` reports:
     /// those whose analysed profile window overlaps that range, and — when
     /// `daily_only` — only those over a daily (`P1D`) profile. Ordered by analysed
@@ -403,6 +438,16 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         }
         oldest.map(|(name, index, _)| (name, index))
     }
+}
+
+/// One instant as an EXACTLY comparable key: whole seconds and sub-second nanoseconds.
+///
+/// `DateTime` carries nanosecond resolution, which an `f64` of current epoch seconds
+/// cannot represent (its granularity there is coarser than a microsecond), so two
+/// instants a fraction of a microsecond apart would compare equal. Ordering and
+/// inclusive-bound tests on stored timestamps go through this instead.
+pub fn instant_key(at: DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
 }
 
 /// The ARN of a profiling group:

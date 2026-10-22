@@ -15,6 +15,8 @@
 mod findings_reports_listing;
 #[path = "all/profiling_group_lifecycle.rs"]
 mod profiling_group_lifecycle;
+#[path = "all/recommendations_analysis.rs"]
+mod recommendations_analysis;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_profiling_group.rs"]
