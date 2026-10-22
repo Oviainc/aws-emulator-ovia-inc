@@ -39,22 +39,23 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for — deliberately not the emulator's
 /// default, so a region echoed into an ARN must have come from the request.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
-/// One emulator holding one shared engine, driven over HTTP.
-struct Lattice {
+/// One emulator holding one shared engine, driven over HTTP. Shared with the other
+/// suites of this test target, so every suite drives one harness.
+pub(crate) struct Lattice {
     router: MultiServiceRouter,
 }
 
 /// What one call answered: the HTTP status, the parsed body, and the wire error code.
-struct Answer {
-    status: u16,
-    body: serde_json::Value,
-    error_code: Option<String>,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: serde_json::Value,
+    pub(crate) error_code: Option<String>,
 }
 
 impl Answer {
-    fn str_field(&self, member: &str) -> String {
+    pub(crate) fn str_field(&self, member: &str) -> String {
         self.body[member]
             .as_str()
             .unwrap_or_else(|| {
@@ -68,7 +69,7 @@ impl Answer {
 }
 
 impl Lattice {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // The single shared engine the router builds in production, handed to every
         // operation of this service through its constructor.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -78,7 +79,12 @@ impl Lattice {
         Self { router }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<serde_json::Value>) -> Answer {
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Answer {
         let payload = body
             .map(|value| serde_json::to_vec(&value).expect("the test body serializes"))
             .unwrap_or_default();
@@ -124,25 +130,25 @@ impl Lattice {
         }
     }
 
-    async fn create_service_network(&self, body: serde_json::Value) -> Answer {
+    pub(crate) async fn create_service_network(&self, body: serde_json::Value) -> Answer {
         self.call("POST", "/servicenetworks", Some(body)).await
     }
 
-    async fn create_service(&self, body: serde_json::Value) -> Answer {
+    pub(crate) async fn create_service(&self, body: serde_json::Value) -> Answer {
         self.call("POST", "/services", Some(body)).await
     }
 
-    async fn get_service(&self, identifier: &str) -> Answer {
+    pub(crate) async fn get_service(&self, identifier: &str) -> Answer {
         self.call("GET", &format!("/services/{identifier}"), None)
             .await
     }
 
-    async fn get_service_network(&self, identifier: &str) -> Answer {
+    pub(crate) async fn get_service_network(&self, identifier: &str) -> Answer {
         self.call("GET", &format!("/servicenetworks/{identifier}"), None)
             .await
     }
 
-    async fn associate(&self, service: &str, network: &str) -> Answer {
+    pub(crate) async fn associate(&self, service: &str, network: &str) -> Answer {
         self.call(
             "POST",
             "/servicenetworkserviceassociations",
@@ -157,7 +163,7 @@ impl Lattice {
 
 /// An ARN used as an `@httpLabel`, encoded the way an AWS SDK encodes a non-greedy
 /// label: the `/` before the resource id becomes `%2F` so it stays one path segment.
-fn as_label(value: &str) -> String {
+pub(crate) fn as_label(value: &str) -> String {
     value.replace('/', "%2F")
 }
 
