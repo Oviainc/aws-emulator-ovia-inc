@@ -339,7 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Built from the members that define the data store — never from the token
 /// itself — with tags taken keyed rather than in arrival order, and the region
-/// included because it is what the minted ARN and endpoint are built from.
+/// included because it is what the minted ARN and endpoint are built from. The
+/// length-prefixed folding itself lives in [`crate::state::request_fingerprint`],
+/// shared with the other creates that honour an idempotency token.
 fn request_fingerprint(
     region: &str,
     name: Option<&str>,
@@ -347,22 +349,23 @@ fn request_fingerprint(
     tags: &::std::collections::BTreeMap<String, String>,
     input: &CreateFHIRDatastoreInput,
 ) -> String {
-    use sha2::Digest;
-
-    let mut hasher = sha2::Sha256::new();
-    for field in [
+    let mut fields = vec![
         region.to_string(),
         // An absent name and an empty one are different requests, so presence
         // is part of the field rather than collapsed by a default.
-        match name {
-            Some(name) => format!("present:{name}"),
-            None => "absent".to_string(),
-        },
+        crate::state::optional_field("DatastoreName", name),
         type_version.to_string(),
-        format!("{tags:?}"),
-        // The configuration shapes have no canonical string form of their own;
-        // their derived `Debug` is deterministic for a given value, which is
-        // all a fingerprint needs.
+        format!("Tags={}", tags.len()),
+    ];
+    // Keyed and ordered, so two requests that differ only in the order their
+    // tags arrived are the same request.
+    for (key, value) in tags {
+        fields.push(key.clone());
+        fields.push(value.clone());
+    }
+    fields.extend([
+        // The configuration shapes carry no map, so their derived `Debug` has a
+        // canonical form for a given value, which is all a fingerprint needs.
         format!("{:?}", input.sse_configuration),
         format!("{:?}", input.preload_data_config),
         format!("{:?}", input.identity_provider_configuration),
@@ -370,10 +373,6 @@ fn request_fingerprint(
         format!("{:?}", input.nlp_configuration),
         format!("{:?}", input.profile_configuration),
         format!("{:?}", input.backup_configuration),
-    ] {
-        // Length-prefixed, so two different field splits cannot hash alike.
-        hasher.update(field.len().to_be_bytes());
-        hasher.update(field.as_bytes());
-    }
-    hex::encode(hasher.finalize())
+    ]);
+    crate::state::request_fingerprint(fields)
 }
