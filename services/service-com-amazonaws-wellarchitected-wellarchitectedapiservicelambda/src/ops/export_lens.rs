@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportLens
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportLens`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportLens::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads back the lens document `ImportLens` recorded in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lenses`].
+//! A pure read: it writes nothing, and reports a lens whose import has not landed yet as
+//! not found.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportLens` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportLensErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportLens"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ExportLensErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool lens store is unavailable".to_string(),
+            })
+        })?;
+
+        // "Lenses provided by Amazon Web Services (Amazon Web Services Official Content)
+        // cannot be exported" (this operation's doc). The refusal is about the lens the
+        // request NAMED, so it is a validation failure on `LensAlias` rather than a
+        // lookup miss — the lens exists, it just cannot be exported.
+        if crate::state::is_aws_official_lens(&input.lens_alias) {
+            return Err(ExportLensErrorModeled::ValidationException(
+                crate::state::member_constraint_exception(
+                    "LensAlias",
+                    "Member must be the ARN of a custom lens; a lens provided by Amazon Web \
+                     Services cannot be exported",
+                ),
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+        let record = store.lens_by_alias(&input.lens_alias).ok_or_else(|| {
+            ExportLensErrorModeled::ResourceNotFoundException(crate::state::lens_not_found(
+                &input.lens_alias,
+            ))
+        })?;
+
+        // "The lens version to be exported": a version exists only once
+        // `CreateLensVersion` has published it from the draft, so a request naming one
+        // resolves against the published versions and nothing else.
+        let content = match input.lens_version.as_deref() {
+            Some(version) => record.versions.get(version).ok_or_else(|| {
+                ExportLensErrorModeled::ResourceNotFoundException(
+                    crate::state::lens_version_not_found(&input.lens_alias, version),
+                )
+            })?,
+            // Without a version, the lens's current content: the latest import that has
+            // landed. While the first import of a lens is still in flight there is no
+            // lens content to export yet.
+            None => record.settled_content(now).ok_or_else(|| {
+                ExportLensErrorModeled::ResourceNotFoundException(crate::state::lens_not_found(
+                    &input.lens_alias,
+                ))
+            })?,
+        };
+
+        Ok(ExportLensOutput {
+            lens_json: Some(content.json.clone()),
+        })
     }
 }
