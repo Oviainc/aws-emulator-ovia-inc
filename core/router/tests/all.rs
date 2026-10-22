@@ -86,3 +86,5 @@ mod sagemaker_signing_name_routing;
 mod bedrock_signing_name_routing;
 #[path = "all/billing_access_denied_principal_agrees_with_sts.rs"]
 mod billing_access_denied_principal_agrees_with_sts;
+#[path = "all/connectcampaigns_signing_name_routing.rs"]
+mod connectcampaigns_signing_name_routing;
