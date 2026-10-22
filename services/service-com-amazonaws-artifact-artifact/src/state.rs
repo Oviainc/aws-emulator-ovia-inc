@@ -15,8 +15,16 @@
 //! persisted here so `GetReport` can check it against the report and version it was
 //! issued for.
 //!
-//! The CUSTOMER-AGREEMENT set is held the same way, and for the same reason: the API has
-//! no operation that creates, accepts or terminates one — an account's agreements are
+//! COMPLIANCE INQUIRIES are the one thing a caller CREATES through this API:
+//! `CreateComplianceInquiry` mints one, so the records live in the state struct rather
+//! than in its [`Default`]. An inquiry carries its own clock-owed transition — AWS
+//! answers the create with HTTP 202 and a non-terminal `PROCESSING` status — which
+//! [`ComplianceInquiry::materialise`] applies from the stored due instant, so a reader
+//! only ever materialises a change the clock had already made due.
+//!
+//! The CUSTOMER-AGREEMENT set is held the same way as the catalog, and for the same
+//! reason: the API has no operation that creates, accepts or terminates one — an
+//! account's agreements are
 //! established outside this API — so the set a caller can see is persisted state built by
 //! this struct's [`Default`], and `ListCustomerAgreements` only reads it. Unlike a report,
 //! a customer-agreement belongs to the calling identity's ACCOUNT, which is what its ARN
@@ -26,8 +34,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, CustomerAgreementSummary, ReportDetail, ReportSummary,
-    ResourceNotFoundException, ValidationException,
+    ConflictException, CustomerAgreementSummary, InquiryDetail, InquirySummary, ReportDetail,
+    ReportSummary, ResourceNotFoundException, ValidationException,
 };
 
 /// The region a report ARN names when the request carries no SigV4 credential scope to
@@ -78,6 +86,82 @@ pub const TERM_GRANT_CAPACITY: usize = 1_000;
 /// `ValidationExceptionReason`'s value for a pagination or term token the service did
 /// not issue.
 pub const REASON_INVALID_TOKEN: &str = "invalidToken";
+
+/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
+/// report for a compliance inquiry id.
+pub const INQUIRY_RESOURCE_TYPE: &str = "ComplianceInquiry";
+
+/// How many compliance inquiries the store holds before `CreateComplianceInquiry`
+/// refuses another.
+///
+/// AWS publishes no quota on compliance inquiries per account, so this is the emulator's
+/// OWN bound on its state rather than a claim about the service: it is what stops a
+/// caller submitting inquiries in a loop from growing `inquiries` without end. Nothing
+/// is evicted to make room — an inquiry is a resource the caller created and a later
+/// `GetComplianceInquiryMetadata` must still find it — so the create is refused instead.
+pub const INQUIRY_CAPACITY: usize = 1_000;
+
+/// How many `CreateComplianceInquiry` `clientToken` records are remembered for replay
+/// before the oldest is forgotten. The same kind of emulator-owned bound as
+/// [`INQUIRY_CAPACITY`]: AWS documents no lifetime for this token, so the records are
+/// bounded by count rather than expired on a span this emulator would be inventing.
+pub const INQUIRY_IDEMPOTENCY_CAPACITY: usize = 1_000;
+
+/// How long after the create call an inquiry's processing is due to be over.
+///
+/// AWS answers `CreateComplianceInquiry` with HTTP 202 and a `PROCESSING` inquiry, so
+/// the terminal status is owed by the CLOCK rather than by any later call. AWS publishes
+/// no duration for it; this is the emulator's own span, chosen so a caller that polls
+/// straight after the create still observes the non-terminal status the create returned.
+pub const INQUIRY_PROCESSING_SPAN: Duration = Duration::from_millis(500);
+
+/// `InquiryStatus`'s non-terminal value, which a created inquiry starts in.
+pub const INQUIRY_STATUS_PROCESSING: &str = "PROCESSING";
+
+/// `InquiryStatus`'s value for an inquiry whose processing is over.
+pub const INQUIRY_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `InquiryStatus`'s value for an inquiry whose processing could not be performed.
+pub const INQUIRY_STATUS_FAILED: &str = "FAILED";
+
+/// `InquiryStatusMessage`'s value for an inquiry that is still being processed.
+pub const INQUIRY_MESSAGE_IN_PROGRESS: &str = "Compliance inquiry processing is in-progress.";
+
+/// `InquiryStatusMessage`'s value for an inquiry that is over with at least one query
+/// that did not yield a response.
+pub const INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS: &str =
+    "Compliance inquiry processing is complete. One or more queries encountered errors \
+     during processing.";
+
+/// `InquiryStatusMessage`'s value for an inquiry whose processing itself failed.
+pub const INQUIRY_MESSAGE_INTERNAL_ERROR: &str =
+    "An internal error occurred while processing the inquiry. Try again at a later time.";
+
+/// `QueryStatus`'s non-terminal value.
+pub const QUERY_STATUS_PROCESSING: &str = "PROCESSING";
+
+/// `QueryStatus`'s value for a query that did not yield a response.
+pub const QUERY_STATUS_FAILED: &str = "FAILED";
+
+/// `QueryStatusMessage`'s value for a query that is still being processed.
+pub const QUERY_MESSAGE_IN_PROGRESS: &str = "Query processing is in-progress.";
+
+/// `QueryStatusMessage`'s value for a query that did not yield a response.
+pub const QUERY_MESSAGE_INTERNAL_ERROR: &str =
+    "An internal error occurred while processing the query. Try again at a later time.";
+
+/// `InputSource`'s value for an inquiry submitted as a single query.
+pub const INPUT_SOURCE_TEXT: &str = "TEXT";
+
+/// `InputSource`'s value for an inquiry submitted as an uploaded document.
+pub const INPUT_SOURCE_FILE: &str = "FILE";
+
+/// `InquirySupportMode`'s default: "Defaults to AI_ONLY if not specified."
+/// (`CreateComplianceInquiryRequest$supportMode`).
+pub const SUPPORT_MODE_AI_ONLY: &str = "AI_ONLY";
+
+/// `ReviewType`'s value for a response reviewed by the service's own model.
+pub const REVIEW_TYPE_AI: &str = "AI";
 
 /// The host this emulator publishes report and term documents under. Nothing serves it;
 /// it is the stable location a document URL points at, built from the stored object
@@ -282,6 +366,176 @@ pub struct TermGrant {
     pub issued_at: SystemTime,
 }
 
+/// What a caller submitted as an inquiry's content, as `InquiryContent`'s two union
+/// members carry it.
+///
+/// The content is kept because it IS the created resource: the inquiry's queries are
+/// enumerated from it, and `ExportComplianceInquiry` reports on it. It is `@sensitive`
+/// in the model, so it is never written to a log or an error message.
+#[derive(Debug, Clone)]
+pub enum InquiryContentRecord {
+    /// `InquiryContent$query` — one query, submitted as text.
+    Text(String),
+    /// `InquiryContent$fileContent` — an uploaded document, plus "the list of file
+    /// sections/sheets to process" (`InquiryFileContent$fileSections`).
+    File {
+        sections: Vec<String>,
+        content: Vec<u8>,
+    },
+}
+
+impl InquiryContentRecord {
+    /// The `InputSource` this content was submitted through.
+    pub fn input_source(&self) -> &'static str {
+        match self {
+            Self::Text(_) => INPUT_SOURCE_TEXT,
+            Self::File { .. } => INPUT_SOURCE_FILE,
+        }
+    }
+}
+
+/// One query within one compliance inquiry — the `QuerySummary` projection
+/// `ListComplianceInquiryQueries` reports, and what `PutComplianceInquiryFeedback`'s
+/// `queryIdentifier` names.
+#[derive(Debug, Clone)]
+pub struct InquiryQuery {
+    /// "Sequential identifier of the query within the inquiry", 1-based.
+    pub identifier: i32,
+    /// "The actual query text", as the inquiry's content carried it.
+    pub query: String,
+    /// "Generated response to the query."
+    ///
+    /// `None` until something generates one. NOTHING in this emulator does: a compliance
+    /// answer is model-generated text, and no such engine runs in-process, so a query
+    /// ends in its modelled failure status instead of carrying a response nothing
+    /// produced.
+    pub response: Option<String>,
+    /// One of `ReviewType`'s values — the review the inquiry was submitted for.
+    pub review_type: Option<String>,
+    /// One of `QueryStatus`'s values.
+    pub status: String,
+    /// One of `QueryStatusMessage`'s values.
+    pub status_message: String,
+    pub created_at: SystemTime,
+}
+
+/// One compliance inquiry a caller created, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct ComplianceInquiry {
+    /// `InquiryId`, `^compliance-inquiry-[a-zA-Z0-9]{16}$`.
+    pub id: String,
+    pub arn: String,
+    /// "Title of the inquiry" (`CreateComplianceInquiryRequest$name`).
+    pub name: String,
+    /// One of `InquiryStatus`'s values.
+    pub status: String,
+    /// One of `InquiryStatusMessage`'s values.
+    pub status_message: String,
+    /// One of `InquirySupportMode`'s values, defaulted to [`SUPPORT_MODE_AI_ONLY`] when
+    /// the request named none.
+    pub support_mode: String,
+    pub content: InquiryContentRecord,
+    /// The queries this inquiry owns, by ascending `queryIdentifier`.
+    pub queries: Vec<InquiryQuery>,
+    pub created_at: SystemTime,
+    /// "Timestamp indicating when the resource was last modified."
+    pub updated_at: SystemTime,
+    /// When this inquiry's processing is due to be over, while it still is.
+    ///
+    /// `None` once the inquiry is in a terminal status. Stored rather than slept on:
+    /// [`materialise`](Self::materialise) applies the transition the clock already owed.
+    pub processing_due_at: Option<SystemTime>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ComplianceInquiry {
+    /// Apply the transition the CLOCK owes this inquiry, if `now` has reached its due
+    /// instant. A no-op otherwise, and a no-op for an inquiry already terminal, so
+    /// calling it on every read is idempotent.
+    ///
+    /// The terminal status is the one the emulator can honestly report. No
+    /// response-generating engine runs in-process, so:
+    ///
+    /// * a TEXT inquiry's one query is enumerated (its text IS the submitted query) and
+    ///   then fails for want of a response, which is exactly the inquiry-level
+    ///   "processing is complete. One or more queries encountered errors" state the
+    ///   `InquiryStatusMessage` enum models;
+    /// * a FILE inquiry's queries would have to be read out of the uploaded document,
+    ///   which this emulator does not parse, so its processing never got as far as a
+    ///   query and the inquiry ends in the modelled FAILED state instead.
+    pub fn materialise(&mut self, now: SystemTime) {
+        let Some(due) = self.processing_due_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.processing_due_at = None;
+        // The transition was owed AT `due`, so that is when the resource changed —
+        // not the instant some caller happened to look.
+        self.updated_at = due;
+        for query in &mut self.queries {
+            query.status = QUERY_STATUS_FAILED.to_string();
+            query.status_message = QUERY_MESSAGE_INTERNAL_ERROR.to_string();
+        }
+        if self.queries.is_empty() {
+            self.status = INQUIRY_STATUS_FAILED.to_string();
+            self.status_message = INQUIRY_MESSAGE_INTERNAL_ERROR.to_string();
+        } else {
+            self.status = INQUIRY_STATUS_COMPLETED.to_string();
+            self.status_message = INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS.to_string();
+        }
+    }
+
+    /// The `InquirySummary` projection `CreateComplianceInquiry` and
+    /// `ListComplianceInquiries` return.
+    pub fn to_summary(&self) -> InquirySummary {
+        InquirySummary {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            id: self.id.clone(),
+            status: self.status.clone(),
+            status_message: self.status_message.clone(),
+            input_source: self.content.input_source().to_string(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+        }
+    }
+
+    /// The `InquiryDetail` projection `GetComplianceInquiryMetadata` returns. Every
+    /// member it shares with [`to_summary`](Self::to_summary) takes the same value: both
+    /// read the one stored record.
+    pub fn to_detail(&self) -> InquiryDetail {
+        InquiryDetail {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            id: self.id.clone(),
+            status: self.status.clone(),
+            status_message: self.status_message.clone(),
+            input_source: self.content.input_source().to_string(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            support_mode: Some(self.support_mode.clone()),
+        }
+    }
+
+    /// The inquiry's tags, in the `TagsMap` shape every operation returns them in.
+    pub fn tags_map(&self) -> ::std::collections::HashMap<String, String> {
+        self.tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+}
+
+/// What one remembered `CreateComplianceInquiry` `clientToken` replays: the inquiry the
+/// first call with that token created, and the fingerprint of the request that created
+/// it, so the same token on a DIFFERENT request is a conflict rather than a replay.
+#[derive(Debug, Clone)]
+pub struct InquiryCreateRecord {
+    pub inquiry_id: String,
+    pub fingerprint: String,
+}
+
 /// Per-service state for com-amazonaws-artifact-artifact. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsArtifactArtifactState {
@@ -298,6 +552,21 @@ pub struct ComAmazonawsArtifactArtifactState {
     pub term_tokens: BTreeMap<String, TermGrant>,
     /// The counter term tokens are minted from, so two calls never share a token.
     pub term_token_seq: u64,
+    /// Every compliance inquiry `CreateComplianceInquiry` has created, keyed by its id.
+    ///
+    /// A `BTreeMap` because the ids are minted from a monotonic counter in fixed-width
+    /// hex, so their lexicographic order IS their creation order: that is the stable
+    /// total order `ListComplianceInquiries` can index a pagination token into.
+    pub inquiries: BTreeMap<String, ComplianceInquiry>,
+    /// The counter inquiry ids are minted from, so two creates never share an id.
+    pub inquiry_seq: u64,
+    /// `CreateComplianceInquiry` `clientToken` -> what it replays. Bounded by
+    /// [`INQUIRY_IDEMPOTENCY_CAPACITY`].
+    pub inquiry_create_tokens: BTreeMap<String, InquiryCreateRecord>,
+    /// The order [`inquiry_create_tokens`](Self::inquiry_create_tokens) were recorded in,
+    /// so the oldest is the one forgotten once the map is full. The tokens are
+    /// caller-chosen, so their own order says nothing about when they arrived.
+    pub inquiry_create_token_order: ::std::collections::VecDeque<String>,
     /// The calling account's customer-agreements, keyed by id. A `BTreeMap` is what
     /// gives `ListCustomerAgreements` the stable total order its pagination token
     /// indexes into.
@@ -310,12 +579,60 @@ impl Default for ComAmazonawsArtifactArtifactState {
             reports: seed_catalog(),
             term_tokens: BTreeMap::new(),
             term_token_seq: 0,
+            inquiries: BTreeMap::new(),
+            inquiry_seq: 0,
+            inquiry_create_tokens: BTreeMap::new(),
+            inquiry_create_token_order: ::std::collections::VecDeque::new(),
             customer_agreements: seed_customer_agreements(),
         }
     }
 }
 
 impl ComAmazonawsArtifactArtifactState {
+    /// Whether the inquiry store is below [`INQUIRY_CAPACITY`].
+    pub fn accepts_another_inquiry(&self) -> bool {
+        self.inquiries.len() < INQUIRY_CAPACITY
+    }
+
+    /// Mint an unused `InquiryId`.
+    ///
+    /// The counter advances on every call and the loop skips an id the store already
+    /// holds, so no two inquiries ever share one. The 16 lower-case hex digits satisfy
+    /// `InquiryId`'s `^compliance-inquiry-[a-zA-Z0-9]{16}$`, and they rise with the
+    /// counter, so the store's key order is its creation order.
+    pub fn mint_inquiry_id(&mut self) -> String {
+        loop {
+            self.inquiry_seq = self.inquiry_seq.wrapping_add(1);
+            let candidate = format!("compliance-inquiry-{:016x}", self.inquiry_seq);
+            if !self.inquiries.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Remember that `token` created `inquiry_id` from the request `fingerprint`,
+    /// forgetting the oldest remembered token once [`INQUIRY_IDEMPOTENCY_CAPACITY`] are
+    /// held — so a caller sending a fresh `clientToken` on every request cannot grow this
+    /// map without end.
+    pub fn record_inquiry_create(&mut self, token: String, inquiry_id: &str, fingerprint: &str) {
+        let record = InquiryCreateRecord {
+            inquiry_id: inquiry_id.to_string(),
+            fingerprint: fingerprint.to_string(),
+        };
+        if self
+            .inquiry_create_tokens
+            .insert(token.clone(), record)
+            .is_none()
+        {
+            self.inquiry_create_token_order.push_back(token);
+        }
+        while self.inquiry_create_token_order.len() > INQUIRY_IDEMPOTENCY_CAPACITY {
+            if let Some(oldest) = self.inquiry_create_token_order.pop_front() {
+                self.inquiry_create_tokens.remove(&oldest);
+            }
+        }
+    }
+
     /// Mint and persist a term grant for one report version, returning its token.
     ///
     /// The counter advances on every call and the loop skips a token the store already
@@ -554,6 +871,39 @@ pub fn report_version_not_found(report_id: &str, version: i64) -> ResourceNotFou
         message: format!("Report {report_id} has no version {version}"),
         resource_id: report_id.to_string(),
         resource_type: REPORT_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The ARN of a compliance inquiry.
+///
+/// Unlike a report, an inquiry is CALLER-owned, so its ARN carries the account id this
+/// emulator presents, through `engine::emulator_arn`.
+pub fn inquiry_arn(region: &str, inquiry_id: &str) -> String {
+    ::engine::emulator_arn("artifact", region, &format!("compliance-inquiry/{inquiry_id}"))
+}
+
+/// The `ResourceNotFoundException` payload for an inquiry id the store does not hold.
+pub fn inquiry_not_found(inquiry_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Compliance inquiry {inquiry_id} not found"),
+        resource_id: inquiry_id.to_string(),
+        resource_type: INQUIRY_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` for a `clientToken` replayed on a request that is
+/// not the one it created an inquiry for.
+///
+/// An `@idempotencyToken` identifies ONE call: honouring it on different content would
+/// either hide the second submission or silently replace the first, so the request is
+/// refused instead.
+pub fn inquiry_token_mismatch(inquiry_id: &str) -> ConflictException {
+    ConflictException {
+        message: "the clientToken was already used to create a compliance inquiry from \
+                  different content"
+            .to_string(),
+        resource_id: inquiry_id.to_string(),
+        resource_type: INQUIRY_RESOURCE_TYPE.to_string(),
     }
 }
 

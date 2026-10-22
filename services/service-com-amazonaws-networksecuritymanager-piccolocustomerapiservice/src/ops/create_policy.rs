@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and PERSISTS a policy in [`crate::state`]: every member of the response is read
+//! back out of the stored record, so a following `GetPolicy`/`ListPolicies` observes
+//! exactly what this call answered.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +205,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Rules the model documents in prose but cannot express as constraint traits, so
+        // the boundary validator let them through.
+        let references = input
+            .associated_template_and_rule_list
+            .as_deref()
+            .unwrap_or_default();
+        if let Some(message) =
+            crate::state::association_list_violation(&input.firewall_type, references)
+        {
+            return Err(
+                CreatePolicyErrorModeled::ValidationException(ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "associatedTemplateAndRuleList".to_string(),
+                        message: message.clone(),
+                    }]),
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: "If you retry a request with the same
+        // client token and the same parameters, the service returns the result of the
+        // original successful request." The original result is replayed out of the store;
+        // this service models no parameter-mismatch error, so a replay never becomes a
+        // failure and never mints a second policy.
+        if let Some(existing) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .map(|call| call.policy_id.clone())
+            .and_then(|policy_id| store.policies.get(&policy_id))
+        {
+            return Ok(output_of(existing));
+        }
+
+        // `policyName` is how an operator names the policy, so a second policy cannot
+        // take a name already in use — the `ConflictException` this operation declares:
+        // "The request conflicts with the current state of the resource."
+        if let Some(existing_id) = store.policy_name_index.get(&input.policy_name) {
+            return Err(CreatePolicyErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "a policy named {:?} already exists in this account",
+                    input.policy_name
+                ),
+                resource_id: Some(existing_id.clone()),
+                resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
+            })
+            .into());
+        }
+
+        // The store is bounded: past its capacity a create is REFUSED with the modelled
+        // quota error rather than growing the process for as long as callers keep asking.
+        if store.policies.len() >= crate::state::MAX_POLICIES {
+            return Err(CreatePolicyErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} policies; delete one \
+                         before creating another",
+                        crate::state::MAX_POLICIES
+                    ),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
+                    ..ServiceQuotaExceededException::default()
+                },
+            )
+            .into());
+        }
+
+        let policy_id = store.mint_policy_id();
+        let policy = crate::state::Policy {
+            policy_arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("policy/{policy_id}"),
+            ),
+            policy_id: policy_id.clone(),
+            policy_name: input.policy_name,
+            policy_description: input.policy_description,
+            status: crate::state::status_for(input.is_published).to_string(),
+            priority: input.priority,
+            firewall_type: input.firewall_type,
+            policy_configuration: Some(input.policy_configuration),
+            associated_template_and_rule_list: references
+                .iter()
+                .map(crate::state::association_of)
+                .collect(),
+            // `EntityVersion` starts at 1; `UpdatePolicy` is what bumps it.
+            version: 1,
+            update_token: crate::state::mint_update_token(),
+            // What this operation creates is the live resource, not a snapshot of a
+            // published version (`CreatePolicySnapshot` makes those).
+            is_snapshot: false,
+            has_published_version: input.is_published,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Rendered from the record that is about to be stored, so the response cannot
+        // disagree with what a later read returns.
+        let output = output_of(&policy);
+        store
+            .policy_name_index
+            .insert(policy.policy_name.clone(), policy_id.clone());
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, policy_id.clone(), policy.version);
+        }
+        store.policies.insert(policy_id, policy);
+        Ok(output)
+    }
+}
+
+/// The `CreatePolicyOutput` view of a persisted policy.
+fn output_of(policy: &crate::state::Policy) -> CreatePolicyOutput {
+    CreatePolicyOutput {
+        policy_id: policy.policy_id.clone(),
+        policy_arn: policy.policy_arn.clone(),
+        policy_name: policy.policy_name.clone(),
+        policy_description: policy.policy_description.clone(),
+        status: policy.status.clone(),
+        priority: policy.priority,
+        associated_template_and_rule_list: policy.associated_template_and_rule_list.clone(),
+        version: policy.version_string(),
+        update_token: Some(policy.update_token.clone()),
+        is_snapshot: Some(policy.is_snapshot),
+        has_published_version: Some(policy.has_published_version),
+        firewall_type: policy.firewall_type.clone(),
+        policy_configuration: policy.policy_configuration.clone(),
+        updated_at: Some(policy.updated_at_timestamp()),
     }
 }

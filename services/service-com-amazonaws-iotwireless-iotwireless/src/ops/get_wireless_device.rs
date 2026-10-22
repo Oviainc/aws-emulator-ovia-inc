@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWirelessDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWirelessDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWirelessDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves one identifier to the persisted device record. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +152,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWirelessDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWirelessDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWirelessDevice"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWirelessDeviceError::from(GetWirelessDeviceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotwireless store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        if !crate::state::WIRELESS_DEVICE_ID_TYPES.contains(&input.identifier_type.as_str()) {
+            return Err(GetWirelessDeviceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "IdentifierType must be one of {:?}, got {:?}",
+                        crate::state::WIRELESS_DEVICE_ID_TYPES, input.identifier_type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let device = store
+            .find_device(&input.identifier_type, &input.identifier)
+            .ok_or_else(|| {
+                GetWirelessDeviceError::from(
+                    GetWirelessDeviceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No wireless device with {} {}",
+                                input.identifier_type, input.identifier
+                            )),
+                            resource_id: Some(input.identifier.clone()),
+                            resource_type: Some("WirelessDevice".to_string()),
+                        },
+                    ),
+                )
+            })?;
+
+        Ok(GetWirelessDeviceOutput {
+            r#type: Some(device.device_type.clone()),
+            name: device.name.clone(),
+            description: device.description.clone(),
+            destination_name: Some(device.destination_name.clone()),
+            id: Some(device.id.clone()),
+            arn: Some(device.arn.clone()),
+            thing_name: device.thing_name.clone(),
+            thing_arn: device.thing_arn.clone(),
+            lo_ra_wan: device.lorawan.clone(),
+            sidewalk: device.sidewalk.clone(),
+            positioning: device.positioning.clone(),
+        })
     }
 }
