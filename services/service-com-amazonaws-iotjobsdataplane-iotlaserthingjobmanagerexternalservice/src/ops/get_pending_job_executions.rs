@@ -131,7 +131,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetPendingJobExecutions<Eng>
 {
     type Input = GetPendingJobExecutionsInput;
-    type Output = GetPendingJobExecutionsOutput;
+    /// The modelled output, written as a COMPLETE document (see
+    /// [`super::types::ResponseDocument`]): this operation determines both lists for
+    /// every answer — "none" is the empty list — so the completion adds nothing
+    /// here; it is the same rule, stated for every operation of this service.
+    type Output = ResponseDocument<GetPendingJobExecutionsOutput>;
     type Error = GetPendingJobExecutionsError;
 
     const NAME: &'static str = "GetPendingJobExecutions";
@@ -166,9 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
-        Ok(GetPendingJobExecutionsOutput {
-            in_progress_jobs: Some(summaries(STATUS_IN_PROGRESS)),
-            queued_jobs: Some(summaries(STATUS_QUEUED)),
-        })
+        Ok(ResponseDocument::new(
+            GetPendingJobExecutionsOutput {
+                in_progress_jobs: Some(summaries(STATUS_IN_PROGRESS)),
+                queued_jobs: Some(summaries(STATUS_QUEUED)),
+            },
+            Self::OUTPUT_SCHEMA,
+        ))
     }
 }

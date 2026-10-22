@@ -16,6 +16,10 @@
 
 pub mod describe_job_execution_types;
 pub mod get_pending_job_executions_types;
+/// How every operation of this service writes its success response: as a document
+/// carrying every modelled output member, JSON `null` where there is no value. Not
+/// generated — see the module docs for the recorded behaviour it exists for.
+pub mod response_document;
 pub mod shared_types;
 pub mod start_command_execution_types;
 pub mod start_next_pending_job_execution_types;
@@ -25,6 +29,8 @@ pub mod update_job_execution_types;
 pub use describe_job_execution_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_pending_job_executions_types::*;
+#[allow(unused_imports)]
+pub use response_document::ResponseDocument;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

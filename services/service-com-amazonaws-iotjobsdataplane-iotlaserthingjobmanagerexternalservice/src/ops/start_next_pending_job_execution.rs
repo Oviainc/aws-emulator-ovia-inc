@@ -5,7 +5,9 @@
 //! Takes the thing's next pending (`IN_PROGRESS` or `QUEUED`) execution, moves it
 //! to `IN_PROGRESS`, applies the request's `statusDetails` and step timeout,
 //! increments `versionNumber` and returns the stored execution with its job
-//! document. A thing with no pending execution gets a 200 with no `execution`.
+//! document. A thing with no pending execution gets a 200 whose `execution` is
+//! JSON `null` — the response document always carries the modelled member (see
+//! [`super::types::ResponseDocument`]).
 //!
 //! ## Shape of an operation
 //!
@@ -141,7 +143,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for StartNextPendingJobExecution<Eng>
 {
     type Input = StartNextPendingJobExecutionInput;
-    type Output = StartNextPendingJobExecutionOutput;
+    /// The modelled output, written as a COMPLETE document: `execution` reaches the
+    /// wire as JSON `null` when there is nothing pending to start, never as a key
+    /// the body leaves out.
+    type Output = ResponseDocument<StartNextPendingJobExecutionOutput>;
     type Error = StartNextPendingJobExecutionError;
 
     const NAME: &'static str = "StartNextPendingJobExecution";
@@ -189,8 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already-started execution is resumed before a queued one is started.
         let Some(index) = state.next_pending_index(&input.thing_name) else {
             // No pending execution for this thing: nothing was started, so there
-            // is no execution to report.
-            return Ok(StartNextPendingJobExecutionOutput { execution: None });
+            // is no execution to report — reported as a null `execution`, which is
+            // this service's wire form for a member it has no value for.
+            return Ok(ResponseDocument::new(
+                StartNextPendingJobExecutionOutput { execution: None },
+                Self::OUTPUT_SCHEMA,
+            ));
         };
 
         let now = crate::state::now_epoch_seconds();
@@ -231,8 +240,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::to_job_execution(record, true, now)
         };
 
-        Ok(StartNextPendingJobExecutionOutput {
-            execution: Some(execution),
-        })
+        Ok(ResponseDocument::new(
+            StartNextPendingJobExecutionOutput {
+                execution: Some(execution),
+            },
+            Self::OUTPUT_SCHEMA,
+        ))
     }
 }

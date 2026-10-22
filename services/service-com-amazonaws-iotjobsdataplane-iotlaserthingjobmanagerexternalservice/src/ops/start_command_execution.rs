@@ -295,7 +295,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for StartCommandExecution<Eng>
 {
     type Input = StartCommandExecutionInput;
-    type Output = StartCommandExecutionOutput;
+    /// The modelled output, written as a COMPLETE document (see
+    /// [`super::types::ResponseDocument`]): this operation mints an `executionId`
+    /// for every answer it returns 200 for, so the completion adds nothing here —
+    /// it is the same rule, stated for every operation of this service.
+    type Output = ResponseDocument<StartCommandExecutionOutput>;
     type Error = StartCommandExecutionError;
 
     const NAME: &'static str = "StartCommandExecution";
@@ -346,9 +350,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(started) = state.idempotency.get(token) {
                 if started.request_fingerprint == fingerprint {
-                    return Ok(StartCommandExecutionOutput {
-                        execution_id: Some(started.execution_id.clone()),
-                    });
+                    return Ok(ResponseDocument::new(
+                        StartCommandExecutionOutput {
+                            execution_id: Some(started.execution_id.clone()),
+                        },
+                        Self::OUTPUT_SCHEMA,
+                    ));
                 }
                 return Err(StartCommandExecutionErrorModeled::ConflictException(
                     ConflictException {
@@ -391,8 +398,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.remember_client_token(token, execution_id.clone(), fingerprint);
         }
 
-        Ok(StartCommandExecutionOutput {
-            execution_id: Some(execution_id),
-        })
+        Ok(ResponseDocument::new(
+            StartCommandExecutionOutput {
+                execution_id: Some(execution_id),
+            },
+            Self::OUTPUT_SCHEMA,
+        ))
     }
 }
