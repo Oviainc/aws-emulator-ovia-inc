@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored workflow by `WorkflowId`: its ARN, description, both step lists
+//! in the order they were created with every documented step-detail default already
+//! resolved, its tags and its log destinations. A pure read — an unknown id answers the
+//! modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +142,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeWorkflow"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeWorkflowErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+        let stored = guard.workflows.get(&input.workflow_id).ok_or_else(|| {
+            st::not_found(DescribeWorkflowErrorModeled::ResourceNotFoundException(
+                st::unknown_workflow(&input.workflow_id),
+            ))
+        })?;
+
+        // Every member is projected from the stored record, which already carries the
+        // create-time defaults — so two reads of one workflow answer the same thing.
+        let workflow = DescribedWorkflow {
+            arn: stored.arn.clone(),
+            description: stored.description.clone(),
+            steps: Some(stored.steps.clone()),
+            on_exception_steps: Some(stored.on_exception_steps.clone()),
+            workflow_id: Some(stored.workflow_id.clone()),
+            // The two step lists are modelled `len 0..8`, so the empty list is a value
+            // they can hold and a workflow with no exception steps reports `[]`.
+            // `Tags` is `len 1..50`, so an empty list is NOT a value it can hold: a
+            // workflow created without tags reports the member absent rather than
+            // empty. Same for `StructuredLogDestinations`, whose absence means no log
+            // group.
+            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            structured_log_destinations: Some(stored.structured_log_destinations.clone())
+                .filter(|destinations| !destinations.is_empty()),
+        };
+
+        Ok(DescribeWorkflowOutput { workflow })
     }
 }

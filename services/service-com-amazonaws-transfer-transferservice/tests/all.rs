@@ -31,3 +31,5 @@ mod state_roundtrip;
 mod user_properties_and_keys;
 #[path = "all/user_state_persistence.rs"]
 mod user_state_persistence;
+#[path = "all/workflow_lifecycle.rs"]
+mod workflow_lifecycle;
