@@ -213,8 +213,10 @@ struct Case {
     /// `InputSource`: `TEXT` for a submitted query, `FILE` for an uploaded document.
     input_source: &'static str,
     /// The `InquiryStatus` the clock owes this inquiry, and the message that goes with
-    /// it. A TEXT submission's one query is enumerated and then has no response to
-    /// report; a FILE submission's queries are never read out of the document at all.
+    /// it. A TEXT submission's one query is enumerated from the request itself and its
+    /// processing is over at the due instant, so the inquiry completes cleanly; a FILE
+    /// submission's queries are never read out of the document at all, so its processing
+    /// failed.
     terminal_status: &'static str,
     /// See [`Case::terminal_status`].
     terminal_message: &'static str,
@@ -225,8 +227,7 @@ struct Case {
 /// many file sections it names, whether `supportMode` is given and which value, and how
 /// many tags come with it — none of which may change whether the inquiry is reported.
 fn cases() -> Vec<Case> {
-    const COMPLETED_WITH_QUERY_ERRORS: &str = "Compliance inquiry processing is complete. \
-         One or more queries encountered errors during processing.";
+    const COMPLETED: &str = "Compliance inquiry processing is complete.";
     const INQUIRY_INTERNAL_ERROR: &str =
         "An internal error occurred while processing the inquiry. Try again at a later time.";
     vec![
@@ -240,7 +241,7 @@ fn cases() -> Vec<Case> {
             ),
             input_source: "TEXT",
             terminal_status: "COMPLETED",
-            terminal_message: COMPLETED_WITH_QUERY_ERRORS,
+            terminal_message: COMPLETED,
         },
         Case {
             label: "a query, FULL_SUPPORT, three tags",
@@ -252,7 +253,7 @@ fn cases() -> Vec<Case> {
             ),
             input_source: "TEXT",
             terminal_status: "COMPLETED",
-            terminal_message: COMPLETED_WITH_QUERY_ERRORS,
+            terminal_message: COMPLETED,
         },
         Case {
             label: "an uploaded document, no sections",

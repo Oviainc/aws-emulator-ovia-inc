@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScheduleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScheduleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScheduleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a `ScheduleGroup` from [`crate::state`], together with the schedules
+//! it held. The reserved built-in group cannot be deleted: that request is a
+//! `ValidationException`. An ordinary group goes to `DELETING` and is removed
+//! once the clock makes its removal due (see
+//! [`crate::state::GROUP_DELETION_DELAY`]); a group this account does not hold
+//! is a `ResourceNotFoundException`.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +151,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScheduleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScheduleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScheduleGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteScheduleGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the scheduler state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // `ClientToken` is the client's retry marker; deleting a group is
+        // idempotent here by STATE rather than by token — a group already being
+        // deleted keeps the due instant its first delete set.
+        let _ = (&input.client_token, ctx);
+
+        // The reserved built-in group is refused on the REQUEST, before the
+        // store is consulted: the name can never be deleted, whatever the
+        // account holds, and the group is left as it was.
+        if let Some(message) = crate::state::reserved_group_refusal(&input.name) {
+            return Err(
+                DeleteScheduleGroupErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(group) = store.groups.get_mut(&input.name) else {
+            return Err(DeleteScheduleGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::group_does_not_exist(&input.name),
+                },
+            )
+            .into());
+        };
+
+        // "When you delete a group, it remains in a DELETING state until all of
+        // its associated schedules are deleted": the group is answered deleted
+        // and then removed, with the schedules it held, once the clock makes
+        // that due.
+        if group.deletion_due.is_none() {
+            group.state = crate::state::SCHEDULE_GROUP_STATE_DELETING.to_string();
+            group.last_modification_date = now;
+            group.deletion_due = Some(now + crate::state::GROUP_DELETION_DELAY);
+        }
+
+        Ok(DeleteScheduleGroupOutput {})
     }
 }

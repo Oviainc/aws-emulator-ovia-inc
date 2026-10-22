@@ -21,9 +21,10 @@
 //!   `ConflictException` — an idempotency token identifies one call, so honouring it on
 //!   other content would hide the second submission.
 //! * The inquiry's RESPONSES are model-generated compliance answers, and no such engine
-//!   runs in this emulator. Nothing is synthesised to look generated: every query ends in
-//!   its modelled failure status with no `response`, and the inquiry ends in the modelled
-//!   status that says so (see `materialise`).
+//!   runs in this emulator. Nothing is synthesised to look generated: no query ever
+//!   carries a `response`, and that absence is the signal — a query read off the request's
+//!   own text still completes, and only an inquiry whose queries could not be enumerated
+//!   at all ends in the modelled failure state (see `materialise`).
 //!
 //! ## Shape of an operation
 //!
@@ -298,6 +299,8 @@ fn content_record(content: InquiryContent) -> crate::state::InquiryContentRecord
 /// uploaded document — reading them out means parsing that document, which this emulator
 /// does not do, so it owns none and `materialise` reports its processing as failed rather
 /// than inventing queries nothing read.
+///
+/// No query carries a `response`: see [`crate::state::InquiryQuery::response`].
 fn enumerate_queries(
     content: &crate::state::InquiryContentRecord,
     now: ::std::time::SystemTime,

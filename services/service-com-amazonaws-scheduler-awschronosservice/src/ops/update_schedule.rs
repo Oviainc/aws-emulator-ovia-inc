@@ -198,7 +198,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
 
         if let Some(message) =
             crate::state::flexible_time_window_violation(&input.flexible_time_window)
@@ -210,7 +209,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let group_name = crate::state::effective_group_name(input.group_name.as_deref());
+
+        // The same execution-role gate as `CreateSchedule`: an update that moves
+        // a schedule onto a role Scheduler cannot assume is refused, and the
+        // stored schedule is left as it was.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) =
+            crate::state::execution_role_violation(ctx, &region, &input.target.role_arn).await
+        {
+            return Err(
+                UpdateScheduleErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        store.settle(now);
 
         let Some(record) = store
             .schedules
@@ -242,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.action_after_completion = input.action_after_completion;
         record.target = input.target;
         record.flexible_time_window = input.flexible_time_window;
-        record.last_modification_date = ::std::time::SystemTime::now();
+        record.last_modification_date = now;
 
         Ok(UpdateScheduleOutput {
             schedule_arn: record.arn.clone(),

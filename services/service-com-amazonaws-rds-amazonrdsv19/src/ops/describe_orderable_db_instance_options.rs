@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An option is offered for an engine VERSION this service reports, so the two
         // reports cannot disagree: `DescribeDBEngineVersions` owns the engine catalogue
         // and this operation reads it.
-        for (_, version, facts) in crate::ops::describe_db_engine_versions::catalogue() {
+        for (_, version, _) in crate::ops::describe_db_engine_versions::catalogue() {
             // Only a version that is still available can be ordered; a deprecated one is
             // reported by `DescribeDBEngineVersions` under `IncludeAll` and ordered by
             // nobody.
@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "{}#{}#{}#{license_model}",
                             version.engine, version.engine_version, class.name
                         ),
-                        to_wire(version, facts, class, license_model, &region),
+                        to_wire(version, class, license_model, &region),
                     ));
                 }
             }
@@ -473,7 +473,6 @@ fn availability_zones(region: &str) -> Vec<AvailabilityZone> {
 /// `OrderableDBInstanceOption` wire shape.
 fn to_wire(
     version: &crate::ops::describe_db_engine_versions::CatalogVersion,
-    facts: &crate::ops::describe_db_engine_versions::EngineFacts,
     class: &InstanceClass,
     license_model: &str,
     region: &str,
@@ -489,7 +488,7 @@ fn to_wire(
         // A Multi-AZ deployment puts the standby in another zone of the same region, so
         // every option offered in several zones is Multi-AZ capable.
         multi_az_capable: Some(true),
-        read_replica_capable: Some(facts.supports_read_replica),
+        read_replica_capable: Some(version.profile.supports_read_replica),
         vpc: Some(true),
         supports_storage_encryption: Some(true),
         storage_type: Some(storage_type.to_string()),
@@ -503,14 +502,18 @@ fn to_wire(
         supports_iam_database_authentication: Some(supports_iam_database_authentication(
             version.engine,
         )),
+        // The engine modes and the global-database capability are the VERSION's, read
+        // from the engine catalogue, so this report and `DescribeDBEngineVersions` cannot
+        // disagree about the version an option is offered for.
         supported_engine_modes: Some(
-            facts
+            version
+                .profile
                 .engine_modes
                 .iter()
                 .map(|mode| (*mode).to_string())
                 .collect(),
         ),
-        supports_global_databases: Some(facts.supports_global_databases),
+        supports_global_databases: Some(version.profile.supports_global_databases),
         // "Whether DB instances can be configured as a Multi-AZ DB cluster": offered on
         // the MySQL and PostgreSQL engines, and never on a burstable class.
         supports_clusters: Some(

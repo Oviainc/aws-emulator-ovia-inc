@@ -11,7 +11,11 @@
 //! It carries one thing DAX does not own: the Region's NETWORK, against which a
 //! subnet group's identifiers are resolved ([`region_subnets`]). The emulator's EC2
 //! service models no subnets yet; when it does, `resolve_subnet` is the one place that
-//! should read them from it instead.
+//! should read them from it instead. FSx's `state.rs` applies the SAME derivation to
+//! `CreateFileSystem$SubnetIds`, both written against the contract
+//! `services/common/src/network.rs` states, so the two report one account network; the
+//! derivation moves into that shared module once one change may carry both service
+//! crates' manifests.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
