@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the service, the listener and the rule from the identifier
+//! forms the model allows and reports the persisted
+//! [`crate::state::Rule`] — the record `CreateRule` wrote. Reporting only: nothing here
+//! writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +130,18 @@ impl From<GetRuleErrorModeled> for GetRuleError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, with AWS's
+/// not-found message construction over the submitted identifier
+/// ([`crate::state::ResourceKind::not_found_message`]).
+fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> GetRuleError {
+    GetRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: kind.not_found_message(identifier),
+        resource_id: identifier.to_string(),
+        resource_type: kind.arn_kind().to_string(),
+    })
+    .into()
+}
+
 /// The `GetRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +178,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // Every identifier is modelled as either the bare id or the resource's ARN.
+        let Some(service_id) = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        ) else {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::ResourceKind::Service,
+            ));
+        };
+        let Some(listener_id) = crate::state::id_from_identifier(
+            &input.listener_identifier,
+            crate::state::PREFIX_LISTENER,
+        ) else {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::ResourceKind::Listener,
+            ));
+        };
+        let Some(rule_id) =
+            crate::state::id_from_identifier(&input.rule_identifier, crate::state::PREFIX_RULE)
+        else {
+            return Err(not_found(
+                &input.rule_identifier,
+                crate::state::ResourceKind::Rule,
+            ));
+        };
+        let store = state.lock();
+        if !store.services.contains_key(&service_id) {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::ResourceKind::Service,
+            ));
+        }
+        if store
+            .listeners
+            .get(&listener_id)
+            .is_none_or(|listener| listener.service_id != service_id)
+        {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::ResourceKind::Listener,
+            ));
+        }
+        // A rule is a resource OF its listener: one stored under a different listener is
+        // not reachable through this one.
+        let Some(rule) = store
+            .rules
+            .get(&rule_id)
+            .filter(|rule| rule.listener_id == listener_id)
+        else {
+            return Err(not_found(
+                &input.rule_identifier,
+                crate::state::ResourceKind::Rule,
+            ));
+        };
+        Ok(GetRuleOutput {
+            id: Some(rule.id.clone()),
+            arn: Some(rule.arn.clone()),
+            name: Some(rule.name.clone()),
+            is_default: Some(rule.is_default),
+            r#match: Some(rule.r#match.clone()),
+            priority: Some(rule.priority),
+            action: Some(rule.action.clone()),
+            created_at: Some(crate::state::timestamp(rule.created_at)),
+            last_updated_at: Some(crate::state::timestamp(rule.last_updated_at)),
+        })
     }
 }

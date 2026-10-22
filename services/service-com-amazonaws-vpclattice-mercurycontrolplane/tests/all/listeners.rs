@@ -41,7 +41,7 @@ use crate::vpclattice_service_slice::{
 /// (`^tg-[0-9a-z]{17}$`). The listener stores the reference as sent: whether the target
 /// group exists is `CreateTargetGroup`'s and the rule operations' concern, not this
 /// slice's.
-fn target_group(suffix: &str) -> String {
+pub(crate) fn target_group(suffix: &str) -> String {
     format!("tg-{suffix:0>17}")
 }
 
@@ -51,7 +51,7 @@ fn listener_kind(service_id: &str) -> String {
 }
 
 /// Create a service to hang listeners off, answering its id and ARN.
-async fn a_service(lattice: &Lattice, name: &str) -> (String, String) {
+pub(crate) async fn a_service(lattice: &Lattice, name: &str) -> (String, String) {
     let created = lattice
         .create_service(serde_json::json!({ "name": name }))
         .await;
@@ -64,7 +64,7 @@ async fn a_service(lattice: &Lattice, name: &str) -> (String, String) {
 }
 
 /// `POST /services/{serviceIdentifier}/listeners`.
-async fn create_listener(
+pub(crate) async fn create_listener(
     lattice: &Lattice,
     service_identifier: &str,
     body: serde_json::Value,

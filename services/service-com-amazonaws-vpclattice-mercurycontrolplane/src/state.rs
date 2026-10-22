@@ -2,8 +2,8 @@
 
 //! Engine state for the com-amazonaws-vpclattice-mercurycontrolplane service.
 //!
-//! One store holds the service-network / service / service-association / listener
-//! slice, and the
+//! One store holds the service-network / service / service-association / listener /
+//! listener-rule slice, and the
 //! helpers every handler in `src/ops/` shares live here too: identifier resolution
 //! (bare id or ARN), id and ARN minting, the request's region, and the clock-owed
 //! `CREATE_IN_PROGRESS -> ACTIVE` span. Handlers reach the store through
@@ -27,6 +27,9 @@ pub const KIND_SERVICE_ASSOCIATION: &str = "servicenetworkserviceassociation";
 /// The ARN resource kind of a listener. A listener ARN nests under its service's:
 /// `…:service/svc-…/listener/listener-…` (`ListenerArn`'s modelled pattern).
 pub const KIND_LISTENER: &str = "listener";
+/// The ARN resource kind of a listener rule. A rule ARN nests under its listener's:
+/// `…:service/svc-…/listener/listener-…/rule/rule-…` (`RuleArn`'s modelled pattern).
+pub const KIND_RULE: &str = "rule";
 
 /// A resource kind this service's error bodies name.
 ///
@@ -45,6 +48,8 @@ pub enum ResourceKind {
     ServiceAssociation,
     /// A listener of a service (`listener-…`).
     Listener,
+    /// A rule of a listener (`rule-…`).
+    Rule,
 }
 
 impl ResourceKind {
@@ -56,6 +61,7 @@ impl ResourceKind {
             Self::Service => KIND_SERVICE,
             Self::ServiceAssociation => KIND_SERVICE_ASSOCIATION,
             Self::Listener => KIND_LISTENER,
+            Self::Rule => KIND_RULE,
         }
     }
 
@@ -66,13 +72,15 @@ impl ResourceKind {
     /// service, and `Association` (not the full association shape name) for a
     /// service-network/service association. No listener not-found body is recorded, so a
     /// listener takes the same rule the other three follow: the Smithy resource name,
-    /// `com.amazonaws.vpclattice#Listener`.
+    /// `com.amazonaws.vpclattice#Listener`. A listener RULE follows it too, over
+    /// `com.amazonaws.vpclattice#Rule`.
     pub fn error_label(self) -> &'static str {
         match self {
             Self::ServiceNetwork => "ServiceNetwork",
             Self::Service => "Service",
             Self::ServiceAssociation => "Association",
             Self::Listener => "Listener",
+            Self::Rule => "Rule",
         }
     }
 
@@ -97,6 +105,8 @@ pub const PREFIX_SERVICE: &str = "svc-";
 pub const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
 /// The id prefix of a listener (`^listener-[0-9a-z]{17}$`).
 pub const PREFIX_LISTENER: &str = "listener-";
+/// The id prefix of a listener rule (`^rule-[0-9a-z]{17}$`).
+pub const PREFIX_RULE: &str = "rule-";
 
 /// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
 const ID_SUFFIX_LEN: usize = 17;
@@ -153,6 +163,13 @@ pub const MAX_SERVICE_ASSOCIATIONS: usize = 1_000;
 /// How many listeners this emulator will hold for one service. Same reasoning as the
 /// ceilings above, and `CreateListener` models the same `ServiceQuotaExceededException`.
 pub const MAX_LISTENERS_PER_SERVICE: usize = 100;
+
+/// How many rules this emulator will hold for one listener. Same reasoning as the
+/// ceilings above, and `CreateRule` models the same `ServiceQuotaExceededException`.
+/// Not a fidelity claim about the published per-listener rule quota: it is this
+/// emulator's own ceiling, so a caller looping on create cannot grow this process's
+/// memory without bound.
+pub const MAX_RULES_PER_LISTENER: usize = 100;
 
 /// The listener port a create gets when it omits `port`, by protocol.
 ///
@@ -319,6 +336,38 @@ pub struct Listener {
     pub sequence: u64,
 }
 
+/// A listener rule: one priority, one match and one action under a listener.
+///
+/// The model gives a rule no status member, so there is no clock-owed transition here —
+/// only the timestamps `GetRule` and `ListRules` report.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    /// The listener this rule belongs to; a rule is only reachable through it.
+    pub listener_id: String,
+    /// The listener's service, so a read through the wrong service is a 404.
+    pub service_id: String,
+    /// `RulePriority`. "Each rule for a specific listener must have a unique priority"
+    /// (the `priority` member's own documentation), so this is unique per `listener_id`.
+    pub priority: i32,
+    /// The modelled `RuleMatch` exactly as the create sent it.
+    pub r#match: crate::ops::types::RuleMatch,
+    /// The rule's action, stored as the modelled union after [`normalized_rule_action`]
+    /// filled in the documented weight default.
+    pub action: crate::ops::types::RuleAction,
+    /// `isDefault`: "Indicates whether this is the default rule." A listener's default
+    /// rule is the one `CreateListener` carries as `defaultAction`; every rule
+    /// `CreateRule` mints is an additional rule, so this is false for them.
+    pub is_default: bool,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    /// Creation order, so a listing pages deterministically. See [`encode_cursor`].
+    pub sequence: u64,
+}
+
 /// The default port of a listener speaking `protocol`, or `None` where the `port`
 /// member documents no default for it.
 pub fn default_port_for(protocol: &str) -> Option<i32> {
@@ -461,6 +510,10 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// service, and every listener of a deleted service goes with it
     /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::remove_listeners_of`]).
     pub listeners: HashMap<String, Listener>,
+    /// Keyed by `rule-…` id. At most [`MAX_RULES_PER_LISTENER`] entries per listener,
+    /// and every rule of a deleted listener goes with it
+    /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::remove_rules_of`]).
+    pub rules: HashMap<String, Rule>,
     /// `<ARN resource kind>/<name>` -> id. A name must be unique to the account, so a
     /// second create under a taken name is a `ConflictException`. One key per stored
     /// resource, so the resource ceilings bound this map too.
@@ -511,6 +564,45 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             .count()
     }
 
+    /// How many rules `listener_id` holds, counted from the rule records.
+    pub fn rule_count(&self, listener_id: &str) -> usize {
+        self.rules
+            .values()
+            .filter(|rule| rule.listener_id == listener_id)
+            .count()
+    }
+
+    /// The rule of `listener_id` that already holds `priority`, if there is one.
+    ///
+    /// "Each rule for a specific listener must have a unique priority" (the `priority`
+    /// member's own documentation), so a create or update that would take a priority
+    /// another rule of the same listener holds is a `ConflictException`.
+    pub fn rule_with_priority(&self, listener_id: &str, priority: i32) -> Option<&Rule> {
+        self.rules
+            .values()
+            .find(|rule| rule.listener_id == listener_id && rule.priority == priority)
+    }
+
+    /// Drop every rule of `listener_id`, releasing its name and token records.
+    ///
+    /// A rule is a resource OF its listener, so deleting the listener (or the service
+    /// that holds it) deletes its rules: `DeleteService` documents that "listener rules"
+    /// go with the service.
+    pub fn remove_rules_of(&mut self, listener_id: &str) {
+        let doomed: Vec<Rule> = self
+            .rules
+            .values()
+            .filter(|rule| rule.listener_id == listener_id)
+            .cloned()
+            .collect();
+        for rule in doomed {
+            self.rules.remove(&rule.id);
+            self.name_index
+                .remove(&rule_name_key(listener_id, &rule.name));
+            self.idempotency_tokens.forget_resource(&rule.id);
+        }
+    }
+
     /// Drop every listener of `service_id`, releasing its name and token records.
     ///
     /// `DeleteService`'s own documentation: "If you delete a service, all resources
@@ -524,6 +616,7 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
             .cloned()
             .collect();
         for listener in doomed {
+            self.remove_rules_of(&listener.id);
             self.listeners.remove(&listener.id);
             self.name_index
                 .remove(&listener_name_key(service_id, &listener.name));
@@ -553,6 +646,13 @@ pub fn name_key(kind: &str, name: &str) -> String {
 /// owning service's id is part of the key.
 pub fn listener_name_key(service_id: &str, name: &str) -> String {
     name_key(&format!("{KIND_SERVICE}/{service_id}/{KIND_LISTENER}"), name)
+}
+
+/// The [`ComAmazonawsVpclatticeMercurycontrolplaneState::name_index`] key of a rule
+/// name. "The name must be unique within the listener" (`CreateRule`'s `name` member),
+/// so the owning listener's id is part of the key.
+pub fn rule_name_key(listener_id: &str, name: &str) -> String {
+    name_key(&format!("{KIND_LISTENER}/{listener_id}/{KIND_RULE}"), name)
 }
 
 /// A `nextToken` no listing of this service ever minted.
@@ -614,6 +714,17 @@ pub fn listener_arn(region: &str, service_id: &str, listener_id: &str) -> String
         region,
         &format!("{KIND_SERVICE}/{service_id}/{KIND_LISTENER}"),
         listener_id,
+    )
+}
+
+/// A rule's ARN, which nests under its listener's:
+/// `arn:aws:vpc-lattice:<region>:<account>:service/<service id>/listener/<listener
+/// id>/rule/<rule id>` (`RuleArn`'s modelled pattern).
+pub fn rule_arn(region: &str, service_id: &str, listener_id: &str, rule_id: &str) -> String {
+    arn_for(
+        region,
+        &format!("{KIND_SERVICE}/{service_id}/{KIND_LISTENER}/{listener_id}/{KIND_RULE}"),
+        rule_id,
     )
 }
 
