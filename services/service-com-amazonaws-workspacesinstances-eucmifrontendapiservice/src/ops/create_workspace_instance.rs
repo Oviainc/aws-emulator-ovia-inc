@@ -189,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (instance_id, ec2_instance_id) = state.mint_ids();
         // Tags arrive as a list of `Tag{Key, Value}`, both optional in the model; a
         // repeated key keeps the last value, which is what merging onto a map gives.
+        // One request's list is `TagList len 0..50` (the same bound as
+        // `state::MAX_TAGS_PER_INSTANCE`, enforced at the boundary before this runs), so
+        // the set this builds is already inside what `ListTagsForResource` can report;
+        // `TagResource` is the only path that can grow it and checks the bound itself.
         let mut tags = std::collections::BTreeMap::new();
         for tag in input.tags.unwrap_or_default() {
             if let Some(key) = tag.key {

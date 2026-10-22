@@ -108,6 +108,22 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// An ISO-8601 timestamp this service rendered, as epoch milliseconds.
+///
+/// Timestamps must be COMPARED as instants, not as strings: the writer trims a
+/// trailing-zero (and an all-zero) millisecond fraction, so `…:00Z` and `…:00.101Z`
+/// are the same second but sort the wrong way round lexicographically (`'Z' > '0'`).
+fn timestamp_millis(case: &str, rendered: &str) -> i64 {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        rendered,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|e| panic!("case {case:?}: {rendered:?} is not an ISO-8601 timestamp: {e}"));
+    parsed.to_millis().unwrap_or_else(|e| {
+        panic!("case {case:?}: {rendered:?} is not representable in milliseconds: {e}")
+    })
+}
+
 fn member<'a>(body: &'a Value, name: &str) -> &'a Value {
     body.get(name).unwrap_or(&Value::Null)
 }
@@ -323,7 +339,10 @@ async fn a_second_put_detector_updates_the_same_record() {
             "case {event_type_name:?}: the ARN must survive an update, got {current:?}"
         );
         assert!(
-            string_member(current, "lastUpdatedTime") >= string_member(&first, "createdTime"),
+            timestamp_millis(
+                event_type_name,
+                &string_member(current, "lastUpdatedTime")
+            ) >= timestamp_millis(event_type_name, &string_member(&first, "createdTime")),
             "case {event_type_name:?}: lastUpdatedTime must not precede createdTime, got {current:?}"
         );
     }

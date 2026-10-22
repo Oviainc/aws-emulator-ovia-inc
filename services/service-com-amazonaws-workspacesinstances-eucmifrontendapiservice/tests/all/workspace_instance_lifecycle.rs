@@ -21,15 +21,22 @@ use smithy_server_runtime::MultiServiceRouter;
 const TARGET_PREFIX: &str = "EUCMIFrontendAPIService";
 
 /// A router carrying only this service, over one shared engine — the same
-/// `EmulatedService::new(engine)` seam `core/router` mounts.
-fn router() -> MultiServiceRouter {
+/// `EmulatedService::new(engine)` seam `core/router` mounts. The engine is returned
+/// alongside so a test can read the stored record directly where the wire cannot
+/// show what it needs (the clock deadline on a record).
+fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator's concern, not this service's; the tests drive
     // unsigned requests whose credential scope still names the service.
     router.set_request_authentication(false);
-    router.register_service(wsinst::EmulatedService::new(engine));
-    router
+    router.register_service(wsinst::EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// [`harness`] when the test needs only the router.
+fn router() -> MultiServiceRouter {
+    harness().0
 }
 
 /// One awsJson1_0 call. Returns the HTTP status and the parsed JSON body.
@@ -457,17 +464,51 @@ async fn provision_state(router: &MultiServiceRouter, id: &str) -> String {
 }
 
 #[tokio::test]
-async fn provision_state_is_the_transient_allocating_straight_after_create() {
-    // ONE create and ONE read, so the pair cannot outlast ALLOCATION_SPAN even on a
-    // loaded runner: the transition the create started is not yet due, and a caller
-    // acting immediately still observes the non-terminal state.
-    let router = router();
+async fn provision_state_is_the_transient_allocating_until_the_span_is_due() {
+    // Two assertions, neither of which races the wall clock:
+    //  1. the deadline the create stored is at least one whole ALLOCATION_SPAN after
+    //     the call, so the transition is never instantaneous; and
+    //  2. whenever the clock says the deadline has NOT passed — checked against an
+    //     instant taken AFTER the Get returned, so it bounds the instant the handler
+    //     itself read — the wire reported the transient ALLOCATING.
+    let (router, engine) = harness();
+    let before_create = std::time::Instant::now();
     let id = create(&router, minimal_create()).await;
-    let state = provision_state(&router, &id).await;
-    assert_eq!(
-        state, "ALLOCATING",
-        "case immediately after create: expected the transient ALLOCATING, got {state:?}"
+
+    let store = wsinst::state::service_state(&*engine).expect("the service's own store");
+    let allocation_due = store
+        .lock()
+        .instances
+        .get(&id)
+        .expect("the create must have stored the record")
+        .allocation_due;
+    assert!(
+        allocation_due >= before_create + wsinst::state::ALLOCATION_SPAN,
+        "case the stored deadline: expected the ALLOCATED transition to fall due no sooner than one span after the call, got a deadline {:?} earlier",
+        (before_create + wsinst::state::ALLOCATION_SPAN).saturating_duration_since(allocation_due)
     );
+
+    let before_get = std::time::Instant::now();
+    let state = provision_state(&router, &id).await;
+    let after_get = std::time::Instant::now();
+    // The handler read the record at some instant in [before_get, after_get], so only
+    // these two implications are sound; inside the window either answer is correct.
+    if after_get < allocation_due {
+        assert_eq!(
+            state, "ALLOCATING",
+            "case read wholly before the deadline: expected the transient ALLOCATING, got {state:?}"
+        );
+    } else if before_get >= allocation_due {
+        assert_eq!(
+            state, "ALLOCATED",
+            "case read wholly at or after the deadline: expected ALLOCATED, got {state:?}"
+        );
+    } else {
+        assert!(
+            state == "ALLOCATING" || state == "ALLOCATED",
+            "case read across the deadline: expected ALLOCATING or ALLOCATED, got {state:?}"
+        );
+    }
 }
 
 #[tokio::test]
