@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one gateway and answers with the stored record: the gateway DescribeGateway
+//! reports and ListGateways summarises afterwards is this one, read back out of
+//! [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +83,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredGateway, SERVICE_NAMESPACE};
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error".
+fn bad_request(message: impl Into<String>) -> CreateGatewayError {
+    CreateGatewayErrorModeled::BadRequestException(BadRequestException {
+        message: message.into(),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +168,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGateway"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGatewayErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect gateway store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The gateway name is the last segment of the ARN this operation mints, and that
+        // ARN addresses the gateway as an `@httpLabel` afterwards.
+        if !crate::state::is_valid_gateway_name(&input.name) {
+            return Err(bad_request(format!(
+                "Invalid gateway name {:?}. A gateway name must not be empty and must not \
+                 contain ':' or '/'.",
+                input.name
+            )));
+        }
+
+        // "Creates a new gateway. The request must include at least one network (up to
+        // four)."
+        if input.networks.is_empty() || input.networks.len() > crate::state::MAX_GATEWAY_NETWORKS {
+            return Err(bad_request(format!(
+                "A create gateway request must include at least one network and at most {}; \
+                 this one has {}.",
+                crate::state::MAX_GATEWAY_NETWORKS,
+                input.networks.len()
+            )));
+        }
+
+        // `GatewayNetwork.Name`: "This name is used to reference the network and must be
+        // unique among networks in this gateway."
+        for (index, network) in input.networks.iter().enumerate() {
+            if input.networks[..index]
+                .iter()
+                .any(|earlier| earlier.name == network.name)
+            {
+                return Err(bad_request(format!(
+                    "A network name must be unique among the networks of one gateway; {:?} \
+                     appears more than once.",
+                    network.name
+                )));
+            }
+        }
+
+        // `EgressCidrBlocks` is a required member naming "the range of IP addresses that
+        // are allowed to contribute content or initiate output requests for flows
+        // communicating with this gateway", so an empty list names no contributor at all;
+        // and the list is stored verbatim in a record nothing evicts, so its entry count
+        // is bounded before it is stored (see `MAX_GATEWAY_EGRESS_CIDR_BLOCKS`).
+        if input.egress_cidr_blocks.is_empty() {
+            return Err(bad_request(
+                "A create gateway request must include at least one egress CIDR block.",
+            ));
+        }
+        if input.egress_cidr_blocks.len() > crate::state::MAX_GATEWAY_EGRESS_CIDR_BLOCKS {
+            return Err(bad_request(format!(
+                "A create gateway request may include at most {} EgressCidrBlocks entries; \
+                 this one has {}.",
+                crate::state::MAX_GATEWAY_EGRESS_CIDR_BLOCKS,
+                input.egress_cidr_blocks.len()
+            )));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The gateway store is bounded: nothing evicts a gateway and DescribeGateway must
+        // still answer what this operation created, so the create refuses once the store
+        // is full rather than growing it without limit. See `crate::state::MAX_GATEWAYS`.
+        if store.gateways.len() >= crate::state::MAX_GATEWAYS {
+            return Err(CreateGatewayErrorModeled::CreateGateway420Exception(
+                CreateGateway420Exception {
+                    message: format!(
+                        "This account already holds the maximum of {} gateways in this Region. \
+                         Delete a gateway before creating another one.",
+                        crate::state::MAX_GATEWAYS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Nothing in the model makes a gateway name unique, and the gateway id in the ARN
+        // keeps two same-named gateways apart, so a name already in use is NOT refused:
+        // each create mints its own gateway.
+        let suffix = store.next_suffix();
+        let gateway_arn = ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            &region,
+            &crate::state::gateway_resource_fragment(suffix, &input.name),
+        );
+
+        store.gateways.insert(
+            gateway_arn.clone(),
+            StoredGateway {
+                gateway_arn: gateway_arn.clone(),
+                name: input.name.clone(),
+                egress_cidr_blocks: input.egress_cidr_blocks.clone(),
+                networks: input.networks.clone(),
+                // A new gateway is not ready yet: AWS answers the create with a gateway
+                // in the non-terminal `CREATING` state, which the clock settles into
+                // `ACTIVE` once `crate::state::TRANSITION_SPAN` has passed.
+                gateway_state: crate::state::GATEWAY_STATE_CREATING.to_string(),
+                pending: Some(crate::state::PendingStatus {
+                    status: crate::state::GATEWAY_STATE_ACTIVE.to_string(),
+                    due_at: now + crate::state::TRANSITION_SPAN,
+                }),
+            },
+        );
+
+        // The response is the STORED record, read back out of the store, not the request.
+        let gateway = store
+            .gateways
+            .get(&gateway_arn)
+            .map(StoredGateway::to_gateway)
+            .ok_or_else(|| {
+                CreateGatewayError::from(CreateGatewayErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the gateway could not be read back after it was stored"
+                            .to_string(),
+                    },
+                ))
+            })?;
+        Ok(CreateGatewayOutput {
+            gateway: Some(gateway),
+        })
     }
 }
