@@ -3,12 +3,12 @@
 //! Engine state for the com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice service.
 //!
 //! This module owns everything the handlers share: the stored form of an
-//! automation rule and of an automation event, the enrollment configuration,
-//! the client-token (idempotency) ledger, and the pure helpers that mint a rule
-//! id, build an opaque page token, bound a queried time range and decide
-//! whether a rule or an event matches a list filter. Handlers live in
-//! `src/ops/`, one file per operation, and build their own output shapes from
-//! what they read back out of here.
+//! automation rule, of an automation event and of a recommended action, the
+//! enrollment configuration, the client-token (idempotency) ledger, and the pure
+//! helpers that mint a rule id, build an opaque page token, bound a queried time
+//! range and decide whether a rule, an event or a recommended action matches a
+//! list filter. Handlers live in `src/ops/`, one file per operation, and build
+//! their own output shapes from what they read back out of here.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,8 +18,8 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, EstimatedMonthlySavings,
-    Filter, OrganizationConfiguration, RecommendedAction, Schedule, Tag,
-    AUTOMATION_EVENT_FILTER_NAME_VALUES,
+    Filter, OrganizationConfiguration, RecommendedAction, RecommendedActionFilter, ResourceDetails,
+    Schedule, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES, RECOMMENDED_ACTION_FILTER_NAME_VALUES,
 };
 
 /// The ARN namespace this service stamps on a rule ARN, from the model's
@@ -484,6 +484,63 @@ impl RuleStore {
     }
 }
 
+/// The recommended actions this service holds, in the order they were recorded,
+/// with the by-id lookup `StartAutomationEvent` needs.
+///
+/// Compute Optimizer's own analysis is what produces a recommended action, so no
+/// operation of THIS API creates one: the store holds the modelled
+/// `RecommendedAction` as recorded, and `ListRecommendedActions` reports entries
+/// straight out of it, never from the request. It reads like the map it replaces
+/// — `insert(id, action)` / `get(id)` — while also keeping the record order a
+/// paginated list has to page over. `insert` is the only writer, so the order and
+/// the index cannot drift apart.
+#[derive(Debug, Default)]
+pub struct RecommendedActionStore {
+    /// `recommendedActionId`s in record order, so a list pages over a stable
+    /// sequence.
+    order: Vec<String>,
+    by_id: HashMap<String, RecommendedAction>,
+}
+
+impl RecommendedActionStore {
+    /// Record `action` under `recommended_action_id`. Re-recording the same id
+    /// replaces the stored action in place, keeping its position in the order.
+    pub fn insert(&mut self, recommended_action_id: String, action: RecommendedAction) {
+        if !self.by_id.contains_key(&recommended_action_id) {
+            self.order.push(recommended_action_id.clone());
+        }
+        self.by_id.insert(recommended_action_id, action);
+    }
+
+    /// The action a `recommendedActionId` names.
+    pub fn get(&self, recommended_action_id: &str) -> Option<&RecommendedAction> {
+        self.by_id.get(recommended_action_id)
+    }
+
+    /// Every recorded action, in record order.
+    pub fn iter_in_order(&self) -> impl Iterator<Item = &RecommendedAction> {
+        self.order.iter().filter_map(|id| self.by_id.get(id))
+    }
+
+    /// How many actions are recorded.
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+}
+
+/// The EBS volume type of `details`, for the
+/// `CurrentResourceDetailsEbsVolumeType` filter. `None` when the action carries
+/// no such configuration.
+fn ebs_volume_type(details: Option<&ResourceDetails>) -> Option<String> {
+    match details? {
+        ResourceDetails::ebsVolume(volume) => volume.configuration.as_ref()?.r#type.clone(),
+    }
+}
+
 /// An automation event as stored: the run of ONE recommended action, which is
 /// what `ListAutomationEvents` and the event readers report. Every response
 /// member is built from one of these, never from the request that asked for it.
@@ -796,18 +853,18 @@ pub struct ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationservi
     pub enrollments: HashMap<String, EnrollmentConfig>,
     /// Every automation rule, in creation order.
     pub rules: RuleStore,
+    /// The recommended actions this service can automate, by
+    /// `recommendedActionId` and in record order.
+    ///
+    /// A recommended action is produced by Compute Optimizer's analysis of the
+    /// account's resources, which this emulator does not perform, so nothing in
+    /// this API populates it: `StartAutomationEvent` resolves every id against
+    /// this ONE store and `ListRecommendedActions` pages over it, so the two
+    /// never read two copies of one resource.
+    pub recommended_actions: RecommendedActionStore,
     /// Every automation event, in creation order. Written by the operations
     /// that start and roll back an event; read by the event readers.
     pub events: EventStore,
-    /// The recommended actions this service can automate, by
-    /// `recommendedActionId`.
-    ///
-    /// A recommended action is produced by Compute Optimizer's analysis of the
-    /// account's resources, which this emulator does not perform, so nothing
-    /// populates this map yet and `StartAutomationEvent` resolves every id
-    /// against it — one lookup, one place for a recommendation source
-    /// (`ListRecommendedActions`, still a stub) to write into.
-    pub recommended_actions: HashMap<String, RecommendedAction>,
     /// `clientToken` -> what the call that first used it did. Bounded by
     /// [`MAX_IDEMPOTENCY_ENTRIES`] and [`IDEMPOTENCY_TTL`].
     pub idempotency: HashMap<String, IdempotencyRecord>,
@@ -984,6 +1041,81 @@ pub fn unknown_filter_name(filters: &[Filter]) -> Option<&str> {
         .find(|name| !AUTOMATION_RULE_FILTER_NAMES.contains(name))
 }
 
+/// Does `action` satisfy every `ListRecommendedActions` filter?
+///
+/// A filter matches when the action's corresponding member equals any of the
+/// filter's values; several filters are ANDed, exactly as for
+/// [`rule_matches_filters`]. A member the stored action does not carry matches
+/// nothing. The names are the model's `RecommendedActionFilterName` value set
+/// ([`RECOMMENDED_ACTION_FILTER_NAME_VALUES`]), and an unrecognised one is
+/// reported by [`unknown_recommended_action_filter_name`] rather than silently
+/// ignored.
+pub fn recommended_action_matches_filters(
+    action: &RecommendedAction,
+    filters: &[RecommendedActionFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let field: Option<String> = match filter.name.as_str() {
+            "ResourceType" => action.resource_type.clone(),
+            "RecommendedActionType" => action.recommended_action_type.clone(),
+            "ResourceId" => action.resource_id.clone(),
+            "AccountId" => action.account_id.clone(),
+            "CurrentResourceDetailsEbsVolumeType" => {
+                ebs_volume_type(action.current_resource_details.as_ref())
+            }
+            // An integer member: the filter carries its decimal rendering, so
+            // the comparison is numeric and a value that is not a number
+            // matches nothing rather than matching by spelling.
+            "LookBackPeriodInDays" => {
+                let Some(days) = action.look_back_period_in_days else {
+                    return false;
+                };
+                return filter
+                    .values
+                    .iter()
+                    .filter_map(|value| value.trim().parse::<i32>().ok())
+                    .any(|wanted| wanted == days);
+            }
+            // A boolean member: `true`/`false`, matched without regard to case
+            // so neither JSON's nor the console's spelling is rejected.
+            "RestartNeeded" => {
+                let Some(restart_needed) = action.restart_needed else {
+                    return false;
+                };
+                return filter
+                    .values
+                    .iter()
+                    .filter_map(|value| value.trim().to_ascii_lowercase().parse::<bool>().ok())
+                    .any(|wanted| wanted == restart_needed);
+            }
+            // The resource's tags are a LIST, so the filter matches when any
+            // requested key (or value) occurs among them.
+            "ResourceTagsKey" => {
+                return action.resource_tags.iter().flatten().any(|tag| {
+                    filter.values.contains(&tag.key)
+                });
+            }
+            "ResourceTagsValue" => {
+                return action.resource_tags.iter().flatten().any(|tag| {
+                    filter.values.contains(&tag.value)
+                });
+            }
+            // An unknown name never reaches here: the caller refuses it first.
+            _ => None,
+        };
+        field.is_some_and(|value| filter.values.contains(&value))
+    })
+}
+
+/// The first filter name that is not one of the model's
+/// `RecommendedActionFilterName` values, if any.
+pub fn unknown_recommended_action_filter_name(filters: &[RecommendedActionFilter]) -> Option<&str> {
+    filters
+        .iter()
+        .map(|f| f.name.as_str())
+        .find(|name| !RECOMMENDED_ACTION_FILTER_NAME_VALUES.contains(name))
+}
+
 /// The refusal for a filter name outside the model's value set. The set is
 /// enumerated from [`AUTOMATION_RULE_FILTER_NAMES`], so the message cannot
 /// drift from the names the service actually accepts.
@@ -1039,9 +1171,9 @@ pub fn priority_is_valid(priority: &str) -> bool {
     }
 }
 
-/// Where a page of `ListAutomationRules` resumed from: how far into the filtered
-/// sequence the previous page stopped, and a fingerprint of the filters it was
-/// taken with, so resuming with different filters is refused instead of
+/// Where a page of a paginated list operation resumed from: how far into the
+/// filtered sequence the previous page stopped, and a fingerprint of the filters
+/// it was taken with, so resuming with different filters is refused instead of
 /// returning a page of a different result set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor {
@@ -1049,8 +1181,8 @@ pub struct PageCursor {
     pub filter_fingerprint: String,
 }
 
-/// Encode a cursor as the opaque `nextToken` the model describes
-/// (`^[A-Za-z0-9+/=]+$`). Hex of `<offset>:<fingerprint>` satisfies that
+/// Encode a cursor as the opaque `nextToken` every paginated operation of this
+/// service describes (`^[A-Za-z0-9+/=]+$`). Hex of `<offset>:<fingerprint>` satisfies that
 /// pattern and carries the cursor itself, so a page token needs no server-side
 /// entry and a read never writes.
 pub fn encode_page_token(cursor: &PageCursor) -> String {
@@ -1058,7 +1190,9 @@ pub fn encode_page_token(cursor: &PageCursor) -> String {
 }
 
 /// Decode a `nextToken` produced by [`encode_page_token`]. `None` when the token
-/// was not produced by this service.
+/// was not produced by this service. What a decoded cursor may resume is the
+/// caller's own check: it compares the cursor's fingerprint against the one it
+/// would have issued for this request.
 pub fn decode_page_token(token: &str) -> Option<PageCursor> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     let (offset, fingerprint) = decoded.split_once(':')?;

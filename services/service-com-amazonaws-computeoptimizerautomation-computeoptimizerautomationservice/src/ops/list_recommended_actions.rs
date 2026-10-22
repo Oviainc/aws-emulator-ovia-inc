@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendedActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendedActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendedActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Reports the recommended actions the store holds, in record order,
+//! narrowed by `filters` and paged by `maxResults` with an opaque `nextToken` that
+//! resumes where the previous page stopped. `@paginated(inputToken: nextToken,
+//! outputToken: nextToken, items: recommendedActions)`.
+//!
+//! A recommended action is produced by Compute Optimizer's own analysis of a
+//! resource, so no operation of THIS API creates one: this handler only reports
+//! what [`crate::state::RecommendedActionStore`] holds (an emulator nothing has
+//! recorded an action into reports an empty list), and it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +162,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendedActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendedActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendedActions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRecommendedActionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        // `RecommendedActionFilter$name` is typed as the
+        // `RecommendedActionFilterName` value set, but a name outside it is
+        // refused here too so a filter is never silently ignored. The refusal
+        // echoes no request value, like every other refusal of this service.
+        if crate::state::unknown_recommended_action_filter_name(&filters).is_some() {
+            return Err(invalid_parameter(crate::state::constraint_report(
+                "filters.member.name",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    RECOMMENDED_ACTION_FILTER_NAME_VALUES.join(", ")
+                ),
+            )));
+        }
+
+        // The page token carries this operation's name and the filters it was
+        // taken with, so resuming a walk with different filters, or with a token
+        // another operation issued, is refused rather than answered with a page
+        // of a different result set.
+        let filter_fingerprint = crate::state::fingerprint(&(Self::NAME, &filters));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned by a previous \
+                         ListRecommendedActions call",
+                    )));
+                };
+                if cursor.filter_fingerprint != filter_fingerprint {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned for the same filters",
+                    )));
+                }
+                cursor.offset
+            }
+        };
+
+        // `maxResults` carries a member `@range` of min 1 / max 100
+        // (`smithy_query(query="shape",shape="ListRecommendedActionsRequest")`),
+        // which the generated request walk enforces BEFORE this handler runs — a
+        // request for 1000 (the ceiling the member's prose names) is refused with
+        // "Member must have value less than or equal to 100" and never arrives
+        // here. So the page size is only defaulted, never validated: a caller
+        // that sends none gets the model's range maximum, and the `.max(1)` is a
+        // floor against a zero page, which would return nothing while carrying a
+        // token whose offset never advances, so a walk would never terminate.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .max(1);
+
+        let guard = state.lock();
+        let matching: Vec<RecommendedAction> = guard
+            .recommended_actions
+            .iter_in_order()
+            .filter(|action| crate::state::recommended_action_matches_filters(action, &filters))
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .cloned()
+            .collect();
+
+        // One extra action was taken: its presence is what says another page
+        // exists, and the token resumes exactly where this page stopped.
+        let has_more = matching.len() > page_size;
+        let page: Vec<RecommendedAction> = matching.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + page.len(),
+                filter_fingerprint,
+            })
+        });
+
+        Ok(ListRecommendedActionsOutput {
+            recommended_actions: Some(page),
+            next_token,
+        })
     }
+}
+
+fn invalid_parameter(message: String) -> ListRecommendedActionsError {
+    ListRecommendedActionsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

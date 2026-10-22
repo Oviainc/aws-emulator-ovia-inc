@@ -19,6 +19,8 @@ mod automation_events;
 mod automation_rule_lifecycle;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/recommended_actions.rs"]
+mod recommended_actions;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

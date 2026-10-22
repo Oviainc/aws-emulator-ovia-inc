@@ -19,13 +19,19 @@ use smithy_server_runtime::MultiServiceRouter;
 /// `pub(crate)` so the other suites in this test binary drive the service through
 /// the same harness instead of each growing a copy of it.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same harness, handing the engine back as well, for a suite that must
+/// record into the store what no operation of this API creates.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the process-wide default: these cases are
     // about the service's behaviour, not about SigV4.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// Call one operation and return `(http status, parsed body)`.
@@ -139,7 +145,7 @@ pub(crate) fn is_rule_id(value: &str) -> bool {
 }
 
 /// `NextToken` is modelled as `^[A-Za-z0-9+/=]+$`.
-fn is_next_token(value: &str) -> bool {
+pub(crate) fn is_next_token(value: &str) -> bool {
     !value.is_empty()
         && value
             .chars()
