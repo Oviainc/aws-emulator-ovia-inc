@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceIntegration
-//! Replaces the integration members the request supplies, leaving the rest as stored.
+//! Replaces the integration members the request supplies, leaving the rest as stored,
+//! and refuses an update whose RESULT would be a configuration the service cannot
+//! represent — customer-managed-key encryption enabled with no key designated.
 //! `DescribeServiceIntegration` reports the result.
 //!
 //! ## Shape of an operation
@@ -154,23 +156,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
-        let integration = &mut guard.service_integration;
 
         // Every member of `UpdateServiceIntegrationConfig` is optional: an absent one
         // leaves that integration as it was, so one call can turn OpsCenter on without
-        // disturbing log anomaly detection or encryption.
+        // disturbing log anomaly detection or encryption. Whether the RESULT is a
+        // configuration the service can represent therefore depends on the merge of the
+        // request onto what is stored, not on the request alone — so the merge is
+        // computed here, validated below, and only then stored, which is what leaves the
+        // stored configuration untouched when the update is refused.
+        let mut prospective = guard.service_integration.clone();
+
         if let Some(ops_center) = &input.service_integration.ops_center {
             if let Some(opt_in_status) = &ops_center.opt_in_status {
-                integration.ops_center_opt_in_status = opt_in_status.clone();
+                prospective.ops_center_opt_in_status = opt_in_status.clone();
             }
         }
         if let Some(logs) = &input.service_integration.logs_anomaly_detection {
             if let Some(opt_in_status) = &logs.opt_in_status {
-                integration.logs_anomaly_detection_opt_in_status = opt_in_status.clone();
+                prospective.logs_anomaly_detection_opt_in_status = opt_in_status.clone();
             }
         }
         if let Some(kms) = &input.service_integration.kms_server_side_encryption {
-            let stored = &mut integration.kms_server_side_encryption;
+            let stored = &mut prospective.kms_server_side_encryption;
             if let Some(opt_in_status) = &kms.opt_in_status {
                 stored.opt_in_status = opt_in_status.clone();
             }
@@ -181,6 +188,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stored.encryption_type = Some(encryption_type.clone());
             }
         }
+
+        // CONDITIONALLY REQUIRED MEMBER. `KMSKeyId` is what designates the key, and a
+        // CUSTOMER-managed key is by definition one the caller supplies, so an enabled
+        // customer-managed-key encryption without it names no key: a state no account can
+        // report. The update is refused with the modelled client error and the stored
+        // configuration is left exactly as it was. An `AWS_OWNED_KMS_KEY` encryption
+        // needs no key, because DevOps Guru owns it.
+        let kms = &prospective.kms_server_side_encryption;
+        if kms.opt_in_status == crate::state::OPT_IN_STATUS_ENABLED
+            && kms.encryption_type.as_deref()
+                == Some(crate::state::SERVER_SIDE_ENCRYPTION_TYPE_CUSTOMER_MANAGED_KEY)
+            && kms.kms_key_id.is_none()
+        {
+            let required_for = crate::state::SERVER_SIDE_ENCRYPTION_TYPE_CUSTOMER_MANAGED_KEY;
+            return Err(UpdateServiceIntegrationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("Must specify KMSKeyId for {required_for}"),
+                    reason: Some(
+                        crate::state::VALIDATION_REASON_INVALID_PARAMETER_COMBINATION.to_string(),
+                    ),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "ServiceIntegration.KMSServerSideEncryption.KMSKeyId".to_string(),
+                        message: format!(
+                            "is required when OptInStatus is {} and Type is {required_for}",
+                            crate::state::OPT_IN_STATUS_ENABLED
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        guard.service_integration = prospective;
 
         Ok(UpdateServiceIntegrationOutput::default())
     }
