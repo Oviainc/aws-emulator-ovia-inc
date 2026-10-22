@@ -4,16 +4,19 @@
 //! IMPLEMENTED: mutates the SAME stored stack (same `StackId`) — replaces the template
 //! unless `UsePreviousTemplate` is set, merges `Parameters` honouring
 //! `UsePreviousValue`, applies the configuration members the request carries, sets
-//! `LastUpdatedTime` and records the `UPDATE_IN_PROGRESS` event.
+//! `LastUpdatedTime` and records the `UPDATE_IN_PROGRESS` event. The template the stack
+//! now carries is DEPLOYED: its resources and its outputs are re-evaluated, and take
+//! effect when the update completes, so a caller reading mid-update still sees the values
+//! in force.
 //!
-//! Members this slice stores but has nothing to act on, because it creates no stack
-//! RESOURCES: `StackPolicyBody` (replaces the stack's policy, which `GetStackPolicy`
+//! Members this slice stores but has nothing to act on, because it performs no resource
+//! updates: `StackPolicyBody` (replaces the stack's policy, which `GetStackPolicy`
 //! reports back) and `ResourceTypes`. `StackPolicyDuringUpdateBody` is a policy that
 //! applies to THIS update only, protecting resources from being changed by it; with no
-//! resources to protect it has nothing to override, so it is accepted and not stored.
-//! `DisableValidation` turns off pre-deployment validation this emulator does not perform
-//! either way. `StackPolicyURL` and `StackPolicyDuringUpdateURL` name a policy in Amazon
-//! S3 and are answered 501, like `TemplateURL`.
+//! resource updates to govern it has nothing to override, so it is accepted and not
+//! stored. `DisableValidation` turns off pre-deployment validation this emulator does not
+//! perform either way. `StackPolicyURL` and `StackPolicyDuringUpdateURL` name a policy in
+//! Amazon S3 and are answered 501, like `TemplateURL`.
 //!
 //! ## Shape of an operation
 //!
@@ -490,6 +493,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.resource_types = resource_types.clone();
         }
         stack.last_updated_time = Some(now);
+        // The update deploys the template the stack now carries: its resources and its
+        // outputs are re-evaluated from the new body and the merged parameters, and
+        // reported once the update completes.
+        stack.deploy_template();
         // The update starts now and settles to UPDATE_COMPLETE once the clock makes that
         // due; the stack id never changes.
         stack.begin_transition(

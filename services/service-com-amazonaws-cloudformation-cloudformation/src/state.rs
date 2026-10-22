@@ -33,8 +33,19 @@
 //! one that reads after the due instant sees the terminal status and the event that
 //! carries it. Nothing sleeps, and no read invents a transition the clock had not
 //! already made due.
+//!
+//! What a create or update DEPLOYS — the resources the template declares and the outputs
+//! evaluated over them (see [`template`]) — rides on that same clock: the call computes
+//! the deployment ([`StoredStack::deploy_template`]) and `settle` installs it with the
+//! terminal status, so a stack always reports the resources and outputs of the template
+//! that finished deploying.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
+
+/// Reading a stack's template body, and evaluating the resources and outputs it
+/// declares.
+pub mod template;
 
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
@@ -138,6 +149,35 @@ pub struct StoredParameter {
     pub value: String,
 }
 
+/// One resource a stack's template declares, as this emulator records it.
+///
+/// The physical resource id and the attributes are what CloudFormation's documented
+/// return values for that resource type give it (see [`template::provision`]); they are
+/// what `Ref` and `Fn::GetAtt` resolve to when the stack's outputs are evaluated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredResource {
+    pub logical_id: String,
+    pub resource_type: String,
+    pub physical_resource_id: String,
+    /// The attributes `Fn::GetAtt` reads off this resource, keyed by attribute name.
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// One evaluated stack output: an `Outputs` entry of the stack's template with its
+/// `Value` resolved against the stack's parameters and resources.
+///
+/// `value` is `None` for a declared output whose value this emulator cannot evaluate —
+/// the output exists because the template declares it, and `Output$OutputValue` is
+/// optional, so an un-evaluable output is reported without a value rather than with an
+/// invented one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOutput {
+    pub key: String,
+    pub value: Option<String>,
+    pub description: Option<String>,
+    pub export_name: Option<String>,
+}
+
 /// A stack tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredTag {
@@ -191,11 +231,27 @@ pub struct PendingStatus {
     pub client_request_token: Option<String>,
 }
 
+/// The resources and outputs an in-flight stack operation will leave the stack with,
+/// once the clock makes its terminal status due.
+///
+/// CloudFormation reports a stack's resources and outputs as of the template that
+/// finished deploying, so a create or update computes them when it starts and they take
+/// effect when it completes.
+#[derive(Debug, Clone, Default)]
+pub struct PendingDeployment {
+    pub resources: Vec<StoredResource>,
+    pub outputs: Vec<StoredOutput>,
+}
+
 /// One stack, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct StoredStack {
     pub stack_id: String,
     pub stack_name: String,
+    /// The Region the stack lives in: the one the call that created it was signed for.
+    /// Every identifier the stack's resources carry is Regional, so this is what the
+    /// template's `AWS::Region` pseudo parameter and every minted ARN resolve to.
+    pub region: String,
     pub template_body: String,
     /// The template's own `Description`, parsed once when the body is stored rather than
     /// on every read: this is where CloudFormation takes both `Stack$Description` and
@@ -217,15 +273,26 @@ pub struct StoredStack {
     /// The stack policy body in force, as `CreateStack`/`UpdateStack` last supplied it.
     ///
     /// A stack policy governs which of a stack's RESOURCES an update may change; this
-    /// slice creates no stack resources, so the policy has nothing to protect yet and is
-    /// stored (and reported by `GetStackPolicy`) rather than enforced.
+    /// service records the resources a template declares but performs no resource
+    /// updates against them, so the policy has nothing to protect yet and is stored (and
+    /// reported by `GetStackPolicy`) rather than enforced.
     pub stack_policy_body: Option<String>,
     /// `ResourceTypes`: the resource types this stack's operations may work with. Stored
-    /// as supplied; it constrains resource creation, which this slice does not do.
+    /// as supplied; it constrains which resource types a stack operation may create,
+    /// which this service does not refuse on.
     pub resource_types: Vec<String>,
     pub status: String,
     pub status_reason: Option<String>,
     pub pending: Option<PendingStatus>,
+    /// The resources the stack's last COMPLETED create or update materialised (see
+    /// [`StoredStack::deploy_template`]).
+    pub resources: Vec<StoredResource>,
+    /// The stack's evaluated outputs, in `OutputKey` order, as of that same completed
+    /// operation — what `DescribeStacks` reports as `Stack$Outputs`.
+    pub outputs: Vec<StoredOutput>,
+    /// What the create or update currently in flight will leave the two fields above
+    /// with when it completes.
+    pub pending_deployment: Option<PendingDeployment>,
     pub creation_time: SystemTime,
     pub last_updated_time: Option<SystemTime>,
     pub deletion_time: Option<SystemTime>,
@@ -241,7 +308,8 @@ impl StoredStack {
         Self {
             stack_id,
             stack_name,
-            template_description: template_description(&template_body),
+            region: DEFAULT_REGION.to_string(),
+            template_description: template::description(&template_body),
             template_body,
             parameters: Vec::new(),
             capabilities: Vec::new(),
@@ -260,6 +328,9 @@ impl StoredStack {
             status: status::CREATE_IN_PROGRESS.to_string(),
             status_reason: None,
             pending: None,
+            resources: Vec::new(),
+            outputs: Vec::new(),
+            pending_deployment: None,
             creation_time: now,
             last_updated_time: None,
             deletion_time: None,
@@ -270,8 +341,62 @@ impl StoredStack {
 
     /// Replace the stored template body, re-deriving the description it carries.
     pub fn set_template_body(&mut self, template_body: String) {
-        self.template_description = template_description(&template_body);
+        self.template_description = template::description(&template_body);
         self.template_body = template_body;
+    }
+
+    /// Materialise what the stored template declares: one record per declared resource,
+    /// and the stack's outputs evaluated against those resources, the stack's parameters
+    /// and the pseudo parameters.
+    ///
+    /// Called by the operation that DEPLOYS the template (`CreateStack`, `UpdateStack`),
+    /// never by a read: the values are a function of the template body and the
+    /// parameters in force, so they are computed once where those change and read back
+    /// unchanged afterwards.
+    ///
+    /// The result is held as the operation's PENDING deployment and takes effect when
+    /// [`Self::settle`] completes that operation — a stack reports the resources and
+    /// outputs of the template that finished deploying, so a caller reading a stack whose
+    /// create is still in progress sees none, and one reading mid-update still sees the
+    /// values in force rather than the ones the update is about to install. A template
+    /// this service cannot read declares nothing, and leaves the stack with no resources
+    /// and no outputs rather than with the previous template's.
+    pub fn deploy_template(&mut self) {
+        let Some(declared) = template::parse(&self.template_body) else {
+            self.pending_deployment = Some(PendingDeployment::default());
+            return;
+        };
+        // "Default: A value of the appropriate type for the template to use if no value
+        // is specified when a stack is created" — the request's values win over the
+        // template's declared defaults.
+        let mut parameters = declared.parameter_defaults.clone();
+        for parameter in &self.parameters {
+            parameters.insert(parameter.key.clone(), parameter.value.clone());
+        }
+        let stack = template::StackScope {
+            region: &self.region,
+            stack_name: &self.stack_name,
+            stack_id: &self.stack_id,
+        };
+        // ONE budget for the whole deployment: the resource names and every output are
+        // evaluated out of it, so the total work one request can ask for is bounded.
+        let mut budget = template::Budget::new();
+        let resources = template::provision(&declared, &parameters, stack, &mut budget);
+        let by_logical_id: BTreeMap<String, StoredResource> = resources
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect();
+        let outputs = template::evaluate_outputs(
+            &declared,
+            &template::Scope {
+                stack,
+                parameters: &parameters,
+                resources: &by_logical_id,
+                mappings: &declared.mappings,
+            },
+            &mut budget,
+        );
+        self.pending_deployment = Some(PendingDeployment { resources, outputs });
     }
 
     /// Whether this stack is still part of the live set — the set addressable by stack
@@ -336,6 +461,16 @@ impl StoredStack {
         self.status_reason = None;
         if self.status == status::DELETE_COMPLETE {
             self.deletion_time = Some(pending.due_at);
+            // The deletion completed, so the stack's resources are gone and there are no
+            // output values left to report for them.
+            self.resources.clear();
+            self.outputs.clear();
+            self.pending_deployment = None;
+        } else if let Some(deployed) = self.pending_deployment.take() {
+            // The create or update completed: the template it deployed is what the stack
+            // reports resources and outputs for from here on.
+            self.resources = deployed.resources;
+            self.outputs = deployed.outputs;
         }
         let status = self.status.clone();
         self.record_event(
@@ -462,15 +597,23 @@ impl ComAmazonawsCloudformationCloudformationState {
     }
 }
 
-/// The `Description` a CloudFormation template declares, if it declares one.
+/// Stored outputs as the modelled `Outputs` member.
 ///
-/// The template body is caller-supplied text; a body that is not JSON (a YAML template,
-/// say) or that carries no string `Description` simply has none, which is why this
-/// answers `Option` rather than refusing the body.
-pub fn template_description(template_body: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(template_body).ok()?;
-    let description = parsed.get("Description")?.as_str()?;
-    (!description.is_empty()).then(|| description.to_string())
+/// A declared output whose value this service could not evaluate carries no
+/// `OutputValue`: the member is optional, and an absent value is the truthful answer
+/// where an invented identifier would not be.
+pub fn output_views(outputs: &[StoredOutput]) -> Option<Vec<crate::ops::types::Output>> {
+    non_empty(
+        outputs
+            .iter()
+            .map(|output| crate::ops::types::Output {
+                output_key: Some(output.key.clone()),
+                output_value: output.value.clone(),
+                description: output.description.clone(),
+                export_name: output.export_name.clone(),
+            })
+            .collect(),
+    )
 }
 
 /// The region the request was signed for, or [`DEFAULT_REGION`] for an unsigned one.

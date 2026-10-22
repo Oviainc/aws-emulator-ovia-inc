@@ -27,6 +27,12 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # Digests the counter + instant behind each minted identifier (see `state::new_identifier`).
 sha2 = { workspace = true }
+# A CloudFormation template body is JSON *or* YAML ("You can write CloudFormation
+# templates in JSON or YAML"), and the YAML spelling carries the short-form intrinsic
+# tags (`!Ref`, `!GetAtt`) that give a template its meaning. yaml-rust2 is a pure-Rust
+# YAML 1.2 implementation whose event stream reports those tags, which a loaded tree
+# drops.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
