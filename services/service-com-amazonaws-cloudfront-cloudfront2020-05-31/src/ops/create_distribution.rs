@@ -344,6 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
+        let _ = ctx;
         let now = SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
@@ -357,6 +358,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A configuration is walked on every payload that reports it, so the counts that
+        // drive that walk are bounded by CloudFront's published quotas on the way IN,
+        // each refused with the error the model names for it.
+        match crate::state::config_limit_exceeded(&input.distribution_config) {
+            None => {}
+            Some(crate::state::ConfigLimit::CacheBehaviors(message)) => {
+                return Err(CreateDistributionErrorModeled::TooManyCacheBehaviors(
+                    TooManyCacheBehaviors {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            Some(crate::state::ConfigLimit::TrustedSigners(message)) => {
+                return Err(CreateDistributionErrorModeled::TooManyTrustedSigners(
+                    TooManyTrustedSigners {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            Some(crate::state::ConfigLimit::TrustedKeyGroups(message)) => {
+                return Err(
+                    CreateDistributionErrorModeled::TooManyKeyGroupsAssociatedToDistribution(
+                        TooManyKeyGroupsAssociatedToDistribution {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         // "The caller reference you attempted to create the distribution with is
@@ -407,9 +441,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deployed_due: now + crate::state::PROPAGATION_DELAY,
             last_modified_time: now,
             etag: etag.clone(),
-            // Stored whole and verbatim: a later read answers from this, never from the
-            // request being served.
-            config: input.distribution_config,
+            // Stored whole, with every member the service itself supplies resolved into
+            // it: a later read answers from this record — the configuration the
+            // distribution actually runs under — never from the request being served.
+            config: crate::state::resolve_distribution_config(input.distribution_config),
             invalidations: BTreeMap::new(),
         };
         let distribution = stored.to_distribution();
@@ -420,7 +455,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             distribution: Some(distribution),
             // "The fully qualified URI of the new distribution resource just created."
             location: Some(crate::state::location_uri(
-                ctx.parts(),
                 &crate::state::distribution_path(&id),
             )),
             // "The current version of the distribution created."
