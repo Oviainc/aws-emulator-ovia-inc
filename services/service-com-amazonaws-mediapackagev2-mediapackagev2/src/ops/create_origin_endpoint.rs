@@ -387,14 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::TokenMatch::Mismatch => {
                 return Err(CreateOriginEndpointErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(crate::state::idempotent_parameter_mismatch_message(
-                            input.client_token.as_deref().unwrap_or_default(),
-                        )),
-                        conflict_exception_type: Some(
-                            "IDEMPOTENT_PARAMETER_MISMATCH".to_string(),
-                        ),
-                    },
+                    crate::state::idempotent_parameter_mismatch(),
                 )
                 .into());
             }
@@ -416,13 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if channel.origin_endpoints.len() >= crate::state::MAX_ORIGIN_ENDPOINTS_PER_CHANNEL {
             return Err(
                 CreateOriginEndpointErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "Channel {} already has the maximum of {} origin endpoints",
-                            channel.name,
-                            crate::state::MAX_ORIGIN_ENDPOINTS_PER_CHANNEL
-                        )),
-                    },
+                    crate::state::quota_exceeded(crate::state::ResourceKind::OriginEndpoint),
                 )
                 .into(),
             );
@@ -523,6 +510,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // And with no harvest job against it yet.
             harvest_jobs: ::std::collections::BTreeMap::new(),
         };
+        // The ONE derivation of an endpoint's ETag, shared with every update path.
         endpoint.etag = crate::state::origin_endpoint_etag(&endpoint);
         channel.origin_endpoints.insert(name.clone(), endpoint);
         // Answer from what was stored, so the response can only carry what a later

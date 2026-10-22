@@ -189,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is no policy resource to report, and `Policy` is a REQUIRED output member, so
         // the only answer the model leaves is the not-found one.
         let Some(policy) = channel.policy.clone() else {
+            // `ResourceTypeNotFound` enumerates CHANNEL_GROUP | CHANNEL | ORIGIN_ENDPOINT
+            // | HARVEST_JOB — no member names a policy, and the channel itself is NOT
+            // missing, so the discriminator is left unset rather than claiming a resource
+            // type that is present (see `crate::state::policy_not_found`).
             return Err(GetChannelPolicyErrorModeled::ResourceNotFoundException(
                 crate::state::policy_not_found(),
             )

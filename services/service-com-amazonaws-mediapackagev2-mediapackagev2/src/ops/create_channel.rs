@@ -395,14 +395,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::TokenMatch::Mismatch => {
                 return Err(CreateChannelErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(crate::state::idempotent_parameter_mismatch_message(
-                            input.client_token.as_deref().unwrap_or_default(),
-                        )),
-                        conflict_exception_type: Some(
-                            "IDEMPOTENT_PARAMETER_MISMATCH".to_string(),
-                        ),
-                    },
+                    crate::state::idempotent_parameter_mismatch(),
                 )
                 .into());
             }
@@ -420,13 +413,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bounded here rather than by how many requests arrive.
         if group.channels.len() >= crate::state::MAX_CHANNELS_PER_GROUP {
             return Err(CreateChannelErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "Channel group {} already has the maximum of {} channels",
-                        group.name,
-                        crate::state::MAX_CHANNELS_PER_GROUP
-                    )),
-                },
+                crate::state::quota_exceeded(crate::state::ResourceKind::Channel),
             )
             .into());
         }

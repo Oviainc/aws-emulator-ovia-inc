@@ -254,14 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::TokenMatch::Mismatch => {
                 return Err(CreateChannelGroupErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(crate::state::idempotent_parameter_mismatch_message(
-                            input.client_token.as_deref().unwrap_or_default(),
-                        )),
-                        conflict_exception_type: Some(
-                            "IDEMPOTENT_PARAMETER_MISMATCH".to_string(),
-                        ),
-                    },
+                    crate::state::idempotent_parameter_mismatch(),
                 )
                 .into());
             }
@@ -286,12 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.channel_groups.len() >= crate::state::MAX_CHANNEL_GROUPS {
             return Err(
                 CreateChannelGroupErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "This account already has the maximum of {} channel groups in {region}",
-                            crate::state::MAX_CHANNEL_GROUPS
-                        )),
-                    },
+                    crate::state::quota_exceeded(crate::state::ResourceKind::ChannelGroup),
                 )
                 .into(),
             );

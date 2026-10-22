@@ -6,9 +6,11 @@
 //! -> origin endpoint — so the store nests the same way: a channel cannot exist
 //! without its group, and deleting a parent that still has children is refused. Every
 //! derived value a response carries (ARN, egress domain, ingest URL, manifest URL,
-//! ETag, timestamps) is computed by the call that WRITES the record \u2014 a create, or an
-//! update \u2014 and persisted, so every later read reproduces it byte for byte and no
-//! response computes a value of its own while being serialized.
+//! ETag, timestamps) is computed by the call that WRITES the record - a create, or an
+//! update - and persisted, so every later read reproduces it byte for byte and no
+//! response computes a value of its own while being serialized. A resource's `ETag` is a
+//! function of its content and of the commit count the store holds it at (see
+//! [`ChannelGroup::version`]), so a write that changed the resource rotates it.
 //!
 //! The maps are [`BTreeMap`]s: `ListOriginEndpoints` pages in name order, and an
 //! ordered map makes that order a property of the store rather than of each read.
@@ -33,7 +35,7 @@ use crate::ops::types::{
     GetLowLatencyHlsManifestConfiguration, GetMssManifestConfiguration, HarvestedManifests,
     HarvesterScheduleConfiguration, IngestEndpoint, InputSwitchConfiguration,
     MultiviewConfiguration, OutputHeaderConfiguration, ResourceNotFoundException, Segment,
-    ValidationException,
+    ServiceQuotaExceededException, ValidationException,
 };
 
 /// The signing name (and ARN service namespace) of this service, from the model's
@@ -723,6 +725,31 @@ impl OriginEndpoint {
         self.version = self.version.saturating_add(1);
         self.modified_at = at;
         self.etag = origin_endpoint_etag(self);
+    }
+
+    /// A fingerprint of everything this endpoint IS, except the bookkeeping a commit
+    /// writes (its commit count, its entity tag and its modification instant).
+    ///
+    /// Taken over the record's own `Debug` rendering, so it covers every member BY
+    /// CONSTRUCTION — including a member added to the struct later, which is exactly what
+    /// a hand-listed digest gets wrong. `tags` is rendered through [`tag_fingerprint`]
+    /// and then taken out of that rendering, because a `HashMap`'s `Debug` order is
+    /// unspecified and a rehash must not look like a change; `harvest_jobs` is left out
+    /// for the same reason the policy is — a sub-resource commits versions of its own.
+    ///
+    /// `UpdateOriginEndpoint` captures it before it writes and compares afterwards, so a
+    /// write that changed ANY member commits (and rotates the tag) while one that stored
+    /// exactly what was there does not. Compared only within one request: derived `Debug`
+    /// output is not a stability contract, so the value is never stored or returned.
+    pub fn configuration_fingerprint(&self) -> String {
+        let mut own = self.clone();
+        own.version = 0;
+        own.etag = String::new();
+        own.modified_at = ::aws_smithy_types::DateTime::from_secs(0);
+        let tags = tag_fingerprint(&own.tags);
+        own.tags = HashMap::new();
+        own.harvest_jobs = BTreeMap::new();
+        format!("{tags}\u{1f}{own:?}")
     }
 }
 
@@ -1575,12 +1602,13 @@ pub fn attached_multiview_channels(group: &ChannelGroup, channel_name: &str) -> 
     (!attached.is_empty()).then_some(attached)
 }
 
-/// An entity tag over a resource's own content.
+/// A length-prefixed digest over the fields the caller supplies.
 ///
-/// Derived from the fields the resource is made of, so it is stable for as long as the
-/// resource is unchanged and differs once any of them does — which is what a caller
-/// doing a conditional update needs from it. `fields` must include the resource's ARN,
-/// so two different resources with equal contents still differ.
+/// The one hashing primitive this module has: each resource's `recompute_etag` (and
+/// [`origin_endpoint_etag`]) builds an entity tag with it, and [`request_fingerprint`] a
+/// create's idempotency fingerprint. The length prefix is what makes two different field
+/// sequences unable to collide, so what the digest means is decided entirely by which
+/// fields the caller passes.
 pub fn etag(fields: &[String]) -> String {
     let mut hasher = Sha256::new();
     for field in fields {
@@ -1663,14 +1691,23 @@ pub fn request_fingerprint(fields: &[String]) -> String {
     etag(fields)
 }
 
-/// The message a repeat create under a token that was used for a different request
-/// carries. The requirement is the 409 and the `IDEMPOTENT_PARAMETER_MISMATCH`
-/// discriminator; this sentence says what the caller has to change.
-pub fn idempotent_parameter_mismatch_message(client_token: &str) -> String {
-    format!(
-        "The ClientToken {client_token} was already used for a request with different \
-         parameters. Repeat the original request, or use a new ClientToken"
-    )
+/// The conflict a repeat create under a token that was used for a DIFFERENT request is
+/// refused with: 409, `IDEMPOTENT_PARAMETER_MISMATCH`, and the service's fixed sentence.
+///
+/// The sentence names no value from the request — least of all the `ClientToken` itself,
+/// which is the caller's own credential-like identifier for the attempt. It follows the
+/// rule the refusal builders below state: a refusal's words depend only on WHAT was
+/// refused, never on the identifiers the caller sent.
+pub fn idempotent_parameter_mismatch() -> ConflictException {
+    ConflictException {
+        message: Some(
+            "You've specified a client token with your request using parameter values \
+             that differ from a previous request that used the same client token. Check \
+             your parameters and then try again"
+                .to_string(),
+        ),
+        conflict_exception_type: Some("IDEMPOTENT_PARAMETER_MISMATCH".to_string()),
+    }
 }
 
 // =============================================================================
@@ -1788,6 +1825,23 @@ pub fn resource_already_exists() -> ConflictException {
                 .to_string(),
         ),
         conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
+    }
+}
+
+/// The 402 a create answers when the collection it would grow is already at its ceiling.
+///
+/// `ServiceQuotaExceededException` declares no discriminator member, so the sentence is
+/// the whole refusal: it names the KIND whose quota is reached and, like every refusal
+/// here, neither the caller's names nor the quota's value — which is a fact about the
+/// account rather than about the refusal.
+pub fn quota_exceeded(kind: ResourceKind) -> ServiceQuotaExceededException {
+    let plural = kind.plural();
+    ServiceQuotaExceededException {
+        message: Some(format!(
+            "MediaPackage can't create the resource you requested because you've reached \
+             the quota for {plural}. Delete {plural} you no longer need, or request a \
+             quota increase, and then try again"
+        )),
     }
 }
 
