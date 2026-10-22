@@ -67,6 +67,85 @@ pub struct TooManyRequestsException {
     pub message: String,
 }
 
+// ================================================================================
+// Hand-written member schemas for the shapes that carry a `date-time` timestamp
+// ================================================================================
+//
+// Every timestamp member of this service targets `__timestampIso8601`, which carries
+// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+// shape="__timestampIso8601")` reports `{"type": "timestamp", "timestampFormat":
+// "date-time"}`). The restJson1 JSON codec renders a timestamp in the format its member
+// schema reports and falls back to the protocol default, epoch seconds, when the member
+// reports none (`vendor/smithy-schema-server/src/json.rs::timestamp_format`) — a JSON
+// NUMBER where the model, and every AWS SDK's generated deserializer for a `date-time`
+// member, requires an RFC 3339 string.
+//
+// The vendored codegen captures `@length`/`@range`/`@pattern`/`@enum`/`@uniqueItems`/
+// `@jsonName`/`@xmlName` onto a generated member schema and never emits
+// `with_timestamp_format`, so `#[smithy_macros::smithy(shape = ...)]` cannot produce a
+// member that reports `date-time`. The shapes that carry such a member are therefore
+// written out by hand, differing from the macro's output in exactly that one chain call,
+// and build their member schemas through the macro below.
+//
+// The codegen gap itself is filed as
+// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`
+// (and the near-duplicate
+// `...20261021T223000Z-scaffold-codegen-drops-timestampformat-from-member-schemas.md`).
+// REMOVE the hand-written shapes once `vendor/smithy-macros` emits
+// `with_timestamp_format`: each one becomes a `#[smithy_macros::smithy(shape = ...)]`
+// attribute again, and `tests/all/iso8601_timestamps.rs` keeps the wire form pinned
+// either way.
+
+/// One member schema of a hand-written shape, named and indexed as the model orders it.
+///
+/// Three arms, one per member form the timestamp-carrying shapes of this service use:
+///
+/// * `iso8601` — a `__timestampIso8601` member: `ShapeType::Timestamp` plus the
+///   `@timestampFormat("date-time")` chain the vendored macro cannot emit.
+/// * `tags` — the `Tags` map member, which the model renames with `@jsonName("tags")`.
+/// * the plain form — any other member, with the `ShapeType` the caller names.
+macro_rules! schemas_member {
+    (iso8601 $shape:literal, $wire:literal, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.schemas#", $shape, "$", $wire),
+                "com.amazonaws.schemas",
+                $wire,
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            $wire,
+            $index,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime)
+    };
+    (tags $shape:literal, $wire:literal, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.schemas#", $shape, "$", $wire),
+                "com.amazonaws.schemas",
+                $wire,
+            ),
+            ::aws_smithy_schema::ShapeType::Map,
+            $wire,
+            $index,
+        )
+        .with_json_name("tags")
+    };
+    ($shape:literal, $wire:literal, $kind:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.schemas#", $shape, "$", $wire),
+                "com.amazonaws.schemas",
+                $wire,
+            ),
+            ::aws_smithy_schema::ShapeType::$kind,
+            $wire,
+            $index,
+        )
+    };
+}
+pub(crate) use schemas_member;
+
 /// The values `CodeGenerationStatus` accepts on the wire.
 pub const CODE_GENERATION_STATUS_VALUES: &[&str] = &["CREATE_COMPLETE", "CREATE_FAILED", "CREATE_IN_PROGRESS"];
 
