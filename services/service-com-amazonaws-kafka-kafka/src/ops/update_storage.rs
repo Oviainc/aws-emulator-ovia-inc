@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStorage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStorage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the EBS storage of a provisioned cluster's brokers, or its storage mode.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStorage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call is ACCEPTED, not completed: it records a cluster operation, moves the
+//! cluster to `UPDATING` and hands it the change the clock applies at
+//! [`crate::state::CLUSTER_UPDATE_DELAY`], which is also when the cluster's next
+//! `CurrentVersion` is generated. The operation this returns is readable through
+//! `DescribeClusterOperation`, and the applied change through `DescribeCluster`.
+//!
+//! A request this region holds no cluster for is a `NotFoundException` whatever its
+//! body asks for: the resource named in the URI is resolved before anything in the
+//! body is judged.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +158,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStorage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStorageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStorage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateStorageErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The cluster is resolved FIRST: an update against an ARN this region
+        // holds no cluster for is a resource that cannot be found, whatever the
+        // body asks for. The settling lookup materialises only the transitions
+        // the clock already owed THIS cluster, so the checks below judge the
+        // configuration it is actually running.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateStorageErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let cluster_state = cluster.state.clone();
+        let current_version = cluster.current_version.clone();
+        let current_volume_size = cluster.volume_size_gb();
+
+        // Only a cluster whose brokers are serving can take an update: one still
+        // being provisioned, or already applying a change, has no settled
+        // configuration to update from.
+        if cluster_state != crate::state::CLUSTER_STATE_ACTIVE {
+            return Err(
+                UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "The cluster is in the {cluster_state} state; it must be {} to be updated.",
+                        crate::state::CLUSTER_STATE_ACTIVE
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The version is the one the caller is updating FROM, so a stale one
+        // means the caller has not seen the cluster's current configuration.
+        if input.current_version != current_version {
+            return Err(
+                UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("currentVersion".to_string()),
+                    message: Some(format!(
+                        "The cluster's current version is {current_version}, not {}.",
+                        input.current_version
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let change = crate::state::StorageChange {
+            volume_size_gb: input.volume_size_gb,
+            provisioned_throughput: input.provisioned_throughput,
+            storage_mode: input.storage_mode,
+        };
+        if change.is_empty() {
+            return Err(
+                UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: None,
+                    message: Some(
+                        "The request must specify at least one of VolumeSizeGB, \
+                         ProvisionedThroughput or StorageMode."
+                            .to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        if let Some(storage_mode) = change.storage_mode.as_deref() {
+            // The stored `StorageMode` is what every reader reports, so only a
+            // value the model's enum names may be written: the catalog is the
+            // generated `STORAGE_MODE_VALUES`, never a literal list here.
+            if !STORAGE_MODE_VALUES.contains(&storage_mode) {
+                return Err(
+                    UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                        invalid_parameter: Some("storageMode".to_string()),
+                        message: Some(format!(
+                            "StorageMode must be one of {}, not {storage_mode}.",
+                            STORAGE_MODE_VALUES.join(", ")
+                        )),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        if let Some(volume_size) = change.volume_size_gb {
+            // `VolumeSizeGB` is a plain `__integer` in the model, so the
+            // boundary validator passes any value through: the range the stored
+            // `EBSStorageInfo$VolumeSize` carries is enforced here instead.
+            if !(crate::state::MIN_VOLUME_SIZE_GB..=crate::state::MAX_VOLUME_SIZE_GB)
+                .contains(&volume_size)
+            {
+                return Err(
+                    UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                        invalid_parameter: Some("volumeSizeGB".to_string()),
+                        message: Some(format!(
+                            "VolumeSizeGB must be between {} and {}, not {volume_size}.",
+                            crate::state::MIN_VOLUME_SIZE_GB,
+                            crate::state::MAX_VOLUME_SIZE_GB
+                        )),
+                    })
+                    .into(),
+                );
+            }
+            // Amazon MSK documents that broker storage can only be expanded —
+            // "you can only increase storage, you cannot decrease it" (Amazon
+            // MSK Developer Guide, broker storage scaling) — so a smaller size
+            // is refused rather than shrinking the volumes.
+            if let Some(current) = current_volume_size.filter(|current| volume_size < *current) {
+                return Err(
+                    UpdateStorageErrorModeled::BadRequestException(BadRequestException {
+                        invalid_parameter: Some("volumeSizeGB".to_string()),
+                        message: Some(format!(
+                            "VolumeSizeGB can only be increased: the cluster's volumes are \
+                             {current} GiB, so {volume_size} GiB is not allowed."
+                        )),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING and stores the instant the change comes due.
+        let Some(operation_arn) = state.start_storage_update(&region, &input.cluster_arn, now, change)
+        else {
+            return Err(UpdateStorageErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the cluster vanished while its update was starting".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(UpdateStorageOutput {
+            cluster_arn: Some(input.cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
 }

@@ -17,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AppMonitor, AppMonitorConfiguration, AppMonitorDetails, AppMonitorSummary,
     ConflictException, CustomEvents, CwLog, DataStorage, DeobfuscationConfiguration,
-    InvalidPolicyRevisionIdException, PolicyNotFoundException, ResourceNotFoundException,
+    InvalidPolicyRevisionIdException, MetricDestinationSummary, PolicyNotFoundException,
+    ResourceNotFoundException, METRIC_DESTINATION_VALUES,
 };
 
 /// This service's ARN namespace / sigv4 signing name (`OPERATIONS.md`,
@@ -91,6 +92,26 @@ pub const MAX_APP_MONITORS: usize = 1000;
 /// days and then deleted"). The count is this emulator's own bound, not AWS's.
 pub const MAX_EVENTS_PER_APP_MONITOR: usize = 10_000;
 
+/// The `MetricDestination` value naming the account's own CloudWatch metrics as the
+/// destination of an app monitor's extended metrics — a member of
+/// [`crate::ops::types::METRIC_DESTINATION_VALUES`].
+pub const CLOUD_WATCH_DESTINATION: &str = "CloudWatch";
+
+/// The `MetricDestination` value naming a CloudWatch Evidently experiment as the
+/// destination of an app monitor's extended metrics — a member of
+/// [`crate::ops::types::METRIC_DESTINATION_VALUES`].
+pub const EVIDENTLY_DESTINATION: &str = "Evidently";
+
+/// The most extended-metrics destinations this emulator keeps per app monitor.
+///
+/// `PutRumMetricsDestination` adds one record per distinct destination key, so without a
+/// ceiling the heap an app monitor holds is set by how many distinct Evidently
+/// experiment ARNs a caller names. AWS bounds the same thing with an adjustable
+/// per-app-monitor quota whose value is not in the model, so this number is the
+/// EMULATOR's own bound; `PutRumMetricsDestination` models no quota error, so the
+/// refusal past it is the `ValidationException` it does model.
+pub const MAX_METRIC_DESTINATIONS_PER_APP_MONITOR: usize = 100;
+
 /// The most bytes a resource-policy document may carry.
 ///
 /// From the model: `PutResourcePolicy` documents "The maximum size of the policy is 4
@@ -148,6 +169,64 @@ pub struct StoredRumEvent {
     pub event_json: String,
 }
 
+/// The identity of one extended-metrics destination of an app monitor: its
+/// `MetricDestination` and, for an Evidently destination, the ARN of the experiment that
+/// receives the metrics (the empty string for a `CloudWatch` destination, which has no
+/// ARN).
+///
+/// This pair is what `PutRumMetricsDestination` creates-or-updates and what
+/// `DeleteRumMetricsDestination` names — both take exactly `Destination` plus the
+/// optional `DestinationArn` — so it is the key the destinations map is held under.
+pub type MetricDestinationKey = (String, String);
+
+/// The [`MetricDestinationKey`] for `destination` and `destination_arn`, with an absent
+/// or empty ARN normalised to the same key, so one destination cannot be stored twice
+/// under two spellings of "no ARN".
+pub fn metric_destination_key(
+    destination: &str,
+    destination_arn: Option<&str>,
+) -> MetricDestinationKey {
+    (
+        destination.to_string(),
+        destination_arn.unwrap_or_default().to_string(),
+    )
+}
+
+/// One persisted extended-metrics destination of an app monitor.
+///
+/// Mirrors the model's `MetricDestinationSummary`, which is the only shape any operation
+/// reports a destination through, with `Destination` held non-optional: a stored
+/// destination always has one (it is `@required` on the put).
+#[derive(Debug, Clone)]
+pub struct MetricDestinationRecord {
+    /// `Destination`, a member of [`crate::ops::types::METRIC_DESTINATION_VALUES`].
+    pub destination: String,
+    /// `DestinationArn`: the Evidently experiment receiving the metrics, and `None` for
+    /// a `CloudWatch` destination, which the model says must carry no ARN.
+    pub destination_arn: Option<String>,
+    /// `IamRoleArn`: the role RUM assumes to write to that experiment. `None` for a
+    /// `CloudWatch` destination, which the model says must carry no role.
+    pub iam_role_arn: Option<String>,
+}
+
+impl MetricDestinationRecord {
+    /// This record's identity in the destinations map.
+    pub fn key(&self) -> MetricDestinationKey {
+        metric_destination_key(&self.destination, self.destination_arn.as_deref())
+    }
+
+    /// Project the stored record onto the model's `MetricDestinationSummary` — the one
+    /// conversion `ListRumMetricsDestinations` goes through, so what a read reports is
+    /// exactly what the put wrote.
+    pub fn to_summary(&self) -> MetricDestinationSummary {
+        MetricDestinationSummary {
+            destination: Some(self.destination.clone()),
+            destination_arn: self.destination_arn.clone(),
+            iam_role_arn: self.iam_role_arn.clone(),
+        }
+    }
+}
+
 /// The resource-based policy attached to one app monitor.
 ///
 /// `PutResourcePolicy` documents "Each app monitor can have one resource-based policy",
@@ -203,6 +282,13 @@ pub struct AppMonitorRecord {
     /// Events delivered by `PutRumEvents`, oldest first. Bounded by
     /// [`MAX_EVENTS_PER_APP_MONITOR`]; append through [`Self::record_events`].
     pub events: VecDeque<StoredRumEvent>,
+    /// The extended-metrics destinations `PutRumMetricsDestination` created or updated
+    /// for this monitor, keyed by [`MetricDestinationKey`]. A `BTreeMap` so
+    /// `ListRumMetricsDestinations` pages in a stable, resumable order. They live ON the
+    /// monitor record because a destination belongs to one app monitor: deleting the
+    /// monitor drops its destinations with it. Bounded by
+    /// [`MAX_METRIC_DESTINATIONS_PER_APP_MONITOR`].
+    pub metric_destinations: BTreeMap<MetricDestinationKey, MetricDestinationRecord>,
     /// This monitor's one resource-based policy, or `None` while it carries none — the
     /// state `GetResourcePolicy` and `DeleteResourcePolicy` answer
     /// `PolicyNotFoundException` for.
@@ -540,6 +626,66 @@ pub fn app_monitor_configuration_refusal(config: &AppMonitorConfiguration) -> Op
     })
 }
 
+/// Why this `Destination`/`DestinationArn` pair cannot be applied, or `None` when it can.
+///
+/// From the model: `PutRumMetricsDestinationRequest$DestinationArn` documents "Use this
+/// parameter only if Destination is Evidently", the operation itself documents "If you
+/// specify Evidently, you must also specify the ARN of the CloudWatchEvidently experiment
+/// that is to be the destination", and `DeleteRumMetricsDestinationRequest$DestinationArn`
+/// states both halves outright: "This parameter is required if Destination is Evidently.
+/// If Destination is CloudWatch, do not use this parameter." So an Evidently destination
+/// is identified by an experiment ARN and a CloudWatch one carries none. Neither half is
+/// expressible as a modelled constraint, so every operation that accepts the pair refuses
+/// it here with the `ValidationException` it declares.
+///
+/// The `Destination` value itself is checked against
+/// [`crate::ops::types::METRIC_DESTINATION_VALUES`] first, so an operation stays correct
+/// on a protocol whose boundary does not enforce the enum.
+pub fn metric_destination_choice_refusal(
+    destination: &str,
+    destination_arn: Option<&str>,
+) -> Option<String> {
+    if !METRIC_DESTINATION_VALUES.contains(&destination) {
+        return Some(format!(
+            "Destination {destination} is not valid; valid values are {}.",
+            METRIC_DESTINATION_VALUES.join(" and ")
+        ));
+    }
+    match (destination, destination_arn) {
+        (EVIDENTLY_DESTINATION, None) => Some(format!(
+            "DestinationArn is required when Destination is {EVIDENTLY_DESTINATION}."
+        )),
+        (EVIDENTLY_DESTINATION, Some(_)) => None,
+        (_, Some(_)) => Some(format!(
+            "DestinationArn cannot be used when Destination is {destination}."
+        )),
+        (_, None) => None,
+    }
+}
+
+/// Why this `Destination`/`IamRoleArn` pair cannot be applied, or `None` when it can.
+///
+/// From the model: `PutRumMetricsDestinationRequest$IamRoleArn` documents "This parameter
+/// is required if Destination is Evidently. If Destination is CloudWatch, don't use this
+/// parameter." — RUM needs a role to assume only when it writes to someone else's
+/// experiment. Same reasoning as [`metric_destination_choice_refusal`]: the rule is prose
+/// in the model, so the handler enforces it.
+pub fn metric_destination_role_refusal(
+    destination: &str,
+    iam_role_arn: Option<&str>,
+) -> Option<String> {
+    match (destination, iam_role_arn) {
+        (EVIDENTLY_DESTINATION, None) => Some(format!(
+            "IamRoleArn is required when Destination is {EVIDENTLY_DESTINATION}."
+        )),
+        (EVIDENTLY_DESTINATION, Some(_)) => None,
+        (_, Some(_)) => Some(format!(
+            "IamRoleArn cannot be used when Destination is {destination}."
+        )),
+        (_, None) => None,
+    }
+}
+
 /// `ResourceNotFoundException` for a name or id that names no stored app monitor. The
 /// message is built from the request, so it names the value given.
 pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
@@ -762,6 +908,56 @@ pub fn app_monitor_already_exists(name: &str) -> ConflictException {
         resource_name: name.to_string(),
         resource_type: Some(APP_MONITOR_RESOURCE_TYPE.to_string()),
     }
+}
+
+/// What separates the components of a continuation token's resume key: a control
+/// character none of the components that precede the last one can contain (an
+/// `AppMonitorName` matches `^(?!\.)[\.\-_#A-Za-z0-9]+$` and a `MetricDestination` is
+/// one of two words). The LAST component needs no such guarantee, because
+/// [`decode_pagination_token`] splits at most `components - 1` times and hands whatever
+/// follows back whole — which matters for a `DestinationArn`, whose
+/// `arn:[^:]*:[^:]*:[^:]*:[^:]*:.*` pattern ends in an unconstrained `.*`.
+const PAGINATION_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// An opaque continuation token for the last entry a page returned: `marker` followed by
+/// the components of that entry's key.
+///
+/// ONE codec for every paginated operation of this service (`ListAppMonitors`,
+/// `ListRumMetricsDestinations`), so their token formats cannot drift. Hex keeps the
+/// token printable and opaque to a client — `NextToken` is an unconstrained `String`, so
+/// a client must pass back what it was handed rather than construct one — while staying
+/// decodable by the next call. `marker` is the issuing operation's own (see
+/// [`decode_pagination_token`]).
+pub fn encode_pagination_token(marker: &str, resume_after: &[&str]) -> String {
+    let key = resume_after.join(&PAGINATION_TOKEN_SEPARATOR.to_string());
+    hex::encode(format!("{marker}{key}"))
+}
+
+/// The `components` of the key a token issued by [`encode_pagination_token`] under
+/// `marker` resumes after, or `None` for any value that operation never issued.
+///
+/// The marker is what makes a token the ISSUING operation's: without it any
+/// hex-decodable string would be read as a continuation, and one list's token would
+/// resume another's. A listing scoped to a parent resource puts that parent's name in
+/// the key, so the caller can also check a token was issued for the resource it is
+/// resuming.
+pub fn decode_pagination_token(
+    marker: &str,
+    token: &str,
+    components: usize,
+) -> Option<Vec<String>> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let resume_after = decoded.strip_prefix(marker)?;
+    // `splitn` so only the components BEFORE the last one are delimited: the last
+    // component keeps any separator it contains, rather than inflating the arity and
+    // making this refuse a token the service itself issued.
+    let key: Vec<String> = resume_after
+        .splitn(components, PAGINATION_TOKEN_SEPARATOR)
+        .map(str::to_string)
+        .collect();
+    // The first component identifies the entry to resume after, so a token carrying
+    // none — or a key of the wrong arity for this operation — names no resume point.
+    (key.len() == components && !key[0].is_empty()).then_some(key)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

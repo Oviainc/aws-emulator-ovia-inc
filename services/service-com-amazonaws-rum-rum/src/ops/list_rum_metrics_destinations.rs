@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRumMetricsDestinations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRumMetricsDestinations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRumMetricsDestinations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the extended-metrics destinations `PutRumMetricsDestination` stored for the
+//! app monitor the request names, read from the ONE map that put writes
+//! (`AppMonitorRecord::metric_destinations`), so a read reports exactly what the put
+//! wrote. `@readonly`: paging the list changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRumMetricsDestinations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRumMetricsDestinationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRumMetricsDestinations"))
+        // `@readonly`: paging a list never changes what a later caller sees, and the
+        // page it reports depends on nothing in the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRumMetricsDestinationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // No token starts at the beginning; a token resumes strictly after the last
+        // destination the page that produced it returned. A token this operation never
+        // issued — or issued for ANOTHER app monitor's listing — is refused rather than
+        // read as some other resume point.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                decode_next_token(&input.app_monitor_name, token).ok_or_else(|| {
+                    ListRumMetricsDestinationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "NextToken {token} is not a pagination token this service issued \
+                                 for app monitor {}.",
+                                input.app_monitor_name
+                            ),
+                        },
+                    )
+                })?,
+            ),
+        };
+
+        // `MaxResults` is modelled `range 1..100`, so the boundary validator has already
+        // refused anything outside it; an absent one pages at the documented default
+        // (`ListRumMetricsDestinationsRequest$MaxResults`: "The default is 50. The
+        // maximum that you can specify is 100.").
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        let store = state.lock();
+        // Destinations are held ON the app monitor record, so a request naming no stored
+        // monitor has no list to report rather than an empty one.
+        let Some(monitor) = store.app_monitors.get(&input.app_monitor_name) else {
+            return Err(
+                ListRumMetricsDestinationsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+
+        // A range query over the key-ordered map, not a scan: resuming costs
+        // O(log n) + O(page) and a page boundary cannot drift from the map it indexes.
+        let start = match resume_after {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = monitor
+            .metric_destinations
+            .range((start, ::std::ops::Bound::Unbounded));
+
+        let mut last_key = None;
+        let destinations: Vec<MetricDestinationSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(key, record)| {
+                last_key = Some(key.clone());
+                record.to_summary()
+            })
+            .collect();
+
+        // A token is emitted only when something is actually left to return, so the
+        // last page carries none.
+        let next_token = match last_key {
+            Some(last) if remaining.next().is_some() => {
+                Some(encode_next_token(&input.app_monitor_name, &last))
+            }
+            _ => None,
+        };
+
+        Ok(ListRumMetricsDestinationsOutput {
+            destinations: Some(destinations),
+            next_token,
+        })
     }
+}
+
+/// The page this operation returns when the request names no `MaxResults`.
+/// From the model: `ListRumMetricsDestinationsRequest$MaxResults` documents "The default
+/// is 50."
+const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// The largest page this operation returns: `MaxResults`' modelled maximum
+/// (`MaxResultsInteger`, range 1..100).
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The marker every token this operation issues carries, so a token the service did not
+/// issue — or one another list issued — is recognisable rather than being read as some
+/// other resume point. The codec itself is shared:
+/// [`crate::state::encode_pagination_token`].
+const TOKEN_MARKER: &str = "ListRumMetricsDestinations/1/";
+
+/// An opaque continuation token for the last destination of a page.
+///
+/// The app monitor the listing is scoped to is part of the key, so a token is only
+/// honoured by the listing that issued it: destinations are per-monitor, and two
+/// monitors' maps have keys in common.
+fn encode_next_token(
+    app_monitor_name: &str,
+    last_returned: &crate::state::MetricDestinationKey,
+) -> String {
+    let (destination, destination_arn) = last_returned;
+    crate::state::encode_pagination_token(
+        TOKEN_MARKER,
+        &[app_monitor_name, destination, destination_arn],
+    )
+}
+
+/// The destination key a token issued by [`encode_next_token`] for `app_monitor_name`
+/// resumes after, or `None` for any value this operation never issued for that monitor.
+fn decode_next_token(
+    app_monitor_name: &str,
+    token: &str,
+) -> Option<crate::state::MetricDestinationKey> {
+    let key = crate::state::decode_pagination_token(TOKEN_MARKER, token, 3)?;
+    let [issued_for, destination, destination_arn] = <[String; 3]>::try_from(key).ok()?;
+    (issued_for == app_monitor_name).then_some((destination, destination_arn))
 }

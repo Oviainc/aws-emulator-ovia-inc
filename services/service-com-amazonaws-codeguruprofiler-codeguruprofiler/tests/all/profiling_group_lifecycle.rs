@@ -81,6 +81,12 @@ impl Harness {
         Self { router, engine }
     }
 
+    /// The shared engine behind the mounted service, so another suite in this target
+    /// can seed or inspect the stored state the way the tests below do.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
+    }
+
     /// What one group holds right now: (retained profiles, retained profile bytes,
     /// remembered profile tokens).
     fn retained(&self, name: &str) -> (usize, usize, usize) {

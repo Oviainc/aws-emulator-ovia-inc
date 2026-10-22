@@ -20,7 +20,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     ArtifactConfigOutput, BrowserConfig, Canary, CanaryCodeOutput, CanaryRun,
     CanaryRunConfigOutput, CanaryRunStatus, CanaryRunTimeline, CanaryScheduleOutput, CanaryStatus,
-    CanaryTimeline, Dependency, RetryConfigOutput, S3EncryptionConfig, VpcConfigOutput,
+    CanaryTimeline, Dependency, RetryConfigOutput, RuntimeVersion, S3EncryptionConfig,
+    VpcConfigOutput,
 };
 
 /// Mint a fresh identifier for a canary or a canary run.
@@ -581,6 +582,256 @@ impl ComAmazonawsSyntheticsSyntheticsState {
             canary.settle(now);
         }
     }
+}
+
+/// `RuntimeVersion$Description` for the Node.js/Puppeteer runtime family.
+///
+/// The published table gives each version a one-line description naming the exact Node.js,
+/// Puppeteer and Chromium builds it bundles; those build numbers are not restated here, so
+/// what a description carries is the family — the language and the browser-automation API a
+/// canary on that runtime is written against — which is what distinguishes one runtime from
+/// another when a caller picks one.
+const PUPPETEER_RUNTIME_DESCRIPTION: &str =
+    "Node.js canary runtime: scripts are written against the Puppeteer API and run on a \
+     bundled headless Chromium.";
+
+/// `RuntimeVersion$Description` for the Node.js/Playwright runtime family, by the same rule
+/// as [`PUPPETEER_RUNTIME_DESCRIPTION`].
+const PLAYWRIGHT_RUNTIME_DESCRIPTION: &str =
+    "Node.js canary runtime: scripts are written against the Playwright API and run on a \
+     bundled headless Chromium.";
+
+/// `RuntimeVersion$Description` for the Python/Selenium runtime family, by the same rule as
+/// [`PUPPETEER_RUNTIME_DESCRIPTION`].
+const SELENIUM_RUNTIME_DESCRIPTION: &str =
+    "Python canary runtime: scripts are written against the Selenium WebDriver API and run \
+     on a bundled headless Chromium.";
+
+/// The RFC 3339 form every catalogued date is written in, and the form the modelled
+/// `Timestamp` serialises as.
+const CATALOG_DATE_FORMAT: ::aws_smithy_types::date_time::Format =
+    ::aws_smithy_types::date_time::Format::DateTime;
+
+/// One canary runtime version this emulator's Synthetics publishes, as
+/// `DescribeRuntimeVersions` reports it. Dates are held as RFC 3339 text so the catalog
+/// below reads like the published table, and are parsed by
+/// [`RuntimeVersionEntry::to_runtime_version`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeVersionEntry {
+    /// `RuntimeVersion$VersionName` — the value a canary carries as its `RuntimeVersion`.
+    pub version_name: &'static str,
+    /// `RuntimeVersion$Description` — "A description of the runtime version, created by
+    /// Amazon".
+    pub description: &'static str,
+    /// `RuntimeVersion$ReleaseDate` — "The date that the runtime version was released".
+    pub release_date: &'static str,
+    /// `RuntimeVersion$DeprecationDate` — "If this runtime version is deprecated, this value
+    /// is the date of deprecation", so `None` for a version that is not deprecated.
+    pub deprecation_date: Option<&'static str>,
+}
+
+impl RuntimeVersionEntry {
+    /// Project this entry onto the modelled `RuntimeVersion` shape — the ONE place a
+    /// `RuntimeVersion` is built, so every reader of the catalog reports it identically.
+    ///
+    /// A date that is not RFC 3339 is reported absent rather than invented; the catalog's
+    /// own test asserts every entry carries a parseable `ReleaseDate`, so an unparseable
+    /// literal fails there instead of reaching a caller.
+    pub fn to_runtime_version(&self) -> RuntimeVersion {
+        RuntimeVersion {
+            version_name: Some(self.version_name.to_string()),
+            description: Some(self.description.to_string()),
+            release_date: catalog_date(self.release_date),
+            deprecation_date: self.deprecation_date.and_then(catalog_date),
+        }
+    }
+}
+
+/// An RFC 3339 catalog date as a modelled timestamp.
+///
+/// A literal that is not RFC 3339 reports the member absent rather than inventing a date;
+/// the `debug_assert` keeps that failure local to the catalog (and this crate's tests assert
+/// every entry carries a parseable `ReleaseDate`).
+fn catalog_date(date: &str) -> Option<::aws_smithy_types::DateTime> {
+    let parsed = ::aws_smithy_types::DateTime::from_str(date, CATALOG_DATE_FORMAT).ok();
+    debug_assert!(
+        parsed.is_some(),
+        "a catalogued runtime version date must be RFC 3339, got {date:?}"
+    );
+    parsed
+}
+
+/// Every canary runtime version this emulator's Synthetics offers, OLDEST FIRST — a total,
+/// stable order, so a `DescribeRuntimeVersions` page boundary means the same thing on the
+/// next call.
+///
+/// Source: the CloudWatch User Guide's canary runtime versions page, which the model's own
+/// `RuntimeVersion` doc links to
+/// (<https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Synthetics_Canaries_Library.html>);
+/// it is that page that names the runtime versions and the release of each. A release the
+/// page dates by month is recorded here as the first day of that month.
+///
+/// Only versions that are OFFERED are catalogued: a canary cannot be created on a runtime
+/// this emulator does not offer, so nothing in the list is deprecated and every entry's
+/// `DeprecationDate` is absent — which is exactly what the member's own doc asks for ("If
+/// this runtime version is deprecated, this value is the date of deprecation").
+pub const RUNTIME_VERSION_CATALOG: &[RuntimeVersionEntry] = &[
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-3.0",
+        description: SELENIUM_RUNTIME_DESCRIPTION,
+        release_date: "2023-11-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-6.2",
+        description: PUPPETEER_RUNTIME_DESCRIPTION,
+        release_date: "2024-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-7.0",
+        description: PUPPETEER_RUNTIME_DESCRIPTION,
+        release_date: "2024-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-4.0",
+        description: SELENIUM_RUNTIME_DESCRIPTION,
+        release_date: "2024-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-8.0",
+        description: PUPPETEER_RUNTIME_DESCRIPTION,
+        release_date: "2024-08-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-4.1",
+        description: SELENIUM_RUNTIME_DESCRIPTION,
+        release_date: "2024-08-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-9.0",
+        description: PUPPETEER_RUNTIME_DESCRIPTION,
+        release_date: "2024-10-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-5.0",
+        description: SELENIUM_RUNTIME_DESCRIPTION,
+        release_date: "2024-10-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-playwright-1.0",
+        description: PLAYWRIGHT_RUNTIME_DESCRIPTION,
+        release_date: "2024-11-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-9.1",
+        description: PUPPETEER_RUNTIME_DESCRIPTION,
+        release_date: "2024-12-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-puppeteer-10.0",
+        description: PUPPETEER_RUNTIME_DESCRIPTION,
+        release_date: "2025-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-python-selenium-5.1",
+        description: SELENIUM_RUNTIME_DESCRIPTION,
+        release_date: "2025-02-01T00:00:00Z",
+        deprecation_date: None,
+    },
+    RuntimeVersionEntry {
+        version_name: "syn-nodejs-playwright-2.0",
+        description: PLAYWRIGHT_RUNTIME_DESCRIPTION,
+        release_date: "2025-05-01T00:00:00Z",
+        deprecation_date: None,
+    },
+];
+
+/// Where `version_name` sits in [`RUNTIME_VERSION_CATALOG`], or `None` when the catalog does
+/// not offer it. The page-token reader uses this, so a token can only resume at a version
+/// this service itself published.
+pub fn runtime_version_position(version_name: &str) -> Option<usize> {
+    RUNTIME_VERSION_CATALOG
+        .iter()
+        .position(|entry| entry.version_name == version_name)
+}
+
+/// The modelled maximum length of `Token`, the shape every paged operation of this service
+/// targets with its `NextToken` (`len 4..252`).
+pub const MAX_TOKEN_LEN: usize = 252;
+
+/// The prefix of a page token that resumes at an OFFSET — the one form that still works for
+/// a key too long to carry inside [`MAX_TOKEN_LEN`]. One constant, so every paged operation
+/// writes the same token form.
+pub const TOKEN_OFFSET_PREFIX: &str = "ix#";
+
+/// Where a page starts within an ordered collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageStart {
+    /// Resume at this key: exact across inserts and deletes, because the page boundary is a
+    /// key in the ordered collection rather than a position in it.
+    Key(String),
+    /// Resume at this position — the fallback for a key a token cannot carry.
+    Offset(usize),
+}
+
+/// The token that resumes the next page after `offset` entries, whose first entry has the
+/// key `next_key`.
+///
+/// `key_prefix` is the issuing operation's own prefix, so the two paged operations share one
+/// token FORM without sharing a token: a token issued over one collection does not decode
+/// over the other. The offset form is used only when prefix + key would exceed the modelled
+/// token length.
+pub fn encode_page_token(key_prefix: &str, offset: usize, next_key: &str) -> String {
+    if key_prefix.len() + next_key.len() <= MAX_TOKEN_LEN {
+        format!("{key_prefix}{next_key}")
+    } else {
+        format!("{TOKEN_OFFSET_PREFIX}{offset}")
+    }
+}
+
+/// Read a token [`encode_page_token`] issued for `key_prefix` over a collection of `len`
+/// entries. `None` means the token is a BAD REQUEST, never an empty page — the caller
+/// answers it with the operation's modelled `ValidationException`.
+///
+/// `key_is_issuable` recognises a key this operation could itself have put in a token, and an
+/// offset must land inside the collection, so a forged token resumes nowhere.
+pub fn decode_page_token(
+    key_prefix: &str,
+    token: &str,
+    len: usize,
+    key_is_issuable: impl FnOnce(&str) -> bool,
+) -> Option<PageStart> {
+    if let Some(key) = token.strip_prefix(key_prefix) {
+        return key_is_issuable(key).then(|| PageStart::Key(key.to_string()));
+    }
+    token
+        .strip_prefix(TOKEN_OFFSET_PREFIX)
+        .and_then(|offset| offset.parse::<usize>().ok())
+        .filter(|offset| *offset <= len)
+        .map(PageStart::Offset)
+}
+
+/// How many entries a page carries: `max_results` when the request names one, otherwise
+/// `default` — what the member's own doc says is used when it is omitted.
+///
+/// Floored at one entry independently of the modelled `@range` the request boundary already
+/// enforces: a page size of zero would return nothing while still emitting a token, so a
+/// client loop would never terminate.
+pub fn page_size(max_results: Option<i32>, default: usize) -> usize {
+    max_results
+        .and_then(|max| usize::try_from(max).ok())
+        .unwrap_or(default)
+        .max(1)
 }
 
 /// A canary's ARN: `arn:aws:synthetics:<region>:<account>:canary:<name>`.

@@ -32,3 +32,8 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the rum emulator
 Call ListRumMetricsDestinations and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Update: the `rum|ListRumMetricsDestinations|NotImplemented` key is fixed
+`ListRumMetricsDestinations` was implemented, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line deleted, as the read-back half of the `PutRumMetricsDestination` stub fix (`issues/things-that-now-work/20261022T205048Z-rum-putrummetricsdestination-stub.md`): it pages the per-app-monitor destinations map that put writes, 404s an app monitor that does not exist, and refuses a `NextToken` it never issued. It no longer answers 501, so the "Description", "Evidence" and "Steps to Reproduce" above describe the state of the code BEFORE that change.
+
+This record stays open for its SECOND key only — `rum.put-rum-metrics-destination-access-denied|_poll_succeeds#8|AssertionError`, the authorization behaviour this service still does not evaluate (see also `issues/things-that-do-not-work/20261022T205048Z-rum-performs-no-authorization-evaluation-and-does-not.md`).

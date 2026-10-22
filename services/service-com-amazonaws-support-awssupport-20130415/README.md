@@ -26,6 +26,23 @@ service-com-amazonaws-support-awssupport-20130415/
     └── ops/              # ONE FILE PER OPERATION
 ```
 
+## The Premium Support subscription (`SUPPORT_PLAN`)
+
+Every operation of this API is served only to an account holding an Amazon Web
+Services Business Support+, Enterprise Support, Unified Operations, Business,
+Enterprise On-Ramp or Enterprise Support plan; from any other account AWS answers
+HTTP 400 with `__type` `SubscriptionRequiredException` instead of running the call.
+Nothing in this API buys a plan, so the emulated account starts with none — what a
+new AWS account has — and an operator grants one out of band:
+
+```bash
+SUPPORT_PLAN=enterprise cargo run -p aws-emulator-router
+```
+
+The plan is read once into `state::ComAmazonawsSupportAwssupport20130415State::support_plan`
+when this service's store is created, and `src/service.rs` enforces it in
+`override_operation`, ahead of every operation's input validation and state access.
+
 ## Implementing an operation
 
 Each file in `src/ops/` owns exactly one operation and declares which one

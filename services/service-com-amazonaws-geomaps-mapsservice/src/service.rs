@@ -87,11 +87,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // The model's own routing table resolves everything it can.
+        if self.entry.protocol().routing_key(req).is_ok() {
+            return None;
+        }
+        // What it cannot: the REST route lookup rejects a candidate route whose
+        // `@required` query bindings are absent from the request, so
+        // `GET /v2/static/{FileName}` without `width`/`height` resolves to NO
+        // operation and would be answered as an unknown route. A missing
+        // required parameter is a client mistake, not an unknown operation, so
+        // the route is claimed here and `GetStaticMap`'s own boundary
+        // validation refuses it with the modeled `ValidationException`.
+        let path = request_path(req.uri());
+        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        if req.method() == "GET" && matches!(segments.as_slice(), ["v2", "static", _]) {
+            return self.entry.routing_table().get("GetStaticMap");
+        }
         None
     }
 
@@ -136,4 +147,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The path component of a request URI, without any scheme/authority prefix or
+/// query string — the same view of the request the REST route table matches on.
+///
+/// Parsed with `http::Uri` rather than split by hand, so this agrees with the
+/// framework about what the path of a request is. An unparsable URI has no
+/// path, which claims nothing.
+fn request_path(uri: &str) -> String {
+    uri.parse::<http::Uri>()
+        .map(|parsed| parsed.path().to_string())
+        .unwrap_or_default()
 }

@@ -148,6 +148,15 @@ impl Emulator {
         .await
     }
 
+    /// Remove `team_id` from this account's Slack workspace registry.
+    pub(crate) async fn delete_workspace(&self, team_id: &str) -> Reply {
+        self.call(
+            "delete-slack-workspace-configuration",
+            json!({ "teamId": team_id }),
+        )
+        .await
+    }
+
     /// A create whose workspace is registered first, so whatever the create answers is
     /// about the request and the stored configurations rather than about the missing
     /// workspace. Registering a workspace the account already holds changes nothing, so

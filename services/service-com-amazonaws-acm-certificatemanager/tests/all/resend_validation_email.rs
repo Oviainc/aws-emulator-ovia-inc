@@ -653,10 +653,10 @@ async fn a_resend_touches_only_the_certificate_it_names() {
         "case the other certificate: its validation must be untouched, got {other}"
     );
     let mailboxes = reported_mailboxes("the other certificate", &other);
-    assert_eq!(
-        mailboxes,
-        expected_mailboxes("shared.sub.example.com"),
-        "case the other certificate: its mailboxes must be untouched, got {mailboxes:?}"
+    assert!(
+        mailboxes.is_empty(),
+        "case the other certificate: its mailbox list must be untouched — nothing has \
+         mailed it, so it names no address — got {mailboxes:?}"
     );
 
     // And an ARN with no record behind it is a lookup failure, not a resend: the

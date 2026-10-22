@@ -21,13 +21,25 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Stable ETags: a SHA-256 of the bytes actually served, rendered as hex.
+sha2 = { workspace = true }
+hex = { workspace = true }
+# PNG codec for the lossless raster assets (sprite sheets, DEM tiles).
+png = "0.17"
+# JPEG codec for the photographic raster assets: the model documents
+# GetStaticMap's blob as a jpeg, and satellite tiles are served as one too.
+jpeg-encoder = "0.6"
+# Protobuf codec for the two protobuf formats this service serves: Mapbox
+# Vector Tiles (GetTile) and SDF glyph ranges (GetGlyphs).
+prost = "0.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# Decoder used only by the tests, to prove the JPEG assets really decode to the
+# requested image size.
+zune-jpeg = "0.4"
 
 [lints]
 workspace = true

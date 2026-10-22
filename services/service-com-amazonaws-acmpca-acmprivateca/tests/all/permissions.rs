@@ -187,6 +187,14 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
             .as_secs_f64(),
     );
 
+    // A `TStamp` is serialized with MILLISECOND resolution, so an instant taken inside
+    // this window comes back truncated to its millisecond — which reads marginally
+    // BEFORE `before` whenever the grant was made in the same millisecond the window
+    // opened. Widen each bound to the millisecond it falls in, so the assertion is
+    // about the window and not about the wire format's resolution.
+    let before = (before * 1_000.0).floor() / 1_000.0;
+    let after = (after * 1_000.0).ceil() / 1_000.0;
+
     for (case, principal, source_account, actions) in rows {
         // A request that names no source account is the calling account's grant, and the
         // calling account is the one every ARN of this emulator carries.

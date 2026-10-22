@@ -19,6 +19,8 @@ mod preferences;
 mod state_roundtrip;
 #[path = "all/validation_refusal_framing.rs"]
 mod validation_refusal_framing;
+#[path = "all/workload_estimate_deletion.rs"]
+mod workload_estimate_deletion;
 #[path = "all/workload_estimate_lifecycle.rs"]
 mod workload_estimate_lifecycle;
 #[path = "all/workload_estimate_listing.rs"]

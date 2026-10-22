@@ -2,18 +2,17 @@
 
 //! What `ResourceNotFoundException$Message` says when a reference does not resolve.
 //!
-//! The rule: the Message is one of TWO fixed service texts, selected only by which branch
-//! of `OutpostId`'s pattern the request used — never built from the request's own ids,
-//! never varying with the operation, and never varying with which resource under the
-//! Outpost failed to resolve. The two branches an Outpost ARN can name an Outpost with
-//! (`op-[a-f0-9]{17}` and `ec2`, per `OutpostArn`'s
-//! `^arn:…:outposts:…:outpost/(op-[a-f0-9]{17}|ec2)$`) are MASKED; the 12-digit
-//! account-id branch, the one no `OutpostArn` admits, reports that the Outpost is missing
-//! or has no S3 capacity.
+//! The rule: it is ONE fixed service text for every reference under an `OutpostId` that
+//! does not resolve — the same text whichever branch of `OutpostId`'s
+//! `^(op-[a-f0-9]{17}|\d{12}|ec2)$` the request used, whichever operation was called and
+//! whichever resource under the Outpost (the Outpost itself or an endpoint on it) failed
+//! to resolve. It is never built from the request's own ids, and it is never an
+//! authorization text: this service models `AccessDeniedException` (403) separately, so a
+//! 404 reports a missing or unprovisioned Outpost.
 //!
 //! Every case here goes through the router, so each exercises routing, deserialization,
 //! boundary validation, the handler and serialization — the path a client takes. The
-//! expected texts are written out here rather than imported from the crate, so a wrong
+//! expected text is written out here rather than imported from the crate, so a wrong
 //! constant in the service cannot make these cases pass.
 
 use serde_json::{json, Value};
@@ -23,31 +22,31 @@ use crate::endpoint_lifecycle::{
     owned_outposts, shared_outpost, string_at, Answer,
 };
 
-/// The masked text, for an `OutpostId` that names a physical Outpost directly. Recorded
-/// AWS behaviour: the model states no message for `ResourceNotFoundException`.
-const MASKED: &str = "Access Denied";
-
-/// The text the 12-digit account-id branch of `OutpostId` answers with. Recorded AWS
-/// behaviour, as above.
+/// The one text an unresolvable reference under an `OutpostId` answers with. Recorded AWS
+/// behaviour: the model states no message for `ResourceNotFoundException`.
 const OUTPOST_MISSING: &str =
     "The specified outpost does not exist, or does not have S3 capacity provisioned on it.";
 
-/// Every branch of `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$`, with the Message its
-/// form selects. Source of the catalogue:
-/// `smithy_query(query="shape", shape="OutpostId")`. None of these ids is in the store:
-/// the provisioned Outposts are discovered through the API by the cases below.
+/// The authorization wording a 404 must never carry: an authorization failure is this
+/// service's `AccessDeniedException` (403), per
+/// `smithy_query(query="operation", operation="CreateEndpoint")`, which lists both errors.
+const AUTHORIZATION_TEXT: &str = "Access Denied";
+
+/// Every branch of `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$`. Source of the
+/// catalogue: `smithy_query(query="shape", shape="OutpostId")`. None of these ids is in
+/// the store: the provisioned Outposts are discovered through the API by the cases below.
 ///
 /// Rows differ along what the rule generalises over — the branch of the pattern, and
 /// within a branch the actual characters, including the `ec2` branch the issue did not
 /// cite.
-const UNRESOLVABLE: &[(&str, &str, &str)] = &[
-    ("op- branch, all f", "op-fffffffffffffffff", MASKED),
-    ("op- branch, all zero", "op-00000000000000000", MASKED),
-    ("op- branch, mixed hex", "op-0123456789abcdef0", MASKED),
-    ("ec2 branch", "ec2", MASKED),
-    ("12-digit branch", "111122223333", OUTPOST_MISSING),
-    ("12-digit branch, all nine", "999999999999", OUTPOST_MISSING),
-    ("12-digit branch, all zero", "000000000000", OUTPOST_MISSING),
+const UNRESOLVABLE: &[(&str, &str)] = &[
+    ("op- branch, all f", "op-fffffffffffffffff"),
+    ("op- branch, all zero", "op-00000000000000000"),
+    ("op- branch, mixed hex", "op-0123456789abcdef0"),
+    ("ec2 branch", "ec2"),
+    ("12-digit branch", "111122223333"),
+    ("12-digit branch, all nine", "999999999999"),
+    ("12-digit branch, all zero", "000000000000"),
 ];
 
 /// Well-formed `EndpointId`s (`^[a-zA-Z0-9]{19}$`) this emulator never issued: upper case,
@@ -59,9 +58,9 @@ const NEVER_ISSUED_ENDPOINT_IDS: &[&str] = &[
     "zzzzzzzzzzzzzzzzzzz",
 ];
 
-/// The modelled 404 with exactly `expected` as its Message, and nothing of the request in
-/// it.
-fn assert_not_found(case: &str, answer: &Answer, expected: &str, request_ids: &[&str]) {
+/// The modelled 404 with exactly the one fixed text as its Message, with nothing of the
+/// request in it and no authorization wording.
+fn assert_not_found(case: &str, answer: &Answer, request_ids: &[&str]) {
     assert_eq!(
         (answer.status, answer.error_code()),
         (404, "ResourceNotFoundException"),
@@ -72,8 +71,13 @@ fn assert_not_found(case: &str, answer: &Answer, expected: &str, request_ids: &[
     );
     assert_eq!(
         answer.message(),
-        expected,
-        "case {case:?}: expected Message {expected:?}, got {:?}",
+        OUTPOST_MISSING,
+        "case {case:?}: expected Message {OUTPOST_MISSING:?}, got {:?}",
+        answer.message()
+    );
+    assert!(
+        !answer.message().contains(AUTHORIZATION_TEXT),
+        "case {case:?}: a not-found answer must not report an authorization failure, got {:?}",
         answer.message()
     );
     for id in request_ids {
@@ -131,52 +135,49 @@ fn create_variants(outpost_id: &str) -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// An `OutpostId` no Outpost resolves for answers the fixed text its form selects, on
-/// every operation that takes one, whatever else the request carries.
+/// An `OutpostId` no Outpost resolves for answers the one fixed text on every operation
+/// that takes one, for every branch of the id's pattern and whatever else the request
+/// carries — and the bodies are byte-identical, not merely the same Message.
 #[tokio::test]
-async fn an_unresolvable_outpost_answers_the_fixed_text_for_its_id_form() {
+async fn an_unresolvable_outpost_answers_one_fixed_text_for_every_id_form() {
     let router = emulator();
+    let mut bodies: Vec<(String, Value)> = Vec::new();
 
-    for (form, outpost_id, expected) in UNRESOLVABLE {
-        // CreateEndpoint: the answer is the same for every other member combination, and
-        // byte-identical bodies, not merely the same Message.
-        let mut bodies = Vec::new();
+    for (form, outpost_id) in UNRESOLVABLE {
+        // CreateEndpoint: the answer is the same for every other member combination.
         for (variant, request) in create_variants(outpost_id) {
             let case = format!("CreateEndpoint on {form} with {variant}");
             let answer = create(&router, request).await;
-            assert_not_found(&case, &answer, expected, &[outpost_id]);
+            assert_not_found(&case, &answer, &[outpost_id]);
             bodies.push((case, answer.body));
-        }
-        let (first_case, first_body) = &bodies[0];
-        for (case, body) in &bodies[1..] {
-            assert_eq!(
-                body, first_body,
-                "case {case:?}: the body must be identical to {first_case:?}, got {body:?}"
-            );
         }
 
         // ListSharedEndpoints: with and without a page size.
         for query in ["", "&maxResults=100", "&maxResults=1"] {
+            let case = format!("ListSharedEndpoints on {form} with {query:?}");
             let answer = list_shared(&router, &format!("?outpostId={outpost_id}{query}")).await;
-            assert_not_found(
-                &format!("ListSharedEndpoints on {form} with {query:?}"),
-                &answer,
-                expected,
-                &[outpost_id],
-            );
+            assert_not_found(&case, &answer, &[outpost_id]);
+            bodies.push((case, answer.body));
         }
 
         // DeleteEndpoint: the Outpost is resolved first, so its text wins over any
         // endpoint-level one — for every well-formed endpoint id.
         for endpoint_id in NEVER_ISSUED_ENDPOINT_IDS {
+            let case = format!("DeleteEndpoint on {form} with endpoint {endpoint_id}");
             let answer = delete_endpoint(&router, outpost_id, endpoint_id).await;
-            assert_not_found(
-                &format!("DeleteEndpoint on {form} with endpoint {endpoint_id}"),
-                &answer,
-                expected,
-                &[outpost_id, endpoint_id],
-            );
+            assert_not_found(&case, &answer, &[outpost_id, endpoint_id]);
+            bodies.push((case, answer.body));
         }
+    }
+
+    // One body for every branch of the pattern, every operation and every request shape:
+    // nothing in the answer is keyed to the form of the id.
+    let (first_case, first_body) = &bodies[0];
+    for (case, body) in &bodies[1..] {
+        assert_eq!(
+            body, first_body,
+            "case {case:?}: the body must be identical to {first_case:?}, got {body:?}"
+        );
     }
 }
 
@@ -192,15 +193,6 @@ async fn an_unresolvable_endpoint_under_a_resolvable_outpost_carries_the_same_te
         "this case needs two Outposts of this account, got {owned:?}"
     );
     let shared = shared_outpost(&router).await;
-
-    // Every Outpost the emulator presents is in the `op-` branch, so the masked text is
-    // the one the rule selects for all of them.
-    for outpost_id in owned.iter().chain(std::iter::once(&shared)) {
-        assert!(
-            outpost_id.starts_with("op-"),
-            "case {outpost_id:?}: this case assumes a provisioned Outpost in the op- branch"
-        );
-    }
 
     // One endpoint of this account, and one the sharing account owns.
     let created = create(&router, minimal_create(&owned[0])).await;
@@ -238,7 +230,7 @@ async fn an_unresolvable_endpoint_under_a_resolvable_outpost_carries_the_same_te
     ];
     for (case, outpost_id, endpoint_id) in &cases {
         let answer = delete_endpoint(&router, outpost_id, endpoint_id).await;
-        assert_not_found(case, &answer, MASKED, &[outpost_id, endpoint_id]);
+        assert_not_found(case, &answer, &[outpost_id, endpoint_id]);
     }
 
     // And a delete that did remove a record: the repeat is the same fixed text.
@@ -252,14 +244,13 @@ async fn an_unresolvable_endpoint_under_a_resolvable_outpost_carries_the_same_te
     assert_not_found(
         "a second delete of the same endpoint",
         &repeated,
-        MASKED,
         &[owned[0].as_str(), mine.as_str()],
     );
 }
 
 /// The boundary still refuses an id the model's pattern does not admit, BEFORE anything is
 /// resolved: that is a 400 `ValidationException` naming the member and its constraint, not
-/// one of the two not-found texts.
+/// the not-found text.
 #[tokio::test]
 async fn a_malformed_id_is_still_a_validation_error() {
     let router = emulator();
@@ -340,7 +331,7 @@ async fn a_malformed_id_is_still_a_validation_error() {
             "case {case:?}: the message must name the pattern constraint, got {:?}",
             answer.message()
         );
-        for text in [MASKED, OUTPOST_MISSING] {
+        for text in [OUTPOST_MISSING, AUTHORIZATION_TEXT] {
             assert!(
                 !answer.message().contains(text),
                 "case {case:?}: a malformed id is not a not-found answer, got {:?}",

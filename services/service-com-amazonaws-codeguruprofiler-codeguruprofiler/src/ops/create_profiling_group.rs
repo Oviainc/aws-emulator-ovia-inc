@@ -247,6 +247,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             latest_agent_profile_reported_at: None,
             profiles: ::std::collections::VecDeque::new(),
             seen_profile_tokens: ::std::collections::VecDeque::new(),
+            // A new profiling group has no resource-based policy: the model's
+            // `PutPermission` doc — "If a profiling group doesn't have a
+            // resource-based policy, one is created for it" — is what attaches one.
+            policy: None,
             // A new group has had no recommendation analysis recorded against it, so it
             // holds no findings reports: `ListFindingsReports` reports the empty list.
             findings_reports: ::std::collections::VecDeque::new(),

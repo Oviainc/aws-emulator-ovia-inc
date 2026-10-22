@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRuntimeVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRuntimeVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the canary runtime versions this service publishes
+//! ([`crate::state::RUNTIME_VERSION_CATALOG`]) — the one catalog, so the names this
+//! operation reports and the names a canary may be created on cannot disagree.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRuntimeVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: nothing about the account's canaries is touched, and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +72,21 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{PageStart, RUNTIME_VERSION_CATALOG, STORE_UNAVAILABLE};
+
+/// `DescribeRuntimeVersionsRequest$MaxResults`: "If you omit this parameter, the default of
+/// 100 is used" (which is also the member's modelled maximum, `MaxSize100`, range 1..100).
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// This operation's page-token prefix: a token resumes at a runtime VERSION NAME, so a page
+/// boundary is a key in the catalog rather than a position in it. The token form itself —
+/// and the offset fallback for a key too long to carry — is
+/// [`crate::state::encode_page_token`], shared with this service's other paged operation.
+///
+/// Three characters, so the shortest legal `VersionName` (one character, `len 1..1024`)
+/// still yields a token at the modelled minimum length of 4.
+const TOKEN_VERSION_PREFIX: &str = "rv#";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +157,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRuntimeVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRuntimeVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRuntimeVersions"))
+        // What this operation reports is the service's published runtime catalog, which is
+        // the same for every caller: the request names no resource to look up. The store is
+        // still reached, so an unreachable store answers with the modelled server error
+        // rather than a catalog the rest of the service could not agree with.
+        let _ = ctx;
+        let _state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeRuntimeVersionsError::from(
+                DescribeRuntimeVersionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(STORE_UNAVAILABLE.to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let start = match input.next_token.as_deref() {
+            None => PageStart::Offset(0),
+            Some(token) => crate::state::decode_page_token(
+                TOKEN_VERSION_PREFIX,
+                token,
+                RUNTIME_VERSION_CATALOG.len(),
+                |version| crate::state::runtime_version_position(version).is_some(),
+            )
+            .ok_or_else(|| {
+                DescribeRuntimeVersionsError::from(
+                    DescribeRuntimeVersionsErrorModeled::ValidationException(ValidationException {
+                        message: Some(
+                            "NextToken is not a token this operation issued".to_string(),
+                        ),
+                    }),
+                )
+            })?,
+        };
+        let page_size = crate::state::page_size(input.max_results, DEFAULT_MAX_RESULTS);
+
+        let from = match start {
+            PageStart::Offset(offset) => offset.min(RUNTIME_VERSION_CATALOG.len()),
+            // A key token only decodes for a version the catalog holds, so this lookup
+            // answers; the bound keeps the slice below well formed whatever it answers.
+            PageStart::Key(version) => crate::state::runtime_version_position(&version)
+                .unwrap_or(RUNTIME_VERSION_CATALOG.len()),
+        };
+        let until = from
+            .saturating_add(page_size)
+            .min(RUNTIME_VERSION_CATALOG.len());
+        let runtime_versions: Vec<RuntimeVersion> = RUNTIME_VERSION_CATALOG[from..until]
+            .iter()
+            .map(|entry| entry.to_runtime_version())
+            .collect();
+        // A token only when entries actually remain, so a client stops paging.
+        let next_token = RUNTIME_VERSION_CATALOG
+            .get(until)
+            .map(|next| crate::state::encode_page_token(TOKEN_VERSION_PREFIX, until, next.version_name));
+
+        Ok(DescribeRuntimeVersionsOutput {
+            runtime_versions: Some(runtime_versions),
+            next_token,
+        })
     }
 }

@@ -8,11 +8,20 @@
 //! `DescribeCommunications` only read it, so every value they report is computed
 //! from what an earlier call persisted.
 //!
+//! The account's Premium Support subscription lives here too
+//! ([`ComAmazonawsSupportAwssupport20130415State::support_plan`]): every operation of
+//! this API is served only to an account whose plan qualifies, which
+//! [`ComAmazonawsSupportAwssupport20130415State::support_api_allowed`] answers and
+//! `crate::service` enforces once, ahead of dispatch.
+//!
 //! Both growth sites are BOUNDED, because every write here is driven by a request:
 //! [`MAX_STORED_CASES`] caps how many cases the store holds (a further create is
 //! refused with the operation's own modelled `CaseCreationLimitExceeded`) and
 //! [`MAX_COMMUNICATIONS_PER_CASE`] caps one case's log, evicting oldest-first
-//! inside the single writer [`Case::record_communication`].
+//! inside the single writer [`Case::record_communication`]. A case's cc list is
+//! capped the same way, at [`MAX_CC_EMAIL_ADDRESSES`] inside
+//! [`Case::merge_cc_email_addresses`], which refuses a request from its length
+//! before doing any work proportional to it.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::SystemTime;
@@ -65,6 +74,64 @@ pub const MAX_STORED_CASES: usize = 128;
 /// 128 * 32 * 8000 bytes.
 pub const MAX_COMMUNICATIONS_PER_CASE: usize = 32;
 
+/// The Amazon Web Services Support plans an account may call this API with.
+///
+/// Source: this service's own documentation, carried on every operation header in
+/// `src/ops/` (`smithy_query(query="doc",shape="AWSSupport_20130415")`): "You must
+/// have an Amazon Web Services Business Support+, Amazon Web Services Enterprise
+/// Support, or Amazon Web Services Unified Operations plan to use the Amazon Web
+/// Services Support API. If you're in an Amazon Web Services Region that doesn't
+/// offer one of these Amazon Web Services Support plans, or if you haven't
+/// transitioned to one of these plans, you can use the Amazon Web Services Support
+/// API with a Business, Enterprise On-Ramp, or Enterprise Support plan." Every plan
+/// the sentence does not name — Basic and Developer — does NOT qualify, and the
+/// documentation says what the service answers then: "the
+/// SubscriptionRequiredException error message appears".
+///
+/// Entries are in the form [`normalize_support_plan`] produces, so a caller compares
+/// through [`plan_qualifies`] rather than against this list directly.
+pub const QUALIFYING_SUPPORT_PLANS: &[&str] = &[
+    "business",
+    "businesssupport+",
+    "enterprise",
+    "enterpriseonramp",
+    "enterprisesupport",
+    "unifiedoperations",
+];
+
+/// The environment variable an operator uses to tell this emulated account which
+/// Support plan it holds, since the Support API models no operation that changes one
+/// (`smithy_query(query="digest")` lists none): a plan name, read once when this
+/// service's store is created (`SUPPORT_PLAN="enterprise"`).
+///
+/// UNSET means the account holds no Premium Support subscription, which is what a new
+/// Amazon Web Services account has — and then every operation of this API answers the
+/// documented subscription-required refusal rather than running.
+pub const SUPPORT_PLAN_ENV: &str = "SUPPORT_PLAN";
+
+/// A plan name reduced to what identifies the plan: ASCII lowercase, with every
+/// separator and the vendor prefix the documentation writes dropped. So
+/// `"Enterprise On-Ramp"`, `"enterprise_on_ramp"` and `"AWS Enterprise On-Ramp"` are
+/// one plan, while `"Business Support+"` keeps the `+` that names it.
+pub fn normalize_support_plan(plan: &str) -> String {
+    let squeezed: String = plan
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '+')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let identifying = squeezed
+        .strip_prefix("amazonwebservices")
+        .or_else(|| squeezed.strip_prefix("aws"))
+        .unwrap_or(squeezed.as_str());
+    identifying.to_string()
+}
+
+/// Whether `plan` names one of the [`QUALIFYING_SUPPORT_PLANS`], i.e. whether an
+/// account holding it may call this API at all.
+pub fn plan_qualifies(plan: &str) -> bool {
+    QUALIFYING_SUPPORT_PLANS.contains(&normalize_support_plan(plan).as_str())
+}
+
 /// The realm segment of a case id (`case-<account>-<realm>-<year>-<16 hex>`).
 ///
 /// AWS documents the SHAPE of a case id but publishes no region-to-realm
@@ -74,16 +141,49 @@ pub const MAX_COMMUNICATIONS_PER_CASE: usize = 32;
 const CASE_ID_REALM: &str = "muen";
 
 /// Per-service state for com-amazonaws-support-awssupport-20130415. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsSupportAwssupport20130415State {
     /// Every case this emulator holds, keyed by its `caseId`. Bounded at
     /// [`MAX_STORED_CASES`]; `CreateCase` consults [`Self::is_full`] first.
     pub cases: HashMap<String, Case>,
     /// Monotonic counter backing each case's numeric `displayId`.
     pub next_display_id: u64,
+    /// The Amazon Web Services Support plan this account holds, as
+    /// [`SUPPORT_PLAN_ENV`] named it at start-up — `None` when nothing named one,
+    /// which is an account with no Premium Support subscription.
+    ///
+    /// It is a field rather than a constant because the subscription is per account
+    /// and nothing in THIS API changes it: a plan is bought outside the operations
+    /// this model declares, so the only way one reaches the emulator is out of band.
+    /// One field serves every caller because this emulator serves ONE account — the
+    /// canonical emulator account (`engine::emulator_account_id()`) that every case id
+    /// and `submittedBy` is built from. [`Self::support_api_allowed`] is what the
+    /// dispatch path reads.
+    pub support_plan: Option<String>,
+}
+
+impl Default for ComAmazonawsSupportAwssupport20130415State {
+    /// An account with no cases and the Support plan [`SUPPORT_PLAN_ENV`] names
+    /// (none, unless it is set — what a new Amazon Web Services account has).
+    fn default() -> Self {
+        Self {
+            cases: HashMap::new(),
+            next_display_id: 0,
+            support_plan: ::std::env::var(SUPPORT_PLAN_ENV).ok(),
+        }
+    }
 }
 
 impl ComAmazonawsSupportAwssupport20130415State {
+    /// Whether this account may call the Support API at all: whether the plan it
+    /// holds is one of the [`QUALIFYING_SUPPORT_PLANS`]. False for an account with
+    /// no plan recorded, and false for one holding a plan that does not qualify
+    /// (Basic, Developer) — the account-level gate that fronts every operation of
+    /// this service.
+    pub fn support_api_allowed(&self) -> bool {
+        self.support_plan.as_deref().is_some_and(plan_qualifies)
+    }
+
     /// Whether the store already holds [`MAX_STORED_CASES`] cases, so a further
     /// `CreateCase` must be refused instead of growing it.
     pub fn is_full(&self) -> bool {
@@ -211,10 +311,23 @@ impl Case {
     }
 
     /// Record `addresses` as case cc recipients, ignoring ones it already holds.
-    /// `Err(total)` when the union would take the case past
+    /// `Err(total)` when the request would take the case past
     /// [`MAX_CC_EMAIL_ADDRESSES`], and then NOTHING is recorded: a request is
     /// refused rather than partly applied.
+    ///
+    /// The refusal comes FIRST, from the lengths alone, so the work this does is
+    /// bounded by [`MAX_CC_EMAIL_ADDRESSES`] rather than by the size of the request:
+    /// a caller-supplied list longer than a case may carry cannot fit however many
+    /// duplicates it holds, so it costs one comparison instead of a clone and a
+    /// membership scan per address. (The modelled `CcEmailAddressList` 0..10 length
+    /// constraint refuses such a list at the boundary before it ever reaches here;
+    /// this keeps the bound true for any other caller of this writer, and makes a
+    /// list of duplicates past the modelled maximum refused rather than collapsed
+    /// into an acceptable one.)
     pub fn merge_cc_email_addresses(&mut self, addresses: &[String]) -> Result<(), usize> {
+        if addresses.len() > MAX_CC_EMAIL_ADDRESSES {
+            return Err(addresses.len());
+        }
         let mut merged = self.cc_email_addresses.clone();
         for address in addresses {
             if !merged.iter().any(|known| known == address) {

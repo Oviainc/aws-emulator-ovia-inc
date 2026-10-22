@@ -17,6 +17,8 @@ mod findings_reports_listing;
 mod profiling_group_lifecycle;
 #[path = "all/recommendations_analysis.rs"]
 mod recommendations_analysis;
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/untag_resource.rs"]

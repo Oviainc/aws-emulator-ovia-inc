@@ -333,23 +333,36 @@ async fn describe_reports_what_request_certificate_stored() {
             detail["CreatedAt"].is_number(),
             "case {case}: expected a numeric CreatedAt timestamp, got {detail}"
         );
-        // Members that only exist once a certificate has been issued stay absent.
-        for absent in ["IssuedAt", "Serial", "Subject", "Issuer", "NotAfter"] {
+        // Members that come into existence only with the certificate itself stay
+        // absent while it is pending.
+        for absent in ["IssuedAt", "Serial", "NotBefore", "NotAfter"] {
             assert!(
                 detail[absent].is_null(),
                 "case {case}: {absent} must be absent before issuance, got {detail}"
             );
         }
 
-        let expected_algorithm = algorithm.unwrap_or("RSA_2048");
+        // The detail reports the key algorithm as the X.509 descriptor (hyphenated),
+        // not as the model enum name the request was written in. The expected spellings
+        // come from the literal catalog in
+        // [`crate::certificate_detail_projection::algorithm_forms`] rather than from
+        // repeating the production transform here.
+        let requested_algorithm = algorithm.unwrap_or("RSA_2048");
+        let (expected_algorithm, expected_signature) =
+            crate::certificate_detail_projection::algorithm_forms(*algorithm);
         assert_eq!(
             detail["KeyAlgorithm"].as_str(),
             Some(expected_algorithm),
             "case {case}: expected KeyAlgorithm {expected_algorithm}, got {detail}"
         );
+        assert_eq!(
+            detail["SignatureAlgorithm"].as_str(),
+            Some(expected_signature),
+            "case {case}: expected SignatureAlgorithm {expected_signature}, got {detail}"
+        );
         assert!(
-            KEY_ALGORITHMS.contains(&detail["KeyAlgorithm"].as_str().unwrap_or_default()),
-            "case {case}: KeyAlgorithm must be a modelled value, got {detail}"
+            KEY_ALGORITHMS.contains(&requested_algorithm),
+            "case {case}: the test's own algorithm must be a modelled value"
         );
 
         // One DomainValidationOptions entry per name, carrying the method's own
@@ -418,23 +431,13 @@ async fn describe_reports_what_request_certificate_stored() {
                         Some(target),
                         "case {case}: expected ACM to mail {target}, got {validation}"
                     );
-                    let mailboxes: Vec<&str> = validation["ValidationEmails"]
-                        .as_array()
-                        .unwrap_or_else(|| {
-                            panic!("case {case}: email validation lists no mailboxes: {validation}")
-                        })
-                        .iter()
-                        .map(|m| m.as_str().unwrap_or_default())
-                        .collect();
-                    assert!(
-                        mailboxes.contains(&format!("admin@{target}").as_str()),
-                        "case {case}: expected admin@{target} among {mailboxes:?}"
-                    );
-                    assert!(
-                        mailboxes
-                            .iter()
-                            .all(|m| m.ends_with(&format!("@{target}"))),
-                        "case {case}: every mailbox must be at {target}, got {mailboxes:?}"
+                    // The mailbox list of an email-validated name names the messages
+                    // ACM has SENT; nothing here sends mail, so it is empty rather
+                    // than carrying invented addresses.
+                    assert_eq!(
+                        validation["ValidationEmails"],
+                        json!([]),
+                        "case {case}: no validation email has been sent, got {validation}"
                     );
                     assert!(
                         validation["ResourceRecord"].is_null(),
@@ -1204,6 +1207,16 @@ async fn arns_are_classified_before_they_are_looked_up() {
             (status, error_code(&response).as_str()),
             (400, *expected),
             "case {case}: expected {expected} for {arn}, got {status} {response}"
+        );
+        // The refusal names the ARN the request sent, so a caller can tell which of
+        // its ARNs was refused.
+        let message = response["message"]
+            .as_str()
+            .or_else(|| response["Message"].as_str())
+            .unwrap_or_default();
+        assert!(
+            message.contains(arn.as_str()),
+            "case {case}: expected the message to name {arn}, got {message:?}"
         );
     }
 

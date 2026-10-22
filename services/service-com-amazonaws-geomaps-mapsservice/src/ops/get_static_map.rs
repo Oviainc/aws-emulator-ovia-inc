@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStaticMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStaticMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Renders one static map image. The request's framing (`BoundingBox`,
+//! `BoundedPositions`, or `Center` with `Zoom` or `Radius`) becomes the
+//! geographic envelope the image covers; the stored style record in
+//! [`crate::state`] supplies the palette, and the catalog supplies the media
+//! type, the cache directive and the pricing bucket. A request that frames
+//! nothing, or that combines framing parameters the model's own documentation
+//! says cannot be combined, is a `ValidationException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStaticMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOT RENDERED YET: `PoliticalView`, `Language` and `CropLabels` are accepted
+//! and change no pixel, because this slice draws no label text and no boundary
+//! layer for them to act on. The gap — and what a fix needs — is recorded in
+//! `issues/things-that-do-not-work/20261022T013000Z-getstaticmap-ignores-politicalview-language-and-croplabels-geomaps.md`.
+//! `CompactOverlay` is the one deferred knob that asks for geometry to be
+//! DRAWN, so it is refused with the modeled `ValidationException` rather than
+//! answered with an image that silently omits it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +159,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::assets::{self, Envelope, FieldFault, Position, StaticMapView};
+use crate::state::ColorSchemeKind;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -225,18 +233,425 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStaticMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStaticMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStaticMap"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator (one shared `InMemoryEngine`), and
+            // this operation models the server error for it.
+            return Err(GetStaticMapErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the maps asset catalog is not available on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `FileName` is `map` or `map@2x` (modeled pattern `^map(@2x)?$`): the
+        // suffix is a device pixel ratio, not a file extension, so the image
+        // format comes from the catalog rather than from the name. Matched
+        // against the modeled set here — the way `GetSprites` matches its own
+        // file names — so an unmatched label is refused by this handler and not
+        // only by the boundary validator.
+        let pixel_ratio = match input.file_name.as_str() {
+            "map" => 1,
+            "map@2x" => 2,
+            _ => {
+                return Err(refuse(FieldFault::new(
+                    "FileName",
+                    "FieldValidationFailed",
+                    format!(
+                        "FileName must be map or map@2x, got `{}`",
+                        input.file_name
+                    ),
+                )))
+            }
+        };
+
+        // `Width`, `Height` and `Padding` are the only request values that
+        // size an allocation here, so this handler enforces their bounds
+        // itself rather than assuming the boundary validator did: the bound the
+        // image is rendered under is this code's own. See the constants below
+        // for where each bound comes from.
+        let width = checked_side("Width", input.width).map_err(refuse)?;
+        let height = checked_side("Height", input.height).map_err(refuse)?;
+        let padding =
+            checked_padding(input.padding.unwrap_or(0), width, height).map_err(refuse)?;
+        // And the product, as a backstop. It cannot fire given the side bounds
+        // above (1400 x 1400 at `@2x` is exactly `MAX_IMAGE_PIXELS`), so the
+        // operative limit on an image is those bounds, not this check; it is
+        // here so the allocation stays bounded if a side bound ever widens.
+        let pixels = width
+            .checked_mul(height)
+            .and_then(|area| area.checked_mul(pixel_ratio * pixel_ratio));
+        if pixels.is_none_or(|pixels| pixels > MAX_IMAGE_PIXELS) {
+            return Err(refuse(FieldFault::new(
+                "Width",
+                "FieldValidationFailed",
+                format!(
+                    "Width x Height at this scale must cover at most {MAX_IMAGE_PIXELS} pixels"
+                ),
+            )));
+        }
+
+        // The modeled patterns admit any number of pairs; the member docs fix
+        // how many each one takes: a bounding box is "two pairs of
+        // coordinates", bounded positions are "two or more", a centre is one.
+        let bounding_box = input
+            .bounding_box
+            .as_deref()
+            .map(|raw| assets::parse_positions("BoundingBox", raw, 2, Some(2)))
+            .transpose()
+            .map_err(refuse)?;
+        let bounded_positions = input
+            .bounded_positions
+            .as_deref()
+            .map(|raw| {
+                assets::parse_positions("BoundedPositions", raw, 2, Some(MAX_BOUNDED_POSITIONS))
+            })
+            .transpose()
+            .map_err(refuse)?;
+        let center: Option<Position> = input
+            .center
+            .as_deref()
+            .map(|raw| assets::parse_positions("Center", raw, 1, Some(1)))
+            .transpose()
+            .map_err(refuse)?
+            .and_then(|positions| positions.first().copied());
+        let zoom = input.zoom.map(f64::from);
+        let radius = input.radius;
+
+        // Each of the three framing parameters frames the whole image, so a
+        // request that supplies two of them states two different views and
+        // there is no documented precedence between them.
+        let framings: Vec<&str> = [
+            ("BoundingBox", bounding_box.is_some()),
+            ("BoundedPositions", bounded_positions.is_some()),
+            ("Center", center.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| present.then_some(name))
+        .collect();
+        if framings.len() > 1 {
+            return Err(refuse(FieldFault::new(
+                framings[1],
+                "FieldValidationFailed",
+                format!(
+                    "a static map is framed by exactly one of BoundingBox, BoundedPositions or Center, got {}",
+                    framings.join(" and ")
+                ),
+            )));
+        }
+
+        // `Zoom` is a finite zoom level (the model bounds it to 0..=20).
+        if zoom.is_some_and(|zoom| !zoom.is_finite()) {
+            return Err(refuse(FieldFault::new(
+                "Zoom",
+                "CannotParse",
+                "Zoom must be a finite zoom level",
+            )));
+        }
+        // `Radius` is documented as taking "any value >= 1" metres.
+        if radius.is_some_and(|radius| radius < 1) {
+            return Err(refuse(FieldFault::new(
+                "Radius",
+                "FieldValidationFailed",
+                "Radius must be at least 1 metre",
+            )));
+        }
+        // `Center` "requires that either zoom or radius is set".
+        if center.is_some() && zoom.is_none() && radius.is_none() {
+            return Err(refuse(FieldFault::new(
+                "Center",
+                "Missing",
+                "Center requires either Zoom or Radius",
+            )));
+        }
+        // `Zoom` "cannot be used with Radius".
+        if zoom.is_some() && radius.is_some() {
+            return Err(refuse(FieldFault::new(
+                "Zoom",
+                "FieldValidationFailed",
+                "Zoom cannot be used with Radius",
+            )));
+        }
+        // `BoundingBox` and `BoundedPositions` each "cannot be used with Zoom
+        // and or Radius": they frame the image themselves.
+        for (name, present) in [
+            ("BoundingBox", bounding_box.is_some()),
+            ("BoundedPositions", bounded_positions.is_some()),
+        ] {
+            if present && (zoom.is_some() || radius.is_some()) {
+                return Err(refuse(FieldFault::new(
+                    name,
+                    "FieldValidationFailed",
+                    format!("{name} cannot be used with Zoom or Radius"),
+                )));
+            }
+        }
+
+        // Every image needs an area to draw: with no framing parameter at all
+        // there is nothing to render.
+        let mut framing: Vec<Position> = Vec::new();
+        framing.extend(bounding_box.into_iter().flatten());
+        framing.extend(bounded_positions.iter().flatten().copied());
+        let envelope = if let Some(envelope) = Envelope::of(&framing) {
+            envelope.padded()
+        } else if let Some(center) = center {
+            match (zoom, radius) {
+                (Some(zoom), _) => Envelope::from_center_zoom(center, zoom, width, height),
+                (None, Some(radius)) => {
+                    Envelope::from_center_radius(center, radius as f64, width, height)
+                }
+                // Refused above: a centre without zoom or radius.
+                (None, None) => return Err(missing_framing()),
+            }
+        } else {
+            return Err(missing_framing());
+        };
+
+        let Some(style) = assets::static_map_style(input.style.as_deref()) else {
+            return Err(refuse(FieldFault::new(
+                "Style",
+                "FieldValidationFailed",
+                format!(
+                    "Style must be one of {}",
+                    STATIC_MAP_STYLE_VALUES.join(" | ")
+                ),
+            )));
+        };
+        let scheme = match input.color_scheme.as_deref() {
+            None => ColorSchemeKind::Light,
+            Some(value) => match ColorSchemeKind::from_wire(value) {
+                Some(scheme) => scheme,
+                None => {
+                    return Err(refuse(FieldFault::new(
+                        "ColorScheme",
+                        "FieldValidationFailed",
+                        format!(
+                            "ColorScheme must be one of {}",
+                            COLOR_SCHEME_VALUES.join(" | ")
+                        ),
+                    )))
+                }
+            },
+        };
+        // The remaining enum-valued knobs: a value outside the model's set is
+        // refused rather than quietly read as the default it is not.
+        for (name, value, allowed) in [
+            ("LabelSize", input.label_size.as_deref(), LABEL_SIZE_VALUES),
+            (
+                "PointsOfInterests",
+                input.points_of_interests.as_deref(),
+                MAP_FEATURE_MODE_VALUES,
+            ),
+            (
+                "ScaleBarUnit",
+                input.scale_bar_unit.as_deref(),
+                SCALE_BAR_UNIT_VALUES,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !allowed.contains(&value) {
+                    return Err(refuse(FieldFault::new(
+                        name,
+                        "FieldValidationFailed",
+                        format!("{name} must be one of {}", allowed.join(" | ")),
+                    )));
+                }
+            }
+        }
+
+        let overlay = input
+            .geo_json_overlay
+            .as_deref()
+            .map(assets::parse_geojson_overlay)
+            .transpose()
+            .map_err(refuse)?
+            .unwrap_or_default();
+        // `CompactOverlay` asks for geometry to be DRAWN, in AWS's own compact
+        // overlay syntax. This emulator renders the GeoJSON overlay and not
+        // that syntax, so the request is refused rather than answered with an
+        // image that silently leaves the overlay out — an absent overlay must
+        // not be indistinguishable from a drawn one.
+        if input.compact_overlay.is_some() {
+            return Err(refuse(FieldFault::new(
+                "CompactOverlay",
+                "Other",
+                "CompactOverlay is not supported by this emulator; pass the same \
+                 geometry as GeoJsonOverlay",
+            )));
+        }
+
+        // Read the catalog, then release it: the render is the expensive part
+        // and nothing in it reads state, so it must not hold this service's one
+        // shared lock.
+        let (palette, content_type, cache_control, pricing_bucket) = {
+            let catalog = state.lock();
+            let Some(style_record) = catalog.styles.get(&(style, scheme)) else {
+                return Err(refuse(FieldFault::new(
+                    "Style",
+                    "FieldValidationFailed",
+                    format!(
+                        "no style is published for {}/{}",
+                        style.as_wire(),
+                        scheme.as_wire()
+                    ),
+                )));
+            };
+            (
+                style_record.palette.clone(),
+                catalog.static_maps.content_type.clone(),
+                catalog.static_maps.cache_control.clone(),
+                catalog.pricing_bucket(catalog.static_maps.pricing_bucket.as_ref()),
+            )
+        };
+
+        let view = StaticMapView {
+            pixel_ratio,
+            width,
+            height,
+            padding,
+            envelope,
+            center,
+            markers: bounded_positions.unwrap_or_default(),
+            // `LabelSize` scales the map's annotations; `Small` is the size
+            // they are drawn at when the request names none.
+            label_scale: if input.label_size.as_deref() == Some("Large") {
+                2
+            } else {
+                1
+            },
+            // `PointsOfInterests` is the switch for POI annotations, which a
+            // map shows unless the request disables them.
+            show_pois: input.points_of_interests.as_deref() != Some("Disabled"),
+            // `ScaleBarUnit`'s leading unit is the one the bar measures in.
+            scale_bar_miles: matches!(
+                input.scale_bar_unit.as_deref(),
+                Some("Miles" | "MilesKilometers")
+            ),
+            overlay,
+        };
+        // Rendering a full-size image is millions of pixel writes with no
+        // await point in it, so it runs on the blocking pool rather than
+        // occupying an async worker for the whole render.
+        let body = match tokio::task::spawn_blocking(move || {
+            assets::render_static_map(&palette, &view)
+        })
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                return Err(GetStaticMapErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!("rendering the static map failed: {error}"),
+                    },
+                )
+                .into())
+            }
+        };
+
+        Ok(GetStaticMapOutput {
+            pricing_bucket,
+            content_type: Some(content_type),
+            cache_control: Some(cache_control),
+            e_tag: Some(assets::etag(&body)),
+            blob: Some(body),
+        })
     }
+}
+
+/// The `Width`/`Height` bounds the model declares: `range { min: 64, max: 1400 }`
+/// on `GetStaticMapRequest$Width` and `$Height`.
+///
+/// Read from the model itself, not from this file's header listing: the
+/// generated listing clips a member's traits, so it renders these two as plain
+/// `SensitiveInteger`. The traits are visible with
+/// `smithy_query(query="operation", operation="GetStaticMap")`, which reports
+/// `"Width": { ..., "range": {"min": 64, "max": 1400} }` and the same for
+/// `Height`.
+const MIN_IMAGE_SIDE: i32 = 64;
+const MAX_IMAGE_SIDE: i32 = 1400;
+
+/// The `Padding` maximum the model declares, `range { min: 0, max: 350 }` —
+/// again from `smithy_query(query="operation", operation="GetStaticMap")`
+/// rather than the clipped header listing. The member's own documentation adds
+/// a second, tighter maximum of `min(height, width) / 4`, which
+/// [`checked_padding`] applies alongside this one.
+const MAX_PADDING: i32 = 350;
+
+/// The most pixels one image may cover: the maximum side above at the `@2x`
+/// scale, squared (2800 x 2800).
+const MAX_IMAGE_PIXELS: u32 = (MAX_IMAGE_SIDE as u32 * 2) * (MAX_IMAGE_SIDE as u32 * 2);
+
+/// The most positions `BoundedPositions` may carry.
+///
+/// Derived from the member's own modeled `length` maximum of 5000 characters
+/// (`smithy_query(query="operation", operation="GetStaticMap")` reports
+/// `"BoundedPositions": { ..., "length": {"max": 5000} }`): the shortest a pair
+/// can be written is four characters (`0,0`) plus its separator, so 5000
+/// characters cannot carry more than this many pairs. The cap is therefore
+/// exactly the modeled edge — no value the model admits is refused by it — and
+/// it keeps the per-marker render work bounded on its own terms rather than
+/// depending on the length trait staying where it is.
+const MAX_BOUNDED_POSITIONS: usize = 1250;
+
+/// One image side, within the modeled range.
+fn checked_side(name: &str, value: i32) -> Result<u32, FieldFault> {
+    if !(MIN_IMAGE_SIDE..=MAX_IMAGE_SIDE).contains(&value) {
+        return Err(FieldFault::new(
+            name,
+            "FieldValidationFailed",
+            format!("{name} must be within {MIN_IMAGE_SIDE}..={MAX_IMAGE_SIDE} pixels"),
+        ));
+    }
+    u32::try_from(value).map_err(|_| {
+        FieldFault::new(
+            name,
+            "FieldValidationFailed",
+            format!("{name} must be a positive pixel count"),
+        )
+    })
+}
+
+/// The padding, within the modeled range and the maximum the member documents
+/// ("Max: min(height, width)/4").
+fn checked_padding(value: i32, width: u32, height: u32) -> Result<u32, FieldFault> {
+    let documented_max = i32::try_from(width.min(height) / 4).unwrap_or(MAX_PADDING);
+    let maximum = MAX_PADDING.min(documented_max);
+    if !(0..=maximum).contains(&value) {
+        return Err(FieldFault::new(
+            "Padding",
+            "FieldValidationFailed",
+            format!("Padding must be within 0..={maximum} for this image size"),
+        ));
+    }
+    u32::try_from(value).map_err(|_| {
+        FieldFault::new(
+            "Padding",
+            "FieldValidationFailed",
+            "Padding must not be negative",
+        )
+    })
+}
+
+/// Refuse a request that frames no area at all.
+fn missing_framing() -> GetStaticMapError {
+    refuse(FieldFault::new(
+        "BoundingBox",
+        "Missing",
+        "one of BoundingBox, BoundedPositions or Center (with Zoom or Radius) is required to frame the image",
+    ))
+}
+
+/// Refuse the request with this operation's own modeled `ValidationException`,
+/// filling the reason and field list the model declares room for.
+fn refuse(fault: FieldFault) -> GetStaticMapError {
+    GetStaticMapErrorModeled::ValidationException(ValidationException {
+        message: fault.message.clone(),
+        reason: fault.reason.to_string(),
+        field_list: vec![ValidationExceptionField {
+            name: fault.name,
+            message: fault.message,
+        }],
+    })
+    .into()
 }

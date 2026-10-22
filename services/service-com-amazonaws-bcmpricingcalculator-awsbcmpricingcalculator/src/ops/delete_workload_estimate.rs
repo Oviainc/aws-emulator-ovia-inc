@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkloadEstimate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkloadEstimate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the workload estimate `identifier` names, so a later `GetWorkloadEstimate`
+//! answers `ResourceNotFoundException` and `ListWorkloadEstimates` no longer lists it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkloadEstimate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@idempotent` and its model declares no not-found error (smithy_query:
+//! `query="operation",operation="DeleteWorkloadEstimate"`), so a second delete of the same
+//! identifier — and a delete of an identifier that never existed — is an empty success
+//! rather than a failure, exactly as the sibling `DeleteBillScenario` behaves.
 //!
 //! ## Shape of an operation
 //!
@@ -130,20 +128,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkloadEstimate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkloadEstimateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkloadEstimate"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteWorkloadEstimateErrorModeled::DataUnavailableException(
+                DataUnavailableException {
+                    message: "the workload estimate store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Materialise what the clock has already made due before resolving the
+        // identifier, so this call never resurrects an estimate already past its
+        // `expiresAt`; every operation that resolves a workload estimate settles first.
+        state.settle(crate::state::now_millis());
+        // `remove_workload_estimate` reports whether anything was there; an absent
+        // estimate is already in the state this call asks for, and this operation models
+        // no not-found error, so that is a success.
+        state.remove_workload_estimate(&input.identifier);
+        Ok(DeleteWorkloadEstimateOutput {})
     }
 }

@@ -5,7 +5,7 @@
 //! One map of profiling groups, keyed by name — the service's only resource. Every
 //! handler computes its response from what is stored here; nothing is canned.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use ::aws_smithy_types::DateTime;
 
@@ -74,6 +74,106 @@ pub const MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP: usize = 64;
 /// profile's token is still recognised as a replay; the oldest token is forgotten
 /// first, so caller-chosen token strings cannot accumulate without limit.
 pub const MAX_RETAINED_PROFILE_TOKENS_PER_GROUP: usize = 64;
+
+/// The IAM policy-language version a resource-based policy document carries. The
+/// version the service's own resource-policy document uses (the AWS CodeGuru Profiler
+/// User Guide, "Resource-based policies in CodeGuru Profiler").
+pub const POLICY_VERSION: &str = "2012-10-17";
+
+/// The one action group a resource-based policy can grant, as the model's `ActionGroup`
+/// enum declares it (`smithy_query(query="shape",shape="ActionGroup")`).
+pub const ACTION_GROUP_AGENT_PERMISSIONS: &str = "agentPermissions";
+
+/// The API actions an action group grants, as IAM action strings
+/// (`<arn namespace>:<operation>`). The model's `PutPermission` doc for `actionGroup`:
+/// "One action group is supported, agentPermissions, which grants permission to perform
+/// actions required by the profiling agent, ConfigureAgent and PostAgentProfile
+/// permissions." An action group this service does not know grants nothing, so it
+/// renders no actions rather than inventing some.
+pub fn action_group_actions(action_group: &str) -> Vec<String> {
+    match action_group {
+        ACTION_GROUP_AGENT_PERMISSIONS => vec![
+            format!("{ARN_NAMESPACE}:ConfigureAgent"),
+            format!("{ARN_NAMESPACE}:PostAgentProfile"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// A profiling group's resource-based policy: which principals hold which action
+/// group, and the revision that identifies the policy's current content.
+///
+/// The policy is stored as the grants themselves, never as a document string, so every
+/// reader ([`ResourcePolicy::document`]) renders the SAME document from the SAME grants
+/// and the group's own stored ARN.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicy {
+    /// `actionGroup` -> the principal ARNs that hold it, in the order they were
+    /// granted. A `BTreeMap` so the rendered document's statement order is stable
+    /// across reads.
+    pub statements: BTreeMap<String, Vec<String>>,
+    /// The policy's current revision, as the modelled `RevisionId`
+    /// (`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`). Rotated by
+    /// whoever changes the grants, never by a read.
+    pub revision_id: String,
+}
+
+impl ResourcePolicy {
+    /// An empty policy at `revision_id`. A policy with no grants is not a policy: the
+    /// writer that empties it clears the group's policy instead, and
+    /// [`ProfilingGroup::resource_policy`] reports it as absent either way.
+    ///
+    /// This constructor and the two writers below exist for the permission handlers —
+    /// `PutPermission` and `RemovePermission`, which are still scaffold stubs with their
+    /// own open issue — so the operations that return `policy` all render the same
+    /// document from the same grants. They are the writers, not dead code.
+    pub fn new(revision_id: impl Into<String>) -> Self {
+        Self {
+            statements: BTreeMap::new(),
+            revision_id: revision_id.into(),
+        }
+    }
+
+    /// Grant `action_group` to exactly `principals`, REPLACING whatever principal set
+    /// the action group held. The revision is NOT touched here: a writer that changes
+    /// the grants rotates it once, with [`ResourcePolicy::set_revision`], however many
+    /// action groups the one call rewrote.
+    pub fn grant(&mut self, action_group: &str, principals: Vec<String>) {
+        self.statements
+            .insert(action_group.to_string(), principals);
+    }
+
+    /// Record `revision_id` as the policy's current revision. Only a change to the
+    /// grants rotates it; a read reports what is stored.
+    pub fn set_revision(&mut self, revision_id: impl Into<String>) {
+        self.revision_id = revision_id.into();
+    }
+
+    /// The JSON-formatted resource-based policy document, as every operation that
+    /// returns `policy` reports it: one `Allow` statement per stored action group,
+    /// naming the principals that hold it, the actions the action group grants and
+    /// `resource_arn` — the profiling group's own stored ARN.
+    pub fn document(&self, resource_arn: &str) -> String {
+        let statements: Vec<::serde_json::Value> = self
+            .statements
+            .iter()
+            .map(|(action_group, principals)| {
+                ::serde_json::json!({
+                    "Sid": action_group,
+                    "Effect": "Allow",
+                    "Principal": { "AWS": principals },
+                    "Action": action_group_actions(action_group),
+                    "Resource": resource_arn,
+                })
+            })
+            .collect();
+        ::serde_json::json!({
+            "Version": POLICY_VERSION,
+            "Statement": statements,
+        })
+        .to_string()
+    }
+}
 
 /// One agent profile as `PostAgentProfile` uploaded it. The bytes are kept verbatim:
 /// the agent profile is an opaque payload (Amazon Ion or JSON) that `GetProfile`
@@ -169,6 +269,11 @@ pub struct ProfilingGroup {
     /// first. Bounded at [`MAX_RETAINED_PROFILE_TOKENS_PER_GROUP`] by
     /// [`ProfilingGroup::remember_profile_token`], which is the only writer.
     pub seen_profile_tokens: VecDeque<String>,
+    /// The group's resource-based policy, or `None` while it has none — a group is
+    /// created without one, and the permission writers attach and clear it. It lives
+    /// ON the group so deleting the group takes its policy with it and a re-created
+    /// group starts with none. Read it through [`ProfilingGroup::resource_policy`].
+    pub policy: Option<ResourcePolicy>,
     /// The recommendation reports recorded against this group, oldest recorded FIRST.
     /// Bounded at [`MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP`] by
     /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_findings_report`],
@@ -240,6 +345,15 @@ impl ProfilingGroup {
         }
         self.seen_profile_tokens.push_back(token.to_string());
         true
+    }
+
+    /// This group's resource-based policy, or `None` when it has none. A policy with
+    /// no grants left is no policy, so an emptied one reads as absent here too — which
+    /// is what the operations returning `policy` must refuse on.
+    pub fn resource_policy(&self) -> Option<&ResourcePolicy> {
+        self.policy
+            .as_ref()
+            .filter(|policy| !policy.statements.is_empty())
     }
 
     /// The span the retained profiles inside `[start, end]` cover, as (earliest receipt

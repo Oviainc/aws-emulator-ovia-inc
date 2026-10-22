@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces the resource-based policy of the resource the `arn` @httpLabel names and
+//! PERSISTS it in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::policies`],
+//! minting a fresh revision `token` for the revision it wrote; the response is read
+//! back out of the stored record, so `GetPolicy` cannot disagree with it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A policy belongs to a resource, so an `arn` that names no resource this account
+//! holds is refused with the modelled `ResourceNotFoundException` (HTTP 404). `token`
+//! is the optimistic-concurrency check — "a unique identifier for the current revision
+//! of the policy" — so a request carrying one that is NOT the current revision's token
+//! is refused with the modelled `ConflictException` (HTTP 400) and changes nothing,
+//! while a request carrying no token writes unconditionally.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +168,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutPolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        // A resource-based policy IS a JSON policy document, and `PolicyDocument` is
+        // modelled only as a bounded string, so the boundary validator cannot refuse a
+        // document that is not JSON at all. Parsing it here is what keeps a stored
+        // policy a policy; the document itself is persisted VERBATIM, never reformatted
+        // from this parse. The parse runs BEFORE the lock is taken (it is the one
+        // unbounded piece of work in this handler) but is only REPORTED after the
+        // resource lookup below, so an ARN that names no resource answers 404 whatever
+        // the body carries.
+        let document_is_object = serde_json::from_str::<serde_json::Value>(&input.policy)
+            .is_ok_and(|document| document.is_object());
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The resource the policy belongs to has to exist, the document has to be one,
+        // and the revision check has to pass, BEFORE anything is minted or stored: a
+        // refused write leaves the store exactly as it was.
+        let resource_created_at = store
+            .policy_resource_created_at(&input.arn, &region)
+            .ok_or_else(|| {
+                PutPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::messages::policy_resource_not_found(&input.arn)),
+                })
+            })?;
+
+        if !document_is_object {
+            return Err(PutPolicyErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::messages::POLICY_NOT_JSON.to_string()),
+            })
+            .into());
+        }
+
+        if let Some(token) = &input.token {
+            // `token` names "the current revision of the policy", so it matches only
+            // the token the write that produced the standing revision answered with. A
+            // resource that carries no policy at all has no current revision, so every
+            // token is stale for it.
+            let current = store
+                .resource_policy(&input.arn, &region)
+                .map(|policy| policy.token.as_str());
+            if current != Some(token.as_str()) {
+                return Err(PutPolicyErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::messages::stale_policy_token(token)),
+                })
+                .into());
+            }
+        }
+
+        // A policy is not a resource of its own: it dies with the resource it is
+        // attached to, and the four resource deletes are each their own operation. So
+        // the write that grows this collection first drops every entry whose resource
+        // is gone, which is what keeps it bounded by the LIVE resources — each of which
+        // has its own quota — rather than by how many resources a caller has ever
+        // policied and deleted.
+        store.prune_orphaned_policies();
+
+        // A write produces a NEW revision, so it mints a new token: the token a caller
+        // holds from an earlier revision stops matching, which is what makes the
+        // conflict above detectable.
+        let record = crate::state::ResourcePolicy {
+            policy: input.policy,
+            token: crate::state::new_policy_token(),
+            resource_created_at,
+        };
+        // Answered from the STORED record, not from the request object: `GetPolicy` and
+        // this response therefore cannot disagree about what was written. The record is
+        // read back through the vacant-or-occupied slot it was written into, so nothing
+        // here indexes a key that might be absent.
+        let stored = match store.policies.entry(input.arn.clone()) {
+            ::std::collections::btree_map::Entry::Occupied(slot) => {
+                let slot = slot.into_mut();
+                *slot = record;
+                &*slot
+            }
+            ::std::collections::btree_map::Entry::Vacant(slot) => slot.insert(record),
+        };
+        Ok(PutPolicyOutput {
+            arn: input.arn.clone(),
+            token: stored.token.clone(),
+            policy: Some(stored.policy.clone()),
+        })
     }
 }

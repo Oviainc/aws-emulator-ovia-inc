@@ -185,7 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
@@ -289,6 +288,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS,
             ),
             tags,
+            // The Region this directory is created in — its `Primary` one — is the one
+            // the request was signed for.
+            primary_region: crate::state::region_from_request(ctx.parts()),
+            // `AddRegion` (still scaffolded) is what replicates a directory to another
+            // Region; a fresh directory exists in its primary Region only.
+            additional_regions: ::std::collections::BTreeSet::new(),
+            // `AddIpRoutes` is what routes an address block to this directory.
+            ip_routes: ::std::collections::BTreeMap::new(),
+            // `EnableLDAPS` / `EnableClientAuthentication` (both still scaffolded) are
+            // what record a setting for a type; nothing is configured at create.
+            ldaps_settings: ::std::collections::BTreeMap::new(),
+            client_authentication_settings: ::std::collections::BTreeMap::new(),
             // No event topic until `RegisterEventTopic` associates one.
             event_topics: ::std::collections::BTreeMap::new(),
             seq,

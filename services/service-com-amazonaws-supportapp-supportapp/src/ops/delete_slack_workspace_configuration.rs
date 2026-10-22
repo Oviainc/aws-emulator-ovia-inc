@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSlackWorkspaceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSlackWorkspaceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSlackWorkspaceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a Slack workspace configuration from this account's workspace registry. The
+//! output shape has no members, so the removal is the operation's only effect: the
+//! account no longer holds that workspace, so a second delete of the same `teamId` —
+//! like a delete of one that was never registered — answers the modelled
+//! `ResourceNotFoundException`, and a `CreateSlackChannelConfiguration` for it is
+//! refused again by the workspace precondition. A Slack channel configuration lives
+//! inside a registered workspace, so the removed workspace's channel configurations go
+//! with it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSlackWorkspaceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSlackWorkspaceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSlackWorkspaceConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSlackWorkspaceConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Support App store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // `teamId` identifies a Slack workspace configuration, so the delete is a
+        // lookup in this account's workspace registry: a `teamId` the account holds no
+        // configuration for is the modelled `ResourceNotFoundException`, which is also
+        // what a repeated delete answers.
+        if store
+            .slack_workspace_configurations
+            .remove(&input.team_id)
+            .is_none()
+        {
+            return Err(
+                DeleteSlackWorkspaceConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::slack_workspace_configuration_not_found(
+                            &input.team_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A Slack channel configuration lives INSIDE a workspace registered to the
+        // account — `CreateSlackChannelConfiguration` refuses one whose `teamId` is not
+        // in the registry — so the channel configurations of the removed workspace go
+        // with it. Keeping them would leave the account holding configurations in a
+        // workspace it no longer has, a state no sequence of calls can otherwise reach,
+        // and they would reappear if that `teamId` were ever registered again.
+        store
+            .slack_channel_configurations
+            .retain(|(team_id, _), _| team_id != &input.team_id);
+
+        Ok(DeleteSlackWorkspaceConfigurationOutput {})
     }
 }

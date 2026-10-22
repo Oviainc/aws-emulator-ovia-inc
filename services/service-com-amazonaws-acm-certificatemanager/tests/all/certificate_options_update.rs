@@ -36,18 +36,6 @@ use crate::certificate_validation_state_machine::{make_validation_due_now, PRIVA
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#ValidationMethod")`).
 const VALIDATION_METHODS: &[&str] = &["DNS", "EMAIL", "HTTP"];
 
-/// The mailbox local parts ACM writes domain-validation mail to, as
-/// `ResendValidationEmailRequest$ValidationDomain`'s doc lists them
-/// (`admin@`, `administrator@`, `hostmaster@`, `postmaster@`, `webmaster@` at the
-/// validation domain). Compared as a set, so mailbox order is not asserted.
-const VALIDATION_MAILBOXES: &[&str] = &[
-    "admin",
-    "administrator",
-    "hostmaster",
-    "postmaster",
-    "webmaster",
-];
-
 /// The zone ACM publishes DNS-validation CNAME targets under, as the
 /// `ResourceRecord$Value` doc shows (`_3639ac533e.acm-validations.aws.`).
 const ACM_VALIDATIONS_ZONE: &str = "acm-validations.aws";
@@ -150,11 +138,28 @@ async fn update_options(
 
 /// Assert the validation evidence of one domain is the evidence `method` asks for, and
 /// carries none of the evidence the other methods ask for.
+///
+/// `ValidationDomain` is not that evidence: every validation names the domain whose
+/// control is being proven (the one the request named for that name, else the name
+/// itself), whatever method proves it, so it is asserted here only to be that name or
+/// a dot-boundary superdomain of it. The mailbox list is the email-only member, and it
+/// stays empty until something sends mail — `ResendValidationEmail` is what records
+/// the addresses it wrote to.
 fn assert_evidence(case: &str, validation: &Value, method: &str) {
     let domain = validation["DomainName"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: a validation carried no DomainName: {validation}"));
     let proven = validation_target(domain);
+    let validation_domain = validation["ValidationDomain"].as_str().unwrap_or_else(|| {
+        panic!("case {case}: every validation names the domain it proves: {validation}")
+    });
+    assert!(
+        validation_domain == proven
+            || proven
+                .strip_suffix(validation_domain)
+                .is_some_and(|higher_labels| higher_labels.ends_with('.')),
+        "case {case}: expected {proven} or a superdomain of it, got {validation_domain:?}"
+    );
     assert_eq!(
         validation["ValidationMethod"].as_str(),
         Some(method),
@@ -180,8 +185,7 @@ fn assert_evidence(case: &str, validation: &Value, method: &str) {
                 "case {case}: expected a CNAME target in {ACM_VALIDATIONS_ZONE}, got {value:?}"
             );
             assert!(
-                validation["ValidationEmails"].is_null()
-                    && validation["ValidationDomain"].is_null(),
+                validation["ValidationEmails"].is_null(),
                 "case {case}: DNS validation sends no mail, got {validation}"
             );
             assert!(
@@ -190,28 +194,12 @@ fn assert_evidence(case: &str, validation: &Value, method: &str) {
             );
         }
         "EMAIL" => {
+            // The mailbox list of an email-validated name is reported as a LIST, and
+            // holds the messages ACM has sent — none, until something sends one.
             assert_eq!(
-                validation["ValidationDomain"].as_str(),
-                Some(proven),
-                "case {case}: expected the mailed domain {proven}, got {validation}"
-            );
-            let mut mailboxes: Vec<String> = validation["ValidationEmails"]
-                .as_array()
-                .unwrap_or_else(|| {
-                    panic!("case {case}: email validation reports its mailboxes, got {validation}")
-                })
-                .iter()
-                .map(|address| address.as_str().unwrap_or_default().to_string())
-                .collect();
-            mailboxes.sort();
-            let mut expected: Vec<String> = VALIDATION_MAILBOXES
-                .iter()
-                .map(|local_part| format!("{local_part}@{proven}"))
-                .collect();
-            expected.sort();
-            assert_eq!(
-                mailboxes, expected,
-                "case {case}: expected the validation mailboxes {expected:?}, got {mailboxes:?}"
+                validation["ValidationEmails"],
+                json!([]),
+                "case {case}: no validation email has been sent, got {validation}"
             );
             assert!(
                 validation["ResourceRecord"].is_null() && validation["HttpRedirect"].is_null(),
@@ -238,8 +226,7 @@ fn assert_evidence(case: &str, validation: &Value, method: &str) {
                 "case {case}: HTTP validation publishes no DNS record, got {validation}"
             );
             assert!(
-                validation["ValidationEmails"].is_null()
-                    && validation["ValidationDomain"].is_null(),
+                validation["ValidationEmails"].is_null(),
                 "case {case}: HTTP validation sends no mail, got {validation}"
             );
         }
@@ -429,21 +416,11 @@ async fn a_requested_validation_domain_survives_a_migration() {
                 Some(*suffix),
                 "case {case}: expected {name} to be mailed at {suffix}, got {validation}"
             );
-            let mut mailboxes: Vec<String> = validation["ValidationEmails"]
-                .as_array()
-                .unwrap_or_else(|| panic!("case {case}: no ValidationEmails in {validation}"))
-                .iter()
-                .map(|address| address.as_str().unwrap_or_default().to_string())
-                .collect();
-            mailboxes.sort();
-            let mut expected: Vec<String> = VALIDATION_MAILBOXES
-                .iter()
-                .map(|local_part| format!("{local_part}@{suffix}"))
-                .collect();
-            expected.sort();
+            let mailboxes = &validation["ValidationEmails"];
             assert_eq!(
-                mailboxes, expected,
-                "case {case}: expected {name} mailed at {expected:?}, got {mailboxes:?}"
+                mailboxes,
+                &json!([]),
+                "case {case}: no validation email has been sent for {name}, got {validation}"
             );
         }
     };
