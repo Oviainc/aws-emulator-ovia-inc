@@ -49,6 +49,10 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 pub(crate) const REGION: &str = "us-east-1";
 
 /// One HTTP answer, reduced to what a client branches on.
+///
+/// This harness (the type, [`emulator`], [`call`] and the per-operation senders below) is
+/// `pub(crate)` so the crate's other suites in `tests/all/` drive the emulator exactly the
+/// same way instead of standing up a second copy of it.
 #[derive(Debug)]
 pub(crate) struct Answer {
     pub(crate) status: u16,

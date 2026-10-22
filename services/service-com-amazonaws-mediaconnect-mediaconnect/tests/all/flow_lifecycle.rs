@@ -695,10 +695,10 @@ struct RefusalCase {
     code: &'static str,
 }
 
-/// Every flow operation refuses an unknown flow with `NotFoundException` (404) and a
-/// malformed ARN with `BadRequestException` (400) — never with a 501 and never with a
-/// success. CreateFlow refuses a request that breaks a rule of the class with
-/// `BadRequestException`.
+/// Every flow operation refuses an unknown flow with `NotFoundException` (404) — whether
+/// the label is an ARN this service could have minted or not an ARN at all, because the
+/// label is an identifier the store resolves. CreateFlow refuses a request that breaks a
+/// rule of the class with `BadRequestException` (400). Never a 501 and never a success.
 #[tokio::test]
 async fn refusals_name_the_modelled_error() {
     let emulator = Emulator::new();
@@ -712,7 +712,7 @@ async fn refusals_name_the_modelled_error() {
 
     // Well-formed per the modelled pattern, but no such flow.
     let missing = "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-deadbeef:missing";
-    // Fails the modelled `FlowArn` pattern.
+    // Not an ARN at all: it names no flow either, so it resolves to no flow.
     let malformed = "not-an-arn";
 
     let cases = vec![
@@ -749,20 +749,20 @@ async fn refusals_name_the_modelled_error() {
             code: "NotFoundException",
         },
         RefusalCase {
-            case: "describe an ARN that fails the modelled pattern",
+            case: "describe a label that is not an ARN",
             method: "GET",
             uri: format!("/v1/flows/{malformed}"),
             body: None,
-            status: 400,
-            code: "BadRequestException",
+            status: 404,
+            code: "NotFoundException",
         },
         RefusalCase {
-            case: "delete an ARN that fails the modelled pattern",
+            case: "delete a label that is not an ARN",
             method: "DELETE",
             uri: format!("/v1/flows/{malformed}"),
             body: None,
-            status: 400,
-            code: "BadRequestException",
+            status: 404,
+            code: "NotFoundException",
         },
         RefusalCase {
             case: "create a flow with no source",

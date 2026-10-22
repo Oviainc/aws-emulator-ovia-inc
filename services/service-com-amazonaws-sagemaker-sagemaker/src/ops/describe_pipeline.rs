@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is the reporting half of `CreatePipeline` — it replays the
+//! pipeline `crate::state` holds under the requested name or ARN, and refuses one it
+//! does not hold with the modelled `ResourceNotFound`. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +161,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePipeline"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `DescribePipeline` takes either form of `PipelineNameOrArn`, and both denote
+        // the same pipeline; the store is keyed by name, so the shared reducer resolves
+        // the ARN form the way every other `ArnOrName` reader in this service does.
+        let name = crate::state::name_from_arn_or_name(&input.pipeline_name);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The one write a report may make: a deletion the clock already owed is
+        // materialised, so a pipeline past its removal instant is reported as gone
+        // whether or not anybody polled in between.
+        store.settle_pipeline_deletions(now);
+
+        let Some(pipeline) = store.pipelines.get(name) else {
+            // Never a 200 with empty fields: a caller cannot tell that from a pipeline
+            // that exists and carries nothing.
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "pipeline",
+                name,
+            );
+            return Err(DescribePipelineErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Pipeline {arn} does not exist.")),
+            })
+            .into());
+        };
+        // A pipeline created here carries exactly one version, the one creating it
+        // minted; no other version id names anything this account holds.
+        if let Some(version) = input
+            .pipeline_version_id
+            .filter(|version| *version != crate::state::PIPELINE_INITIAL_VERSION)
+        {
+            return Err(DescribePipelineErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Pipeline {} does not have a version with id {version}.",
+                    pipeline.arn
+                )),
+            })
+            .into());
+        }
+
+        Ok(DescribePipelineOutput {
+            pipeline_arn: Some(pipeline.arn.clone()),
+            pipeline_name: Some(pipeline.name.clone()),
+            pipeline_display_name: pipeline.display_name.clone(),
+            pipeline_definition: Some(pipeline.definition.clone()),
+            pipeline_description: pipeline.description.clone(),
+            role_arn: Some(pipeline.role_arn.clone()),
+            pipeline_status: Some(pipeline.status.clone()),
+            creation_time: Some(crate::state::timestamp(pipeline.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(pipeline.last_modified_time)),
+            last_run_time: pipeline.last_run_time.map(crate::state::timestamp),
+            // SageMaker fills these from the Studio user context of the calling
+            // identity, which this emulator does not model; absent is what it reports
+            // for a pipeline created outside Studio.
+            created_by: None,
+            last_modified_by: None,
+            parallelism_configuration: pipeline.parallelism_configuration.clone(),
+            // Set by the pipeline-version operations, none of which runs yet.
+            pipeline_version_display_name: None,
+            pipeline_version_description: None,
+        })
     }
 }
