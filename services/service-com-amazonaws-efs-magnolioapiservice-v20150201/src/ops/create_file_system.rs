@@ -500,6 +500,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             size_measured_at: now,
             tags,
             mount_target_ids: Vec::new(),
+            // "Replication overwrite protection is ENABLED by default."
+            replication_overwrite_protection: efs::PROTECTION_ENABLED.to_string(),
             // A new file system carries no LifecycleConfiguration until
             // PutLifecycleConfiguration stores one.
             lifecycle_policies: Vec::new(),
