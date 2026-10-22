@@ -177,7 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
             return Err(CreateRepositoryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Domain {} not found.", input.domain),
+                    message: crate::state::domain_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
+                    ),
                     resource_id: Some(input.domain.clone()),
                     resource_type: Some("domain".to_string()),
                 },
@@ -188,9 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if domain.repositories.contains_key(&input.repository) {
             return Err(CreateRepositoryErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "Repository {} already exists in domain {}.",
-                        input.repository, input.domain
+                    message: crate::state::repository_already_exists_message(
+                        &input.domain,
+                        &domain.owner,
+                        &input.repository,
                     ),
                     resource_id: Some(input.repository.clone()),
                     resource_type: Some("repository".to_string()),
@@ -246,9 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !domain.repositories.contains_key(&upstream.repository_name) {
                 return Err(CreateRepositoryErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Upstream repository {} not found in domain {}.",
-                            upstream.repository_name, input.domain
+                        message: crate::state::repository_not_found_message(
+                            &input.domain,
+                            input.domain_owner.as_deref(),
+                            &upstream.repository_name,
                         ),
                         resource_id: Some(upstream.repository_name.clone()),
                         resource_type: Some("repository".to_string()),

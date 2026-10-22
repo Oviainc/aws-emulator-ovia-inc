@@ -37,3 +37,5 @@ mod state_roundtrip;
 // readability convention, and the sorted list above is intact.
 #[path = "all/external_connection_disassociation.rs"]
 mod external_connection_disassociation;
+#[path = "all/error_message_composition.rs"]
+mod error_message_composition;

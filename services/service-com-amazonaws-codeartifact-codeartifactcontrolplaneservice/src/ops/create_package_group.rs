@@ -198,13 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
             return Err(CreatePackageGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Domain not found. Domain '{}' owned by account '{}' does not exist.",
-                        input.domain,
-                        input
-                            .domain_owner
-                            .as_deref()
-                            .unwrap_or(::engine::emulator_account_id())
+                    message: crate::state::domain_not_found_message(
+                        &input.domain,
+                        input.domain_owner.as_deref(),
                     ),
                     resource_id: Some(input.domain.clone()),
                     resource_type: Some("domain".to_string()),
@@ -222,9 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if domain.package_groups.contains_key(&pattern) {
             return Err(CreatePackageGroupErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "Package group '{pattern}' in domain '{}' owned by '{}' already exists.",
-                        domain.name, domain.owner
+                    message: crate::state::package_group_already_exists_message(
+                        &domain.name,
+                        &domain.owner,
+                        &pattern,
                     ),
                     resource_id: Some(pattern.clone()),
                     resource_type: None,

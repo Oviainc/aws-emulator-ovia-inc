@@ -1140,6 +1140,106 @@ pub fn repository_arn(region: &str, domain: &str, repository: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Refusal messages
+//
+// A CodeArtifact refusal that names a resource IDENTIFIES it: the resource kind, its
+// name quoted, the parent domain when the resource is nested in one, and the 12-digit
+// account that owns the domain. The account is the point — CodeArtifact domains are
+// shared across accounts through `domainOwner`, so a caller has to be able to tell
+// "missing in my account" from "missing in the owner's account" from the message alone.
+//
+// They live here, beside the store the handlers resolve against, so every operation that
+// refuses the same way words it the same way: without this, each handler spells its own
+// sentence and the implemented ones drift from each other.
+// ---------------------------------------------------------------------------
+
+/// The account a request addressed a domain to: the `domainOwner` it pinned the domain
+/// to, or — when the request named none — the account this emulator serves, which owns
+/// every domain it holds.
+///
+/// This is the account a refusal reports, including a refusal for a domain that is NOT
+/// held: it is the account the caller asked about, which is what makes a cross-account
+/// miss distinguishable from a miss in the caller's own account.
+pub fn addressed_domain_owner(domain_owner: Option<&str>) -> &str {
+    match domain_owner {
+        Some(owner) => owner,
+        None => ::engine::emulator_account_id(),
+    }
+}
+
+/// The `ResourceNotFoundException` message for a domain the store does not hold for this
+/// caller.
+pub fn domain_not_found_message(domain: &str, domain_owner: Option<&str>) -> String {
+    format!(
+        "Domain not found. Domain '{domain}' owned by account '{}' does not exist.",
+        addressed_domain_owner(domain_owner)
+    )
+}
+
+/// The `ResourceNotFoundException` message for a repository the addressed domain does not
+/// hold — whether the caller named it directly or as another repository's upstream.
+pub fn repository_not_found_message(
+    domain: &str,
+    domain_owner: Option<&str>,
+    repository: &str,
+) -> String {
+    format!(
+        "Repository not found. Repository '{repository}' in domain '{domain}' owned by \
+         account '{}' does not exist.",
+        addressed_domain_owner(domain_owner)
+    )
+}
+
+/// The `ConflictException` message for a create whose domain name is already held.
+///
+/// `owner` is the account that owns the COLLIDING domain — read off the stored record,
+/// not off the request, because that is the fact the caller cannot otherwise see.
+pub fn domain_already_exists_message(domain: &str, owner: &str) -> String {
+    format!("Domain '{domain}' owned by '{owner}' already exists.")
+}
+
+/// The `ConflictException` message for a create whose repository name is already held in
+/// the addressed domain.
+pub fn repository_already_exists_message(domain: &str, owner: &str, repository: &str) -> String {
+    format!(
+        "Repository '{repository}' in domain '{domain}' owned by '{owner}' already exists."
+    )
+}
+
+/// The `ConflictException` message for `DeleteDomain` on a domain that still holds
+/// repositories.
+///
+/// This refusal states the PRECONDITION and interpolates nothing: it is the same sentence
+/// whatever domain was addressed and however many repositories remain, so it reports no
+/// count of a domain the caller may not be able to list.
+pub const DOMAIN_NOT_EMPTY_MESSAGE: &str = "Domain must contain 0 repositories before deletion";
+
+/// The `ResourceNotFoundException` message for a package group the addressed domain does
+/// not hold. Same composition as the two above, for the third resource kind a domain
+/// contains: the pattern is the group's identifier, so it is what the sentence quotes.
+pub fn package_group_not_found_message(
+    domain: &str,
+    domain_owner: Option<&str>,
+    package_group: &str,
+) -> String {
+    format!(
+        "Package group not found. Package group '{package_group}' in domain '{domain}' \
+         owned by account '{}' does not exist.",
+        addressed_domain_owner(domain_owner)
+    )
+}
+
+/// The `ConflictException` message for a create whose package-group pattern is already
+/// held in the addressed domain.
+pub fn package_group_already_exists_message(
+    domain: &str,
+    owner: &str,
+    package_group: &str,
+) -> String {
+    format!("Package group '{package_group}' in domain '{domain}' owned by '{owner}' already exists.")
+}
+
 /// The ARN of a package group:
 /// `arn:aws:codeartifact:<region>:<owner>:package-group/<domain><pattern>`.
 ///
