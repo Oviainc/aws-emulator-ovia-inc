@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRuleGroupsNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRuleGroupsNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists a new rule groups namespace under its workspace and answers
+//! from the PERSISTED record. The namespace starts in `CREATING` and the clock owes its
+//! move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken` makes the call
+//! idempotent, and a name the workspace already holds is refused with
+//! `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRuleGroupsNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +172,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRuleGroupsNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleGroupsNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRuleGroupsNamespace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateRuleGroupsNamespaceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
+        // its own tag keys, so it holds for the tags a namespace is created with too.
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys()))
+        {
+            return Err(CreateRuleGroupsNamespaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX,
+                    ),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "tags".to_string(),
+                        message: format!(
+                            "keys must not begin with {}",
+                            crate::state::RESERVED_TAG_KEY_PREFIX
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The namespace is created "within a workspace", so without that workspace
+        // there is nothing to create it in: `ResourceNotFoundException` (404).
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(
+                CreateRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Workspace not found: {}", input.workspace_id),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `clientToken` carries `@idempotencyToken`: replaying a token that already
+        // created a namespace in this workspace answers with THAT namespace instead of
+        // creating a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = workspace
+                .rule_groups_namespaces
+                .values()
+                .find(|namespace| namespace.create_token.as_deref() == Some(token))
+            {
+                return Ok(response_for(existing));
+            }
+        }
+
+        // `RuleGroupsNamespaceStatusCode` documents the rule the service follows: a
+        // namespace changes only "until namespace is ACTIVE and workspace status is
+        // ACTIVE", and `WorkspaceStatusCode$ACTIVE` is the status at which a workspace
+        // "has been created and is usable". Adding a namespace to a workspace that is
+        // still being created, or being deleted, would leave an inconsistent state —
+        // `ConflictException` (409).
+        if workspace.status_code != crate::state::STATUS_ACTIVE {
+            return Err(CreateRuleGroupsNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Workspace {} is {}; a rule groups namespace can be created only when the workspace status is {}",
+                        workspace.workspace_id,
+                        workspace.status_code,
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    resource_id: workspace.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // "Use this operation only to create new rule groups namespaces. To update an
+        // existing rule groups namespace, use PutRuleGroupsNamespace." — so a name the
+        // workspace already holds is a conflict, never a second namespace and never a
+        // silent overwrite of the rules file it holds.
+        if let Some(existing) = workspace.rule_groups_namespaces.get(&input.name) {
+            return Err(CreateRuleGroupsNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Rule groups namespace {} already exists in workspace {}; use PutRuleGroupsNamespace to update it",
+                        existing.name, workspace.workspace_id,
+                    ),
+                    resource_id: existing.arn.clone(),
+                    resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The store is BOUNDED: past its quota a create is refused rather than adding
+        // another record. `ServiceQuotaExceededException` is the modelled refusal for
+        // exactly this.
+        if workspace.rule_groups_namespaces.len()
+            >= crate::state::RULE_GROUPS_NAMESPACES_PER_WORKSPACE
+        {
+            return Err(
+                CreateRuleGroupsNamespaceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "workspace {} already holds the maximum of {} rule groups namespaces",
+                            workspace.workspace_id,
+                            crate::state::RULE_GROUPS_NAMESPACES_PER_WORKSPACE,
+                        ),
+                        // The bound is per workspace, so the workspace is the resource
+                        // that reached it.
+                        resource_id: workspace.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                        service_code: ctx.identity().signing_name().to_string(),
+                        // Named for what it bounds: a real quota code is an identifier
+                        // Service Quotas issues, which this emulator does not model and
+                        // so must not invent one of.
+                        quota_code: "RuleGroupsNamespacesPerWorkspace".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let namespace = crate::state::RuleGroupsNamespace {
+            arn: crate::state::rule_groups_namespace_arn(
+                &region,
+                &workspace.workspace_id,
+                &input.name,
+            ),
+            name: input.name.clone(),
+            // `RuleGroupsNamespaceData` is a blob: the rules file is stored byte for
+            // byte, so a reader gets back exactly what was written.
+            data: input.data,
+            // `CREATING` — "Namespace is being created" — and the clock owes the move to
+            // ACTIVE at `transition_due`.
+            status_code: crate::state::NAMESPACE_STATUS_CREATING.to_string(),
+            // "The reason for the failure, if any": nothing has failed.
+            status_reason: None,
+            created_at: now,
+            modified_at: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            create_token: input.client_token,
+        };
+
+        let response = response_for(&namespace);
+        workspace.rule_groups_namespaces.insert(input.name, namespace);
+        Ok(response)
+    }
+}
+
+/// The response for a stored namespace.
+///
+/// Every member is read back off the persisted record — so `tags` and `status` report
+/// what the namespace HOLDS, not what the request carried.
+fn response_for(namespace: &crate::state::RuleGroupsNamespace) -> CreateRuleGroupsNamespaceOutput {
+    CreateRuleGroupsNamespaceOutput {
+        name: namespace.name.clone(),
+        arn: namespace.arn.clone(),
+        status: RuleGroupsNamespaceStatus {
+            status_code: namespace.status_code.clone(),
+            status_reason: namespace.status_reason.clone(),
+        },
+        tags: crate::state::tag_map(&namespace.tags),
     }
 }
