@@ -54,8 +54,9 @@ pub const STATUS_ACTIVE: &str = "Active";
 /// lists straight after enrolling still observes the pre-analysis state.
 const RECOMMENDATION_GENERATION_DELAY: Duration = Duration::from_millis(500);
 
-/// Currency every figure in the catalog is denominated in.
-const CURRENCY_CODE: &str = "USD";
+/// Currency every figure in the catalog is denominated in. Public because a
+/// reader that summarises an empty set still reports the unit its zero is in.
+pub const CURRENCY_CODE: &str = "USD";
 
 /// An account's enrollment in Cost Optimization Hub.
 #[derive(Debug, Clone)]
@@ -421,6 +422,21 @@ impl StoredRecommendation {
         })
     }
 
+    /// The group label this recommendation falls under for one grouping
+    /// dimension: that dimension's value as text, because
+    /// `RecommendationSummary.group` is a string whatever type the member it
+    /// names carries (`smithy_query query="shape" shape="RecommendationSummary"`).
+    pub fn group_label(&self, dimension: Dimension) -> String {
+        match dimension {
+            Dimension::RestartNeeded => self.restart_needed.to_string(),
+            Dimension::RollbackPossible => self.rollback_possible.to_string(),
+            other => match self.dimension_key(other) {
+                SortKey::Text(text) => text,
+                SortKey::Number(number) => number.to_string(),
+            },
+        }
+    }
+
     /// The value of one `OrderBy` dimension, as a sort key.
     pub fn dimension_key(&self, dimension: Dimension) -> SortKey {
         match dimension {
@@ -556,6 +572,74 @@ impl Dimension {
         };
         Some(OrderDimension::Plain(plain))
     }
+}
+
+/// The dimensions a recommendation summary can be grouped by: the CATEGORICAL
+/// recommendation dimensions, whose values form a set a caller can be shown one
+/// total per.
+///
+/// The per-resource identifiers (`recommendationId`, `resourceId`,
+/// `resourceArn`) are not here — `ListRecommendationSummaries` documents those
+/// three as unsupported for this API, and one group per resource is no summary —
+/// and neither are the continuous members (the money figures, the lookback
+/// period and the refresh timestamp), which carry a quantity rather than a
+/// category.
+pub const GROUP_DIMENSIONS: &[Dimension] = &[
+    Dimension::AccountId,
+    Dimension::Region,
+    Dimension::CurrentResourceType,
+    Dimension::RecommendedResourceType,
+    Dimension::ActionType,
+    Dimension::ImplementationEffort,
+    Dimension::Source,
+    Dimension::CurrencyCode,
+    Dimension::RestartNeeded,
+    Dimension::RollbackPossible,
+];
+
+/// Resolve a `groupBy` value, or `None` when it names no dimension a summary can
+/// be grouped by.
+///
+/// The dimension is named as the model names the `Recommendation` member
+/// (case-insensitively, as `orderBy` is), plus `ResourceType`: the name
+/// `Filter.resourceTypes` gives the type the resource has today, which is the
+/// type the recommendation is about.
+pub fn parse_group_dimension(group_by: &str) -> Option<Dimension> {
+    if group_by.trim().eq_ignore_ascii_case("ResourceType") {
+        return Some(Dimension::CurrentResourceType);
+    }
+    match Dimension::parse(group_by)? {
+        OrderDimension::Plain(dimension) if GROUP_DIMENSIONS.contains(&dimension) => Some(dimension),
+        _ => None,
+    }
+}
+
+/// Keep one recommendation per resource: the one that saves the most under
+/// `mode`, because that is the recommendation for the resource. Ties keep the
+/// catalog's order, so the choice is stable across calls.
+///
+/// This is the de-duplication both recommendation views need: the list view
+/// serves it when `includeAllRecommendations` is false, and the summary view
+/// totals it into `estimatedTotalDedupedSavings`.
+pub fn dedupe_by_resource(
+    rows: &[StoredRecommendation],
+    mode: Option<&str>,
+) -> Vec<StoredRecommendation> {
+    let mut best: Vec<StoredRecommendation> = Vec::with_capacity(rows.len());
+    for row in rows {
+        match best
+            .iter()
+            .position(|kept| kept.resource_id == row.resource_id)
+        {
+            None => best.push(row.clone()),
+            Some(index) => {
+                if row.monthly_savings(mode) > best[index].monthly_savings(mode) {
+                    best[index] = row.clone();
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Whether `value` is in `allowed`, treating an absent list as "not filtered".

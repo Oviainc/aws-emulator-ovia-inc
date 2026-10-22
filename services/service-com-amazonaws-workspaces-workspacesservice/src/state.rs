@@ -70,24 +70,58 @@ pub const USER_DECOUPLED_USER_NAME: &str = "[UNDEFINED]";
 /// without one cannot be served a larger page either.
 pub const DEFAULT_DESCRIBE_PAGE_SIZE: usize = 25;
 
-/// Per-item error code for a WorkSpace id that names no stored WorkSpace.
+// Per-item `ErrorCode` values: the per-item failure vocabulary.
+//
+// The batch operations (`CreateWorkspaces`, `StartWorkspaces`,
+// `StopWorkspaces`, `TerminateWorkspaces`, and the reboot/rebuild/restore
+// family once implemented) report a per-request failure INSIDE a 200 response,
+// in `FailedCreateWorkspaceRequest$ErrorCode` / `FailedWorkspaceChangeRequest$ErrorCode`.
+// Both members target `com.amazonaws.workspaces#ErrorType`, a free-form string
+// with no enum: a per-item code, NOT the name of a modelled exception shape.
+// An exception shape name can only travel as a top-level error (and these
+// operations model no errors at all), so putting one in a per-item `ErrorCode`
+// names nothing a client can branch on.
+//
+// The vocabulary AWS answers with is the dotted `<Condition>[.<Resource>]`
+// form: the condition, spelled as the matching exception shape is but without
+// its `Exception` suffix, qualified with the resource the item is about when
+// the item names one, and left unqualified when the failure is about the
+// request's own members or an account-wide quota. `ResourceNotFound.Workspace`
+// (an unknown `WorkspaceId`), `ResourceNotFound.Directory` and
+// `ResourceNotFound.Bundle` are recorded values; the rest follow the same form.
+//
+// This is ONE vocabulary for the whole service: the codes below are shared by
+// every batch operation that can report a given condition, so two operations
+// cannot report one condition two ways.
+
+/// Per-item `ErrorType` code for a WorkSpace id that names no stored WorkSpace.
 ///
-/// The batch operations report per-item failures inside a 200 response, so the
-/// code is a string rather than a modelled error. These four spell one of THIS
-/// service's own modelled error SHAPE names, and are what `StartWorkspaces`,
-/// `StopWorkspaces`, `TerminateWorkspaces` and the bundle store still report
-/// (that those three should report the dotted `ErrorType` vocabulary instead is
-/// its own open issue); the `ERROR_CODE_*` constants below them are the
-/// `ErrorType` codes `CreateWorkspaces` reports.
-pub const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
-/// Per-item error code for a WorkSpace whose current state forbids the change.
-pub const ERROR_CODE_INVALID_STATE: &str = "InvalidResourceStateException";
-/// Per-item error code for a create request that collides with a stored resource.
-pub const ERROR_CODE_ALREADY_EXISTS: &str = "ResourceAlreadyExistsException";
-/// Per-item error code for a create request whose member combination is invalid.
-pub const ERROR_CODE_INVALID_PARAMETERS: &str = "InvalidParameterValuesException";
-/// Per-item error code for a create request the store has no room for.
-pub const ERROR_CODE_LIMIT_EXCEEDED: &str = "ResourceLimitExceededException";
+/// The recorded value: `StartWorkspaces`, `StopWorkspaces` and
+/// `TerminateWorkspaces` all answer an unknown `WorkspaceId` with this code and
+/// the fixed message [`MESSAGE_WORKSPACE_NOT_FOUND`].
+pub const ERROR_CODE_WORKSPACE_NOT_FOUND: &str = "ResourceNotFound.Workspace";
+/// Per-item `ErrorType` code for a WorkSpace whose current state forbids the
+/// change. Follows the same form as the recorded code above; AWS publishes no
+/// spelling for it.
+pub const ERROR_CODE_WORKSPACE_INVALID_STATE: &str = "InvalidResourceState.Workspace";
+
+/// The per-item `ErrorMessage` paired with [`ERROR_CODE_WORKSPACE_NOT_FOUND`].
+///
+/// A FIXED sentence rather than one built from the request: AWS answers the same
+/// text for every unknown `WorkspaceId`, and the recorded responses carry this
+/// message beside an id that appears nowhere in it.
+pub const MESSAGE_WORKSPACE_NOT_FOUND: &str = "The specified WorkSpace could not be found.";
+
+/// The name of the modelled error shape a bundle-name collision is reported
+/// with, for a handler to lift into that TOP-LEVEL error.
+///
+/// Distinct from the per-item codes here: the bundle operations model their
+/// errors, so a refusal there travels as an exception, not inside a 200 body,
+/// and an exception shape name is the correct wire value for it.
+pub const MODELED_ERROR_ALREADY_EXISTS: &str = "ResourceAlreadyExistsException";
+/// The name of the modelled error shape an exceeded bundle bound is reported
+/// with. See [`MODELED_ERROR_ALREADY_EXISTS`].
+pub const MODELED_ERROR_LIMIT_EXCEEDED: &str = "ResourceLimitExceededException";
 
 /// Per-item `ErrorType` code for a create request naming a directory that is not
 /// registered with WorkSpaces.
@@ -108,11 +142,13 @@ pub const ERROR_CODE_BUNDLE_NOT_FOUND: &str = "ResourceNotFound.Bundle";
 /// Per-item `ErrorType` code for a create request whose directory user already
 /// holds a WorkSpace.
 pub const ERROR_CODE_WORKSPACE_EXISTS: &str = "ResourceExists.WorkspaceUser";
-/// Per-item `ErrorType` code for a create request whose member combination is
-/// invalid. No resource is missing, so the code names no resource.
-pub const ERROR_CODE_CREATE_INVALID_PARAMETERS: &str = "InvalidParameterValues";
-/// Per-item `ErrorType` code for a create request the store has no room for.
-pub const ERROR_CODE_CREATE_LIMIT_EXCEEDED: &str = "ResourceLimitExceeded";
+/// Per-item `ErrorType` code for a request whose member combination is invalid.
+/// No resource is missing, so the code names no resource. Shared by the create
+/// and the change operations (a change item that names no `WorkspaceId`).
+pub const ERROR_CODE_INVALID_PARAMETERS: &str = "InvalidParameterValues";
+/// Per-item `ErrorType` code for a request the store has no room for. About an
+/// account-wide quota, so it names no resource.
+pub const ERROR_CODE_LIMIT_EXCEEDED: &str = "ResourceLimitExceeded";
 
 /// The `ErrorMessage` reported beside [`ERROR_CODE_DIRECTORY_NOT_FOUND`].
 ///
@@ -148,8 +184,9 @@ pub const MAX_STORED_WORKSPACES: usize = 2_000;
 /// A per-item batch failure: the wire `ErrorCode` and `ErrorMessage` a
 /// `FailedCreateWorkspaceRequest` / `FailedWorkspaceChangeRequest` carries.
 ///
-/// Also the (code, message) pair the bundle store reports a refusal with, so a
-/// handler can lift it into the modelled error that code names.
+/// Also the (code, message) pair the bundle store reports a refusal with, where
+/// the code is a `MODELED_ERROR_*` shape name so a handler can lift it into the
+/// top-level error that code names.
 pub type ItemFailure = (&'static str, String);
 
 /// The `ENABLED` value of the model's `DedicatedTenancySupportResultEnum`
@@ -1235,7 +1272,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     ) -> Result<WorkspaceRecord, ItemFailure> {
         if request.user_name == USER_DECOUPLED_USER_NAME && request.workspace_name.is_none() {
             return Err((
-                ERROR_CODE_CREATE_INVALID_PARAMETERS,
+                ERROR_CODE_INVALID_PARAMETERS,
                 format!(
                     "WorkspaceName is required when UserName is {USER_DECOUPLED_USER_NAME}."
                 ),
@@ -1290,7 +1327,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         // The store is bounded: refuse rather than grow without end.
         if self.workspaces.len() >= MAX_STORED_WORKSPACES {
             return Err((
-                ERROR_CODE_CREATE_LIMIT_EXCEEDED,
+                ERROR_CODE_LIMIT_EXCEEDED,
                 format!(
                     "Your resource limits have been exceeded: at most {MAX_STORED_WORKSPACES} WorkSpaces can exist."
                 ),
@@ -1389,7 +1426,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     fn record_mut(&mut self, workspace_id: &str) -> Result<&mut WorkspaceRecord, ItemFailure> {
         self.workspaces
             .get_mut(workspace_id)
-            .ok_or_else(|| not_found(workspace_id))
+            .ok_or_else(not_found)
     }
 
     /// The next creation sequence number.
@@ -1763,7 +1800,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
             .find(|record| record.owner == account && record.name == request.name)
         {
             return Err((
-                ERROR_CODE_ALREADY_EXISTS,
+                MODELED_ERROR_ALREADY_EXISTS,
                 format!(
                     "Bundle {} already exists with the name {}.",
                     existing.bundle_id, existing.name
@@ -1772,7 +1809,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         }
         if self.bundles.len() >= MAX_STORED_BUNDLES {
             return Err((
-                ERROR_CODE_LIMIT_EXCEEDED,
+                MODELED_ERROR_LIMIT_EXCEEDED,
                 format!(
                     "Your resource limits have been exceeded: at most {MAX_STORED_BUNDLES} bundles can exist."
                 ),
@@ -1861,10 +1898,14 @@ pub struct NewBundle {
 }
 
 /// The per-item failure for a WorkSpace id that names no stored WorkSpace.
-fn not_found(workspace_id: &str) -> ItemFailure {
+///
+/// The message is the service's FIXED sentence ([`MESSAGE_WORKSPACE_NOT_FOUND`]) and
+/// so names no id: which id was asked about is already reported in the failure's
+/// own `WorkspaceId` member.
+fn not_found() -> ItemFailure {
     (
-        ERROR_CODE_NOT_FOUND,
-        format!("The WorkSpace {workspace_id} could not be found."),
+        ERROR_CODE_WORKSPACE_NOT_FOUND,
+        MESSAGE_WORKSPACE_NOT_FOUND.to_string(),
     )
 }
 
@@ -1875,7 +1916,7 @@ fn invalid_state(
     action: &str,
 ) -> ItemFailure {
     (
-        ERROR_CODE_INVALID_STATE,
+        ERROR_CODE_WORKSPACE_INVALID_STATE,
         format!(
             "The WorkSpace {workspace_id} is in state {} and cannot be {action}.",
             state.as_wire()

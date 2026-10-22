@@ -15,6 +15,8 @@
 mod describe_standards;
 #[path = "all/enabled_standards.rs"]
 mod enabled_standards;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/security_hub_core_loop.rs"]
 mod security_hub_core_loop;
 #[path = "all/state_roundtrip.rs"]

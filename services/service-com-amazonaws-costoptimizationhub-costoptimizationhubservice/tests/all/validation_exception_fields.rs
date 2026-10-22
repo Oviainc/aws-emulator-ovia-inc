@@ -294,9 +294,9 @@ async fn a_constraint_refusal_names_every_member_and_its_constraint() {
             ],
         ),
         (
-            // Validation precedes the handler, so an operation this slice still
-            // answers 501 for refuses a bad request the same way.
-            "length on a scaffolded operation's member",
+            // The length of a list member, on an operation whose handler reads
+            // the member: the refusal is the model's, raised before the handler.
+            "length on a list member of an implemented operation",
             "ListRecommendationSummaries",
             json!({"groupBy": "ActionType", "metrics": []}),
             vec![entry(
@@ -379,7 +379,25 @@ async fn a_handler_raised_refusal_names_its_member_too() {
     let router = router();
 
     // (case, operation, request, the member the refusal is attributed to)
-    let cases: [(&str, &str, Value, &str); 3] = [
+    let cases: [(&str, &str, Value, &str); 6] = [
+        (
+            "a groupBy that names no dimension",
+            "ListRecommendationSummaries",
+            json!({"groupBy": "NotADimension"}),
+            "groupBy",
+        ),
+        (
+            "a groupBy naming a per-resource identifier",
+            "ListRecommendationSummaries",
+            json!({"groupBy": "ResourceId"}),
+            "groupBy",
+        ),
+        (
+            "a filter this operation does not support",
+            "ListRecommendationSummaries",
+            json!({"groupBy": "ResourceType", "filter": {"resourceIds": ["i-0a1b2c3d4e5f60001"]}}),
+            "filter.resourceIds",
+        ),
         (
             "a nextToken this service never issued",
             "ListEnrollmentStatuses",
@@ -466,9 +484,18 @@ async fn every_request_inside_its_constraints_is_served() {
         ),
         (
             "a valid request to a scaffolded operation".to_string(),
+            "ListEfficiencyMetrics",
+            json!({
+                "granularity": "Monthly",
+                "timePeriod": {"start": "2026-01-01", "end": "2026-02-01"},
+            }),
+            501,
+        ),
+        (
+            "a valid request to an implemented list operation".to_string(),
             "ListRecommendationSummaries",
             json!({"groupBy": "ActionType", "metrics": ["SavingsPercentage"]}),
-            501,
+            200,
         ),
     ];
     // Every value the model's `EnrollmentStatus` enum holds is accepted, so the

@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mode = mode.as_deref();
 
         if !input.include_all_recommendations {
-            rows = dedupe_by_resource(rows, mode);
+            rows = crate::state::dedupe_by_resource(&rows, mode);
         }
 
         if let Some((dimension, descending)) = order {
@@ -226,30 +226,6 @@ const PAGE_KIND: &str = "recommendations";
 /// order a dimension's values take on their own, and is what an absent `order`
 /// leaves them in.
 const ORDER_DESC: &str = "Desc";
-
-/// Keep one recommendation per resource: the one that saves the most, because
-/// that is the recommendation for the resource. Ties keep the catalog's order,
-/// so the choice is stable across calls.
-fn dedupe_by_resource(
-    rows: Vec<crate::state::StoredRecommendation>,
-    mode: Option<&str>,
-) -> Vec<crate::state::StoredRecommendation> {
-    let mut best: Vec<crate::state::StoredRecommendation> = Vec::with_capacity(rows.len());
-    for row in rows {
-        match best
-            .iter()
-            .position(|kept| kept.resource_id == row.resource_id)
-        {
-            None => best.push(row),
-            Some(index) => {
-                if row.monthly_savings(mode) > best[index].monthly_savings(mode) {
-                    best[index] = row;
-                }
-            }
-        }
-    }
-    best
-}
 
 /// Order the rows by one `orderBy` dimension.
 fn sort_rows(

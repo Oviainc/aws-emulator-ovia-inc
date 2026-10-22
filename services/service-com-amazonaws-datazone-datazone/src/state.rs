@@ -38,6 +38,10 @@ pub const PROJECT_STATUS_ACTIVE: &str = "ACTIVE";
 /// `com.amazonaws.datazone#DomainVersion`: V1 | V2).
 pub const DEFAULT_DOMAIN_VERSION: &str = "V1";
 
+/// The `Revision` (`com.amazonaws.datazone#Revision`, len 1..64) a freshly created
+/// revisioned resource carries: DataZone numbers revisions from 1, as a decimal string.
+pub const FIRST_REVISION: &str = "1";
+
 /// Milliseconds since the Unix epoch, now.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -76,6 +80,11 @@ pub struct Domain {
     /// The projects stored in this domain, so they go with it when it is deleted.
     /// Bounded by [`MAX_PROJECTS_PER_DOMAIN`].
     pub projects: BTreeMap<String, Project>,
+    /// The custom asset types stored in this domain, keyed by the type's NAME — the
+    /// `AssetTypeIdentifier` `GetAssetType`/`DeleteAssetType` address a type by — so a
+    /// name is unique within the domain and the types go with it when it is deleted.
+    /// Bounded by [`MAX_ASSET_TYPES_PER_DOMAIN`].
+    pub asset_types: BTreeMap<String, AssetType>,
 }
 
 /// The stored form of the modelled `SingleSignOn` structure.
@@ -106,6 +115,39 @@ pub struct Project {
     pub project_category: Option<String>,
 }
 
+/// One stored DataZone asset type, at one revision.
+///
+/// An asset type is a named, revisioned schema: the metadata forms an asset of that
+/// type carries. `CreateAssetType` mints revision [`FIRST_REVISION`] and the model
+/// declares no update operation for it, so a stored type keeps the revision it was
+/// created at.
+#[derive(Debug, Clone)]
+pub struct AssetType {
+    pub name: String,
+    pub domain_id: String,
+    pub revision: String,
+    pub description: Option<String>,
+    /// The metadata forms attached to the type, keyed by form name. A `BTreeMap` so the
+    /// forms are reported in one stable order whatever order the request listed them in;
+    /// the modelled `FormsOutputMap` is bounded at 10 entries, which the request-level
+    /// constraint on `formsInput` already enforces.
+    pub forms: BTreeMap<String, AssetTypeForm>,
+    pub owning_project_id: String,
+    pub created_at_ms: i64,
+    pub created_by: String,
+    pub updated_at_ms: i64,
+    pub updated_by: String,
+}
+
+/// One metadata form attached to an asset type: the stored form of the modelled
+/// `FormEntryOutput` (`typeName`, `typeRevision`, `required`).
+#[derive(Debug, Clone)]
+pub struct AssetTypeForm {
+    pub type_name: String,
+    pub type_revision: String,
+    pub required: Option<bool>,
+}
+
 /// The most domains this emulator stores.
 ///
 /// A ceiling, not a guess at AWS's published quota: it exists so a create loop cannot
@@ -117,6 +159,10 @@ pub const MAX_DOMAINS: usize = 100;
 /// The most projects this emulator stores in one domain, for the same reason and with
 /// the same refusal (`CreateProject` models `ServiceQuotaExceededException` too).
 pub const MAX_PROJECTS_PER_DOMAIN: usize = 500;
+
+/// The most asset types this emulator stores in one domain, for the same reason and
+/// with the same refusal (`CreateAssetType` models `ServiceQuotaExceededException` too).
+pub const MAX_ASSET_TYPES_PER_DOMAIN: usize = 500;
 
 /// The hard ceiling on remembered `@idempotencyToken`s.
 ///

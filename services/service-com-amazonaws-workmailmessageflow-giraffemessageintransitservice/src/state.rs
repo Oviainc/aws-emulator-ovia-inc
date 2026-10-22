@@ -21,6 +21,20 @@ use crate::ops::types::S3Reference;
 /// credential scope does not name one (an unsigned or anonymous request).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The `message` of the `ResourceNotFoundException` every operation of this
+/// service raises for a `messageId` that is not in transit.
+///
+/// The model documents the error only as "The requested email message is not
+/// found." (`smithy_query(query="shape", shape="ResourceNotFoundException")`) and
+/// states no text, but the real service builds the text from the request: it is
+/// the fixed prefix `Unknown messageId: ` followed verbatim by the `messageId`
+/// the request asked for, so the caller is told which id was rejected. Both
+/// modeled operations raise this error on the same condition, so both render it
+/// through this one function rather than each inventing wording.
+pub fn unknown_message_id(message_id: &str) -> String {
+    format!("Unknown messageId: {message_id}")
+}
+
 /// A reference to an S3 object, as `PutRawMessageContent` supplies it.
 ///
 /// `object_version` is part of the identity of what is referenced — the model

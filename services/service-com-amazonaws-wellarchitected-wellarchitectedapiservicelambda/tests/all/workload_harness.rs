@@ -40,6 +40,18 @@ impl Client {
         Self { router, engine }
     }
 
+    /// This emulator's service state, for a test that has to reach a ceiling the HTTP
+    /// boundary would take tens of thousands of requests to reach. The boundary itself is
+    /// still crossed over HTTP for everything the test asserts about behaviour.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState,
+    > {
+        self.engine
+            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>()
+    }
+
     /// Fill the store straight through the state the handlers share, so a test can reach
     /// the workload quota without issuing ten thousand HTTP requests. The boundary itself
     /// is still crossed over HTTP.
@@ -169,6 +181,21 @@ impl Client {
     pub(crate) async fn list(&self, body: Value) -> Answer {
         self.send("POST", "/workloadsSummaries", Some(body)).await
     }
+}
+
+/// Percent-encode a value so it survives as ONE path segment: everything RFC 3986 does
+/// not leave unreserved is escaped, so an ARN's `:` and `/` reach the server's label
+/// decoder intact. The one encoder in this crate's tests; every value they send is ASCII.
+pub(crate) fn encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 /// A minimal valid `CreateWorkload` request; callers override the members their case

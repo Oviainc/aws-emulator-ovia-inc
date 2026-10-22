@@ -179,6 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .ok_or_else(policy_not_found)?;
 
+        // A `PolicyDefinitionDetail` must agree with `policyType`, so the arm is
+        // chosen by the stored type rather than assumed. Only `CreatePolicy`'s
+        // `static` arm is served in this slice, so a stored policy is always
+        // STATIC; a template-linked one would need its template, which
+        // `CreatePolicyTemplate` does not create yet.
+        let definition = policy_definition_detail(policy).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("GetPolicy for a templateLinked policy")
+        })?;
+
         Ok(GetPolicyOutput {
             policy_store_id: policy.policy_store_id.clone(),
             policy_id: policy.policy_id.clone(),
@@ -198,26 +207,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(super::create_policy::action_identifier)
                     .collect()
             }),
-            definition: match policy.policy_type.as_str() {
-                // A `PolicyDefinitionDetail` must agree with `policyType`, so the
-                // arm is chosen by the stored type rather than assumed. Only
-                // `CreatePolicy`'s `static` arm is served in this slice, so a
-                // stored policy is always STATIC; a template-linked one would need
-                // its template, which `CreatePolicyTemplate` does not create yet.
-                "STATIC" => PolicyDefinitionDetail::Static(StaticPolicyDefinitionDetail {
-                    description: policy.description.clone(),
-                    statement: policy.statement.clone(),
-                }),
-                _ => {
-                    return Err(crate::scaffolded::Scaffolded::not_implemented(
-                        "GetPolicy for a templateLinked policy",
-                    ))
-                }
-            },
+            definition,
             created_date: policy.created_date,
             last_updated_date: policy.last_updated_date,
             effect: policy.effect.clone(),
             name: policy.name.clone(),
         })
+    }
+}
+
+/// A persisted policy's `PolicyDefinitionDetail`.
+///
+/// The union arm is chosen by the stored `policyType`, so the detail always
+/// agrees with the `policyType` reported beside it. `None` for a
+/// `TEMPLATE_LINKED` policy: its detail needs the `policyTemplateId` it was
+/// instantiated from, and `CreatePolicyTemplate` does not create templates yet,
+/// so no store holds such a policy. Shared with `BatchGetPolicy`, which reports
+/// the same union for the same stored policies.
+pub fn policy_definition_detail(policy: &crate::state::Policy) -> Option<PolicyDefinitionDetail> {
+    match policy.policy_type.as_str() {
+        "STATIC" => Some(PolicyDefinitionDetail::Static(StaticPolicyDefinitionDetail {
+            description: policy.description.clone(),
+            statement: policy.statement.clone(),
+        })),
+        _ => None,
     }
 }

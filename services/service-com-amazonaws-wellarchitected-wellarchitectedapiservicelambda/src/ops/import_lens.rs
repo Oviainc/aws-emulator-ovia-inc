@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportLens
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportLens`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportLens::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: parses the lens document against the lens JSON format specification and
+//! records the lens — its document, its parsed definition and its tags — in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lenses`],
+//! so `ExportLens` reads back what was imported.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportLens` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportLensErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportLens"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ImportLensErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool lens store is unavailable".to_string(),
+            })
+        })?;
+
+        // "Lenses are defined in JSON": the document IS the resource, so it is parsed
+        // and checked before anything is recorded — a document that is not a lens
+        // imports nothing.
+        let definition = crate::state::parse_lens_json(&input.json_string).map_err(rejected)?;
+
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "JSONString": &input.json_string,
+            "LensAlias": &input.lens_alias,
+            "Tags": &tags,
+        }));
+
+        let now = std::time::SystemTime::now();
+        // The import is a job rather than an edit — the operation answers an
+        // `ImportLensStatus` — so the content it carries lands at an instant the clock
+        // owes, and until that instant the lens reports `IN_PROGRESS` and has nothing to
+        // read. Nothing sleeps for it: the instant is stored and compared on read.
+        let content = crate::state::LensContent {
+            json: input.json_string,
+            definition,
+            imported_at: now,
+        };
+        let completes_at = now + crate::state::LENS_IMPORT_DURATION;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters reports
+        // the original import instead of importing a second time.
+        if let Some(token) = store.import_lens_tokens.get(&input.client_request_token) {
+            let lens_id = token.lens_id.clone();
+            if token.fingerprint != fingerprint {
+                return Err(ImportLensErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::LENS_RESOURCE_TYPE,
+                        lens_id,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(record) = store.lenses.get(&lens_id) {
+                return Ok(ImportLensOutput {
+                    lens_arn: Some(record.lens_arn.clone()),
+                    status: Some(record.import_status(now).to_string()),
+                });
+            }
+        }
+
+        // "To update an existing custom lens, specify its ARN as the LensAlias. If no
+        // ARN is specified, a new custom lens is created."
+        let lens_id = match input.lens_alias.as_deref().filter(|alias| is_arn(alias)) {
+            Some(alias) => {
+                // "Note that some operations … are not permitted on Amazon Web Services
+                // official lenses" (`LensAlias` doc): an official lens is AWS's own
+                // content, so a caller cannot import over it.
+                if crate::state::is_aws_official_lens(alias) {
+                    return Err(field_validation(
+                        "LensAlias",
+                        "Member must be the ARN of a custom lens; an Amazon Web Services \
+                         official lens cannot be imported over",
+                    ));
+                }
+                let record = store.lens_by_alias_mut(alias).ok_or_else(|| {
+                    ImportLensErrorModeled::ResourceNotFoundException(
+                        crate::state::lens_not_found(alias),
+                    )
+                })?;
+                // A resource holds at most `TagMap`'s own maximum of tags, so an update
+                // that would push the lens past it is refused rather than growing the
+                // stored map without bound. Checked BEFORE anything is written, so a
+                // refused request changes nothing.
+                let merged_tags = record
+                    .tags
+                    .keys()
+                    .chain(tags.keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                if merged_tags > crate::state::MAX_TAGS_PER_RESOURCE {
+                    return Err(field_validation(
+                        "Tags",
+                        &format!(
+                            "Member must not raise the lens's tag count above {}",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        ),
+                    ));
+                }
+                // An import that already landed becomes the lens's draft content before
+                // this one takes its place as the import in flight.
+                record.settle(now);
+                record.pending = Some(crate::state::PendingLensImport {
+                    content,
+                    completes_at,
+                });
+                // "Tags to associate to a lens": the tags a request names are associated
+                // with the lens, which keeps the ones it already carries.
+                record.tags.extend(tags);
+                record.lens_id.clone()
+            }
+            None => {
+                // Custom lenses are metered per account and Region, and this operation
+                // models `ServiceQuotaExceededException` for exactly that case.
+                if store.lenses.len() >= crate::state::MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION {
+                    return Err(ImportLensErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "The custom lens quota of {} for this account and Region has \
+                                 been reached",
+                                crate::state::MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION
+                            ),
+                            resource_id: None,
+                            resource_type: Some(crate::state::LENS_RESOURCE_TYPE.to_string()),
+                            // `QuotaCode` and `ServiceCode` are modelled `@required`.
+                            // The model publishes no numeric Service Quotas code for the
+                            // lens quota, so the quota is named by what it meters; the
+                            // service code is this service's own signing name.
+                            quota_code: "CustomLensesPerAccountPerRegion".to_string(),
+                            service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        },
+                    )
+                    .into());
+                }
+                let lens_id = store.mint_lens_id();
+                store.lenses.insert(
+                    lens_id.clone(),
+                    crate::state::LensRecord {
+                        lens_arn: ::engine::emulator_arn(
+                            crate::state::ARN_NAMESPACE,
+                            &region,
+                            &format!("lens/{lens_id}"),
+                        ),
+                        lens_id: lens_id.clone(),
+                        owner: ::engine::emulator_account_id().to_string(),
+                        created_at: now,
+                        tags,
+                        draft: None,
+                        pending: Some(crate::state::PendingLensImport {
+                            content,
+                            completes_at,
+                        }),
+                        // "The new or updated lens will have a status of DRAFT": nothing
+                        // is published from it until `CreateLensVersion` publishes a
+                        // version.
+                        versions: std::collections::BTreeMap::new(),
+                    },
+                );
+                lens_id
+            }
+        };
+
+        // Written through the store's bounded ledger, which holds the remembered tokens
+        // at `MAX_REMEMBERED_IMPORT_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, and an update adds no lens for the lens quota to bound.
+        store.remember_import_token(
+            input.client_request_token,
+            crate::state::ImportLensToken {
+                lens_id: lens_id.clone(),
+                fingerprint,
+            },
+        );
+
+        let record = store.lenses.get(&lens_id).ok_or_else(|| {
+            ImportLensErrorModeled::InternalServerException(InternalServerException {
+                message: "the imported lens could not be read back from the lens store".to_string(),
+            })
+        })?;
+        Ok(ImportLensOutput {
+            lens_arn: Some(record.lens_arn.clone()),
+            status: Some(record.import_status(now).to_string()),
+        })
     }
+}
+
+/// Whether a `LensAlias` is an ARN. "To update an existing custom lens, specify its ARN
+/// as the LensAlias. If no ARN is specified, a new custom lens is created"
+/// (`ImportLens` doc), so this is what tells an update from a create.
+fn is_arn(alias: &str) -> bool {
+    alias.starts_with("arn:")
+}
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — built through the service's shared envelope so
+/// every operation words a refusal identically.
+fn field_validation(member: &str, constraint: &str) -> ImportLensError {
+    ImportLensErrorModeled::ValidationException(crate::state::member_constraint_exception(
+        member, constraint,
+    ))
+    .into()
+}
+
+/// A refused lens document, as the modelled `ValidationException`: `CANNOT_PARSE` when
+/// the payload is not JSON at all, `FIELD_VALIDATION_FAILED` when it is JSON but breaks
+/// a rule of the lens format, naming the member and the rule it broke.
+fn rejected(rejection: crate::state::LensJsonRejection) -> ImportLensError {
+    ImportLensErrorModeled::ValidationException(crate::state::lens_json_exception(&rejection)).into()
 }

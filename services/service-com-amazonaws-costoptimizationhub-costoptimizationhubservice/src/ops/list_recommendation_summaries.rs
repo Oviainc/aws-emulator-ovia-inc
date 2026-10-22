@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendationSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendationSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendationSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Summarises the recommendations the calling account may read — the catalog an
+//! ENROLLED account has once the analysis its enrollment started is due, which
+//! is the visibility `ListRecommendations` serves: narrows them by every
+//! `filter` member the request sets, groups the surviving rows by the `groupBy`
+//! dimension, and reports per group how many recommendations fall under it and
+//! what they save per month together. `estimatedTotalDedupedSavings` is that
+//! total taken over one recommendation per resource, so a resource several
+//! recommendation types cover is counted once. Every figure is computed from
+//! the rows' stored prices under the caller's effective `savingsEstimationMode`
+//! preference, so a summary never disagrees with `ListRecommendations`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,269 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendationSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendationSummaries"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListRecommendationSummariesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the Cost Optimization Hub store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A `groupBy` that names no dimension a summary can be grouped by
+        // cannot be honoured, so the request is refused rather than silently
+        // summarised along another dimension.
+        let dimension = match crate::state::parse_group_dimension(&input.group_by) {
+            Some(dimension) => dimension,
+            None => return Err(unknown_group_by(&input.group_by)),
+        };
+
+        // The three filters this API does not support are refused rather than
+        // ignored, so a caller is never served a list it believes was narrowed.
+        if let Some(filter) = &input.filter {
+            for (member, supplied) in [
+                (
+                    "filter.recommendationIds",
+                    filter.recommendation_ids.is_some(),
+                ),
+                ("filter.resourceIds", filter.resource_ids.is_some()),
+                ("filter.resourceArns", filter.resource_arns.is_some()),
+            ] {
+                if supplied {
+                    return Err(unsupported_filter(member));
+                }
+            }
+        }
+
+        // An additional metric this service cannot report is refused for the
+        // same reason: the answer would be missing what was asked for.
+        if let Some(metrics) = &input.metrics {
+            for metric in metrics {
+                if !SUMMARY_METRICS_VALUES.contains(&metric.as_str()) {
+                    return Err(unknown_metric(metric));
+                }
+            }
+        }
+        let savings_percentage_requested = input
+            .metrics
+            .as_ref()
+            .is_some_and(|metrics| metrics.iter().any(|metric| metric == SAVINGS_PERCENTAGE));
+
+        let offset = match &input.next_token {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
+                Some(offset) => offset,
+                None => return Err(invalid_next_token()),
+            },
+        };
+
+        let (mode, rows) = {
+            let store = state.lock();
+            let mode = store
+                .effective_preferences(crate::state::caller_account_id())
+                .savings_estimation_mode;
+            // The rows this account may read — the same visibility
+            // `ListRecommendations` and `GetRecommendation` serve, so a summary
+            // never reports a catalog nobody opted into — narrowed by the
+            // request's filter.
+            let rows: Vec<crate::state::StoredRecommendation> = store
+                .visible_recommendations(crate::state::caller_account_id())
+                .into_iter()
+                .filter(|row| {
+                    input
+                        .filter
+                        .as_ref()
+                        .is_none_or(|filter| row.matches_filter(filter))
+                })
+                .collect();
+            (mode, rows)
+        };
+        let mode = mode.as_deref();
+
+        // The currency the figures are denominated in is the one the summarised
+        // rows are priced in; where none were summarised it is the currency this
+        // service denominates in, so a caller always reads the unit the zero is
+        // in.
+        let currency_code = Some(
+            rows.first()
+                .map_or_else(
+                    || crate::state::CURRENCY_CODE.to_string(),
+                    |row| row.currency_code.clone(),
+                ),
+        );
+
+        let groups = summarise(&rows, dimension, mode);
+
+        // De-duped: one recommendation per resource, so a resource covered by
+        // several recommendation types contributes its best saving once. The
+        // total is of the whole filtered view, not of the page being returned.
+        let deduped = crate::state::dedupe_by_resource(&rows, mode);
+        let total_deduped_savings = crate::state::round_cents(
+            deduped.iter().map(|row| row.monthly_savings(mode)).sum(),
+        );
+
+        let page = crate::state::paginate(PAGE_KIND, &groups, offset, input.max_results);
+
+        let metrics = savings_percentage_requested.then(|| SummaryMetricsResult {
+            savings_percentage: Some(savings_percentage(
+                input.filter.as_ref(),
+                &deduped,
+                total_deduped_savings,
+                mode,
+            )),
+        });
+
+        Ok(ListRecommendationSummariesOutput {
+            estimated_total_deduped_savings: Some(total_deduped_savings),
+            items: Some(page.items.to_vec()),
+            group_by: Some(input.group_by.clone()),
+            currency_code,
+            metrics,
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The list a `nextToken` from this operation belongs to.
+const PAGE_KIND: &str = "recommendation-summaries";
+
+/// The one `SummaryMetrics` value the model declares
+/// (`shared_types::SUMMARY_METRICS_VALUES`), which the input documents as the
+/// only metric this operation reports.
+const SAVINGS_PERCENTAGE: &str = "SavingsPercentage";
+
+/// What `metrics.savingsPercentage` reports when the request asked for the
+/// metric but narrowed the view by a dimension the metric is not defined over.
+/// `SummaryMetricsResult.savingsPercentage` is documented to carry the result
+/// OR the description of a metric, and the model's note on it says the metric
+/// "is only supported when filtering by Region, account ID, or tags".
+const SAVINGS_PERCENTAGE_UNSUPPORTED: &str =
+    "savingsPercentage is only supported when filtering by Region, account ID, or tags";
+
+/// Total the rows per group: one `RecommendationSummary` per distinct value of
+/// the grouping dimension, carrying how many recommendations fall under that
+/// value and what they save per month together.
+///
+/// The groups come out biggest saving first — which is what a savings summary
+/// ranks by — with ties broken by the group label, so the order is total and a
+/// page resumes at the same place on every call.
+fn summarise(
+    rows: &[crate::state::StoredRecommendation],
+    dimension: crate::state::Dimension,
+    mode: Option<&str>,
+) -> Vec<RecommendationSummary> {
+    let mut groups: Vec<(String, f64, i32)> = Vec::new();
+    for row in rows {
+        let label = row.group_label(dimension);
+        let savings = row.monthly_savings(mode);
+        match groups.iter_mut().find(|(group, _, _)| *group == label) {
+            Some((_, total, count)) => {
+                *total += savings;
+                *count += 1;
+            }
+            None => groups.push((label, savings, 1)),
+        }
+    }
+    groups.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    groups
+        .into_iter()
+        .map(|(group, savings, count)| RecommendationSummary {
+            group: Some(group),
+            estimated_monthly_savings: Some(crate::state::round_cents(savings)),
+            recommendation_count: Some(count),
+        })
+        .collect()
+}
+
+/// The `savingsPercentage` metric: the de-duped monthly saving as a percentage
+/// of what the summarised resources cost per month — the share of the spend the
+/// recommendations would remove — or, where the metric is not defined over the
+/// requested view, the description of why no figure is reported.
+fn savings_percentage(
+    filter: Option<&Filter>,
+    deduped: &[crate::state::StoredRecommendation],
+    total_savings: f64,
+    mode: Option<&str>,
+) -> String {
+    if !savings_percentage_is_defined(filter) {
+        return SAVINGS_PERCENTAGE_UNSUPPORTED.to_string();
+    }
+    let spend: f64 = deduped.iter().map(|row| row.monthly_cost(mode)).sum();
+    format!(
+        "{:.2}",
+        crate::state::percentage_of(total_savings, crate::state::round_cents(spend))
+    )
+}
+
+/// Whether the `savingsPercentage` metric is defined over the requested view:
+/// the metric is a share of the account's spend, so it survives narrowing by
+/// the dimensions that scope spend (Region, account id, tags) and not by the
+/// ones that pick out individual recommendations within it.
+fn savings_percentage_is_defined(filter: Option<&Filter>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    filter.restart_needed.is_none()
+        && filter.rollback_possible.is_none()
+        && filter.implementation_efforts.is_none()
+        && filter.resource_types.is_none()
+        && filter.action_types.is_none()
+}
+
+/// Refuse a `nextToken` this service did not issue for this list.
+fn invalid_next_token() -> ListRecommendationSummariesError {
+    field_refusal(
+        "nextToken",
+        "nextToken is not a pagination token issued by ListRecommendationSummaries".to_string(),
+        "the value is not a pagination token issued by ListRecommendationSummaries".to_string(),
+    )
+}
+
+/// Refuse a `groupBy` that names no dimension recommendations can be summarised
+/// by.
+fn unknown_group_by(group_by: &str) -> ListRecommendationSummariesError {
+    field_refusal(
+        "groupBy",
+        format!("groupBy {group_by} is not a recommendation dimension"),
+        format!("{group_by} is not a dimension recommendations can be grouped by"),
+    )
+}
+
+/// Refuse a `filter` member this API documents as unsupported.
+fn unsupported_filter(member: &str) -> ListRecommendationSummariesError {
+    field_refusal(
+        member,
+        format!("{member} is not supported by ListRecommendationSummaries"),
+        format!("{member} is not a filter this operation supports"),
+    )
+}
+
+/// Refuse a requested metric this operation cannot report.
+fn unknown_metric(metric: &str) -> ListRecommendationSummariesError {
+    field_refusal(
+        "metrics",
+        format!("metrics {metric} is not a summary metric"),
+        format!("{metric} is not a metric this operation reports"),
+    )
+}
+
+/// One refused request, attributed to the member it is about: the shape every
+/// handler-raised refusal in this service answers with.
+fn field_refusal(
+    field_name: &str,
+    message: String,
+    field_message: String,
+) -> ListRecommendationSummariesError {
+    ListRecommendationSummariesErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("FieldValidationFailed".to_string()),
+        fields: Some(vec![ValidationExceptionDetail {
+            field_name: field_name.to_string(),
+            message: field_message,
+        }]),
+    })
+    .into()
 }

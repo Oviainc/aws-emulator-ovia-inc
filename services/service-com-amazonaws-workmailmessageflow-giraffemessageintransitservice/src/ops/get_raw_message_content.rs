@@ -147,11 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 outcome = "ResourceNotFoundException",
                 "no in-transit message is stored under this id"
             );
+            // The text is the service's own rule — the fixed prefix plus the
+            // rejected id — and both operations render it from the one place that
+            // states it, `crate::state::unknown_message_id`.
             GetRawMessageContentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "The in-transit message {} was not found.",
-                    input.message_id
-                )),
+                message: Some(crate::state::unknown_message_id(&input.message_id)),
             })
         })?;
 

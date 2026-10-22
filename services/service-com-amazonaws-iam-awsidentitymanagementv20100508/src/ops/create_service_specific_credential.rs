@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceSpecificCredential
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceSpecificCredential`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceSpecificCredential::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +160,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceSpecificCredential` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceSpecificCredentialErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceSpecificCredential"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault
+            // (`smithy_query(query="operation", operation="CreateServiceSpecificCredential")`
+            // lists only `LimitExceededException`, `NoSuchEntityException` and
+            // `ServiceNotSupportedException`), and an engine this service was not
+            // mounted on cannot serve the operation at all — which is exactly what the
+            // scaffold's 501 states. The router builds the one engine that does carry
+            // the store, so this is unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateServiceSpecificCredential",
+            ));
+        };
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // The expiries the clock already owes, materialised before the per-service
+        // quota is counted against what the user holds.
+        store.expire_service_specific_credentials(now);
+
+        // The credentials are usable "only for the specified service", so a service
+        // that issues no service-specific credentials at all has none to generate.
+        let Some(service) = crate::state::service_with_credentials(&input.service_name) else {
+            return Err(
+                CreateServiceSpecificCredentialErrorModeled::ServiceNotSupportedException(
+                    ServiceNotSupportedException {
+                        message: Some(format!(
+                            "The service {} does not support service-specific credentials.",
+                            input.service_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The credential belongs to a STORED IAM user: the new credentials "have the
+        // same permissions as the associated user", so a name the account does not
+        // hold has no permissions to carry.
+        let Some(user) = store.users.get(&crate::state::name_key(&input.user_name)) else {
+            return Err(
+                CreateServiceSpecificCredentialErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "The user with name {} cannot be found.",
+                            input.user_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The user name is reported as the ACCOUNT holds it, not as this request
+        // spelled it: IAM entity names are not distinguished by case.
+        let user_name = user.user_name.clone();
+        let user_key = crate::state::name_key(&user_name);
+
+        // `CredentialAgeDays` "is only valid for services that support long-term API
+        // keys", so a request that asks a password-issuing service for an expiring
+        // credential asks for something that service cannot issue. This operation
+        // models no client-input error, so the refusal goes through the crate's
+        // generic client-input channel (HTTP 400 `ValidationException`).
+        let credential_age_days = match (input.credential_age_days, service.form) {
+            (Some(days), crate::state::ServiceCredentialForm::LongTermApiKey) => Some(days),
+            (Some(_), crate::state::ServiceCredentialForm::UserNameAndPassword) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "CredentialAgeDays is only valid for services that support long-term \
+                     API keys, and {} does not",
+                    service.service_name
+                )));
+            }
+            (None, _) => None,
+        };
+
+        // "You can have a maximum of two sets of service-specific credentials for
+        // each supported service per user"; past that the user cannot hold another.
+        let held = store.service_specific_credential_count(&user_key, service.service_name);
+        if held >= crate::state::MAX_SERVICE_SPECIFIC_CREDENTIALS_PER_SERVICE {
+            return Err(
+                CreateServiceSpecificCredentialErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Cannot exceed quota for ServiceSpecificCredentialsPerUserPerService: {}",
+                            crate::state::MAX_SERVICE_SPECIFIC_CREDENTIALS_PER_SERVICE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id and the secret come from the emulator's credential store, never from
+        // this handler. The store never mints an id it already holds and this one is
+        // removed from it again, so an id the account already uses is possible only by
+        // chance — mint again rather than overwrite a credential the user holds.
+        let mut minted = crate::state::mint_service_specific_credential(ctx.credential_store());
+        while minted
+            .as_ref()
+            .is_some_and(|(id, _)| store.service_specific_credentials.contains_key(id))
+        {
+            minted = crate::state::mint_service_specific_credential(ctx.credential_store());
+        }
+        let Some((credential_id, secret)) = minted else {
+            // No secret was minted, and this operation will not invent one; it models
+            // no server fault, so the honest answer is "this emulator did not serve
+            // it".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateServiceSpecificCredential",
+            ));
+        };
+
+        // Which members carry the credential is the FORM the service issues: a user
+        // name and a password, or a long-term API key's public alias and its secret.
+        let (service_user_name, service_password, alias, credential_secret) = match service.form {
+            crate::state::ServiceCredentialForm::UserNameAndPassword => (
+                Some(crate::state::service_user_name(&user_name)),
+                Some(secret),
+                None,
+                None,
+            ),
+            crate::state::ServiceCredentialForm::LongTermApiKey => (
+                None,
+                None,
+                Some(crate::state::api_key_alias(&user_name, now)),
+                Some(secret),
+            ),
+        };
+
+        // What the account keeps: every member but the password, which is available
+        // only in this response.
+        let stored = ServiceSpecificCredentialMetadata {
+            user_name,
+            status: crate::state::CREDENTIAL_STATUS_ACTIVE.to_string(),
+            service_user_name,
+            service_credential_alias: alias,
+            create_date: now,
+            // Only a long-term API key created with an age expires; with no
+            // `CredentialAgeDays` "the credential will not expire".
+            expiration_date: credential_age_days
+                .map(|days| crate::state::credential_expiration(now, days)),
+            service_specific_credential_id: credential_id.clone(),
+            service_name: service.service_name.to_string(),
+        };
+        store
+            .service_specific_credentials
+            .insert(credential_id, stored.clone());
+
+        Ok(CreateServiceSpecificCredentialOutput {
+            service_specific_credential: Some(ServiceSpecificCredential {
+                create_date: stored.create_date,
+                expiration_date: stored.expiration_date,
+                service_name: stored.service_name,
+                service_user_name: stored.service_user_name,
+                // "This is the only time that the password for this credential set is
+                // available. It cannot be recovered later" — so it is reported here
+                // and stored nowhere.
+                service_password,
+                service_credential_alias: stored.service_credential_alias,
+                service_credential_secret: credential_secret,
+                service_specific_credential_id: stored.service_specific_credential_id,
+                user_name: stored.user_name,
+                status: stored.status,
+            }),
+        })
     }
 }

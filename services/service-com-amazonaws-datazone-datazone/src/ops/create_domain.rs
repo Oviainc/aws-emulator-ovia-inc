@@ -296,6 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_at_ms: now,
             status_due_ms: Some(now + LIFECYCLE_SETTLE_MS),
             projects: std::collections::BTreeMap::new(),
+            asset_types: std::collections::BTreeMap::new(),
             id: id.clone(),
         };
 

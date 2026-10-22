@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_workspaces_workspacesservice::ops::types::WorkspaceRequest;
 use service_com_amazonaws_workspaces_workspacesservice::state::{
-    service_state, MAX_STORED_WORKSPACES, TRANSITION_DELAY,
+    service_state, ERROR_CODE_WORKSPACE_INVALID_STATE, ERROR_CODE_WORKSPACE_NOT_FOUND,
+    MAX_STORED_WORKSPACES, MESSAGE_WORKSPACE_NOT_FOUND, TRANSITION_DELAY,
 };
 use service_com_amazonaws_workspaces_workspacesservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -121,7 +122,9 @@ pub(crate) fn settle(engine: &Arc<engine::InMemoryEngine>) {
 }
 
 /// Create one WorkSpace and return its id, asserting the call was accepted.
-async fn create_one(router: &MultiServiceRouter, request: &Value) -> String {
+///
+/// `pub(crate)`: see [`emulator_with_engine`].
+pub(crate) async fn create_one(router: &MultiServiceRouter, request: &Value) -> String {
     let (status, body) = call(router, "CreateWorkspaces", &json!({ "Workspaces": [request] })).await;
     assert_eq!(
         status, 200,
@@ -202,7 +205,9 @@ fn is_modelled_workspace_id(candidate: &str) -> bool {
 }
 
 /// The `ErrorCode`/`ErrorMessage`/`WorkspaceId` triples of a batch response.
-fn failed_requests(case: &str, body: &Value) -> Vec<(String, String, String)> {
+///
+/// `pub(crate)`: see [`emulator_with_engine`].
+pub(crate) fn failed_requests(case: &str, body: &Value) -> Vec<(String, String, String)> {
     body["FailedRequests"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: FailedRequests must be a list, got {body:?}"))
@@ -465,26 +470,32 @@ async fn unknown_and_wrong_state_ids_are_reported_per_item() {
     )
     .await;
 
-    // (operation, request member, the id to send, the expected ErrorCode).
-    let cases: Vec<(&str, &str, &str, &str)> = vec![
+    // (operation, request member, the id to send, the expected per-item ErrorCode,
+    // the expected ErrorMessage where the service fixes it — `None` means the message
+    // is built from the request and must name the WorkSpace).
+    let not_found_message = Some(MESSAGE_WORKSPACE_NOT_FOUND);
+    let cases: Vec<(&str, &str, &str, &str, Option<&str>)> = vec![
         // An id no WorkSpace carries is a per-item failure, not a top-level error.
         (
             "StopWorkspaces",
             "StopWorkspaceRequests",
             "ws-00000000",
-            "ResourceNotFoundException",
+            ERROR_CODE_WORKSPACE_NOT_FOUND,
+            not_found_message,
         ),
         (
             "StartWorkspaces",
             "StartWorkspaceRequests",
             "ws-00000000",
-            "ResourceNotFoundException",
+            ERROR_CODE_WORKSPACE_NOT_FOUND,
+            not_found_message,
         ),
         (
             "TerminateWorkspaces",
             "TerminateWorkspaceRequests",
             "ws-00000000",
-            "ResourceNotFoundException",
+            ERROR_CODE_WORKSPACE_NOT_FOUND,
+            not_found_message,
         ),
         // A state that forbids the change is a per-item failure too: an AVAILABLE
         // WorkSpace cannot be started, and a STOPPING one cannot be stopped... it is
@@ -493,17 +504,19 @@ async fn unknown_and_wrong_state_ids_are_reported_per_item() {
             "StartWorkspaces",
             "StartWorkspaceRequests",
             &available,
-            "InvalidResourceStateException",
+            ERROR_CODE_WORKSPACE_INVALID_STATE,
+            None,
         ),
         (
             "StartWorkspaces",
             "StartWorkspaceRequests",
             &pending,
-            "InvalidResourceStateException",
+            ERROR_CODE_WORKSPACE_INVALID_STATE,
+            None,
         ),
     ];
 
-    for (operation, member, workspace_id, expected_code) in cases {
+    for (operation, member, workspace_id, expected_code, expected_message) in cases {
         let case = format!("{operation}({workspace_id})");
         let (status, body) = call(
             &router,
@@ -530,10 +543,16 @@ async fn unknown_and_wrong_state_ids_are_reported_per_item() {
             code, expected_code,
             "case {case}: expected ErrorCode {expected_code}, got {failures:?}"
         );
-        assert!(
-            message.contains(workspace_id),
-            "case {case}: the message names the WorkSpace, got {message:?}"
-        );
+        match expected_message {
+            Some(expected) => assert_eq!(
+                message, expected,
+                "case {case}: expected the fixed ErrorMessage {expected:?}, got {message:?}"
+            ),
+            None => assert!(
+                message.contains(workspace_id),
+                "case {case}: the message names the WorkSpace, got {message:?}"
+            ),
+        }
     }
 }
 
