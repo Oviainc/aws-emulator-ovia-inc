@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: validates the request's pipeline definition — the published schema
+//! version, the step list, unique step names, and a `DependsOn` graph that resolves and
+//! is acyclic — then registers the pipeline in `crate::state` under its `PipelineName`,
+//! minting the `PipelineArn` from the request's region. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A definition handed in through `PipelineDefinitionS3Location` is the one input path
+//! left unimplemented: it needs the definition fetched from S3, which nothing here does
+//! yet, so that form answers the scaffold's 501 rather than persisting a pipeline with
+//! no definition.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +163,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePipeline"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The definition comes from exactly one of the two members: SageMaker reads the
+        // inline `PipelineDefinition`, or retrieves one from
+        // `PipelineDefinitionS3Location`. Neither, or both, is a request the service
+        // cannot act on.
+        let definition = match (&input.pipeline_definition, &input.pipeline_definition_s3_location)
+        {
+            (Some(definition), None) => definition.clone(),
+            (None, Some(_)) => {
+                // Honest about the gap: retrieving the definition from S3 is not written
+                // yet, and a 200 here would persist a pipeline whose definition nothing
+                // ever read.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "CreatePipeline with PipelineDefinitionS3Location",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Only one of PipelineDefinition and PipelineDefinitionS3Location may be \
+                     supplied",
+                ));
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "One of PipelineDefinition and PipelineDefinitionS3Location must be supplied",
+                ));
+            }
+        };
+        // The step graph is resolved when the pipeline is WRITTEN, not when it runs, so a
+        // definition naming a step it does not declare, or depending on itself through a
+        // cycle, is refused here and nothing is persisted.
+        if let Some(violation) = crate::state::pipeline_definition_violation(&definition) {
+            return Err(crate::scaffolded::Scaffolded::validation(violation));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "pipeline", &input.pipeline_name);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A pipeline whose deletion the clock already owes is gone before this create
+        // reads the store, so its name is free again.
+        store.settle_pipeline_deletions(now);
+
+        if let Some(existing) = store.pipelines.get(&input.pipeline_name) {
+            // `ClientRequestToken` makes the operation idempotent — "an idempotent
+            // operation completes no more than one time" — so a retry of the very call
+            // that created this pipeline answers what that call answered and changes
+            // nothing. A different token naming an existing pipeline is a second create.
+            //
+            // The rule is scoped to a pipeline that still EXISTS under that name and
+            // token: a token is not a record of its own, so a retry arriving after the
+            // pipeline was deleted creates it again (the name is free), and the same
+            // token under another name is a create of that other pipeline.
+            if existing.client_request_token == input.client_request_token {
+                return Ok(CreatePipelineOutput {
+                    pipeline_arn: Some(existing.arn.clone()),
+                });
+            }
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Pipeline names must be unique within an Amazon Web Services account and \
+                 region. Pipeline with name {} already exists.",
+                input.pipeline_name
+            )));
+        }
+        // The store is bounded, so a caller varying `PipelineName` cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.pipelines_below_quota() {
+            return Err(CreatePipelineErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for pipelines is {}, with current \
+                         utilization of {} and a request delta of 1.",
+                        crate::state::PIPELINE_QUOTA,
+                        store.pipelines.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.pipelines.insert(
+            input.pipeline_name.clone(),
+            crate::state::Pipeline {
+                name: input.pipeline_name.clone(),
+                arn: arn.clone(),
+                display_name: input.pipeline_display_name,
+                definition,
+                description: input.pipeline_description,
+                role_arn: input.role_arn,
+                // A created pipeline is usable at once: `Active` is the status SageMaker
+                // reports for it, and the other member of `PipelineStatus` (`Deleting`)
+                // is reached only through `DeletePipeline`.
+                status: crate::state::PIPELINE_STATUS_ACTIVE.to_string(),
+                parallelism_configuration: input.parallelism_configuration,
+                tags: input.tags.unwrap_or_default(),
+                client_request_token: input.client_request_token,
+                creation_time: now,
+                last_modified_time: now,
+                last_run_time: None,
+                removal_due_at: None,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreatePipelineOutput {
+            pipeline_arn: Some(arn),
+        })
     }
 }

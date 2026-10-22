@@ -183,16 +183,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // @readonly: this operation only reports, so it takes the lock to resolve
-        // the model and writes nothing.
-        if state.lock().resolve_model(&input.model_id).is_none() {
-            return Err(CountTokensErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "The provided model identifier is invalid: {}",
-                        input.model_id
-                    )),
-                },
-            )
+        // the model and writes nothing. An identifier the service cannot
+        // interpret is a 400, one naming a model or resource that is not
+        // available here a 404 (see
+        // `crate::state::resolve_model_for_inference`).
+        if let Err(rejection) = state.lock().resolve_model_for_inference(&input.model_id) {
+            return Err(match rejection {
+                crate::state::ModelRejection::Invalid(message) => {
+                    CountTokensErrorModeled::ValidationException(ValidationException {
+                        message: Some(message),
+                    })
+                }
+                crate::state::ModelRejection::NotFound(message) => {
+                    CountTokensErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: Some(message),
+                    })
+                }
+            }
             .into());
         }
 
