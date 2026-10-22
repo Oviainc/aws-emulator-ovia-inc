@@ -152,10 +152,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(GetGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
         let guard = state.lock();
         let Some(record) = guard.graphql_apis.get(&input.api_id) else {
             return Err(GetGraphqlApiErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("No GraphQL API found with ID {}", input.api_id)),
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };
