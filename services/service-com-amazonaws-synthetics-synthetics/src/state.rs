@@ -616,6 +616,88 @@ pub fn request_region(headers: &::http::HeaderMap) -> String {
 /// The region an unsigned request is attributed to.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The scheme every Amazon S3 location is written with.
+pub const S3_LOCATION_SCHEME: &str = "s3://";
+
+/// Amazon S3's bucket naming rules, as the S3 User Guide's "General purpose bucket naming
+/// rules" states them: a name is 3–63 characters long, uses only lowercase letters,
+/// numbers, periods and hyphens, begins and ends with a letter or a number, must not be
+/// formatted as an IP address, must not contain two adjacent periods, must not start with
+/// `xn--`, `sthree-` or `amzn-s3-demo-`, and must not end with `-s3alias` or `--ol-s3`.
+const S3_BUCKET_MIN_LEN: usize = 3;
+const S3_BUCKET_MAX_LEN: usize = 63;
+const S3_BUCKET_RESERVED_PREFIXES: [&str; 3] = ["xn--", "sthree-", "amzn-s3-demo-"];
+const S3_BUCKET_RESERVED_SUFFIXES: [&str; 2] = ["-s3alias", "--ol-s3"];
+
+/// Whether `location` is a well-formed Amazon S3 location for canary artifacts.
+///
+/// `CreateCanaryRequest$ArtifactS3Location` — and the same member on
+/// `UpdateCanaryRequest` and `StartCanaryDryRunRequest` — documents itself as "The
+/// location in Amazon S3 where Synthetics stores artifacts from the test runs of this
+/// canary … The name of the Amazon S3 bucket can't include a period (.)"
+/// (`smithy_query(query="doc",shape="CreateCanaryRequest",member="ArtifactS3Location")`).
+/// So the value names an S3 bucket and an optional key prefix inside it: `s3://<bucket>`
+/// or `s3://<bucket>/<key prefix>`, with the bucket component held to Amazon S3's own
+/// bucket naming rules (see the constants above) plus that member's extra no-period rule.
+/// A value that is not such a location is refused with the modelled
+/// `ValidationException`; nothing else about the value is checked here, because the
+/// member's length is already a modelled `@length` constraint the request boundary
+/// enforces.
+pub fn is_s3_artifact_location(location: &str) -> bool {
+    let Some(bucket_and_key) = location.strip_prefix(S3_LOCATION_SCHEME) else {
+        return false;
+    };
+    // The bucket is everything up to the first `/`; the rest is the key prefix the
+    // artifacts are written under, which may be absent and is otherwise opaque (any
+    // sequence of characters is a legal S3 key).
+    let bucket = match bucket_and_key.split_once('/') {
+        Some((bucket, _key_prefix)) => bucket,
+        None => bucket_and_key,
+    };
+    is_s3_bucket_name(bucket)
+}
+
+/// Whether `bucket` satisfies Amazon S3's bucket naming rules AND the no-period rule
+/// `ArtifactS3Location` adds to them. See [`is_s3_artifact_location`].
+fn is_s3_bucket_name(bucket: &str) -> bool {
+    if !(S3_BUCKET_MIN_LEN..=S3_BUCKET_MAX_LEN).contains(&bucket.len()) {
+        return false;
+    }
+    // "The name of the Amazon S3 bucket can't include a period (.)" — the member's own
+    // rule, stricter than S3's, which also settles S3's "no two adjacent periods" and
+    // "must not be formatted as an IP address" rules: neither form survives it.
+    if bucket.contains('.') {
+        return false;
+    }
+    if !bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return false;
+    }
+    let alphanumeric = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !bucket.bytes().next().is_some_and(alphanumeric)
+        || !bucket.bytes().next_back().is_some_and(alphanumeric)
+    {
+        return false;
+    }
+    if S3_BUCKET_RESERVED_PREFIXES
+        .iter()
+        .any(|prefix| bucket.starts_with(prefix))
+    {
+        return false;
+    }
+    !S3_BUCKET_RESERVED_SUFFIXES
+        .iter()
+        .any(|suffix| bucket.ends_with(suffix))
+}
+
+/// How Synthetics words the refusal of a location that is not a well-formed S3 location.
+///
+/// One sentence naming the member and the defect class, the way the service states it;
+/// it carries nothing from the request, so a rejected value is never echoed back.
+pub const ARTIFACT_S3_LOCATION_MALFORMED: &str = "ArtifactS3Location: The location is malformed.";
+
 /// How often `expression` runs the canary, in seconds, when that is determinable.
 ///
 /// `CanaryScheduleInput$Expression` documents the rate form as `rate(<number> <unit>)`

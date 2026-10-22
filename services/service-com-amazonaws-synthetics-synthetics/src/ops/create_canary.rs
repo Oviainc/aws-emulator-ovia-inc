@@ -149,11 +149,12 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::state::{
-    default_run_timeout_in_seconds, engine_arn, source_location_arn, CanaryState,
-    StoredArtifactConfig, StoredCanary, StoredCode, StoredDependency, StoredRunConfig,
-    StoredSchedule, StoredVpcConfig, CREATE_IN_PROGRESS_REASON_CODE,
-    DEFAULT_PROVISIONED_RESOURCE_CLEANUP, DEFAULT_RETENTION_PERIOD_IN_DAYS,
-    DEFAULT_SCHEDULE_DURATION_IN_SECONDS, MAX_CANARIES, PROVISIONING_SETTLE, STORE_UNAVAILABLE,
+    default_run_timeout_in_seconds, engine_arn, is_s3_artifact_location, source_location_arn,
+    CanaryState, StoredArtifactConfig, StoredCanary, StoredCode, StoredDependency,
+    StoredRunConfig, StoredSchedule, StoredVpcConfig, ARTIFACT_S3_LOCATION_MALFORMED,
+    CREATE_IN_PROGRESS_REASON_CODE, DEFAULT_PROVISIONED_RESOURCE_CLEANUP,
+    DEFAULT_RETENTION_PERIOD_IN_DAYS, DEFAULT_SCHEDULE_DURATION_IN_SECONDS, MAX_CANARIES,
+    PROVISIONING_SETTLE, STORE_UNAVAILABLE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -241,6 +242,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are refused here rather than at the boundary.
         validate_code(&input.code)?;
         validate_run_config(input.run_config.as_ref())?;
+        // `CreateCanaryRequest$ArtifactS3Location` is "The location in Amazon S3 where
+        // Synthetics stores artifacts … The name of the Amazon S3 bucket can't include a
+        // period (.)": a value that is not a well-formed S3 location names no bucket the
+        // canary could ever write to, so it is refused here rather than stored verbatim.
+        if !is_s3_artifact_location(&input.artifact_s3_location) {
+            return Err(validation(ARTIFACT_S3_LOCATION_MALFORMED));
+        }
         if input.resources_to_replicate_tags.is_some()
             && input.tags.as_ref().is_none_or(|tags| tags.is_empty())
         {
