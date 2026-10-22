@@ -341,12 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(id) = resolve_resource_set_id(&store, &input.resource_set_identifier) else {
             return Err(
                 BatchAssociateResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "no Firewall Manager resource set with the identifier {}",
-                            input.resource_set_identifier
-                        )),
-                    },
+                    crate::state::resource_not_found(),
                 )
                 .into(),
             );

@@ -165,12 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(channel) = store.notification_channel.as_ref() else {
             return Err(
                 GetNotificationChannelErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            "no Firewall Manager SNS notification channel is configured"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::resource_not_found(),
                 )
                 .into(),
             );

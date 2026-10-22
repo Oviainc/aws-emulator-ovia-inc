@@ -15,6 +15,8 @@
 mod admin_account_disassociation;
 #[path = "all/administrator_gated_operations.rs"]
 mod administrator_gated_operations;
+#[path = "all/error_message_members.rs"]
+mod error_message_members;
 #[path = "all/member_accounts.rs"]
 mod member_accounts;
 #[path = "all/policy_lifecycle.rs"]

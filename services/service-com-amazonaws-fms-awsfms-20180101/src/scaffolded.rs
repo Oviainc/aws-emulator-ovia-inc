@@ -189,18 +189,28 @@ impl SerializableStruct for ValidationException {
     }
 }
 
-/// The `message` member of the synthetic `AccessDeniedException` error shape.
+/// The `Message` member of the synthetic `AccessDeniedException` error shape.
+///
+/// Spelled `Message`, not `message`: this shape is not a framework signal but
+/// the stand-in for an error the LIVE service answers with, and every error
+/// shape in this service's model declares its one member as `Message` (an
+/// `ErrorMessage`), which on the awsJson / rpcv2Cbor wire is the key clients and
+/// SDKs read the exception message from. The member name IS that key on these
+/// protocols (`@jsonName` is not consulted by the awsJson family), so a
+/// lowercase name would answer a body with no message member at all as far as a
+/// client is concerned.
 static ACCESS_DENIED_EXCEPTION_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
-        "smithy.framework#AccessDeniedException$message",
+        "smithy.framework#AccessDeniedException$Message",
         "smithy.framework",
-        "message",
+        "Message",
     ),
     ShapeType::String,
-    "message",
+    "Message",
     0,
 )
-.with_xml_name("Message");
+.with_xml_name("Message")
+.with_json_name("Message");
 
 /// Schema for the synthetic `AccessDeniedException` error shape.
 ///

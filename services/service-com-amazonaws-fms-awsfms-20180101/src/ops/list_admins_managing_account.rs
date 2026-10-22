@@ -195,12 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // apart.
         if admins.is_empty() {
             return Err(ListAdminsManagingAccountErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(
-                        "no Firewall Manager administrator account manages the calling account"
-                            .to_string(),
-                    ),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         }

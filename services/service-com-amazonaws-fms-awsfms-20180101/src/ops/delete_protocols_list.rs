@@ -179,12 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(removed) = store.protocols_lists.remove(&input.list_id) else {
             return Err(DeleteProtocolsListErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no Firewall Manager protocols list with the id {}",
-                        input.list_id
-                    )),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };

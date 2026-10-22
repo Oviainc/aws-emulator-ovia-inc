@@ -166,11 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_admin_account();
         let Some(admin) = store.admin_account.as_ref() else {
             return Err(GetAdminAccountErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(
-                        "no Firewall Manager administrator account is associated".to_string(),
-                    ),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };

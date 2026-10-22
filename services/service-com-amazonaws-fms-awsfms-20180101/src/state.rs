@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AppsListData, DiscoveredResource, Policy, PolicySummary, ProtocolsListData, ResourceSet, Tag,
+    AppsListData, DiscoveredResource, Policy, PolicySummary, ProtocolsListData,
+    ResourceNotFoundException, ResourceSet, Tag,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -609,6 +610,29 @@ pub fn arn_format_error(arn: &str) -> Option<String> {
 /// (`com.amazonaws.fms#AWSAccountId`: length 1..1024, pattern `^[0-9]+$`).
 pub fn is_account_id(value: &str) -> bool {
     (1..=1024).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The `Message` Firewall Manager puts on EVERY `ResourceNotFoundException` it
+/// answers, whatever was looked up.
+///
+/// The model declares the member but no literal, and the recordings of the live
+/// service carry this one string on five different operations, across three
+/// fixtures and across two kinds of lookup key (a policy UUID and a resource
+/// ARN) — never the identifier that was looked up. So the text is a service
+/// constant, not a per-call detail, and this is the single place it is written.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The referenced item does not exist.";
+
+/// The modelled `ResourceNotFoundException` for anything this service could not
+/// find: the identifier, ARN or name that was looked up never reaches the wire.
+///
+/// Every not-found site goes through here, so no handler can word its own
+/// not-found text and no two of them can disagree. Which resource was missing is
+/// the caller's own request — it is not restated in the error, exactly as the
+/// live service does not restate it.
+pub fn resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
 }
 
 /// The Firewall Manager administrator the organization has associated, or the

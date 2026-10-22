@@ -211,12 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         let Some((policy_id, arn, held)) = resolved else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no Firewall Manager resource with the ARN {}",
-                        input.resource_arn
-                    )),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };

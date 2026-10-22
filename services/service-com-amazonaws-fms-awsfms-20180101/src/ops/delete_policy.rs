@@ -192,9 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(removed) = store.policies.remove(&input.policy_id) else {
             return Err(DeletePolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("no policy with the id {}", input.policy_id)),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };

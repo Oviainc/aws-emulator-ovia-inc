@@ -177,12 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|record| record.default_list == input.default_list);
         let Some(record) = found else {
             return Err(GetProtocolsListErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no Firewall Manager protocols list with the id {}",
-                        input.list_id
-                    )),
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         };
