@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the sessions an actor has in an AgentCore Memory container, from
+//! [`crate::state`] — the sessions the stored events imply. Reporting only: it writes
+//! nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each summary's `createdAt` is the `eventTimestamp` of the session's first event.
+//! The page is newest-first and bounded by `maxResults`, with an opaque `nextToken`
+//! resuming after it.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +99,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The list this operation's `nextToken` belongs to, so a token minted by another
+/// paginated operation does not silently resume this one.
+const PAGE_KIND: &str = "sessions";
+
+/// The ordering key sessions are reported by: when the session came into being, with
+/// its id breaking a tie between sessions created at the same instant.
+fn session_order_key(session: &crate::state::SessionStore) -> (i64, u32, &str) {
+    (
+        session.created_at.secs(),
+        session.created_at.subsec_nanos(),
+        session.session_id.as_str(),
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -175,18 +187,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSessions"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSessionsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_next_token(PAGE_KIND, token).ok_or_else(|| {
+                ListSessionsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this operation issued".to_string(),
+                    reason: "CannotParse".to_string(),
+                    field_list: None,
+                })
+            })?,
+        };
+        // `@range(1..100)` is refused at the boundary; the clamp keeps this arithmetic
+        // total rather than restating that refusal.
+        let max_results = input.max_results.clamp(1, 100) as usize;
+        // The only modelled condition: keep the sessions that hold at least one event.
+        let has_events_only = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.event_filter.as_deref())
+            == Some("HAS_EVENTS");
+
+        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
+        let store = state.lock();
+        let memory = store.memories.get(&memory_id).ok_or_else(|| {
+            ListSessionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("memory {memory_id} not found")),
+            })
+        })?;
+
+        // An actor with no events in this memory simply has no sessions; the memory is
+        // the addressed resource, and it exists.
+        let mut sessions: Vec<&crate::state::SessionStore> = memory
+            .actors
+            .get(&input.actor_id)
+            .map(|actor| {
+                actor
+                    .sessions
+                    .values()
+                    .filter(|session| !has_events_only || !session.events.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Newest-first, with the session id breaking a tie so one state always paginates
+        // the same way.
+        sessions.sort_by(|left, right| session_order_key(right).cmp(&session_order_key(left)));
+
+        // Rendered page-first: only the summaries of this page are built, however many
+        // sessions the actor holds.
+        let (session_summaries, next_token) = crate::state::paginate_with(
+            &sessions,
+            PAGE_KIND,
+            offset,
+            max_results,
+            |session| session.summary(),
+        );
+
+        Ok(ListSessionsOutput {
+            session_summaries,
+            next_token,
+        })
     }
 }

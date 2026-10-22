@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports a session's stored events from [`crate::state`], newest-first. Reporting
+//! only: it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `includePayloads` (default true) decides whether each event carries its payload,
+//! `filter` narrows the events by branch and by event metadata, and the page is
+//! bounded by `maxResults` with an opaque `nextToken` resuming after it.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +102,126 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::StoredEvent;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// The list this operation's `nextToken` belongs to, so a token minted by another
+/// paginated operation does not silently resume this one.
+const PAGE_KIND: &str = "events";
+
+/// The most `eventMetadata` expressions one request may carry.
+///
+/// `EventMetadataFilterList` is modelled `@length(min: 1, max: 5)`, so the boundary
+/// validator already refuses more; restating it here keeps the bound on the work this
+/// handler does (expressions x the session's events) LOCAL to this crate rather than
+/// inherited from the validator.
+const MAX_FILTER_EXPRESSIONS: usize = 5;
+
+/// The branch names a `BranchFilter` keeps, and whether it keeps the trunk.
+///
+/// `name` is the branch asked for. `includeParentBranches` (default true) widens that
+/// to the branches the named one descends from: a branch records the `rootEventId` it
+/// forked from, so the branch of that event is the named branch's parent, and the walk
+/// continues until it reaches the trunk (events stored without a `branch`) or a branch
+/// whose root is not in this session.
+///
+/// The session's events are indexed ONCE up front, so the walk costs one hop per
+/// distinct branch name rather than a rescan per hop, and the `names` set makes a
+/// branch cycle terminate.
+fn branch_scope<'a>(
+    events: &'a VecDeque<StoredEvent>,
+    filter: &'a BranchFilter,
+) -> (HashSet<&'a str>, bool) {
+    // branch name -> the event id it forked from, and event id -> its branch name.
+    let mut forked_from: HashMap<&str, Option<&str>> = HashMap::new();
+    let mut branch_of: HashMap<&str, Option<&str>> = HashMap::new();
+    for event in events {
+        branch_of.insert(event.event_id.as_str(), event.branch_name());
+        if let Some(branch) = event.branch.as_ref() {
+            forked_from
+                .entry(branch.name.as_str())
+                .or_insert(branch.root_event_id.as_deref());
+        }
+    }
+
+    let mut names: HashSet<&str> = HashSet::new();
+    let mut include_trunk = false;
+    let mut name: &str = filter.name.as_str();
+    loop {
+        // A branch already in the set closes a cycle; stop rather than walk it again.
+        if !names.insert(name) || !filter.include_parent_branches {
+            break;
+        }
+        let Some(root) = forked_from.get(name).copied().flatten() else {
+            break;
+        };
+        match branch_of.get(root) {
+            // The fork point is not in this session, so its branch is unknown.
+            None => break,
+            // The fork point is on the trunk, so the trunk is a parent.
+            Some(None) => {
+                include_trunk = true;
+                break;
+            }
+            Some(Some(parent)) => name = parent,
+        }
+    }
+    (names, include_trunk)
+}
+
+/// Whether `event` is on one of the branches `scope` keeps.
+fn on_branch(event: &StoredEvent, scope: &(HashSet<&str>, bool)) -> bool {
+    let (names, include_trunk) = scope;
+    match event.branch_name() {
+        Some(name) => names.contains(name),
+        None => *include_trunk,
+    }
+}
+
+/// Refuse an `eventMetadata` expression the model admits but that cannot be evaluated:
+/// `EQUALS_TO` has nothing to compare against without its right operand, which the
+/// model leaves optional because `EXISTS` / `NOT_EXISTS` take none.
+fn check_expression(expression: &EventMetadataFilterExpression) -> Result<(), String> {
+    let EventMetadataFilterExpression {
+        left: LeftExpression::metadataKey(key),
+        operator,
+        right,
+    } = expression;
+    match operator.as_str() {
+        "EQUALS_TO" if right.is_none() => Err(format!(
+            "filter.eventMetadata expression on key {key} uses operator EQUALS_TO, \
+             which requires right.metadataValue"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `event`'s metadata satisfies one checked expression.
+///
+/// `OperatorType` admits `EQUALS_TO`, `EXISTS` and `NOT_EXISTS`; the boundary refuses
+/// anything else, so an unknown operator keeps nothing.
+fn metadata_matches(event: &StoredEvent, expression: &EventMetadataFilterExpression) -> bool {
+    let EventMetadataFilterExpression {
+        left: LeftExpression::metadataKey(key),
+        operator,
+        right,
+    } = expression;
+    let stored = event.metadata.as_ref().and_then(|metadata| metadata.get(key));
+    match operator.as_str() {
+        "EXISTS" => stored.is_some(),
+        "NOT_EXISTS" => stored.is_none(),
+        "EQUALS_TO" => {
+            let Some(RightExpression::metadataValue(MetadataValue::stringValue(wanted))) =
+                right.as_ref()
+            else {
+                return false;
+            };
+            matches!(stored, Some(MetadataValue::stringValue(value)) if value == wanted)
+        }
+        _ => false,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,18 +296,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEvents"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEventsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_next_token(PAGE_KIND, token).ok_or_else(|| {
+                ListEventsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this operation issued".to_string(),
+                    reason: "CannotParse".to_string(),
+                    field_list: None,
+                })
+            })?,
+        };
+        // `@range(1..100)` is refused at the boundary; the clamp keeps this arithmetic
+        // total rather than restating that refusal.
+        let max_results = input.max_results.clamp(1, 100) as usize;
+
+        let expressions: &[EventMetadataFilterExpression] = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.event_metadata.as_deref())
+            .unwrap_or(&[]);
+        if expressions.len() > MAX_FILTER_EXPRESSIONS {
+            return Err(ListEventsErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "filter.eventMetadata carries {} expressions; at most {MAX_FILTER_EXPRESSIONS} are accepted",
+                    expressions.len()
+                ),
+                reason: "FieldValidationFailed".to_string(),
+                field_list: None,
+            })
+            .into());
+        }
+        // An unevaluable expression is refused whether or not the session holds events.
+        for expression in expressions {
+            check_expression(expression).map_err(|message| {
+                ListEventsErrorModeled::ValidationException(ValidationException {
+                    message,
+                    reason: "FieldValidationFailed".to_string(),
+                    field_list: None,
+                })
+            })?;
+        }
+
+        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
+        let store = state.lock();
+        let session = store
+            .session(&memory_id, &input.actor_id, &input.session_id)
+            .ok_or_else(|| {
+                ListEventsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "session {} not found for actor {} in memory {}",
+                        input.session_id, input.actor_id, memory_id
+                    )),
+                })
+            })?;
+
+        // Selecting and sorting walk one session's events, which the store bounds at
+        // `crate::state::MAX_EVENTS_PER_SESSION`, and `expressions` is bounded above,
+        // so neither the scan nor the sort grows with request volume.
+        let scope = input
+            .filter
+            .as_ref()
+            .and_then(|filter| filter.branch.as_ref())
+            .map(|filter| branch_scope(&session.events, filter));
+        let mut selected: Vec<&StoredEvent> = session
+            .events
+            .iter()
+            .filter(|event| scope.as_ref().is_none_or(|scope| on_branch(event, scope)))
+            // Several expressions narrow together: an event must satisfy every one.
+            .filter(|event| {
+                expressions
+                    .iter()
+                    .all(|expression| metadata_matches(event, expression))
+            })
+            .collect();
+        // Newest-first by the modelled `eventTimestamp`, with creation order breaking a
+        // tie between events stored at the same instant.
+        selected.sort_by_key(|event| std::cmp::Reverse(event.order_key()));
+
+        // Rendered page-first: only the events of this page are cloned into the
+        // response, however many the session holds.
+        let (events, next_token) = crate::state::paginate_with(
+            &selected,
+            PAGE_KIND,
+            offset,
+            max_results,
+            |event| event.to_event(input.include_payloads),
+        );
+
+        Ok(ListEventsOutput { events, next_token })
     }
 }
