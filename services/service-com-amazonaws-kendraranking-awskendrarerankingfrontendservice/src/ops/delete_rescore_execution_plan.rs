@@ -4,7 +4,9 @@
 //!
 //! REMOVES the plan from this service's store, so a later Describe, Rescore or Delete
 //! of the same id answers `ResourceNotFoundException` and the plan no longer appears in
-//! `ListRescoreExecutionPlans`.
+//! `ListRescoreExecutionPlans`. A plan that is not `ACTIVE` — one an
+//! `UpdateRescoreExecutionPlan` call is still having re-provisioned — is refused with
+//! the modelled `ConflictException` instead.
 //!
 //! ## Shape of an operation
 //!
@@ -184,8 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = crate::state::now_millis();
         let mut store = state.lock();
-        let Some(plan) = store.plans.remove(&input.id) else {
+        let Some(plan) = store.plans.get_mut(&input.id) else {
             return Err(
                 DeleteRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -198,10 +201,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        store.arn_index.remove(&plan.arn);
+
+        // A transition the clock already owes is materialised first, so this call
+        // decides against the status a reader sees now rather than a stale one.
+        plan.settle_status(now);
+        // A plan the service is still provisioning cannot be deleted out from under
+        // that work: that is the modelled `ConflictException` ("A conflict occurred
+        // with the request. Please fix any inconsistencies with your resources and try
+        // again.").
+        if plan.status != crate::state::STATUS_ACTIVE {
+            return Err(
+                DeleteRescoreExecutionPlanErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Rescore execution plan {} is {} and can only be deleted while it is {}.",
+                        plan.id,
+                        plan.status,
+                        crate::state::STATUS_ACTIVE
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let id = plan.id.clone();
+        let arn = plan.arn.clone();
+        store.plans.remove(&id);
+        store.arn_index.remove(&arn);
         // The idempotency tokens that created this plan must go with it, or a repeated
         // create would answer with the id of a plan that no longer exists.
-        store.client_tokens.retain(|_, id| *id != plan.id);
+        store.client_tokens.retain(|_, plan_id| *plan_id != id);
 
         Ok(DeleteRescoreExecutionPlanOutput)
     }

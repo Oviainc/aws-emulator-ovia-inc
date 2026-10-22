@@ -253,6 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_at_millis: now,
                 updated_at_millis: now,
                 status: crate::state::STATUS_ACTIVE.to_string(),
+                pending_status: None,
                 error_message: None,
                 tags: input.tags.unwrap_or_default(),
             },

@@ -11,6 +11,30 @@ use crate::ops::types::{CapacityUnitsConfiguration, Tag};
 /// use." — `RescoreExecutionPlanSummary$Status` in the model).
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
+/// The `RescoreExecutionPlanStatus` value a plan carries while the service
+/// re-provisions it for an `UpdateRescoreExecutionPlan` call (`UPDATING` is one of the
+/// five values `RescoreExecutionPlanStatus` models).
+pub const STATUS_UPDATING: &str = "UPDATING";
+
+/// How long a plan a mutating call put into a transient status stays there before the
+/// clock owes it its settled status.
+///
+/// The model publishes no duration for the transition and the service re-provisions the
+/// plan after the call has returned, so this span is the emulator's own. It is never
+/// zero: a caller acting straight after the mutating call observes the transient status
+/// — and the refusals it causes — exactly as it would on the real service.
+pub const TRANSIENT_STATUS_MILLIS: i64 = 500;
+
+/// A status the clock owes a plan: the value the plan takes once `due_millis` has
+/// passed, with no further call needed to make it due.
+#[derive(Debug, Clone)]
+pub struct PendingStatus {
+    /// The `RescoreExecutionPlanStatus` value the plan settles into.
+    pub status: String,
+    /// The instant the settled status comes due, Unix epoch milliseconds.
+    pub due_millis: i64,
+}
+
 /// The signing name / ARN namespace of this service, as the model's
 /// `aws.api#service` trait states it (see `OPERATIONS.md`).
 pub const ARN_NAMESPACE: &str = "kendra-ranking";
@@ -35,11 +59,52 @@ pub struct RescoreExecutionPlan {
     pub created_at_millis: i64,
     /// Last-update instant, Unix epoch milliseconds.
     pub updated_at_millis: i64,
-    /// A `RescoreExecutionPlanStatus` value.
+    /// A `RescoreExecutionPlanStatus` value. Read it through
+    /// [`status_at`](RescoreExecutionPlan::status_at), never directly: a transition the
+    /// clock already owes is held in `pending_status` until some call materialises it.
     pub status: String,
+    /// The status the clock owes this plan, while a transition is in flight; `None`
+    /// once the plan has settled.
+    pub pending_status: Option<PendingStatus>,
     /// Set only for a plan whose status is `FAILED`; absent otherwise.
     pub error_message: Option<String>,
     pub tags: Vec<Tag>,
+}
+
+impl RescoreExecutionPlan {
+    /// This plan's status as of `now_millis`: the pending status once the clock owes it,
+    /// otherwise the stored one.
+    ///
+    /// A reporting operation reads the status through this, so a transition that came
+    /// due is visible without the read having to write anything.
+    pub fn status_at(&self, now_millis: i64) -> &str {
+        match &self.pending_status {
+            Some(pending) if now_millis >= pending.due_millis => pending.status.as_str(),
+            _ => self.status.as_str(),
+        }
+    }
+
+    /// Materialise a transition the clock already owes, so a mutating call decides
+    /// against the same status a reader sees rather than a stale one.
+    pub fn settle_status(&mut self, now_millis: i64) {
+        if let Some(pending) = self.pending_status.take() {
+            if now_millis >= pending.due_millis {
+                self.status = pending.status;
+            } else {
+                self.pending_status = Some(pending);
+            }
+        }
+    }
+
+    /// Put this plan into `transient` now, with `settled` the status the clock owes it
+    /// [`TRANSIENT_STATUS_MILLIS`] later.
+    pub fn begin_transition(&mut self, transient: &str, settled: &str, now_millis: i64) {
+        self.status = transient.to_string();
+        self.pending_status = Some(PendingStatus {
+            status: settled.to_string(),
+            due_millis: now_millis.saturating_add(TRANSIENT_STATUS_MILLIS),
+        });
+    }
 }
 
 /// The number of rescore execution plans this emulator holds.

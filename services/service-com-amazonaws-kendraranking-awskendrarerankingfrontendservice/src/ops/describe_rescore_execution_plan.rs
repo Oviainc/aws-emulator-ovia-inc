@@ -188,6 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        let now = crate::state::now_millis();
         let Some(plan) = store.plans.get(&input.id) else {
             return Err(
                 DescribeRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
@@ -210,7 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capacity_units: plan.capacity_units.clone(),
             created_at: Some(crate::state::timestamp(plan.created_at_millis)),
             updated_at: Some(crate::state::timestamp(plan.updated_at_millis)),
-            status: Some(plan.status.clone()),
+            // A transition the clock already owes is reported as due, so a plan an
+            // update put into `UPDATING` reads back as `ACTIVE` once its span has
+            // passed, whether or not a later call materialised it.
+            status: Some(plan.status_at(now).to_string()),
             error_message: plan.error_message.clone(),
         })
     }
