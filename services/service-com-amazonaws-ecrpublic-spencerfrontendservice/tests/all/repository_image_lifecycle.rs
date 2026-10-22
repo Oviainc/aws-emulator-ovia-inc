@@ -1452,10 +1452,6 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
             json!({"repositoryName": "team/app"}),
         ),
         (
-            "InitiateLayerUpload",
-            json!({"repositoryName": "team/app"}),
-        ),
-        (
             "ListTagsForResource",
             json!({"resourceArn": format!("{ARN_PREFIX}team/app")}),
         ),
