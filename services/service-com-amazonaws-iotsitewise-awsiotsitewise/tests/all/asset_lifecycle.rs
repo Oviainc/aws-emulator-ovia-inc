@@ -155,7 +155,7 @@ pub(crate) async fn create_asset(
 /// one attribute. Source: `smithy_query(query="shape", shape="PropertyDataType")`
 /// — STRING | INTEGER | DOUBLE | BOOLEAN | STRUCT | VIDEO | ANNOTATION | JSON,
 /// of which the last four are not measurement types.
-fn property_catalog() -> Value {
+pub(crate) fn property_catalog() -> Value {
     json!([
         {"name": "Temperature", "dataType": "DOUBLE", "unit": "Celsius", "type": {"measurement": {}}},
         {"name": "Cycles", "dataType": "INTEGER", "unit": "Count", "type": {"measurement": {}}},

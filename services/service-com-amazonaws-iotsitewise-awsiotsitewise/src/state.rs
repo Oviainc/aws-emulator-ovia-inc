@@ -124,6 +124,19 @@ pub struct AssetRecord {
 }
 
 impl AssetRecord {
+    /// Where in `properties` the property a `CustomID` label names sits — a raw
+    /// property id, or `externalId:<externalId>` for one that carries an external
+    /// id — if this asset holds it.
+    pub fn property_position(&self, label: &str) -> Option<usize> {
+        match label.strip_prefix(EXTERNAL_ID_PREFIX) {
+            Some(external) => self
+                .properties
+                .iter()
+                .position(|property| property.external_id.as_deref() == Some(external)),
+            None => self.properties.iter().position(|property| property.id == label),
+        }
+    }
+
     /// The asset's status as of `now`; see [`AssetModelRecord::status`].
     pub fn status(&self, now: SystemTime) -> AssetStatus {
         AssetStatus {
@@ -201,6 +214,76 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             Some(external) => self.asset_external_ids.get(external).cloned(),
             None => self.assets.contains_key(label).then(|| label.to_string()),
         }
+    }
+
+    /// Make `alias` the one alias the `(asset_id, property_id)` property carries,
+    /// or remove the property's alias with `None`.
+    ///
+    /// A binding lives in TWO places — the stored property's `alias` member, which
+    /// `DescribeAsset` reports, and [`Self::property_alias_index`], which the alias
+    /// form of a property lookup resolves through — so both move together here and
+    /// nowhere else. The alias the property carried before is dropped from the
+    /// index (only when the index still attributes it to THIS property, so a
+    /// binding another property has since taken over survives).
+    ///
+    /// `asset_id` is a stored id, not a label: resolve it with
+    /// [`Self::resolve_asset_id`] first. `property_id` takes either `CustomID`
+    /// form. Answers `false` when no stored asset holds that property.
+    ///
+    /// A caller that binds an alias another property already carries displaces it:
+    /// that property's own `alias` member is cleared here too, so no two stored
+    /// properties can ever report one alias while the index names only the newer.
+    /// `UpdateAssetProperty` refuses such a request with the modelled conflict
+    /// before reaching this helper; this keeps the store consistent for any caller
+    /// whose own rule allows the rebind.
+    pub fn set_property_alias(
+        &mut self,
+        asset_id: &str,
+        property_id: &str,
+        alias: Option<String>,
+    ) -> bool {
+        let Some(asset) = self.assets.get_mut(asset_id) else {
+            return false;
+        };
+        let Some(at) = asset.property_position(property_id) else {
+            return false;
+        };
+        let property = &mut asset.properties[at];
+        let resolved_property_id = property.id.clone();
+        let previous = property.alias.take();
+        property.alias = alias.clone();
+
+        if let Some(previous) = previous {
+            let ours = self
+                .property_alias_index
+                .get(&previous)
+                .is_some_and(|(bound_asset, bound_property)| {
+                    bound_asset == asset_id && *bound_property == resolved_property_id
+                });
+            if ours {
+                self.property_alias_index.remove(&previous);
+            }
+        }
+        if let Some(alias) = alias {
+            // Whoever held this alias loses it, record and index together.
+            if let Some((held_by_asset, held_by_property)) =
+                self.property_alias_index.insert(
+                    alias,
+                    (asset_id.to_string(), resolved_property_id.clone()),
+                )
+            {
+                let displaced = held_by_asset != asset_id
+                    || held_by_property != resolved_property_id;
+                if displaced {
+                    if let Some(asset) = self.assets.get_mut(&held_by_asset) {
+                        if let Some(at) = asset.property_position(&held_by_property) {
+                            asset.properties[at].alias = None;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Append `value` to the `(asset_id, property_id)` series, keeping it sorted
@@ -317,6 +400,27 @@ pub fn asset_model_arn(region: &str, asset_model_id: &str) -> String {
 pub fn asset_arn(region: &str, asset_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("asset/{asset_id}"))
 }
+
+/// The MQTT topic IoT SiteWise publishes one asset property's value updates to.
+///
+/// The form is the one the IoT SiteWise User Guide documents for property-value
+/// update notifications ("Interacting with other AWS services"):
+/// `$aws/sitewise/asset-models/{assetModelId}/assets/{assetId}/properties/{propertyId}`.
+/// Built from the three ids, so the topic a property reports always names the
+/// property it belongs to rather than being stored and able to drift.
+pub fn property_notification_topic(
+    asset_model_id: &str,
+    asset_id: &str,
+    property_id: &str,
+) -> String {
+    format!(
+        "$aws/sitewise/asset-models/{asset_model_id}/assets/{asset_id}/properties/{property_id}"
+    )
+}
+
+/// The `PropertyNotificationState` a property takes when `UpdateAssetProperty`
+/// omits one: the model's own documented default for that member.
+pub const NOTIFICATION_STATE_DISABLED: &str = "DISABLED";
 
 /// How many ids this process has minted. Part of every id's seed, so no two
 /// minted ids collide even when two calls land in the same nanosecond.

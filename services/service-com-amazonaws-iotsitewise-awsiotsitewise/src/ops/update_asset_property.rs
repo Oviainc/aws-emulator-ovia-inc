@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssetProperty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssetProperty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssetProperty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation overwrites a stored asset property's alias,
+//! notification state and unit in the shared engine store (`crate::state`), and
+//! moves the alias index with it; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +195,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssetProperty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssetPropertyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssetProperty"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAssetPropertyError::Modeled(
+                UpdateAssetPropertyErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay — no token -> answer
+        // mapping is stored, as in `CreateAsset`. This operation is idempotent by
+        // construction anyway: it OVERWRITES the three members from the request, so
+        // a retry of the same request leaves the same property behind.
+        let mut store = state.lock();
+
+        // Both ids are `CustomID`s: a raw id, or `externalId:<externalId>`. The asset
+        // resolves through the shared resolver every other handler uses; the property
+        // resolves within that asset's materialised property list.
+        let asset_id = store
+            .resolve_asset_id(&input.asset_id)
+            .ok_or_else(|| not_found(format!("The asset {} could not be found.", input.asset_id)))?;
+        let asset = store
+            .assets
+            .get(&asset_id)
+            .ok_or_else(|| not_found(format!("The asset {} could not be found.", input.asset_id)))?;
+        let at = asset.property_position(&input.property_id).ok_or_else(|| {
+            not_found(format!(
+                "The asset {} has no property {}.",
+                input.asset_id, input.property_id
+            ))
+        })?;
+        let property_id = asset.properties[at].id.clone();
+        let asset_model_id = asset.asset_model_id.clone();
+
+        // An alias names ONE data stream, so it cannot stand for two properties at
+        // once: an alias another property already carries is the modelled conflict
+        // over that resource. Re-binding the alias a property already carries to that
+        // same property is not a conflict — it is the documented way to keep it.
+        if let Some(alias) = input.property_alias.as_deref() {
+            if let Some((bound_asset, bound_property)) = store.property_alias_index.get(alias) {
+                if bound_asset != &asset_id || bound_property != &property_id {
+                    let bound_asset = bound_asset.clone();
+                    let bound_property = bound_property.clone();
+                    let arn = store
+                        .assets
+                        .get(&bound_asset)
+                        .map(|asset| asset.arn.clone())
+                        // The index is only written beside a stored asset, so a
+                        // dangling entry cannot normally happen; the canonical ARN
+                        // of that id is still the honest answer, never a blank one.
+                        .unwrap_or_else(|| crate::state::asset_arn(&region, &bound_asset));
+                    return Err(UpdateAssetPropertyError::Modeled(
+                        UpdateAssetPropertyErrorModeled::ConflictingOperationException(
+                            ConflictingOperationException {
+                                message: format!(
+                                    "The property alias {alias} is already associated with \
+                                     property {bound_property} of asset {bound_asset}."
+                                ),
+                                resource_id: bound_asset,
+                                resource_arn: arn,
+                            },
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Every member this operation takes OVERWRITES what the property carried,
+        // and an omitted one takes the documented default rather than keeping the
+        // stored value:
+        //  * `propertyAlias` omitted -> the alias is removed from the property;
+        //  * `propertyNotificationState` omitted -> the state is set to `DISABLED`;
+        //  * `propertyUnit` omitted -> the unit falls back to the one the asset
+        //    model's property definition carries.
+        let notification_state = input
+            .property_notification_state
+            .clone()
+            .unwrap_or_else(|| crate::state::NOTIFICATION_STATE_DISABLED.to_string());
+        let unit = match input.property_unit.clone() {
+            Some(unit) => Some(unit),
+            None => store
+                .asset_models
+                .get(&asset_model_id)
+                .and_then(|model| {
+                    model
+                        .properties
+                        .iter()
+                        .find(|property| property.id.as_deref() == Some(property_id.as_str()))
+                })
+                .and_then(|property| property.unit.clone()),
+        };
+        let topic =
+            crate::state::property_notification_topic(&asset_model_id, &asset_id, &property_id);
+
+        // The alias moves through the state helper, so the property's `alias` member
+        // and the alias index cannot disagree. Both lookups resolved above under
+        // this same lock, so a miss here would mean the store changed under it:
+        // reported as the modelled server failure rather than answered 200 after a
+        // partial write.
+        if !store.set_property_alias(&asset_id, &property_id, input.property_alias.clone()) {
+            return Err(store_moved(&asset_id, &property_id));
+        }
+        let Some(asset) = store.assets.get_mut(&asset_id) else {
+            return Err(store_moved(&asset_id, &property_id));
+        };
+        let Some(at) = asset.property_position(&property_id) else {
+            return Err(store_moved(&asset_id, &property_id));
+        };
+        let property = &mut asset.properties[at];
+        property.notification = Some(PropertyNotification {
+            topic,
+            state: notification_state,
+        });
+        property.unit = unit;
+        // The asset carries the property that just changed, so its last-update
+        // instant moves with it.
+        asset.last_update_date = now;
+
+        Ok(UpdateAssetPropertyOutput)
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> UpdateAssetPropertyError {
+    UpdateAssetPropertyError::Modeled(
+        UpdateAssetPropertyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message,
+        }),
+    )
+}
+
+/// HTTP 500 `InternalFailureException` for a property that resolved while the
+/// write was being prepared and no longer resolves while it is applied.
+fn store_moved(asset_id: &str, property_id: &str) -> UpdateAssetPropertyError {
+    UpdateAssetPropertyError::Modeled(
+        UpdateAssetPropertyErrorModeled::InternalFailureException(InternalFailureException {
+            message: format!(
+                "The property {property_id} of asset {asset_id} stopped resolving while the \
+                 update was being applied."
+            ),
+        }),
+    )
 }
