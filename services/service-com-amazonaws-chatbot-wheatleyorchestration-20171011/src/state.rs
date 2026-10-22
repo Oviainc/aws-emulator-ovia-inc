@@ -7,13 +7,15 @@
 //! request's region, and the record -> modelled-shape projection). Handlers reach it
 //! through [`service_state`]; nothing here is per-request.
 //!
-//! It also owns the registry of Slack workspaces AUTHORIZED with the account, which a
-//! channel configuration has to name one of — see [`seed_slack_workspaces`] for how a
-//! workspace gets into it, given that no operation in this model authorizes one.
+//! It also owns the registries of chat workspaces AUTHORIZED with the account — Slack
+//! workspaces, which a channel configuration has to name one of, and Microsoft Teams
+//! teams, which `ListMicrosoftTeamsConfiguredTeams` reports. See
+//! [`seed_slack_workspaces`] and [`seed_microsoft_teams_configured_teams`] for how an
+//! authorization gets into them, given that no operation in this model creates one.
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{SlackChannelConfiguration, SlackWorkspace, Tag};
+use crate::ops::types::{ConfiguredTeam, SlackChannelConfiguration, SlackWorkspace, Tag};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. `us-east-1` is the emulator-wide default region.
@@ -71,6 +73,19 @@ pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     ///
     /// Populated out of band; see [`seed_slack_workspaces`].
     slack_workspace_authorizations: BTreeMap<String, SlackWorkspaceRecord>,
+    /// The Microsoft Teams teams AUTHORIZED with this account, keyed by `TeamId`.
+    ///
+    /// The Microsoft Teams counterpart of `slack_workspace_authorizations`: a team is
+    /// authorized by the one-time Microsoft Teams client handshake the AWS Chatbot
+    /// console drives, which no operation in this model performs, so membership of this
+    /// map — and nothing about the spelling of a `TeamId` — is what decides whether a
+    /// team is configured with this account.
+    ///
+    /// `BTreeMap` so `ListMicrosoftTeamsConfiguredTeams` walks the teams in one stable
+    /// total order and can resume that walk from an opaque token.
+    ///
+    /// Populated out of band; see [`seed_microsoft_teams_configured_teams`].
+    microsoft_teams_authorizations: BTreeMap<String, MicrosoftTeamsConfiguredTeamRecord>,
 }
 
 impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
@@ -80,6 +95,10 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
             slack_workspace_authorizations: seed_slack_workspaces()
                 .into_iter()
                 .map(|workspace| (workspace.slack_team_id.clone(), workspace))
+                .collect(),
+            microsoft_teams_authorizations: seed_microsoft_teams_configured_teams()
+                .into_iter()
+                .map(|team| (team.team_id.clone(), team))
                 .collect(),
         }
     }
@@ -125,6 +144,53 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
         };
         self.slack_workspace_authorizations
             .insert(slack_team_id.to_string(), record.clone());
+        record
+    }
+
+    /// The authorized Microsoft Teams team `team_id` names, or `None` when no team with
+    /// that id is configured with this account.
+    ///
+    /// The lookup every Microsoft Teams operation addressed by `TeamId` resolves
+    /// through, so one registry decides what is configured.
+    pub fn microsoft_teams_configured_team(
+        &self,
+        team_id: &str,
+    ) -> Option<&MicrosoftTeamsConfiguredTeamRecord> {
+        self.microsoft_teams_authorizations.get(team_id)
+    }
+
+    /// Every configured Microsoft Teams team, in `TeamId` order.
+    pub fn microsoft_teams_configured_teams(
+        &self,
+    ) -> impl Iterator<Item = &MicrosoftTeamsConfiguredTeamRecord> {
+        self.microsoft_teams_authorizations.values()
+    }
+
+    /// Record `team_id`, in the Microsoft Teams tenant `tenant_id`, as a team authorized
+    /// with this account under the display name `team_name`, and hand back the record now
+    /// stored for it.
+    ///
+    /// The out-of-band authorization channel described on
+    /// `microsoft_teams_authorizations`: on AWS a team is authorized by the one-time
+    /// Microsoft Teams client handshake the AWS Chatbot console drives, which no
+    /// operation in this model performs, so nothing a client sends over the wire reaches
+    /// here. Authorizing a team that is already authorized REPLACES its tenant and
+    /// display name: one team id, one authorization.
+    pub fn authorize_microsoft_teams_team(
+        &mut self,
+        tenant_id: &str,
+        team_id: &str,
+        team_name: Option<&str>,
+    ) -> MicrosoftTeamsConfiguredTeamRecord {
+        let record = MicrosoftTeamsConfiguredTeamRecord {
+            tenant_id: tenant_id.to_string(),
+            team_id: team_id.to_string(),
+            team_name: team_name.map(str::to_string),
+            state: STATE_ENABLED.to_string(),
+            state_reason: None,
+        };
+        self.microsoft_teams_authorizations
+            .insert(team_id.to_string(), record.clone());
         record
     }
 }
@@ -198,6 +264,76 @@ pub fn unauthorized_slack_workspace_message(slack_team_id: &str) -> String {
          https://docs.aws.amazon.com/chatbot/latest/adminguide/slack-setup.html#slack-client-setup",
         ::emulator_server::emulator_account_id()
     )
+}
+
+/// One authorized Microsoft Teams team: what `ListMicrosoftTeamsConfiguredTeams`
+/// reports and what a Microsoft Teams channel configuration is bound to.
+#[derive(Debug, Clone, Default)]
+pub struct MicrosoftTeamsConfiguredTeamRecord {
+    /// The Microsoft Teams tenant the team belongs to.
+    pub tenant_id: String,
+    pub team_id: String,
+    /// The team's display name. Optional on the modelled `ConfiguredTeam`, so a stored
+    /// authorization that carries none reports none rather than an invented name.
+    pub team_name: Option<String>,
+    /// `ENABLED` or `DISABLED`; see [`STATE_ENABLED`].
+    pub state: String,
+    pub state_reason: Option<String>,
+}
+
+impl MicrosoftTeamsConfiguredTeamRecord {
+    /// Project the stored authorization onto the modelled `ConfiguredTeam`.
+    pub fn view(&self) -> ConfiguredTeam {
+        ConfiguredTeam {
+            tenant_id: self.tenant_id.clone(),
+            team_id: self.team_id.clone(),
+            team_name: self.team_name.clone(),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+        }
+    }
+}
+
+/// The Microsoft Teams teams this store starts out holding an authorization for.
+///
+/// A team becomes authorized with an AWS account through the one-time Microsoft Teams
+/// client handshake in the AWS Chatbot console. NO operation in this model performs it:
+/// `ListMicrosoftTeamsConfiguredTeams` lists the authorizations and
+/// `DeleteMicrosoftTeamsConfiguredTeam` removes one, and neither creates one. Without a
+/// seed the registry would therefore be empty for good, so the teams below are a fixture
+/// standing in for that handshake: a client can discover them with
+/// `ListMicrosoftTeamsConfiguredTeams`. A test (or an admin path) registers its own with
+/// [`ComAmazonawsChatbotWheatleyorchestration20171011State::authorize_microsoft_teams_team`].
+///
+/// Every id and name satisfies the model's `UUID` shape (`smithy_query` shape=UUID:
+/// `length 36..36`, `pattern ^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$`),
+/// which `ConfiguredTeam`'s `TenantId`, `TeamId` AND `TeamName` all target — so the
+/// display name is UUID-shaped too, because that is what this service's model says that
+/// member carries.
+pub fn seed_microsoft_teams_configured_teams() -> Vec<MicrosoftTeamsConfiguredTeamRecord> {
+    [
+        (
+            "11111111-1111-1111-1111-111111111111",
+            "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+            "c0ffee00-0001-4000-8000-000000000001",
+        ),
+        (
+            "11111111-1111-1111-1111-111111111111",
+            "f1e2d3c4-b5a6-4987-8765-43210fedcba9",
+            "c0ffee00-0002-4000-8000-000000000002",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(tenant_id, team_id, team_name)| MicrosoftTeamsConfiguredTeamRecord {
+            tenant_id: tenant_id.to_string(),
+            team_id: team_id.to_string(),
+            team_name: Some(team_name.to_string()),
+            state: STATE_ENABLED.to_string(),
+            state_reason: None,
+        },
+    )
+    .collect()
 }
 
 /// One stored Slack channel configuration: everything a later `Describe`, `Update`,
@@ -330,5 +466,29 @@ pub fn authorize_slack_workspace<Eng: Send + Sync + 'static>(
     let record = state
         .lock()
         .authorize_slack_workspace(slack_team_id, slack_team_name);
+    Some(record)
+}
+
+/// Authorize the Microsoft Teams team `team_id`, in tenant `tenant_id` and under the
+/// display name `team_name`, with this account in `engine`'s store.
+///
+/// The engine-level form of
+/// [`ComAmazonawsChatbotWheatleyorchestration20171011State::authorize_microsoft_teams_team`],
+/// for a fixture (or an admin path) that holds the shared engine rather than the store:
+/// the Microsoft Teams client handshake that authorizes a team on AWS has no operation in
+/// this model, so this is the only way one gets authorized.
+///
+/// Answers `None` when `engine` is not the shared [`::engine::InMemoryEngine`] (so there
+/// is no store to write), otherwise the record now stored for the team.
+pub fn authorize_microsoft_teams_team<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    tenant_id: &str,
+    team_id: &str,
+    team_name: Option<&str>,
+) -> Option<MicrosoftTeamsConfiguredTeamRecord> {
+    let state = service_state(engine)?;
+    let record = state
+        .lock()
+        .authorize_microsoft_teams_team(tenant_id, team_id, team_name);
     Some(record)
 }
