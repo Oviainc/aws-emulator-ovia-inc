@@ -10,7 +10,7 @@
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarms`] and
 //!   [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarm_history`] — the
 //!   metric-alarm lifecycle written by `PutMetricAlarm` / `SetAlarmState` / `DeleteAlarms`
-//!   and read by `DescribeAlarms`.
+//!   and read by `DescribeAlarms` and `DescribeAlarmHistory`.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metric_streams`] — the
 //!   metric streams written by `PutMetricStream` and read back by `GetMetricStream`.
 //!
@@ -104,6 +104,22 @@ pub struct StoredAlarm {
     pub tags: Vec<Tag>,
 }
 
+/// A stored alarm history item: the modelled shape `DescribeAlarmHistory` returns, plus the
+/// store-wide sequence number it was recorded under.
+///
+/// The sequence number is the item's STABLE identity. It is what `DescribeAlarmHistory`
+/// pages on: it never changes once assigned, so a cursor minted from it keeps naming the
+/// same item even after retention has removed older items, which a position in the vector
+/// would not. It also breaks a tie between two items recorded in the same instant, so the
+/// reporting order is total.
+#[derive(Debug, Clone, Default)]
+pub struct StoredHistoryItem {
+    /// The order this item was recorded in, across every alarm.
+    pub sequence: u64,
+    /// The item as `DescribeAlarmHistory` reports it.
+    pub item: AlarmHistoryItem,
+}
+
 /// A stored metric stream: the modelled shape `GetMetricStream` returns, plus the tags
 /// `PutMetricStream` accepted (no `GetMetricStreamOutput` member carries them).
 #[derive(Debug, Clone, Default)]
@@ -123,7 +139,9 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// Metric alarms by alarm name.
     pub alarms: HashMap<String, StoredAlarm>,
     /// Alarm history by alarm name, in append order.
-    pub alarm_history: HashMap<String, Vec<AlarmHistoryItem>>,
+    pub alarm_history: HashMap<String, Vec<StoredHistoryItem>>,
+    /// The sequence number the next recorded history item takes.
+    pub next_history_sequence: u64,
     /// Metric streams by stream name.
     pub metric_streams: HashMap<String, StoredMetricStream>,
 }
@@ -238,6 +256,15 @@ pub const MAX_ALARMS: usize = 5_000;
 /// so repeated configuration or state updates cannot grow memory without limit.
 pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;
 
+/// The largest number of ALARMS whose history this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota, and a separate one from [`MAX_ALARMS`]: an alarm's
+/// history outlives the alarm itself, so the number of histories is not bounded by how many
+/// alarms exist and has to be bounded here — the records live in this process's memory, so
+/// their number has to be finite. Reaching it evicts the history whose NEWEST item is the
+/// oldest, the same direction retention ages history out in, so recent reads stay exact.
+pub const MAX_ALARM_HISTORIES: usize = 10_000;
+
 /// The largest number of metric streams this in-memory store holds.
 ///
 /// A capacity bound, not an AWS quota: the stream records live in this process's memory, so
@@ -277,27 +304,76 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         Ok(())
     }
 
-    /// Record an alarm history item, so `DescribeAlarmHistory` can be layered on later
-    /// without re-plumbing the writers.
+    /// Record an alarm history item, read back by `DescribeAlarmHistory`.
     ///
-    /// The alarm's history is bounded on every append: items past the 14-day retention
-    /// window the service documents are dropped (an expiry the clock already made due), and
-    /// what remains is trimmed to [`MAX_HISTORY_ITEMS_PER_ALARM`], oldest first.
+    /// The history is bounded on every append: THIS alarm's items past the retention window
+    /// are dropped and what remains for it is trimmed to [`MAX_HISTORY_ITEMS_PER_ALARM`],
+    /// oldest first, while the store-wide sweep stays on the read path
+    /// ([`Self::expire_history`]) so one append never re-scans every retained item.
     pub fn record_history(&mut self, alarm_name: &str, now_secs: f64, item: AlarmHistoryItem) {
+        // A history for an alarm this store holds none for yet needs a slot, so make one by
+        // evicting the least recently written history when the store is already full.
+        while !self.alarm_history.contains_key(alarm_name)
+            && self.alarm_history.len() >= MAX_ALARM_HISTORIES
+            && self.evict_oldest_history()
+        {}
+        let sequence = self.next_history_sequence;
+        self.next_history_sequence = sequence.wrapping_add(1);
         let history = self
             .alarm_history
             .entry(alarm_name.to_string())
             .or_default();
-        history.retain(|item| {
-            item.timestamp
-                .as_ref()
-                .is_none_or(|stamp| now_secs - from_timestamp(stamp) <= ALARM_HISTORY_RETENTION_SECS)
-        });
-        history.push(item);
+        history.retain(|stored| within_retention(stored, now_secs));
+        history.push(StoredHistoryItem { sequence, item });
         if history.len() > MAX_HISTORY_ITEMS_PER_ALARM {
             history.drain(..history.len() - MAX_HISTORY_ITEMS_PER_ALARM);
         }
     }
+
+    /// Drop the history whose newest item is the oldest, reporting whether one was dropped.
+    ///
+    /// The capacity valve behind [`MAX_ALARM_HISTORIES`]: retention alone cannot bound the
+    /// NUMBER of histories, because a history is retained for its full window even after its
+    /// alarm is deleted.
+    fn evict_oldest_history(&mut self) -> bool {
+        let stalest = self
+            .alarm_history
+            .iter()
+            .min_by(|left, right| newest_sequence(left.1).cmp(&newest_sequence(right.1)))
+            .map(|(alarm_name, _)| alarm_name.clone());
+        stalest.is_some_and(|alarm_name| self.alarm_history.remove(&alarm_name).is_some())
+    }
+
+    /// Drop every history item older than [`ALARM_HISTORY_RETENTION_SECS`], and every alarm
+    /// whose history is empty once they are gone.
+    ///
+    /// This is an expiry the CLOCK already made due: an item 14 days old has aged out at
+    /// this instant whether or not anybody called, which is why a reporting operation may
+    /// materialise it. History outlives its alarm (`DescribeAlarmHistory`: "CloudWatch
+    /// retains the history of an alarm even if you delete the alarm"), so retention is the
+    /// only thing that ever removes it.
+    pub fn expire_history(&mut self, now_secs: f64) {
+        self.alarm_history.retain(|_, history| {
+            history.retain(|stored| within_retention(stored, now_secs));
+            !history.is_empty()
+        });
+    }
+}
+
+/// Whether one stored history item is still inside [`ALARM_HISTORY_RETENTION_SECS`] at
+/// `now_secs`. An item carrying no time stamp has no age to age out of.
+fn within_retention(stored: &StoredHistoryItem, now_secs: f64) -> bool {
+    stored
+        .item
+        .timestamp
+        .as_ref()
+        .is_none_or(|stamp| now_secs - from_timestamp(stamp) <= ALARM_HISTORY_RETENTION_SECS)
+}
+
+/// The sequence number of the most recently recorded item in one alarm's history; `0` for an
+/// empty history, which sorts it first for eviction.
+fn newest_sequence(history: &[StoredHistoryItem]) -> u64 {
+    history.last().map_or(0, |stored| stored.sequence)
 }
 
 /// The store cannot hold another resource of this kind; the caller answers with its own

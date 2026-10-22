@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAlarmHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAlarmHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the alarm history that this service's alarm writers (`PutMetricAlarm`,
+//! `SetAlarmState`) recorded in
+//! [`crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarm_history`]:
+//! filtered by alarm name, alarm type, history item type, contributor and date range,
+//! ordered by time stamp in the direction `ScanBy` asks for, and paged with `MaxRecords` /
+//! `NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAlarmHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: it reports what the writers persisted and materialises only the 14-day retention
+//! the clock has already made due ([`crate::state::ALARM_HISTORY_RETENTION_SECS`]).
 //!
 //! ## Shape of an operation
 //!
@@ -103,10 +103,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `DescribeAlarmHistoryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DescribeAlarmHistory")]
+//
+// `InternalServiceFault` is widened in: it is THIS service's own server fault (every
+// metric operation declares it), and it is the only honest answer when the shared store
+// cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DescribeAlarmHistory",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeAlarmHistoryErrorModeled {
     InvalidNextToken(InvalidNextToken),
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -160,18 +168,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAlarmHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAlarmHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAlarmHistory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAlarmHistoryErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        // `MaxRecords` is modelled `range 1..100`, so 100 is the most a caller can ask for
+        // and the only default that cannot exceed what the model permits.
+        const MAX_RECORDS_CAP: i32 = 100;
+        // "If you omit this parameter, only metric alarms are returned."
+        // (DescribeAlarmHistoryInput$AlarmTypes)
+        const DEFAULT_ALARM_TYPE: &str = "MetricAlarm";
+        // `ScanBy` (one of TimestampAscending | TimestampDescending): the model states no
+        // default and CloudWatch reports alarm history newest-first, so anything other than
+        // an explicit `TimestampAscending` is answered newest-first.
+        const SCAN_ASCENDING: &str = "TimestampAscending";
+
+        // A `NextToken` this service did not mint is refused before anything is read, so a
+        // bogus token never silently answers the first page.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                DescribeAlarmHistoryErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some("NextToken is not a token this service issued".into()),
+                })
+            })?),
+        };
+
+        let start_date = input.start_date.as_ref().map(crate::state::from_timestamp);
+        let end_date = input.end_date.as_ref().map(crate::state::from_timestamp);
+        if let (Some(start), Some(end)) = (start_date, end_date) {
+            if start > end {
+                // `StartDate` and `EndDate` bound ONE range, so an inverted range is a
+                // request the service cannot answer and the model declares no error for.
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "StartDate must not be later than EndDate",
+                ));
+            }
+        }
+
+        let default_types = [DEFAULT_ALARM_TYPE.to_string()];
+        let wanted_types: &[String] = match input.alarm_types.as_deref() {
+            Some(types) if !types.is_empty() => types,
+            _ => &default_types,
+        };
+        let ascending = input.scan_by.as_deref() == Some(SCAN_ASCENDING);
+
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+        // Retention is due on the clock, not on this call: drop what has aged out of the
+        // retention window before reporting, so a read never reports an expired item.
+        store.expire_history(now);
+
+        let mut selected: Vec<(String, &AlarmHistoryItem)> = Vec::new();
+        // "If an alarm name is not specified, the histories for either all metric alarms or
+        // all composite alarms are returned." The store is KEYED by alarm name, so naming
+        // one alarm is a lookup rather than a scan.
+        let histories: Vec<&Vec<crate::state::StoredHistoryItem>> = match input.alarm_name.as_deref()
+        {
+            Some(alarm_name) => store.alarm_history.get(alarm_name).into_iter().collect(),
+            None => store.alarm_history.values().collect(),
+        };
+        for history in histories {
+            for stored in history {
+                let item = &stored.item;
+                // Only an item whose own alarm type is one of the requested types is
+                // reported, so an item carrying no alarm type is reported under none.
+                if !item
+                    .alarm_type
+                    .as_deref()
+                    .is_some_and(|kind| wanted_types.iter().any(|wanted| wanted == kind))
+                {
+                    continue;
+                }
+                if input
+                    .history_item_type
+                    .as_deref()
+                    .is_some_and(|wanted| item.history_item_type.as_deref() != Some(wanted))
+                {
+                    continue;
+                }
+                if input
+                    .alarm_contributor_id
+                    .as_deref()
+                    .is_some_and(|wanted| item.alarm_contributor_id.as_deref() != Some(wanted))
+                {
+                    continue;
+                }
+                // An item outside the requested date range is not reported, and an item
+                // carrying no time stamp is in no range at all.
+                let stamp = item.timestamp.as_ref().map(crate::state::from_timestamp);
+                if start_date.is_some_and(|start| stamp.is_none_or(|stamp| stamp < start)) {
+                    continue;
+                }
+                if end_date.is_some_and(|end| stamp.is_none_or(|stamp| stamp > end)) {
+                    continue;
+                }
+                selected.push((
+                    history_cursor(stamp.unwrap_or_default(), stored.sequence),
+                    item,
+                ));
+            }
+        }
+
+        // ONE total order over the selected items, by time stamp in the direction `ScanBy`
+        // asked for. It is both the reporting order and the paging order: a token names the
+        // item the next page starts at, so paging always advances.
+        if ascending {
+            selected.sort_by(|left, right| left.0.cmp(&right.0));
+        } else {
+            selected.sort_by(|left, right| right.0.cmp(&left.0));
+        }
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(key, _)| {
+                if ascending {
+                    key.as_str() < cursor
+                } else {
+                    key.as_str() > cursor
+                }
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        let limit = usize::try_from(
+            input
+                .max_records
+                .unwrap_or(MAX_RECORDS_CAP)
+                .clamp(1, MAX_RECORDS_CAP),
+        )
+        .unwrap_or(1);
+        let next_token = page
+            .get(limit)
+            .map(|(key, _)| crate::state::encode_page_token(key));
+
+        Ok(DescribeAlarmHistoryOutput {
+            alarm_history_items: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(_, item)| (*item).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The sort and paging key of one stored history item.
+///
+/// Time stamp first, zero-padded to a fixed width so comparing the strings compares the
+/// instants (a stored item's time stamp comes from this service's own clock, so it is never
+/// negative and never wider than the padding — which the `debug_assert` holds the format to);
+/// then the item's store-wide sequence number, which breaks a tie between two items recorded
+/// in the same instant and, unlike a position in the stored history, never shifts when
+/// retention removes an older item — so a token keeps naming the same item for as long as
+/// that item exists.
+fn history_cursor(timestamp_secs: f64, sequence: u64) -> String {
+    let secs = timestamp_secs.max(0.0);
+    let stamp = format!("{secs:017.6}");
+    debug_assert_eq!(
+        stamp.len(),
+        17,
+        "a cursor's time stamp field has to stay fixed-width for comparing cursors to compare \
+         instants, got {stamp}"
+    );
+    format!("{stamp}#{sequence:020}")
 }

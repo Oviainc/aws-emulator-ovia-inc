@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the resource-based policy attached to the table named by
+//! `ResourceArn` and reports the revision id of what was removed, so a later
+//! `GetResourcePolicy` answers `PolicyNotFoundException` and the data plane stops
+//! refusing what that policy denied.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Idempotent, as the doc below states: "running it multiple times on the same
+//! resource doesn't result in an error response" — a resource carrying no policy is a
+//! success with no `RevisionId`. `ExpectedRevisionId` is the one exception: it "will
+//! then return a PolicyNotFoundException" when no policy matches it.
+//!
+//! DynamoDB "ensures that the root principal of your Amazon Web Services account can
+//! perform DeleteResourcePolicy requests, even if your resource-based policy explicitly
+//! denies the root principal's access" — and the root principal is the only identity
+//! this emulator has ([`crate::state::caller_principal`]) — so the attached policy is
+//! not evaluated against this call.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +188,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let resource =
+            crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store
+            .table_mut(&resource.region, &resource.table)
+            .map_err(lift)?;
+        // "When you provide an expected revision ID, if the revision ID of the existing
+        // policy on the resource doesn't match or if there's no policy attached to the
+        // resource, the request will fail and return a PolicyNotFoundException"
+        // (`DeleteResourcePolicy$ExpectedRevisionId`).
+        if let Some(expected) = input.expected_revision_id.as_deref() {
+            let matches = table
+                .resource_policy
+                .as_ref()
+                .is_some_and(|policy| policy.revision_id == expected);
+            if !matches {
+                return Err(
+                    DeleteResourcePolicyErrorModeled::PolicyNotFoundException(
+                        PolicyNotFoundException {
+                            message: Some(format!(
+                                "No resource-based policy with the expected revision id is \
+                                 attached to {}",
+                                input.resource_arn
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        let removed = table.resource_policy.take();
+
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %resource.table,
+            outcome = if removed.is_some() { "removed" } else { "absent" },
+            "resource-based policy deleted"
+        );
+
+        // "This value will be empty if you make a request against a resource without a
+        // policy" (`DeleteResourcePolicyOutput$RevisionId`).
+        Ok(DeleteResourcePolicyOutput {
+            revision_id: removed.map(|policy| policy.revision_id),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> DeleteResourcePolicyError {
+    DeleteResourcePolicyErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> DeleteResourcePolicyError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }
