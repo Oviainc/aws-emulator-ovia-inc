@@ -214,71 +214,91 @@ const SQLSERVER_ENGINES: &[&str] = &[
 const SQLSERVER_FULL_EDITIONS: &[&str] = &["sqlserver-ee", "sqlserver-se"];
 
 /// `MARIADB_AUDIT_PLUGIN`'s settings, as the MariaDB Audit Plugin option table
-/// publishes them.
+/// publishes them: NINE settings, including the `SERVER_AUDIT` setting that loads the
+/// plugin itself, which is published as not modifiable and so always reports its
+/// published default `FORCE_PLUS_PERMANENT`.
+///
+/// The rows carry the published value lists rather than the engine's own: the plugin's
+/// `server_audit_events` variable accepts a `TABLE` class that this option does not
+/// publish, and `server_audit_logging` is published with the single allowed value `ON`
+/// because RDS loads the plugin with logging on and does not let a group turn it off.
+/// `SERVER_AUDIT_FILE_PATH` reports the RDS audit-log directory, which is likewise not
+/// a group's to change.
+///
+/// Each row's `Description` is the wording published for that setting — the audit
+/// plugin's own documented variable description where it has one.
 const MARIADB_AUDIT_PLUGIN_SETTINGS: &[OptionSettingFacts] = &[
-    collection_setting(
-        "SERVER_AUDIT_EVENTS",
-        "The event classes recorded in the audit log.",
+    fixed_setting(
+        "SERVER_AUDIT_LOGGING",
+        "Determines if logging is turned on",
         DYNAMIC,
         STRING,
-        "CONNECT,QUERY",
-        "CONNECT,QUERY,QUERY_DDL,QUERY_DML,QUERY_DML_NO_SELECT,QUERY_DCL,TABLE",
-    ),
-    collection_setting(
-        "SERVER_AUDIT_EXCL_USERS",
-        "The users whose activity is not recorded in the audit log.",
-        DYNAMIC,
-        STRING,
-        "",
-        "",
+        "ON",
+        "ON",
     ),
     collection_setting(
         "SERVER_AUDIT_INCL_USERS",
-        "The users whose activity is recorded in the audit log.",
+        "Include specified users",
         DYNAMIC,
         STRING,
         "",
         "",
     ),
     fixed_setting(
-        "SERVER_AUDIT_FILE_PATH",
-        "The path of the audit log file.",
+        "SERVER_AUDIT",
+        "Forces the plugin to be loaded.",
         STATIC,
         STRING,
-        "RDS_AUDIT",
-        "",
+        "FORCE_PLUS_PERMANENT",
+        "FORCE_PLUS_PERMANENT",
+    ),
+    setting(
+        "SERVER_AUDIT_QUERY_LOG_LIMIT",
+        "Limit on the length of the query string in a record.",
+        DYNAMIC,
+        INTEGER,
+        "1024",
+        "0-2147483647",
     ),
     setting(
         "SERVER_AUDIT_FILE_ROTATE_SIZE",
-        "The size in bytes at which an audit log file is rotated.",
+        "Maximum size of the log to start the rotation.",
         DYNAMIC,
         INTEGER,
         "1000000",
         "1-1000000000",
     ),
+    fixed_setting(
+        "SERVER_AUDIT_FILE_PATH",
+        "Path to the log file.",
+        DYNAMIC,
+        STRING,
+        "/rdsdbdata/log/audit/",
+        "",
+    ),
+    collection_setting(
+        "SERVER_AUDIT_EVENTS",
+        "Types of actions to be logged (connect, query, or table)",
+        DYNAMIC,
+        STRING,
+        "CONNECT,QUERY",
+        "CONNECT,QUERY,QUERY_DDL,QUERY_DML,QUERY_DCL,QUERY_DML_NO_SELECT",
+    ),
+    collection_setting(
+        "SERVER_AUDIT_EXCL_USERS",
+        "Exclude specified users",
+        DYNAMIC,
+        STRING,
+        "",
+        "",
+    ),
     setting(
         "SERVER_AUDIT_FILE_ROTATIONS",
-        "The number of rotated audit log files kept.",
+        "Number of rotations before log is removed.",
         DYNAMIC,
         INTEGER,
         "9",
         "0-100",
-    ),
-    fixed_setting(
-        "SERVER_AUDIT_LOGGING",
-        "Whether audit logging is enabled.",
-        STATIC,
-        STRING,
-        "ON",
-        "ON,OFF",
-    ),
-    setting(
-        "SERVER_AUDIT_QUERY_LOG_LIMIT",
-        "The number of characters of a query recorded in the audit log.",
-        DYNAMIC,
-        INTEGER,
-        "1024",
-        "0-2147483647",
     ),
 ];
 

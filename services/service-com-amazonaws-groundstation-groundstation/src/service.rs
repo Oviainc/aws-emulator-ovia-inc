@@ -96,17 +96,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // AWS Ground Station sits behind a request validator that refuses a body
+        // failing the model's own rules — an absent required member, or a value
+        // outside a declared bound — as HTTP 400 `BadRequestException` with the fixed
+        // text below, rather than echoing the constraint that failed. The error CODE is
+        // what an SDK resolves the error shape from and what a client branches on, and
+        // `ValidationException` (the framework's default, and no error this service
+        // models) is caught by nobody, so both the code and the message are replaced
+        // here together. An authentication refusal is not this validator's, so it keeps
+        // the framework's 403 wording.
+        match refusal {
+            Refusal::Invalid(_) => Some(Refused {
+                code: crate::state::BAD_REQUEST_ERROR_CODE.to_string(),
+                message: crate::state::INVALID_REQUEST_BODY.to_string(),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
