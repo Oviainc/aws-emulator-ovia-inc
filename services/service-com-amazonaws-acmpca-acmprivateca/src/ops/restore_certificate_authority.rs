@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RestoreCertificateAuthorityErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("the certificate authority {arn} was not found")),
+                        message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into(),

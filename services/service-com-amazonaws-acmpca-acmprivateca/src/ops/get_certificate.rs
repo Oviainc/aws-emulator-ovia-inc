@@ -189,9 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let Some(record) = state.certificate_authority_mut(&ca_arn, now) else {
-            return Err(not_found(format!(
-                "the certificate authority {ca_arn} was not found"
-            )));
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
         if record.status == crate::state::STATUS_CREATING {
             return Err(GetCertificateErrorModeled::RequestInProgressException(

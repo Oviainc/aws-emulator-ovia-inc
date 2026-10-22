@@ -21,6 +21,8 @@ mod delete_certificate_authority;
 mod permissions;
 #[path = "all/private_ca_lifecycle.rs"]
 mod private_ca_lifecycle;
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
 #[path = "all/resource_policy_read.rs"]
 mod resource_policy_read;
 #[path = "all/restore_certificate_authority.rs"]

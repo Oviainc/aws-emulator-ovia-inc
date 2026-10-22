@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +183,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPolicy"))
+        let _ = ctx;
+        let arn = input.resource_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(PutPolicyErrorModeled::InvalidArnException(InvalidArnException {
+                message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        // The document is judged before the CA is read: whether this is a policy at all
+        // does not depend on which CA it was addressed to.
+        if !crate::state::is_well_formed_policy(&input.policy) {
+            return Err(PutPolicyErrorModeled::InvalidPolicyException(
+                InvalidPolicyException {
+                    message: Some(crate::state::INVALID_POLICY_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutPolicyErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The lookup also materialises the CREATING -> PENDING_CERTIFICATE change the
+        // clock already owed, so the CA this call acts on is the one it is at this
+        // instant.
+        let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
+        else {
+            return Err(ca_not_found());
+        };
+
+        // "The policy can be displayed with GetPolicy and removed with DeletePolicy":
+        // one policy per CA, so attaching replaces whatever was attached before. No
+        // status gate: nothing recorded says a CA refuses a policy before its certificate
+        // is imported, and `GetPolicy` reports the policy of such a CA.
+        record.resource_policy = Some(input.policy);
+
+        Ok(PutPolicyOutput)
     }
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found." — for a request that attaches a policy the absence can only be the
+/// CA it names, so this is the CA's own sentence.
+fn ca_not_found() -> PutPolicyError {
+    PutPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
 }

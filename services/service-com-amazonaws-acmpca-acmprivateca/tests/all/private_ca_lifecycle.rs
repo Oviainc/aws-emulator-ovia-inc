@@ -26,7 +26,7 @@ use x509_cert::Certificate;
 /// A SigV4 `Authorization` header whose credential scope names this service and the
 /// region every ARN the request mints must carry. The router verifies no signature here
 /// (`set_request_authentication(false)`); the scope is read for routing and the region.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
                              Credential=AKIDTESTTESTTEST/20260101/eu-west-1/acm-pca/aws4_request, \
                              SignedHeaders=host;x-amz-date, Signature=deadbeef";
 
