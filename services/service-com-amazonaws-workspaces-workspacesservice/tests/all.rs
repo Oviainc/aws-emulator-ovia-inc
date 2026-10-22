@@ -14,5 +14,8 @@
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/workspace_bundles.rs"]
+mod workspace_bundles;
+
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;

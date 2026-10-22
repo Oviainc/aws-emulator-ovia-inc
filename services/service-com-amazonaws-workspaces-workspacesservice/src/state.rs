@@ -7,11 +7,19 @@
 //! `StartWorkspaces`, `StopWorkspaces` and `TerminateWorkspaces` request. The
 //! transitions live here rather than in one of the operation files because all
 //! four batch operations apply the same rules to the same records.
+//!
+//! It also owns the WorkSpace BUNDLE store `DescribeWorkspaceBundles` reports:
+//! the Amazon-provided catalog every account can create WorkSpaces from, which
+//! exists before any caller arrives and so is seeded when the store is built,
+//! plus the bundles an account owns.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::ops::types::{Tag, Workspace, WorkspaceProperties, WorkspaceRequest};
+use crate::ops::types::{
+    ComputeType, RootStorage, Tag, UserStorage, Workspace, WorkspaceBundle, WorkspaceProperties,
+    WorkspaceRequest, COMPUTE_VALUES,
+};
 
 /// How long a lifecycle transition the clock owes stays in its transient state.
 ///
@@ -65,7 +73,51 @@ pub const MAX_STORED_WORKSPACES: usize = 2_000;
 
 /// A per-item batch failure: the wire `ErrorCode` and `ErrorMessage` a
 /// `FailedCreateWorkspaceRequest` / `FailedWorkspaceChangeRequest` carries.
+///
+/// Also the (code, message) pair the bundle store reports a refusal with, so a
+/// handler can lift it into the modelled error that code names.
 pub type ItemFailure = (&'static str, String);
+
+/// The `Owner` a bundle Amazon Web Services provides carries.
+///
+/// From `WorkspaceBundle$Owner`: "This is the account identifier of the owner,
+/// or `AMAZON` if the bundle is provided by Amazon Web Services", and
+/// `DescribeWorkspaceBundlesRequest$Owner`: "To describe the bundles provided by
+/// Amazon Web Services, specify `AMAZON`."
+pub const AMAZON_BUNDLE_OWNER: &str = "AMAZON";
+
+/// The `WorkspaceBundleState` of a bundle WorkSpaces can be created from (one of
+/// `WORKSPACE_BUNDLE_STATE_VALUES` in `ops::types`).
+pub const BUNDLE_STATE_AVAILABLE: &str = "AVAILABLE";
+
+/// The `BundleType` of an ordinary bundle, as opposed to the `STANDBY` type a
+/// standby WorkSpace uses (one of `BUNDLE_TYPE_VALUES` in `ops::types`).
+pub const BUNDLE_TYPE_REGULAR: &str = "REGULAR";
+
+/// The page size `DescribeWorkspaceBundles` reports.
+///
+/// `DescribeWorkspaceBundlesRequest` models no `Limit` member, so the caller
+/// cannot ask for a size and this number is the emulator's OWN choice. It is the
+/// 25 the rest of this service's surface bounds a page at: every `Limit` member
+/// is `range 1..25` and `BundleIdList` is `length 1..25`.
+pub const DESCRIBE_BUNDLE_PAGE_SIZE: usize = 25;
+
+/// The root volume size, in GiB, every bundle in the Amazon-provided catalog
+/// carries.
+///
+/// AWS publishes its bundles with an 80 GB root volume paired with a 10, 50 or
+/// 100 GB user volume, which is where this number and
+/// [`catalog_user_capacity_gib`]'s three come from.
+const CATALOG_ROOT_CAPACITY_GIB: u32 = 80;
+
+/// The most bundles this emulator stores at once.
+///
+/// AWS caps the bundles an account owns with a service quota and reports an
+/// exceeded cap as `ResourceLimitExceededException`, which
+/// `CreateWorkspaceBundle` models. The NUMBER is this emulator's own bound on an
+/// in-memory store, and sits far above the Amazon-provided catalog plus anything
+/// a test or client script creates.
+pub const MAX_STORED_BUNDLES: usize = 500;
 
 /// The operational state of a stored WorkSpace.
 ///
@@ -221,6 +273,87 @@ fn occupancy_key(directory_id: &str, user_name: &str, workspace_name: Option<&st
     }
 }
 
+/// One persisted WorkSpace bundle.
+///
+/// Volume sizes are held as GiB numbers and rendered into the modelled
+/// `RootStorage$Capacity` / `UserStorage$Capacity` strings on the way out, so the
+/// store never holds a value it cannot render.
+#[derive(Debug, Clone)]
+pub struct WorkspaceBundleRecord {
+    /// Sequence number: the stable order [`ComAmazonawsWorkspacesWorkspacesserviceState::ordered_bundles`]
+    /// reports and pagination resumes after.
+    pub seq: u64,
+    pub bundle_id: String,
+    pub name: String,
+    pub description: String,
+    pub image_id: String,
+    /// One of the model's `Compute` enum values (`COMPUTE_VALUES` in `ops::types`).
+    pub compute_name: String,
+    pub root_capacity_gib: u32,
+    pub user_capacity_gib: u32,
+    /// `AMAZON` for a bundle this service provides, otherwise the owning
+    /// account id.
+    pub owner: String,
+    /// One of the model's `WorkspaceBundleState` values.
+    pub state: &'static str,
+    /// One of the model's `BundleType` values.
+    pub bundle_type: &'static str,
+    pub created: SystemTime,
+    pub last_updated: SystemTime,
+}
+
+impl WorkspaceBundleRecord {
+    /// This record as the modelled `WorkspaceBundle` structure.
+    pub fn to_workspace_bundle(&self) -> WorkspaceBundle {
+        WorkspaceBundle {
+            bundle_id: Some(self.bundle_id.clone()),
+            name: Some(self.name.clone()),
+            owner: Some(self.owner.clone()),
+            description: Some(self.description.clone()),
+            image_id: Some(self.image_id.clone()),
+            root_storage: Some(RootStorage {
+                capacity: self.root_capacity_gib.to_string(),
+            }),
+            user_storage: Some(UserStorage {
+                capacity: self.user_capacity_gib.to_string(),
+            }),
+            compute_type: Some(ComputeType {
+                name: Some(self.compute_name.clone()),
+            }),
+            last_updated_time: Some(::aws_smithy_types::DateTime::from(self.last_updated)),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.created)),
+            state: Some(self.state.to_string()),
+            bundle_type: Some(self.bundle_type.to_string()),
+        }
+    }
+}
+
+/// The `BundleId` / `WorkspaceImageId` fragment that identifies the
+/// Amazon-provided bundle of `compute`.
+///
+/// `BundleId` is `^wsb-[0-9a-z]{8,63}$` and `WorkspaceImageId` is
+/// `^wsi-[0-9a-z]{9,63}$`; every `Compute` value is upper-case letters, digits
+/// and underscores, so lower-casing it and dropping the underscores leaves the
+/// `[0-9a-z]` the patterns allow, and the `amzn` prefix below carries the
+/// shortest value (`VALUE`) past the nine characters the image id needs.
+fn catalog_slug(compute: &str) -> String {
+    format!("amzn{}", compute.to_lowercase().replace('_', ""))
+}
+
+/// The user volume size, in GiB, the Amazon-provided bundle of `compute` carries.
+///
+/// AWS publishes its bundles with the root volume [`CATALOG_ROOT_CAPACITY_GIB`]
+/// paired with a 10, 50 or 100 GB user volume. WHICH of those three a given
+/// compute type ships with is this emulator's own assignment — a function of the
+/// compute type alone, so a bundle reports the same size on every read.
+fn catalog_user_capacity_gib(compute: &str) -> u32 {
+    match compute {
+        "VALUE" => 10,
+        "STANDARD" | "PERFORMANCE" => 50,
+        _ => 100,
+    }
+}
+
 /// Per-service state for com-amazonaws-workspaces-workspacesservice. A handler reaches it through [`service_state`].
 ///
 /// The three maps below are one store with two indexes over it, so they are
@@ -229,7 +362,13 @@ fn occupancy_key(directory_id: &str, user_name: &str, workspace_name: Option<&st
 /// make a directory slot permanently unavailable. Readers use
 /// [`Self::workspace`], [`Self::workspace_count`] and
 /// [`Self::ordered_workspaces`].
-#[derive(Debug, Default)]
+///
+/// The bundle store below is the same shape: one map plus an index by
+/// `BundleId`, both written only through [`Self::insert_bundle`]. A freshly
+/// built store already holds the Amazon-provided catalog (see [`Self::default`]),
+/// because those bundles exist in every account before any caller arrives —
+/// `DescribeWorkspaceBundles` reports them, it does not create them.
+#[derive(Debug)]
 pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Every stored WorkSpace, keyed by its `WorkspaceId`. Never larger than
     /// [`MAX_STORED_WORKSPACES`].
@@ -246,6 +385,40 @@ pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Monotonic counter behind both the minted `WorkspaceId` and the creation
     /// order [`Self::ordered_workspaces`] reports.
     pub next_workspace_seq: u64,
+    /// Every stored bundle by sequence number: the stable order
+    /// [`Self::ordered_bundles`] reports and `DescribeWorkspaceBundles`
+    /// paginates over. Never larger than [`MAX_STORED_BUNDLES`].
+    bundles: BTreeMap<u64, WorkspaceBundleRecord>,
+    /// Which sequence number each `BundleId` names, so looking a bundle up by id
+    /// costs one lookup rather than a scan.
+    bundle_ids: HashMap<String, u64>,
+    /// Monotonic counter behind both the minted `BundleId` and the order
+    /// [`Self::ordered_bundles`] reports.
+    next_bundle_seq: u64,
+}
+
+impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
+    /// An empty WorkSpace store that already holds the Amazon-provided bundle
+    /// catalog.
+    ///
+    /// The catalog is seeded HERE, when the engine builds this service's state,
+    /// rather than by the first `DescribeWorkspaceBundles` call: those bundles
+    /// are AWS's own and are describable in a brand-new account, so reporting
+    /// them must not be a write. Its `CreationTime` is the instant the store was
+    /// built, which is stable for the life of the emulator.
+    fn default() -> Self {
+        let mut state = Self {
+            workspaces: HashMap::new(),
+            occupancy: HashMap::new(),
+            order: BTreeMap::new(),
+            next_workspace_seq: 0,
+            bundles: BTreeMap::new(),
+            bundle_ids: HashMap::new(),
+            next_bundle_seq: 0,
+        };
+        state.seed_amazon_bundle_catalog(SystemTime::now());
+        state
+    }
 }
 
 impl ComAmazonawsWorkspacesWorkspacesserviceState {
@@ -461,6 +634,139 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         self.next_workspace_seq += 1;
         self.next_workspace_seq
     }
+
+    /// Every stored bundle in the order [`Self::ordered_bundles`] documents: the
+    /// Amazon-provided catalog first, then the bundles this account created, in
+    /// creation order.
+    pub fn ordered_bundles(&self) -> Vec<&WorkspaceBundleRecord> {
+        self.bundles.values().collect()
+    }
+
+    /// The stored bundle `bundle_id` names, if any.
+    pub fn bundle(&self, bundle_id: &str) -> Option<&WorkspaceBundleRecord> {
+        self.bundle_ids
+            .get(bundle_id)
+            .and_then(|seq| self.bundles.get(seq))
+    }
+
+    /// How many bundles are stored, the Amazon-provided catalog included.
+    pub fn bundle_count(&self) -> usize {
+        self.bundles.len()
+    }
+
+    /// Create one bundle owned by this account, or report why it could not be
+    /// created.
+    ///
+    /// The writer side of the bundle store: `CreateWorkspaceBundle` is the
+    /// operation that calls it (it is still a scaffold stub, so this service's
+    /// own test suite is its only caller today). The returned record is a
+    /// snapshot of what was persisted.
+    pub fn create_bundle(
+        &mut self,
+        request: &NewBundle,
+    ) -> Result<WorkspaceBundleRecord, ItemFailure> {
+        let account = ::engine::emulator_account_id();
+        if let Some(existing) = self
+            .bundles
+            .values()
+            .find(|record| record.owner == account && record.name == request.name)
+        {
+            return Err((
+                ERROR_CODE_ALREADY_EXISTS,
+                format!(
+                    "Bundle {} already exists with the name {}.",
+                    existing.bundle_id, existing.name
+                ),
+            ));
+        }
+        if self.bundles.len() >= MAX_STORED_BUNDLES {
+            return Err((
+                ERROR_CODE_LIMIT_EXCEEDED,
+                format!(
+                    "Your resource limits have been exceeded: at most {MAX_STORED_BUNDLES} bundles can exist."
+                ),
+            ));
+        }
+
+        let seq = self.next_bundle_seq();
+        let now = SystemTime::now();
+        let record = WorkspaceBundleRecord {
+            seq,
+            bundle_id: format!("wsb-{seq:08x}"),
+            name: request.name.clone(),
+            description: request.description.clone(),
+            image_id: request.image_id.clone(),
+            compute_name: request.compute_name.clone(),
+            root_capacity_gib: request.root_capacity_gib,
+            user_capacity_gib: request.user_capacity_gib,
+            owner: account.to_string(),
+            state: BUNDLE_STATE_AVAILABLE,
+            bundle_type: BUNDLE_TYPE_REGULAR,
+            created: now,
+            last_updated: now,
+        };
+        self.insert_bundle(record.clone());
+        Ok(record)
+    }
+
+    /// Seed the Amazon-provided bundle catalog, one bundle per compute type.
+    ///
+    /// The catalog's MEMBERSHIP comes from the model: `COMPUTE_VALUES` in
+    /// `ops::types` is the `Compute` enum, and AWS offers a bundle for each of
+    /// those compute types. The volume sizes come from
+    /// [`CATALOG_ROOT_CAPACITY_GIB`] and [`catalog_user_capacity_gib`], and the
+    /// ids are a function of the compute type (see [`catalog_slug`]) so they are
+    /// the same on every read and in every run.
+    fn seed_amazon_bundle_catalog(&mut self, created: SystemTime) {
+        for compute in COMPUTE_VALUES {
+            let slug = catalog_slug(compute);
+            let user_capacity_gib = catalog_user_capacity_gib(compute);
+            let seq = self.next_bundle_seq();
+            self.insert_bundle(WorkspaceBundleRecord {
+                seq,
+                bundle_id: format!("wsb-{slug}"),
+                name: format!("Amazon {compute}"),
+                description: format!(
+                    "Amazon-provided WorkSpaces bundle: {compute} compute, a {CATALOG_ROOT_CAPACITY_GIB} GiB root volume and a {user_capacity_gib} GiB user volume."
+                ),
+                image_id: format!("wsi-{slug}"),
+                compute_name: (*compute).to_string(),
+                root_capacity_gib: CATALOG_ROOT_CAPACITY_GIB,
+                user_capacity_gib,
+                owner: AMAZON_BUNDLE_OWNER.to_string(),
+                state: BUNDLE_STATE_AVAILABLE,
+                bundle_type: BUNDLE_TYPE_REGULAR,
+                created,
+                last_updated: created,
+            });
+        }
+    }
+
+    /// Store `record` and point the `BundleId` index at it.
+    fn insert_bundle(&mut self, record: WorkspaceBundleRecord) {
+        self.bundle_ids.insert(record.bundle_id.clone(), record.seq);
+        self.bundles.insert(record.seq, record);
+    }
+
+    /// The next bundle sequence number. Strictly increasing and never reset, as
+    /// [`Self::next_seq`] is for WorkSpaces.
+    fn next_bundle_seq(&mut self) -> u64 {
+        self.next_bundle_seq += 1;
+        self.next_bundle_seq
+    }
+}
+
+/// What a bundle this account owns is created from: the members
+/// `CreateWorkspaceBundle` takes, with the modelled `Capacity` strings already
+/// parsed into the GiB numbers the store holds.
+#[derive(Debug, Clone)]
+pub struct NewBundle {
+    pub name: String,
+    pub description: String,
+    pub image_id: String,
+    pub compute_name: String,
+    pub root_capacity_gib: u32,
+    pub user_capacity_gib: u32,
 }
 
 /// The per-item failure for a WorkSpace id that names no stored WorkSpace.

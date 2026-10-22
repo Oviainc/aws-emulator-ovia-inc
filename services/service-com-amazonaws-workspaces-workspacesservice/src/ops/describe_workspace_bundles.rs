@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeWorkspaceBundles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeWorkspaceBundles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeWorkspaceBundles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the WorkSpace bundles this service has persisted — the
+//! Amazon-provided catalog and the bundles this account owns — filtered by the one
+//! filter the request names and paginated over a stable order.
 //!
 //! ## Shape of an operation
 //!
@@ -88,10 +83,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `DescribeWorkspaceBundlesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#DescribeWorkspaceBundles")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#DescribeWorkspaceBundles",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeWorkspaceBundlesErrorModeled {
     InvalidParameterValuesException(InvalidParameterValuesException),
+    // `InternalServerException` is widened in with `extra_errors`: the service
+    // models it ("Unexpected server error occured.") but does not list it on this
+    // operation, and it is the only shape that can carry the one fault this handler
+    // can hit — the engine not being the in-memory engine this service's store
+    // lives in.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -145,18 +149,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeWorkspaceBundles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeWorkspaceBundlesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeWorkspaceBundles"))
+        let _ = ctx;
+
+        // "You can filter the results using either bundle ID or owner, but not
+        // both", and each of `BundleIds` and `Owner` documents "You cannot combine
+        // this parameter with any other filter".
+        if input.bundle_ids.is_some() && input.owner.is_some() {
+            return Err(
+                DescribeWorkspaceBundlesErrorModeled::InvalidParameterValuesException(
+                    InvalidParameterValuesException {
+                        message: Some(
+                            "Only one filter can be specified at a time, but BundleIds, Owner were specified."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token names the last bundle the previous page reported, by its
+        // sequence number; this page resumes strictly after it.
+        let after_seq = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(token).ok_or_else(|| {
+                DescribeWorkspaceBundlesErrorModeled::InvalidParameterValuesException(
+                    InvalidParameterValuesException {
+                        message: Some("The NextToken value is not valid.".to_string()),
+                    },
+                )
+            })?,
+            None => 0,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeWorkspaceBundlesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the WorkSpaces state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // Reporting only: a bundle carries no transition the clock owes, so this
+        // call writes nothing and a later caller sees exactly what this one saw.
+        let state = state.lock();
+
+        // `Owner`: "To describe the bundles provided by Amazon Web Services, specify
+        // AMAZON. To describe the bundles that belong to your account, don't specify
+        // a value." — so an absent `Owner` filters on this account's own id, and any
+        // other value (`AMAZON`, or another account's id) filters on that owner.
+        // `BundleIds` names bundles outright, whoever owns them.
+        let owner: &str = match input.owner.as_deref() {
+            Some(owner) => owner,
+            None => ::engine::emulator_account_id(),
+        };
+        let matched: Vec<&crate::state::WorkspaceBundleRecord> = state
+            .ordered_bundles()
+            .into_iter()
+            .filter(|record| match input.bundle_ids.as_ref() {
+                Some(ids) => ids.contains(&record.bundle_id),
+                None => record.owner == owner,
+            })
+            .collect();
+
+        // Resume strictly after the bundle the token names, and report a token only
+        // when a matching bundle is left beyond this page.
+        let mut remaining = matched.into_iter().filter(|record| record.seq > after_seq);
+        let page_records: Vec<&crate::state::WorkspaceBundleRecord> = remaining
+            .by_ref()
+            .take(crate::state::DESCRIBE_BUNDLE_PAGE_SIZE)
+            .collect();
+        let more_to_come = remaining.next().is_some();
+        let next_token = page_records
+            .last()
+            .filter(|_| more_to_come)
+            .map(|record| crate::state::encode_page_token(record.seq));
+        let page: Vec<WorkspaceBundle> = page_records
+            .iter()
+            .map(|record| record.to_workspace_bundle())
+            .collect();
+
+        Ok(DescribeWorkspaceBundlesOutput {
+            bundles: Some(page),
+            next_token,
+        })
     }
 }
+

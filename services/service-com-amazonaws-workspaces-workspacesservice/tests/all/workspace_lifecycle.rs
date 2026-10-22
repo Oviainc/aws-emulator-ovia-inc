@@ -30,7 +30,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A router with only this service mounted, together with the engine it shares, so a
 /// case that needs a pre-populated store can reach the same state the handlers see.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because `tests/all.rs` compiles every suite into ONE test crate, so the
+/// bundle suite beside this one shares this harness rather than copying it.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite asserts handler behaviour, not signing, so no authenticator runs.
@@ -45,7 +48,13 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// The `Authorization` credential scope is what routes the request: it names the signing
 /// name (`workspaces`), which is the signal `resolve_route_key` reads first and the only
 /// one that agrees with this service's identity.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// `pub(crate)`: see [`emulator_with_engine`].
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = smithy_server_runtime::http::Request::builder()
         .method("POST")
         .uri("/")
