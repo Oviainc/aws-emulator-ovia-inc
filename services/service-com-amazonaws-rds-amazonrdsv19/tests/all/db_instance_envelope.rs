@@ -171,10 +171,10 @@ const ENGINE_CASES: &[EngineCase] = &[
         port: "3306",
     },
     EngineCase {
-        case: "mysql, a version inside a published major version",
-        identifier: "emu-env-mysql-8-0-99",
+        case: "mysql, an exact version that is not its engine's default",
+        identifier: "emu-env-mysql-8-0-40",
         engine: "mysql",
-        requested_version: Some("8.0.99"),
+        requested_version: Some("8.0.40"),
         engine_version: "8.0.40",
         db_parameter_group: "default.mysql8.0",
         option_group: "default:mysql-8-0",
@@ -452,6 +452,28 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
 async fn a_supplied_member_is_reported_from_the_store_rather_than_defaulted() {
     let router = emulator();
     let identifier = "emu-env-supplied";
+    // A `DBSubnetGroupName` is RESOLVED against the store rather than echoed, so the
+    // group this row names has to exist before an instance can reference it.
+    expect_ok(
+        "the named subnet group is created first",
+        call(
+            &router,
+            "CreateDBSubnetGroup",
+            &[
+                ("DBSubnetGroupName", "emu-subnets".to_string()),
+                ("DBSubnetGroupDescription", "two subnets".to_string()),
+                (
+                    "SubnetIds.SubnetIdentifier.1",
+                    "subnet-0a1b2c3d".to_string(),
+                ),
+                (
+                    "SubnetIds.SubnetIdentifier.2",
+                    "subnet-1b2c3d4e".to_string(),
+                ),
+            ],
+        )
+        .await,
+    );
     // The other branch of every default the table above takes, plus the members whose
     // values are lists.
     let supplied: &[(&str, &str)] = &[
@@ -597,9 +619,12 @@ struct VersionCase {
 }
 
 /// Every branch of the resolution: no value, an exact version (default or not), a major
-/// version, a version inside a published major version, a major version the catalogue
-/// publishes no AVAILABLE version for (`mysql` 5.7 is deprecated), a version no major
-/// version prefixes, and an engine the catalogue publishes no version for at all.
+/// version, a version the catalogue publishes no entry for even though its major version
+/// IS published (`8.0.99` is not `8.0`, which the real service refuses: the recorded
+/// `CreateDBInstance` answers 400 `InvalidParameterCombination` "Cannot find version
+/// 8.0.99 for mysql"), a major version the catalogue publishes no AVAILABLE version for
+/// (`mysql` 5.7 is deprecated), a version no major version matches, and an engine the
+/// catalogue publishes no version for at all.
 const VERSION_CASES: &[VersionCase] = &[
     VersionCase {
         case: "no version named",
@@ -623,11 +648,11 @@ const VERSION_CASES: &[VersionCase] = &[
         provisioned: Some("8.0.37"),
     },
     VersionCase {
-        case: "a version inside a published major version",
+        case: "a version the catalogue publishes no entry for, inside a published major version",
         identifier: "emu-ver-mysql-8099",
         engine: "mysql",
         requested: Some("8.0.99"),
-        provisioned: Some("8.0.40"),
+        provisioned: None,
     },
     VersionCase {
         case: "a version named in another case",
@@ -665,11 +690,11 @@ const VERSION_CASES: &[VersionCase] = &[
         provisioned: Some("17.2"),
     },
     VersionCase {
-        case: "a postgres version inside a published major version",
+        case: "a postgres version the catalogue publishes no entry for",
         identifier: "emu-ver-postgres-1699",
         engine: "postgres",
         requested: Some("16.99"),
-        provisioned: Some("16.4"),
+        provisioned: None,
     },
     VersionCase {
         case: "an aurora major version",
@@ -711,13 +736,16 @@ async fn the_engine_version_is_resolved_through_the_catalogue() {
             }
             None => {
                 // No modelled error covers a version the service cannot provision, so
-                // it is refused with a 400 naming the member and the value.
-                let body = expect_error(row.case, response, 400, "ValidationException");
+                // it is refused with the query error code the real service answers —
+                // `InvalidParameterCombination` — in a message naming the engine and
+                // the version that cannot be found for it.
+                let body =
+                    expect_error(row.case, response, 400, "InvalidParameterCombination");
                 let message = text(&body, "Message");
                 assert!(
-                    message.contains("EngineVersion")
+                    message.contains(row.engine)
                         && message.contains(row.requested.unwrap_or_default()),
-                    "case {:?}: the refusal must name EngineVersion and the value, \
+                    "case {:?}: the refusal must name the engine and the version, \
                      got {message:?}",
                     row.case
                 );
@@ -729,7 +757,7 @@ async fn the_engine_version_is_resolved_through_the_catalogue() {
 #[tokio::test]
 async fn modifying_an_instance_resolves_the_new_engine_version_too() {
     let router = emulator();
-    let case = "modify to a version inside a published major version";
+    let case = "modify to another version of the engine";
     let identifier = "emu-env-modified";
     create_instance(&router, case, identifier, "postgres", &[("EngineVersion", "15.8")]).await;
     wait_for_settle();
@@ -737,7 +765,7 @@ async fn modifying_an_instance_resolves_the_new_engine_version_too() {
     let rows: &[(&str, &str, &str)] = &[
         ("an exact version", "17.2", "17.2"),
         ("a major version", "16", "16.4"),
-        ("a version inside a published major version", "15.99", "15.8"),
+        ("another major version", "15", "15.8"),
     ];
     for (row_case, requested, expected) in rows {
         let modified = expect_ok(
@@ -773,11 +801,11 @@ async fn modifying_an_instance_resolves_the_new_engine_version_too() {
         )
         .await,
         400,
-        "ValidationException",
+        "InvalidParameterCombination",
     );
     assert!(
-        text(&body, "Message").contains("EngineVersion"),
-        "the refusal must name EngineVersion, got {body}"
+        text(&body, "Message").contains("42.0"),
+        "the refusal must name the version it cannot provision, got {body}"
     );
     let described = describe_instance(&router, "after the refusal", identifier).await;
     assert_member(

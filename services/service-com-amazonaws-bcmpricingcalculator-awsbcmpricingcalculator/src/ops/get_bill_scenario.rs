@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBillScenario
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBillScenario`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the stored bill scenario `identifier` names, unchanged. It reports only
+//! stored state, as the model's `@readonly` says; its one write is materialising an
+//! expiry the clock had already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBillScenario::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An identifier no live scenario carries — never created, or deleted — is
+//! `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +149,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBillScenario` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBillScenarioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBillScenario"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetBillScenarioErrorModeled::DataUnavailableException(
+                DataUnavailableException {
+                    message: "the bill scenario store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Materialise the expiry the clock has already made due, so a scenario past its
+        // `expiresAt` reads as gone rather than lingering for the life of the process.
+        state.purge_expired(crate::state::now_secs());
+
+        let Some(scenario) = state.bill_scenario(&input.identifier) else {
+            return Err(GetBillScenarioErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "No bill scenario found with identifier {}",
+                        input.identifier
+                    ),
+                    resource_id: input.identifier.clone(),
+                    resource_type: "BillScenario".to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetBillScenarioOutput {
+            id: scenario.id.clone(),
+            name: Some(scenario.name.clone()),
+            bill_interval: Some(scenario.bill_interval()),
+            status: Some(scenario.status.clone()),
+            created_at: Some(scenario.created_at),
+            expires_at: Some(scenario.expires_at),
+            failure_message: scenario.failure_message.clone(),
+            group_sharing_preference: scenario.group_sharing_preference.clone(),
+            cost_category_group_sharing_preference_arn: scenario
+                .cost_category_group_sharing_preference_arn
+                .clone(),
+        })
     }
 }

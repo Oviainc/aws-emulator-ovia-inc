@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AttributeDefinition, AttributeValue, BillingModeSummary, Capacity, ConsumedCapacity,
-    GlobalSecondaryIndexDescription, KeySchemaElement, Projection, ProvisionedThroughput,
+    GlobalSecondaryIndexDescription, ItemCollectionMetrics, KeySchemaElement,
+    LocalSecondaryIndexDescription, Projection, ProvisionedThroughput,
     ProvisionedThroughputDescription, Tag, TableClassSummary, TableDescription,
 };
 
@@ -85,6 +86,12 @@ pub const RESERVED_TAG_PREFIX: &str = "aws:";
 /// `CreateTable$GlobalSecondaryIndexes` doc).
 pub const MAX_GLOBAL_SECONDARY_INDEXES: usize = 20;
 
+/// The most local secondary indexes one table may carry: "You can define a maximum of
+/// 5 local secondary indexes per table" ("Service, Account, and Table Quotas" in the
+/// Amazon DynamoDB Developer Guide). A local index is defined with the table and can
+/// never be added later, so this is the only place the count is checked.
+pub const MAX_LOCAL_SECONDARY_INDEXES: usize = 5;
+
 /// The most `HASH` and the most `RANGE` elements one global secondary index's key
 /// schema may carry: "Each global secondary index supports up to 4 partition keys and
 /// up to 4 sort keys" (`CreateTable$GlobalSecondaryIndexes`).
@@ -102,8 +109,9 @@ pub const MAX_INDEX_KEY_ELEMENTS: usize = MAX_INDEX_PARTITION_KEYS + MAX_INDEX_S
 /// `RANGE`) plus those of its indexes. A request declaring more than that is already
 /// invalid, and clamping it up front is what bounds the work matching definitions
 /// against key schemas: both counts come from the request body.
-pub const MAX_ATTRIBUTE_DEFINITIONS: usize =
-    2 + MAX_GLOBAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS;
+pub const MAX_ATTRIBUTE_DEFINITIONS: usize = 2
+    + MAX_GLOBAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS
+    + MAX_LOCAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS;
 
 /// What one table, and the whole store, may hold in items.
 ///
@@ -359,6 +367,45 @@ impl NumberKey {
     fn significant_digits(&self) -> i64 {
         i64::try_from(self.digits.len()).unwrap_or(i64::MAX)
     }
+
+    /// This number's CANONICAL text — the one form every read of it reports.
+    ///
+    /// An `N` value travels as a string ("Numbers are sent across the network to
+    /// DynamoDB as strings, to maximize compatibility across languages and libraries.
+    /// However, DynamoDB treats them as number type attributes" — `AttributeValue$N`),
+    /// so what is stored is the NUMBER and what a read reports is that number rendered
+    /// once, not the lexeme a writer happened to send. The rendering is plain decimal
+    /// over the normalised digits — never an exponent, no sign on zero, and a leading
+    /// or trailing zero only where the decimal point needs one — so every spelling of
+    /// one value reads back identically.
+    pub fn canonical_text(&self) -> String {
+        if self.digits.is_empty() {
+            return "0".to_string();
+        }
+        let digits: String = self
+            .digits
+            .iter()
+            .map(|digit| char::from(b'0' + digit))
+            .collect();
+        // The value is 0.<digits> * 10^point, so `point` is where the decimal point
+        // falls among the digits: left of them all (a leading "0." and the zeros the
+        // exponent asks for), right of them all (trailing zeros), or between two.
+        let magnitude = match usize::try_from(self.point) {
+            Err(_) | Ok(0) => {
+                let zeros = usize::try_from(self.point.unsigned_abs()).unwrap_or(0);
+                format!("0.{}{digits}", "0".repeat(zeros))
+            }
+            Ok(at) if at >= self.digits.len() => {
+                format!("{digits}{}", "0".repeat(at - self.digits.len()))
+            }
+            Ok(at) => format!("{}.{}", &digits[..at], &digits[at..]),
+        };
+        if self.negative {
+            format!("-{magnitude}")
+        } else {
+            magnitude
+        }
+    }
 }
 
 impl Ord for NumberKey {
@@ -412,41 +459,157 @@ impl GlobalSecondaryIndex {
         }
     }
 
-    /// Whether `item` is projected into this index: an item reaches a global secondary
-    /// index only when it carries every attribute of the index's key schema ("Not all
-    /// items will qualify: For example, a partition key cannot have any duplicate
-    /// values" — the `Backfilling` doc).
+    /// Whether `item` is projected into this index.
     fn covers(&self, item: &Item) -> bool {
-        self.key_schema
-            .iter()
-            .all(|element| item.contains_key(&element.attribute_name))
+        index_covers(&self.key_schema, item)
     }
 
-    /// The bytes this index stores for one covered item: the attributes the index
-    /// projects, which are the index and table key attributes plus whatever
-    /// `Projection` adds.
+    /// The bytes this index stores for one covered item.
     fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
-        let projection_type = self.projection.projection_type.as_deref().unwrap_or("ALL");
-        if projection_type == "ALL" {
-            return item_size(item);
+        index_projected_size(&self.key_schema, &self.projection, item, table_key_schema)
+    }
+}
+
+/// One stored local secondary index: an index that shares the table's partition key
+/// and orders each partition by a different sort key.
+///
+/// A local index is defined WITH the table and cannot be added, changed or removed
+/// afterwards (`UpdateTable` carries no local-index member), and the model's
+/// `LocalSecondaryIndexDescription` declares no `IndexStatus` or throughput — so unlike
+/// [`GlobalSecondaryIndex`] there is no per-index lifecycle or capacity to record here.
+/// Like a global index it holds no items of its own, so its `ItemCount` and
+/// `IndexSizeBytes` are DERIVED from the table's items.
+#[derive(Debug, Clone)]
+pub struct LocalSecondaryIndex {
+    pub name: String,
+    pub arn: String,
+    pub key_schema: Vec<KeySchemaElement>,
+    pub projection: Projection,
+}
+
+impl LocalSecondaryIndex {
+    /// Whether `item` is projected into this index.
+    fn covers(&self, item: &Item) -> bool {
+        index_covers(&self.key_schema, item)
+    }
+
+    /// The bytes this index stores for one covered item.
+    fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
+        index_projected_size(&self.key_schema, &self.projection, item, table_key_schema)
+    }
+}
+
+/// Whether `item` reaches an index with this key schema: an item is projected into a
+/// secondary index only when it carries every attribute of the index's key schema
+/// ("Not all items will qualify: For example, a partition key cannot have any duplicate
+/// values" — the `Backfilling` doc). One rule for both index kinds, so an item is
+/// counted, sized and charged for by the same test wherever it is projected.
+fn index_covers(key_schema: &[KeySchemaElement], item: &Item) -> bool {
+    key_schema
+        .iter()
+        .all(|element| item.contains_key(&element.attribute_name))
+}
+
+/// The bytes an index stores for one covered item: the attributes the index projects,
+/// which are the index and table key attributes plus whatever `Projection` adds.
+fn index_projected_size(
+    key_schema: &[KeySchemaElement],
+    projection: &Projection,
+    item: &Item,
+    table_key_schema: &[KeySchemaElement],
+) -> i64 {
+    let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
+    if projection_type == "ALL" {
+        return item_size(item);
+    }
+    let non_key = projection.non_key_attributes.as_deref().unwrap_or_default();
+    let projected: Item = item
+        .iter()
+        .filter(|(name, _)| {
+            key_schema
+                .iter()
+                .chain(table_key_schema)
+                .any(|element| &element.attribute_name == *name)
+                || (projection_type == "INCLUDE" && non_key.iter().any(|kept| kept == *name))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    item_size(&projected)
+}
+
+/// What a write costs ONE index, or `None` when that index is not affected at all.
+///
+/// The Developer Guide gives the rule under "Provisioned throughput considerations for
+/// local secondary indexes", and the global indexes follow the same accounting:
+///
+/// * "If you write a new item to the table that defines an indexed attribute, or you
+///   update an existing item to define a previously undefined indexed attribute, one
+///   write operation is required to put the item into the index."
+/// * "If an update to the table changes the value of an indexed key attribute (from A to
+///   B), two writes are required, one to delete the previous item from the index and
+///   another write to put the new item into the index."
+/// * "If an item was present in the index, but a table write caused the indexed
+///   attribute to be deleted, one write is required to delete the old item projection
+///   out of the index."
+/// * "If an item is not present in the index before or after the update, there is no
+///   additional write cost for the index."
+/// * "If an update to the table changes only the value of projected attributes ... but
+///   does not change the value of any indexed key attribute, then one write is required
+///   to update the values of the projected attributes into the index" — charged, like the
+///   table itself, on the larger of the two projections.
+fn index_write_units<'a>(
+    key_schema: &[KeySchemaElement],
+    projection: &Projection,
+    table_key_schema: &[KeySchemaElement],
+    before: Option<&'a Item>,
+    after: Option<&'a Item>,
+) -> Option<f64> {
+    let entry = |version: Option<&'a Item>| version.filter(|item| index_covers(key_schema, item));
+    let size =
+        |item: &Item| index_projected_size(key_schema, projection, item, table_key_schema);
+    match (entry(before), entry(after)) {
+        (None, None) => None,
+        (None, Some(item)) | (Some(item), None) => Some(write_capacity_units(size(item))),
+        (Some(old), Some(new)) => {
+            if index_key_changed(key_schema, old, new) {
+                Some(write_capacity_units(size(old)) + write_capacity_units(size(new)))
+            } else {
+                Some(write_capacity_units(size(old).max(size(new))))
+            }
         }
-        let non_key = self
-            .projection
-            .non_key_attributes
-            .as_deref()
-            .unwrap_or_default();
-        let projected: Item = item
-            .iter()
-            .filter(|(name, _)| {
-                self.key_schema
-                    .iter()
-                    .chain(table_key_schema)
-                    .any(|element| &element.attribute_name == *name)
-                    || (projection_type == "INCLUDE" && non_key.iter().any(|kept| kept == *name))
-            })
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        item_size(&projected)
+    }
+}
+
+/// Whether the two versions of an item differ in any of this index's key values.
+fn index_key_changed(key_schema: &[KeySchemaElement], before: &Item, after: &Item) -> bool {
+    key_schema.iter().any(|element| {
+        !same_key_value(
+            before.get(&element.attribute_name),
+            after.get(&element.attribute_name),
+        )
+    })
+}
+
+/// Whether two values of one key attribute are the same key.
+///
+/// An index key attribute is always a scalar (`CreateTable` refuses a key attribute
+/// whose `AttributeType` is not `S`, `N` or `B`), and an `N` key is compared NUMERICALLY
+/// — `"1e2"` and `"100"` are one key, the way [`NumberKey`] orders them — so a rewrite
+/// that respells a number has not changed the index key.
+fn same_key_value(before: Option<&AttributeValue>, after: Option<&AttributeValue>) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(AttributeValue::S(before)), Some(AttributeValue::S(after))) => before == after,
+        (Some(AttributeValue::B(before)), Some(AttributeValue::B(after))) => before == after,
+        (Some(AttributeValue::N(before)), Some(AttributeValue::N(after))) => {
+            match (NumberKey::parse(before), NumberKey::parse(after)) {
+                (Some(before), Some(after)) => before == after,
+                // Neither denotes a number at all, so there is nothing to compare but
+                // the text they were written as.
+                _ => before == after,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -552,6 +715,11 @@ pub struct Table {
     /// declared, exactly as the request gave them — `DescribeTable` projects each into a
     /// `GlobalSecondaryIndexDescription` and never stores one.
     pub global_secondary_indexes: Vec<GlobalSecondaryIndex>,
+    /// The local secondary indexes defined on this table, in the order they were
+    /// declared. Like the global ones they are projected into a description on every
+    /// read and never stored as one; unlike them they can only be defined here, at
+    /// `CreateTable`.
+    pub local_secondary_indexes: Vec<LocalSecondaryIndex>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
     /// The tags this table carries: the set `CreateTable` seeded and every later
@@ -664,18 +832,10 @@ impl Table {
             ("B", AttributeValue::B(bytes)) => Ok(AttributeValueKey::B(bytes.clone())),
             ("N", AttributeValue::N(text)) => NumberKey::parse(text)
                 .map(AttributeValueKey::N)
-                .ok_or_else(|| {
-                    // A text longer than this emulator's own numeric-text limit is
-                    // refused here too, so the message names that limit as well as the
-                    // documented form.
-                    RequestError::Validation(format!(
-                        "The parameter cannot be converted to a numeric value: {text} \
-                         (a number must carry at most {MAX_SIGNIFICANT_DIGITS} significant \
-                         digits, an exponent within 10^{MIN_POINT}..10^{MAX_POINT}, and at \
-                         most {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's \
-                         input-size limit)"
-                    ))
-                }),
+                // A text longer than this emulator's own numeric-text limit is
+                // refused here too, so the message names that limit as well as the
+                // documented form.
+                .ok_or_else(|| not_a_number(text)),
             (_, actual) => Err(RequestError::Validation(format!(
                 "Type mismatch for key {attribute} expected: {declared} actual: {}",
                 attribute_value_type(actual)
@@ -806,6 +966,133 @@ impl Table {
         }
     }
 
+    /// Project one local secondary index into the description `DescribeTable` and the
+    /// table-mutating operations report. `ItemCount` and `IndexSizeBytes` are computed
+    /// from the table's items by the same rule the global indexes use.
+    fn describe_local_index(&self, index: &LocalSecondaryIndex) -> LocalSecondaryIndexDescription {
+        let covered = self.items.values().filter(|item| index.covers(item));
+        let item_count = i64::try_from(covered.clone().count()).unwrap_or(i64::MAX);
+        let index_size_bytes = covered
+            .map(|item| index.projected_size(item, &self.key_schema))
+            .sum();
+        LocalSecondaryIndexDescription {
+            index_name: Some(index.name.clone()),
+            index_arn: Some(index.arn.clone()),
+            key_schema: Some(index.key_schema.clone()),
+            projection: Some(index.projection.clone()),
+            item_count: Some(item_count),
+            index_size_bytes: Some(index_size_bytes),
+        }
+    }
+
+    /// The capacity ONE write consumes on this table and on each secondary index the
+    /// write affects, from the item that stood at the key `before` it and the item that
+    /// stands there `after`.
+    ///
+    /// The table's own units are one per 1 KB of the item, weighing BOTH versions and
+    /// charging for the larger: "PutItem — Writes a single item to a table. If an item
+    /// with the same primary key exists in the table, the operation replaces the item.
+    /// For calculating provisioned throughput consumption, the item size that matters is
+    /// the larger of the two" ("Capacity unit consumption for write operations" in the
+    /// Developer Guide). A delete weighs the removed item alone, since nothing stands at
+    /// the key afterwards, and a delete that found nothing weighs neither — it still
+    /// costs the table the one-unit minimum and touches no index.
+    ///
+    /// Each index is charged by [`index_write_units`], so an index the write leaves
+    /// untouched gets no entry at all.
+    pub fn write_capacity(&self, before: Option<&Item>, after: Option<&Item>) -> WriteCapacity {
+        let mut capacity = WriteCapacity {
+            table: write_capacity_units(before.map_or(0, item_size).max(after.map_or(0, item_size))),
+            ..WriteCapacity::default()
+        };
+        for index in &self.local_secondary_indexes {
+            if let Some(units) = index_write_units(
+                &index.key_schema,
+                &index.projection,
+                &self.key_schema,
+                before,
+                after,
+            ) {
+                capacity
+                    .local_secondary_indexes
+                    .insert(index.name.clone(), units);
+            }
+        }
+        for index in &self.global_secondary_indexes {
+            if let Some(units) = index_write_units(
+                &index.key_schema,
+                &index.projection,
+                &self.key_schema,
+                before,
+                after,
+            ) {
+                capacity
+                    .global_secondary_indexes
+                    .insert(index.name.clone(), units);
+            }
+        }
+        capacity
+    }
+
+    /// The `ItemCollectionKey` of an item: "The partition key value of the item
+    /// collection. This value is the same as the partition key value of the item"
+    /// (`ItemCollectionMetrics$ItemCollectionKey`) — so it is the item's own partition
+    /// key attribute, name and value, and nothing else.
+    fn item_collection_key(&self, item: &Item) -> Item {
+        item.get_key_value(self.partition_key_name())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .into_iter()
+            .collect()
+    }
+
+    /// The bytes one item collection holds: "the size of all the items in the table,
+    /// plus the size of all attributes projected into all of the local secondary indexes
+    /// on that table" (`ItemCollectionMetrics$SizeEstimateRangeGB`), summed over the
+    /// items that share `partition` — which is what an item collection is.
+    ///
+    /// One partition's items are contiguous in the store, so this is a range scan over
+    /// that collection rather than a walk over the table.
+    fn item_collection_bytes(&self, partition: &AttributeValueKey) -> i64 {
+        let first = ItemKey {
+            partition: partition.clone(),
+            sort: None,
+        };
+        sum_of(
+            self.items
+                .range(first..)
+                .take_while(|(key, _)| &key.partition == partition)
+                .map(|(_, item)| {
+                    sum_of(
+                        self.local_secondary_indexes
+                            .iter()
+                            .filter(|index| index.covers(item))
+                            .map(|index| index.projected_size(item, &self.key_schema)),
+                    )
+                    .saturating_add(item_size(item))
+                }),
+        )
+    }
+
+    /// The `ItemCollectionMetrics` for the collection the key of `item` belongs to, or
+    /// `None` when this table has no local secondary index: "If the table does not have
+    /// any local secondary indexes, this information is not returned in the response"
+    /// (`ItemCollectionMetrics`).
+    ///
+    /// `item` may be a whole item or just a `Key` map — only its key attributes are
+    /// read — so one rule serves every write operation.
+    pub fn item_collection_metrics(&self, item: &Item) -> Option<ItemCollectionMetrics> {
+        if self.local_secondary_indexes.is_empty() {
+            return None;
+        }
+        let key = self.key_of_item(item).ok()?;
+        Some(ItemCollectionMetrics {
+            item_collection_key: Some(self.item_collection_key(item)),
+            size_estimate_range_gb: Some(size_estimate_range_gb(
+                self.item_collection_bytes(&key.partition),
+            )),
+        })
+    }
+
     /// Project this table into the `TableDescription` every table operation returns.
     /// `ItemCount` and `TableSizeBytes` are derived from `items` here, never stored.
     pub fn describe(&self, now: SystemTime) -> TableDescription {
@@ -847,6 +1134,12 @@ impl Table {
                 self.global_secondary_indexes
                     .iter()
                     .map(|index| self.describe_index(index, now))
+                    .collect()
+            }),
+            local_secondary_indexes: (!self.local_secondary_indexes.is_empty()).then(|| {
+                self.local_secondary_indexes
+                    .iter()
+                    .map(|index| self.describe_local_index(index))
                     .collect()
             }),
             table_class_summary: self.table_class.as_ref().map(|class| TableClassSummary {
@@ -989,6 +1282,15 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
 
     /// Write one item into `name`, replacing whatever that key held.
     ///
+    /// Numbers are canonicalized HERE, the store's only item-write site, so what is
+    /// stored is the number each `N` denotes rather than the lexeme a writer sent, and
+    /// every read path reports that one form without normalising anything itself
+    /// ([`canonicalize_item`]). It runs before this method's own budget checks and
+    /// after the caller has resolved the table — every handler reaches this through
+    /// [`Self::active_table`]/[`Table::key_of_item`] first — so a write naming a table
+    /// that is absent or not `ACTIVE` is still answered with that refusal rather than
+    /// with a number's.
+    ///
     /// This is the store's only growth site, so it is also where the budgets are
     /// enforced: a write that would push the table past
     /// [`MAX_ITEMS_PER_TABLE`]/[`MAX_TABLE_SIZE_BYTES`], or the store past
@@ -1001,13 +1303,17 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         name: &str,
         now: SystemTime,
         key: ItemKey,
-        item: Item,
+        mut item: Item,
     ) -> Result<Option<Item>, RequestError> {
+        canonicalize_item(&mut item)?;
         let size = item_size(&item);
         let stored = self.stored_bytes();
         let table = self.active_table_mut(region, name, now)?;
-        let replaced_size = table.items.get(&key).map_or(0, item_size);
-        if replaced_size == 0 && table.items.len() >= MAX_ITEMS_PER_TABLE {
+        // Whether this write INSERTS is whether the key is held, not whether the item
+        // it holds sizes to zero — an item can legitimately size to nothing.
+        let replaced = table.items.get(&key);
+        let replaced_size = replaced.map_or(0, item_size);
+        if replaced.is_none() && table.items.len() >= MAX_ITEMS_PER_TABLE {
             return Err(RequestError::Validation(format!(
                 "Table {name} already holds this emulator's maximum of \
                  {MAX_ITEMS_PER_TABLE} items"
@@ -1316,6 +1622,121 @@ fn number_size(text: &str) -> i64 {
     }
 }
 
+/// The `ValidationException` refusal for a text that denotes no number this store can
+/// hold: not a number at all, or outside the documented precision and exponent range
+/// (or longer than this emulator's own numeric-text limit, which the message names
+/// alongside them).
+fn not_a_number(text: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "The parameter cannot be converted to a numeric value: {text} \
+         (a number must carry at most {MAX_SIGNIFICANT_DIGITS} significant \
+         digits, an exponent within 10^{MIN_POINT}..10^{MAX_POINT}, and at \
+         most {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's \
+         input-size limit)"
+    ))
+}
+
+/// One `N` value's canonical stored text, or the refusal for a text that is not a
+/// number: DynamoDB stores the number, so a write normalises the lexeme ONCE here and
+/// every later read reports that form ([`NumberKey::canonical_text`]).
+///
+/// Crate-visible: the write path reaches it through [`canonicalize_item`], and a
+/// handler that needs one value canonicalized (an `UpdateItem` attribute, say) is in
+/// this crate too, so nothing outside it needs this.
+pub(crate) fn canonical_number_text(text: &str) -> Result<String, RequestError> {
+    NumberKey::parse(text)
+        .map(|number| number.canonical_text())
+        .ok_or_else(|| not_a_number(text))
+}
+
+/// Canonicalize every number inside one attribute value, and refuse a set that holds
+/// one value twice.
+///
+/// The rule is about the number TYPE, not about where a number sits, so this reaches
+/// the `N` of a scalar, every member of an `NS`, and every number nested in an `L` or
+/// an `M` at any depth. Set distinctness is checked AFTER canonicalization, so two
+/// spellings of one number are the duplicate member DynamoDB refuses rather than two
+/// members of the stored set. The walk is ITERATIVE, over an explicit stack, for the
+/// reason [`attribute_value_size`]'s is: how deeply a value nests is the caller's
+/// choice, so recursing on it would make stack use a function of the request.
+pub(crate) fn canonicalize_attribute_value(
+    value: &mut AttributeValue,
+) -> Result<(), RequestError> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            AttributeValue::N(text) => *text = canonical_number_text(text)?,
+            AttributeValue::Ns(members) => {
+                for member in members.iter_mut() {
+                    *member = canonical_number_text(member)?;
+                }
+                require_distinct(members, "NS", String::clone)?;
+            }
+            AttributeValue::Ss(members) => require_distinct(members, "SS", String::clone)?,
+            AttributeValue::Bs(members) => require_distinct(members, "BS", |bytes| {
+                format!("a {}-byte value", bytes.len())
+            })?,
+            AttributeValue::L(members) => pending.extend(members.iter_mut()),
+            AttributeValue::M(entries) => pending.extend(entries.values_mut()),
+            AttributeValue::S(_)
+            | AttributeValue::B(_)
+            | AttributeValue::Bool(_)
+            | AttributeValue::Null(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a set whose members are not distinct: a set holds each of its values once,
+/// so a request naming one twice is a `ValidationException` rather than a stored
+/// duplicate. Members are compared as the values they are — numerically for `NS`,
+/// because its members are canonicalized first — and the check sorts BORROWED members,
+/// so it costs O(n log n) and copies nothing.
+fn require_distinct<T: Ord>(
+    members: &[T],
+    set_type: &str,
+    render: impl Fn(&T) -> String,
+) -> Result<(), RequestError> {
+    let mut sorted: Vec<&T> = members.iter().collect();
+    sorted.sort_unstable();
+    for pair in sorted.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(RequestError::Validation(format!(
+                "Input collection contains duplicates: the {set_type} member {} appears \
+                 more than once",
+                render(pair[0])
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize every number in one item, which is what a write does before the item
+/// lands. A refusal names the attribute it came from, so a caller can find it.
+///
+/// The attributes are walked in NAME order rather than in the hash map's own order,
+/// and the walk STOPS at the first refusal: two identical requests are therefore
+/// refused with identical messages, and a refused item is left with the attributes
+/// after the failing one untouched.
+pub fn canonicalize_item(item: &mut Item) -> Result<(), RequestError> {
+    let mut names: Vec<String> = item.keys().cloned().collect();
+    names.sort_unstable();
+    for name in names {
+        let Some(value) = item.get_mut(&name) else {
+            continue;
+        };
+        if let Err(error) = canonicalize_attribute_value(value) {
+            return Err(match error {
+                RequestError::Validation(message) => {
+                    RequestError::Validation(format!("Invalid attribute {name}: {message}"))
+                }
+                other => other,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The capacity units a write of `size` bytes consumes: one unit per 1 KB, and never
 /// less than one unit.
 pub fn write_capacity_units(size: i64) -> f64 {
@@ -1341,7 +1762,119 @@ fn units_of(size: i64, unit_bytes: i64) -> f64 {
     f64::from(u32::try_from(whole_units).unwrap_or(u32::MAX))
 }
 
-/// The `ConsumedCapacity` a request that asked for it gets back, or `None` when it
+/// What ONE write consumed, broken down the way `ConsumedCapacity` reports it: the
+/// units the table itself took, and the units each secondary index the write affected
+/// took.
+///
+/// The per-index maps are ordered, so a write reports its indexes in one stable order
+/// whatever order the table declared them in.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteCapacity {
+    /// The units consumed on the table itself.
+    pub table: f64,
+    /// The units consumed on each local secondary index the write affected.
+    pub local_secondary_indexes: BTreeMap<String, f64>,
+    /// The units consumed on each global secondary index the write affected.
+    pub global_secondary_indexes: BTreeMap<String, f64>,
+}
+
+impl WriteCapacity {
+    /// The aggregate `CapacityUnits`: "The total number of capacity units consumed by
+    /// the operation" (`ConsumedCapacity$CapacityUnits`) — the table's units plus those
+    /// of every index the write fanned out to.
+    pub fn total(&self) -> f64 {
+        self.local_secondary_indexes
+            .values()
+            .chain(self.global_secondary_indexes.values())
+            .fold(self.table, |total, units| total + units)
+    }
+}
+
+/// The `ConsumedCapacity` a WRITE that asked for it gets back, or `None` when it asked
+/// for `NONE` (or did not ask at all).
+///
+/// `TOTAL` reports "only the aggregate ConsumedCapacity for the operation"; `INDEXES`
+/// reports "the aggregate ConsumedCapacity for the operation, together with
+/// ConsumedCapacity for each table and secondary index that was accessed" (the
+/// `ReturnConsumedCapacity` doc), so the `Table` and per-index breakdown is returned
+/// only then — and only for the indexes the write actually affected, since an index it
+/// did not reach consumed nothing on it.
+pub fn consumed_write_capacity(
+    requested: Option<&str>,
+    table_name: &str,
+    capacity: &WriteCapacity,
+) -> Option<ConsumedCapacity> {
+    let detail = match requested {
+        Some("TOTAL") => false,
+        Some("INDEXES") => true,
+        _ => return None,
+    };
+    let breakdown = |units: &BTreeMap<String, f64>| -> Option<HashMap<String, Capacity>> {
+        (detail && !units.is_empty()).then(|| {
+            units
+                .iter()
+                .map(|(name, units)| {
+                    (
+                        name.clone(),
+                        Capacity {
+                            capacity_units: Some(*units),
+                            ..Capacity::default()
+                        },
+                    )
+                })
+                .collect()
+        })
+    };
+    Some(ConsumedCapacity {
+        table_name: Some(table_name.to_string()),
+        capacity_units: Some(capacity.total()),
+        table: detail.then(|| Capacity {
+            capacity_units: Some(capacity.table),
+            ..Capacity::default()
+        }),
+        local_secondary_indexes: breakdown(&capacity.local_secondary_indexes),
+        global_secondary_indexes: breakdown(&capacity.global_secondary_indexes),
+        ..ConsumedCapacity::default()
+    })
+}
+
+/// Whether a write reports item collection metrics: "If set to SIZE, the response
+/// includes statistics about item collections, if any, that were modified during the
+/// operation ... If set to NONE (the default), no statistics are returned"
+/// (`PutItem$ReturnItemCollectionMetrics`). A value the model's
+/// `ReturnItemCollectionMetrics` enum does not name is a bad request rather than a
+/// silent `NONE`.
+pub fn returns_item_collection_metrics(requested: Option<&str>) -> Result<bool, RequestError> {
+    match requested {
+        None | Some("NONE") => Ok(false),
+        Some("SIZE") => Ok(true),
+        Some(other) => Err(RequestError::Validation(format!(
+            "ReturnItemCollectionMetrics can only be SIZE or NONE, got {other}"
+        ))),
+    }
+}
+
+/// A gigabyte, as `SizeEstimateRangeGB` denominates its bounds. DynamoDB's size quotas
+/// are decimal ("The maximum size of any item collection is 10 GB" — "Service, Account,
+/// and Table Quotas"), so a gigabyte here is 10^9 bytes.
+const BYTES_PER_GB: i64 = 1_000_000_000;
+
+/// The two-element `[lower, upper]` bound, in GB, that brackets `bytes`.
+///
+/// "This value is a two-element array containing a lower bound and an upper bound for
+/// the estimate ... The estimate is subject to change over time; therefore, do not rely
+/// on the precision or accuracy of the estimate"
+/// (`ItemCollectionMetrics$SizeEstimateRangeGB`). The bracket reported here is the whole
+/// gigabyte at or below the measured size and the next one above it, so the measured
+/// size always lies inside the reported range and a collection under a gigabyte reports
+/// `[0.0, 1.0]`.
+pub fn size_estimate_range_gb(bytes: i64) -> Vec<f64> {
+    let whole_gb = bytes.max(0) / BYTES_PER_GB;
+    let lower = f64::from(u32::try_from(whole_gb).unwrap_or(u32::MAX));
+    vec![lower, lower + 1.0]
+}
+
+/// The `ConsumedCapacity` a READ that asked for it gets back, or `None` when it
 /// asked for `NONE` (or did not ask at all).
 ///
 /// `INDEXES` asks for the per-table breakdown as well as the aggregate; on a base

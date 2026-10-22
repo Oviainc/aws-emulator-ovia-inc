@@ -288,9 +288,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `redriveFilter` selects by whether an execution was redriven.
-        // `RedriveExecution` is not implemented in this emulator, so no stored
-        // execution has been redriven and `REDRIVEN` selects none of them.
+        // `redriveFilter` selects by whether an execution was redriven, which the
+        // execution's own `redriveCount` records: `RedriveExecution` moves it, so
+        // `REDRIVEN` selects the executions a redrive was performed on.
         let redrive_filter = input.redrive_filter.as_deref();
         let matching: Vec<&crate::state::Execution> = store
             .executions_newest_first(state_machine_arn)
@@ -324,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state_machine_version_arn: None,
                 state_machine_alias_arn: None,
                 redrive_count: Some(execution.redrive_count),
-                redrive_date: None,
+                redrive_date: execution.redrive_date.map(crate::state::to_date_time),
             })
             .collect();
 

@@ -40,10 +40,176 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// AppSync's own modelled error for a request that is not well formed:
+/// `BadRequestException`, `httpError` 400, with members `message`/`reason`/`detail`
+/// (`smithy_query(query="shape", shape="BadRequestException")`). Every operation of
+/// this service models it, and no operation models `ValidationException`.
+const BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The error code the framework names a boundary refusal with on this service's
+/// restJson1 envelope (`json` in `vendor/smithy-server-runtime/src/pre_dispatch.rs`),
+/// repeated here because [`Refused`] replaces the code and the message TOGETHER: the
+/// refusals below that only adjust the WORDING must keep answering under the code the
+/// caller would otherwise have seen.
+const FRAMEWORK_REFUSAL_CODE: &str = "ValidationException";
+
+/// Every member this service's model constrains with `@range`, with the bounds the
+/// shape it targets declares, keyed by the member name a violation path ends in.
+///
+/// Source: `smithy_query(query="shape", shape="MaxResults,MaxBatchSize,
+/// QueryDepthLimit,ResolverCountLimit")` — `MaxResults` 0..25 (every list operation's
+/// `maxResults`), `MaxBatchSize` 0..2000 (`CreateResolver`/`UpdateResolver`/
+/// `CreateFunction`/`UpdateFunction`), `QueryDepthLimit` 0..75 and
+/// `ResolverCountLimit` 0..10000 (`CreateGraphqlApi`/`UpdateGraphqlApi`). Those four
+/// shapes are the whole of it: every other numeric member of this model (the `ttl`
+/// and `expires` members among them) targets an unconstrained `Long`, so no other
+/// member can produce a range violation.
+///
+/// FOLLOW-UP: these bounds are copied out of the model rather than read from it,
+/// because a refusal reaches this file as a [`Violation`] whose
+/// `ViolationKind::MinValue`/`MaxValue` carries only the bound that was CROSSED
+/// (`vendor/smithy-schema-server/src/constraints.rs`), and the message states both.
+/// Carrying the whole declared range on those variants would let the message be
+/// computed from the model at refusal time and make this table unnecessary; that is a
+/// change to the vendored framework, which this fix cannot make. Until then a member
+/// absent from the table is named alone rather than with invented bounds, so drift
+/// drops the range clause instead of stating a wrong one.
+const RANGED_MEMBERS: &[(&str, i64, i64)] = &[
+    ("maxBatchSize", 0, 2_000),
+    ("maxResults", 0, 25),
+    ("queryDepthLimit", 0, 75),
+    ("resolverCountLimit", 0, 10_000),
+];
+
+/// The members AppSync's own refusal labels differently from the request member that
+/// carries them.
+///
+/// This is service vocabulary, not model data: nothing in the model states it, and it
+/// comes from the service's observed wording — `resolverCountLimit` is reported as
+/// `resolverLimit` ("Invalid resolverLimit given. Must fall within range 0 to
+/// 10,000") and `operationLevelMetricsConfig` as `operationLevelMetricConfig`
+/// ("Invalid operationLevelMetricConfig given."), a label short of the member's
+/// plural. A member absent from this table is named exactly as the model names it,
+/// which is what every other refusal above shows.
+const REFUSAL_LABELS: &[(&str, &str)] = &[
+    ("operationLevelMetricsConfig", "operationLevelMetricConfig"),
+    ("resolverCountLimit", "resolverLimit"),
+];
+
+/// The member a violation path names: its last segment, so a nested member
+/// (`enhancedMetricsConfig.dataSourceLevelMetricsBehavior`) is named the way AppSync
+/// names it in a refusal — by the member, not by the path it sits on.
+fn violated_member(path: &str) -> &str {
+    path.split('.').next_back().unwrap_or(path)
+}
+
+/// The label AppSync's refusal names `member` by ([`REFUSAL_LABELS`]).
+fn refusal_label(member: &str) -> &str {
+    REFUSAL_LABELS
+        .iter()
+        .find(|(name, _)| *name == member)
+        .map_or(member, |(_, label)| *label)
+}
+
+/// `value` with its digits grouped in threes by commas, the way AppSync renders a
+/// bound in a refusal ("Must fall within range 0 to 10,000").
+fn grouped(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if value < 0 {
+        out.push('-');
+    }
+    for (position, digit) in digits.char_indices() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// AppSync's own refusal for a member whose value the model rules out outright — an
+/// absent required member, or a value outside the member's modelled `@range`: the
+/// service's `BadRequestException`, naming the offending member, and the whole
+/// modelled range rather than the single bound that was crossed.
+///
+/// The framework's generic report would name `ValidationException`, a shape no
+/// operation of this service models, so a client matching on `BadRequestException`
+/// (and reading its `reason`/`detail`) would never fire. The message states ONE
+/// member — the first the walk refused — where the framework's aggregates every
+/// clause, because that is how the service states it.
+///
+/// `None` when no violation is of either kind; a length, a pattern or an enum value
+/// set then keeps the framework's wording (see [`without_rejected_enum_values`]).
+fn member_refusal(violations: &[Violation]) -> Option<Refused> {
+    violations.iter().find_map(|violation| {
+        let member = violated_member(&violation.path);
+        let label = refusal_label(member);
+        let range = RANGED_MEMBERS.iter().find(|(name, _, _)| *name == member);
+        let message = match violation.kind {
+            ViolationKind::MissingRequiredMember => format!("Invalid {label} given."),
+            ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) => match range {
+                Some((_, min, max)) => format!(
+                    "Invalid {label} given. Must fall within range {} to {}",
+                    grouped(*min),
+                    grouped(*max)
+                ),
+                // A range this model does not declare cannot be stated; name the
+                // member alone rather than inventing bounds for it.
+                None => format!("Invalid {label} given."),
+            },
+            _ => return None,
+        };
+        Some(Refused {
+            code: BAD_REQUEST_CODE.to_string(),
+            message,
+        })
+    })
+}
+
+/// The framework's aggregated constraint report with the rejected value lifted out of
+/// every ENUM clause, or `None` when no clause echoes one.
+///
+/// A value outside an enumerated type's value set is reported by naming the member
+/// path and the permitted values; the rejected value itself is withheld, because it
+/// is precisely the value the set does not contain. Every other clause — a length, a
+/// range, a pattern, an absent member — keeps the framework's wording, including its
+/// echo, and the code stays the one the framework answers with
+/// ([`FRAMEWORK_REFUSAL_CODE`]).
+///
+/// The text replaced is built from the SAME two fields the framework interpolated
+/// (`Violation::message`), so it matches the echo exactly whatever the value holds.
+fn without_rejected_enum_values(violations: &[Violation]) -> Option<Refused> {
+    let echoes_enum_value = violations
+        .iter()
+        .any(|v| matches!(v.kind, ViolationKind::EnumValue(_)) && v.value.is_some());
+    if !echoes_enum_value {
+        return None;
+    }
+    let mut message = aws_smithy_schema_server::envelope(violations)?;
+    for violation in violations {
+        if !matches!(violation.kind, ViolationKind::EnumValue(_)) {
+            continue;
+        }
+        let Some(value) = violation.value.as_deref() else {
+            continue;
+        };
+        message = message.replace(
+            &format!("Value '{value}' at '{}'", violation.path),
+            &format!("Value at '{}'", violation.path),
+        );
+    }
+    Some(Refused {
+        code: FRAMEWORK_REFUSAL_CODE.to_string(),
+        message,
+    })
+}
 
 /// The `com-amazonaws-appsync-awsdeepdishcontrolplaneservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +263,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. AppSync states two of those classes itself:
+        //
+        // * a member the model rules out outright — absent though required, or
+        //   outside its modelled `@range` — is its own `BadRequestException` naming
+        //   that member, and its range when it has one (`member_refusal`); the
+        //   framework's `ValidationException` is a shape no operation of this service
+        //   models;
+        // * a value outside an enumerated type's value set names the member path and
+        //   the permitted values WITHOUT echoing the rejected value
+        //   (`without_rejected_enum_values`), under the framework's own code.
+        //
+        // Every other refusal — a length, a pattern — keeps the framework's wording
+        // and code.
+        match refusal {
+            Refusal::Invalid(violations) => member_refusal(violations)
+                .or_else(|| without_rejected_enum_values(violations)),
+            // Authentication refusals, and any refusal kind added later, keep the
+            // framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

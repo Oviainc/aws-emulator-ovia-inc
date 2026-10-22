@@ -33,6 +33,9 @@ use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
 use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The refusal-code reader is the harness's, so there is one implementation of it.
+use crate::emulator::error_code;
+
 /// The region most of these tests sign for; the region-scoping test uses a second one.
 const REGION: &str = "us-east-1";
 
@@ -87,17 +90,6 @@ async fn ok(router: &MultiServiceRouter, region: &str, operation: &str, body: Va
         "case {region} {operation} {body}: expected HTTP 200, got {status} with {parsed}"
     );
     parsed
-}
-
-/// The wire error code (`__type`) of a refusal.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit(['#', '/'])
-        .next()
-        .unwrap_or("<no __type>")
-        .to_string()
 }
 
 /// Create a table carrying `tags`, wait out the `CREATING` -> `ACTIVE` transition the

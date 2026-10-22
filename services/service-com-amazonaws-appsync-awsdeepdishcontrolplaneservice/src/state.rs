@@ -153,6 +153,43 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     }
 }
 
+/// The number of characters an AppSync API id has.
+///
+/// The ids this service mints are 26 base-32 characters ([`mint_id`]), the shape
+/// AppSync's own `apiId` takes. The model types every `apiId` member as a plain
+/// `String`, so nothing refuses a longer one at the boundary; [`is_api_id`] is where
+/// this service refuses it.
+///
+/// [`mint_id`]: ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::mint_id
+pub const API_ID_LEN: usize = 26;
+
+/// Whether `candidate` is syntactically an AppSync API id, i.e. whether it could name
+/// an API at all.
+///
+/// The test is on LENGTH only: an id longer than [`API_ID_LEN`] holds more characters
+/// than an AppSync API id has, so it names no API and the call is a bad request, while
+/// a shorter one is simply an id this account does not hold and the call is a
+/// not-found. The alphabet is deliberately NOT part of the test: AppSync answers
+/// not-found for a short id drawn from outside the id alphabet, so a character outside
+/// it does not make the request malformed.
+pub fn is_api_id(candidate: &str) -> bool {
+    !candidate.is_empty() && candidate.chars().count() <= API_ID_LEN
+}
+
+/// AppSync's refusal text for an `apiId` that is not an API id ([`is_api_id`]): the
+/// rejected id, so the caller can see which value was refused.
+pub fn invalid_api_id_message(api_id: &str) -> String {
+    format!("Invalid API ID {api_id}")
+}
+
+/// AppSync's fixed, request-independent text for an API that is absent, carried by
+/// `NotFoundException` (HTTP 404) by every operation that resolves an `apiId`.
+pub const API_NOT_FOUND_MESSAGE: &str = "API not found.";
+
+/// AppSync's fixed, request-independent text for a `nextToken` a list operation cannot
+/// resume from, carried by `BadRequestException` (HTTP 400).
+pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token given.";
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

@@ -6,6 +6,10 @@
 //! name, and returns the ARN. An `IdempotencyToken` re-sent with the same request
 //! parameters resolves to the certificate already created for it.
 //!
+//! `PENDING_VALIDATION` is not where the certificate stays: the call records the
+//! validation outcome the clock owes it ([`crate::state::PendingValidation`]) and the
+//! instant it falls due, which whichever call next touches the store materialises.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -301,7 +305,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         });
 
+        // ONE instant answers the whole request: it materialises the outcomes the
+        // clock already owes and dates the certificate this call creates.
+        let now = std::time::SystemTime::now();
+
         let mut store = state.lock();
+        store.materialize_due(now);
 
         // A re-sent request resolves to the certificate it already created. An entry
         // whose certificate has since been deleted is stale, so it is not reused: a
@@ -363,13 +372,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             certificate_authority_arn: input.certificate_authority_arn.clone(),
             managed_by: input.managed_by.clone(),
             renewal_eligibility: crate::state::RENEWAL_INELIGIBLE.to_string(),
+            // Nothing has failed: `FailureReason` "exists only when the certificate
+            // status is FAILED" (`CertificateDetail$FailureReason` doc).
+            failure_reason: None,
+            // ACM resolves the validation of a requested certificate on its own, so
+            // the outcome is owed from here on; the instant it falls due is fixed now
+            // and materialised by whichever call next touches the store.
+            pending_validation: Some(crate::state::PendingValidation::starting_at(
+                now,
+                validation_outcome(&input),
+            )),
             in_use_by: Vec::new(),
             // A certificate carries X.509 key-usage extensions only once it has been
             // issued, and this one is pending validation.
             key_usages: Vec::new(),
             extended_key_usages: Vec::new(),
             exported: false,
-            created_at: std::time::SystemTime::now(),
+            created_at: now,
             issued_at: None,
             not_before: None,
             not_after: None,
@@ -384,6 +403,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(RequestCertificateOutput {
             certificate_arn: Some(arn),
         })
+    }
+}
+
+/// How the validation of the certificate this request creates will resolve.
+///
+/// "If you are requesting a private certificate, domain validation is not required.
+/// If you are requesting a public certificate, each domain name that you specify must
+/// be validated to verify that you own or control the domain" (`RequestCertificate`
+/// doc). A request naming a private certificate authority therefore has nothing left
+/// to prove and is issued; a public one needs proof of control of every name it
+/// covers, which lives outside this emulator (a DNS record, a mailbox or an HTTP
+/// token on the domain itself, none of which it can reach), so no public request can
+/// be carried through and it ends in the modelled failure for a request that needs
+/// verification the service cannot obtain.
+fn validation_outcome(input: &RequestCertificateInput) -> crate::state::ValidationOutcome {
+    if input.certificate_authority_arn.is_some() {
+        crate::state::ValidationOutcome::Issued
+    } else {
+        crate::state::ValidationOutcome::Failed
     }
 }
 

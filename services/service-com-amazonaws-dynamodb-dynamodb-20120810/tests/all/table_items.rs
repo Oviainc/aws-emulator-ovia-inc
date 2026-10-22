@@ -22,6 +22,9 @@ use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
 use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The refusal-code reader is the harness's, so there is one implementation of it.
+use crate::emulator::error_code;
+
 /// A SigV4-shaped `Authorization` header: its credential scope is what routes the
 /// request to this service (signing name `dynamodb`) and names the region the ARNs
 /// the service mints carry. Request authentication is off in these tests, so the
@@ -66,17 +69,6 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value 
         "case {operation} {body}: expected HTTP 200, got {status} with {parsed}"
     );
     parsed
-}
-
-/// The wire error code (`__type`) of a refusal.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit(['#', '/'])
-        .next()
-        .unwrap_or("<no __type>")
-        .to_string()
 }
 
 /// Create a table from `(attribute, key type, attribute type)` rows and wait for the
@@ -558,8 +550,10 @@ async fn sort_key_order_is_the_order_of_the_key_attributes_type() {
         (
             "ByNumber",
             "N",
+            // '1e2' is written in exponent form and read back canonically ('100'):
+            // what is stored is the NUMBER, so the order is numeric either way.
             &["10", "9", "-1", "1e2", "0.5", "0"],
-            &["-1", "0", "0.5", "9", "10", "1e2"],
+            &["-1", "0", "0.5", "9", "10", "100"],
         ),
         (
             "ByBinary",

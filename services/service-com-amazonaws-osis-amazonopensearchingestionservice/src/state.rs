@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BufferOptions, EncryptionAtRestOptions, LogPublishingOptions, Pipeline, PipelineStatusReason,
-    PipelineSummary, Tag, VpcEndpoint, VpcOptions,
+    BufferOptions, EncryptionAtRestOptions, LogPublishingOptions, Pipeline,
+    PipelineBlueprintSummary, PipelineStatusReason, PipelineSummary, Tag, VpcEndpoint, VpcOptions,
 };
 
 /// `com.amazonaws.osis#PipelineStatus` values this emulator moves a pipeline through.
@@ -175,13 +175,357 @@ impl StoredPipeline {
     }
 }
 
+/// A blueprint the service publishes: the five members `PipelineBlueprintSummary` models
+/// (smithy_query: shape PipelineBlueprintSummary), plus the Data Prepper configuration
+/// document the record carries, held once in the YAML form
+/// `PipelineBlueprint$PipelineConfigurationBody` documents ("The YAML configuration of the
+/// blueprint").
+///
+/// Blueprints are service-provided data, not caller-created resources: the service ships
+/// the catalog and `ListPipelineBlueprints` only reports it, so these records are seeded
+/// when the store is first reached and no operation writes them.
+#[derive(Debug, Clone)]
+pub struct StoredBlueprint {
+    pub blueprint_name: String,
+    pub display_name: String,
+    pub display_description: String,
+    pub service: String,
+    pub use_case: String,
+    /// The blueprint's Data Prepper pipeline configuration, as a YAML document.
+    pub pipeline_configuration_body: String,
+}
+
+impl StoredBlueprint {
+    /// The modelled `PipelineBlueprintSummary`, as `ListPipelineBlueprints` returns it —
+    /// every member of `PipelineBlueprint` except the configuration body.
+    pub fn to_summary(&self) -> PipelineBlueprintSummary {
+        PipelineBlueprintSummary {
+            blueprint_name: Some(self.blueprint_name.clone()),
+            display_name: Some(self.display_name.clone()),
+            display_description: Some(self.display_description.clone()),
+            service: Some(self.service.clone()),
+            use_case: Some(self.use_case.clone()),
+        }
+    }
+}
+
+/// One row of the built-in blueprint catalog.
+struct CatalogEntry {
+    blueprint_name: &'static str,
+    display_name: &'static str,
+    display_description: &'static str,
+    service: &'static str,
+    use_case: &'static str,
+    configuration_body: &'static str,
+}
+
+/// The blueprints this emulator publishes.
+///
+/// Hand-written, because the catalog is data the real service ships rather than anything
+/// the model carries: the member meanings come from smithy_query shape
+/// `PipelineBlueprintSummary` (`BlueprintName`, `DisplayName`, `DisplayDescription`,
+/// `Service`, `UseCase`), and the names and configuration documents follow the
+/// `AWS-<source>Pipeline` blueprints described by "Using blueprints to create a pipeline",
+/// the page `ListPipelineBlueprints`' own model doc points at. Each body is a Data Prepper
+/// v2 pipeline configuration; the set is the emulator's own and is NOT a claim to be
+/// byte-identical with the live catalog, which AWS grows over time.
+const BLUEPRINT_CATALOG: &[CatalogEntry] = &[
+    CatalogEntry {
+        blueprint_name: "AWS-ApacheLogPipeline",
+        display_name: "Apache log ingestion",
+        display_description: "Ingest Apache access logs over HTTP, parse them with grok, \
+                              and write them to an OpenSearch index.",
+        service: "Apache HTTP Server",
+        use_case: "Log Analytics",
+        configuration_body: r#"version: "2"
+apache-log-pipeline:
+  source:
+    http:
+      path: "/${pipelineName}/logs"
+  processor:
+    - grok:
+        match:
+          log:
+            - "%{COMMONAPACHELOG_DATATYPED}"
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "apache_logs"
+"#,
+    },
+    CatalogEntry {
+        blueprint_name: "AWS-CloudTrailLogPipeline",
+        display_name: "CloudTrail log ingestion",
+        display_description: "Read CloudTrail log files from an Amazon S3 bucket through an \
+                              SQS notification queue and index each event.",
+        service: "Amazon S3",
+        use_case: "Log Analytics",
+        configuration_body: r#"version: "2"
+cloudtrail-log-pipeline:
+  source:
+    s3:
+      codec:
+        newline: {}
+      compression: "gzip"
+      acknowledgments: true
+      sqs:
+        queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/example-queue"
+      aws:
+        region: "us-east-1"
+        sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+  processor:
+    - parse_json:
+        source: "message"
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "cloudtrail_logs"
+"#,
+    },
+    CatalogEntry {
+        blueprint_name: "AWS-VPCFlowLogPipeline",
+        display_name: "VPC flow log ingestion",
+        display_description: "Read VPC flow log files from an Amazon S3 bucket, split each \
+                              record into its documented columns, and index it.",
+        service: "Amazon S3",
+        use_case: "Log Analytics",
+        configuration_body: r#"version: "2"
+vpc-flow-log-pipeline:
+  source:
+    s3:
+      codec:
+        newline: {}
+      compression: "gzip"
+      acknowledgments: true
+      sqs:
+        queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/example-queue"
+      aws:
+        region: "us-east-1"
+        sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+  processor:
+    - csv:
+        delimiter: " "
+        column_names:
+          - "version"
+          - "account_id"
+          - "interface_id"
+          - "srcaddr"
+          - "dstaddr"
+          - "srcport"
+          - "dstport"
+          - "protocol"
+          - "packets"
+          - "bytes"
+          - "start"
+          - "end"
+          - "action"
+          - "log_status"
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "vpc_flow_logs"
+"#,
+    },
+    CatalogEntry {
+        blueprint_name: "AWS-TraceAnalyticsPipeline",
+        display_name: "Trace analytics",
+        display_description: "Receive OpenTelemetry spans, then fan them out to the raw-trace \
+                              and service-map indexes Trace Analytics reads.",
+        service: "OpenTelemetry",
+        use_case: "Trace Analytics",
+        configuration_body: r#"version: "2"
+entry-pipeline:
+  source:
+    otel_trace_source:
+      path: "/${pipelineName}/v1/traces"
+  processor:
+    - trace_peer_forwarder: {}
+  sink:
+    - pipeline:
+        name: "raw-trace-pipeline"
+    - pipeline:
+        name: "service-map-pipeline"
+raw-trace-pipeline:
+  source:
+    pipeline:
+      name: "entry-pipeline"
+  processor:
+    - otel_traces: {}
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index_type: "trace-analytics-raw"
+service-map-pipeline:
+  source:
+    pipeline:
+      name: "entry-pipeline"
+  processor:
+    - service_map: {}
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index_type: "trace-analytics-service-map"
+"#,
+    },
+    CatalogEntry {
+        blueprint_name: "AWS-MetricIngestionPipeline",
+        display_name: "Metric ingestion",
+        display_description: "Receive OpenTelemetry metrics, flatten the histogram buckets, \
+                              and index the result.",
+        service: "OpenTelemetry",
+        use_case: "Metric Analytics",
+        configuration_body: r#"version: "2"
+metrics-pipeline:
+  source:
+    otel_metrics_source:
+      path: "/${pipelineName}/v1/metrics"
+  processor:
+    - otel_metrics:
+        calculate_histogram_buckets: true
+        calculate_exponential_histogram_buckets: true
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "metrics"
+"#,
+    },
+    CatalogEntry {
+        blueprint_name: "AWS-DynamoDBChangeDataCapturePipeline",
+        display_name: "DynamoDB change data capture",
+        display_description: "Load an Amazon DynamoDB table from its point-in-time-recovery \
+                              export, then keep it in sync from the table's stream.",
+        service: "Amazon DynamoDB",
+        use_case: "Change Data Capture",
+        configuration_body: r#"version: "2"
+dynamodb-pipeline:
+  source:
+    dynamodb:
+      tables:
+        - table_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/example-table"
+          export:
+            s3_bucket: "amzn-s3-demo-bucket"
+            s3_region: "us-east-1"
+          stream:
+            start_position: "LATEST"
+      aws:
+        region: "us-east-1"
+        sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "example-table"
+        document_id: "${getMetadata(\"primary_key\")}"
+        action: "${getMetadata(\"opensearch_action\")}"
+"#,
+    },
+    CatalogEntry {
+        blueprint_name: "AWS-S3SelectLogPipeline",
+        display_name: "Amazon S3 log scan",
+        display_description: "Scan an Amazon S3 bucket prefix on a schedule and index every \
+                              JSON log object it holds.",
+        service: "Amazon S3",
+        use_case: "Log Analytics",
+        configuration_body: r#"version: "2"
+s3-log-pipeline:
+  source:
+    s3:
+      codec:
+        json: {}
+      compression: "none"
+      acknowledgments: true
+      scan:
+        buckets:
+          - bucket:
+              name: "amzn-s3-demo-bucket"
+              filter:
+                include_prefix:
+                  - "logs/"
+      aws:
+        region: "us-east-1"
+        sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+  sink:
+    - opensearch:
+        hosts:
+          - "https://search-domain-endpoint.us-east-1.es.amazonaws.com"
+        aws:
+          sts_role_arn: "arn:aws:iam::123456789012:role/Example-Role"
+          region: "us-east-1"
+        index: "s3_logs"
+"#,
+    },
+];
+
+/// The catalog as stored records, keyed and ordered by blueprint name.
+fn builtin_blueprints() -> BTreeMap<String, StoredBlueprint> {
+    BLUEPRINT_CATALOG
+        .iter()
+        .map(|entry| {
+            (
+                entry.blueprint_name.to_string(),
+                StoredBlueprint {
+                    blueprint_name: entry.blueprint_name.to_string(),
+                    display_name: entry.display_name.to_string(),
+                    display_description: entry.display_description.to_string(),
+                    service: entry.service.to_string(),
+                    use_case: entry.use_case.to_string(),
+                    pipeline_configuration_body: entry.configuration_body.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-osis-amazonopensearchingestionservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsOsisAmazonopensearchingestionserviceState {
     /// Every pipeline, keyed by its name — unique per account per Region, per the
     /// `PipelineName` doc — and ordered by it, so `ListPipelines` paginates
     /// deterministically.
     pub pipelines: BTreeMap<String, StoredPipeline>,
+    /// The blueprint catalog, keyed and ordered by blueprint name. Seeded from
+    /// [`BLUEPRINT_CATALOG`] when the store is first reached, because the service ships
+    /// these: no caller creates or deletes one, so both blueprint operations are pure
+    /// reports over this map and cannot disagree with each other.
+    pub blueprints: BTreeMap<String, StoredBlueprint>,
+}
+
+/// The store a fresh engine hands this service: no pipelines yet, and the blueprint
+/// catalog the service publishes.
+impl Default for ComAmazonawsOsisAmazonopensearchingestionserviceState {
+    fn default() -> Self {
+        Self {
+            pipelines: BTreeMap::new(),
+            blueprints: builtin_blueprints(),
+        }
+    }
 }
 
 impl ComAmazonawsOsisAmazonopensearchingestionserviceState {

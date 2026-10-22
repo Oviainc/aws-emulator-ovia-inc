@@ -21,8 +21,10 @@
 //! starts them, because that is what the service reports:
 //!
 //! * an execution starts `RUNNING` and reaches its terminal status later. The run is
-//!   interpreted eagerly by [`asl::run`] at `StartExecution` and parked in
-//!   [`PendingOutcome`], owed at `startDate + EXECUTION_SETTLE_DELAY + <every Wait>`.
+//!   interpreted eagerly by [`asl::run`] at `StartExecution` — and again at
+//!   `RedriveExecution`, which re-runs the same definition over the same input — and
+//!   parked in [`PendingOutcome`], owed at
+//!   `<the attempt's start> + EXECUTION_SETTLE_DELAY + <every Wait>`.
 //! * `DeleteStateMachine` is documented as asynchronous: it "sets the state machine's
 //!   status to `DELETING` and begins the deletion process", so the record moves to
 //!   `DELETING` now and is removed once [`DELETE_SETTLE_DELAY`] has passed.
@@ -94,6 +96,90 @@ pub const EXECUTION_STATUS_FAILED: &str = "FAILED";
 
 /// An execution `StopExecution` stopped.
 pub const EXECUTION_STATUS_ABORTED: &str = "ABORTED";
+
+// ---------------------------------------------------------------------------
+// Redrive
+//
+// `DescribeExecution` reports, for every execution, whether `RedriveExecution`
+// would redrive it (`redriveStatus`) and — when it would not — the reason why
+// (`redriveStatusReason`). Both are answered from ONE predicate,
+// [`ComAmazonawsSfnAwsstepfunctionsState::not_redrivable_reason`], so the field a
+// client reads to decide whether to call `RedriveExecution` cannot disagree with
+// what that call then does.
+// ---------------------------------------------------------------------------
+
+/// `ExecutionRedriveStatus`'s value for an execution `RedriveExecution` would
+/// redrive.
+pub const REDRIVE_STATUS_REDRIVABLE: &str = "REDRIVABLE";
+
+/// `ExecutionRedriveStatus`'s value for an execution it would refuse: "redriveStatus
+/// is NOT_REDRIVABLE if calling the RedriveExecution API action would return the
+/// ExecutionNotRedrivable error".
+pub const REDRIVE_STATUS_NOT_REDRIVABLE: &str = "NOT_REDRIVABLE";
+
+// The `redriveStatusReason` values below are the ones that member's own
+// documentation lists verbatim, so the reason this emulator reports is a reason the
+// service publishes rather than wording of its own.
+
+/// "Execution is RUNNING and cannot be redriven."
+pub const NOT_REDRIVABLE_RUNNING: &str = "Execution is RUNNING and cannot be redriven";
+
+/// "Execution is SUCCEEDED and cannot be redriven."
+pub const NOT_REDRIVABLE_SUCCEEDED: &str = "Execution is SUCCEEDED and cannot be redriven";
+
+/// "State machine is in DELETING status."
+pub const NOT_REDRIVABLE_DELETING: &str = "State machine is in DELETING status";
+
+/// "Execution history event limit exceeded."
+pub const NOT_REDRIVABLE_EVENT_LIMIT: &str = "Execution history event limit exceeded";
+
+/// "Execution has exceeded the max execution time."
+pub const NOT_REDRIVABLE_MAX_EXECUTION_TIME: &str =
+    "Execution has exceeded the max execution time";
+
+/// "Execution redrivable period exceeded."
+pub const NOT_REDRIVABLE_PERIOD: &str = "Execution redrivable period exceeded";
+
+/// How long after an execution completes it can still be redriven.
+///
+/// An AWS-documented duration, from `RedriveExecution`'s own documentation: "Your
+/// workflow execution has not exceeded the redrivable period of 14 days. Redrivable
+/// period refers to the time during which you can redrive a given execution. This
+/// period starts from the day a state machine completes its execution."
+pub const REDRIVABLE_PERIOD: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// The longest an execution may be open and still be redrivable.
+///
+/// An AWS-documented duration, from the same list: "The workflow execution has not
+/// exceeded the maximum open time of one year."
+pub const MAX_OPEN_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// The history event count at which an execution stops being redrivable.
+///
+/// From the same list: "The execution event history count is less than 24,999.
+/// Redriven executions append their event history to the existing event history."
+pub const MAX_REDRIVABLE_HISTORY_EVENTS: usize = 24_999;
+
+/// How many client tokens of successful redrives one execution remembers.
+///
+/// From `RedriveExecution`'s `clientToken` documentation: "The API will return
+/// idempotent responses for the last 10 client tokens used to successfully redrive
+/// the execution."
+pub const MAX_REDRIVE_CLIENT_TOKENS: usize = 10;
+
+/// How long one of those client tokens keeps answering idempotently.
+///
+/// An AWS-documented duration, from the same member: "These client tokens are valid
+/// for up to 15 minutes after they are first used."
+pub const REDRIVE_CLIENT_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// The history event an execution's FIRST attempt opens with.
+pub const EVENT_EXECUTION_STARTED: &str = "ExecutionStarted";
+
+/// The history event a redrive opens with, before the re-run's own events:
+/// `RedriveExecution` documents that "redriven executions append their event history
+/// to the existing event history" and names "the ExecutionRedriven history event".
+pub const EVENT_EXECUTION_REDRIVEN: &str = "ExecutionRedriven";
 
 // ---------------------------------------------------------------------------
 // Spans the clock owes
@@ -318,6 +404,29 @@ fn history_bytes(events: &[HistoryEvent]) -> usize {
         .sum()
 }
 
+/// The bytes one execution's remembered redrive client tokens hold.
+fn redrive_tokens_bytes(tokens: &[RedriveToken]) -> usize {
+    tokens
+        .iter()
+        .map(|remembered| std::mem::size_of::<RedriveToken>() + remembered.token.len())
+        .sum()
+}
+
+/// One client token a successful `RedriveExecution` was performed under, with the
+/// `redriveDate` that call answered.
+///
+/// From `RedriveExecution`'s `clientToken` documentation: "The API will return
+/// idempotent responses for the last [`MAX_REDRIVE_CLIENT_TOKENS`] client tokens
+/// used to successfully redrive the execution. These client tokens are valid for up
+/// to [`REDRIVE_CLIENT_TOKEN_TTL`] after they are first used."
+#[derive(Debug, Clone)]
+pub struct RedriveToken {
+    pub token: String,
+    /// The instant the redrive this token performed happened — both the response it
+    /// keeps answering and the start of its validity.
+    pub redrive_date: SystemTime,
+}
+
 /// One stored execution: every member `DescribeExecution` and `ListExecutions`
 /// report.
 #[derive(Debug, Clone)]
@@ -334,6 +443,15 @@ pub struct Execution {
     pub cause: Option<String>,
     pub trace_header: Option<String>,
     pub redrive_count: i32,
+    /// The instant the last successful `RedriveExecution` redrove this execution;
+    /// `None` until one has, which is what `redriveDate`'s own documentation says it
+    /// reports ("If you have not yet redriven an execution, the redriveDate is
+    /// null").
+    pub redrive_date: Option<SystemTime>,
+    /// The client tokens the last [`MAX_REDRIVE_CLIENT_TOKENS`] successful redrives
+    /// carried, oldest first, so a repeat of one of them answers what it answered
+    /// the first time instead of redriving a second time.
+    pub redrive_tokens: Vec<RedriveToken>,
     pub history: Vec<HistoryEvent>,
     /// The outcome the interpreter computed, until the clock makes it due.
     pub pending: Option<PendingOutcome>,
@@ -371,6 +489,7 @@ impl Execution {
             + self.error.as_ref().map_or(0, String::len)
             + self.cause.as_ref().map_or(0, String::len)
             + self.trace_header.as_ref().map_or(0, String::len)
+            + redrive_tokens_bytes(&self.redrive_tokens)
             + history_bytes(&self.history)
             + self.pending.as_ref().map_or(0, PendingOutcome::measure)
             // A running execution can still be stopped, and a stop writes a
@@ -430,6 +549,73 @@ impl Execution {
             timestamp,
             state_name: None,
         });
+    }
+
+    /// The id of the last event this execution's history holds, so a later attempt's
+    /// events continue the numbering rather than restarting it.
+    pub fn last_event_id(&self) -> i64 {
+        self.history.last().map_or(0, |event| event.id)
+    }
+
+    /// The `redriveDate` a successful redrive under `client_token` already answered,
+    /// when that token is still one of the remembered, unexpired ones.
+    ///
+    /// This is what makes `RedriveExecution` idempotent per client token, for the
+    /// window and the count its own documentation publishes.
+    pub fn redrive_for_token(&self, client_token: &str, now: SystemTime) -> Option<SystemTime> {
+        self.redrive_tokens
+            .iter()
+            .rev()
+            .find(|remembered| {
+                remembered.token == client_token
+                    && remembered
+                        .redrive_date
+                        .checked_add(REDRIVE_CLIENT_TOKEN_TTL)
+                        .is_none_or(|expiry| expiry > now)
+            })
+            .map(|remembered| remembered.redrive_date)
+    }
+
+    /// Record a redrive: the execution runs again from `now`, so it reports `RUNNING`
+    /// until the clock makes `pending` due, its `redriveCount` and `redriveDate`
+    /// move, and `opening` (the `ExecutionRedriven` event) is appended to the
+    /// history the first attempt left — "redriven executions append their event
+    /// history to the existing event history".
+    ///
+    /// The terminal values of the attempt being redriven are cleared, because the
+    /// execution has no terminal values again until the re-run reaches its own.
+    fn apply_redrive(
+        &mut self,
+        now: SystemTime,
+        client_token: Option<&str>,
+        opening: Vec<HistoryEvent>,
+        pending: PendingOutcome,
+    ) {
+        self.status = EXECUTION_STATUS_RUNNING.to_string();
+        self.stop_date = None;
+        self.output = None;
+        self.error = None;
+        self.cause = None;
+        self.redrive_count = self.redrive_count.saturating_add(1);
+        self.redrive_date = Some(now);
+        if let Some(token) = client_token {
+            // Only the last [`MAX_REDRIVE_CLIENT_TOKENS`] are remembered, so this
+            // list is bounded however many redrives one execution takes.
+            while self.redrive_tokens.len() >= MAX_REDRIVE_CLIENT_TOKENS {
+                self.redrive_tokens.remove(0);
+            }
+            self.redrive_tokens.push(RedriveToken {
+                token: token.to_string(),
+                redrive_date: now,
+            });
+        }
+        for event in opening {
+            if self.history.len() >= MAX_HISTORY_EVENTS {
+                break;
+            }
+            self.history.push(event);
+        }
+        self.pending = Some(pending);
     }
 }
 
@@ -751,6 +937,109 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         Some(now)
     }
 
+    /// Why `RedriveExecution` would refuse `execution` at `now`, in the words
+    /// `DescribeExecution`'s `redriveStatusReason` documents — or `None` when it
+    /// would redrive it, which is exactly when `redriveStatus` is `REDRIVABLE`
+    /// ("redriveStatus is NOT_REDRIVABLE if calling the RedriveExecution API action
+    /// would return the ExecutionNotRedrivable error").
+    ///
+    /// The conditions are `RedriveExecution`'s own: "You can redrive executions if
+    /// your original execution meets the following conditions: The execution status
+    /// isn't SUCCEEDED. Your workflow execution has not exceeded the redrivable
+    /// period of 14 days [...] The workflow execution has not exceeded the maximum
+    /// open time of one year [...] The execution event history count is less than
+    /// 24,999." An execution that has not reached a terminal status has not finished,
+    /// so there is nothing to continue from, and a state machine that is being
+    /// deleted can run nothing: both are reasons that member's list names too.
+    pub fn not_redrivable_reason(
+        &self,
+        execution: &Execution,
+        now: SystemTime,
+    ) -> Option<&'static str> {
+        if !execution.is_terminal() {
+            return Some(NOT_REDRIVABLE_RUNNING);
+        }
+        if execution.status == EXECUTION_STATUS_SUCCEEDED {
+            return Some(NOT_REDRIVABLE_SUCCEEDED);
+        }
+        // A state machine whose deletion has begun runs nothing; one the store no
+        // longer holds at all is past the end of that same deletion.
+        if self
+            .state_machines
+            .get(&execution.state_machine_arn)
+            .is_none_or(StateMachine::is_deleting)
+        {
+            return Some(NOT_REDRIVABLE_DELETING);
+        }
+        // "Redriven executions append their event history to the existing event
+        // history. Make sure your workflow execution contains less than 24,999
+        // events to accommodate the ExecutionRedriven history event and at least one
+        // other history event." This emulator's own history ceiling is lower, and an
+        // execution already at it has no room for that event either, so whichever is
+        // reached first is this reason.
+        if execution.history.len() + 2 > MAX_REDRIVABLE_HISTORY_EVENTS.min(MAX_HISTORY_EVENTS) {
+            return Some(NOT_REDRIVABLE_EVENT_LIMIT);
+        }
+        if now
+            .duration_since(execution.start_date)
+            .is_ok_and(|open| open > MAX_OPEN_DURATION)
+        {
+            return Some(NOT_REDRIVABLE_MAX_EXECUTION_TIME);
+        }
+        // The redrivable period "starts from the day a state machine completes its
+        // execution", which is the execution's own `stopDate`.
+        if execution
+            .stop_date
+            .and_then(|completed| now.duration_since(completed).ok())
+            .is_some_and(|since| since > REDRIVABLE_PERIOD)
+        {
+            return Some(NOT_REDRIVABLE_PERIOD);
+        }
+        None
+    }
+
+    /// Record a redrive of the execution `arn` names, with the opening history event
+    /// and the outcome a re-run of its definition computed.
+    ///
+    /// The execution reports `RUNNING` again until the clock makes that outcome due,
+    /// its `redriveCount` and `redriveDate` move, and `client_token` — when the
+    /// caller supplied one — is remembered so a repeat answers the same
+    /// `redriveDate`. Answers the `redriveDate` the redrive carries.
+    pub fn redrive_execution(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+        client_token: Option<&str>,
+        opening: Vec<HistoryEvent>,
+        pending: PendingOutcome,
+    ) -> Result<SystemTime, RedriveRejection> {
+        let Some(execution) = self.executions.get(arn) else {
+            return Err(RedriveRejection::NotFound);
+        };
+        // A redrive GROWS the record — the outcome the re-run computed, the events it
+        // appends and one remembered client token — so it is admitted against the
+        // store's ceiling exactly as a start is, rather than growing it past
+        // [`MAX_STORE_BYTES`].
+        let before = execution.retained_bytes;
+        let mut candidate = execution.clone();
+        candidate.apply_redrive(now, client_token, opening, pending);
+        let after = candidate.measure();
+        if after > before && !self.has_room_for(after - before) {
+            return Err(RedriveRejection::NoRoom);
+        }
+        candidate.retained_bytes = after;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        // The re-run's outcome is owed to the clock, so this execution joins the
+        // settle queue again; it left the queue when its first attempt settled.
+        self.pending_executions.retain(|pending| pending != arn);
+        self.pending_executions.push(arn.to_string());
+        self.executions.insert(arn.to_string(), candidate);
+        Ok(now)
+    }
+
     /// How many executions this state machine already holds.
     pub fn execution_count(&self, state_machine_arn: &str) -> usize {
         self.executions_by_sm
@@ -837,6 +1126,21 @@ pub fn untaggable_arn_message(resource_arn: &str) -> String {
 /// resource under, for the same reason.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("could not find the resource {resource_arn}")
+}
+
+/// Why a redrive was not performed; see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::redrive_execution`]. A redrive the
+/// execution itself is not eligible for is reported by
+/// [`ComAmazonawsSfnAwsstepfunctionsState::not_redrivable_reason`] instead, so this
+/// carries only what the store itself refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedriveRejection {
+    /// The store holds no execution under that ARN — the modelled
+    /// `ExecutionDoesNotExist`.
+    NotFound,
+    /// The re-run would take the store past [`MAX_STORE_BYTES`] — the modelled
+    /// `ExecutionLimitExceeded`.
+    NoRoom,
 }
 
 /// Why a tag write was not applied; see
@@ -1127,16 +1431,27 @@ fn uuid_v4(high: u64, low: u64) -> String {
 
 /// Interpret `definition` against `input` and schedule what the clock owes.
 ///
-/// The run happens HERE, at `StartExecution`: [`asl::run`] walks the states and the
-/// result is parked in a [`PendingOutcome`] due at
-/// `start + EXECUTION_SETTLE_DELAY + <every Wait the walk passed>`. Returns the
-/// `ExecutionStarted` event the execution begins its history with, and that outcome.
-pub fn plan_run(definition: &str, input: &str, start: SystemTime) -> (Vec<HistoryEvent>, PendingOutcome) {
+/// The run happens HERE, in the call that starts it: [`asl::run`] walks the states
+/// and the result is parked in a [`PendingOutcome`] due at
+/// `start + EXECUTION_SETTLE_DELAY + <every Wait the walk passed>`. Returns the event
+/// the attempt opens its history with, and that outcome.
+///
+/// `opening` is that event's type — [`EVENT_EXECUTION_STARTED`] for a
+/// `StartExecution`, [`EVENT_EXECUTION_REDRIVEN`] for a `RedriveExecution` — and
+/// `previous_event_id` the last id the execution's history already holds, so a
+/// redrive's events CONTINUE the existing numbering instead of restarting it.
+pub fn plan_run(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    opening: &str,
+    previous_event_id: i64,
+) -> (Vec<HistoryEvent>, PendingOutcome) {
     let run = asl::run(definition, input, start);
     let started = HistoryEvent {
-        id: 1,
-        previous_event_id: 0,
-        event_type: "ExecutionStarted".to_string(),
+        id: previous_event_id + 1,
+        previous_event_id,
+        event_type: opening.to_string(),
         timestamp: start,
         state_name: None,
     };
@@ -1186,6 +1501,15 @@ pub mod asl {
     //! An execution that reaches one ends in the service's own failure state:
     //! `FAILED`, with the ASL-documented [`RUNTIME_ERROR`] error name and a cause
     //! that says exactly what was not run.
+    //!
+    //! ## The document the walk carries
+    //!
+    //! A state's input and output is a JSON DOCUMENT, and a document no state
+    //! TRANSFORMED is carried on in its own BYTES rather than re-encoded from a
+    //! parsed copy: the caller's `input` text reaches `output` byte for byte when the
+    //! walk only passed it through. JSON is parsed to check that the document IS
+    //! JSON, and a `Pass` state's `Result` is a value of the parsed definition, so
+    //! that one state puts out that value's own encoding.
 
     use std::time::{Duration, SystemTime};
 
@@ -1289,6 +1613,7 @@ pub mod asl {
     pub struct Run {
         /// `SUCCEEDED` or `FAILED`.
         pub status: &'static str,
+        /// The document the run ended with, in the bytes it was written with.
         pub output: Option<String>,
         pub error: Option<String>,
         pub cause: Option<String>,
@@ -1420,16 +1745,17 @@ pub mod asl {
                 "the state machine definition carries no 'StartAt' and 'States' pair".to_string(),
             );
         };
-        let mut current: Value = match serde_json::from_str(input) {
-            Ok(value) => value,
-            Err(error) => {
-                return runtime_failure(
-                    steps,
-                    elapsed,
-                    format!("the execution input is not valid JSON: {error}"),
-                );
-            }
-        };
+        // The execution input is the FIRST state's input document. It is parsed only
+        // to check that it is JSON: what the walk carries on is the caller's own
+        // bytes.
+        if let Err(error) = serde_json::from_str::<Value>(input) {
+            return runtime_failure(
+                steps,
+                elapsed,
+                format!("the execution input is not valid JSON: {error}"),
+            );
+        }
+        let mut current: String = input.to_string();
 
         let mut name = start_at.to_string();
         for _ in 0..MAX_STATE_TRANSITIONS {
@@ -1465,9 +1791,12 @@ pub mod asl {
                 "Pass" => {
                     steps.push(step("PassStateEntered", &name, elapsed));
                     // A `Pass` state's output is its `Result` when it declares one,
-                    // and its input unchanged otherwise.
+                    // and its input unchanged otherwise. A `Result` is a value of the
+                    // PARSED definition, so what the state puts out is that value's
+                    // own encoding; the pass-through case carries the input
+                    // document's bytes on, because the state did not transform it.
                     if let Some(result) = state.get("Result") {
-                        current = result.clone();
+                        current = result.to_string();
                     }
                     steps.push(step("PassStateExited", &name, elapsed));
                 }
@@ -1581,8 +1910,11 @@ pub mod asl {
         }
     }
 
-    fn success(mut steps: Vec<Step>, elapsed: Duration, value: &Value) -> Run {
-        let output = value.to_string();
+    fn success(mut steps: Vec<Step>, elapsed: Duration, document: &str) -> Run {
+        // The document the walk carried, in the bytes it was written with: the
+        // execution's reported `output` is what the caller or the definition wrote,
+        // not a re-encoding of it.
+        let output = document.to_string();
         // A state's output is bounded by what the service can report it through, so
         // a run whose value outgrew that ends with ASL's own data-limit error rather
         // than storing a payload no response could carry.

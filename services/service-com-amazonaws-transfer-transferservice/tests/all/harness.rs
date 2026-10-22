@@ -34,6 +34,7 @@ pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/transfer-s3";
 /// One emulator: the shared engine plus the transfer service mounted on a router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 /// One HTTP answer, decoded.
@@ -72,9 +73,25 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_transfer_transferservice::EmulatedService::new(engine),
+            service_com_amazonaws_transfer_transferservice::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// This emulator's store — the SAME one the handlers reach through
+    /// `crate::state::service_state(&*self.engine)`, since `state::<T>()` is keyed by
+    /// type on the one shared engine (see `state_roundtrip.rs`).
+    ///
+    /// For a suite that has to SEED a resource whose write operation is still a
+    /// scaffold stub; a suite whose write operation exists goes over the wire instead.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_transfer_transferservice::ComAmazonawsTransferTransferserviceState,
+    > {
+        self.engine.state()
     }
 
     pub(crate) async fn call(&self, op: &str, body: Value) -> Answer {
@@ -187,4 +204,64 @@ pub(crate) fn assert_members(case: &str, actual: &Value, expected: &Value) {
             );
         }
     }
+}
+
+/// Drain every page of a `List*` operation, returning the per-page item counts and the
+/// concatenated item key at `key_member`.
+///
+/// Shared by every `@paginated` suite in this crate, so the paging walk is written
+/// once: `base` is the request without paging members, `max_results` the page bound to
+/// send (`None` sends none), `items_member` the output's list member and `key_member`
+/// the identifier to collect from each item.
+pub(crate) async fn drain_pages(
+    emulator: &Emulator,
+    op: &str,
+    base: &Value,
+    items_member: &str,
+    key_member: &str,
+    max_results: Option<i64>,
+) -> (Vec<usize>, Vec<String>) {
+    let mut page_sizes = Vec::new();
+    let mut keys = Vec::new();
+    let mut next: Option<String> = None;
+
+    loop {
+        let mut request = base.clone();
+        if let Some(limit) = max_results {
+            request["MaxResults"] = json!(limit);
+        }
+        if let Some(token) = &next {
+            request["NextToken"] = json!(token);
+        }
+        let answer = emulator.call(op, request).await;
+        assert_eq!(
+            answer.status, 200,
+            "{op} (MaxResults {max_results:?}): expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        let items = answer
+            .get(items_member)
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        page_sizes.push(items.len());
+        for item in &items {
+            keys.push(
+                item.get(key_member)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        match answer.get("NextToken").as_str() {
+            Some(token) => next = Some(token.to_string()),
+            None => break,
+        }
+        assert!(
+            page_sizes.len() < 64,
+            "{op} (MaxResults {max_results:?}): paging did not terminate"
+        );
+    }
+
+    (page_sizes, keys)
 }

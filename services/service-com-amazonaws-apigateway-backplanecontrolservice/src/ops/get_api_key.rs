@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the stored `ApiKey` record for `apiKey`, or
+//! `NotFoundException` when no key has that id. A pure read: it never writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The key's `value` is reported only when the request asks for it with
+//! `includeValue`, which is what that member is for.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +84,30 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ApiKeyEntry;
+
+impl From<&ApiKeyEntry> for GetApiKeyOutput {
+    /// The `ApiKey` body for a stored key. `GetApiKey` and `CreateApiKey` share the
+    /// `ApiKey` shape but the scaffold renders it as two Rust types, so this mirrors
+    /// the `CreateApiKeyOutput` conversion member for member rather than rendering the
+    /// record a second way.
+    fn from(entry: &ApiKeyEntry) -> Self {
+        let body = CreateApiKeyOutput::from(entry);
+        Self {
+            id: body.id,
+            value: body.value,
+            name: body.name,
+            customer_id: body.customer_id,
+            description: body.description,
+            enabled: body.enabled,
+            created_date: body.created_date,
+            last_updated_date: body.last_updated_date,
+            stage_keys: body.stage_keys,
+            tags: body.tags,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +179,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApiKey"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        let entry = store.api_keys.get(&input.api_key).ok_or_else(|| {
+            GetApiKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_API_KEY.to_string()),
+            })
+        })?;
+        let mut body = GetApiKeyOutput::from(entry);
+        // "A boolean flag to specify whether (true) or not (false) the result contains
+        // the key value" (`GetApiKeyRequest$includeValue`): the member is nullable with
+        // no default, so a request that does not ask for the value is not told it.
+        if input.include_value != Some(true) {
+            body.value = None;
+        }
+        Ok(body)
     }
 }

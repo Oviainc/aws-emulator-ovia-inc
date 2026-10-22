@@ -15,6 +15,10 @@
 mod emulator;
 #[path = "all/global_secondary_indexes.rs"]
 mod global_secondary_indexes;
+#[path = "all/index_capacity_and_item_collections.rs"]
+mod index_capacity_and_item_collections;
+#[path = "all/number_canonicalization.rs"]
+mod number_canonicalization;
 #[path = "all/regions_indexes_and_capacity.rs"]
 mod regions_indexes_and_capacity;
 

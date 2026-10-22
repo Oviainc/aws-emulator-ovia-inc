@@ -398,15 +398,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(&region);
 
         // RDS is regional: only the region the request was signed for is in scope.
+        //
+        // The message wording is this operation's own: the recorded `ModifyDBInstance`
+        // answers "DB instance not found: <id>" where `DescribeDBInstances` answers
+        // "DBInstance <id> not found." for the same fault, so each handler words it the
+        // way the service words it there rather than sharing one phrasing.
         let key = (region.clone(), identifier.clone());
         if !store.db_instances.contains_key(&key) {
             return Err(ModifyDBInstanceErrorModeled::DBInstanceNotFoundFault(
                 DBInstanceNotFoundFault {
-                    message: Some(format!("DBInstance {identifier} not found.")),
+                    message: Some(format!("DB instance not found: {identifier}")),
                 },
             )
             .into());
         }
+        // A value this service can resolve for itself is resolved before the record is
+        // written, exactly as `CreateDBInstance` resolves it: a modification onto an
+        // engine this service does not host, or onto something that is not a DB
+        // instance class at all, is refused rather than stored. `EngineVersion` is
+        // resolved further down, where the entry it resolves to is what the record
+        // stores, against the engine the modification leaves the instance on.
+        if let Some(engine) = &input.engine {
+            crate::state::check_engine(engine)
+                .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
+        }
+        if let Some(class) = &input.db_instance_class {
+            crate::state::check_db_instance_class(class)
+                .map_err(ModifyDBInstanceError::invalid_parameter_value)?;
+        }
+        // And every resource the request REFERENCES by name is resolved in the store,
+        // answering that resource type's modelled not-found fault when it names none.
+        // `DBSubnetGroupName`: "This value is stored as a lowercase string."
+        //
+        // This operation's model declares `OptionGroupNotFoundFault` but NO
+        // `DBSubnetGroupNotFoundFault` (`smithy_query(query="operation",
+        // operation="ModifyDBInstance")`), and `#[operation_error]` accepts only the
+        // variants the model declares — so a DB subnet group that resolves to nothing
+        // is refused as the `InvalidParameterValue` query error naming the member,
+        // which is the closest answer this operation's vocabulary allows and still a
+        // 400 the caller can act on.
+        let moved_to_subnet_group = input
+            .db_subnet_group_name
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase());
+        if let Some(name) = &moved_to_subnet_group {
+            if store.resolve_db_subnet_group(&region, name).is_none() {
+                return Err(ModifyDBInstanceError::invalid_parameter_value(format!(
+                    "invalid value '{name}' for DBSubnetGroupName: no DB subnet group of \
+                     that name exists"
+                )));
+            }
+        }
+        // `OptionGroupName` is NOT resolved the same way, and deliberately: AWS creates
+        // a DEFAULT option group per engine major version (`default:mysql-8-0`) that no
+        // request creates and this service does not hold, so refusing every name it has
+        // no record of would refuse the groups AWS itself provides. See
+        // `CreateDBInstance`, which says the same of `DBParameterGroupName`.
         // An instance that is still coming up, or is on its way out, cannot take a
         // modification — the state the clock has yet to settle is real. One that is
         // already `modifying` can: RDS accepts a further change while it applies the
@@ -452,7 +499,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &engine,
                     Some(requested.as_str()),
                 )
-                .map_err(ModifyDBInstanceError::validation)?;
+                .map_err(ModifyDBInstanceError::invalid_parameter_combination)?;
                 Some(match resolved {
                     Some(entry) => entry.engine_version.to_string(),
                     // An engine the catalogue publishes no available version for:
@@ -546,7 +593,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             record.deletion_protection = value;
         }
-        if let Some(value) = input.db_subnet_group_name {
+        if let Some(value) = moved_to_subnet_group {
             changed = true;
             record.db_subnet_group_name = Some(value);
         }

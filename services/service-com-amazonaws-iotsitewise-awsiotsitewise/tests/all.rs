@@ -19,6 +19,13 @@
 #[path = "all/property_aggregates.rs"]
 mod property_aggregates;
 
+// Same reasoning as `property_aggregates` above, and declared beside it rather than
+// inside the list or after it, which are the two spots the comment above names as
+// the ones a concurrent change also edits. Fold it into the list once the churn
+// settles.
+#[path = "all/interpolated_property_values.rs"]
+mod interpolated_property_values;
+
 #[path = "all/asset_hierarchies.rs"]
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]
@@ -29,6 +36,8 @@ mod asset_model_composite_model;
 mod asset_model_properties;
 #[path = "all/asset_property_update.rs"]
 mod asset_property_update;
+#[path = "all/associated_assets.rs"]
+mod associated_assets;
 #[path = "all/batch_get_latest_values.rs"]
 mod batch_get_latest_values;
 #[path = "all/batch_put_timestamp_and_quality.rs"]

@@ -7,8 +7,23 @@
 //! `AttributeDefinitions` declare. `ReturnValues=ALL_OLD` reports the replaced item.
 //! An unknown — or not yet `ACTIVE` — table is `ResourceNotFoundException`.
 //!
+//! Every number the item carries is stored CANONICALLY — "DynamoDB treats them as
+//! number type attributes" (`AttributeValue$N`), so the store keeps the number each
+//! `N` denotes, not the lexeme that spelled it, whether it sits at the top level,
+//! inside an `L`/`M` at any depth, or in an `NS`
+//! ([`crate::state::canonicalize_item`]). A set that holds one value twice once its
+//! members are canonical is refused with a `ValidationException`, and so is an `N`
+//! that denotes no number.
+//!
 //! Conditional writes (`ConditionExpression`, the legacy `Expected`) are refused with
 //! the scaffold's 501 and filed as their own gap issue.
+//!
+//! `ReturnConsumedCapacity=INDEXES` reports the capacity the write consumed on the table
+//! AND on each secondary index the written item reaches, and
+//! `ReturnItemCollectionMetrics=SIZE` reports the item collection the write landed in —
+//! both computed from the stored table by [`crate::state::Table::write_capacity`] and
+//! [`crate::state::Table::item_collection_metrics`], so an index the item does not reach
+//! and a table with no local secondary index report nothing.
 //!
 //! Sizes a request can choose are bounded before the write lands: the item's own size
 //! (the documented 400 KB limit), its nesting (the documented 32 levels) and the
@@ -323,6 +338,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        let report_item_collection = crate::state::returns_item_collection_metrics(
+            input.return_item_collection_metrics.as_deref(),
+        )
+        .map_err(lift)?;
+
         // Nesting is refused before the item is sized or stored: "DynamoDB supports
         // nested attributes up to 32 levels deep".
         for (attribute, value) in &input.item {
@@ -334,7 +354,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let size = crate::state::item_size(&input.item);
+        // Numbers are canonicalized BEFORE the item is sized, keyed or stored, so
+        // every figure reported below — the capacity billed, the item-collection key
+        // echoed — is computed from the item as STORED rather than from the lexemes
+        // the request spelled. Like the depth check above and the size check below it
+        // is request validation, so it precedes the table lookup; the store
+        // canonicalizes again at its write site, which is idempotent, so no other
+        // write path can land a non-canonical number.
+        let mut item = input.item;
+        crate::state::canonicalize_item(&mut item).map_err(lift)?;
+
+        let size = crate::state::item_size(&item);
         if size > crate::state::MAX_ITEM_SIZE_BYTES {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "Item size has exceeded the maximum allowed size of {} bytes: {size} bytes",
@@ -346,24 +376,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
-            table.key_of_item(&input.item).map_err(lift)?
+            table.key_of_item(&item).map_err(lift)?
         };
         // The store enforces its own budgets here: the only growth site this
         // operation has is the item it inserts.
         let replaced = store
-            .put_item(&region, &name, now, key, input.item.clone())
+            .put_item(&region, &name, now, key, item.clone())
             .map_err(lift)?;
+
+        // Both figures are read back from the table the write landed in, so the capacity
+        // fan-out and the item-collection size are computed from stored state rather
+        // than from the request alone.
+        let table = store.active_table(&region, &name, now).map_err(lift)?;
+        let capacity = table.write_capacity(replaced.as_ref(), Some(&item));
+        let item_collection_metrics =
+            report_item_collection.then(|| table.item_collection_metrics(&item));
 
         Ok(PutItemOutput {
             attributes: if return_old { replaced } else { None },
-            consumed_capacity: crate::state::consumed_capacity(
+            consumed_capacity: crate::state::consumed_write_capacity(
                 input.return_consumed_capacity.as_deref(),
                 &name,
-                crate::state::write_capacity_units(size),
+                &capacity,
             ),
-            // ItemCollectionMetrics is reported only for a table that has a local
-            // secondary index, which this slice does not create.
-            item_collection_metrics: None,
+            item_collection_metrics: item_collection_metrics.flatten(),
         })
     }
 }
