@@ -201,11 +201,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let state = state.lock();
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
 
         // `NamespaceName` is the namespace's `HttpName` (which equals its `Name`
-        // unless a reused name forced a hash onto it), never its id.
-        let Some(namespace) = state.namespace_by_http_name(&input.namespace_name) else {
+        // unless a reused name forced a hash onto it), never its id. The namespace's
+        // stored names are taken here, and the service resolved next, so the health
+        // status changes the clock already owes this service's instances can be
+        // materialised before anything is read.
+        let Some((namespace_id, namespace_name, namespace_discovery_name)) = state
+            .namespace_by_http_name(&input.namespace_name)
+            .map(|namespace| {
+                (
+                    namespace.id.clone(),
+                    namespace.name.clone(),
+                    namespace
+                        .http_name
+                        .clone()
+                        .unwrap_or_else(|| namespace.name.clone()),
+                )
+            })
+        else {
             return Err(DiscoverInstancesErrorModeled::NamespaceNotFound(NamespaceNotFound {
                 message: Some(format!(
                     "No namespace exists with the specified name {}.",
@@ -214,19 +230,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let Some(service) = state
-            .service_ids_by_namespace_and_name
-            .get(&(namespace.id.clone(), input.service_name.clone()))
-            .and_then(|service_id| state.services.get(service_id))
-        else {
-            return Err(DiscoverInstancesErrorModeled::ServiceNotFound(ServiceNotFound {
+
+        // The one answer for a service this namespace does not hold, whether the name
+        // index does not name it or the record it names is no longer stored: a read
+        // never depends on the two agreeing.
+        let service_not_found = || {
+            DiscoverInstancesErrorModeled::ServiceNotFound(ServiceNotFound {
                 message: Some(format!(
-                    "No service exists with the specified name {} in namespace {}.",
-                    input.service_name, namespace.name
+                    "No service exists with the specified name {} in namespace {namespace_name}.",
+                    input.service_name
                 )),
             })
-            .into());
         };
+
+        let Some(service_id) = state
+            .service_ids_by_namespace_and_name
+            .get(&(namespace_id, input.service_name.clone()))
+            .cloned()
+        else {
+            return Err(service_not_found().into());
+        };
+        // A status the service's own checker or a client decided on was due at its
+        // stored instant whether or not anybody asked, so materialising it here is what
+        // this read may write; it changes nothing a later caller would not have seen
+        // anyway.
+        let Some(service) = state.services.get_mut(&service_id) else {
+            return Err(service_not_found().into());
+        };
+        service.apply_due_health_statuses(now);
+        // The rest of this handler only reads, so the record is reborrowed immutably
+        // rather than looked up a second time.
+        let service = &*service;
 
         let empty = std::collections::HashMap::new();
         let query = input.query_parameters.as_ref().unwrap_or(&empty);
@@ -307,10 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both names come from the STORED records, not from the request: the summary
         // reports the namespace's `HttpName` (which the request may have reached
         // through the `Name` fallback) and the service's own stored name.
-        let namespace_name = namespace
-            .http_name
-            .clone()
-            .unwrap_or_else(|| namespace.name.clone());
+        let namespace_name = namespace_discovery_name;
         let service_name = service.name.clone();
         let instances: Vec<HttpInstanceSummary> = ordered
             .into_iter()

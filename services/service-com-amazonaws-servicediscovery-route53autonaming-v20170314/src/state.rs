@@ -48,6 +48,47 @@ pub const ARN_NAMESPACE: &str = "servicediscovery";
 /// service never sleeps for it.
 pub const OPERATION_SUCCESS_SPAN: Duration = Duration::from_millis(250);
 
+/// How long a custom health status a client submitted stays owed before the clock
+/// applies it to the instance.
+///
+/// `HealthCheckCustomConfig` documents that the change is NOT applied at the instant of
+/// the call: "Cloud Map waits for approximately 30 seconds after receiving an
+/// `UpdateInstanceCustomHealthStatus` request before changing the status of the service
+/// instance", and "Sending a second or subsequent `UpdateInstanceCustomHealthStatus`
+/// request with the same value before 30 seconds has passed doesn't accelerate the
+/// change." That wait is the service's own propagation latency rather than a duration a
+/// caller or a configuration asks for (`FailureThreshold` is deprecated and "always set
+/// to 1"), so the span here is the emulator's 250-750 ms window for a transition the
+/// clock owes: a caller reading straight after the update still observes the previous
+/// status, as it would against the real service. The due instant is stored and
+/// materialised on read — the service never sleeps for it.
+pub const CUSTOM_HEALTH_STATUS_SPAN: Duration = Duration::from_millis(250);
+
+/// How long a Route 53 health check's verdict stays owed to a freshly registered
+/// instance before the clock reports it.
+///
+/// `GetInstancesHealthStatus` documents that the status is computed server-side and is
+/// not there straight away: "There's a brief delay between when you register an instance
+/// and when the health status for the instance is available." AWS's own wait is the
+/// health check's failure threshold times its 30-second interval; that is the service's
+/// own latency rather than a duration the caller asks for, so the span here is the
+/// emulator's 250-750 ms window for a transition the clock owes: a caller reading
+/// straight after the registration still observes `UNKNOWN`, the status the real service
+/// reports until its checker has reported. The due instant is stored and materialised on
+/// read — the service never sleeps for it.
+pub const ROUTE53_HEALTH_CHECK_SPAN: Duration = Duration::from_millis(250);
+
+/// The verdict a Route 53 health check reaches in this emulator.
+///
+/// A `HealthCheckConfig` health check is performed BY the service, by probing the
+/// instance's endpoint from outside; this emulator opens no outbound connections, so a
+/// probe of that endpoint can never be observed to succeed. The verdict it reports once
+/// the check is due is therefore the failing one — never `HEALTHY`, which would claim a
+/// successful probe that nothing performed. A client cannot override it:
+/// `UpdateInstanceCustomHealthStatus` refuses a service checked this way with
+/// `CustomHealthNotFound`.
+pub const ROUTE53_HEALTH_CHECK_VERDICT: &str = HEALTH_STATUS_UNHEALTHY;
+
 /// The quota on tags per resource, from the `TooManyTagsException` documentation:
 /// "The maximum number of tags that can be applied to a resource is 50."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
@@ -210,6 +251,24 @@ pub struct ServiceRecord {
 }
 
 impl ServiceRecord {
+    /// Apply to every instance of this service the health status change the clock
+    /// already owes it, so a read reports it.
+    pub fn apply_due_health_statuses(&mut self, now: SystemTime) {
+        for instance in self.instances.values_mut() {
+            instance.apply_due_health_status(now);
+        }
+    }
+
+    /// Whether this service's health checking is the custom kind, the only kind
+    /// `UpdateInstanceCustomHealthStatus` can set: "You can use
+    /// UpdateInstanceCustomHealthStatus to change the status only for custom health
+    /// checks, which you define using HealthCheckCustomConfig … You can't use it to
+    /// change the status for Route 53 health checks, which you define using
+    /// HealthCheckConfig."
+    pub fn custom_health_checked(&self) -> bool {
+        self.health_check_custom_config.is_some()
+    }
+
     /// `InstanceCount`, derived from what is stored rather than counted by hand.
     pub fn instance_count(&self) -> i32 {
         i32::try_from(self.instances.len()).unwrap_or(i32::MAX)
@@ -230,9 +289,46 @@ pub struct InstanceRecord {
     pub attributes: HashMap<String, String>,
     pub creator_request_id: Option<String>,
     /// A `HealthStatus` value. An instance starts `UNKNOWN`: nothing has reported on
-    /// it yet, neither a Route 53 health checker nor an
+    /// it yet, neither the service's own health checker nor an
     /// `UpdateInstanceCustomHealthStatus` call.
     pub health_status: String,
+    /// The health status the clock still owes this instance — the one a client
+    /// submitted for a custom health check, or the verdict of the service's Route 53
+    /// health check. `None` once it has been applied, and for an instance of a service
+    /// that configures no health checking at all.
+    pub pending_health_status: Option<PendingHealthStatus>,
+}
+
+impl InstanceRecord {
+    /// Apply the owed health status when the clock has reached its due instant.
+    ///
+    /// A read may do this: the status was due to change at `due_at` whether or not
+    /// anybody asked, exactly as [`ComAmazonawsServicediscoveryRoute53autonamingV20170314State::operation`]
+    /// materialises an operation's terminal status.
+    pub fn apply_due_health_status(&mut self, now: SystemTime) {
+        if let Some(pending) = &self.pending_health_status {
+            if now >= pending.due_at {
+                self.health_status = pending.status.clone();
+                self.pending_health_status = None;
+            }
+        }
+    }
+
+    /// The health status the clock still owes this instance, if any.
+    pub fn owed_health_status(&self) -> Option<&str> {
+        self.pending_health_status
+            .as_ref()
+            .map(|pending| pending.status.as_str())
+    }
+}
+
+/// A health status the service has decided on that the clock has not applied yet.
+#[derive(Debug, Clone)]
+pub struct PendingHealthStatus {
+    /// A `HealthStatus` value.
+    pub status: String,
+    /// When the clock owes the instance this status.
+    pub due_at: SystemTime,
 }
 
 /// A persisted asynchronous operation, the record `GetOperation` reads.
