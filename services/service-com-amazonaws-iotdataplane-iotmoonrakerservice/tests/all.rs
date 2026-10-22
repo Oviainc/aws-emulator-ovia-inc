@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/reserved_topic_namespace.rs"]
 mod reserved_topic_namespace;
+#[path = "all/response_envelope.rs"]
+mod response_envelope;
 #[path = "all/shadow_and_retained_message.rs"]
 mod shadow_and_retained_message;
 #[path = "all/state_roundtrip.rs"]

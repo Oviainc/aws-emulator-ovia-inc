@@ -34,14 +34,18 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTEST/20260101/us-east-1/iotdata/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
-/// One HTTP answer, reduced to what these tests assert on.
-struct Answer {
-    status: u16,
-    body: Vec<u8>,
+/// One HTTP answer, reduced to what these tests assert on. Shared with the sibling
+/// suites in this target, which drive the same service over the same router.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+    /// The response's `content-type`, which the shadow operations report as
+    /// `application/json` because their body IS a JSON document.
+    pub(crate) content_type: Option<String>,
 }
 
 impl Answer {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|error| {
             panic!(
                 "expected a JSON body, got {error}: {}",
@@ -51,7 +55,7 @@ impl Answer {
     }
 
     /// The modelled error code, which restJson1 carries in `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.json()
             .get("__type")
             .and_then(Value::as_str)
@@ -65,12 +69,12 @@ impl Answer {
 
 /// The emulator, assembled exactly as the router assembles it: one shared engine
 /// behind one mounted service.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -80,7 +84,13 @@ impl Harness {
         Self { router }
     }
 
-    async fn send(&self, method: &str, uri: &str, headers: &[(&str, &str)], body: Vec<u8>) -> Answer {
+    pub(crate) async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Answer {
         let mut request = http::Request::builder()
             .method(method)
             .uri(uri)
@@ -100,34 +110,44 @@ impl Harness {
             .await;
         Answer {
             status: response.status().as_u16(),
+            content_type: response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
             body: response.into_body().to_vec(),
         }
     }
 
     /// The shadow route, with the `name` query parameter only when a shadow is named.
-    fn shadow_uri(thing: &str, shadow: Option<&str>) -> String {
+    pub(crate) fn shadow_uri(thing: &str, shadow: Option<&str>) -> String {
         match shadow {
             Some(name) => format!("/things/{thing}/shadow?name={name}"),
             None => format!("/things/{thing}/shadow"),
         }
     }
 
-    async fn update(&self, thing: &str, shadow: Option<&str>, payload: Vec<u8>) -> Answer {
+    pub(crate) async fn update(
+        &self,
+        thing: &str,
+        shadow: Option<&str>,
+        payload: Vec<u8>,
+    ) -> Answer {
         self.send("POST", &Self::shadow_uri(thing, shadow), &[], payload)
             .await
     }
 
-    async fn get_shadow(&self, thing: &str, shadow: Option<&str>) -> Answer {
+    pub(crate) async fn get_shadow(&self, thing: &str, shadow: Option<&str>) -> Answer {
         self.send("GET", &Self::shadow_uri(thing, shadow), &[], Vec::new())
             .await
     }
 
-    async fn delete_shadow(&self, thing: &str, shadow: Option<&str>) -> Answer {
+    pub(crate) async fn delete_shadow(&self, thing: &str, shadow: Option<&str>) -> Answer {
         self.send("DELETE", &Self::shadow_uri(thing, shadow), &[], Vec::new())
             .await
     }
 
-    async fn list_named_shadows(&self, thing: &str, query: &str) -> Answer {
+    pub(crate) async fn list_named_shadows(&self, thing: &str, query: &str) -> Answer {
         self.send(
             "GET",
             &format!("/api/things/shadow/ListNamedShadowsForThing/{thing}{query}"),
@@ -137,7 +157,7 @@ impl Harness {
         .await
     }
 
-    async fn publish(
+    pub(crate) async fn publish(
         &self,
         topic: &str,
         qos: i32,
@@ -157,7 +177,7 @@ impl Harness {
         .await
     }
 
-    async fn get_retained_message(&self, topic: &str) -> Answer {
+    pub(crate) async fn get_retained_message(&self, topic: &str) -> Answer {
         self.send("GET", &format!("/retainedMessage/{topic}"), &[], Vec::new())
             .await
     }
@@ -1301,9 +1321,12 @@ async fn a_retained_publish_is_what_the_retained_message_reader_answers_with() {
             published.status,
             String::from_utf8_lossy(&published.body)
         );
-        assert!(
-            published.body.is_empty(),
-            "case {:?}: Publish models no output, got body {}",
+        // The acknowledgement envelope itself is asserted by the `response_envelope`
+        // suite; here it only has to say the publish was accepted.
+        assert_eq!(
+            published.json().get("message").and_then(Value::as_str),
+            Some("OK"),
+            "case {:?}: expected the publish acknowledgement, got body {}",
             case.name,
             String::from_utf8_lossy(&published.body)
         );

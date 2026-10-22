@@ -151,9 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetThingShadowErrorModeled::InternalFailureException(InternalFailureException {
-                message: Some("the thing-shadow store is unavailable".to_string()),
-            })
+            GetThingShadowErrorModeled::InternalFailureException(InternalFailureException::new(
+                "An unexpected error has occurred.",
+            ))
         })?;
 
         let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
@@ -161,15 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: the document is rendered from what is stored, and nothing
         // about the stored shadow changes because it was read.
         let shadow = guard.shadows.get(&key).ok_or_else(|| {
-            GetThingShadowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(match input.shadow_name.as_deref() {
-                    Some(name) => format!(
-                        "no shadow named '{name}' exists for thing '{}'",
-                        input.thing_name
-                    ),
-                    None => format!("no shadow exists for thing '{}'", input.thing_name),
-                }),
-            })
+            GetThingShadowErrorModeled::ResourceNotFoundException(ResourceNotFoundException::new(
+                crate::state::no_shadow_exists(crate::state::addressed_shadow_name(
+                    &input.thing_name,
+                    input.shadow_name.as_deref(),
+                )),
+            ))
         })?;
 
         Ok(GetThingShadowOutput {

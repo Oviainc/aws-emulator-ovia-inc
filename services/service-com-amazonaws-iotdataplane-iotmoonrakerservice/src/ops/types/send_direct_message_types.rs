@@ -33,9 +33,13 @@ pub struct SendDirectMessageOutput {
     pub trace_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iotdataplane#GatewayTimeoutException")]
-#[derive(Debug, Clone, Default)]
-pub struct GatewayTimeoutException {
-    pub message: Option<String>,
+// Declared through the service's envelope macro rather than
+// `#[smithy_macros::smithy(shape = …)]`, for the reason given on
+// `super::shared_types::error_with_envelope`: the body carries a `traceId` beside the
+// modelled `message`.
+super::shared_types::error_with_envelope! {
+    /// `GatewayTimeoutException` (HTTP 504) — the delivery confirmation was not
+    /// received from the client within the specified timeout period.
+    GatewayTimeoutException => SCHEMA_GATEWAY_TIMEOUT_EXCEPTION,
 }
 

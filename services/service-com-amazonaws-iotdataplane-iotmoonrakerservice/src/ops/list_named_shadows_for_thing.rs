@@ -152,9 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListNamedShadowsForThingErrorModeled::InternalFailureException(
-                InternalFailureException {
-                    message: Some("the thing-shadow store is unavailable".to_string()),
-                },
+                InternalFailureException::new("An unexpected error has occurred."),
             )
         })?;
 
@@ -165,9 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0usize,
             Some(token) => token.parse::<usize>().map_err(|_| {
                 ListNamedShadowsForThingErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!("the nextToken '{token}' is not valid")),
-                    },
+                    InvalidRequestException::new(format!("the nextToken '{token}' is not valid")),
                 )
             })?,
         };
@@ -180,12 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
         if !guard.has_any_shadow(&input.thing_name) {
             return Err(ListNamedShadowsForThingErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no shadow exists for thing '{}'",
-                        input.thing_name
-                    )),
-                },
+                ResourceNotFoundException::new(crate::state::no_shadow_exists(&input.thing_name)),
             )
             .into());
         }

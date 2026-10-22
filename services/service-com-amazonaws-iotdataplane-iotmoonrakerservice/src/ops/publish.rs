@@ -11,6 +11,10 @@
 //! publish to: a topic in the reserved `$` namespace (the service's own system
 //! topics) or one carrying MQTT subscription wildcards.
 //!
+//! An accepted publish answers in the data plane's `{message, traceId}` envelope — the
+//! acknowledgement that tells a caller the broker took the message — and so does every
+//! rejection of a topic the broker will not publish to.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -126,27 +130,73 @@ pub fn is_reserved_topic(topic: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct PublishOutput;
+pub struct PublishOutput {
+    /// The service's status message for the accepted publish.
+    pub message: Option<String>,
+    /// This response's correlation id.
+    pub trace_id: Option<String>,
+}
 
 impl PublishOutput {
     // `with_http` carries this operation's modelled response status. Remove it and
     // the status falls back to the protocol default, so a modelled 204 answers 200.
+    //
+    // The model types this operation's output `Unit`, but the data plane answers an
+    // accepted publish with the SAME `{message, traceId}` envelope it returns from
+    // `SendDirectMessage` (whose response shape models both members) — that
+    // acknowledgement is what tells a caller the broker took the message, as distinct
+    // from a response the caller failed to parse. The two members are therefore
+    // declared here, on this operation's synthetic output schema, and carry the same
+    // wire keys as the modelled envelope. The schema is NOT named `smithy.api#Unit`
+    // for the same reason: the protocol answers a Unit-shaped output with an empty
+    // body, whatever members the struct writes.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
-        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.iotdataplane#PublishResponse",
+            "com.amazonaws.iotdataplane",
+            "PublishResponse",
+        ),
         ::aws_smithy_schema::ShapeType::Structure,
-        &[],
+        &crate::ops::types::shared_types::RESPONSE_ENVELOPE_MEMBERS,
     )
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "POST",
         "/topics/{topic}",
         Some(200u16),
     ));
+
+    /// The service's acknowledgement of an accepted publish, with a freshly minted
+    /// `traceId`.
+    pub fn accepted() -> Self {
+        Self {
+            message: Some(PUBLISH_ACCEPTED_MESSAGE.to_string()),
+            trace_id: Some(crate::state::new_trace_id()),
+        }
+    }
 }
+
+/// The status message the data plane returns for a publish the broker accepted.
+const PUBLISH_ACCEPTED_MESSAGE: &str = "OK";
 
 pub static PUBLISH_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &PublishOutput::SCHEMA;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for PublishOutput {
-    fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(message) = self.message.as_deref() {
+            serializer
+                .write_string(&crate::ops::types::shared_types::RESPONSE_MESSAGE_MEMBER, message)?;
+        }
+        if let Some(trace_id) = self.trace_id.as_deref() {
+            serializer.write_string(
+                &crate::ops::types::shared_types::RESPONSE_TRACE_ID_MEMBER,
+                trace_id,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
@@ -217,43 +267,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            PublishErrorModeled::InternalFailureException(InternalFailureException {
-                message: Some("the retained-message store is unavailable".to_string()),
-            })
+            PublishErrorModeled::InternalFailureException(InternalFailureException::new(
+                "An unexpected error has occurred.",
+            ))
         })?;
 
         // The `$`-prefixed namespace is the service's own: a client publish to a topic
         // whose name starts with `$` is refused, so no reserved topic ever reaches the
         // broker or the retained-message store.
         if is_reserved_topic(&input.topic) {
-            return Err(PublishErrorModeled::InvalidRequestException(InvalidRequestException {
-                message: Some(RESERVED_TOPIC_MESSAGE.to_string()),
-            })
+            return Err(PublishErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(RESERVED_TOPIC_MESSAGE),
+            )
             .into());
         }
 
         // MQTT forbids the single-level (`+`) and multi-level (`#`) wildcards in a
-        // PUBLISH topic: they are subscription syntax.
-        if let Some(wildcard) = input.topic.chars().find(|c| *c == '+' || *c == '#') {
-            return Err(PublishErrorModeled::InvalidRequestException(InvalidRequestException {
-                message: Some(format!(
-                    "the topic '{}' contains the MQTT wildcard '{wildcard}', which a publish \
-                     topic may not use",
-                    input.topic
+        // PUBLISH topic: a topic carrying one is a topic FILTER, which only a
+        // subscription may be — which is exactly what the service's rejection says.
+        if input.topic.contains('+') || input.topic.contains('#') {
+            return Err(PublishErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(crate::state::INVALID_TOPIC_FILTER),
+            )
+            .into());
+        }
+
+        // A topic name is a path of levels separated by `/`, and the broker bounds how
+        // many levels one carries.
+        if input.topic.split('/').count() > crate::state::MAX_TOPIC_PARTS {
+            return Err(PublishErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(crate::state::too_many_topic_parts(
+                    crate::state::MAX_TOPIC_PARTS,
                 )),
-            })
+            )
             .into());
         }
 
         let payload = input.payload.unwrap_or_default();
         if payload.len() > crate::state::MAX_PUBLISH_PAYLOAD_BYTES {
-            return Err(PublishErrorModeled::InvalidRequestException(InvalidRequestException {
-                message: Some(format!(
+            return Err(PublishErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(format!(
                     "the payload is {} bytes; the maximum message payload size is {} bytes",
                     payload.len(),
                     crate::state::MAX_PUBLISH_PAYLOAD_BYTES
                 )),
-            })
+            )
             .into());
         }
 
@@ -264,17 +322,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // topic's retained message.
                 guard.retained_messages.remove(&input.topic);
             } else {
+                // This cap is the emulator's own, not a quota the service publishes,
+                // so its message says so rather than borrowing service text.
                 if !guard.retained_messages.contains_key(&input.topic)
                     && guard.retained_messages.len() >= crate::state::MAX_RETAINED_TOPICS
                 {
                     return Err(PublishErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(format!(
-                                "this emulator retains messages for at most {} topics; clear a \
-                                 retained message before retaining another",
-                                crate::state::MAX_RETAINED_TOPICS
-                            )),
-                        },
+                        InvalidRequestException::new(format!(
+                            "this emulator retains messages for at most {} topics; clear a \
+                             retained message before retaining another",
+                            crate::state::MAX_RETAINED_TOPICS
+                        )),
                     )
                     .into());
                 }
@@ -294,6 +352,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        Ok(PublishOutput)
+        Ok(PublishOutput::accepted())
     }
 }

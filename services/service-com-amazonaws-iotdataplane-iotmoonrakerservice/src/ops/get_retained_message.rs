@@ -157,21 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetRetainedMessageErrorModeled::InternalFailureException(InternalFailureException {
-                message: Some("the retained-message store is unavailable".to_string()),
-            })
+            GetRetainedMessageErrorModeled::InternalFailureException(
+                InternalFailureException::new("An unexpected error has occurred."),
+            )
         })?;
 
         let guard = state.lock();
         // Reporting only: reading a retained message does not consume it — MQTT keeps
         // a retained message until it is overwritten or cleared.
         let retained = guard.retained_messages.get(&input.topic).ok_or_else(|| {
-            GetRetainedMessageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no retained message exists for topic '{}'",
-                    input.topic
-                )),
-            })
+            GetRetainedMessageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException::new(crate::state::RETAINED_MESSAGE_NOT_FOUND),
+            )
         })?;
 
         Ok(GetRetainedMessageOutput {

@@ -19,15 +19,26 @@ pub struct UpdateThingShadowInput {
     pub payload: Vec<u8>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iotdataplane#UpdateThingShadowResponse")]
-#[derive(Debug, Clone, Default)]
-pub struct UpdateThingShadowOutput {
-    pub payload: Option<Vec<u8>>,
+// Declared through the shared envelope macro for the same reason as
+// `GetThingShadowOutput`: the accepted document is JSON, so the response states its
+// content type rather than taking the protocol's blob fallback.
+super::shared_types::json_document_output! {
+    /// The output from the UpdateThingShadow operation: the document the merge
+    /// produced.
+    UpdateThingShadowOutput => UPDATE_THING_SHADOW_OUTPUT_SCHEMA,
+    shape: "UpdateThingShadowResponse",
+    members: UPDATE_THING_SHADOW_OUTPUT_MEMBERS,
+    payload: UPDATE_THING_SHADOW_PAYLOAD_MEMBER
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iotdataplane#ConflictException")]
-#[derive(Debug, Clone, Default)]
-pub struct ConflictException {
-    pub message: Option<String>,
+// Declared through the service's envelope macro rather than
+// `#[smithy_macros::smithy(shape = …)]`: like every other failure this data plane
+// writes, a conflict body carries a `traceId` beside the modelled `message`, and that
+// member is not on the error shape for the macro to emit. See
+// `super::shared_types::error_with_envelope`.
+super::shared_types::error_with_envelope! {
+    /// `ConflictException` (HTTP 409) — the specified version does not match the
+    /// version of the document.
+    ConflictException => SCHEMA_CONFLICT_EXCEPTION,
 }
 

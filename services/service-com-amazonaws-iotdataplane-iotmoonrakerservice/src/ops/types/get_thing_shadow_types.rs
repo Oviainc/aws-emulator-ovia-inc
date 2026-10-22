@@ -18,9 +18,15 @@ pub struct GetThingShadowInput {
     pub shadow_name: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iotdataplane#GetThingShadowResponse")]
-#[derive(Debug, Clone, Default)]
-pub struct GetThingShadowOutput {
-    pub payload: Option<Vec<u8>>,
+// The response is declared through the shared envelope macro rather than
+// `#[smithy_macros::smithy(shape = …)]` so it can state its content type: the body is
+// a shadow DOCUMENT, and the protocol's fallback for a blob `@httpPayload` is
+// `application/octet-stream`. See `super::shared_types::json_document_output`.
+super::shared_types::json_document_output! {
+    /// The output from the GetThingShadow operation: the shadow document.
+    GetThingShadowOutput => GET_THING_SHADOW_OUTPUT_SCHEMA,
+    shape: "GetThingShadowResponse",
+    members: GET_THING_SHADOW_OUTPUT_MEMBERS,
+    payload: GET_THING_SHADOW_PAYLOAD_MEMBER
 }
 

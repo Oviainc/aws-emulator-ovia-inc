@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mint the `traceId` this data plane returns in every response envelope it writes
+# (`state::new_trace_id`): `sha2` spreads the clock, the process and a per-process
+# counter over the id's hex digits, and `hex` renders them. Already workspace
+# dependencies, and already used by this crate's tests.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

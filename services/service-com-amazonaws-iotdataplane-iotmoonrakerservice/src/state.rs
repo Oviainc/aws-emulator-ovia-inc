@@ -14,11 +14,144 @@
 //!
 //! Both are `BTreeMap`s so a list operation walks them in a stable key order and an
 //! offset-style `nextToken` keeps meaning across calls.
+//!
+//! Beside the two stores, this module holds the service's RESPONSE TEXT: the fixed
+//! message it answers each condition with, and the two templates it renders from the
+//! request. They live here, not in the handlers, because several operations answer the
+//! same condition and a message composed per handler drifts into describing the
+//! emulator's internals instead of the service's contract.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+
+/// How many `traceId`s this process has minted. Part of what makes the next one
+/// unique: two calls in the same clock tick still differ.
+static TRACE_IDS_MINTED: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `traceId` for one response: the per-request correlation id this data plane
+/// returns beside `message` in every envelope it writes.
+///
+/// Minted per CALL and stored nowhere: the id identifies the request, not the
+/// resource, so two calls that read the same shadow carry different ids and neither is
+/// derived from the request. Unique without a random source — the clock, the process
+/// and a monotone per-process counter cannot repeat together — and rendered in the
+/// 8-4-4-4-12 hexadecimal form the member carries, which is what the digest of those
+/// three is sliced into.
+pub fn new_trace_id() -> String {
+    let mut digest = Sha256::new();
+    digest.update(duration_since_epoch().as_nanos().to_be_bytes());
+    digest.update(TRACE_IDS_MINTED.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    digest.update(std::process::id().to_be_bytes());
+    let hex = hex::encode(digest.finalize());
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// The service's fixed rejection for a state document over the size limit, which is
+/// the one message this service builds from the request: the size of the state the
+/// document carries (see [`state_sections_bytes`]) and the limit it exceeded. Rendered
+/// exactly as the data plane renders it, two spaces after the period included.
+pub fn json_document_too_large(size: usize, max_allowed: usize) -> String {
+    format!("Json document too large.  Size is {size}, max allowed: {max_allowed}")
+}
+
+/// The size the state-document quota weighs, in bytes: the STATE a document carries —
+/// its `desired` and `reported` nodes as canonical JSON.
+///
+/// What the quota bounds is the state itself, so none of the framing around it counts:
+/// not the document's own `state`/`version` keys, not the insignificant whitespace a
+/// client spaced the request out with, not the `state.delta` the service DERIVES from
+/// the two sections, and not the `metadata` mirror the service maintains beside them.
+/// The same measure weighs one request's document and the document a merge would
+/// leave stored ([`Shadow::state_bytes`]), so one limit means one thing throughout.
+pub fn state_sections_bytes(desired: Option<&Value>, reported: Option<&Value>) -> usize {
+    [desired, reported]
+        .into_iter()
+        .flatten()
+        .map(|section| section.to_string().len())
+        .sum()
+}
+
+/// This emulator's refusal of a request larger than one of its OWN size caps. The
+/// service's `Json document too large.  …` template reports the service's published
+/// quota, so a cap this emulator chose says it is the emulator's instead of borrowing
+/// that text. `subject` reads as the verb phrase after "this emulator".
+pub fn emulator_size_cap(subject: &str, size: usize, max_allowed: usize) -> String {
+    format!(
+        "this emulator {subject} of at most {max_allowed} bytes, and this request would need {size}"
+    )
+}
+
+/// The service's fixed rejection for a payload that is not a JSON document.
+pub const PAYLOAD_INVALID_JSON: &str = "Payload contains invalid json";
+
+/// The service's fixed rejection for a document that names no `state` node — the one
+/// node a state document must carry.
+pub const MISSING_STATE_NODE: &str = "Missing required node: state";
+
+/// The service's fixed rejection for a `version` that is not a document version.
+pub const INVALID_VERSION: &str = "Invalid version";
+
+/// The service's fixed rejection for a node of the state document that must be an
+/// object and is not. `node` is the node's name as the service writes it (`State`,
+/// `Desired`, `Reported`).
+pub fn node_must_be_an_object(node: &str) -> String {
+    format!("{node} node must be an object")
+}
+
+/// The service's fixed rejection for a node under `state` that the service does not
+/// recognise: it merges `desired` and `reported` and derives everything else.
+pub fn invalid_state_node(node: &str) -> String {
+    format!("State contains an invalid node: '{node}'")
+}
+
+/// The service's fixed rejection for an update whose stated `version` is not the
+/// version stored. The condition, not the two versions, is what the caller branches
+/// on — a conflicted writer re-reads the document rather than parsing this text.
+pub const VERSION_CONFLICT: &str = "Version conflict";
+
+/// The service's fixed rejection for a publish topic that is not a single, concrete
+/// topic name — an MQTT wildcard makes it a topic FILTER, which only a subscription
+/// may be.
+pub const INVALID_TOPIC_FILTER: &str = "Invalid topic filter";
+
+/// How many `/`-separated levels one topic name may carry. The IoT Core message-broker
+/// quota "Maximum number of slashes in topic and topic filter" is 7, which is 8 levels.
+pub const MAX_TOPIC_PARTS: usize = 8;
+
+/// The service's fixed rejection for a topic with more levels than the broker allows.
+pub fn too_many_topic_parts(max_parts: usize) -> String {
+    format!("Topic can't contain more than {max_parts} parts")
+}
+
+/// The service's fixed answer when a topic holds no retained message.
+pub const RETAINED_MESSAGE_NOT_FOUND: &str = "Retained message not found";
+
+/// The service's fixed answer when the addressed shadow does not exist. `name` is the
+/// shadow the request addressed: its `name` query parameter, or — for the unnamed
+/// ("classic") shadow, which is addressed by the thing alone — the thing's own name.
+pub fn no_shadow_exists(name: &str) -> String {
+    format!("No shadow exists with name: '{name}'")
+}
+
+/// The shadow a request addresses, as the service names it in a message: the request's
+/// `shadowName`, or the thing's own name for the classic shadow.
+pub fn addressed_shadow_name<'a>(thing_name: &'a str, shadow_name: Option<&'a str>) -> &'a str {
+    match shadow_name {
+        Some(name) if name != CLASSIC_SHADOW => name,
+        _ => thing_name,
+    }
+}
 
 /// The shadow-name key of the unnamed ("classic") shadow — the shadow a request that
 /// carries no `name` query parameter addresses. The model constrains `shadowName` to
@@ -31,6 +164,16 @@ pub const CLASSIC_SHADOW: &str = "";
 /// an update whose merged result would exceed it is refused with the operation's
 /// modelled `RequestEntityTooLargeException` and changes nothing.
 pub const MAX_SHADOW_DOCUMENT_BYTES: usize = 8 * 1024;
+
+/// The largest request entity this emulator will READ as a state document, in bytes.
+///
+/// Emulator-chosen, and deliberately far above [`MAX_SHADOW_DOCUMENT_BYTES`]: the
+/// service's published quota bounds the STATE a document carries, which can only be
+/// weighed once the document has been parsed, while this bounds the work one request
+/// can ask for BEFORE that — the payload is parsed only once it is known to be within
+/// it. Eight times the state quota leaves ample room for the framing and the
+/// insignificant whitespace an 8 KB state document can arrive wrapped in.
+pub const MAX_SHADOW_REQUEST_ENTITY_BYTES: usize = 8 * MAX_SHADOW_DOCUMENT_BYTES;
 
 /// The largest stored shadow document this service keeps, in bytes, counting the
 /// `metadata` mirror and the version/timestamp alongside the `state` node that
@@ -126,6 +269,25 @@ impl Shadow {
                 *section = None;
             }
         }
+    }
+
+    /// The size of the state this shadow STORES, in bytes, as
+    /// [`state_sections_bytes`] measures it: its `desired` and `reported` sections as
+    /// canonical JSON, with the derived `delta` and the `metadata` mirror excluded.
+    ///
+    /// Serializing each section's map directly measures the same bytes
+    /// `state_sections_bytes` would, without copying the section to wrap it in a
+    /// `Value` first.
+    pub fn state_bytes(&self) -> usize {
+        [self.desired.as_ref(), self.reported.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|section| {
+                serde_json::to_string(&section.state)
+                    .expect("a state section serializes to JSON")
+                    .len()
+            })
+            .sum()
     }
 
     /// The shadow document as a client reads it: `state` (with `delta` derived now),

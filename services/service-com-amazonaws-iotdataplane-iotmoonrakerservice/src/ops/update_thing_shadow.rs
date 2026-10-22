@@ -6,6 +6,10 @@
 //! `state.delta`, the per-leaf `metadata`, the incremented `version` and the accepted
 //! `timestamp`. Never the request echoed back.
 //!
+//! Every failure here answers in the data plane's `{message, traceId}` envelope, with
+//! the service's own fixed text for the condition — see `crate::state` for the
+//! catalog and `super::types::shared_types` for the envelope.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,95 +161,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UpdateThingShadowErrorModeled::InternalFailureException(InternalFailureException {
-                message: Some("the thing-shadow store is unavailable".to_string()),
-            })
+            UpdateThingShadowErrorModeled::InternalFailureException(
+                InternalFailureException::new("An unexpected error has occurred."),
+            )
         })?;
 
-        if input.payload.len() > crate::state::MAX_SHADOW_DOCUMENT_BYTES {
+        // This emulator's own ceiling on the entity it will read, weighed BEFORE the
+        // payload is parsed so the work one request can ask for is bounded. It is the
+        // emulator's cap, not the service's quota, so it says so; the service's quota
+        // is weighed on the state the document carries, once it can be read.
+        if input.payload.len() > crate::state::MAX_SHADOW_REQUEST_ENTITY_BYTES {
             return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
-                RequestEntityTooLargeException {
-                    message: Some(format!(
-                        "the state document is {} bytes; the maximum state document size is {} bytes",
-                        input.payload.len(),
-                        crate::state::MAX_SHADOW_DOCUMENT_BYTES
-                    )),
-                },
+                RequestEntityTooLargeException::new(crate::state::emulator_size_cap(
+                    "reads a state document",
+                    input.payload.len(),
+                    crate::state::MAX_SHADOW_REQUEST_ENTITY_BYTES,
+                )),
             )
             .into());
         }
 
-        // A shadow document is UTF-8 JSON. Bytes that are not UTF-8 at all are an
-        // encoding this service does not support (415); bytes that are UTF-8 but not a
-        // well-formed state document are an invalid request (400).
-        let text = ::std::str::from_utf8(&input.payload).map_err(|error| {
+        // A shadow document is UTF-8 JSON: bytes that are not UTF-8 at all are an
+        // encoding this service does not support (415), and UTF-8 that is not a JSON
+        // document is an invalid request (400). Either way the message is the
+        // service's own — a parser diagnostic describes this emulator's JSON library,
+        // not the contract.
+        let text = ::std::str::from_utf8(&input.payload).map_err(|_| {
             UpdateThingShadowErrorModeled::UnsupportedDocumentEncodingException(
-                UnsupportedDocumentEncodingException {
-                    message: Some(format!(
-                        "the state document must be UTF-8 encoded JSON: {error}"
-                    )),
-                },
+                UnsupportedDocumentEncodingException::new("The document encoding is not supported"),
             )
         })?;
-        let document: ::serde_json::Value = ::serde_json::from_str(text).map_err(|error| {
-            UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
-                message: Some(format!("the state document is not valid JSON: {error}")),
-            })
+        let document: ::serde_json::Value = ::serde_json::from_str(text).map_err(|_| {
+            UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException::new(
+                crate::state::PAYLOAD_INVALID_JSON,
+            ))
         })?;
+        // The state document's own shape is reported in the service's own words: one
+        // fixed sentence per malformed node, naming the node at fault. A payload that
+        // parses but is not an object at all (a list, a number) has no service text of
+        // its own that is known, and the node the service requires is missing from it
+        // either way, so it takes the missing-`state`-node rejection.
         let document = document.as_object().ok_or_else(|| {
-            UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
-                message: Some("the state document must be a JSON object".to_string()),
-            })
+            UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException::new(
+                crate::state::MISSING_STATE_NODE,
+            ))
         })?;
 
-        let state_node = document
-            .get("state")
-            .and_then(::serde_json::Value::as_object)
-            .ok_or_else(|| {
-                UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: Some(
-                        "the state document must carry a 'state' object naming 'desired' \
-                         and/or 'reported'"
-                            .to_string(),
-                    ),
-                })
-            })?;
+        let state_node = match document.get("state") {
+            None => {
+                return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
+                    InvalidRequestException::new(crate::state::MISSING_STATE_NODE),
+                )
+                .into())
+            }
+            Some(::serde_json::Value::Object(node)) => node,
+            Some(_) => {
+                return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
+                    InvalidRequestException::new(crate::state::node_must_be_an_object("State")),
+                )
+                .into())
+            }
+        };
         // `delta` is derived by the service from the other two, so a client may only
-        // write `desired` and `reported`.
+        // write `desired` and `reported`; any other node under `state` is one the
+        // service does not recognise.
         if let Some(unknown) = state_node
             .keys()
             .find(|key| key.as_str() != "desired" && key.as_str() != "reported")
         {
             return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "the 'state' node may only carry 'desired' and 'reported', not '{unknown}'"
-                    )),
-                },
+                InvalidRequestException::new(crate::state::invalid_state_node(unknown)),
             )
             .into());
         }
         let desired = state_node.get("desired");
         let reported = state_node.get("reported");
         if desired.is_none() && reported.is_none() {
+            // The one shape failure with no service text of its own: stated as a
+            // validation message naming the members and the constraint.
             return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(
-                        "the 'state' node must carry 'desired' and/or 'reported'".to_string(),
-                    ),
-                },
+                InvalidRequestException::new(
+                    "the 'state' node must carry 'desired' and/or 'reported'",
+                ),
             )
             .into());
         }
-        for (name, section) in [("desired", desired), ("reported", reported)] {
+        for (name, section) in [("Desired", desired), ("Reported", reported)] {
             if section.is_some_and(|section| !section.is_object()) {
                 return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!("the '{name}' node must be a JSON object")),
-                    },
+                    InvalidRequestException::new(crate::state::node_must_be_an_object(name)),
                 )
                 .into());
             }
+        }
+
+        // The state the document carries is what the state-document limit weighs —
+        // the framing around it, and the whitespace the request was spaced out with,
+        // are not state. See `crate::state::state_sections_bytes`.
+        let document_state_bytes = crate::state::state_sections_bytes(desired, reported);
+        if document_state_bytes > crate::state::MAX_SHADOW_DOCUMENT_BYTES {
+            return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
+                RequestEntityTooLargeException::new(crate::state::json_document_too_large(
+                    document_state_bytes,
+                    crate::state::MAX_SHADOW_DOCUMENT_BYTES,
+                )),
+            )
+            .into());
         }
 
         // An update may carry the version it expects to be updating, which makes the
@@ -253,9 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let expected_version = match document.get("version") {
             None | Some(::serde_json::Value::Null) => None,
             Some(version) => Some(version.as_i64().ok_or_else(|| {
-                UpdateThingShadowErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: Some("the 'version' node must be a number".to_string()),
-                })
+                UpdateThingShadowErrorModeled::InvalidRequestException(
+                    InvalidRequestException::new(crate::state::INVALID_VERSION),
+                )
             })?),
         };
 
@@ -267,12 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(expected) = expected_version {
             if expected != stored_version {
                 return Err(UpdateThingShadowErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(format!(
-                            "the update expects version {expected} but the document is at \
-                             version {stored_version}"
-                        )),
-                    },
+                    ConflictException::new(crate::state::VERSION_CONFLICT),
                 )
                 .into());
             }
@@ -280,16 +296,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both halves of the key come from the request, so a caller must not be able
         // to name a new shadow per call forever. An update of a shadow that is
-        // already stored never trips this; deleting one frees the slot.
+        // already stored never trips this; deleting one frees the slot. The cap is
+        // this emulator's, not a quota the service publishes, so its message says so.
         if !guard.shadows.contains_key(&key) && guard.shadows.len() >= crate::state::MAX_SHADOWS {
             return Err(UpdateThingShadowErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "this emulator stores at most {} shadow documents; delete a shadow \
-                         before creating another",
-                        crate::state::MAX_SHADOWS
-                    )),
-                },
+                InvalidRequestException::new(format!(
+                    "this emulator stores at most {} shadow documents; delete a shadow \
+                     before creating another",
+                    crate::state::MAX_SHADOWS
+                )),
             )
             .into());
         }
@@ -303,33 +318,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         merged.version = stored_version + 1;
         merged.timestamp_secs = timestamp_secs;
         let accepted = merged.document();
-        let state_bytes = accepted
-            .get("state")
-            .map_or(0, |state| state.to_string().len());
+        // The same measure again, on the state the merge would leave STORED: the
+        // quota bounds the accumulated state, not one request's document.
+        let state_bytes = merged.state_bytes();
         if state_bytes > crate::state::MAX_SHADOW_DOCUMENT_BYTES {
             return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
-                RequestEntityTooLargeException {
-                    message: Some(format!(
-                        "the update would leave a state document of {state_bytes} bytes; the \
-                         maximum state document size is {} bytes",
-                        crate::state::MAX_SHADOW_DOCUMENT_BYTES
-                    )),
-                },
+                RequestEntityTooLargeException::new(crate::state::json_document_too_large(
+                    state_bytes,
+                    crate::state::MAX_SHADOW_DOCUMENT_BYTES,
+                )),
             )
             .into());
         }
         let serialized =
             ::serde_json::to_vec(&accepted).expect("a shadow document serializes to JSON");
         if serialized.len() > crate::state::MAX_STORED_SHADOW_BYTES {
+            // Another cap of this emulator's own, on the whole stored record rather
+            // than the state the quota bounds, so it names itself as the emulator's.
             return Err(UpdateThingShadowErrorModeled::RequestEntityTooLargeException(
-                RequestEntityTooLargeException {
-                    message: Some(format!(
-                        "the update would leave a stored document of {} bytes; the maximum \
-                         stored document size is {} bytes",
-                        serialized.len(),
-                        crate::state::MAX_STORED_SHADOW_BYTES
-                    )),
-                },
+                RequestEntityTooLargeException::new(crate::state::emulator_size_cap(
+                    "stores a shadow document",
+                    serialized.len(),
+                    crate::state::MAX_STORED_SHADOW_BYTES,
+                )),
             )
             .into());
         }

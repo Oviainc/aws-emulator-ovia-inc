@@ -18,9 +18,15 @@ pub struct DeleteThingShadowInput {
     pub shadow_name: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.iotdataplane#DeleteThingShadowResponse")]
-#[derive(Debug, Clone, Default)]
-pub struct DeleteThingShadowOutput {
-    pub payload: Vec<u8>,
+// Declared through the shared envelope macro for the same reason as
+// `GetThingShadowOutput`: the deletion acknowledgement is a JSON document, so the
+// response states its content type rather than taking the protocol's blob fallback.
+// `payload` is `@required` on this response shape, hence the non-`Option` field.
+super::shared_types::json_document_output! {
+    /// The output from the DeleteThingShadow operation: the deletion acknowledgement.
+    DeleteThingShadowOutput => DELETE_THING_SHADOW_OUTPUT_SCHEMA,
+    shape: "DeleteThingShadowResponse",
+    members: DELETE_THING_SHADOW_OUTPUT_MEMBERS,
+    payload: DELETE_THING_SHADOW_PAYLOAD_MEMBER, required
 }
 

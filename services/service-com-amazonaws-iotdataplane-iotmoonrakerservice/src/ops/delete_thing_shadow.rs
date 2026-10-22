@@ -151,23 +151,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteThingShadowErrorModeled::InternalFailureException(InternalFailureException {
-                message: Some("the thing-shadow store is unavailable".to_string()),
-            })
+            DeleteThingShadowErrorModeled::InternalFailureException(InternalFailureException::new(
+                "An unexpected error has occurred.",
+            ))
         })?;
 
         let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
         let mut guard = state.lock();
         let deleted = guard.shadows.remove(&key).ok_or_else(|| {
-            DeleteThingShadowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(match input.shadow_name.as_deref() {
-                    Some(name) => format!(
-                        "no shadow named '{name}' exists for thing '{}'",
-                        input.thing_name
+            DeleteThingShadowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException::new(crate::state::no_shadow_exists(
+                    crate::state::addressed_shadow_name(
+                        &input.thing_name,
+                        input.shadow_name.as_deref(),
                     ),
-                    None => format!("no shadow exists for thing '{}'", input.thing_name),
-                }),
-            })
+                )),
+            )
         })?;
         drop(guard);
 
