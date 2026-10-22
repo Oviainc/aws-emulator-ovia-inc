@@ -668,6 +668,30 @@ async fn an_unreadable_document_is_reported_and_the_rest_of_the_batch_still_land
             "InvalidField",
             Some("0000000000000000"),
         ),
+        (
+            // No reader can convert an instant this far from the epoch to the
+            // modelled `Timestamp`, so the document is refused rather than
+            // stored.
+            "start_time further from the epoch than a recorded time can be",
+            json!({"trace_id": trace_id(25), "id": "1111000000000000", "name": "x", "start_time": 1e300_f64})
+                .to_string(),
+            "InvalidField",
+            Some("1111000000000000"),
+        ),
+        (
+            "a negative start_time further from the epoch than a recorded time can be",
+            json!({"trace_id": trace_id(26), "id": "2222000000000000", "name": "x", "start_time": -1e300_f64})
+                .to_string(),
+            "InvalidField",
+            Some("2222000000000000"),
+        ),
+        (
+            "end_time further from the epoch than a recorded time can be",
+            json!({"trace_id": trace_id(27), "id": "3333000000000000", "name": "x", "start_time": 1.0_f64, "end_time": 1e300_f64})
+                .to_string(),
+            "InvalidField",
+            Some("3333000000000000"),
+        ),
     ];
 
     for (label, bad, expected_code, expected_id) in rows {

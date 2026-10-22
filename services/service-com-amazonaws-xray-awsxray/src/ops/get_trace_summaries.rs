@@ -306,9 +306,7 @@ fn summary_of(trace: &crate::state::TraceRecord) -> TraceSummary {
     let root = trace.root();
     TraceSummary {
         id: Some(trace.id.clone()),
-        start_time: Some(::aws_smithy_types::DateTime::from_secs_f64(
-            trace.first_start,
-        )),
+        start_time: Some(crate::state::timestamp_of(trace.first_start)),
         duration: trace.duration(),
         response_time: trace.response_time(),
         has_fault: Some(trace.has_fault()),

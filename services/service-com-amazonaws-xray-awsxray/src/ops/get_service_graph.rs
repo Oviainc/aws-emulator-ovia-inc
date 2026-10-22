@@ -9,6 +9,10 @@
 //! different services, and every count, time and histogram recomputed from the
 //! documents `PutTraceSegments` kept.
 //!
+//! A `GroupName` / `GroupARN` names the group whose `FilterExpression` the
+//! graph would be scoped by; this slice does not evaluate an expression, so a
+//! group that carries one is refused rather than answered unscoped.
+//!
 //! Two refusals, both `InvalidRequestException` (400):
 //!
 //! * a `[StartTime, EndTime]` window that names no interval of recorded traffic,
