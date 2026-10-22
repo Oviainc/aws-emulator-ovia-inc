@@ -99,6 +99,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The member `clusterCount` is written under, beside the modelled `cluster`.
+///
+/// RECORDED behaviour: `DeleteClusterResponse` declares the single member `cluster`
+/// (`smithy_query(query="operation", operation="DeleteCluster")`), so there is no
+/// generated field for `clusterCount` and this schema is what names it on the wire.
+/// Index 1 is the first free member index after `cluster` (index 0). See
+/// [`crate::state::ClusterCountEnvelope`].
+const CLUSTER_COUNT_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.ecs#DeleteClusterResponse$clusterCount",
+        "com.amazonaws.ecs",
+        "clusterCount",
+    ),
+    ::aws_smithy_schema::ShapeType::Integer,
+    "clusterCount",
+    1,
+);
+
+/// What `DeleteCluster` answers: the modelled `DeleteClusterResponse` plus the recorded
+/// top-level `clusterCount`.
+pub type DeleteClusterResponse = crate::state::ClusterCountEnvelope<DeleteClusterOutput>;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteCluster<Eng>
 {
     type Input = DeleteClusterInput;
-    type Output = DeleteClusterOutput;
+    type Output = DeleteClusterResponse;
     type Error = DeleteClusterError;
 
     const NAME: &'static str = "DeleteCluster";
@@ -229,10 +251,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard
             .services
             .retain(|_, service| service.cluster_name != cluster_name);
-        let view = guard.cluster_view(&record, crate::state::ClusterFields::all());
+        // `DeleteCluster` takes neither `tags` nor an `include`, so the response reports
+        // no tag set — only the cluster's own configured state and lifecycle.
+        let view = guard.cluster_mutation_view(&record, false);
 
-        Ok(DeleteClusterOutput {
-            cluster: Some(view),
+        // `clusterCount` is read AFTER the delete landed, so the cluster this call
+        // removed is no longer counted.
+        Ok(DeleteClusterResponse {
+            payload: DeleteClusterOutput {
+                cluster: Some(view),
+            },
+            cluster_count: guard.cluster_count(),
+            member: &CLUSTER_COUNT_MEMBER,
         })
     }
 }

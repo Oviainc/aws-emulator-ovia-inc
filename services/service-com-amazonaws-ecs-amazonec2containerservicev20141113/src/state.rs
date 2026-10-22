@@ -46,7 +46,7 @@ use crate::ops::types::{
     ProxyConfiguration, Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
     ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration, Tag,
     Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride, ThresholdConfiguration,
-    VersionInfo, Volume, VpcLatticeConfiguration,
+    VersionInfo, Volume, VpcLatticeConfiguration, CLUSTER_SETTING_NAME_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -62,6 +62,21 @@ pub const ARN_NAMESPACE: &str = "ecs";
 /// cluster that's named default"; every other operation's `cluster` doc: "If you do not
 /// specify a cluster, the default cluster is assumed."
 pub const DEFAULT_CLUSTER_NAME: &str = "default";
+
+/// The value a cluster setting takes when neither the cluster nor the account set one.
+/// `ClusterSetting$value`: "The supported values are `enhanced`, `enabled`, and
+/// `disabled`. ... If a cluster value is specified, it will override the
+/// `containerInsights` value set with PutAccountSetting or PutAccountSettingDefault" —
+/// and CloudWatch Container Insights is OFF until one of those turns it on, so the
+/// account default a cluster inherits here is `disabled`.
+///
+/// TODO: `PutAccountSetting`/`PutAccountSettingDefault` are scaffold stubs (501), so
+/// there is no account-settings store to read the inherited value from yet. When those
+/// writes land — they are part of the related open issue on unpersisted ECS cluster
+/// mutations — [`ClusterRecord::effective_settings`] must read the account default from
+/// that store and fall back to this constant, or a cluster will keep reporting
+/// `disabled` after an account default turned Container Insights on.
+pub const CLUSTER_SETTING_DEFAULT_VALUE: &str = "disabled";
 
 /// How long a task takes to cross one lifecycle boundary (`PENDING` -> `RUNNING`,
 /// `DEACTIVATING` -> `STOPPED`). EMULATOR-CHOSEN — AWS publishes no duration for it —
@@ -346,6 +361,30 @@ pub struct ClusterRecord {
     pub configuration: Option<ClusterConfiguration>,
     pub capacity_providers: Vec<String>,
     pub default_capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
+}
+
+impl ClusterRecord {
+    /// The cluster's EFFECTIVE settings: one entry for every setting name the model
+    /// defines (`ClusterSettingName`), carrying the value stored for this cluster when
+    /// one was set and the inherited account default ([`CLUSTER_SETTING_DEFAULT_VALUE`])
+    /// otherwise. `Cluster$settings` is "the settings for the cluster. This parameter
+    /// indicates whether CloudWatch Container Insights is on or off for a cluster", so a
+    /// cluster that set nothing still has an answer to that question and reports it.
+    pub fn effective_settings(&self) -> Vec<ClusterSetting> {
+        CLUSTER_SETTING_NAME_VALUES
+            .iter()
+            .map(|name| ClusterSetting {
+                name: Some((*name).to_string()),
+                value: Some(
+                    self.settings
+                        .iter()
+                        .find(|setting| setting.name.as_deref() == Some(*name))
+                        .and_then(|setting| setting.value.clone())
+                        .unwrap_or_else(|| CLUSTER_SETTING_DEFAULT_VALUE.to_string()),
+                ),
+            })
+            .collect()
+    }
 }
 
 /// A container instance, as `RegisterContainerInstance` left it: the EC2 or external
@@ -1631,7 +1670,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 None
             },
             settings: if fields.settings {
-                Some(cluster.settings.clone())
+                Some(cluster.effective_settings())
             } else {
                 None
             },
@@ -1658,6 +1697,52 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
     }
 
+    /// The `Cluster` an operation that CREATES or DELETES a cluster reports.
+    ///
+    /// Such an operation carries no `include` member, and the halves of a `Cluster`
+    /// answer that differently.
+    ///
+    /// What the cluster is CONFIGURED to be is always materialised: `settings` (the
+    /// effective value of every setting name the model defines, see
+    /// [`ClusterRecord::effective_settings`] — `Cluster$settings` "indicates whether
+    /// CloudWatch Container Insights is on or off for a cluster", which is true of a
+    /// cluster whoever reads it) and `configuration` ("the execute command and managed
+    /// storage configuration for the cluster"), so a client can read back the cluster it
+    /// just changed.
+    ///
+    /// `statistics` — "additional information about your clusters that are separated by
+    /// launch type" — is COMPUTED only for a read that asks for it
+    /// (`DescribeClusters$include` `STATISTICS`), so here it is an EMPTY list: emitting
+    /// launch-type metrics nobody asked for hands metric-name-keyed client code values
+    /// the service never reported.
+    ///
+    /// `tags` is materialised only where the ANSWERING OPERATION'S INPUT SHAPE mentions
+    /// tags — the `tags` member a create is handed (`report_tags`), or the `TAGS` entry of
+    /// a read's `include`. An operation whose input mentions tags nowhere, a delete,
+    /// reports an empty list rather than the resource's tag set, so "no tags on this
+    /// cluster" and "tags not requested" stay the same answer they are on AWS.
+    pub fn cluster_mutation_view(&self, cluster: &ClusterRecord, report_tags: bool) -> Cluster {
+        let mut view = self.cluster_view(
+            cluster,
+            ClusterFields {
+                attachments: true,
+                configurations: true,
+                settings: true,
+                statistics: false,
+                tags: report_tags,
+            },
+        );
+        view.statistics = Some(Vec::new());
+        view.tags = Some(view.tags.unwrap_or_default());
+        view
+    }
+
+    /// How many clusters the account holds — the top-level `clusterCount` a
+    /// cluster-mutating response carries, read after the call has been applied. See
+    /// [`ClusterCountEnvelope`] for why it is not a modelled member.
+    pub fn cluster_count(&self) -> i32 {
+        i32::try_from(self.clusters.len()).unwrap_or(i32::MAX)
+    }
 }
 
 /// What one pass over the task map and one over the service map count for a cluster:
@@ -1705,6 +1790,42 @@ fn cluster_statistics(tally: &TaskTally) -> Vec<KeyValuePair> {
     ]
 }
 
+/// A cluster response plus the top-level `clusterCount` Amazon ECS answers a
+/// cluster-mutating call with.
+///
+/// `clusterCount` is RECORDED behaviour, not modelled behaviour: the Smithy model's
+/// `CreateClusterResponse`/`DeleteClusterResponse` declare the single member `cluster`
+/// (`smithy_query(query="operation", operation="CreateCluster,DeleteCluster")`), while
+/// every recorded 200 from either operation carries `clusterCount` beside `cluster`,
+/// counting the clusters the account holds once the call has been applied (1 after the
+/// first create, 0 after the last delete). Because the member is not in the model it has
+/// no generated field to fill, so this envelope writes it after the modelled payload's
+/// own members, with the member schema the operation declares — the modelled shapes and
+/// the model file stay exactly as shipped, and an SDK that knows only the modelled shape
+/// ignores the extra key.
+#[derive(Debug)]
+pub struct ClusterCountEnvelope<T> {
+    /// The modelled response — the only part an SDK-generated client reads.
+    pub payload: T,
+    /// How many clusters the account holds after this call.
+    pub cluster_count: i32,
+    /// The member schema `clusterCount` is written under, declared by the operation
+    /// that answers (each response shape names its own member).
+    pub member: &'static ::aws_smithy_schema::Schema,
+}
+
+impl<T: ::aws_smithy_schema::serde::SerializableStruct> ::aws_smithy_schema::serde::SerializableStruct
+    for ClusterCountEnvelope<T>
+{
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.payload.serialize_members(serializer)?;
+        serializer.write_integer(self.member, self.cluster_count)
+    }
+}
+
 /// One `KeyValuePair` of `Cluster$statistics`.
 fn pair(name: &str, value: String) -> KeyValuePair {
     KeyValuePair {
@@ -1726,19 +1847,6 @@ pub struct ClusterFields {
 }
 
 impl ClusterFields {
-    /// Every optional field — what the operation that CREATED or MUTATED the cluster
-    /// returns, since the caller just supplied them and `CreateCluster` has no
-    /// `include` member to narrow them with.
-    pub fn all() -> Self {
-        Self {
-            attachments: true,
-            configurations: true,
-            settings: true,
-            statistics: true,
-            tags: true,
-        }
-    }
-
     /// The fields the `include` list of a describe request asks for. Unknown entries
     /// cannot reach here: `include` targets the closed `ClusterField` enum.
     pub fn from_include(include: Option<&Vec<String>>) -> Self {
