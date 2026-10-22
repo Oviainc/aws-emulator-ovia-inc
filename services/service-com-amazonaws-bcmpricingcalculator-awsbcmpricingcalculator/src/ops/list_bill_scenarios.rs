@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBillScenarios
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBillScenarios`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one `BillScenarioSummary` per live bill scenario, in creation order. It
+//! reports only stored state, as the model's `@readonly` says; its one write is
+//! materialising an expiry the clock had already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBillScenarios::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `filters` select on the scenario attribute each `ListBillScenariosFilterName` names,
+//! with the filter's `matchOption`; several filters are AND-ed and the values of one
+//! filter are OR-ed. `createdAtFilter` / `expiresAtFilter` keep only scenarios whose
+//! timestamp falls in the window. `maxResults` is the page size and `nextToken` is
+//! emitted only while items remain.
+//!
+//! Selection is deliberately account-agnostic: this emulator presents one account
+//! (`engine::emulator_account_id`), and no stored scenario carries an owning account to
+//! filter on, so every live scenario is the caller's. An issue that gives the emulator
+//! several accounts adds the scoping here.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +112,50 @@ impl From<ListBillScenariosErrorModeled> for ListBillScenariosError {
     }
 }
 
+/// Whether `scenario` satisfies every filter the request carries.
+fn selected(scenario: &crate::state::BillScenario, input: &ListBillScenariosInput) -> bool {
+    if !crate::state::within_window(
+        scenario.created_at,
+        input
+            .created_at_filter
+            .as_ref()
+            .and_then(|window| window.after_timestamp),
+        input
+            .created_at_filter
+            .as_ref()
+            .and_then(|window| window.before_timestamp),
+    ) {
+        return false;
+    }
+    if !crate::state::within_window(
+        scenario.expires_at,
+        input
+            .expires_at_filter
+            .as_ref()
+            .and_then(|window| window.after_timestamp),
+        input
+            .expires_at_filter
+            .as_ref()
+            .and_then(|window| window.before_timestamp),
+    ) {
+        return false;
+    }
+    input
+        .filters
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .all(|filter| match scenario.filter_value(&filter.name) {
+            Some(candidate) => crate::state::matches_filter(
+                candidate,
+                &filter.values,
+                filter.match_option.as_deref(),
+            ),
+            // The scenario carries nothing for this attribute, so no value matches.
+            None => false,
+        })
+}
+
 /// The `ListBillScenarios` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,20 +190,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBillScenarios` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBillScenariosErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBillScenarios"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListBillScenariosErrorModeled::DataUnavailableException(
+                DataUnavailableException {
+                    message: "the bill scenario store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Materialise the expiry the clock has already made due, so a scenario past its
+        // `expiresAt` reads as gone rather than lingering for the life of the process.
+        state.purge_expired(crate::state::now_secs());
+
+        let matching: Vec<BillScenarioSummary> = state
+            .bill_scenarios
+            .iter()
+            .filter(|scenario| selected(scenario, &input))
+            .map(|scenario| BillScenarioSummary {
+                id: scenario.id.clone(),
+                name: Some(scenario.name.clone()),
+                bill_interval: Some(scenario.bill_interval()),
+                status: Some(scenario.status.clone()),
+                created_at: Some(scenario.created_at),
+                expires_at: Some(scenario.expires_at),
+                failure_message: scenario.failure_message.clone(),
+                group_sharing_preference: scenario.group_sharing_preference.clone(),
+                cost_category_group_sharing_preference_arn: scenario
+                    .cost_category_group_sharing_preference_arn
+                    .clone(),
+            })
+            .collect();
+
+        // A page token is bound to the selection it was measured against, so an offset
+        // from one filter set is never applied to a differently filtered list.
+        let mut scope_parts: Vec<String> = vec![Self::NAME.to_string()];
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            scope_parts.push(filter.name.clone());
+            scope_parts.push(filter.match_option.clone().unwrap_or_default());
+            scope_parts.extend(filter.values.iter().cloned());
+        }
+        for window in [&input.created_at_filter, &input.expires_at_filter] {
+            // Both halves of each bound go in, because `within_window` compares
+            // sub-second precision too: two requests whose windows differ only in
+            // nanoseconds select differently, so they must not share a token scope.
+            for bound in [
+                window.as_ref().and_then(|window| window.after_timestamp),
+                window.as_ref().and_then(|window| window.before_timestamp),
+            ] {
+                scope_parts.push(bound.map(|at| at.secs()).unwrap_or_default().to_string());
+                scope_parts.push(
+                    bound
+                        .map(|at| at.subsec_nanos())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        let scope = crate::state::request_fingerprint(&scope_parts);
+
+        let (items, next_token) = crate::state::paginate(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            &scope,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(ListBillScenariosOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

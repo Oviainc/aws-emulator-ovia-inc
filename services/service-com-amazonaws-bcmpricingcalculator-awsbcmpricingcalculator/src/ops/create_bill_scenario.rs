@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBillScenario
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBillScenario`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a bill scenario, persists it in [`crate::state`], and answers from what it
+//! stored. The minted `id` is a fresh lowercase-hex v4 UUID, the scenario is `READY`
+//! as soon as it exists (nothing is computed asynchronously at create time), and
+//! `billInterval` is the UTC calendar month the create call fell in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBillScenario::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@idempotent` and `clientToken` is an `@idempotencyToken`, so a
+//! replayed token answers with the scenario the first call created instead of minting
+//! a second one. A token carrying a request the first call did not make is
+//! `ConflictException` (HTTP 409) rather than a replay of someone else's answer.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +131,23 @@ impl From<CreateBillScenarioErrorModeled> for CreateBillScenarioError {
     }
 }
 
+/// This operation's response, read off the stored scenario.
+fn output_for(scenario: &crate::state::BillScenario) -> CreateBillScenarioOutput {
+    CreateBillScenarioOutput {
+        id: scenario.id.clone(),
+        name: Some(scenario.name.clone()),
+        bill_interval: Some(scenario.bill_interval()),
+        status: Some(scenario.status.clone()),
+        created_at: Some(scenario.created_at),
+        expires_at: Some(scenario.expires_at),
+        failure_message: scenario.failure_message.clone(),
+        group_sharing_preference: scenario.group_sharing_preference.clone(),
+        cost_category_group_sharing_preference_arn: scenario
+            .cost_category_group_sharing_preference_arn
+            .clone(),
+    }
+}
+
 /// The `CreateBillScenario` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +184,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBillScenario` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBillScenarioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBillScenario"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateBillScenarioErrorModeled::DataUnavailableException(
+                DataUnavailableException {
+                    message: "the bill scenario store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        let now = crate::state::now_secs();
+        // Materialise the expiry the clock has already made due before answering, so
+        // the retention this scenario's `expiresAt` advertises is enforced rather than
+        // merely reported.
+        state.purge_expired(now);
+
+        // A replayed `@idempotencyToken` answers with the scenario the first call
+        // created: the same `id`, not a second scenario. The SAME token carrying a
+        // different request is not a retry, so it is refused as a conflict rather than
+        // answered with another request's scenario.
+        let mut digest_parts: Vec<String> = vec![
+            input.name.clone(),
+            input.group_sharing_preference.clone().unwrap_or_default(),
+            input
+                .cost_category_group_sharing_preference_arn
+                .clone()
+                .unwrap_or_default(),
+        ];
+        // Sorted, because a map's iteration order is not the request's; key and value
+        // go in as SEPARATE parts, which `request_fingerprint` length-prefixes, so
+        // `{"a=b": "c"}` and `{"a": "b=c"}` cannot collide.
+        let mut tags: Vec<(String, String)> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+        tags.sort();
+        for (key, value) in tags {
+            digest_parts.push(key);
+            digest_parts.push(value);
+        }
+        let fingerprint = crate::state::request_fingerprint(&digest_parts);
+
+        match state.replay(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Replayed(ids) => {
+                // The record resolves unless pruning has removed the scenario it
+                // named, which `prune_idempotency` only does once that scenario is
+                // gone; falling through then creates what the caller asked for.
+                if let Some(existing) = ids.first().and_then(|id| state.bill_scenario(id)) {
+                    return Ok(output_for(existing));
+                }
+            }
+            crate::state::Replay::Mismatch(created) => {
+                return Err(CreateBillScenarioErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "this clientToken was already used for a different \
+                                  CreateBillScenario request"
+                            .to_string(),
+                        // The scenario the token already created, so the caller can
+                        // resolve the conflict against it.
+                        resource_id: created.first().cloned().unwrap_or_default(),
+                        resource_type: "BillScenario".to_string(),
+                    },
+                )
+                .into());
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        if state.bill_scenarios.len() >= crate::state::MAX_BILL_SCENARIOS {
+            return Err(CreateBillScenarioErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the maximum of {} bill scenarios already exist",
+                        crate::state::MAX_BILL_SCENARIOS
+                    ),
+                    // `resourceId` is `@required` and no scenario was created, so it
+                    // carries what the request asked for; `resourceType` beside it
+                    // says what that name denotes.
+                    resource_id: input.name.clone(),
+                    resource_type: "BillScenario".to_string(),
+                    service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_resource_id();
+        let (interval_start, interval_end) = crate::state::month_bounds(now);
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let scenario = crate::state::BillScenario {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("bill-scenario/{id}"),
+            ),
+            id: id.clone(),
+            name: input.name.clone(),
+            // The scenario exists ready to be modified: nothing is computed at create
+            // time, so it never passes through a transient status.
+            status: "READY".to_string(),
+            created_at: ::aws_smithy_types::DateTime::from_secs(now),
+            expires_at: ::aws_smithy_types::DateTime::from_secs(
+                now + crate::state::BILL_SCENARIO_RETENTION_SECS,
+            ),
+            bill_interval_start: ::aws_smithy_types::DateTime::from_secs(interval_start),
+            bill_interval_end: ::aws_smithy_types::DateTime::from_secs(interval_end),
+            failure_message: None,
+            group_sharing_preference: input.group_sharing_preference.clone(),
+            cost_category_group_sharing_preference_arn: input
+                .cost_category_group_sharing_preference_arn
+                .clone(),
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            usage_modifications: Vec::new(),
+        };
+
+        let output = output_for(&scenario);
+        state.bill_scenarios.push(scenario);
+        state.record_idempotent(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            vec![id],
+        );
+        Ok(output)
     }
 }
