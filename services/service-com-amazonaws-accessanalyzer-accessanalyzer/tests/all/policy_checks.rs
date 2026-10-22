@@ -845,7 +845,9 @@ async fn a_refused_document_names_the_member_that_was_wrong() {
         );
         assert_eq!(
             reply.member("reason").and_then(Value::as_str),
-            Some("cannotParse"),
+            // The `cannotParse` discriminator, spelled the way a response spells it: the
+            // model's own SCREAMING_SNAKE name for it (see `harness::VALIDATION_REASONS`).
+            Some(crate::harness::wire_reason("cannotParse")),
             "case {name:?}: a document that is not JSON cannot be parsed, got {:?}",
             reply.body
         );

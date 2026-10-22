@@ -29,6 +29,8 @@ mod modelled_wire_shape;
 mod policy_access_check;
 #[path = "all/policy_checks.rs"]
 mod policy_checks;
+#[path = "all/response_vocabulary.rs"]
+mod response_vocabulary;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_analyzer.rs"]
