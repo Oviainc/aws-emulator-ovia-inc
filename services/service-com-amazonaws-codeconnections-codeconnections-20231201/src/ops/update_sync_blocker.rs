@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSyncBlocker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSyncBlocker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSyncBlocker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSyncBlocker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSyncBlockerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSyncBlockerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The BLOCKER ID is resolved FIRST, before the `(SyncType, ResourceName)` pair
+        // the request also carries: an id that names no blocker is refused with the
+        // modeled `SyncBlockerDoesNotExistException` (404) whatever the resource turns
+        // out to be, so a caller resolving blockers can tell an unknown blocker id from
+        // an unknown resource. The blocker store is keyed by id for exactly that
+        // reason.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSyncBlocker"))
+        // Only the SERVICE mints a blocker, when a Git sync it performed is blocked.
+        // This emulator performs no Git sync (see `state::StoredSyncBlocker`), so the
+        // store holds no blocker and no id resolves — the refusal below is what a
+        // caller gets, rather than an invented blocker.
+        let Some(blocker) = store.sync_blockers.get(&input.id).cloned() else {
+            return Err(
+                UpdateSyncBlockerErrorModeled::SyncBlockerDoesNotExistException(
+                    SyncBlockerDoesNotExistException {
+                        message: Some(format!("Sync blocker with id {} does not exist", input.id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A blocker belongs to one resource and sync type, so an id that resolves to a
+        // blocker of some OTHER resource names no blocker of the resource this request
+        // addresses — the same refusal, by the same rule.
+        if blocker.sync_type != input.sync_type || blocker.resource_name != input.resource_name {
+            return Err(
+                UpdateSyncBlockerErrorModeled::SyncBlockerDoesNotExistException(
+                    SyncBlockerDoesNotExistException {
+                        message: Some(format!(
+                            "Sync blocker with id {} does not exist for resource {}",
+                            input.id, input.resource_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Resolving the blocker is the whole update: the reason the caller gave and the
+        // instant it was resolved are recorded, and the status moves to the modeled
+        // `BlockerStatus` value `RESOLVED` (see `types::BLOCKER_STATUS_VALUES`).
+        let mut resolved = blocker;
+        resolved.status = "RESOLVED".to_string();
+        resolved.resolved_reason = Some(input.resolved_reason);
+        resolved.resolved_at = Some(::aws_smithy_types::DateTime::from(
+            ::std::time::SystemTime::now(),
+        ));
+        let resource_name = resolved.resource_name.clone();
+        let parent_resource_name = resolved.parent_resource_name.clone();
+        let sync_blocker = resolved.to_modeled();
+        store.sync_blockers.insert(input.id.clone(), resolved);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged.
+        ::tracing::info!(
+            operation = "UpdateSyncBlocker",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            sync_blocker_id = %input.id,
+            resource_name = %resource_name,
+            outcome = "resolved",
+            "codeconnections state change"
+        );
+
+        Ok(UpdateSyncBlockerOutput {
+            resource_name,
+            parent_resource_name,
+            sync_blocker,
+        })
     }
 }

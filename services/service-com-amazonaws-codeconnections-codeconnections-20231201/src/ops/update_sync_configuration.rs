@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSyncConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSyncConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSyncConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +166,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSyncConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSyncConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSyncConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSyncConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The configuration this call addresses is resolved FIRST, by the
+        // `(SyncType, ResourceName)` pair: a resource that has no configuration of this
+        // sync type is refused with the modeled `InvalidInputException` (400) — the
+        // operation's own code for input that names nothing it can update — and nothing
+        // is written.
+        let key = crate::state::sync_configuration_key(&input.sync_type, &input.resource_name);
+        let Some(existing) = store.sync_configurations.get(&key).cloned() else {
+            return Err(UpdateSyncConfigurationErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Sync Configuration for Resource {} was not found",
+                        input.resource_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A replacement repository link is RESOLVED against the repository-link store,
+        // exactly as `CreateSyncConfiguration` resolves the first one, and the members
+        // that describe the repository follow it.
+        let replacement_link = match input.repository_link_id.as_deref() {
+            None => None,
+            Some(repository_link_id) => match store.repository_links.get(repository_link_id) {
+                Some(link) => Some(link.clone()),
+                None => {
+                    return Err(UpdateSyncConfigurationErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "Repository Link with id {repository_link_id} was not found"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // Each member the request carries replaces the stored one; a member it omits
+        // leaves that value alone, so an update that names nothing changes nothing.
+        let mut updated = existing;
+        if let Some(link) = replacement_link {
+            updated.repository_link_id = link.repository_link_id;
+            updated.owner_id = link.owner_id;
+            updated.provider_type = link.provider_type;
+            updated.repository_name = link.repository_name;
+        }
+        if let Some(branch) = input.branch {
+            updated.branch = branch;
+        }
+        if let Some(config_file) = input.config_file {
+            updated.config_file = Some(config_file);
+        }
+        if let Some(role_arn) = input.role_arn {
+            updated.role_arn = role_arn;
+        }
+        if let Some(publish_deployment_status) = input.publish_deployment_status {
+            updated.publish_deployment_status = Some(publish_deployment_status);
+        }
+        if let Some(trigger_resource_update_on) = input.trigger_resource_update_on {
+            updated.trigger_resource_update_on = Some(trigger_resource_update_on);
+        }
+        if let Some(pull_request_comment) = input.pull_request_comment {
+            updated.pull_request_comment = Some(pull_request_comment);
+        }
+        let sync_configuration = updated.to_modeled();
+        store.sync_configurations.insert(key, updated);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged.
+        ::tracing::info!(
+            operation = "UpdateSyncConfiguration",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            sync_type = %sync_configuration.sync_type,
+            resource_name = %sync_configuration.resource_name,
+            outcome = "updated",
+            "codeconnections state change"
+        );
+
+        Ok(UpdateSyncConfigurationOutput { sync_configuration })
     }
 }

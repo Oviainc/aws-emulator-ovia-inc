@@ -174,6 +174,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // `HostArnFilter` names ANOTHER resource this service holds, so it is RESOLVED
+        // against the host store before it is used as a predicate: a filter naming a
+        // host that is not there selects nothing because the host does not exist, which
+        // is not the same answer as "this host has no connections". The operation models
+        // `ResourceNotFoundException` (404) for exactly that, so an unresolvable filter
+        // is refused rather than reported as an empty page.
+        if let Some(host_arn) = input.host_arn_filter.as_deref() {
+            if !store.hosts.contains_key(host_arn) {
+                return Err(ListConnectionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No host exists with the ARN: {host_arn}")),
+                    },
+                )
+                .into());
+            }
+        }
         // Walked in `ConnectionArn` order (the `BTreeMap` key order), so the page a
         // token resumes is the continuation of the page that issued it.
         let matching: Vec<&crate::state::StoredConnection> = store
