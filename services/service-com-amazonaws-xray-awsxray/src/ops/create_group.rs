@@ -5,6 +5,11 @@
 //! Inserts a group keyed by name and mints its `GroupARN`, then answers from
 //! the STORED record — `GetGroup` and `GetGroups` return the same ARN later.
 //!
+//! The `FilterExpression` is PARSED first
+//! ([`crate::state::filter_expression`]): an expression X-Ray would refuse —
+//! unparseable, addressing a field it does not index, or empty — is answered
+//! with `InvalidRequestException` before any state is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,12 +168,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `GroupName`'s length bound is modelled, so the boundary refuses a
-        // missing or over-length name before this handler runs; what is left to
-        // refuse is a configuration the documentation forbids, a name already
-        // taken, and a store already full (the cap is owned by `insert_group`,
-        // which answers `None` once it is reached).
-        //
+        // The filter expression is parsed BEFORE anything is written, so an
+        // expression X-Ray would refuse never reaches the store. An absent
+        // `FilterExpression` is the same refusal as an empty one — X-Ray treats
+        // the two identically — which is why `unwrap_or_default` stands in for
+        // the missing member rather than skipping the check.
+        if let Err(failure) = crate::state::filter_expression::validate(
+            input.filter_expression.as_deref().unwrap_or_default(),
+        ) {
+            return Err(CreateGroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(failure.message()),
+                },
+            )
+            .into());
+        }
+
         // "Notifications may only be enabled on a group with InsightsEnabled set
         // to true" (`InsightsConfiguration` on this operation's input), decided
         // against the record this call would store — the same rule `UpdateGroup`
@@ -188,14 +203,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `GroupName`'s length bound is modelled, so the boundary refuses a
+        // missing or over-length name before this handler runs; what is left to
+        // refuse is a name already taken IN THIS REGION — the reserved `Default`
+        // group included, since it exists without being created — and a store
+        // already full (the cap is owned by `insert_group`, which answers `None`
+        // once it is reached).
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        if store.groups.contains_key(&input.group_name) {
+        if store.name_is_taken(&region, &input.group_name) {
             return Err(CreateGroupErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(format!(
-                        "a group named `{}` already exists",
-                        input.group_name
-                    )),
+                    // X-Ray words a name collision from the request: the
+                    // requested name, then " already exists".
+                    message: Some(format!("{} already exists", input.group_name)),
                 },
             )
             .into());
@@ -236,7 +257,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let draft = crate::state::GroupRecordDraft {
             group_name: input.group_name,
             filter_expression: input.filter_expression,

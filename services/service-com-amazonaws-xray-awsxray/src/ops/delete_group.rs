@@ -132,7 +132,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteGroupErrorModeled::ThrottledException(ThrottledException {
                 message: Some(
@@ -143,16 +142,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        let group_name = store
-            .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
+        let region = crate::state::request_region(ctx.parts());
+        let group = store
+            .find_group(
+                &region,
+                input.group_name.as_deref(),
+                input.group_arn.as_deref(),
+            )
             .map_err(|failure| {
                 DeleteGroupErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: Some(
-                        failure.message(input.group_name.as_deref(), input.group_arn.as_deref()),
-                    ),
+                    message: Some(failure.message().to_string()),
                 })
             })?;
-        store.remove_group(&group_name);
+        // The account-level `Default` group is reserved: it is not created by a
+        // caller and cannot be deleted by one either.
+        if group.group_name == crate::state::DEFAULT_GROUP_NAME {
+            return Err(DeleteGroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "{} is a reserved group and cannot be deleted",
+                        crate::state::DEFAULT_GROUP_NAME
+                    )),
+                },
+            )
+            .into());
+        }
+        // The removal addresses the RECORD the lookup resolved, by the key that
+        // record carries (its region and name), never a string from the
+        // request — so a caller can only ever delete the group its own lookup
+        // returned.
+        store.remove_group(&group);
 
         Ok(DeleteGroupOutput {})
     }

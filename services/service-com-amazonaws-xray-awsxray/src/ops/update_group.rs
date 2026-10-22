@@ -12,6 +12,12 @@
 //! at once) is refused with the modelled `InvalidRequestException` (HTTP 400)
 //! before anything is written.
 //!
+//! A supplied `FilterExpression` is PARSED first
+//! ([`crate::state::filter_expression`]): an expression X-Ray would refuse is
+//! answered with `InvalidRequestException` and the group keeps the expression it
+//! had. The reserved `Default` group is updatable like any other — it is derived
+//! until the first update stores it, with the ARN it already reads with.
+//!
 //! Supplying both selectors is refused whatever they name, which is also what
 //! settles a CONFLICTING pair: two selectors that name different stored groups
 //! can never be acted on, so no update mutates a group the caller did not name
@@ -160,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateGroupErrorModeled::ThrottledException(ThrottledException {
                 message: Some(
@@ -169,6 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // The filter expression is parsed BEFORE anything is written, so a
+        // refused update leaves the stored expression exactly as it was.
+        if let Some(expression) = input.filter_expression.as_deref() {
+            if let Err(failure) = crate::state::filter_expression::validate(expression) {
+                return Err(refuse(failure.message()));
+            }
+        }
 
         // "Notifications can only be enabled on a group with InsightsEnabled set
         // to true" (`InsightsConfiguration` on this operation's input). Decided
@@ -199,13 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // different stored groups can never be acted on, so no update can mutate
         // a group the caller did not name on its own.
         let mut store = state.lock();
-        let group_name = store
-            .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
+        let region = crate::state::request_region(ctx.parts());
+        let group = store
+            .find_group(
+                &region,
+                input.group_name.as_deref(),
+                input.group_arn.as_deref(),
+            )
             .map_err(|failure| {
                 UpdateGroupErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: Some(
-                        failure.message(input.group_name.as_deref(), input.group_arn.as_deref()),
-                    ),
+                    message: Some(failure.message().to_string()),
                 })
             })?;
 
@@ -216,18 +232,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .map(InsightsConfigurationRecord::from_configuration),
         };
-        // `resolve_group_name` ran under this same guard, so the record is there;
-        // write it fallibly all the same, so no request-reachable path can panic.
+        // The reserved `Default` group is derived rather than stored, so the
+        // first update of it materialises its record — carrying the ARN it is
+        // already read with. The only way that can fail is a store already
+        // holding its maximum of groups.
         let Some(group) = store
-            .apply_group_update(&group_name, update)
+            .apply_group_update(group, update)
             .map(GroupRecord::to_group)
         else {
             return Err(UpdateGroupErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(
-                        crate::state::GroupLookupError::NotFound
-                            .message(input.group_name.as_deref(), input.group_arn.as_deref()),
-                    ),
+                    message: Some(format!(
+                        "this emulator holds the maximum of {} groups",
+                        crate::state::MAX_GROUPS
+                    )),
                 },
             )
             .into());

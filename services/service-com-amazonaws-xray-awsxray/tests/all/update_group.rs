@@ -12,13 +12,16 @@
 //! identity — its case-sensitive name and the ARN that was generated upon
 //! creation — is untouched; the updated record is then what every later read
 //! answers, and a request naming no group is refused with
-//! `InvalidRequestException` rather than creating one.
+//! `InvalidRequestException` rather than creating one (a request violating a
+//! MODELLED constraint is refused one layer earlier, as `ValidationException`).
 //!
 //! The rows differ along what that rule generalises over: which members the
 //! update supplies (filter only, insights only, both, neither), which selector
-//! picks the group, what the group held before the update (nothing, a filter, an
-//! insights configuration, both), the form and length of the supplied values,
-//! and both published `GroupName` length bounds.
+//! picks the group, what the group held before the update (an insights
+//! configuration or not, which filter expression), the form and length of the
+//! supplied values, and both published `GroupName` length bounds. Every group is
+//! created WITH a filter expression, because X-Ray refuses a `CreateGroup` that
+//! supplies none — see `group_control_plane.rs` for that rule.
 
 use serde_json::{json, Value};
 
@@ -66,10 +69,10 @@ impl UpdateCase {
 fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
-            case: "a filter expression onto a group that had none",
+            case: "a filter expression onto a group with no insights",
             name: "adopts-filter",
             created: Configuration {
-                filter: None,
+                filter: Some("ok"),
                 insights: None,
             },
             update: Configuration {
@@ -108,7 +111,7 @@ fn update_cases() -> Vec<UpdateCase> {
             case: "insights notifications turned on, selected by ARN",
             name: "enables-notifications",
             created: Configuration {
-                filter: None,
+                filter: Some("http.status = 429"),
                 insights: Some((true, false)),
             },
             update: Configuration {
@@ -161,7 +164,7 @@ fn update_cases() -> Vec<UpdateCase> {
             case: "the shortest name the model allows",
             name: "a",
             created: Configuration {
-                filter: None,
+                filter: Some("partial"),
                 insights: None,
             },
             update: Configuration {
@@ -364,8 +367,8 @@ async fn an_update_replaces_what_it_supplies_keeps_what_it_omits_and_persists() 
         );
         assert_eq!(
             summaries.len(),
-            1,
-            "case {label:?}: an update must not create a second group, got {summaries:?}"
+            2,
+            "case {label:?}: an update must not create a second group — only the created one and the reserved Default group are listed, got {summaries:?}"
         );
 
         // Applying the same update again is idempotent.
@@ -388,7 +391,10 @@ async fn an_update_replaces_what_it_supplies_keeps_what_it_omits_and_persists() 
 async fn updates_accumulate_in_the_order_they_were_applied() {
     let xray = Xray::new();
     let created = xray
-        .call("/CreateGroup", &json!({"GroupName": "sequence"}))
+        .call(
+            "/CreateGroup",
+            &json!({"GroupName": "sequence", "FilterExpression": "ok"}),
+        )
         .await;
     assert_eq!(
         created.status, 200,
@@ -471,12 +477,20 @@ async fn an_update_that_names_no_stored_group_is_refused_and_changes_nothing() {
 
     // Rows span the ways an UpdateGroup request can fail to name a group this
     // emulator holds, plus both published length bounds of each selector
-    // (`GroupName` 1..32, `GroupARN` 1..400).
-    let rows: Vec<(&str, Value)> = vec![
-        ("neither selector", json!({"FilterExpression": "fault = true"})),
+    // (`GroupName` 1..32, `GroupARN` 1..400). A selector outside its MODELLED
+    // bound is refused one layer earlier, by the request layer, which answers
+    // the `ValidationException` envelope rather than this operation's own
+    // modelled error.
+    let rows: Vec<(&str, Value, &str)> = vec![
+        (
+            "neither selector",
+            json!({"FilterExpression": "fault = true"}),
+            "InvalidRequestException",
+        ),
         (
             "a GroupName naming no stored group",
             json!({"GroupName": "absent", "FilterExpression": "fault = true"}),
+            "InvalidRequestException",
         ),
         (
             "a GroupARN naming no stored group",
@@ -484,31 +498,36 @@ async fn an_update_that_names_no_stored_group_is_refused_and_changes_nothing() {
                 "GroupARN": "arn:aws:xray:us-east-1:000000000000:group/absent/0123456789ab",
                 "FilterExpression": "fault = true"
             }),
+            "InvalidRequestException",
         ),
         (
             "a GroupName below the modelled minimum length",
             json!({"GroupName": "", "FilterExpression": "fault = true"}),
+            "ValidationException",
         ),
         (
             "a GroupName above the modelled maximum length",
             json!({"GroupName": "a".repeat(33), "FilterExpression": "fault = true"}),
+            "ValidationException",
         ),
         (
             "a GroupARN below the modelled minimum length",
             json!({"GroupARN": "", "FilterExpression": "fault = true"}),
+            "ValidationException",
         ),
         (
             "a GroupARN above the modelled maximum length",
             json!({"GroupARN": "a".repeat(401), "FilterExpression": "fault = true"}),
+            "ValidationException",
         ),
     ];
 
-    for (label, body) in rows {
+    for (label, body, code) in rows {
         let refused = xray.call("/UpdateGroup", &body).await;
         assert_eq!(
             (refused.status, refused.error_type.as_deref()),
-            (400, Some("InvalidRequestException")),
-            "case {label:?}: an update naming no stored group must be refused with 400 InvalidRequestException, got {refused:?}"
+            (400, Some(code)),
+            "case {label:?}: an update naming no stored group must be refused with 400 {code}, got {refused:?}"
         );
         // A framework refusal renders `message`; a modelled error shape renders
         // its member's own casing (`Message`).
@@ -523,18 +542,23 @@ async fn an_update_that_names_no_stored_group_is_refused_and_changes_nothing() {
     }
 
     // Every refusal left the one stored group exactly as it was, and created
-    // nothing.
+    // nothing: it and the reserved `Default` group are all that is listed.
     let listed = xray.call("/Groups", &json!({})).await;
     let summaries = listed.get("Groups").as_array().cloned().unwrap_or_default();
     assert_eq!(
         summaries.len(),
-        1,
+        2,
         "a refused update must store nothing, got {summaries:?}"
     );
+    let kept = summaries
+        .iter()
+        .find(|group| group.get("GroupName").and_then(Value::as_str) == Some("kept"))
+        .cloned()
+        .unwrap_or(Value::Null);
     assert_group(
         "after the refusals",
         "GetGroups",
-        &summaries[0],
+        &kept,
         "kept",
         &arn,
         Configuration {
@@ -567,12 +591,19 @@ async fn an_update_that_names_no_stored_group_is_refused_and_changes_nothing() {
         );
     }
     let empty = xray.call("/Groups", &json!({})).await;
-    assert!(
-        empty
-            .get("Groups")
-            .as_array()
-            .is_none_or(|groups| groups.is_empty()),
-        "a refused update must not re-create the deleted group, got {:?}",
-        empty.get("Groups")
+    let remaining: Vec<&str> = empty
+        .get("Groups")
+        .as_array()
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|group| group.get("GroupName").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        remaining,
+        vec!["Default"],
+        "a refused update must not re-create the deleted group, got {remaining:?}"
     );
 }

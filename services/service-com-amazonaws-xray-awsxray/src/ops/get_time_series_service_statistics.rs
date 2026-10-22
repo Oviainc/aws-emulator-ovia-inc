@@ -164,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetTimeSeriesServiceStatisticsErrorModeled::ThrottledException(
                 ThrottledException {
@@ -242,26 +241,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // aggregate; a group that carries a filter expression would narrow it
         // further than this slice can.
         if input.group_name.is_some() || input.group_arn.is_some() {
-            let group_name = store
-                .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
+            let region = crate::state::request_region(ctx.parts());
+            let group = store
+                .find_group(
+                    &region,
+                    input.group_name.as_deref(),
+                    input.group_arn.as_deref(),
+                )
                 .map_err(|failure| {
                     GetTimeSeriesServiceStatisticsErrorModeled::InvalidRequestException(
                         InvalidRequestException {
-                            message: Some(failure.message(
-                                input.group_name.as_deref(),
-                                input.group_arn.as_deref(),
-                            )),
+                            message: Some(failure.message().to_string()),
                         },
                     )
                 })?;
-            let filtered = store
-                .groups
-                .get(&group_name)
-                .and_then(|group| group.filter_expression.as_deref())
+            let filtered = group
+                .filter_expression
+                .as_deref()
                 .is_some_and(|filter| !filter.trim().is_empty());
             if filtered {
                 return Err(unsupported(format!(
-                    "group `{group_name}` carries a FilterExpression, which this emulator does not evaluate yet; pull statistics from a group without one"
+                    "group `{}` carries a FilterExpression, which this emulator does not evaluate yet; pull statistics from a group without one",
+                    group.group_name
                 )));
             }
         }

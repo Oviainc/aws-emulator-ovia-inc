@@ -22,11 +22,14 @@
 //! * a paginated operation emits a `NextToken` only when its results were
 //!   truncated, and resuming from that token yields the remainder exactly once;
 //! * a group is answered from its stored record, by either selector, until it
-//!   is deleted;
-//! * behaviour this slice does not implement (a `FilterExpression`, another
-//!   `TimeRangeType`, sampling, a token this service never issued) is REFUSED
-//!   with `InvalidRequestException`, never answered with a success that ignored
-//!   it;
+//!   is deleted, and the reserved account-level `Default` group is listed
+//!   beside the stored ones (`group_control_plane.rs` owns that rule);
+//! * behaviour this slice does not implement (a `GetTraceSummaries`
+//!   `FilterExpression`, another `TimeRangeType`, sampling, a token this
+//!   service never issued) is REFUSED with the service's own
+//!   `InvalidRequestException`, never answered with a success that ignored it,
+//!   while a violated MODELLED constraint is refused by the request layer as
+//!   `ValidationException`;
 //! * caller-driven work and growth are bounded: a batch, a requested-id list, a
 //!   trace's segments and the stored trace count each have a cap, and the cap is
 //!   reported — as a refusal, as an `UnprocessedTraceSegment`, as
@@ -44,6 +47,10 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) struct Xray {
     router: MultiServiceRouter,
 }
+
+/// The region every unsigned-scope call lands in, which is also the region the
+/// service falls back to when a request names none.
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
 /// What one call answered.
 #[derive(Debug)]
@@ -81,11 +88,27 @@ impl Xray {
     }
 
     pub(crate) async fn call(&self, path: &str, body: &Value) -> Answer {
+        self.call_in_region(DEFAULT_REGION, path, body).await
+    }
+
+    /// The same call, signed for `region`.
+    ///
+    /// The region a handler works in comes from the request's SigV4 credential
+    /// scope, so this is how a case addresses another region: the `Authorization`
+    /// header carries the scope even though signature verification is off.
+    pub(crate) async fn call_in_region(&self, region: &str, path: &str, body: &Value) -> Answer {
         let request = ::http::Request::builder()
             .method("POST")
-            .uri(format!("https://xray.us-east-1.amazonaws.com{path}"))
-            .header("host", "xray.us-east-1.amazonaws.com")
+            .uri(format!("https://xray.{region}.amazonaws.com{path}"))
+            .header("host", format!("xray.{region}.amazonaws.com"))
             .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/{region}/xray/aws4_request, \
+                     SignedHeaders=host, Signature=not-verified"
+                ),
+            )
             .body(::bytes::Bytes::from(body.to_string()))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
@@ -147,7 +170,8 @@ pub(crate) fn trace_id(n: u32) -> String {
     format!("1-{n:08x}-{n:024x}")
 }
 
-/// The JSON array member of `value`, or an empty slice.
+/// The JSON array member of `value`, or an empty slice. `pub(crate)` for the
+/// same reason as [`Xray`]: a sibling suite reads responses the same way.
 pub(crate) fn array<'a>(value: &'a Value, member: &str) -> &'a [Value] {
     value
         .get(member)
@@ -766,12 +790,15 @@ async fn the_time_window_is_half_open_and_selects_on_the_stored_start_time() {
 // =============================================================================
 
 /// One group definition. Rows differ in name length (both published length
-/// bounds), character set, whether a filter expression / insights configuration
-/// / tags were supplied, and which selector deletes it.
+/// bounds), character set, the form of the filter expression, whether an
+/// insights configuration / tags were supplied, and which selector deletes it.
+///
+/// Every row carries a filter expression, because X-Ray refuses a `CreateGroup`
+/// that supplies none — see `group_control_plane.rs` for that rule.
 struct GroupCase {
     case: &'static str,
     name: &'static str,
-    filter: Option<&'static str>,
+    filter: &'static str,
     insights: Option<(bool, bool)>,
     tags: Vec<(&'static str, &'static str)>,
     delete_by_arn: bool,
@@ -780,9 +807,9 @@ struct GroupCase {
 fn group_cases() -> Vec<GroupCase> {
     vec![
         GroupCase {
-            case: "name only",
+            case: "name and filter only",
             name: "alpha",
-            filter: None,
+            filter: "ok",
             insights: None,
             tags: vec![],
             delete_by_arn: false,
@@ -790,7 +817,7 @@ fn group_cases() -> Vec<GroupCase> {
         GroupCase {
             case: "filter expression and insights",
             name: "beta",
-            filter: Some("service(\"svc\")"),
+            filter: "service(\"svc\")",
             insights: Some((true, false)),
             tags: vec![("Stage", "Production")],
             delete_by_arn: true,
@@ -799,7 +826,7 @@ fn group_cases() -> Vec<GroupCase> {
             // GroupName's published @length is min 1 ...
             case: "the shortest name the model allows",
             name: "a",
-            filter: Some("fault = true"),
+            filter: "fault = true",
             insights: Some((true, true)),
             tags: vec![],
             delete_by_arn: false,
@@ -808,7 +835,7 @@ fn group_cases() -> Vec<GroupCase> {
             // ... and max 32.
             case: "the longest name the model allows",
             name: "abcdefghijklmnopqrstuvwxyz012345",
-            filter: None,
+            filter: "annotation.probe = \"edge\"",
             insights: Some((false, false)),
             tags: vec![("Team", "payments"), ("Owner", "sre")],
             delete_by_arn: true,
@@ -816,7 +843,7 @@ fn group_cases() -> Vec<GroupCase> {
         GroupCase {
             case: "mixed case and punctuation",
             name: "Prod-Group_1.0",
-            filter: Some("responsetime > 2"),
+            filter: "responsetime > 2",
             insights: None,
             tags: vec![],
             delete_by_arn: false,
@@ -826,10 +853,7 @@ fn group_cases() -> Vec<GroupCase> {
 
 /// The request body `CreateGroup` takes for a case.
 fn create_body(case: &GroupCase) -> Value {
-    let mut body = json!({ "GroupName": case.name });
-    if let Some(filter) = case.filter {
-        body["FilterExpression"] = json!(filter);
-    }
+    let mut body = json!({ "GroupName": case.name, "FilterExpression": case.filter });
     if let Some((insights, notifications)) = case.insights {
         body["InsightsConfiguration"] =
             json!({"InsightsEnabled": insights, "NotificationsEnabled": notifications});
@@ -860,7 +884,7 @@ fn assert_group_matches(label: &str, source: &str, group: &Value, case: &GroupCa
     );
     assert_eq!(
         group.get("FilterExpression").and_then(Value::as_str),
-        case.filter,
+        Some(case.filter),
         "case {label:?} via {source}: expected FilterExpression {:?}, got {group:?}",
         case.filter
     );
@@ -888,6 +912,26 @@ fn assert_group_matches(label: &str, source: &str, group: &Value, case: &GroupCa
                 .is_none_or(Value::is_null),
             "case {label:?} via {source}: no InsightsConfiguration was supplied, got {group:?}"
         ),
+    }
+}
+
+/// Every `GroupName` `GetGroups` lists, walked across pages.
+async fn all_group_names(xray: &Xray) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = xray.get_groups(token.as_deref()).await;
+        assert_eq!(page.status, 200, "GetGroups must succeed, got {page:?}");
+        names.extend(
+            array(&page.body, "Groups")
+                .iter()
+                .filter_map(|group| group.get("GroupName").and_then(Value::as_str))
+                .map(str::to_string),
+        );
+        token = page.get("NextToken").as_str().map(str::to_string);
+        if token.is_none() {
+            return names;
+        }
     }
 }
 
@@ -964,18 +1008,13 @@ async fn a_group_is_created_read_listed_and_deleted_from_its_stored_record() {
         );
     }
 
-    // GetGroups lists every created group (there are exactly as many as a page
-    // holds, so no token).
-    let listed = xray.get_groups(None).await;
-    assert_eq!(
-        listed.status, 200,
-        "GetGroups must succeed, got {listed:?}"
-    );
-    let listed_names: BTreeSet<&str> = array(&listed.body, "Groups")
-        .iter()
-        .filter_map(|group| group.get("GroupName").and_then(Value::as_str))
-        .collect();
-    let expected_names: BTreeSet<&str> = cases.iter().map(|case| case.name).collect();
+    // GetGroups lists every created group, plus the reserved `Default` group
+    // every account/region holds. Six groups exceed one page, so this walks the
+    // pages.
+    let listed_names = all_group_names(&xray).await;
+    let mut expected_names: BTreeSet<String> =
+        cases.iter().map(|case| case.name.to_string()).collect();
+    expected_names.insert("Default".to_string());
     assert_eq!(
         listed_names, expected_names,
         "GetGroups must list every stored group, got {listed_names:?}"
@@ -1017,10 +1056,14 @@ async fn a_group_is_created_read_listed_and_deleted_from_its_stored_record() {
     }
 
     let empty = xray.get_groups(None).await;
-    assert!(
-        array(&empty.body, "Groups").is_empty(),
-        "every group was deleted, so GetGroups must list none, got {:?}",
-        empty.get("Groups")
+    let remaining: Vec<&str> = array(&empty.body, "Groups")
+        .iter()
+        .filter_map(|group| group.get("GroupName").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["Default"],
+        "every created group was deleted, so only the reserved Default group is left, got {remaining:?}"
     );
 
     // Re-creating a deleted name mints a NEW ARN, and the superseded one still
@@ -1076,10 +1119,17 @@ async fn a_next_token_appears_only_when_truncated_and_resumes_exactly_once() {
         GROUPS_PAGE_SIZE * 2 + 2,
     ] {
         let xray = Xray::new();
-        let mut expected: Vec<String> = Vec::new();
+        // The reserved `Default` group is listed beside the created ones, so it
+        // belongs in the expected listing of every row.
+        let mut expected: Vec<String> = vec!["Default".to_string()];
         for index in 0..count {
             let name = format!("group-{index:02}");
-            let created = xray.call("/CreateGroup", &json!({"GroupName": name})).await;
+            let created = xray
+                .call(
+                    "/CreateGroup",
+                    &json!({"GroupName": name, "FilterExpression": "ok"}),
+                )
+                .await;
             assert_eq!(
                 created.status, 200,
                 "count {count}: seeding {name} must succeed, got {created:?}"
@@ -1233,7 +1283,11 @@ async fn a_next_token_appears_only_when_truncated_and_resumes_exactly_once() {
 }
 
 // =============================================================================
-// 6. Refusals carry 400 InvalidRequestException
+// 6. Refusals carry 400, with the code that class of refusal is answered with:
+//    the service's own `InvalidRequestException` for a rule this service
+//    enforces, and the protocol's `ValidationException` for a violated
+//    MODELLED constraint (see `group_control_plane.rs` for that rule over a
+//    table of its own).
 // =============================================================================
 
 #[tokio::test]
@@ -1241,73 +1295,94 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
     let xray = Xray::new();
     // One group exists, so the duplicate-name row has something to collide with.
     let seeded = xray
-        .call("/CreateGroup", &json!({"GroupName": "taken"}))
+        .call(
+            "/CreateGroup",
+            &json!({"GroupName": "taken", "FilterExpression": "ok"}),
+        )
         .await;
     assert_eq!(seeded.status, 200, "seeding must succeed, got {seeded:?}");
 
     // Rows span the ways a request can be invalid: a modelled bound (both ends),
     // an absent required member, a name already in use, a selector naming
     // nothing, no selector at all, and a token this service never issued.
-    let rows: Vec<(&str, &str, Value)> = vec![
+    let rows: Vec<(&str, &str, Value, &str)> = vec![
         (
             "GroupName shorter than the model's minimum",
             "/CreateGroup",
             json!({"GroupName": ""}),
+            "ValidationException",
         ),
         (
             "GroupName longer than the model's maximum",
             "/CreateGroup",
             json!({"GroupName": "a".repeat(33)}),
+            "ValidationException",
         ),
         (
             "GroupName absent",
             "/CreateGroup",
             json!({"FilterExpression": "fault = true"}),
+            "ValidationException",
         ),
         (
             "GroupName already in use",
             "/CreateGroup",
-            json!({"GroupName": "taken"}),
+            json!({"GroupName": "taken", "FilterExpression": "ok"}),
+            "InvalidRequestException",
         ),
         (
             "GetGroup with neither selector",
             "/GetGroup",
             json!({}),
+            "InvalidRequestException",
         ),
         (
             "GetGroup naming no stored group",
             "/GetGroup",
             json!({"GroupName": "absent"}),
+            "InvalidRequestException",
         ),
         (
             "GetGroup naming no stored ARN",
             "/GetGroup",
             json!({"GroupARN": "arn:aws:xray:us-east-1:000000000000:group/absent/0123456789ab"}),
+            "InvalidRequestException",
         ),
         (
             "DeleteGroup with neither selector",
             "/DeleteGroup",
             json!({}),
+            "InvalidRequestException",
+        ),
+        (
+            "DeleteGroup on the reserved Default group",
+            "/DeleteGroup",
+            json!({"GroupName": "Default"}),
+            "InvalidRequestException",
         ),
         (
             "TraceSegmentDocuments absent",
             "/TraceSegments",
             json!({}),
+            "ValidationException",
         ),
         (
             "TraceIds absent",
             "/Traces",
             json!({}),
+            "ValidationException",
         ),
         (
             "a NextToken this service never issued",
             "/Traces",
             json!({"TraceIds": [trace_id(1)], "NextToken": "not-a-token"}),
+            "InvalidRequestException",
         ),
         (
             "a NextToken past the end of the requested TraceIds",
             "/Traces",
             json!({"TraceIds": [trace_id(1)], "NextToken": "7"}),
+            "InvalidRequestException",
         ),
         (
             "more TraceIds than one call accepts",
@@ -1321,21 +1396,25 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
                     })
                     .collect::<Vec<String>>(),
             }),
+            "InvalidRequestException",
         ),
         (
             "a GetGroups NextToken beyond the listed keyspace",
             "/Groups",
             json!({"NextToken": "zzz-never-issued"}),
+            "InvalidRequestException",
         ),
         (
             "a GetTraceSummaries NextToken naming no stored trace",
             "/TraceSummaries",
             json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "NextToken": trace_id(99)}),
+            "InvalidRequestException",
         ),
         (
             "StartTime absent",
             "/TraceSummaries",
             json!({"EndTime": 1.0_f64}),
+            "ValidationException",
         ),
         // Behaviour this slice does not implement is refused, not answered with
         // an unfiltered 200.
@@ -1343,26 +1422,31 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
             "a FilterExpression this slice does not evaluate",
             "/TraceSummaries",
             json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "FilterExpression": "fault = true"}),
+            "InvalidRequestException",
         ),
         (
             "TimeRangeType Event",
             "/TraceSummaries",
             json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "TimeRangeType": "Event"}),
+            "InvalidRequestException",
         ),
         (
             "TimeRangeType Service",
             "/TraceSummaries",
             json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "TimeRangeType": "Service"}),
+            "InvalidRequestException",
         ),
         (
             "TimeRangeType outside the model's value set",
             "/TraceSummaries",
             json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "TimeRangeType": "Whenever"}),
+            "ValidationException",
         ),
         (
             "Sampling requested",
             "/TraceSummaries",
             json!({"StartTime": 0.0_f64, "EndTime": 1.0_f64, "Sampling": true}),
+            "InvalidRequestException",
         ),
         (
             "a SamplingStrategy requested",
@@ -1372,15 +1456,16 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
                 "EndTime": 1.0_f64,
                 "SamplingStrategy": {"Name": "FixedRate", "Value": 0.5_f64},
             }),
+            "InvalidRequestException",
         ),
     ];
 
-    for (label, path, body) in rows {
+    for (label, path, body, code) in rows {
         let refused = xray.call(path, &body).await;
         assert_eq!(
             (refused.status, refused.error_type.as_deref()),
-            (400, Some("InvalidRequestException")),
-            "case {label:?}: expected 400 InvalidRequestException, got {refused:?}"
+            (400, Some(code)),
+            "case {label:?}: expected 400 {code}, got {refused:?}"
         );
         // A framework refusal renders `message`; a modelled error shape renders
         // its member's own casing (`Message`).
@@ -1394,7 +1479,8 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
         );
     }
 
-    // And the refused CreateGroup rows stored nothing.
+    // And the refused CreateGroup rows stored nothing: the seeded group and the
+    // reserved `Default` group are all that is listed.
     let listed = xray.get_groups(None).await;
     let names: Vec<&str> = array(&listed.body, "Groups")
         .iter()
@@ -1402,7 +1488,7 @@ async fn a_request_the_service_cannot_satisfy_is_refused_as_invalid() {
         .collect();
     assert_eq!(
         names,
-        vec!["taken"],
+        vec!["Default", "taken"],
         "a refused CreateGroup must store nothing, got {names:?}"
     );
 }

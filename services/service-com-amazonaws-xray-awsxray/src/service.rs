@@ -24,8 +24,18 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. NOT overridden here, so the framework's own
+//!   wording stands: a value that violates a MODELLED constraint (a `@length`, a
+//!   `@range`, an absent `@required` member, a value outside an enum) is refused
+//!   by the request layer, and AWS answers that class with the protocol-level
+//!   `ValidationException` envelope — HTTP 400, code `ValidationException`,
+//!   message "<N> validation error(s) detected: Value … at '<member>' failed to
+//!   satisfy constraint: …" — never with an operation's own modelled error.
+//!   X-Ray's `InvalidRequestException` is what this SERVICE's handlers answer
+//!   for a request they refuse themselves (a group name already in use, an
+//!   unparseable filter expression, a group that does not exist), and they
+//!   return it directly; mapping the boundary class onto it as well would hand a
+//!   client one code for two different failures.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,9 +50,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-xray-awsxray` emulated service: the generated [`ServiceDefinition`] plus
@@ -93,31 +101,6 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the `Action` form field on a query protocol, say — is reachable here.
         let _ = req;
         None
-    }
-
-    fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // X-Ray declares `InvalidRequestException` — "The request is missing
-        // required parameters or has invalid parameters" — on every operation of
-        // this service that models a client-input error (37 of the 38; only
-        // `PutResourcePolicy`, which models the more specific
-        // `MalformedPolicyDocumentException` family instead, does not), so that
-        // is the code this service answers when the framework refuses a request
-        // for exactly that reason, rather than the framework's generic
-        // `ValidationException`. The message is the framework's own clause,
-        // which names the member and the constraint it failed. An
-        // authentication refusal keeps the framework's wording: it is not an
-        // invalid request.
-        match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: "InvalidRequestException".to_string(),
-                message: violations
-                    .iter()
-                    .map(smithy_server_runtime::Violation::message)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            }),
-            _ => None,
-        }
     }
 
     fn override_routing_error(

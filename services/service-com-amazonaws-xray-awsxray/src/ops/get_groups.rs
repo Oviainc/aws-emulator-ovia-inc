@@ -2,8 +2,10 @@
 
 //! @op GetGroups
 //!
-//! Lists the stored groups, honouring the `@paginated` contract: a `NextToken`
-//! only when the listing was truncated, and resuming from it returns the rest.
+//! Lists every group this caller sees — the reserved account-level `Default`
+//! group, which exists in every region without being created, plus the stored
+//! ones — honouring the `@paginated` contract: a `NextToken` only when the
+//! listing was truncated, and resuming from it returns the rest.
 //!
 //! ## Shape of an operation
 //!
@@ -133,7 +135,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetGroupsErrorModeled::ThrottledException(ThrottledException {
                 message: Some(
@@ -144,16 +145,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // Every group this caller sees, in `GroupName` order: the reserved
+        // account-level `Default` group — which exists in every region without
+        // being created — plus every stored one.
+        let region = crate::state::request_region(ctx.parts());
+        let visible = store.visible_groups(&region);
         // A token this service issued names the group the next page starts at.
         // One still inside the keyspace being walked is honoured even if that
         // exact group has since been deleted, so a concurrent delete does not
         // fail an in-flight paginator; one beyond it never came from here.
         if let Some(token) = input.next_token.as_deref() {
-            let within_keyspace = store
-                .groups
-                .keys()
-                .next_back()
-                .is_some_and(|last| token <= last.as_str());
+            let within_keyspace = visible
+                .last()
+                .is_some_and(|last| token <= last.group_name.as_str());
             if !within_keyspace {
                 return Err(GetGroupsErrorModeled::InvalidRequestException(
                     InvalidRequestException {
@@ -166,15 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `groups` is a `BTreeMap`, so the listing is in group-name order and a
-        // token naming the next name resumes exactly where the last page stopped.
+        // `visible` is in group-name order, so a token naming the next name
+        // resumes exactly where the last page stopped.
         let remaining: Vec<&crate::state::GroupRecord> = match input.next_token.as_deref() {
-            Some(token) => store
-                .groups
-                .range(token.to_string()..)
-                .map(|(_, record)| record)
+            Some(token) => visible
+                .iter()
+                .filter(|record| record.group_name.as_str() >= token)
                 .collect(),
-            None => store.groups.values().collect(),
+            None => visible.iter().collect(),
         };
 
         let next_token = remaining

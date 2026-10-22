@@ -712,21 +712,18 @@ async fn refuses_what_it_cannot_aggregate() {
         .await;
     assert_eq!(put.status, 200, "the ingest must succeed, got {put:?}");
 
-    // A group with no filter expression narrows nothing, so it is ANSWERED;
-    // one carrying a filter expression would narrow the aggregation further
-    // than this slice evaluates.
-    let plain = xray
-        .call("/CreateGroup", &json!({"GroupName": "plain"}))
-        .await;
-    assert_eq!(
-        plain.status, 200,
-        "CreateGroup must succeed, got {plain:?}"
-    );
-    let plain_arn = plain
-        .get("Group")
-        .get("GroupARN")
-        .and_then(Value::as_str)
-        .expect("the created group carries an ARN")
+    // The reserved account-level `Default` group is the group with NO filter
+    // expression: X-Ray refuses a `CreateGroup` that supplies none (see
+    // `group_control_plane.rs`), so the group every region already holds is what
+    // narrows nothing and is ANSWERED; one carrying a filter expression would
+    // narrow the aggregation further than this slice evaluates.
+    let listed = xray.call("/Groups", &json!({})).await;
+    assert_eq!(listed.status, 200, "GetGroups must succeed, got {listed:?}");
+    let plain_arn = array(&listed.body, "Groups")
+        .iter()
+        .find(|group| group.get("GroupName").and_then(Value::as_str) == Some("Default"))
+        .and_then(|group| group.get("GroupARN").and_then(Value::as_str))
+        .expect("the reserved Default group is listed and carries an ARN")
         .to_string();
     let filtered = xray
         .call(
@@ -810,7 +807,7 @@ async fn refuses_what_it_cannot_aggregate() {
     // And the supported group selectors still answer the aggregation, by either
     // selector.
     for (label, selector) in [
-        ("by GroupName", json!({"GroupName": "plain"})),
+        ("by GroupName", json!({"GroupName": "Default"})),
         ("by GroupARN", json!({"GroupARN": plain_arn})),
     ] {
         let mut body = base.clone();

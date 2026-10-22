@@ -21,8 +21,10 @@
 //! * a destination outside the model's `TraceSegmentDestination` value set, an
 //!   absent destination, a `CloudWatchLogsConfiguration` beside a destination
 //!   other than `CloudWatchLogs`, and a `SpansLogGroupKmsKeyId` that is not a
-//!   KMS key ARN are each refused with the modelled `InvalidRequestException`
-//!   at HTTP 400, and a refused call changes nothing.
+//!   KMS key ARN are each refused at HTTP 400 — a value outside the MODELLED
+//!   enum by the request layer as `ValidationException`, a rule this service
+//!   enforces itself by the handler as the modelled `InvalidRequestException` —
+//!   and a refused call changes nothing.
 
 use std::time::Duration;
 
@@ -329,24 +331,37 @@ async fn an_invalid_destination_request_is_refused_and_stores_nothing() {
     // value outside the model's enum (unknown, miscased, empty), a
     // configuration beside the wrong destination, and every
     // `SpansLogGroupKmsKeyId` form the member's documentation excludes.
-    let rows: Vec<(&str, Value)> = vec![
-        ("Destination absent", json!({})),
+    //
+    // The third column is the code that class of refusal carries: a value
+    // outside the MODELLED enum is refused by the request layer, which answers
+    // the `ValidationException` envelope, while a rule this service enforces
+    // itself is refused by the handler as `InvalidRequestException`.
+    let rows: Vec<(&str, Value, &str)> = vec![
+        ("Destination absent", json!({}), "InvalidRequestException"),
         (
             "Destination absent but a configuration supplied",
             json!({"CloudWatchLogsConfiguration": {"SpansLogGroupKmsKeyId": KEY_ARN}}),
+            "InvalidRequestException",
         ),
-        ("Destination empty", json!({"Destination": ""})),
+        (
+            "Destination empty",
+            json!({"Destination": ""}),
+            "ValidationException",
+        ),
         (
             "Destination outside the model's value set",
             json!({"Destination": "S3"}),
+            "ValidationException",
         ),
         (
             "Destination miscased",
             json!({"Destination": "cloudwatchlogs"}),
+            "ValidationException",
         ),
         (
             "Destination with surrounding whitespace",
             json!({"Destination": " CloudWatchLogs "}),
+            "ValidationException",
         ),
         (
             "a configuration beside the XRay destination",
@@ -354,6 +369,7 @@ async fn an_invalid_destination_request_is_refused_and_stores_nothing() {
                 "Destination": "XRay",
                 "CloudWatchLogsConfiguration": {"SpansLogGroupKmsKeyId": KEY_ARN},
             }),
+            "InvalidRequestException",
         ),
         (
             "SpansLogGroupKmsKeyId as a bare key id",
@@ -363,6 +379,7 @@ async fn an_invalid_destination_request_is_refused_and_stores_nothing() {
                     "SpansLogGroupKmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
                 },
             }),
+            "InvalidRequestException",
         ),
         (
             "SpansLogGroupKmsKeyId as an alias name",
@@ -370,6 +387,7 @@ async fn an_invalid_destination_request_is_refused_and_stores_nothing() {
                 "Destination": "CloudWatchLogs",
                 "CloudWatchLogsConfiguration": {"SpansLogGroupKmsKeyId": "alias/spans"},
             }),
+            "InvalidRequestException",
         ),
         (
             "SpansLogGroupKmsKeyId as an alias ARN",
@@ -379,6 +397,7 @@ async fn an_invalid_destination_request_is_refused_and_stores_nothing() {
                     "SpansLogGroupKmsKeyId": "arn:aws:kms:us-east-1:123456789012:alias/spans",
                 },
             }),
+            "InvalidRequestException",
         ),
         (
             "SpansLogGroupKmsKeyId naming another service's resource",
@@ -388,10 +407,11 @@ async fn an_invalid_destination_request_is_refused_and_stores_nothing() {
                     "SpansLogGroupKmsKeyId": "arn:aws:logs:us-east-1:123456789012:key/1234abcd",
                 },
             }),
+            "InvalidRequestException",
         ),
     ];
 
-    for (case, body) in rows {
+    for (case, body, code) in rows {
         // Start from a destination that is NOT the default, so a refusal that
         // wrote anything — including a reset to the default — would show.
         let xray = Xray::new();
@@ -400,8 +420,8 @@ async fn an_invalid_destination_request_is_refused_and_stores_nothing() {
         let refused = update_destination(&xray, &body).await;
         assert_eq!(
             (refused.status, refused.error_type.as_deref()),
-            (400, Some("InvalidRequestException")),
-            "case {case:?}: expected 400 InvalidRequestException, got {refused:?}"
+            (400, Some(code)),
+            "case {case:?}: expected 400 {code}, got {refused:?}"
         );
         // A framework refusal renders `message`; a modelled error shape renders
         // its member's own casing (`Message`).

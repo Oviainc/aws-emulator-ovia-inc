@@ -49,8 +49,12 @@ fn tag_list<K: AsRef<str>, V: AsRef<str>>(tags: &[(K, V)]) -> Value {
 }
 
 /// Create a group through `CreateGroup` and answer the ARN it persisted.
+///
+/// Every group carries a filter expression, because X-Ray refuses a
+/// `CreateGroup` that supplies none — see `group_control_plane.rs` for that
+/// rule. Which expression is irrelevant here; these cases are about tags.
 async fn create_group(xray: &Xray, name: &str, tags: &[(&str, &str)]) -> String {
-    let mut body = json!({"GroupName": name});
+    let mut body = json!({"GroupName": name, "FilterExpression": "ok"});
     if !tags.is_empty() {
         body["Tags"] = tag_list(tags);
     }

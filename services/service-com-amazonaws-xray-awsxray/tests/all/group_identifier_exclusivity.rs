@@ -96,6 +96,11 @@ async fn seed(xray: &Xray) -> Vec<Seeded> {
 }
 
 /// `GroupName` -> `FilterExpression`, as `GetGroups` reports the store.
+///
+/// The reserved account-level `Default` group is listed too — it exists in
+/// every region without being created — but it is not one of the groups these
+/// cases seed, so it is left out here; `group_control_plane.rs` owns the rule
+/// that it is always present.
 async fn snapshot(xray: &Xray) -> BTreeMap<String, String> {
     let listed = xray.call("/Groups", &json!({})).await;
     assert_eq!(
@@ -108,6 +113,9 @@ async fn snapshot(xray: &Xray) -> BTreeMap<String, String> {
         .cloned()
         .unwrap_or_default()
         .iter()
+        .filter(|group| {
+            group.get("GroupName").and_then(Value::as_str) != Some("Default")
+        })
         .map(|group| {
             (
                 group

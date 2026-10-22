@@ -164,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetServiceGraphErrorModeled::ThrottledException(
                 ThrottledException {
@@ -190,20 +189,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the expression — so a group that carries one is REFUSED rather than
         // answered with every service in the window.
         if input.group_name.is_some() || input.group_arn.is_some() {
-            let Ok(group_name) =
-                store.resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
-            else {
+            let region = crate::state::request_region(ctx.parts());
+            let Ok(group) = store.find_group(
+                &region,
+                input.group_name.as_deref(),
+                input.group_arn.as_deref(),
+            ) else {
                 return Err(refuse(GROUP_NOT_FOUND.to_string()));
             };
-            let filtered = store.groups.get(&group_name).is_some_and(|group| {
-                group
-                    .filter_expression
-                    .as_deref()
-                    .is_some_and(|filter| !filter.trim().is_empty())
-            });
+            let filtered = group
+                .filter_expression
+                .as_deref()
+                .is_some_and(|filter| !filter.trim().is_empty());
             if filtered {
                 return Err(refuse(format!(
-                    "the FilterExpression of group `{group_name}` is not evaluated by this emulator yet; ask for a graph of a group without one, or omit the group"
+                    "the FilterExpression of group `{}` is not evaluated by this emulator yet; ask for a graph of a group without one, or omit the group",
+                    group.group_name
                 )));
             }
         }

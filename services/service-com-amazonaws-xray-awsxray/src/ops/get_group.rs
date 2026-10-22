@@ -68,8 +68,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::GroupRecord;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -139,7 +137,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetGroupErrorModeled::ThrottledException(ThrottledException {
                 message: Some(
@@ -150,29 +147,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let group_name = store
-            .resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
+        let region = crate::state::request_region(ctx.parts());
+        // Either selector resolves the same record, and the reserved `Default`
+        // group resolves by either without ever being stored.
+        let group = store
+            .find_group(
+                &region,
+                input.group_name.as_deref(),
+                input.group_arn.as_deref(),
+            )
             .map_err(|failure| {
                 GetGroupErrorModeled::InvalidRequestException(InvalidRequestException {
-                    message: Some(
-                        failure.message(input.group_name.as_deref(), input.group_arn.as_deref()),
-                    ),
+                    message: Some(failure.message().to_string()),
                 })
             })?;
-        // `resolve_group_name` ran under this same guard, so the record is there;
-        // read it fallibly all the same, so no request-reachable path can panic.
-        let Some(group) = store.groups.get(&group_name).map(GroupRecord::to_group) else {
-            return Err(GetGroupErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(
-                        crate::state::GroupLookupError::NotFound
-                            .message(input.group_name.as_deref(), input.group_arn.as_deref()),
-                    ),
-                },
-            )
-            .into());
-        };
 
-        Ok(GetGroupOutput { group: Some(group) })
+        Ok(GetGroupOutput {
+            group: Some(group.to_group()),
+        })
     }
 }

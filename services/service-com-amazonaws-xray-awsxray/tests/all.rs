@@ -17,6 +17,9 @@ mod encryption_config;
 #[path = "all/graphs_rules_retrievals_and_insights.rs"]
 mod graphs_rules_retrievals_and_insights;
 
+#[path = "all/group_control_plane.rs"]
+mod group_control_plane;
+
 #[path = "all/group_identifier_exclusivity.rs"]
 mod group_identifier_exclusivity;
 

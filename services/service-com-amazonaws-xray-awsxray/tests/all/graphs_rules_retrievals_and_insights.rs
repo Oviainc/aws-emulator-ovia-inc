@@ -1516,18 +1516,20 @@ async fn a_service_graph_of_a_group_resolves_the_group_or_is_refused() {
     let base = now() - 3_600.0;
     seed_graph(&xray, base).await;
 
-    let unfiltered = xray
-        .call("/CreateGroup", &json!({"GroupName": "no-filter"}))
-        .await;
+    // The reserved account-level `Default` group is the group with NO filter
+    // expression: X-Ray refuses a `CreateGroup` that supplies none (see
+    // `group_control_plane.rs`), so the group every region already holds is what
+    // exercises the unfiltered path, by either selector.
+    let listed = xray.call("/Groups", &json!({})).await;
     assert_eq!(
-        unfiltered.status, 200,
-        "seeding the unfiltered group must succeed, got {unfiltered:?}"
+        listed.status, 200,
+        "GetGroups must succeed, got {listed:?}"
     );
-    let unfiltered_arn = unfiltered
-        .get("Group")
-        .get("GroupARN")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+    let unfiltered_arn = array(&listed.body, "Groups")
+        .iter()
+        .find(|group| group.get("GroupName").and_then(Value::as_str) == Some("Default"))
+        .and_then(|group| group.get("GroupARN").and_then(Value::as_str))
+        .unwrap_or_else(|| panic!("the reserved Default group must be listed, got {listed:?}"))
         .to_string();
     let filtered = xray
         .call(
@@ -1550,7 +1552,7 @@ async fn a_service_graph_of_a_group_resolves_the_group_or_is_refused() {
     // A group with no filter expression selects everything in the window, by
     // either selector.
     for (label, body) in [
-        ("by GroupName", json!({"GroupName": "no-filter"})),
+        ("by GroupName", json!({"GroupName": "Default"})),
         ("by GroupARN", json!({"GroupARN": unfiltered_arn})),
     ] {
         let answer = xray.call("/ServiceGraph", &window(body)).await;

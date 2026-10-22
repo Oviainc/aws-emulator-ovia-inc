@@ -7,10 +7,15 @@
 //! trace, and every reader (`BatchGetTraces`, `GetTraceSummaries`) recomputes
 //! its answer from those stored documents — nothing is echoed from the request
 //! that stored them. Groups are a keyed map plus an ARN index, so `GetGroup`
-//! resolves a group by either selector. Indexing rules are a fixed, seeded
-//! keyed map: the account's `Default` rule exists before the first call, and
-//! `UpdateIndexingRule` rewrites its configuration in place for
-//! `GetIndexingRules` to report.
+//! resolves a group by either selector; the account-level `Default` group is
+//! DERIVED rather than stored ([`default_group`]), because it exists in every
+//! region without being created and cannot be created or deleted. Indexing
+//! rules are a fixed, seeded keyed map: the account's `Default` rule exists
+//! before the first call, and `UpdateIndexingRule` rewrites its configuration in
+//! place for `GetIndexingRules` to report.
+//!
+//! [`filter_expression`] is the `FilterExpression` grammar `CreateGroup` and
+//! `UpdateGroup` validate against before either writes anything.
 //!
 //! A group's tags are keyed by tag key ON its record, so `CreateGroup`,
 //! `TagResource`, `UntagResource` and `ListTagsForResource` read and write ONE
@@ -433,10 +438,17 @@ pub const MAX_HISTOGRAM_ENTRIES: usize = 50;
 pub struct ComAmazonawsXrayAwsxrayState {
     /// Ingested traces, keyed by `trace_id`, at most [`MAX_TRACES`] of them.
     pub traces: BTreeMap<String, TraceRecord>,
-    /// Groups, keyed by their case-sensitive `GroupName`, at most [`MAX_GROUPS`].
-    pub groups: BTreeMap<String, GroupRecord>,
-    /// `GroupARN` -> `GroupName`, so a reader can resolve a group by either selector.
-    pub group_arn_to_name: BTreeMap<String, String>,
+    /// Groups, keyed by [`GroupKey`] — the region they live in and their
+    /// case-sensitive `GroupName` — at most [`MAX_GROUPS`] of them.
+    ///
+    /// The reserved [`DEFAULT_GROUP_NAME`] group is NOT here: it is derived
+    /// ([`default_group`]), so a fresh store already answers for it, and only an
+    /// `UpdateGroup` of it ever stores a record under that name.
+    pub groups: BTreeMap<GroupKey, GroupRecord>,
+    /// `GroupARN` -> the [`GroupKey`] it names, so a reader can resolve a group
+    /// by either selector. A group ARN embeds its region and carries a unique
+    /// suffix, so one ARN names at most one record anywhere in this store.
+    pub group_arn_to_name: BTreeMap<String, GroupKey>,
     /// Feeds the unique suffix of a minted group ARN; never reset, so two groups
     /// of the same name created in sequence still get distinct ARNs.
     pub group_seq: u64,
@@ -835,6 +847,10 @@ pub struct HttpRecord {
 /// the request that created it.
 #[derive(Debug, Clone, Default)]
 pub struct GroupRecord {
+    /// The region this group lives in. Part of the record, not context around
+    /// it, so [`ComAmazonawsXrayAwsxrayState::key`] can rebuild the exact key a
+    /// lookup resolved and a write can never address another region's record.
+    pub region: String,
     /// The group's case-sensitive name.
     pub group_name: String,
     /// The ARN minted when the group was created, and persisted since.
@@ -859,12 +875,92 @@ pub struct InsightsConfigurationRecord {
     pub notifications_enabled: Option<bool>,
 }
 
+/// What identifies one group in the store: the region it lives in and its
+/// case-sensitive `GroupName`.
+///
+/// An X-Ray group is a REGIONAL resource — its ARN carries the region, and the
+/// same name in another region is another group — so the region is part of the
+/// key, not context around it. Every lookup and every write goes through this
+/// one key type, so a caller addressing a group in its own region can neither
+/// read nor remove a record belonging to another.
+pub type GroupKey = (String, String);
+
+/// The name of the group every X-Ray account and region holds without anyone
+/// creating it.
+///
+/// `CreateGroupRequest$GroupName` says so in the model
+/// (`smithy_query(query="shape",shape="CreateGroupRequest")`): "Default is a
+/// reserved name and names must be unique".
+pub const DEFAULT_GROUP_NAME: &str = "Default";
+
+/// `arn:aws:xray:<region>:<account>:group/<GroupName>/<12 hex digits>` — the ONE
+/// place a group ARN's shape is written, so a minted ARN and the reserved
+/// group's derived one cannot drift apart.
+///
+/// X-Ray's `GroupARN` is "generated based on the GroupName"; `seed`
+/// distinguishes two ARNs carrying the same name, and is mixed with the name
+/// into the 48-bit suffix (exactly 12 hexadecimal digits) by `std`'s default
+/// hasher, whose algorithm `std` does not promise to keep stable across
+/// releases — so the suffix is an opaque unique id rather than a value to depend
+/// on. No clock enters the value.
+///
+/// Seed `0` is reserved for the derived [`DEFAULT_GROUP_NAME`] group and
+/// [`ComAmazonawsXrayAwsxrayState::mint_group_arn`] only ever seeds from a
+/// counter it has already advanced past zero, so no minted ARN can collide with
+/// the reserved group's.
+fn group_arn(region: &str, group_name: &str, seed: u64) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    group_name.hash(&mut hasher);
+    seed.hash(&mut hasher);
+    let suffix = hasher.finish() & 0xffff_ffff_ffff;
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("group/{group_name}/{suffix:012x}"),
+    )
+}
+
+/// The reserved [`DEFAULT_GROUP_NAME`] group, as a caller in `region` reads it.
+///
+/// DERIVED, never stored: the group exists in every account and region without
+/// being created, so there is no record to insert and no request can remove it.
+/// Its ARN is a pure function of the reserved name and the region, which is what
+/// keeps it stable across reads — two `GetGroups` calls answer the same ARN —
+/// while a caller signing for another region reads that region's ARN.
+pub fn default_group(region: &str) -> GroupRecord {
+    GroupRecord {
+        region: region.to_string(),
+        group_name: DEFAULT_GROUP_NAME.to_string(),
+        group_arn: group_arn(region, DEFAULT_GROUP_NAME, 0),
+        // The reserved group selects every trace, so nothing is configured on
+        // it: no filter expression and no insights configuration. Neither is
+        // invented here.
+        filter_expression: None,
+        insights_configuration: None,
+        tags: BTreeMap::new(),
+    }
+}
+
 /// The refusal X-Ray answers when a request supplies BOTH group selectors.
 ///
 /// A group is identified by exactly one of `GroupName` or `GroupARN`, so a
 /// request carrying both states two identities at once; the service refuses it
 /// with this fixed wording rather than servicing one of them.
 pub const CONFLICTING_GROUP_SELECTORS_MESSAGE: &str = "Provide either GroupName or GroupARN";
+
+/// The reserved [`DEFAULT_GROUP_NAME`] group `resource_arn` names, when it names
+/// that group's derived ARN.
+///
+/// The region comes out of the ARN itself (`arn:aws:xray:<region>:…`) and the
+/// whole ARN is then re-derived and compared, so only the exact ARN this
+/// emulator would answer for that region's reserved group matches.
+fn default_group_for_arn(resource_arn: &str) -> Option<GroupRecord> {
+    let region = resource_arn.split(':').nth(3)?;
+    let reserved = default_group(region);
+    (reserved.group_arn == resource_arn).then_some(reserved)
+}
 
 /// Why a `(GroupName, GroupARN)` pair names no single stored group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -879,15 +975,18 @@ pub enum GroupLookupError {
 
 impl GroupLookupError {
     /// What to tell the caller. Lives here, beside
-    /// [`ComAmazonawsXrayAwsxrayState::resolve_group_name`], so `GetGroup` and
+    /// [`ComAmazonawsXrayAwsxrayState::find_group`], so `GetGroup` and
     /// `DeleteGroup` cannot drift into two wordings of one refusal.
-    pub fn message(self, group_name: Option<&str>, group_arn: Option<&str>) -> String {
+    ///
+    /// A lookup that matched nothing is answered with the fixed text X-Ray uses,
+    /// `Group not found`: it names neither selector, so no value from the
+    /// request — and nothing about how this emulator represents one — reaches
+    /// the caller.
+    pub fn message(self) -> &'static str {
         match self {
-            Self::NoSelector => "either GroupName or GroupARN must be specified".to_string(),
-            Self::ConflictingSelectors => CONFLICTING_GROUP_SELECTORS_MESSAGE.to_string(),
-            Self::NotFound => format!(
-                "no group matches GroupName {group_name:?} / GroupARN {group_arn:?}"
-            ),
+            Self::NoSelector => "either GroupName or GroupARN must be specified",
+            Self::ConflictingSelectors => CONFLICTING_GROUP_SELECTORS_MESSAGE,
+            Self::NotFound => "Group not found",
         }
     }
 }
@@ -1441,41 +1540,36 @@ impl ComAmazonawsXrayAwsxrayState {
         }
     }
 
-    /// Mint a group ARN of the form
-    /// `arn:aws:xray:<region>:<account>:group/<GroupName>/<12 hex digits>`, as
-    /// X-Ray's `GroupARN` is "generated based on the GroupName".
+    /// Mint a group ARN for a newly created group, in the shape
+    /// [`group_arn`] writes.
     ///
-    /// The 12-hex suffix is unique per minted group: it is derived from the name
-    /// and the never-reset [`group_seq`](Self::group_seq), so two groups never
-    /// share an ARN even when one replaces the other by name, and no clock
-    /// enters the value. The mixing function is `std`'s default hasher, whose
-    /// algorithm `std` does not promise to keep stable across releases, so the
-    /// suffix is a unique opaque id rather than a value to depend on.
+    /// The suffix is unique per minted group: it is seeded from the never-reset
+    /// [`group_seq`](Self::group_seq), advanced before use, so two groups never
+    /// share an ARN even when one replaces the other by name, and none can
+    /// collide with the reserved group's seed of `0`.
     pub fn mint_group_arn(&mut self, region: &str, group_name: &str) -> String {
-        use std::hash::{Hash, Hasher};
-
         self.group_seq += 1;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        group_name.hash(&mut hasher);
-        self.group_seq.hash(&mut hasher);
-        // 48 bits renders as exactly 12 hexadecimal digits.
-        let suffix = hasher.finish() & 0xffff_ffff_ffff;
-        ::emulator_server::emulator_arn(
-            ARN_NAMESPACE,
-            region,
-            &format!("group/{group_name}/{suffix:012x}"),
-        )
+        group_arn(region, group_name, self.group_seq)
+    }
+
+    /// The [`GroupKey`] a `(region, GroupName)` pair makes. The ONE place a
+    /// group key is built, so a lookup and the write that follows it cannot
+    /// disagree about which record is addressed.
+    fn key(region: &str, group_name: &str) -> GroupKey {
+        (region.to_string(), group_name.to_string())
     }
 
     /// Insert a group and index its ARN, returning the stored record, or `None`
     /// when the store already holds [`MAX_GROUPS`] groups.
     ///
-    /// Inserting over a name that already exists REPLACES that record, and drops
-    /// its superseded ARN from the index in the same step — so the index never
-    /// grows past `groups`, and a superseded ARN resolves to nothing rather than
-    /// to whatever group later took the name.
+    /// Inserting over a name that already exists IN THAT REGION replaces that
+    /// record, and drops its superseded ARN from the index in the same step — so
+    /// the index never grows past `groups`, and a superseded ARN resolves to
+    /// nothing rather than to whatever group later took the name. A group of the
+    /// same name in another region is a different group and is untouched.
     pub fn insert_group(&mut self, region: &str, record: GroupRecordDraft) -> Option<&GroupRecord> {
-        match self.groups.remove(&record.group_name) {
+        let key = Self::key(region, &record.group_name);
+        match self.groups.remove(&key) {
             Some(superseded) => {
                 self.group_arn_to_name.remove(&superseded.group_arn);
             }
@@ -1483,27 +1577,28 @@ impl ComAmazonawsXrayAwsxrayState {
             None => {}
         }
         let group_arn = self.mint_group_arn(region, &record.group_name);
-        let group_name = record.group_name.clone();
         self.group_arn_to_name
-            .insert(group_arn.clone(), group_name.clone());
+            .insert(group_arn.clone(), key.clone());
         self.groups.insert(
-            group_name.clone(),
+            key.clone(),
             GroupRecord {
-                group_name: group_name.clone(),
+                region: region.to_string(),
+                group_name: record.group_name,
                 group_arn,
                 filter_expression: record.filter_expression,
                 insights_configuration: record.insights_configuration,
                 tags: record.tags,
             },
         );
-        Some(&self.groups[&group_name])
+        Some(&self.groups[&key])
     }
 
-    /// The stored name a `(GroupName, GroupARN)` pair selects.
+    /// The group a `(GroupName, GroupARN)` pair selects, for a caller in
+    /// `region`.
     ///
-    /// A group is identified by EXACTLY ONE selector: `GroupName` is "the
-    /// case-sensitive name of the group" and `GroupARN` "the ARN that was
-    /// generated upon creation"
+    /// Either selector resolves the same record, but a request supplies EXACTLY
+    /// ONE: `GroupName` is "the case-sensitive name of the group" and `GroupARN`
+    /// "the ARN that was generated upon creation"
     /// (`smithy_query(query="shape",shape="UpdateGroupRequest")`), two names for
     /// one identity with no operation that re-points either at another group.
     /// So a pair that supplies NEITHER names nothing
@@ -1512,29 +1607,99 @@ impl ComAmazonawsXrayAwsxrayState {
     /// ([`GroupLookupError::ConflictingSelectors`]) — whether or not the two
     /// happen to agree — rather than one side being preferred silently.
     /// Otherwise the single selector resolves the record, by name or through the
-    /// ARN index.
-    pub fn resolve_group_name(
+    /// ARN index, and last the reserved [`DEFAULT_GROUP_NAME`] group, which is
+    /// derived rather than stored (see [`default_group`]) and so is resolvable by
+    /// name and by ARN without ever appearing in `groups`.
+    ///
+    /// Both selectors are scoped to `region`: a group lives in one region, so an
+    /// ARN minted in another region resolves to nothing here, exactly as a name
+    /// that was never used in this one does.
+    pub fn find_group(
         &self,
+        region: &str,
         group_name: Option<&str>,
         group_arn: Option<&str>,
-    ) -> Result<String, GroupLookupError> {
+    ) -> Result<GroupRecord, GroupLookupError> {
         if group_name.is_none() && group_arn.is_none() {
             return Err(GroupLookupError::NoSelector);
         }
         if group_name.is_some() && group_arn.is_some() {
             return Err(GroupLookupError::ConflictingSelectors);
         }
-        if let Some(name) = group_name {
-            if self.groups.contains_key(name) {
-                return Ok(name.to_string());
-            }
+        if let Some(record) = group_name
+            .map(|name| Self::key(region, name))
+            .and_then(|key| self.groups.get(&key))
+        {
+            return Ok(record.clone());
         }
-        if let Some(arn) = group_arn {
-            if let Some(name) = self.group_arn_to_name.get(arn) {
-                return Ok(name.clone());
-            }
+        if let Some(record) = group_arn
+            .and_then(|arn| self.group_arn_to_name.get(arn))
+            .filter(|(arn_region, _)| arn_region == region)
+            .and_then(|key| self.groups.get(key))
+        {
+            return Ok(record.clone());
+        }
+        let default = default_group(region);
+        if group_name == Some(DEFAULT_GROUP_NAME) || group_arn == Some(default.group_arn.as_str()) {
+            return Ok(default);
         }
         Err(GroupLookupError::NotFound)
+    }
+
+    /// Every group a caller in `region` sees, in `GroupName` order: the reserved
+    /// [`DEFAULT_GROUP_NAME`] group plus every one stored IN THAT REGION.
+    ///
+    /// This is what `GetGroups` lists, so the reserved group is visible on a
+    /// fresh emulator exactly as it is in a fresh account, and another region's
+    /// groups are not. Bounded by [`MAX_GROUPS`] + 1.
+    pub fn visible_groups(&self, region: &str) -> Vec<GroupRecord> {
+        // `groups` is a `BTreeMap` keyed (region, name), so one region's records
+        // are a contiguous run in `GroupName` order.
+        let mut visible: Vec<GroupRecord> = self
+            .groups
+            .range(Self::key(region, "")..)
+            .take_while(|((stored_region, _), _)| stored_region == region)
+            .map(|(_, record)| record.clone())
+            .collect();
+        // The reserved group is stored only once an `UpdateGroup` has
+        // materialised it, in which case it is already in `groups`; this guard
+        // is what keeps the listing from carrying it twice.
+        if !self.groups.contains_key(&Self::key(region, DEFAULT_GROUP_NAME)) {
+            visible.push(default_group(region));
+        }
+        visible.sort_by(|left, right| left.group_name.cmp(&right.group_name));
+        visible
+    }
+
+    /// Whether `group_name` already names a group in `region`, the reserved
+    /// [`DEFAULT_GROUP_NAME`] one included — `CreateGroup`'s uniqueness check.
+    pub fn name_is_taken(&self, region: &str, group_name: &str) -> bool {
+        group_name == DEFAULT_GROUP_NAME
+            || self.groups.contains_key(&Self::key(region, group_name))
+    }
+
+    /// The stored record for `group`, for an operation that MUTATES it.
+    ///
+    /// Addressed by the key `group` itself carries — the record a lookup
+    /// resolved — never by a string from the request, so a write cannot reach a
+    /// record the lookup did not resolve.
+    ///
+    /// The reserved [`DEFAULT_GROUP_NAME`] group is derived rather than stored
+    /// ([`default_group`]), so the first write to it is what gives it a stored
+    /// record — carrying the SAME derived ARN, so its ARN stays stable across
+    /// that write and every selector that resolved it before still does. `None`
+    /// means there is no record to write and no room to materialise one.
+    fn group_mut(&mut self, group: GroupRecord) -> Option<&mut GroupRecord> {
+        let key = Self::key(&group.region, &group.group_name);
+        if !self.groups.contains_key(&key) {
+            if group.group_name != DEFAULT_GROUP_NAME || self.groups.len() >= MAX_GROUPS {
+                return None;
+            }
+            self.group_arn_to_name
+                .insert(group.group_arn.clone(), key.clone());
+            self.groups.insert(key.clone(), group);
+        }
+        self.groups.get_mut(&key)
     }
 
     /// Store one `PutTelemetryRecords` batch under the source that reported it.
@@ -1589,9 +1754,9 @@ impl ComAmazonawsXrayAwsxrayState {
         }
     }
 
-    /// Apply an `UpdateGroup` to the stored group `group_name`, returning the
-    /// record as it now stands, or `None` when no group is stored under that
-    /// name.
+    /// Apply an `UpdateGroup` to the group `group` names, returning the record
+    /// as it now stands, or `None` when there is no record to write (see
+    /// [`group_mut`](Self::group_mut)).
     ///
     /// Each member the update SUPPLIES replaces the stored one; each member it
     /// OMITS leaves the stored one as it is. The group's identity — its
@@ -1601,10 +1766,10 @@ impl ComAmazonawsXrayAwsxrayState {
     /// here and every selector that resolved the group before still does.
     pub fn apply_group_update(
         &mut self,
-        group_name: &str,
+        group: GroupRecord,
         update: GroupUpdate,
     ) -> Option<&GroupRecord> {
-        let record = self.groups.get_mut(group_name)?;
+        let record = self.group_mut(group)?;
         if let Some(filter_expression) = update.filter_expression {
             record.filter_expression = Some(filter_expression);
         }
@@ -1614,9 +1779,18 @@ impl ComAmazonawsXrayAwsxrayState {
         Some(record)
     }
 
-    /// Remove a group and its ARN index entry.
-    pub fn remove_group(&mut self, group_name: &str) -> Option<GroupRecord> {
-        let record = self.groups.remove(group_name)?;
+    /// Remove the group `group` IS — the record a lookup resolved — and its ARN
+    /// index entry.
+    ///
+    /// Takes the resolved record rather than a name from the request, and
+    /// addresses it by the key that record carries, so the removal can only ever
+    /// reach the record the lookup returned: a caller in one region cannot
+    /// remove a same-named group in another. `None` means there was nothing
+    /// under that key.
+    pub fn remove_group(&mut self, group: &GroupRecord) -> Option<GroupRecord> {
+        let record = self
+            .groups
+            .remove(&Self::key(&group.region, &group.group_name))?;
         self.group_arn_to_name.remove(&record.group_arn);
         Some(record)
     }
@@ -1626,20 +1800,43 @@ impl ComAmazonawsXrayAwsxrayState {
     ///
     /// X-Ray tags attach to a group or a sampling rule; sampling rules are not
     /// implemented in this emulator yet (`CreateSamplingRule` is still a
-    /// scaffold), so a stored group's ARN is the only one that resolves today,
-    /// and this lookup is the single place their branch goes when they land.
+    /// scaffold), so a group's ARN is the only one that resolves today, and this
+    /// lookup is the single place their branch goes when they land.
+    ///
+    /// No region argument: a group ARN carries the region it was minted in and a
+    /// suffix unique to the group, so it names at most one record in the whole
+    /// store — the ARN IS the key, and resolving one cannot reach a resource in
+    /// another region by accident.
+    ///
+    /// The reserved [`DEFAULT_GROUP_NAME`] group resolves here too, by the ARN it
+    /// is read with, so every tagging operation accepts exactly the ARNs the
+    /// group operations do. Until something tags it there is no record to read
+    /// from, and the group carries no tags, so the answer is the empty map.
     pub fn tags_for_resource(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
-        let group_name = self.group_arn_to_name.get(resource_arn)?;
-        Some(&self.groups.get(group_name)?.tags)
+        /// The tags a resource that holds none reports. `static`, so the read
+        /// path borrows it rather than materialising a record.
+        static NO_TAGS: BTreeMap<String, String> = BTreeMap::new();
+
+        if let Some(key) = self.group_arn_to_name.get(resource_arn) {
+            return Some(&self.groups.get(key)?.tags);
+        }
+        default_group_for_arn(resource_arn).map(|_| &NO_TAGS)
     }
 
     /// The same lookup, for a tagging operation that writes.
+    ///
+    /// Writing to the reserved group materialises its derived record first —
+    /// with the ARN it is already read with — the same way `UpdateGroup` does,
+    /// because a tag has to be stored somewhere to be read back.
     pub fn tags_for_resource_mut(
         &mut self,
         resource_arn: &str,
     ) -> Option<&mut BTreeMap<String, String>> {
-        let group_name = self.group_arn_to_name.get(resource_arn)?.clone();
-        Some(&mut self.groups.get_mut(&group_name)?.tags)
+        if let Some(key) = self.group_arn_to_name.get(resource_arn).cloned() {
+            return Some(&mut self.groups.get_mut(&key)?.tags);
+        }
+        let reserved = default_group_for_arn(resource_arn)?;
+        Some(&mut self.group_mut(reserved)?.tags)
     }
 
     /// Materialise the destination change the clock already owes at `now`.
@@ -1700,6 +1897,466 @@ pub struct GroupRecordDraft {
     pub insights_configuration: Option<InsightsConfigurationRecord>,
     /// The requested tags, keyed by tag key.
     pub tags: BTreeMap<String, String>,
+}
+
+/// X-Ray's filter-expression language, as `CreateGroup` and `UpdateGroup` see
+/// it: an expression is parsed before anything is written, so an unparseable one
+/// never reaches the store.
+///
+/// The language is proprietary to X-Ray — no crates.io crate parses it — so the
+/// grammar is written here as a tokenizer plus a recursive-descent parser. Both
+/// the grammar and the keyword catalog come from AWS's "Using filter
+/// expressions" reference for X-Ray; the model carries no field list.
+pub mod filter_expression {
+    /// The longest expression this parser accepts, in CHARACTERS — the unit the
+    /// tokenizer walks, so the bound and the parsed unit agree whatever the
+    /// encoding. `FilterExpression` carries no modelled length bound, so this is
+    /// the emulator's own: it keeps one request from driving unbounded parsing.
+    pub const MAX_LENGTH: usize = 4_096;
+
+    /// The deepest nesting of `(…)` / `{…}` this parser accepts, for the same
+    /// reason — a bound on caller-driven work, not a published limit.
+    pub const MAX_DEPTH: usize = 32;
+
+    /// The fields a filter expression may address, from AWS's X-Ray "Using
+    /// filter expressions" keyword reference: the boolean request keywords
+    /// (`ok`, `error`, `fault`, `throttle`, `partial`), the numeric ones
+    /// (`duration`, `responsetime`, `http.status`, `coverage`), the string ones
+    /// (the rest of `http.*`, `user`, `resource.arn`, `trace_id`), the complex
+    /// keywords that take arguments (`service`, `edge`, `id`, `group`) and the
+    /// members addressable inside one of their blocks (`name`, `type`,
+    /// `message`, `account.id`, `service.*`, `edge.*`).
+    ///
+    /// A field NOT reachable from this catalog is not indexed by X-Ray, and an
+    /// expression addressing one is refused — `metadata.<key>` is the ordinary
+    /// case: a segment's metadata is stored but never indexed, so no filter can
+    /// select on it.
+    const KEYWORDS: &[&str] = &[
+        "account.id",
+        "coverage",
+        "duration",
+        "edge",
+        "edge.destination",
+        "edge.source",
+        "error",
+        "fault",
+        "group",
+        "http.clientip",
+        "http.method",
+        "http.status",
+        "http.url",
+        "http.useragent",
+        "id",
+        "message",
+        "name",
+        "ok",
+        "partial",
+        "resource.arn",
+        "responsetime",
+        "service",
+        "service.account.id",
+        "service.name",
+        "service.type",
+        "throttle",
+        "trace_id",
+        "type",
+        "user",
+    ];
+
+    /// Keyword roots that take a caller-chosen suffix: an annotation key
+    /// (`annotation.<key>`) and a root-cause path (`rootcause.<…>`).
+    const KEYWORD_PREFIXES: &[&str] = &["annotation.", "rootcause."];
+
+    /// The comparison operators written as words, from the same reference's
+    /// string operators. They sit beside `=`, `!=`, `<`, `<=`, `>` and `>=`.
+    const WORD_COMPARISONS: &[&str] = &["contains", "beginswith", "startswith", "endswith"];
+
+    /// Whether `path` names a field a filter expression may address.
+    #[must_use]
+    pub fn is_indexed_field(path: &str) -> bool {
+        KEYWORDS.contains(&path)
+            || KEYWORD_PREFIXES
+                .iter()
+                .any(|prefix| path.len() > prefix.len() && path.starts_with(prefix))
+    }
+
+    /// Why a `FilterExpression` was refused.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Error {
+        /// The expression was absent, empty or only whitespace. X-Ray treats an
+        /// omitted `FilterExpression` and an empty one identically.
+        Empty,
+        /// The expression does not parse.
+        Syntax(String),
+        /// The expression addresses a field X-Ray does not index.
+        UnknownField(String),
+    }
+
+    impl Error {
+        /// What to tell the caller. The empty case carries X-Ray's own fixed
+        /// wording; the other two are built from the request, naming the field
+        /// or the token at fault so the caller can fix the expression.
+        #[must_use]
+        pub fn message(&self) -> String {
+            match self {
+                Self::Empty => "Filter Expression is empty".to_string(),
+                Self::Syntax(detail) => format!("Invalid filter expression: {detail}"),
+                Self::UnknownField(path) => {
+                    format!("Invalid filter expression: `{path}` is not an indexed field")
+                }
+            }
+        }
+    }
+
+    /// One lexical item. The six comparison operators collapse into one token:
+    /// which comparison it is does not change whether the expression parses.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Token {
+        /// A bare word: a keyword path, or a label inside a keyword's arguments.
+        Field(String),
+        /// A quoted string literal.
+        Text(String),
+        /// A numeric literal.
+        Number(f64),
+        /// `true` / `false`.
+        Boolean(bool),
+        And,
+        Or,
+        Not,
+        /// One of `=`, `!=`, `<`, `<=`, `>`, `>=`, or one of the string
+        /// operators the same reference lists (`CONTAINS`, `BEGINSWITH`,
+        /// `STARTSWITH`, `ENDSWITH`): which comparison it is does not change
+        /// whether the expression parses.
+        Comparison,
+        OpenParen,
+        CloseParen,
+        OpenBrace,
+        CloseBrace,
+        Comma,
+        Colon,
+    }
+
+    /// How a token reads in a refusal message.
+    fn describe(token: &Token) -> String {
+        match token {
+            Token::Field(path) => format!("`{path}`"),
+            Token::Text(text) => format!("the string `{text}`"),
+            Token::Number(number) => format!("the number `{number}`"),
+            Token::Boolean(value) => format!("`{value}`"),
+            Token::And => "`AND`".to_string(),
+            Token::Or => "`OR`".to_string(),
+            Token::Not => "`NOT`".to_string(),
+            Token::Comparison => "a comparison operator".to_string(),
+            Token::OpenParen => "`(`".to_string(),
+            Token::CloseParen => "`)`".to_string(),
+            Token::OpenBrace => "`{`".to_string(),
+            Token::CloseBrace => "`}`".to_string(),
+            Token::Comma => "`,`".to_string(),
+            Token::Colon => "`:`".to_string(),
+        }
+    }
+
+    /// Split `expression` into tokens, refusing anything that is not one.
+    fn tokenize(expression: &str) -> Result<Vec<Token>, Error> {
+        let characters: Vec<char> = expression.chars().collect();
+        let mut tokens = Vec::new();
+        let mut at = 0;
+        while at < characters.len() {
+            let character = characters[at];
+            match character {
+                whitespace if whitespace.is_whitespace() => at += 1,
+                '"' | '\'' => {
+                    at += 1;
+                    let mut text = String::new();
+                    loop {
+                        match characters.get(at) {
+                            None => {
+                                return Err(Error::Syntax(format!(
+                                    "unterminated string literal, expected a closing {character}"
+                                )))
+                            }
+                            Some('\\') => {
+                                let Some(escaped) = characters.get(at + 1) else {
+                                    return Err(Error::Syntax(
+                                        "the expression ends in a trailing `\\`".to_string(),
+                                    ));
+                                };
+                                text.push(*escaped);
+                                at += 2;
+                            }
+                            Some(&closing) if closing == character => {
+                                at += 1;
+                                break;
+                            }
+                            Some(&other) => {
+                                text.push(other);
+                                at += 1;
+                            }
+                        }
+                    }
+                    tokens.push(Token::Text(text));
+                }
+                '(' => {
+                    tokens.push(Token::OpenParen);
+                    at += 1;
+                }
+                ')' => {
+                    tokens.push(Token::CloseParen);
+                    at += 1;
+                }
+                '{' => {
+                    tokens.push(Token::OpenBrace);
+                    at += 1;
+                }
+                '}' => {
+                    tokens.push(Token::CloseBrace);
+                    at += 1;
+                }
+                ',' => {
+                    tokens.push(Token::Comma);
+                    at += 1;
+                }
+                ':' => {
+                    tokens.push(Token::Colon);
+                    at += 1;
+                }
+                '=' => {
+                    tokens.push(Token::Comparison);
+                    at += 1;
+                }
+                '<' | '>' => {
+                    at += usize::from(characters.get(at + 1) == Some(&'=')) + 1;
+                    tokens.push(Token::Comparison);
+                }
+                '!' => {
+                    if characters.get(at + 1) != Some(&'=') {
+                        return Err(Error::Syntax(
+                            "`!` is only valid as part of `!=`".to_string(),
+                        ));
+                    }
+                    tokens.push(Token::Comparison);
+                    at += 2;
+                }
+                digit
+                    if digit.is_ascii_digit()
+                        || (digit == '-'
+                            && characters.get(at + 1).is_some_and(char::is_ascii_digit)) =>
+                {
+                    let start = at;
+                    at += 1;
+                    while characters
+                        .get(at)
+                        .is_some_and(|next| next.is_ascii_digit() || *next == '.')
+                    {
+                        at += 1;
+                    }
+                    let literal: String = characters[start..at].iter().collect();
+                    let number = literal.parse::<f64>().map_err(|_| {
+                        Error::Syntax(format!("`{literal}` is not a number"))
+                    })?;
+                    tokens.push(Token::Number(number));
+                }
+                word if word.is_alphabetic() || word == '_' => {
+                    let start = at;
+                    while characters
+                        .get(at)
+                        .is_some_and(|next| next.is_alphanumeric() || "_.-".contains(*next))
+                    {
+                        at += 1;
+                    }
+                    let word: String = characters[start..at].iter().collect();
+                    tokens.push(if word.eq_ignore_ascii_case("and") {
+                        Token::And
+                    } else if word.eq_ignore_ascii_case("or") {
+                        Token::Or
+                    } else if word.eq_ignore_ascii_case("not") {
+                        Token::Not
+                    } else if word.eq_ignore_ascii_case("true") {
+                        Token::Boolean(true)
+                    } else if word.eq_ignore_ascii_case("false") {
+                        Token::Boolean(false)
+                    } else if WORD_COMPARISONS
+                        .iter()
+                        .any(|operator| word.eq_ignore_ascii_case(operator))
+                    {
+                        Token::Comparison
+                    } else {
+                        Token::Field(word)
+                    });
+                }
+                other => {
+                    return Err(Error::Syntax(format!("unexpected character `{other}`")));
+                }
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// The recursive-descent walk over the tokens.
+    ///
+    /// ```text
+    /// expression := term (("AND" | "OR") term)*
+    /// term       := "NOT" term | "(" expression ")" | predicate
+    /// predicate  := keyword ["(" arguments ")"] ["{" expression "}" | comparison operand]
+    /// arguments  := argument ("," argument)*
+    /// argument   := [label ":"] operand
+    /// operand    := text | number | boolean | keyword
+    /// ```
+    struct Parser {
+        tokens: Vec<Token>,
+        at: usize,
+    }
+
+    impl Parser {
+        fn peek(&self) -> Option<&Token> {
+            self.tokens.get(self.at)
+        }
+
+        fn take(&mut self) -> Option<Token> {
+            let token = self.tokens.get(self.at).cloned();
+            if token.is_some() {
+                self.at += 1;
+            }
+            token
+        }
+
+        fn eat(&mut self, token: &Token) -> bool {
+            if self.peek() == Some(token) {
+                self.at += 1;
+                return true;
+            }
+            false
+        }
+
+        /// What the walk is looking at, for a refusal message.
+        fn found(&self) -> String {
+            match self.peek() {
+                Some(token) => format!(", found {}", describe(token)),
+                None => ", found the end of the expression".to_string(),
+            }
+        }
+
+        fn expect(&mut self, token: &Token, what: &str) -> Result<(), Error> {
+            if self.eat(token) {
+                return Ok(());
+            }
+            Err(Error::Syntax(format!("expected {what}{}", self.found())))
+        }
+
+        fn expression(&mut self, depth: usize) -> Result<(), Error> {
+            self.term(depth)?;
+            while matches!(self.peek(), Some(Token::And | Token::Or)) {
+                self.at += 1;
+                self.term(depth)?;
+            }
+            Ok(())
+        }
+
+        fn term(&mut self, depth: usize) -> Result<(), Error> {
+            if depth > MAX_DEPTH {
+                return Err(Error::Syntax(format!(
+                    "nested more than {MAX_DEPTH} levels deep"
+                )));
+            }
+            match self.take() {
+                Some(Token::Not) => self.term(depth + 1),
+                Some(Token::OpenParen) => {
+                    self.expression(depth + 1)?;
+                    self.expect(&Token::CloseParen, "a closing `)`")
+                }
+                Some(Token::Field(path)) => self.predicate(path, depth),
+                Some(other) => Err(Error::Syntax(format!(
+                    "expected a keyword, found {}",
+                    describe(&other)
+                ))),
+                None => Err(Error::Syntax(
+                    "expected a keyword, found the end of the expression".to_string(),
+                )),
+            }
+        }
+
+        fn predicate(&mut self, path: String, depth: usize) -> Result<(), Error> {
+            if !is_indexed_field(&path) {
+                return Err(Error::UnknownField(path));
+            }
+            if self.eat(&Token::OpenParen) {
+                self.arguments()?;
+            }
+            if self.eat(&Token::OpenBrace) {
+                self.expression(depth + 1)?;
+                return self.expect(&Token::CloseBrace, "a closing `}`");
+            }
+            if self.eat(&Token::Comparison) {
+                return self.operand();
+            }
+            Ok(())
+        }
+
+        fn arguments(&mut self) -> Result<(), Error> {
+            loop {
+                // A labelled argument, as in `id(name: "svc", type: "AWS::EC2")`.
+                // The label is a member of the keyword, not a field of its own,
+                // so it is not looked up in the catalog.
+                if matches!(self.peek(), Some(Token::Field(_)))
+                    && self.tokens.get(self.at + 1) == Some(&Token::Colon)
+                {
+                    self.at += 2;
+                }
+                self.operand()?;
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::CloseParen, "a closing `)`")
+        }
+
+        fn operand(&mut self) -> Result<(), Error> {
+            match self.take() {
+                Some(Token::Text(_) | Token::Number(_) | Token::Boolean(_)) => Ok(()),
+                Some(Token::Field(path)) => {
+                    if is_indexed_field(&path) {
+                        return Ok(());
+                    }
+                    Err(Error::UnknownField(path))
+                }
+                Some(other) => Err(Error::Syntax(format!(
+                    "expected a value, found {}",
+                    describe(&other)
+                ))),
+                None => Err(Error::Syntax(
+                    "expected a value, found the end of the expression".to_string(),
+                )),
+            }
+        }
+    }
+
+    /// Parse `expression`, answering `Ok(())` only for one X-Ray would accept.
+    ///
+    /// An ABSENT expression is the same refusal as an empty one — X-Ray treats
+    /// the two identically — so a handler passes `unwrap_or_default()` here
+    /// rather than skipping the check when the member is `None`.
+    pub fn validate(expression: &str) -> Result<(), Error> {
+        if expression.trim().is_empty() {
+            return Err(Error::Empty);
+        }
+        if expression.chars().count() > MAX_LENGTH {
+            return Err(Error::Syntax(format!(
+                "longer than the {MAX_LENGTH} characters this emulator parses"
+            )));
+        }
+        let mut parser = Parser {
+            tokens: tokenize(expression)?,
+            at: 0,
+        };
+        parser.expression(0)?;
+        if let Some(trailing) = parser.peek() {
+            return Err(Error::Syntax(format!(
+                "unexpected trailing {}",
+                describe(trailing)
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// What `UpdateGroup` supplies: the members of a group a caller may change.
