@@ -17,8 +17,10 @@
 //! * `clientToken` is an `@idempotencyToken`: the same token names the inquiry its first
 //!   call created, a different token names a different inquiry, and the same token on
 //!   different content is refused rather than honoured;
-//! * an inquiry id the store does not hold is refused with the modelled
-//!   `ResourceNotFoundException`.
+//! * an inquiry id the store does not hold is refused with the front door's 401
+//!   `UnauthorizedException`, not with the modelled not-found: the stored inquiry set IS
+//!   the account's entitlement, so the absence of an inquiry the caller may not read is
+//!   never confirmed.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -723,7 +725,7 @@ async fn a_client_token_reused_on_different_content_is_refused() {
 }
 
 #[tokio::test]
-async fn an_inquiry_id_the_store_does_not_hold_is_refused_as_not_found() {
+async fn an_inquiry_id_the_store_does_not_hold_is_refused_as_unauthorized() {
     let router = emulator();
     // A control, so the refusals below are about the id and not about the operation.
     let created = create(
@@ -738,39 +740,73 @@ async fn an_inquiry_id_the_store_does_not_hold_is_refused_as_not_found() {
     );
     let known = created.inquiry_id();
 
-    // Well-formed ids (`InquiryId`'s pattern) that name nothing: one of each shape the
-    // 16-character suffix admits.
-    let unknown = [
-        "compliance-inquiry-0000000000000000",
-        "compliance-inquiry-ffffffffffffffff",
-        "compliance-inquiry-AbCdEf0123456789",
+    // Well-formed ids (`InquiryId`'s `^compliance-inquiry-[a-zA-Z0-9]{16}$`) that this
+    // account holds no inquiry for. The rows differ along what the 16-character suffix
+    // generalises over — digits, lowercase, uppercase, mixed — plus one that differs from
+    // the control's id in its last character only, so a refusal cannot come from matching
+    // a prefix instead of the whole id.
+    let mut unknown: Vec<(String, String)> = vec![
+        (
+            "all digits".to_string(),
+            "compliance-inquiry-0000000000000000".to_string(),
+        ),
+        (
+            "all lowercase".to_string(),
+            "compliance-inquiry-ffffffffffffffff".to_string(),
+        ),
+        (
+            "all uppercase".to_string(),
+            "compliance-inquiry-ZZZZZZZZZZZZZZZZ".to_string(),
+        ),
+        (
+            "mixed case and digits".to_string(),
+            "compliance-inquiry-AbCdEf0123456789".to_string(),
+        ),
     ];
-    for id in unknown {
-        assert_ne!(id, known, "the unknown ids must not be the control's");
+    unknown.push((
+        "one character off the control's id".to_string(),
+        {
+            let mut neighbour = known.clone();
+            let last = neighbour.pop().expect("a minted id is not empty");
+            neighbour.push(if last == 'z' { 'y' } else { 'z' });
+            neighbour
+        },
+    ));
+
+    for (case, id) in &unknown {
+        assert!(
+            matches_inquiry_id_pattern(id),
+            "case {case:?}: the row must satisfy InquiryId's pattern, got {id:?}"
+        );
+        assert_ne!(
+            id, &known,
+            "case {case:?}: the unknown ids must not be the control's"
+        );
         let answer = get_metadata(&router, id).await;
         assert_eq!(
-            answer.status, 404,
-            "case {id:?}: an unknown inquiry must be refused with HTTP 404, got {} with \
-             {:?}",
+            answer.status, 401,
+            "case {case:?} {id:?}: an inquiry the account does not hold must answer HTTP \
+             401, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "case {id:?}: expected the modelled ResourceNotFoundException, got {:?}",
+            "UnauthorizedException",
+            "case {case:?} {id:?}: expected UnauthorizedException, got {:?}",
             answer.body
         );
-        assert_eq!(
-            answer.body["resourceId"].as_str(),
-            Some(id),
-            "case {id:?}: the refusal must name the id that was asked for, got {:?}",
-            answer.body["resourceId"]
+        // The refusal says nothing about the resource: naming it (or its type) is what
+        // would confirm the absence AWS declines to confirm.
+        assert!(
+            answer.body["resourceId"].is_null() && answer.body["resourceType"].is_null(),
+            "case {case:?} {id:?}: an authorization refusal must disclose no resource, got \
+             {:?}",
+            answer.body
         );
-        assert_eq!(
-            answer.body["resourceType"].as_str(),
-            Some("ComplianceInquiry"),
-            "case {id:?}: the refusal must name the resource type, got {:?}",
-            answer.body["resourceType"]
+        assert!(
+            answer.detail().is_null(),
+            "case {case:?} {id:?}: a refused read must carry no inquiry detail, got {:?}",
+            answer.body
         );
     }
 
@@ -779,5 +815,11 @@ async fn an_inquiry_id_the_store_does_not_hold_is_refused_as_not_found() {
         control.status, 200,
         "the control inquiry must still be found, got {} with {:?}",
         control.status, control.body
+    );
+    assert_eq!(
+        control.detail()["id"].as_str(),
+        Some(known.as_str()),
+        "the control inquiry must report its own id, got {:?}",
+        control.body
     );
 }

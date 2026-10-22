@@ -213,19 +213,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ImportCertificateAuthorityCertificateErrorModeled::InvalidArnException(
                     InvalidArnException {
-                        message: Some(format!(
-                            "'{arn}' does not refer to a certificate authority in this service"
-                        )),
+                        message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
                     },
                 )
                 .into(),
             );
         }
 
-        // The certificate (and the chain, when one is supplied) has to be a PEM
-        // certificate block before anything is persisted: a body that is not one is
+        // The certificate (and the chain, when one is supplied) has to be a PEM-framed
+        // DER X.509 certificate before anything is persisted: a body that is not one is
         // malformed, whatever the CA's state.
-        let certificate = pem_certificate(&input.certificate, "Certificate")?;
+        let certificate = pem_certificate(&input.certificate)?;
         let chain = match input.certificate_chain.as_deref() {
             // An empty chain blob is modelled (`CertificateChainBlob` has min length 0)
             // and carries no certificate, so it is the same as supplying none.
@@ -267,9 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ImportCertificateAuthorityCertificateErrorModeled::RequestInProgressException(
                         RequestInProgressException {
-                            message: Some(format!(
-                                "the certificate authority {arn} is still being created"
-                            )),
+                            message: Some(crate::state::CREATE_IN_PROGRESS_MESSAGE.to_string()),
                         },
                     )
                     .into(),
@@ -304,34 +300,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The one PEM certificate block `bytes` carries, or `MalformedCertificateException`.
+/// The one X.509 certificate `bytes` carries, re-encoded canonically, or
+/// `MalformedCertificateException`.
 fn pem_certificate(
     bytes: &[u8],
-    member: &str,
 ) -> Result<String, ImportCertificateAuthorityCertificateError> {
-    ::std::str::from_utf8(bytes)
+    let der = ::std::str::from_utf8(bytes)
         .ok()
         .and_then(|text| crate::state::parse_pem_block(text, crate::state::PEM_LABEL_CERTIFICATE))
-        .ok_or_else(|| malformed_certificate(member))
+        .filter(|der| crate::state::is_x509_certificate(der))
+        .ok_or_else(malformed_certificate)?;
+    Ok(crate::state::encode_pem(
+        crate::state::PEM_LABEL_CERTIFICATE,
+        &der,
+    ))
 }
 
-/// Every PEM certificate block `bytes` carries, or `MalformedCertificateException`.
+/// Every X.509 certificate `bytes` carries, re-encoded canonically, or
+/// `MalformedCertificateException`.
 fn pem_certificate_chain(
     bytes: &[u8],
 ) -> Result<String, ImportCertificateAuthorityCertificateError> {
-    ::std::str::from_utf8(bytes)
+    let blocks = ::std::str::from_utf8(bytes)
         .ok()
         .and_then(|text| crate::state::parse_pem_blocks(text, crate::state::PEM_LABEL_CERTIFICATE))
-        .ok_or_else(|| malformed_certificate("CertificateChain"))
+        .filter(|blocks| {
+            blocks
+                .iter()
+                .all(|der| crate::state::is_x509_certificate(der))
+        })
+        .ok_or_else(malformed_certificate)?;
+    Ok(blocks
+        .iter()
+        .map(|der| crate::state::encode_pem(crate::state::PEM_LABEL_CERTIFICATE, der))
+        .collect())
 }
 
 /// "One or more fields in the certificate are invalid."
-fn malformed_certificate(member: &str) -> ImportCertificateAuthorityCertificateError {
+fn malformed_certificate() -> ImportCertificateAuthorityCertificateError {
     ImportCertificateAuthorityCertificateErrorModeled::MalformedCertificateException(
         MalformedCertificateException {
-            message: Some(format!(
-                "{member} must be a PEM-encoded CERTIFICATE block whose body is base64"
-            )),
+            message: Some(crate::state::MALFORMED_CERTIFICATE_MESSAGE.to_string()),
         },
     )
     .into()

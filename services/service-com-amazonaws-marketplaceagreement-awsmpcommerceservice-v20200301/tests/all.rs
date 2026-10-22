@@ -19,8 +19,12 @@ mod agreement_lifecycle;
 mod billing_adjustments;
 #[path = "all/payment_requests.rs"]
 mod payment_requests;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unknown_ids.rs"]
+mod unknown_ids;
 #[path = "all/validation_envelope.rs"]
 mod validation_envelope;
 #[path = "all/validation_messages.rs"]

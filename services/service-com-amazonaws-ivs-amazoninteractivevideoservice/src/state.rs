@@ -6,10 +6,14 @@
 //! `Channel` rules the model documents).
 
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Channel, MultitrackInputConfiguration, StreamKey};
+use crate::ops::types::{
+    Channel, MultitrackInputConfiguration, RecordingConfiguration, RenditionConfiguration,
+    StreamKey, ThumbnailConfiguration,
+};
 
 /// The region every minted ARN falls back to when the request carries no SigV4
 /// credential scope to read one from (an unsigned, anonymous call).
@@ -26,9 +30,24 @@ pub struct ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// a key to its channel: `ListStreamKeys` filters on it and `DeleteChannel`
     /// drops every key that names the channel it removed.
     pub stream_keys: BTreeMap<String, StreamKey>,
+    /// Every persisted recording configuration, keyed by its ARN, each with the
+    /// instant its `CREATING` → `ACTIVE` transition falls due. A `BTreeMap` for the
+    /// same reason as [`Self::channels`]: one stable order for
+    /// `ListRecordingConfigurations` to page over.
+    pub recording_configurations: BTreeMap<String, RecordingConfigurationRecord>,
     /// How many ids this store has minted. Part of every id's seed, so no two
     /// minted ids collide even when two calls land in the same nanosecond.
     pub minted: u64,
+}
+
+/// A persisted recording configuration together with the instant at which the
+/// `CREATING` → `ACTIVE` transition the clock owes it becomes due.
+#[derive(Debug, Clone)]
+pub struct RecordingConfigurationRecord {
+    /// What every read of this resource answers.
+    pub configuration: RecordingConfiguration,
+    /// When the owed transition falls due; see [`RECORDING_CONFIGURATION_ACTIVATION`].
+    pub active_at: SystemTime,
 }
 
 impl ComAmazonawsIvsAmazoninteractivevideoserviceState {
@@ -47,6 +66,25 @@ impl ComAmazonawsIvsAmazoninteractivevideoserviceState {
         let seed = format!("{label}|{}|{}|{nanos}", self.minted, std::process::id());
         let digest = Sha256::digest(seed.as_bytes());
         hex::encode(&digest[..bytes.min(digest.len())])
+    }
+
+    /// Materialise every `CREATING` → `ACTIVE` transition the clock already owes.
+    ///
+    /// A recording configuration is minted in `CREATING` and AWS turns it `ACTIVE`
+    /// on its own, so the move is owed by the clock at
+    /// [`RecordingConfigurationRecord::active_at`] whether or not anybody calls.
+    /// Every operation that reports a recording configuration runs this first, so a
+    /// read materialises only what was already due and never advances a resource
+    /// because it was looked at.
+    pub fn settle_recording_configurations(&mut self) {
+        let now = SystemTime::now();
+        for record in self.recording_configurations.values_mut() {
+            if record.configuration.state == RECORDING_CONFIGURATION_CREATING
+                && record.active_at <= now
+            {
+                record.configuration.state = RECORDING_CONFIGURATION_ACTIVE.to_string();
+            }
+        }
     }
 }
 
@@ -94,6 +132,108 @@ pub fn channel_arn(region: &str, id: &str) -> String {
 /// A `StreamKeyArn`: `arn:aws:ivs:<region>:<account>:stream-key/<id>`.
 pub fn stream_key_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("ivs", region, &format!("stream-key/{id}"))
+}
+
+/// A `RecordingConfigurationArn`:
+/// `arn:aws:ivs:<region>:<account>:recording-configuration/<id>`.
+pub fn recording_configuration_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("ivs", region, &format!("recording-configuration/{id}"))
+}
+
+/// The state a recording configuration is minted in, from the modelled
+/// `RecordingConfigurationState` values `CREATING | CREATE_FAILED | ACTIVE`.
+pub const RECORDING_CONFIGURATION_CREATING: &str = "CREATING";
+
+/// The state a recording configuration settles in once the clock owes the move:
+/// "When the state is `ACTIVE`, the configuration is ready for recording a channel
+/// stream" (model doc on `RecordingConfiguration$state`).
+pub const RECORDING_CONFIGURATION_ACTIVE: &str = "ACTIVE";
+
+/// How long after `CreateRecordingConfiguration` the `CREATING` → `ACTIVE`
+/// transition falls due.
+///
+/// AWS publishes no duration for it, so this is the emulator's own choice inside
+/// the project's 250-750 ms band for a transition the clock owes. It is
+/// deliberately non-zero: a caller that reads straight after the create still
+/// observes `CREATING`, exactly as it would against AWS.
+pub const RECORDING_CONFIGURATION_ACTIVATION: Duration = Duration::from_millis(500);
+
+/// The ceiling on how many recording configurations this store holds, for the same
+/// reason as [`MAX_CHANNELS`]: a create is the only thing that adds one and the
+/// store lives for the life of the process, so caller-driven growth needs a bound.
+/// Past it, `CreateRecordingConfiguration` answers the
+/// `ServiceQuotaExceededException` (HTTP 402) it models. The number is the
+/// emulator's own bound, not a published AWS default (AWS publishes the quota as
+/// adjustable), and is set high enough that no ordinary workflow meets it.
+pub const MAX_RECORDING_CONFIGURATIONS: usize = 1_000;
+
+/// Refuse a rendition configuration whose members cannot hold together, returning
+/// the message to put on a `ValidationException`.
+///
+/// From the model doc on `RenditionConfiguration$renditionSelection`: "If `CUSTOM`
+/// is specified, a set of renditions must be specified in the `renditions` field."
+/// An absent or empty list names no rendition, so neither is a set.
+pub fn check_rendition_configuration(rendition: &RenditionConfiguration) -> Result<(), String> {
+    let selection = rendition.rendition_selection.as_deref().unwrap_or("");
+    let renditions = rendition.renditions.as_deref().unwrap_or(&[]);
+    if selection == "CUSTOM" && renditions.is_empty() {
+        return Err(
+            "renditionConfiguration.renditions is required to name at least one rendition \
+             when renditionConfiguration.renditionSelection is CUSTOM"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The rendition configuration to persist for what the caller sent: every member it
+/// omitted filled from the model's documented default.
+///
+/// From the model doc on `RenditionConfiguration$renditionSelection`: "Indicates
+/// which set of renditions are recorded for a stream. … Default: `ALL`." A caller
+/// that sent no `renditionConfiguration` at all chose nothing, and the model
+/// documents no default for the structure itself, so that stays absent.
+pub fn effective_rendition_configuration(
+    requested: Option<RenditionConfiguration>,
+) -> Option<RenditionConfiguration> {
+    requested.map(|mut rendition| {
+        if rendition
+            .rendition_selection
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            rendition.rendition_selection = Some("ALL".to_string());
+        }
+        rendition
+    })
+}
+
+/// The thumbnail configuration to persist for what the caller sent: every member it
+/// omitted filled from the model's documented default.
+///
+/// From the model docs on `ThumbnailConfiguration`: `recordingMode` "Default:
+/// `INTERVAL`"; `targetIntervalSeconds` "is configurable (and required) only if
+/// `recordingMode` is `INTERVAL`. Default: 60"; `storage` "Default: `SEQUENTIAL`";
+/// `resolution` "Default: Null (source resolution is returned)", so an omitted
+/// resolution stays absent. As with [`effective_rendition_configuration`], an
+/// omitted structure carries no choice and stays absent.
+pub fn effective_thumbnail_configuration(
+    requested: Option<ThumbnailConfiguration>,
+) -> Option<ThumbnailConfiguration> {
+    requested.map(|mut thumbnail| {
+        if thumbnail.recording_mode.as_deref().is_none_or(str::is_empty) {
+            thumbnail.recording_mode = Some("INTERVAL".to_string());
+        }
+        if thumbnail.recording_mode.as_deref() == Some("INTERVAL")
+            && thumbnail.target_interval_seconds.is_none()
+        {
+            thumbnail.target_interval_seconds = Some(60);
+        }
+        if thumbnail.storage.is_none() {
+            thumbnail.storage = Some(vec!["SEQUENTIAL".to_string()]);
+        }
+        thumbnail
+    })
 }
 
 /// The ceiling on how many channels this store holds, and on how many stream keys

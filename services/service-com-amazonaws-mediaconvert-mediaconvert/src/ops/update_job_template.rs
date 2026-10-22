@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJobTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJobTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJobTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +167,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJobTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJobTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateJobTemplateErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "The new queue for the job template, if you are changing it" — a queue the
+        // caller named is a reference to a queue resource, by name or by ARN, exactly as
+        // it is on create. A member the caller SENT is a value they meant, so an empty
+        // one is refused rather than quietly dropped.
+        let queue = match input.queue.as_deref().map(str::trim) {
+            Some("") => {
+                return Err(UpdateJobTemplateErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some("Queue must not be empty.".to_string()),
+                    },
+                )
+                .into())
+            }
+            Some(reference) => Some(crate::state::queue_name_from_reference(reference).to_string()),
+            None => None,
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // The stored key is the name exactly as `CreateJobTemplate` persisted it, so the
+        // label is read as sent rather than normalised.
+        let name = input.name.clone();
+        let mut state = state.lock();
+
+        // Read under the same guard that will apply the change, before the template is
+        // borrowed mutably, so the queue reference is checked against the store the
+        // update writes to.
+        let queue_missing = queue
+            .as_deref()
+            .is_some_and(|queue| !state.queues.contains_key(queue));
+
+        // The ADDRESSED resource is checked first: the template must exist, and a
+        // built-in one cannot be changed at all — "System or built-in job templates can't
+        // be modified or deleted by the user" — so a request naming one is refused with
+        // the modelled 403 before any member it carries is applied.
+        let Some(template) = state.job_templates.get_mut(&name) else {
+            return Err(UpdateJobTemplateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("name")),
+            })
+            .into());
+        };
+        if template.template_type == crate::state::TYPE_SYSTEM {
+            return Err(UpdateJobTemplateErrorModeled::ForbiddenException(ForbiddenException {
+                message: Some(crate::state::system_resource_modify_message("name")),
+            })
+            .into());
+        }
+        if queue_missing {
+            return Err(UpdateJobTemplateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("queue")),
+            })
+            .into());
+        }
+
+        // Each member is "the new <member> for the job template, if you are changing it":
+        // a member the caller sent replaces the stored one, and a member it left out
+        // leaves the stored one exactly as it was.
+        if let Some(category) = input.category {
+            template.category = Some(category);
+        }
+        if let Some(description) = input.description {
+            template.description = Some(description);
+        }
+        if let Some(settings) = input.settings {
+            template.settings = settings;
+        }
+        if let Some(queue) = queue {
+            template.queue = Some(queue);
+        }
+        if let Some(priority) = input.priority {
+            template.priority = Some(priority);
+        }
+        if let Some(interval) = input.status_update_interval {
+            template.status_update_interval = Some(interval);
+        }
+        if let Some(acceleration) = input.acceleration_settings {
+            template.acceleration_settings = Some(acceleration);
+        }
+        if let Some(hops) = input.hop_destinations {
+            template.hop_destinations = hops;
+        }
+        // "The timestamp in epoch seconds when the Job template was last updated."
+        template.last_updated = now;
+
+        Ok(UpdateJobTemplateOutput {
+            job_template: Some(template.view(&region)),
+        })
     }
 }

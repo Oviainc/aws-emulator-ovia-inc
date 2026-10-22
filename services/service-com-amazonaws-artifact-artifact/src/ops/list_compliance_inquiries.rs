@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComplianceInquiries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComplianceInquiries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the compliance inquiries this account created, as the `InquirySummary`
+//! projection, paginated: every member of every entry is read off the ONE stored record
+//! in [`crate::state`], so a summary here can never disagree with the summary
+//! `CreateComplianceInquiry` returned or the detail `GetComplianceInquiryMetadata`
+//! reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComplianceInquiries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules shape the handler:
+//!
+//! * It is a REPORTING operation (`@readonly` in the model): it creates nothing and
+//!   changes no inquiry's own data. The one write it makes is
+//!   [`crate::state::ComplianceInquiry::materialise`] on an entry it projects — the
+//!   transition the CLOCK already owed that inquiry, which was due at the same instant
+//!   whether or not anybody listed.
+//! * The order is the store's key order, which is creation order: the ids are minted
+//!   from a monotonic counter, so a `BTreeMap` walk is a stable total order, which is
+//!   what a pagination token can index into without an entry being served twice or
+//!   skipped when another inquiry is created between pages.
+//! * `nextToken` is the inquiry id the next page RESUMES at, so the page starts at the
+//!   first id at or after it (an inquiry that left the store meanwhile does not strand
+//!   the page), and a token that is not an `InquiryId` was never issued by this
+//!   operation and is refused with the service's modelled invalid-token
+//!   `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +161,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComplianceInquiries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComplianceInquiriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComplianceInquiries"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListComplianceInquiriesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact compliance inquiry store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The token is the inquiry id the next page starts at, so anything that is not an
+        // `InquiryId` was never issued by this operation. A token this service did not
+        // issue is refused with the service's one fixed invalid-token text, the same as
+        // every other token member.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_inquiry_id(token) {
+                return Err(ListComplianceInquiriesErrorModeled::ValidationException(
+                    crate::state::invalid_token(),
+                )
+                .into());
+            }
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let capacity = page_size.min(store.inquiries.len());
+        let mut compliance_inquiries = Vec::with_capacity(capacity);
+        let mut next_token = None;
+        for (id, inquiry) in &mut store.inquiries {
+            // Resume at the first id at or after the token, so a page is still served
+            // when the inquiry the token named left the store meanwhile.
+            if input
+                .next_token
+                .as_deref()
+                .is_some_and(|token| id.as_str() < token)
+            {
+                continue;
+            }
+            if compliance_inquiries.len() >= page_size {
+                next_token = Some(id.clone());
+                break;
+            }
+            // The only write a read may make: the transition the clock had already made
+            // due. Applied here so this listing and a `GetComplianceInquiryMetadata` of
+            // the same inquiry at the same instant report the same status.
+            inquiry.materialise(now);
+            compliance_inquiries.push(inquiry.to_summary());
+        }
+
+        Ok(ListComplianceInquiriesOutput {
+            compliance_inquiries: Some(compliance_inquiries),
+            next_token,
+        })
     }
 }

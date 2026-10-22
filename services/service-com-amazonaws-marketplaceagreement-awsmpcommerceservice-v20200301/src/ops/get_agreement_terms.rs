@@ -164,10 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure report: it reads the stored accepted terms and writes nothing.
         let store = state.lock();
         let Some(agreement) = store.agreements.get(&input.agreement_id) else {
-            return Err(GetAgreementTermsErrorModeled::ResourceNotFoundException(
-                crate::state::agreement_not_found(&input.agreement_id),
-            )
-            .into());
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                GetAgreementTermsErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
         };
 
         // The token resumes this agreement's terms and no other list's.

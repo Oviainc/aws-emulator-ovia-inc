@@ -2,8 +2,11 @@
 
 //! @op UpdateOriginEndpoint
 //! IMPLEMENTED. Replaces the packaging configuration of an origin endpoint persisted in
-//! [`crate::state`] and rotates its ETag, leaving the endpoint's identity (its name, ARN
-//! and creation instant) alone.
+//! [`crate::state`], leaving the endpoint's identity (its name, ARN and creation instant)
+//! alone. A write that CHANGED the endpoint commits a new version of it, and its ETag is a
+//! function of that version, so the tag rotates and the one the caller held stops
+//! matching; a write that stored what was already there commits nothing and leaves both
+//! the tag and `ModifiedAt` as they were.
 //!
 //! What it refuses, before anything is written:
 //!
@@ -482,6 +485,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel: &channel_name,
             endpoint: &input.origin_endpoint_name,
         };
+        // What the endpoint was before this request wrote anything, so the commit below
+        // can tell a real change from an update that stores what was already there.
+        let before = endpoint.configuration_fingerprint();
         endpoint.hls_manifests = input
             .hls_manifests
             .unwrap_or_default()
@@ -532,11 +538,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(mode) = input.stream_name_output_mode {
             endpoint.stream_name_output_mode = mode;
         }
-        endpoint.modified_at = crate::state::now();
-        // The ETag covers everything the endpoint is made of, so it rotates exactly when
-        // this update changed something — which is what a conditional update needs of it.
-        let rotated = crate::state::origin_endpoint_etag(endpoint);
-        endpoint.etag = rotated;
+        // A write that CHANGED the endpoint commits a new version of it, and the ETag is
+        // a function of that version as well as of the endpoint's content: the tag this
+        // update answers with then differs from the one the caller held — which is what
+        // makes `x-amzn-update-if-match` detect a lost update — and a following
+        // `GetOriginEndpoint` reports exactly this tag. An update that stored what was
+        // already there changed nothing, so it commits nothing: neither the tag nor
+        // `ModifiedAt` moves, and the tag the caller holds stays usable as the
+        // precondition of the update it is entitled to make.
+        if endpoint.configuration_fingerprint() != before {
+            endpoint.commit(crate::state::now());
+        }
 
         Ok(endpoint_output(endpoint))
     }

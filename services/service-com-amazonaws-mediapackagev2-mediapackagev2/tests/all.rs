@@ -33,6 +33,8 @@ mod error_bodies;
 mod origin_endpoint_policy;
 #[path = "all/origin_endpoint_reset.rs"]
 mod origin_endpoint_reset;
+#[path = "all/refusal_text_and_entity_tags.rs"]
+mod refusal_text_and_entity_tags;
 #[path = "all/rejection_rule_and_negative_paths.rs"]
 mod rejection_rule_and_negative_paths;
 #[path = "all/server_materialised_members.rs"]

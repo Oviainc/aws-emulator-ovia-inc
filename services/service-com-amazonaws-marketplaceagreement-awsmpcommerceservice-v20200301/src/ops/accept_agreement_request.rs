@@ -158,10 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(request) = store.agreement_requests.get(&input.agreement_request_id).cloned()
         else {
-            return Err(AcceptAgreementRequestErrorModeled::ResourceNotFoundException(
-                crate::state::agreement_request_not_found(&input.agreement_request_id),
-            )
-            .into());
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                AcceptAgreementRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_request_not_found(&input.agreement_request_id),
+                ),
+            ));
         };
 
         // A quote is accepted once: the second accept would mint a second
@@ -188,10 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut source = None;
         if let Some(id) = request.source_agreement_identifier.as_deref() {
             let Some(stored) = store.agreements.get(id) else {
-                return Err(AcceptAgreementRequestErrorModeled::ResourceNotFoundException(
-                    crate::state::agreement_not_found(id),
-                )
-                .into());
+                // The agreement this request acts upon is gone: the same
+                // not-found refusal, naming the agreement that was looked for.
+                return Err(crate::state::not_found(
+                    AcceptAgreementRequestErrorModeled::ResourceNotFoundException(
+                        crate::state::agreement_not_found(id),
+                    ),
+                ));
             };
             source = Some(stored.clone());
         }

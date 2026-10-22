@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: merges the request's tags into the tag set of the keyspace or table the
+//! `resourceArn` names in [`crate::state`], where `ListTagsForResource` reads them back.
+//! This is the ONLY file to touch for `TagResource`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +153,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // The status transitions the clock already owed at this instant, so a table whose
+        // deletion has completed is no longer a resource this call can tag.
+        store.settle(::std::time::SystemTime::now());
+
+        // Tags attach to the resource the ARN names, so the ARN — not a name — is what is
+        // resolved; one that names no stored resource is the 404 the model declares.
+        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::arn_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // `merge_tags` upserts by key and refuses BEFORE storing anything, so a refused
+        // call leaves the resource's tags exactly as they were. The two refusals are the
+        // reserved `aws:` key prefix (400 `ValidationException`) and the per-resource tag
+        // quota (402 `ServiceQuotaExceededException`) — neither is expressible in the
+        // model, since the quota depends on the tags the resource already holds.
+        crate::state::merge_tags(tags, &input.tags).map_err(|rejection| {
+            let message = Some(rejection.message());
+            match rejection.is_quota() {
+                true => TagResourceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message },
+                ),
+                false => {
+                    TagResourceErrorModeled::ValidationException(ValidationException { message })
+                }
+            }
+        })?;
+
+        Ok(TagResourceOutput {})
     }
 }

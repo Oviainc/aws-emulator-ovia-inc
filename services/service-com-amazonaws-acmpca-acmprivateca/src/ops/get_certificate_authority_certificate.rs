@@ -156,9 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetCertificateAuthorityCertificateErrorModeled::InvalidArnException(
                     InvalidArnException {
-                        message: Some(format!(
-                            "'{arn}' does not refer to a certificate authority in this service"
-                        )),
+                        message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
                     },
                 )
                 .into(),
@@ -190,15 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Only a CA that has taken its certificate has one to return; before that the
-        // CA is in a state that cannot answer this read.
+        // CA is in a state that cannot answer this read. The sentence is the service's
+        // own for this refusal, naming the CA it is about.
         let Some(certificate) = record.ca_certificate_pem.clone() else {
             return Err(
                 GetCertificateAuthorityCertificateErrorModeled::InvalidStateException(
                     InvalidStateException {
                         message: Some(format!(
-                            "the certificate authority {arn} is in state {}, which holds no \
-                             certificate authority certificate",
-                            record.status
+                            "The certificate authority {arn} is not in the correct state to have \
+                             a certificate signing request."
                         )),
                     },
                 )

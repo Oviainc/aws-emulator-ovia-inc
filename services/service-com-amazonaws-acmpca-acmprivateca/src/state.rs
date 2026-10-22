@@ -12,11 +12,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+use x509_cert::attr::AttributeTypeAndValue;
+use x509_cert::der::asn1::{Any, BitString, SetOfVec};
+use x509_cert::der::{Decode, Encode, Tag as DerTag};
+use x509_cert::name::{Name, RdnSequence, RelativeDistinguishedName};
+use x509_cert::request::{CertReq, CertReqInfo};
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier, SubjectPublicKeyInfoOwned};
+use x509_cert::time::{Time, Validity as CertificateValidity};
+use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::ops::types::{
     ASN1Subject, CertificateAuthority, CertificateAuthorityConfiguration, RevocationConfiguration,
     Tag, Validity,
 };
+
+/// A PKCS#10 certification request, as this service reads and writes one.
+pub type CertificationRequest = CertReq;
+
+/// The content of a certification request: the subject and the public key a certificate
+/// issued for it carries.
+pub type CertificationRequestInfo = CertReqInfo;
 
 /// The ARN namespace / sigv4 signing name of this service (`awsService.arnNamespace`).
 pub const ARN_SERVICE: &str = "acm-pca";
@@ -32,6 +48,61 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_PENDING_CERTIFICATE: &str = "PENDING_CERTIFICATE";
 /// Private CA holds its certificate and may issue end-entity certificates.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
+
+/// What Amazon Web Services Private CA answers while a CA's creation is still in
+/// progress — one sentence, the same for every operation that refuses on `CREATING`
+/// rather than one built from the request.
+pub const CREATE_IN_PROGRESS_MESSAGE: &str =
+    "The request to create certificate authority is still in progress. Try again later.";
+
+/// What Amazon Web Services Private CA answers when a request carries a tag key in the
+/// reserved `aws:` namespace: the service's own sentence for the refusal, not one built
+/// from the request.
+pub const RESERVED_TAG_MESSAGE: &str = "Tags starting with 'aws' are categorized as AWS \
+     internal tags and cannot be used for tagging in ACM Private CA service.";
+
+/// What Amazon Web Services Private CA answers for an Amazon Resource Name that is not
+/// one of its own: one sentence about the ARN, the same for every operation that reads
+/// one.
+pub const INVALID_ARN_MESSAGE: &str = "Not a valid arn.";
+
+/// What Amazon Web Services Private CA answers for a certificate body it cannot read:
+/// one sentence about the certificate, the same for the certificate and for the chain.
+pub const MALFORMED_CERTIFICATE_MESSAGE: &str = "Malformed certificate.";
+
+/// What Amazon Web Services Private CA answers when a CA is asked to issue a certificate
+/// in a state that does not allow issuance: one sentence about the CA, naming no request
+/// of its own.
+pub const ISSUANCE_INVALID_STATE_MESSAGE: &str =
+    "The certificate authority is not in a valid state for issuing certificates";
+
+/// What Amazon Web Services Private CA answers for a certificate ARN no certificate of
+/// the CA matches: one sentence about the certificate, naming no ARN of its own.
+pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certificate.";
+
+/// `SigningAlgorithm`'s members in the order the model DECLARES them, which is the order
+/// Amazon Web Services Private CA lists the usable algorithms in when it refuses a
+/// key/signing-algorithm pairing.
+///
+/// `ops::types::SIGNING_ALGORITHM_VALUES` is the same set sorted alphabetically, so it
+/// cannot be read for this; the order below is the enum's, from
+/// `smithy_query(query="shape",shape="SigningAlgorithm")`. A test pins that the two hold
+/// the same members, so a member added to the model cannot go unnoticed here.
+pub const SIGNING_ALGORITHMS_IN_MODEL_ORDER: &[&str] = &[
+    "SHA256WITHECDSA",
+    "SHA384WITHECDSA",
+    "SHA512WITHECDSA",
+    "SHA256WITHRSA",
+    "SHA384WITHRSA",
+    "SHA512WITHRSA",
+    "SHA256WITHRSA_PSS",
+    "SHA384WITHRSA_PSS",
+    "SHA512WITHRSA_PSS",
+    "SM3WITHSM2",
+    "ML_DSA_44",
+    "ML_DSA_65",
+    "ML_DSA_87",
+];
 
 /// Default `UsageMode` — "The default value is GENERAL_PURPOSE."
 /// (`CreateCertificateAuthorityRequest$UsageMode` docs).
@@ -193,7 +264,9 @@ impl CertificateAuthorityRecord {
             not_after: self.not_after.map(to_date_time),
             failure_reason: self.failure_reason.clone(),
             certificate_authority_configuration: Some(self.configuration.clone()),
-            revocation_configuration: self.revocation_configuration.clone(),
+            revocation_configuration: Some(reported_revocation_configuration(
+                self.revocation_configuration.as_ref(),
+            )),
             restorable_until: self.restorable_until.map(to_date_time),
             key_storage_security_standard: Some(self.key_storage_security_standard.clone()),
             usage_mode: Some(self.usage_mode.clone()),
@@ -208,6 +281,31 @@ impl CertificateAuthorityRecord {
             Some(chain) => format!("{ca_certificate}{chain}"),
             None => ca_certificate.clone(),
         })
+    }
+}
+
+/// The `RevocationConfiguration` a reported `CertificateAuthority` carries.
+///
+/// Both sub-configurations are always present: `CrlConfiguration$Enabled` and
+/// `OcspConfiguration$Enabled` are `@required` booleans, and "By default, both
+/// certificate validation mechanisms are disabled."
+/// (`CreateCertificateAuthorityRequest$RevocationConfiguration` docs), so a mechanism the
+/// CA was not configured with is reported as the disabled configuration rather than left
+/// out. A mechanism the CA WAS configured with is reported exactly as it was stored.
+pub fn reported_revocation_configuration(
+    configured: Option<&RevocationConfiguration>,
+) -> RevocationConfiguration {
+    RevocationConfiguration {
+        crl_configuration: Some(
+            configured
+                .and_then(|revocation| revocation.crl_configuration.clone())
+                .unwrap_or_default(),
+        ),
+        ocsp_configuration: Some(
+            configured
+                .and_then(|revocation| revocation.ocsp_configuration.clone())
+                .unwrap_or_default(),
+        ),
     }
 }
 
@@ -462,26 +560,20 @@ pub fn encode_pem(label: &str, body: &[u8]) -> String {
     out
 }
 
-/// The single PEM block `label` frames, re-encoded canonically, when `text` is exactly
-/// one well-formed non-empty block of that label. `None` for anything else — the caller
-/// refuses that as malformed.
-pub fn parse_pem_block(text: &str, label: &str) -> Option<String> {
-    match parse_pem_blocks_as(text, label)?.as_slice() {
-        [one] => Some(encode_pem(label, one)),
+/// The single PEM block `label` frames, when `text` is exactly one well-formed non-empty
+/// block of that label. `None` for anything else — the caller refuses that as malformed.
+pub fn parse_pem_block(text: &str, label: &str) -> Option<Vec<u8>> {
+    match parse_pem_blocks(text, label)?.as_slice() {
+        [one] => Some(one.clone()),
         _ => None,
     }
 }
 
-/// Every PEM block of `label` in `text`, re-encoded canonically, or `None` if any of it
-/// is not a well-formed non-empty block of that label.
-pub fn parse_pem_blocks(text: &str, label: &str) -> Option<String> {
+/// The body of every PEM block of `label` in `text`, or `None` if any of it is not a
+/// well-formed non-empty block of that label.
+pub fn parse_pem_blocks(text: &str, label: &str) -> Option<Vec<Vec<u8>>> {
     let blocks = parse_pem_blocks_as(text, label)?;
-    (!blocks.is_empty()).then(|| {
-        blocks
-            .iter()
-            .map(|body| encode_pem(label, body))
-            .collect::<String>()
-    })
+    (!blocks.is_empty()).then_some(blocks)
 }
 
 /// The contents of every PEM block in `text`, requiring the text to be nothing but
@@ -511,85 +603,330 @@ fn parse_pem_blocks_as(text: &str, label: &str) -> Option<Vec<Vec<u8>>> {
     Some(bodies)
 }
 
-/// The certification request this CA hands out, derived once at create time.
+// ---------------------------------------------------------------------------
+// X.509 / PKCS#10 objects
+// ---------------------------------------------------------------------------
+
+/// Object identifiers this service names in the DER it reads and writes.
 ///
-/// The emulator holds no HSM, so the body is not a signed PKCS#10 structure: it is the
-/// request's own content — the CA's ARN, key and signing algorithms and subject
-/// distinguished name — rendered deterministically inside the PEM envelope the modelled
-/// `CsrBody` carries, so the same CA always answers with the same CSR.
-pub fn derive_csr_pem(arn: &str, configuration: &CertificateAuthorityConfiguration) -> String {
-    let subject = distinguished_name(&configuration.subject);
-    let descriptor = format!(
-        "aws-emulator acm-pca certification request\n\
-         certificate-authority: {arn}\n\
-         key-algorithm: {}\n\
-         signing-algorithm: {}\n\
-         subject: {subject}\n",
-        configuration.key_algorithm, configuration.signing_algorithm,
-    );
-    encode_pem(PEM_LABEL_CSR, descriptor.as_bytes())
+/// A hand-written catalog of specification constants — no crate publishes the ML-DSA and
+/// SM2 arcs this model's algorithm enums reach — each with its source:
+///
+/// * the X.500 attribute types a distinguished name carries: RFC 4519 section 2
+///   (`2.5.4.*`), whose short names are the ones RFC 4514 section 3 prints;
+/// * RSA keys and signatures: RFC 8017 appendix C (`1.2.840.113549.1.1.*`);
+/// * EC public keys, the named curves and the ECDSA signatures: RFC 5480 sections 2.1.1
+///   and 2.1.1.1 and RFC 5758 section 3.2 (`1.2.840.10045.*`, `1.3.132.0.*`);
+/// * ML-DSA: the NIST CSOR arc for FIPS 204 (`2.16.840.1.101.3.4.3.17` ..
+///   `2.16.840.1.101.3.4.3.19`);
+/// * SM2 keys and the SM3-with-SM2 signature: GM/T 0006 (`1.2.156.10197.1.*`).
+mod oid {
+    use super::ObjectIdentifier;
+
+    // RFC 4519 section 2 attribute types, in the order `distinguished_name` prints them.
+    pub const COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+    pub const SERIAL_NUMBER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.5");
+    pub const ORGANIZATIONAL_UNIT: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.11");
+    pub const ORGANIZATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.10");
+    pub const LOCALITY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.7");
+    pub const STATE_OR_PROVINCE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.8");
+    pub const COUNTRY: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.6");
+    pub const TITLE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.12");
+    pub const SURNAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.4");
+    pub const GIVEN_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.42");
+    pub const INITIALS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.43");
+    pub const PSEUDONYM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.65");
+    pub const GENERATION_QUALIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.44");
+    pub const DN_QUALIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.46");
+
+    // Public key algorithms.
+    pub const RSA_ENCRYPTION: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    pub const EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+    pub const PRIME256V1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+    pub const SECP384R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+    pub const SECP521R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
+    pub const SM2: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.156.10197.1.301");
+
+    // Signature algorithms.
+    pub const SHA256_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+    pub const SHA384_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+    pub const SHA512_WITH_RSA: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+    pub const RSASSA_PSS: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
+    pub const ECDSA_WITH_SHA256: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    pub const ECDSA_WITH_SHA384: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
+    pub const ECDSA_WITH_SHA512: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
+    pub const SM3_WITH_SM2: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.156.10197.1.501");
+
+    // ML-DSA names one algorithm for the key and the signature alike.
+    pub const ML_DSA_44: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.17");
+    pub const ML_DSA_65: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.18");
+    pub const ML_DSA_87: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.19");
 }
 
-/// The certificate this CA issues for `csr`, derived from what the CA persisted and
-/// from the request.
+/// Whether `der` is a well-formed X.509 certificate.
 ///
-/// As with the CSR above there is no HSM to sign with, so the body is the certificate's
-/// own content — issuer, serial, validity window, signing algorithm, template and the
-/// digest of the certification request it answers — rendered deterministically inside
-/// the PEM envelope `CertificateBody` carries.
-#[allow(clippy::too_many_arguments)]
+/// The structure RFC 5280 section 4.1 defines, decoded by `x509-cert`: a body that is not
+/// one is what `MalformedCertificateException` answers. Nothing here verifies the
+/// signature — the emulator holds no issuer key to verify it against.
+pub fn is_x509_certificate(der: &[u8]) -> bool {
+    Certificate::from_der(der).is_ok()
+}
+
+/// The PKCS#10 certification request `der` carries (RFC 2986 section 4), or `None` when
+/// it is not one — what `MalformedCSRException` answers.
+pub fn parse_certification_request(der: &[u8]) -> Option<CertificationRequest> {
+    CertReq::from_der(der).ok()
+}
+
+/// The certification request this CA hands out, derived once at create time.
+///
+/// A real PKCS#10 `CertificationRequest` whose subject is the CA's own configured
+/// subject and whose `SubjectPublicKeyInfo` names the algorithm the CA was created with,
+/// so the body the CA hands out is the structure a signing authority expects — and the
+/// certificate this service issues for it (below) can be imported back into a CA.
+///
+/// The emulator holds no HSM, so there is no key pair and no signature to make: the
+/// public key and the signature are stand-ins of the right ASN.1 shape, each the SHA-256
+/// digest of the content it belongs to (the CA's ARN, and the request body the signature
+/// covers), so the same CA always answers with the same CSR. Nothing in the emulator
+/// verifies either.
+///
+/// `None` when the configured subject cannot be encoded as an X.500 name.
+pub fn derive_csr_pem(
+    arn: &str,
+    configuration: &CertificateAuthorityConfiguration,
+) -> Option<String> {
+    let info = CertReqInfo {
+        version: x509_cert::request::Version::V1,
+        subject: subject_name(&configuration.subject)?,
+        public_key: public_key_info(&configuration.key_algorithm, arn)?,
+        attributes: SetOfVec::new(),
+    };
+    let algorithm = signature_algorithm_identifier(&configuration.signing_algorithm)?;
+    let signature = stand_in_signature(&info.to_der().ok()?)?;
+    let request = CertReq {
+        info,
+        algorithm,
+        signature,
+    };
+    Some(encode_pem(PEM_LABEL_CSR, &request.to_der().ok()?))
+}
+
+/// The certificate this CA issues for a certification request, built from what the CA
+/// persisted and from the request it answers.
+///
+/// A real X.509 `Certificate` (RFC 5280 section 4.1): the serial the CA allocated, the
+/// issuer the CA's own subject, the resolved validity window, and — as a CA does — the
+/// subject and the public key copied out of the certification request being signed.
+///
+/// As with the CSR above there is no key to sign with, so the signature is a stand-in of
+/// the right ASN.1 shape: the SHA-256 digest of the TBS certificate the signature would
+/// cover. Nothing in the emulator verifies it.
+///
+/// `None` when the CA's subject, the allocated serial or the validity window cannot be
+/// encoded as the certificate's DER demands.
 pub fn derive_certificate_pem(
     ca: &CertificateAuthorityRecord,
     serial: &str,
-    csr: &[u8],
+    request: &CertificationRequestInfo,
     signing_algorithm: &str,
-    template_arn: Option<&String>,
     not_before: SystemTime,
     not_after: SystemTime,
-) -> String {
-    let descriptor = format!(
-        "aws-emulator acm-pca certificate\n\
-         serial: {serial}\n\
-         issuer: {}\n\
-         certificate-authority: {}\n\
-         signing-algorithm: {signing_algorithm}\n\
-         template: {}\n\
-         not-before: {}\n\
-         not-after: {}\n\
-         csr-sha256: {}\n",
-        distinguished_name(&ca.configuration.subject),
-        ca.arn,
-        template_arn.map_or("-", String::as_str),
-        format_timestamp(not_before),
-        format_timestamp(not_after),
-        ::hex::encode(Sha256::digest(csr)),
-    );
-    encode_pem(PEM_LABEL_CERTIFICATE, descriptor.as_bytes())
+) -> Option<String> {
+    let algorithm = signature_algorithm_identifier(signing_algorithm)?;
+    let tbs_certificate = TbsCertificate {
+        version: Version::V3,
+        serial_number: serial_number(serial)?,
+        signature: algorithm.clone(),
+        issuer: subject_name(&ca.configuration.subject)?,
+        validity: CertificateValidity {
+            not_before: certificate_time(not_before)?,
+            not_after: certificate_time(not_after)?,
+        },
+        subject: request.subject.clone(),
+        subject_public_key_info: request.public_key.clone(),
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: None,
+    };
+    let signature = stand_in_signature(&tbs_certificate.to_der().ok()?)?;
+    let certificate = Certificate {
+        tbs_certificate,
+        signature_algorithm: algorithm,
+        signature,
+    };
+    Some(encode_pem(PEM_LABEL_CERTIFICATE, &certificate.to_der().ok()?))
+}
+
+/// The certificate serial `serial` names, as an X.509 `CertificateSerialNumber`.
+///
+/// The CA allocates its serials as hex ([`mint_serial`]), which is how they appear in a
+/// certificate ARN; the DER integer the certificate carries is that same number, so the
+/// two always agree. `SerialNumber` keeps it the positive integer RFC 5280 section
+/// 4.1.2.2 requires by prepending a zero byte when the leading bit is set, which changes
+/// no value.
+fn serial_number(serial: &str) -> Option<SerialNumber> {
+    SerialNumber::new(&::hex::decode(serial).ok()?).ok()
+}
+
+/// `time` as the certificate validity field RFC 5280 section 4.1.2.5 calls for: UTCTime
+/// through 2049 and GeneralizedTime from 2050, which is what `Time::try_from` picks.
+fn certificate_time(time: SystemTime) -> Option<Time> {
+    Time::try_from(time).ok()
+}
+
+/// The `AlgorithmIdentifier` of a modelled `SigningAlgorithm`, or `None` for a value the
+/// enum does not declare.
+///
+/// The three `*_RSA_PSS` members share the RSASSA-PSS identifier and this emitter leaves
+/// its `RSASSA-PSS-params` out, so they are not told apart in the DER: the parameters
+/// describe the digest and salt of a signature, and the emulator makes no signature to
+/// describe (see [`stand_in_signature`]). The member the caller asked for is persisted on
+/// the issued certificate either way.
+fn signature_algorithm_identifier(signing_algorithm: &str) -> Option<AlgorithmIdentifierOwned> {
+    let (algorithm, parameters) = match signing_algorithm {
+        // RSASSA-PKCS1-v1_5 takes a NULL parameter (RFC 8017 appendix C).
+        "SHA256WITHRSA" => (oid::SHA256_WITH_RSA, Some(null_parameters()?)),
+        "SHA384WITHRSA" => (oid::SHA384_WITH_RSA, Some(null_parameters()?)),
+        "SHA512WITHRSA" => (oid::SHA512_WITH_RSA, Some(null_parameters()?)),
+        "SHA256WITHRSA_PSS" | "SHA384WITHRSA_PSS" | "SHA512WITHRSA_PSS" => {
+            (oid::RSASSA_PSS, None)
+        }
+        // ECDSA and ML-DSA identifiers take no parameters (RFC 5758 section 3.2).
+        "SHA256WITHECDSA" => (oid::ECDSA_WITH_SHA256, None),
+        "SHA384WITHECDSA" => (oid::ECDSA_WITH_SHA384, None),
+        "SHA512WITHECDSA" => (oid::ECDSA_WITH_SHA512, None),
+        "SM3WITHSM2" => (oid::SM3_WITH_SM2, None),
+        "ML_DSA_44" => (oid::ML_DSA_44, None),
+        "ML_DSA_65" => (oid::ML_DSA_65, None),
+        "ML_DSA_87" => (oid::ML_DSA_87, None),
+        _ => return None,
+    };
+    Some(AlgorithmIdentifierOwned {
+        oid: algorithm,
+        parameters,
+    })
+}
+
+/// The `SubjectPublicKeyInfo` of a CA created with `key_algorithm`.
+///
+/// The algorithm identifier is the real one for that member of `KeyAlgorithm`; the key
+/// bits are a stand-in derived from `seed` (see [`derive_csr_pem`]), since the emulator
+/// holds no key material. `None` for a value `KeyAlgorithm` does not declare.
+fn public_key_info(key_algorithm: &str, seed: &str) -> Option<SubjectPublicKeyInfoOwned> {
+    let (algorithm, parameters) = match key_algorithm {
+        "RSA_2048" | "RSA_3072" | "RSA_4096" => (oid::RSA_ENCRYPTION, Some(null_parameters()?)),
+        "EC_prime256v1" => (oid::EC_PUBLIC_KEY, Some(curve_parameters(oid::PRIME256V1)?)),
+        "EC_secp384r1" => (oid::EC_PUBLIC_KEY, Some(curve_parameters(oid::SECP384R1)?)),
+        "EC_secp521r1" => (oid::EC_PUBLIC_KEY, Some(curve_parameters(oid::SECP521R1)?)),
+        "SM2" => (oid::EC_PUBLIC_KEY, Some(curve_parameters(oid::SM2)?)),
+        "ML_DSA_44" => (oid::ML_DSA_44, None),
+        "ML_DSA_65" => (oid::ML_DSA_65, None),
+        "ML_DSA_87" => (oid::ML_DSA_87, None),
+        _ => return None,
+    };
+    Some(SubjectPublicKeyInfoOwned {
+        algorithm: AlgorithmIdentifierOwned {
+            oid: algorithm,
+            parameters,
+        },
+        subject_public_key: BitString::from_bytes(&Sha256::digest(seed.as_bytes())).ok()?,
+    })
+}
+
+/// The named-curve `parameters` of an EC public key (RFC 5480 section 2.1.1).
+fn curve_parameters(curve: ObjectIdentifier) -> Option<Any> {
+    Any::new(DerTag::ObjectIdentifier, curve.as_bytes()).ok()
+}
+
+/// The explicit NULL an RSA algorithm identifier carries as its parameters.
+fn null_parameters() -> Option<Any> {
+    Any::new(DerTag::Null, Vec::new()).ok()
+}
+
+/// The signature bits of an object this service writes: the SHA-256 digest of the DER the
+/// signature covers, standing in for a signature the emulator has no key to make.
+fn stand_in_signature(signed: &[u8]) -> Option<BitString> {
+    BitString::from_bytes(&Sha256::digest(signed)).ok()
+}
+
+/// The `SigningAlgorithm` members usable with `key_algorithm`, in the order the model
+/// declares them: the ones whose algorithm family is the family of that key.
+pub fn signing_algorithms_for_key(key_algorithm: &str) -> Vec<&'static str> {
+    let Some(family) = algorithm_family(key_algorithm) else {
+        return Vec::new();
+    };
+    SIGNING_ALGORITHMS_IN_MODEL_ORDER
+        .iter()
+        .copied()
+        .filter(|signing| algorithm_family(signing) == Some(family))
+        .collect()
+}
+
+/// The subject's relative distinguished names, most specific first: the X.500 attribute
+/// type, the short name RFC 4514 section 3 prints for it, and the value.
+///
+/// The one ordered reading of an `ASN1Subject`, shared by the RFC 4514 string below and
+/// by the DER `Name` the certificates carry, so the two can never disagree. An attribute
+/// the request left out or left empty names nothing and is not a relative distinguished
+/// name.
+fn subject_attributes(subject: &ASN1Subject) -> Vec<(ObjectIdentifier, &'static str, &str)> {
+    [
+        (oid::COMMON_NAME, "CN", &subject.common_name),
+        (oid::SERIAL_NUMBER, "SERIALNUMBER", &subject.serial_number),
+        (
+            oid::ORGANIZATIONAL_UNIT,
+            "OU",
+            &subject.organizational_unit,
+        ),
+        (oid::ORGANIZATION, "O", &subject.organization),
+        (oid::LOCALITY, "L", &subject.locality),
+        (oid::STATE_OR_PROVINCE, "ST", &subject.state),
+        (oid::COUNTRY, "C", &subject.country),
+        (oid::TITLE, "TITLE", &subject.title),
+        (oid::SURNAME, "SN", &subject.surname),
+        (oid::GIVEN_NAME, "GIVENNAME", &subject.given_name),
+        (oid::INITIALS, "INITIALS", &subject.initials),
+        (oid::PSEUDONYM, "PSEUDONYM", &subject.pseudonym),
+        (
+            oid::GENERATION_QUALIFIER,
+            "GENERATIONQUALIFIER",
+            &subject.generation_qualifier,
+        ),
+        (
+            oid::DN_QUALIFIER,
+            "DNQ",
+            &subject.distinguished_name_qualifier,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(attribute, key, value)| {
+        value
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| (attribute, key, value))
+    })
+    .collect()
 }
 
 /// The subject's X.500 distinguished name, most specific relative distinguished name
 /// first, as RFC 4514 renders one.
 pub fn distinguished_name(subject: &ASN1Subject) -> String {
-    let mut rdns: Vec<String> = Vec::new();
-    let mut push = |key: &str, value: &Option<String>| {
-        if let Some(value) = value.as_ref().filter(|value| !value.is_empty()) {
-            rdns.push(format!("{key}={value}"));
-        }
-    };
-    push("CN", &subject.common_name);
-    push("SERIALNUMBER", &subject.serial_number);
-    push("OU", &subject.organizational_unit);
-    push("O", &subject.organization);
-    push("L", &subject.locality);
-    push("ST", &subject.state);
-    push("C", &subject.country);
-    push("TITLE", &subject.title);
-    push("SN", &subject.surname);
-    push("GIVENNAME", &subject.given_name);
-    push("INITIALS", &subject.initials);
-    push("PSEUDONYM", &subject.pseudonym);
-    push("GENERATIONQUALIFIER", &subject.generation_qualifier);
-    push("DNQ", &subject.distinguished_name_qualifier);
+    let mut rdns: Vec<String> = subject_attributes(subject)
+        .into_iter()
+        .map(|(_, key, value)| format!("{key}={value}"))
+        .collect();
     for attribute in subject.custom_attributes.iter().flatten() {
         rdns.push(format!(
             "{}={}",
@@ -597,6 +934,40 @@ pub fn distinguished_name(subject: &ASN1Subject) -> String {
         ));
     }
     rdns.join(",")
+}
+
+/// The subject as the DER `Name` a certificate or certification request carries: one
+/// relative distinguished name per attribute the subject supplies, in the order
+/// [`subject_attributes`] reads them, each a `SET OF` one `AttributeTypeAndValue` whose
+/// value is a UTF8String (RFC 5280 section 4.1.2.4).
+///
+/// `None` when an attribute cannot be encoded — a `CustomAttribute` whose
+/// `ObjectIdentifier` is not an object identifier, or a value the DER string type refuses.
+fn subject_name(subject: &ASN1Subject) -> Option<Name> {
+    let mut rdns: Vec<RelativeDistinguishedName> = Vec::new();
+    for (attribute, _, value) in subject_attributes(subject) {
+        rdns.push(relative_distinguished_name(attribute, value)?);
+    }
+    for attribute in subject.custom_attributes.iter().flatten() {
+        let custom = ObjectIdentifier::new(&attribute.object_identifier).ok()?;
+        rdns.push(relative_distinguished_name(custom, &attribute.value)?);
+    }
+    Some(Name::from(RdnSequence(rdns)))
+}
+
+/// One relative distinguished name: the `SET OF` holding the single attribute type and
+/// its UTF8String value.
+fn relative_distinguished_name(
+    attribute: ObjectIdentifier,
+    value: &str,
+) -> Option<RelativeDistinguishedName> {
+    let pair = AttributeTypeAndValue {
+        oid: attribute,
+        value: Any::new(DerTag::Utf8String, value.as_bytes()).ok()?,
+    };
+    Some(RelativeDistinguishedName::from(
+        SetOfVec::try_from(vec![pair]).ok()?,
+    ))
 }
 
 /// Whether `subject` carries at least one relative distinguished name.

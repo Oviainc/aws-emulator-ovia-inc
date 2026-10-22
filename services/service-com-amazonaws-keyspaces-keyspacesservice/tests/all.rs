@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/keyspace_table_lifecycle.rs"]
 mod keyspace_table_lifecycle;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

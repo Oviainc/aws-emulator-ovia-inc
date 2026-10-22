@@ -859,9 +859,16 @@ async fn a_created_request_reads_back_through_get() {
         ] {
             let missing = get(&router, agreement_id, request_id).await;
             assert_eq!(
-                missing.status, 404,
-                "case {case:?} / {not_found_case:?}: expected 404, got {} with {:?}",
-                missing.status, missing.body
+                // This service answers a lookup that found nothing with the
+                // modelled `ResourceNotFoundException` body at HTTP 400, for
+                // every resource it holds — see `crate::state::NOT_FOUND_STATUS`
+                // for the recorded evidence that its model's `@httpError(404)`
+                // understates the wire.
+                missing.status,
+                400,
+                "case {case:?} / {not_found_case:?}: expected 400, got {} with {:?}",
+                missing.status,
+                missing.body
             );
             assert_eq!(
                 missing.error_code(),

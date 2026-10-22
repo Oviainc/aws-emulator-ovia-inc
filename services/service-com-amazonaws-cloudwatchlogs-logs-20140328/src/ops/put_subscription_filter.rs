@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSubscriptionFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSubscriptionFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSubscriptionFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates or updates the subscription filter `filterName` names on the
+//! log group in the shared store, so `DescribeSubscriptionFilters` reports it back.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -222,18 +216,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSubscriptionFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSubscriptionFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSubscriptionFilter"))
+        // `ctx` carries only request metadata: a subscription filter is identified by the
+        // log group it is associated with and its own name, both of which are in `input`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutSubscriptionFilterError::from(
+                PutSubscriptionFilterErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            PutSubscriptionFilterError::from(
+                PutSubscriptionFilterErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // "Creates or updates a subscription filter and associates it with the specified
+        // log group": there is nothing to associate it with until that group exists.
+        let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
+            return Err(PutSubscriptionFilterErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log group does not exist".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The destination has to be one of the kinds this operation documents as
+        // supported; the `logs` one is a logical destination created with
+        // `PutDestination`, not a log group.
+        if !crate::state::is_subscription_destination_arn(&input.destination_arn) {
+            return Err(invalid(format!(
+                "destinationArn must be the ARN of a {} resource",
+                crate::state::SUBSCRIPTION_DESTINATIONS
+                    .iter()
+                    .map(|(service, _)| *service)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        // "Valid values are @aws.account, @aws.region, and @source.log" — the modelled
+        // `SystemField` is a plain string, so the boundary validator does not hold the
+        // list to that catalogue.
+        if let Some(fields) = input.emit_system_fields.as_deref() {
+            if let Some(unknown) = fields
+                .iter()
+                .find(|field| !crate::state::SUBSCRIPTION_SYSTEM_FIELDS.contains(&field.as_str()))
+            {
+                return Err(invalid(format!(
+                    "emitSystemFields value {unknown} is not one of {}",
+                    crate::state::SUBSCRIPTION_SYSTEM_FIELDS.join(", ")
+                )));
+            }
+        }
+
+        // "Each log group can have up to two subscription filters associated with it. If
+        // you are updating an existing filter, you must specify the correct name in
+        // filterName" — so a put under a name the group already holds is an update, and
+        // only a put that would add a filter can exceed the quota.
+        if !group.subscription_filters.contains_key(&input.filter_name)
+            && group.subscription_filters.len()
+                >= crate::state::MAX_SUBSCRIPTION_FILTERS_PER_GROUP
+        {
+            return Err(PutSubscriptionFilterErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a log group can have up to {} subscription filters associated with it",
+                        crate::state::MAX_SUBSCRIPTION_FILTERS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An update keeps the filter's creation time: it is still the same filter, so
+        // only a filter this call creates is stamped with now.
+        let creation_time_ms = group
+            .subscription_filters
+            .get(&input.filter_name)
+            .map_or_else(crate::state::now_ms, |existing| existing.creation_time_ms);
+
+        // Every other member is replaced by what this put names, so a member the request
+        // omits is absent afterwards rather than inherited from the previous put.
+        group.subscription_filters.insert(
+            input.filter_name.clone(),
+            crate::state::SubscriptionFilterRecord {
+                filter_name: input.filter_name,
+                filter_pattern: input.filter_pattern,
+                destination_arn: input.destination_arn,
+                role_arn: input.role_arn,
+                distribution: input.distribution,
+                apply_on_transformed_logs: input.apply_on_transformed_logs,
+                field_selection_criteria: input.field_selection_criteria,
+                emit_system_fields: input.emit_system_fields,
+                creation_time_ms,
+            },
+        );
+
+        Ok(PutSubscriptionFilterOutput)
     }
 }

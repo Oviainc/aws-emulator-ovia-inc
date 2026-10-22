@@ -919,7 +919,10 @@ async fn a_payment_request_needs_an_active_agreement_with_that_variable_term() {
                 "name": "Payment for nothing",
                 "chargeAmount": "10",
             }),
-            status: 404,
+            // This service answers a lookup that found nothing with the modelled
+            // `ResourceNotFoundException` body at HTTP 400, for every resource
+            // it holds — see `crate::state::NOT_FOUND_STATUS`.
+            status: 400,
             code: "ResourceNotFoundException",
             reason: None,
         },

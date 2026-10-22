@@ -16,6 +16,11 @@
 //! is named by the (template, account) pair, so it is held on the template record and its
 //! count is derived from that map.
 //!
+//! Besides those caller-owned records it holds the service's own data: the built-in FIS
+//! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` reports from. No API creates,
+//! updates or deletes an action, so that catalog is a constant table rather than a map a
+//! handler writes.
+//!
 //! Both records are the one copy every handler reads and writes, so a value a create
 //! call returns is the value a later read reports. An experiment also owes the clock a
 //! transition (`initiating` -> `running`, `stopping` -> `stopped`): the instant it falls
@@ -26,7 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, CreateExperimentTemplateActionInput,
+    Action, ActionParameter, ActionTarget, ConflictException, CreateExperimentTemplateActionInput,
     CreateExperimentTemplateExperimentOptionsInput, CreateExperimentTemplateInput,
     CreateExperimentTemplateLogConfigurationInput,
     CreateExperimentTemplateReportConfigurationInput, CreateExperimentTemplateStopConditionInput,
@@ -79,6 +84,14 @@ pub const TEMPLATE_ID_PREFIX: &str = "EXT";
 
 /// The prefix of a minted experiment id, as FIS writes it (`EXP…`).
 pub const EXPERIMENT_ID_PREFIX: &str = "EXP";
+
+/// The ARN resource prefix of a FIS action (`arn:aws:fis:<region>::action/<id>`).
+///
+/// Unlike an experiment or an experiment template, an action is SERVICE-owned: no API
+/// creates one, so its ARN carries no account segment. The AWS Service Authorization
+/// Reference gives the action resource ARN as
+/// `arn:${Partition}:fis:${Region}::action/${Id}`.
+pub const ACTION_RESOURCE: &str = "action";
 
 /// How many characters follow the prefix in a minted id.
 ///
@@ -807,6 +820,17 @@ pub fn experiment_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{EXPERIMENT_RESOURCE}/{id}"))
 }
 
+/// The ARN of the FIS action `id` names, in `region`.
+///
+/// Formatted here rather than through `::engine::emulator_arn` for one reason: that
+/// helper always interpolates the emulator account, and an action's ARN has an EMPTY
+/// account segment because the action belongs to the service rather than to an account
+/// (see [`ACTION_RESOURCE`]). Every account-owned resource this service mints still goes
+/// through the helper — [`template_arn`] and [`experiment_arn`].
+pub fn action_arn(region: &str, id: &str) -> String {
+    format!("arn:aws:{ARN_SERVICE}:{region}::{ACTION_RESOURCE}/{id}")
+}
+
 /// The region this request was signed for — what a minted ARN names.
 ///
 /// The scope's region is only honoured when it has an AWS region's SHAPE
@@ -952,6 +976,14 @@ pub fn invalid_input(message: impl Into<String>) -> ValidationException {
 pub fn template_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("No experiment template found with id {id}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an action id the catalog does not hold —
+/// "the specified resource cannot be found".
+pub fn action_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("No action found with id {id}")),
     }
 }
 
@@ -1248,6 +1280,497 @@ fn experiment_report_configuration(
         pre_experiment_duration: configuration.pre_experiment_duration.clone(),
         post_experiment_duration: configuration.post_experiment_duration.clone(),
     }
+}
+
+/// One parameter of a built-in FIS action, as [`ACTION_CATALOG`] records it.
+#[derive(Debug, Clone, Copy)]
+pub struct ActionCatalogParameter {
+    /// The key the parameter is named by in `Action$parameters`.
+    pub name: &'static str,
+    /// `ActionParameter$description`.
+    pub description: &'static str,
+    /// `ActionParameter$required` — whether an experiment template's action must set it.
+    pub required: bool,
+}
+
+/// One supported target of a built-in FIS action, as [`ACTION_CATALOG`] records it.
+#[derive(Debug, Clone, Copy)]
+pub struct ActionCatalogTarget {
+    /// The key the target is named by in `Action$targets`, which is also the key an
+    /// experiment template's action refers to a target by.
+    pub name: &'static str,
+    /// `ActionTarget$resourceType` — a `TargetResourceTypeId`.
+    pub resource_type: &'static str,
+}
+
+/// One built-in FIS action.
+///
+/// An action is SERVICE-owned: FIS publishes the catalog and no API creates, updates or
+/// deletes an entry, so `GetAction` and `ListActions` report from this table rather than
+/// from anything a caller stored. The table is what makes those two operations agree.
+#[derive(Debug, Clone, Copy)]
+pub struct ActionCatalogEntry {
+    /// `ActionId` — the fully qualified action id (`aws:<service>:<operation>`).
+    pub id: &'static str,
+    /// `ActionDescription`.
+    pub description: &'static str,
+    /// The action's parameters, empty for an action that takes none.
+    pub parameters: &'static [ActionCatalogParameter],
+    /// The target resource types the action supports, empty for an action that needs no
+    /// target.
+    pub targets: &'static [ActionCatalogTarget],
+}
+
+impl ActionCatalogEntry {
+    /// The `Action` `GetAction` reports for this entry, in `region`.
+    ///
+    /// `tags` is an empty map: an action is service-owned, so there is nothing for a
+    /// caller to have tagged on it.
+    pub fn to_action(&self, region: &str) -> Action {
+        Action {
+            id: Some(self.id.to_string()),
+            arn: Some(action_arn(region, self.id)),
+            description: Some(self.description.to_string()),
+            parameters: Some(
+                self.parameters
+                    .iter()
+                    .map(|parameter| {
+                        (
+                            parameter.name.to_string(),
+                            ActionParameter {
+                                description: Some(parameter.description.to_string()),
+                                required: Some(parameter.required),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            targets: Some(
+                self.targets
+                    .iter()
+                    .map(|target| {
+                        (
+                            target.name.to_string(),
+                            ActionTarget {
+                                resource_type: Some(target.resource_type.to_string()),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            tags: Some(HashMap::new()),
+        }
+    }
+}
+
+/// The built-in FIS actions this emulator serves.
+///
+/// SOURCE: the AWS FIS actions reference
+/// (<https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html>), which
+/// `Action`'s own model documentation points at ("Describes an action. For more
+/// information, see FIS actions in the Fault Injection Service User Guide"). Each entry
+/// records what that reference states for the action: its id, a one-line summary of what
+/// it does, the parameters it accepts and which of them are required, and the target
+/// resource types it supports under the key an experiment template refers to them by.
+///
+/// It is a SUBSET of the published catalog, not the whole of it: an id this table does
+/// not hold answers `ResourceNotFoundException` rather than a fabricated action.
+///
+/// Kept sorted by id, which is the order `ListActions` enumerates in.
+pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
+    ActionCatalogEntry {
+        id: "aws:cloudwatch:assert-alarm-state",
+        description: "Verify that the specified alarms are in one of the specified alarm states.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "alarmArns",
+                description: "The Amazon Resource Names (ARNs) of the alarms, separated by commas.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "alarmStates",
+                description: "The alarm states, separated by commas.",
+                required: true,
+            },
+        ],
+        targets: &[],
+    },
+    ActionCatalogEntry {
+        id: "aws:ebs:pause-volume-io",
+        description: "Pause I/O operations on the target EBS volumes.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Volumes",
+            resource_type: "aws:ec2:ebs-volume",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ec2:api-insufficient-instance-capacity-error",
+        description: "Cause EC2 RunInstances requests made with the target IAM roles to fail with \
+                      an insufficient instance capacity error.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "availabilityZoneIdentifiers",
+                description: "The Availability Zones, separated by commas.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percentage",
+                description: "The percentage of calls to affect.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Roles",
+            resource_type: "aws:iam:role",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ec2:asg-insufficient-instance-capacity-error",
+        description: "Cause instance launches in the target Auto Scaling groups to fail with an \
+                      insufficient instance capacity error.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "availabilityZoneIdentifiers",
+                description: "The Availability Zones, separated by commas.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percentage",
+                description: "The percentage of calls to affect.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "AutoScalingGroups",
+            resource_type: "aws:ec2:autoscaling-group",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ec2:reboot-instances",
+        description: "Reboot the target EC2 instances.",
+        parameters: &[],
+        targets: &[ActionCatalogTarget {
+            name: "Instances",
+            resource_type: "aws:ec2:instance",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ec2:send-spot-instance-interruptions",
+        description: "Interrupt the target Spot Instances.",
+        parameters: &[ActionCatalogParameter {
+            name: "durationBeforeInterruption",
+            description: "The length of time before the interruption notice is sent, in ISO 8601 \
+                          format.",
+            required: false,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "SpotInstances",
+            resource_type: "aws:ec2:spot-instance",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ec2:stop-instances",
+        description: "Stop the target EC2 instances.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "completeIfInstancesTerminated",
+                description: "Whether to complete the action if the target instances were \
+                              terminated instead of stopped.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "startInstancesAfterDuration",
+                description: "The length of time to wait before starting the instances again, in \
+                              ISO 8601 format.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Instances",
+            resource_type: "aws:ec2:instance",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ec2:terminate-instances",
+        description: "Terminate the target EC2 instances.",
+        parameters: &[],
+        targets: &[ActionCatalogTarget {
+            name: "Instances",
+            resource_type: "aws:ec2:instance",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ecs:drain-container-instances",
+        description: "Drain the container instances of the target Amazon ECS clusters.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "drainagePercentage",
+                description: "The percentage of container instances to drain.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Clusters",
+            resource_type: "aws:ecs:cluster",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ecs:stop-task",
+        description: "Stop the target Amazon ECS tasks.",
+        parameters: &[],
+        targets: &[ActionCatalogTarget {
+            name: "Tasks",
+            resource_type: "aws:ecs:task",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:terminate-nodegroup-instances",
+        description: "Terminate instances in the target Amazon EKS node groups.",
+        parameters: &[ActionCatalogParameter {
+            name: "instanceTerminationPercentage",
+            description: "The percentage of instances to terminate.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Nodegroups",
+            resource_type: "aws:eks:nodegroup",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:fis:inject-api-internal-error",
+        description: "Cause API requests made with the target IAM roles to fail with an internal \
+                      error.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "operations",
+                description: "The API operations to affect, separated by commas.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percentage",
+                description: "The percentage of calls to affect.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "service",
+                description: "The AWS service whose API operations are affected.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Roles",
+            resource_type: "aws:iam:role",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:fis:inject-api-throttle-error",
+        description: "Cause API requests made with the target IAM roles to be throttled.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "operations",
+                description: "The API operations to affect, separated by commas.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percentage",
+                description: "The percentage of calls to affect.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "service",
+                description: "The AWS service whose API operations are affected.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Roles",
+            resource_type: "aws:iam:role",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:fis:inject-api-unavailable-error",
+        description: "Cause API requests made with the target IAM roles to fail with an \
+                      unavailable error.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "operations",
+                description: "The API operations to affect, separated by commas.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percentage",
+                description: "The percentage of calls to affect.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "service",
+                description: "The AWS service whose API operations are affected.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Roles",
+            resource_type: "aws:iam:role",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:fis:wait",
+        description: "Wait for the specified duration.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[],
+    },
+    ActionCatalogEntry {
+        id: "aws:network:disrupt-connectivity",
+        description: "Disrupt network connectivity for the target subnets.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "scope",
+                description: "The traffic to disrupt.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Subnets",
+            resource_type: "aws:ec2:subnet",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:rds:failover-db-cluster",
+        description: "Fail over the target Amazon Aurora DB clusters.",
+        parameters: &[],
+        targets: &[ActionCatalogTarget {
+            name: "Clusters",
+            resource_type: "aws:rds:cluster",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:rds:reboot-db-instances",
+        description: "Reboot the target Amazon RDS DB instances.",
+        parameters: &[ActionCatalogParameter {
+            name: "forceFailover",
+            description: "Whether to force a failover of a Multi-AZ DB instance.",
+            required: false,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "DBInstances",
+            resource_type: "aws:rds:db",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ssm:send-command",
+        description: "Run the specified SSM document on the target instances.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "documentArn",
+                description: "The Amazon Resource Name (ARN) of the document.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "documentParameters",
+                description: "The document parameters, as a JSON object.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "documentVersion",
+                description: "The version of the document.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Instances",
+            resource_type: "aws:ec2:instance",
+        }],
+    },
+    ActionCatalogEntry {
+        id: "aws:ssm:start-automation-execution",
+        description: "Run the specified SSM automation document.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "documentArn",
+                description: "The Amazon Resource Name (ARN) of the automation document.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "documentParameters",
+                description: "The document parameters, as a JSON object.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "documentVersion",
+                description: "The version of the document.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "maxConcurrency",
+                description: "The maximum number of automation executions to run at the same \
+                              time.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "maxErrors",
+                description: "The maximum number of allowed automation execution failures.",
+                required: false,
+            },
+        ],
+        targets: &[],
+    },
+];
+
+/// The catalog entry `id` names, or `None` when FIS publishes no such action.
+///
+/// `ActionId` is matched exactly: an action id is case-sensitive, so a differently cased
+/// or abbreviated id names no action.
+pub fn action_catalog_entry(id: &str) -> Option<&'static ActionCatalogEntry> {
+    ACTION_CATALOG.iter().find(|entry| entry.id == id)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

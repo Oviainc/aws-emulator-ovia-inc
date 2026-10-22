@@ -17,6 +17,8 @@ mod application_lifecycle;
 mod application_projection;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/session_lifecycle.rs"]
 mod session_lifecycle;
 #[path = "all/state_roundtrip.rs"]

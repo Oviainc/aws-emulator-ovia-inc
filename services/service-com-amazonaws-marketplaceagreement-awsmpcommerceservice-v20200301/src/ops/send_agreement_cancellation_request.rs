@@ -214,12 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(agreement) = store.agreements.get(&input.agreement_id) else {
-            return Err(
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
                 SendAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
                     crate::state::agreement_not_found(&input.agreement_id),
-                )
-                .into(),
-            );
+                ),
+            ));
         };
 
         // "Allows sellers (proposers) to submit a cancellation request for an

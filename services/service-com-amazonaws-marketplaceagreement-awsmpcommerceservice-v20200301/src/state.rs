@@ -1634,6 +1634,41 @@ fn violation_kind(violation: &::smithy_server_runtime::Violation) -> RefusalKind
     }
 }
 
+/// The HTTP status this service answers a reference to an id that names no
+/// resource with, for EVERY resource it holds.
+///
+/// `ResourceNotFoundException` is the shape such a reference is answered with —
+/// it is the one that carries `resourceId` and `resourceType`, naming what was
+/// looked for — and the model declares it `@httpError(404)`. The status this
+/// service actually sends with that body is 400: the recorded AWS responses for
+/// `AWSMPCommerceService_v20200301` answer an unknown agreement and an unknown
+/// agreement request with HTTP 400 carrying the `ResourceNotFoundException`
+/// body, so the model's `@httpError` understates what the wire does. The status
+/// belongs to the SERVICE and not to those two resources — one condition cannot
+/// read as two status classes depending on which of this service's resources was
+/// looked for — so every lookup in this crate answers through [`not_found`].
+/// Only the STATUS is this service's; the body and the error code stay the
+/// model's, which is exactly what
+/// [`crate::scaffolded::Scaffolded::ModeledWithStatus`] renders.
+pub const NOT_FOUND_STATUS: u16 = 400;
+
+/// Lift a not-found refusal into an operation's error channel at
+/// [`NOT_FOUND_STATUS`], so every lookup that found nothing answers the one
+/// status this service answers them with.
+pub fn not_found<E>(error: E) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::modeled_with_status(error, NOT_FOUND_STATUS)
+}
+
+/// How this service words a reference to a resource that does not exist, for
+/// the resource noun its message names.
+///
+/// One sentence per resource kind, naming the KIND and not the id — the id the
+/// caller supplied is reported in `resourceId`, which is the modelled place for
+/// it, so nothing about the request is lost.
+fn does_not_exist(resource: &str) -> String {
+    format!("Provided {resource} does not exist.")
+}
+
 /// How this service states a request whose filters cannot hold together with
 /// the rest of the request.
 ///
@@ -1684,7 +1719,7 @@ pub fn store_full(resource_type: &str, quota: usize) -> ThrottlingException {
 pub fn agreement_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         request_id: None,
-        message: Some(format!("agreement {id} not found")),
+        message: Some(does_not_exist("agreement")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_AGREEMENT.to_string()),
     }
@@ -1694,7 +1729,7 @@ pub fn agreement_not_found(id: &str) -> ResourceNotFoundException {
 pub fn agreement_request_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         request_id: None,
-        message: Some(format!("agreement request {id} not found")),
+        message: Some(does_not_exist("agreement request")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_AGREEMENT_REQUEST.to_string()),
     }
@@ -1705,7 +1740,7 @@ pub fn agreement_request_not_found(id: &str) -> ResourceNotFoundException {
 pub fn billing_adjustment_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         request_id: None,
-        message: Some(format!("billing adjustment request {id} not found")),
+        message: Some(does_not_exist("billing adjustment request")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST.to_string()),
     }

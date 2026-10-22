@@ -2,10 +2,11 @@
 
 //! Engine state for the com-amazonaws-mediaconvert-mediaconvert service.
 //!
-//! The transcoding-job control plane: the `queues` a job can be sent to, the `jobs`
-//! themselves, the output `presets` a job's outputs can name and the account's input
-//! `policy`. Every response the handlers in `src/ops/` build is projected from a record
-//! stored here, so a value a caller reads back is the value some earlier call persisted.
+//! The transcoding-job control plane: the `queues` a job can be sent to, the
+//! `job_templates` a job can be created from, the `jobs` themselves, the output `presets`
+//! a job's outputs can name and the account's input `policy`. Every response the handlers
+//! in `src/ops/` build is projected from a record stored here, so a value a caller reads
+//! back is the value some earlier call persisted.
 //!
 //! The account policy is a SINGLETON — the API has no policy name or id, so `PutPolicy`
 //! replaces one record and `DeletePolicy` drops it; it is not caller-driven growth.
@@ -14,16 +15,15 @@
 //!
 //! Nothing here grows without a ceiling and nothing here walks an unbounded set:
 //!
-//! * `queues` is capped at [`MAX_QUEUES`], `jobs` at [`MAX_JOBS`] and `presets` at
-//!   [`MAX_PRESETS`]; a create past the cap is refused with the modelled
-//!   `ServiceQuotaExceededException` (HTTP 402) instead of growing the store.
-//!   `idempotency` holds at most one entry per stored job, so it is bounded by
-//!   `MAX_JOBS` too, and `endpoints` \u2014 one account endpoint per region a request
-//!   was signed for \u2014 is capped at [`MAX_ENDPOINTS`] the same way.
-//! * `job_templates` is seeded once, at state construction, with the built-in system
-//!   templates and is not grown by any request path yet, so its size is a constant;
-//!   the cap on caller-created templates belongs with `CreateJobTemplate`, which is
-//!   still a scaffold stub.
+//! * `queues` is capped at [`MAX_QUEUES`], `jobs` at [`MAX_JOBS`], `job_templates` at
+//!   [`MAX_JOB_TEMPLATES`] and `presets` at [`MAX_PRESETS`]; a create past the cap is
+//!   refused with the modelled `ServiceQuotaExceededException` (HTTP 402) instead of
+//!   growing the store. The built-in system templates `job_templates` is seeded with are
+//!   inside that cap, and no request path removes or re-seeds them: `UpdateJobTemplate`
+//!   and `DeleteJobTemplate` refuse a `SYSTEM` template with the modelled
+//!   `ForbiddenException`. `idempotency` holds at most one entry per stored job, so it is
+//!   bounded by `MAX_JOBS` too, and `endpoints` (one account endpoint per region a request
+//!   was signed for) is capped at [`MAX_ENDPOINTS`] the same way.
 //! * A record's `tags` are capped at [`MAX_TAGS_PER_RESOURCE`], so `TagResource` cannot
 //!   grow one record without limit either; past the cap it answers the same quota error.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
@@ -143,6 +143,11 @@ pub const MAX_QUEUES: usize = 1_000;
 /// bound, as [`MAX_QUEUES`] is, and the ceiling on every walk over the job set.
 pub const MAX_JOBS: usize = 10_000;
 
+/// How many job templates this store holds before `CreateJobTemplate` is refused. A
+/// chosen capacity bound, as [`MAX_QUEUES`] is, refused with the same modelled
+/// `ServiceQuotaExceededException` the operation declares.
+pub const MAX_JOB_TEMPLATES: usize = 1_000;
+
 /// How many presets this store holds before `CreatePreset` is refused. A chosen
 /// capacity bound, as [`MAX_QUEUES`] is, refused with the same modelled
 /// `ServiceQuotaExceededException`.
@@ -223,8 +228,22 @@ pub fn not_found_message(member: &str) -> String {
 /// member that named the resource. As with [`not_found_message`], the wording is built
 /// from the request, never from the resource's own name.
 pub fn system_resource_delete_message(member: &str) -> String {
+    system_resource_message(member, "delete")
+}
+
+/// As [`system_resource_delete_message`], for a request that would MODIFY a built-in
+/// resource rather than delete it — `UpdateJobTemplate` on a `SYSTEM` template, which
+/// `JobTemplate$Type` says a user "can't modify or delete". Same recorded shape, naming
+/// the request member and the action the request asked for.
+pub fn system_resource_modify_message(member: &str) -> String {
+    system_resource_message(member, "modify")
+}
+
+/// The one wording both built-in-resource refusals share, so the recorded sentence lives
+/// in a single format string and only the action the request asked for differs.
+fn system_resource_message(member: &str, action: &str) -> String {
     format!(
-        "You specified an invalid value for {member}. You are not allowed to delete \
+        "You specified an invalid value for {member}. You are not allowed to {action} \
          system resources."
     )
 }
@@ -829,7 +848,7 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     pub policy: Option<PolicyRecord>,
     /// Job templates by `Name`; "Each name must be unique within your account". Seeded
     /// with the built-in [`SYSTEM_JOB_TEMPLATES`]; a caller's own templates join them
-    /// through `CreateJobTemplate`, which is where that growth gets its cap.
+    /// through `CreateJobTemplate`, which holds the total to [`MAX_JOB_TEMPLATES`].
     pub job_templates: BTreeMap<String, JobTemplateRecord>,
     /// The account's API endpoint URL per region, keyed by the region of the request
     /// that first asked for it in `DEFAULT` mode. At most [`MAX_ENDPOINTS`] entries.
@@ -1067,6 +1086,11 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// Whether the store is at [`MAX_QUEUES`] and can hold no further queue.
     pub fn queues_at_capacity(&self) -> bool {
         self.queues.len() >= MAX_QUEUES
+    }
+
+    /// Whether the store is at [`MAX_JOB_TEMPLATES`] and can hold no further template.
+    pub fn job_templates_at_capacity(&self) -> bool {
+        self.job_templates.len() >= MAX_JOB_TEMPLATES
     }
 
     /// Whether the store is at [`MAX_PRESETS`] and can hold no further preset.

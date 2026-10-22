@@ -11,13 +11,9 @@
 //! document shape, scope, ARN form, page size, quota boundary); any single policy an
 //! issue happens to mention is one row.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 
-/// The region the test's SigV4 credential scope names, so an ARN built from the request
-/// is distinguishable from one built from a hardcoded default.
-const REGION: &str = "eu-west-2";
+use crate::harness::{now_ms, Logs};
 
 /// AWS's documented quota, from `PutResourcePolicy`: "An account can have a maximum of
 /// 10 policies without resourceARN and one per LogGroup resourceARN".
@@ -44,81 +40,6 @@ const ACCOUNT_POLICY_ROWS: &[(&str, &str, &[&str])] = &[
         &["logs:CreateLogStream"],
     ),
 ];
-
-/// One service mounted on one shared engine, reached over the wire.
-struct Logs {
-    router: smithy_server_runtime::MultiServiceRouter,
-}
-
-impl Logs {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = smithy_server_runtime::MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// Call one operation, returning its HTTP status and parsed JSON body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("Logs_20140328.{operation}"))
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/logs/aws4_request, \
-                     SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
-                ),
-            )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("the request body serializes"),
-            ))
-            .expect("a valid request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, parsed)
-    }
-
-    /// Call one operation that must succeed, returning its response body.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
-        let (status, parsed) = self.call(operation, body).await;
-        assert_eq!(
-            status, 200,
-            "{operation} {body}: expected HTTP 200, got {status} {parsed}"
-        );
-        parsed
-    }
-
-    /// Call one operation that must be refused as a client error, returning its wire
-    /// error code.
-    async fn err(&self, operation: &str, body: &Value) -> String {
-        let (status, parsed) = self.call(operation, body).await;
-        assert_eq!(
-            status, 400,
-            "{operation} {body}: expected HTTP 400, got {status} {parsed}"
-        );
-        error_code(&parsed)
-    }
-}
-
-/// The wire error code of an awsJson error body (`__type`, which may carry a namespace).
-fn error_code(body: &Value) -> String {
-    let raw = body
-        .get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("an error body must carry __type, got {body}"));
-    raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
-}
 
 /// A resource policy document of the form `PutResourcePolicy$policyDocument` documents:
 /// a statement allowing a service principal the actions the API supports.
@@ -864,15 +785,4 @@ async fn put_refuses_requests_it_cannot_store() {
         "ValidationException",
         "case policyScope EVERYTHING: the scope is ACCOUNT or RESOURCE"
     );
-}
-
-/// Wall-clock milliseconds, the unit every CloudWatch Logs timestamp member carries.
-fn now_ms() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the clock is after the Unix epoch")
-            .as_millis(),
-    )
-    .expect("the epoch milliseconds fit in an i64")
 }

@@ -26,6 +26,15 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex for those serials and digests.
 hex = { workspace = true }
+# Reads and writes the DER X.509 certificates and PKCS#10 certification requests this
+# service accepts (ImportCertificateAuthorityCertificate, IssueCertificate) and hands
+# out (GetCertificateAuthorityCsr, GetCertificate).
+x509-cert = "0.2"
+
+[dev-dependencies]
+# Generates the real certificates and certification requests the tests feed the
+# service, independently of the DER this crate writes itself.
+rcgen = "0.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

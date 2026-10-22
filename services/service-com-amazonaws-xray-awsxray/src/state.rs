@@ -46,6 +46,16 @@
 //! publishes no telemetry reader — so the store is what the ingest asserts, and
 //! it is bounded like the trace store is.
 //!
+//! A trace retrieval is the same loop over a longer clock: `StartTraceRetrieval`
+//! stores one [`TraceRetrievalRecord`] per accepted call under the token it
+//! minted, and every reader of that token (`ListRetrievedTraces`,
+//! `GetRetrievedTracesGraph`) recomputes BOTH its `RetrievalStatus` — from the
+//! instants stored on the record, through
+//! [`TraceRetrievalRecord::status`] — and its traces — from the stored segment
+//! documents of the requested ids inside the requested window, through
+//! [`ComAmazonawsXrayAwsxrayState::retrieved_traces`]. `CancelTraceRetrieval` is
+//! the one call that moves a retrieval's status by hand.
+//!
 //! Every instant a segment document carries is checked where the document is
 //! read ([`MAX_SEGMENT_EPOCH_SECONDS`]), so no stored `start_time` / `end_time`
 //! can be a value a reader cannot convert to the modelled `Timestamp`; the
@@ -443,6 +453,52 @@ pub const TRACE_RETRIEVAL_BURST: u32 = 3;
 /// the budget down and is told so, while a caller that starts one retrieval at a
 /// time is never throttled.
 pub const TRACE_RETRIEVAL_RATE_PER_SECOND: f64 = 3.0;
+
+/// `RetrievalStatus` for a retrieval that was accepted but has not begun
+/// reading, from
+/// [`RETRIEVAL_STATUS_VALUES`](crate::ops::types::RETRIEVAL_STATUS_VALUES).
+pub const RETRIEVAL_STATUS_SCHEDULED: &str = "SCHEDULED";
+
+/// `RetrievalStatus` while a retrieval is reading, from
+/// [`RETRIEVAL_STATUS_VALUES`](crate::ops::types::RETRIEVAL_STATUS_VALUES).
+pub const RETRIEVAL_STATUS_RUNNING: &str = "RUNNING";
+
+/// `RetrievalStatus` once a retrieval's results are readable, from
+/// [`RETRIEVAL_STATUS_VALUES`](crate::ops::types::RETRIEVAL_STATUS_VALUES).
+pub const RETRIEVAL_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// `RetrievalStatus` for a retrieval `CancelTraceRetrieval` stopped, from
+/// [`RETRIEVAL_STATUS_VALUES`](crate::ops::types::RETRIEVAL_STATUS_VALUES).
+pub const RETRIEVAL_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// How long a started retrieval reports `SCHEDULED` before the clock owes it
+/// `RETRIEVAL_STATUS_RUNNING`.
+///
+/// CHOSEN, not documented: X-Ray publishes no duration for scheduling a
+/// retrieval, so this is a value inside the project's 250–750 ms band for a
+/// transition the clock owes. It is deliberately non-zero because
+/// `GetRetrievedTracesGraph` documents the states a caller can observe — "Retry
+/// the request after the status changes from RUNNING or SCHEDULED to COMPLETE" —
+/// so a read taken straight after the start must still see the retrieval before
+/// it runs.
+pub const TRACE_RETRIEVAL_SCHEDULED_SPAN_SECONDS: f64 = 0.25;
+
+/// How long a retrieval reports `RETRIEVAL_STATUS_RUNNING` before the clock owes
+/// it `RETRIEVAL_STATUS_COMPLETE`.
+///
+/// CHOSEN for the same reason as [`TRACE_RETRIEVAL_SCHEDULED_SPAN_SECONDS`], and
+/// non-zero for the same one: "the API will return an empty response" while the
+/// status is not `COMPLETE` (`ListRetrievedTraces`), which a caller can only
+/// observe if the running state lasts.
+pub const TRACE_RETRIEVAL_RUNNING_SPAN_SECONDS: f64 = 0.25;
+
+/// `TraceFormatType` for the X-Ray segment documents this service ingests, from
+/// [`TRACE_FORMAT_TYPE_VALUES`](crate::ops::types::TRACE_FORMAT_TYPE_VALUES).
+pub const TRACE_FORMAT_XRAY: &str = "XRAY";
+
+/// `TraceFormatType` for OpenTelemetry spans, from
+/// [`TRACE_FORMAT_TYPE_VALUES`](crate::ops::types::TRACE_FORMAT_TYPE_VALUES).
+pub const TRACE_FORMAT_OTEL: &str = "OTEL";
 
 /// How far past the present a `[StartTime, EndTime]` bound may land before the
 /// window is refused as not naming a time the data could have.
@@ -1651,6 +1707,38 @@ impl TraceRecord {
     pub fn is_partial(&self) -> bool {
         self.segments.iter().any(|segment| segment.in_progress)
     }
+
+    /// This trace with only the segments whose `start_time` falls in the
+    /// INCLUSIVE interval `[start, end]`, with its id index and time bounds
+    /// recomputed over what is left.
+    ///
+    /// The index is rebuilt rather than carried over, so a reader that resolves
+    /// a `parent_id` through the trimmed trace — a derived graph does — can
+    /// never reach a segment the window excluded.
+    fn within(&self, start: f64, end: f64) -> Self {
+        let segments: Vec<SegmentRecord> = self
+            .segments
+            .iter()
+            .filter(|segment| segment.start_time >= start && segment.start_time <= end)
+            .cloned()
+            .collect();
+        let segment_index = segments
+            .iter()
+            .enumerate()
+            .map(|(at, segment)| (segment.id.clone(), at))
+            .collect();
+        let mut trimmed = Self {
+            id: self.id.clone(),
+            segments,
+            segment_index,
+            first_start: 0.0,
+            last_end: 0.0,
+            limit_exceeded: self.limit_exceeded,
+            ingest_seq: self.ingest_seq,
+        };
+        trimmed.recompute_bounds();
+        trimmed
+    }
 }
 
 impl GroupRecord {
@@ -2781,7 +2869,8 @@ impl Default for RateLimiter {
 // ---------------------------------------------------------------------------
 
 /// One started trace retrieval: what `StartTraceRetrieval` was asked for, under
-/// the `RetrievalToken` it minted for it.
+/// the `RetrievalToken` it minted for it, plus the instants the clock owes its
+/// `RetrievalStatus` transitions at.
 #[derive(Debug, Clone, Default)]
 pub struct TraceRetrievalRecord {
     /// The minted, opaque `RetrievalToken`.
@@ -2794,9 +2883,51 @@ pub struct TraceRetrievalRecord {
     pub end_time: f64,
     /// When the retrieval was started, in seconds of epoch time.
     pub started_at: f64,
+    /// When the retrieval stops reporting `SCHEDULED` and starts reporting
+    /// `RUNNING`, in seconds of epoch time.
+    pub running_at: f64,
+    /// When the retrieval's results become readable and it starts reporting
+    /// `COMPLETE`, in seconds of epoch time.
+    pub complete_at: f64,
+    /// When `CancelTraceRetrieval` stopped this retrieval, in seconds of epoch
+    /// time; `None` while it was never cancelled.
+    pub cancelled_at: Option<f64>,
     /// When the retrieval times out, [`TRACE_RETRIEVAL_TIMEOUT_SECONDS`] after
     /// it started.
     pub expires_at: f64,
+}
+
+impl TraceRetrievalRecord {
+    /// This retrieval's `RetrievalStatus` at `now`, computed from the instants
+    /// stored on it — never from a status written at the time of some earlier
+    /// call, so two readers at the same instant always agree.
+    ///
+    /// `FAILED` and `TIMEOUT` are never reported: no retrieval here can fail
+    /// (the results are derived from traces already stored), and every one
+    /// becomes readable within [`TRACE_RETRIEVAL_RUNNING_SPAN_SECONDS`] of
+    /// running — far inside the documented 60-minute timeout, so nothing ever
+    /// runs out of it.
+    pub fn status(&self, now: f64) -> &'static str {
+        if self.cancelled_at.is_some() {
+            RETRIEVAL_STATUS_CANCELLED
+        } else if now >= self.complete_at {
+            RETRIEVAL_STATUS_COMPLETE
+        } else if now >= self.running_at {
+            RETRIEVAL_STATUS_RUNNING
+        } else {
+            RETRIEVAL_STATUS_SCHEDULED
+        }
+    }
+
+    /// Whether this retrieval is still the "ongoing trace retrieval job"
+    /// `CancelTraceRetrieval` cancels: one that has not reached a status it can
+    /// no longer leave.
+    pub fn is_ongoing(&self, now: f64) -> bool {
+        matches!(
+            self.status(now),
+            RETRIEVAL_STATUS_SCHEDULED | RETRIEVAL_STATUS_RUNNING
+        )
+    }
 }
 
 impl ComAmazonawsXrayAwsxrayState {
@@ -2826,6 +2957,7 @@ impl ComAmazonawsXrayAwsxrayState {
         }
         self.retrieval_seq += 1;
         let retrieval_token = self.mint_retrieval_token(&trace_ids, start_time, end_time);
+        let running_at = now + TRACE_RETRIEVAL_SCHEDULED_SPAN_SECONDS;
         self.retrievals.insert(
             retrieval_token.clone(),
             TraceRetrievalRecord {
@@ -2834,10 +2966,84 @@ impl ComAmazonawsXrayAwsxrayState {
                 start_time,
                 end_time,
                 started_at: now,
+                running_at,
+                complete_at: running_at + TRACE_RETRIEVAL_RUNNING_SPAN_SECONDS,
+                cancelled_at: None,
                 expires_at: now + TRACE_RETRIEVAL_TIMEOUT_SECONDS,
             },
         );
         &self.retrievals[&retrieval_token]
+    }
+
+    /// The retrieval `retrieval_token` names, once the retrievals the clock has
+    /// already timed out are gone.
+    ///
+    /// `None` is a token this service never issued, or one whose retrieval has
+    /// timed out — which is what a reader answers `ResourceNotFoundException`
+    /// for. The expiry it materialises was owed at `now` whether or not anybody
+    /// called, so a reader may do it too.
+    pub fn trace_retrieval(
+        &mut self,
+        retrieval_token: &str,
+        now: f64,
+    ) -> Option<&TraceRetrievalRecord> {
+        self.expire_trace_retrievals(now);
+        self.retrievals.get(retrieval_token)
+    }
+
+    /// Stop an ongoing retrieval, so every later read of its token reports
+    /// `RETRIEVAL_STATUS_CANCELLED`.
+    ///
+    /// `Ok` carries the cancelled retrieval. `Err(Some(status))` is a retrieval
+    /// that is no longer ongoing — there is no job left to cancel — and
+    /// `Err(None)` a token that names no retrieval at all.
+    pub fn cancel_trace_retrieval(
+        &mut self,
+        retrieval_token: &str,
+        now: f64,
+    ) -> Result<&TraceRetrievalRecord, Option<&'static str>> {
+        self.expire_trace_retrievals(now);
+        let Some(retrieval) = self.retrievals.get_mut(retrieval_token) else {
+            return Err(None);
+        };
+        let status = retrieval.status(now);
+        if !retrieval.is_ongoing(now) {
+            return Err(Some(status));
+        }
+        retrieval.cancelled_at = Some(now);
+        Ok(retrieval)
+    }
+
+    /// The traces one retrieval holds: every requested trace id that names a
+    /// stored trace, each trimmed to the segments whose `start_time` falls
+    /// inside the retrieval's window, in the order the retrieval asked for them.
+    ///
+    /// The window is INCLUSIVE at both ends — "The range is inclusive, so the
+    /// specified start time is included in the query" /"the specified end time
+    /// is included", `StartTraceRetrieval`'s own documentation for `StartTime`
+    /// and `EndTime` — unlike the half-open interval `GetTraceSummaries`
+    /// selects on.
+    ///
+    /// A requested id that names nothing stored, a repeat of one already
+    /// answered, and a trace whose every segment started outside the window each
+    /// contribute no trace: a retrieval reports the traffic that was recorded,
+    /// never the ids that were asked about.
+    pub fn retrieved_traces(&self, retrieval: &TraceRetrievalRecord) -> Vec<TraceRecord> {
+        let mut answered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut traces = Vec::new();
+        for trace_id in &retrieval.trace_ids {
+            if !answered.insert(trace_id.as_str()) {
+                continue;
+            }
+            let Some(trace) = self.traces.get(trace_id) else {
+                continue;
+            };
+            let trimmed = trace.within(retrieval.start_time, retrieval.end_time);
+            if !trimmed.segments.is_empty() {
+                traces.push(trimmed);
+            }
+        }
+        traces
     }
 
     /// Drop every retrieval the clock has already timed out.

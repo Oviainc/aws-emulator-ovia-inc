@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region every request below is signed for. Deliberately NOT the emulator's default
 /// region, so an ARN built from the request's own SigV4 credential scope is
 /// distinguishable from one built from a constant.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// How long a test waits before expecting a transient status to have settled: the span
 /// the service stores, plus a margin for a loaded test machine.
@@ -44,12 +44,12 @@ fn settle_wait() -> Duration {
 }
 
 /// One emulator holding one shared engine, driven over HTTP exactly as the router does.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's own concern and is exercised
@@ -63,7 +63,7 @@ impl Emulator {
     }
 
     /// Call one operation and return its HTTP status and parsed JSON body.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method(http::Method::POST)
             .uri("/")
@@ -101,7 +101,7 @@ impl Emulator {
 
 /// The wire error code of a failure body: the `__type` member, stripped of any namespace
 /// so `com.amazonaws.keyspaces#X` and `X` compare equal.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type member>")
@@ -112,7 +112,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// Assert a call failed with `expected_status` and `expected_code`, naming the case.
-fn assert_failure(case: &str, got: (u16, Value), expected_status: u16, expected_code: &str) {
+pub(crate) fn assert_failure(case: &str, got: (u16, Value), expected_status: u16, expected_code: &str) {
     let (status, body) = got;
     assert_eq!(
         (status, error_code(&body).as_str()),
@@ -126,20 +126,20 @@ fn assert_failure(case: &str, got: (u16, Value), expected_status: u16, expected_
 }
 
 /// Assert a call succeeded, naming the case, and hand back its body.
-fn assert_ok(case: &str, got: (u16, Value)) -> Value {
+pub(crate) fn assert_ok(case: &str, got: (u16, Value)) -> Value {
     let (status, body) = got;
     assert_eq!(status, 200, "case {case:?}: expected 200, got {status} {body}");
     body
 }
 
-fn keyspace_arn(name: &str) -> String {
+pub(crate) fn keyspace_arn(name: &str) -> String {
     format!(
         "arn:aws:cassandra:{REGION}:{}:/keyspace/{name}/",
         engine::emulator_account_id()
     )
 }
 
-fn table_arn(keyspace: &str, table: &str) -> String {
+pub(crate) fn table_arn(keyspace: &str, table: &str) -> String {
     format!(
         "arn:aws:cassandra:{REGION}:{}:/keyspace/{keyspace}/table/{table}",
         engine::emulator_account_id()
@@ -147,7 +147,7 @@ fn table_arn(keyspace: &str, table: &str) -> String {
 }
 
 /// The smallest schema the model accepts: one partition key drawn from two columns.
-fn minimal_schema(partition_key: &str) -> Value {
+pub(crate) fn minimal_schema(partition_key: &str) -> Value {
     json!({
         "allColumns": [
             {"name": partition_key, "type": "text"},

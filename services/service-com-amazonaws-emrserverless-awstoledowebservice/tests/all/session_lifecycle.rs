@@ -137,7 +137,10 @@ async fn application(
 }
 
 /// An application that serves sessions, on the earliest release that does.
-async fn session_application(router: &MultiServiceRouter, token: &str) -> (String, String) {
+pub(crate) async fn session_application(
+    router: &MultiServiceRouter,
+    token: &str,
+) -> (String, String) {
     application(
         router,
         token,
@@ -147,7 +150,7 @@ async fn session_application(router: &MultiServiceRouter, token: &str) -> (Strin
     .await
 }
 
-async fn start_session(
+pub(crate) async fn start_session(
     router: &MultiServiceRouter,
     application_id: &str,
     body: Value,
@@ -161,7 +164,7 @@ async fn start_session(
     .await
 }
 
-async fn get_session(
+pub(crate) async fn get_session(
     router: &MultiServiceRouter,
     application_id: &str,
     session_id: &str,
@@ -176,7 +179,7 @@ async fn get_session(
 }
 
 /// A `StartSession` body carrying only the two required members beyond the token.
-fn minimal_session(token: &str) -> Value {
+pub(crate) fn minimal_session(token: &str) -> Value {
     json!({
         "clientToken": token,
         "executionRoleArn": EXECUTION_ROLE,

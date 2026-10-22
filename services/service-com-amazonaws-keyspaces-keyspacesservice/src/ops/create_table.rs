@@ -289,6 +289,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let point_in_time_recovery = input.point_in_time_recovery.unwrap_or(PointInTimeRecovery {
             status: crate::state::DEFAULT_POINT_IN_TIME_RECOVERY_STATUS.to_string(),
         });
+        // The per-resource tag rules hold wherever a caller supplies tags, so a create
+        // applies the same ones `TagResource` does: at most
+        // `MAX_TAGS_PER_RESOURCE` tags on the resource, no reserved key, one tag per key.
+        let tags = crate::state::new_tag_set(input.tags.as_deref()).map_err(|rejection| {
+            let message = Some(rejection.message());
+            match rejection.is_quota() {
+                true => CreateTableErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message },
+                ),
+                false => {
+                    CreateTableErrorModeled::ValidationException(ValidationException { message })
+                }
+            }
+        })?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -352,7 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 default_time_to_live: input.default_time_to_live,
                 comment: input.comment,
                 client_side_timestamps: input.client_side_timestamps,
-                tags: input.tags.unwrap_or_default(),
+                tags,
             },
         );
         // The clock now owes this table its ACTIVE transition; tell the store the earliest

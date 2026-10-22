@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRecordingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRecordingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRecordingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a recording configuration in `CREATING`, persists it in
+//! [`crate::state::ComAmazonawsIvsAmazoninteractivevideoserviceState`] and returns
+//! what it stored. Every omitted member of a nested configuration the caller DID
+//! send is filled from the model's documented default before the record is written,
+//! so a following `GetRecordingConfiguration` answers the same resource this call
+//! returned. The `CREATING` → `ACTIVE` move is owed by the clock
+//! ([`crate::state::RECORDING_CONFIGURATION_ACTIVATION`]) and is materialised by
+//! whatever reports the resource next, not here.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +174,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRecordingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRecordingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRecordingConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRecordingConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    exception_message: Some("the IVS store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // A cross-member rule the model cannot express, so the boundary validator
+        // let it through: CUSTOM rendition selection has to name the renditions.
+        if let Some(rendition) = input.rendition_configuration.as_ref() {
+            crate::state::check_rendition_configuration(rendition).map_err(|message| {
+                CreateRecordingConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        exception_message: Some(message),
+                        ..Default::default()
+                    },
+                )
+            })?;
+        }
+
+        // The model's documented defaults for every member the caller omitted.
+        // `recordingReconnectWindowSeconds` carries `@default(0)`, so the framework
+        // has already materialised its default by the time the input reaches here.
+        let rendition_configuration =
+            crate::state::effective_rendition_configuration(input.rendition_configuration);
+        let thumbnail_configuration =
+            crate::state::effective_thumbnail_configuration(input.thumbnail_configuration);
+
+        let mut store = state.lock();
+        // The store grows by one configuration per call and lives for the life of the
+        // process, so the growth is capped; past the cap the service answers the
+        // quota error it models rather than accepting another entry.
+        if store.recording_configurations.len() >= crate::state::MAX_RECORDING_CONFIGURATIONS {
+            return Err(
+                CreateRecordingConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        exception_message: Some(format!(
+                            "the number of recording configurations would exceed the limit of {}",
+                            crate::state::MAX_RECORDING_CONFIGURATIONS
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        let id = store.mint_hex("recording-configuration", 6);
+        let arn = crate::state::recording_configuration_arn(&region, &id);
+        let configuration = RecordingConfiguration {
+            arn: arn.clone(),
+            name: Some(input.name.unwrap_or_default()),
+            destination_configuration: input.destination_configuration,
+            // A new configuration is not ready yet: AWS answers `CREATING` and turns
+            // it `ACTIVE` itself, which is what `active_at` below owes.
+            state: crate::state::RECORDING_CONFIGURATION_CREATING.to_string(),
+            tags: Some(input.tags.unwrap_or_default()),
+            thumbnail_configuration,
+            recording_reconnect_window_seconds: input.recording_reconnect_window_seconds,
+            rendition_configuration,
+        };
+        store.recording_configurations.insert(
+            arn,
+            crate::state::RecordingConfigurationRecord {
+                configuration: configuration.clone(),
+                active_at: ::std::time::SystemTime::now()
+                    + crate::state::RECORDING_CONFIGURATION_ACTIVATION,
+            },
+        );
+
+        Ok(CreateRecordingConfigurationOutput {
+            recording_configuration: Some(configuration),
+        })
     }
 }

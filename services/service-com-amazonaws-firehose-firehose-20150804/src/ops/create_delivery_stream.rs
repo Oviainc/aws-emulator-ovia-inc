@@ -322,6 +322,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source,
             destinations: Vec::new(),
             encryption,
+            pending_encryption: None,
+            encryption_calls: Vec::new(),
             // `Tags` is a modelled list of 1..50, so a longer one is refused at the
             // boundary; two entries with the same key fold to the last given.
             tags: input
@@ -349,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The default `DeliveryStreamType`.
-const DIRECT_PUT: &str = "DirectPut";
+const DIRECT_PUT: &str = crate::state::DIRECT_PUT_STREAM_TYPE;
 
 /// Refuse an input combination the model cannot express, with this operation's own
 /// `InvalidArgumentException`: "The specified input parameter has a value that is not
@@ -585,6 +587,10 @@ fn source_description(
 
 /// The stored encryption state for a create that asked for server-side encryption.
 ///
+/// The configuration itself is judged by [`crate::state::check_encryption_configuration_input`],
+/// which every operation taking a `DeliveryStreamEncryptionConfigurationInput` shares;
+/// only the mapping onto THIS operation's modelled errors lives here.
+///
 /// Enabling SSE is asynchronous, so it starts `ENABLING` and the clock owes it `ENABLED`.
 fn encryption_configuration(
     input: Option<&DeliveryStreamEncryptionConfigurationInput>,
@@ -593,56 +599,26 @@ fn encryption_configuration(
     let Some(input) = input else {
         return Ok(None);
     };
-    if !KEY_TYPE_VALUES.contains(&input.key_type.as_str()) {
-        return Err(invalid_argument(format!(
-            "KeyType '{}' is not valid; valid values are {}",
-            input.key_type,
-            KEY_TYPE_VALUES.join(", ")
-        )));
-    }
-    // "If you set KeyType to CUSTOMER_MANAGED_CMK, you must specify the Amazon Resource
-    // Name (ARN) of the CMK. If you set KeyType to AWS_OWNED_CMK, Firehose uses a
-    // service-account CMK."
-    match (input.key_type.as_str(), input.key_arn.as_ref()) {
-        ("CUSTOMER_MANAGED_CMK", None) => {
-            return Err(invalid_argument(
-                "KeyARN is required when KeyType is CUSTOMER_MANAGED_CMK".to_string(),
-            ))
+    crate::state::check_encryption_configuration_input(input, region).map_err(|refusal| {
+        match refusal {
+            crate::state::EncryptionConfigRefusal::InvalidArgument(message) => {
+                invalid_argument(message)
+            }
+            crate::state::EncryptionConfigRefusal::InvalidKmsResource { code, message } => {
+                CreateDeliveryStreamErrorModeled::InvalidKMSResourceException(
+                    InvalidKMSResourceException {
+                        code: Some(code),
+                        message: Some(message),
+                    },
+                )
+                .into()
+            }
         }
-        ("AWS_OWNED_CMK", Some(_)) => {
-            return Err(invalid_argument(
-                "KeyARN cannot be specified when KeyType is AWS_OWNED_CMK".to_string(),
-            ))
-        }
-        _ => {}
-    }
-    // A CMK is reachable only from its own Region, so one named in another Region cannot
-    // be used: KMS answers NotFoundException, which Firehose reports as
-    // `InvalidKMSResourceException` ("Firehose throws this exception when an attempt to
-    // put records or to start or stop Firehose stream encryption fails. This happens when
-    // the KMS service throws one of the following exception types: AccessDeniedException,
-    // InvalidStateException, DisabledException, or NotFoundException."). The ARN grammar
-    // itself is modelled, so the boundary has already checked it; the Region is the part
-    // this emulator can judge.
-    if let Some(key_arn) = input.key_arn.as_ref() {
-        let key_region = key_arn.split(':').nth(3).unwrap_or_default();
-        if !key_region.is_empty() && key_region != region {
-            return Err(CreateDeliveryStreamErrorModeled::InvalidKMSResourceException(
-                InvalidKMSResourceException {
-                    code: Some("NotFoundException".to_string()),
-                    message: Some(format!(
-                        "the KMS key {key_arn} is in Region {key_region} and cannot be used \
-                         by a Firehose stream in Region {region}"
-                    )),
-                },
-            )
-            .into());
-        }
-    }
+    })?;
     Ok(Some(DeliveryStreamEncryptionConfiguration {
         key_arn: input.key_arn.clone(),
         key_type: Some(input.key_type.clone()),
-        status: Some("ENABLING".to_string()),
+        status: Some(crate::state::ENCRYPTION_ENABLING.to_string()),
         failure_description: None,
     }))
 }

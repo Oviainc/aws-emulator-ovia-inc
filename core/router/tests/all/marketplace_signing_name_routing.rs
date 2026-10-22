@@ -331,7 +331,14 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
             "/",
             Some("AWSMPCommerceService_v20200301.DescribeAgreement"),
             Some(json!({"agreementId": "no-such-agreement"})),
-            404,
+            // The Agreement service answers a lookup that found nothing with the
+            // modelled `ResourceNotFoundException` body at HTTP 400 — the status
+            // its recorded responses carry with that body, which its model's
+            // `@httpError(404)` understates (see that crate's
+            // `state::NOT_FOUND_STATUS`). The point of this row is unchanged:
+            // only the Agreement service models this operation, so only it can
+            // answer here.
+            400,
             "ResourceNotFoundException",
         ),
         (

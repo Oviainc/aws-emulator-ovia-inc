@@ -151,9 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::parse_certificate_authority_arn(&arn).is_none() {
             return Err(GetCertificateAuthorityCsrErrorModeled::InvalidArnException(
                 InvalidArnException {
-                    message: Some(format!(
-                        "'{arn}' does not refer to a certificate authority in this service"
-                    )),
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -195,9 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::STATUS_CREATING => Err(
                 GetCertificateAuthorityCsrErrorModeled::RequestInProgressException(
                     RequestInProgressException {
-                        message: Some(format!(
-                            "the certificate authority {arn} is still being created"
-                        )),
+                        message: Some(crate::state::CREATE_IN_PROGRESS_MESSAGE.to_string()),
                     },
                 )
                 .into(),

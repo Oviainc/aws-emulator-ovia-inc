@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the named tags from the tag set of the keyspace or table the
+//! `resourceArn` names in [`crate::state`]. This is the ONLY file to touch for
+//! `UntagResource`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +148,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+
+        // Refused before anything is removed, so a refused call leaves the tag set
+        // exactly as it was: a reserved key could never have been assigned by a caller
+        // ("Amazon Web Services-assigned tag names ... the user cannot assign", `Tag`), so
+        // refusing it says the key is one the caller does not own, rather than reporting a
+        // removal that cannot have happened.
+        if let Some(reserved) = input
+            .tags
+            .iter()
+            .find(|tag| tag.key.starts_with(crate::state::RESERVED_TAG_KEY_PREFIX))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    crate::state::TagRejection::ReservedKeyPrefix {
+                        key: reserved.key.clone(),
+                    }
+                    .message(),
+                ),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        // See the note in `tag_resource.rs`: the transitions the clock already owed.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::arn_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // The KEY identifies the tag to remove: "Each Amazon Keyspaces resource can only
+        // have up to one tag with the same key" (`Tag$key`), so the key names at most one
+        // tag and the value in the request cannot select a different one. Removal is
+        // idempotent — a key the resource does not hold removes nothing and is not an
+        // error, which is what makes a retried `UntagResource` safe.
+        for tag in &input.tags {
+            tags.remove(&tag.key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

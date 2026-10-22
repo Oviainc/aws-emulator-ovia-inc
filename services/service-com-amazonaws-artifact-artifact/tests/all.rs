@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/compliance_inquiry_lifecycle.rs"]
 mod compliance_inquiry_lifecycle;
+#[path = "all/compliance_inquiry_listing.rs"]
+mod compliance_inquiry_listing;
 #[path = "all/customer_agreements.rs"]
 mod customer_agreements;
 #[path = "all/front_door_errors.rs"]

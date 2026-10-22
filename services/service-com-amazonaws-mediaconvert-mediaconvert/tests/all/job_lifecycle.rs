@@ -28,7 +28,7 @@ fn authorization(region: &str) -> String {
 }
 
 /// The region every case signs for unless it names another.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// An IAM role ARN of the shape the `Role` member documents.
 pub(crate) const ROLE: &str = "arn:aws:iam::123456789012:role/MediaConvertRole";
@@ -47,6 +47,9 @@ pub(crate) const PAST_THE_SETTLE: Duration = Duration::from_millis(400);
 /// One emulator: a single shared engine behind the multi-service router, exactly as the
 /// production router assembles it.
 pub(crate) struct Emulator {
+    /// The one shared engine behind the router, so a case that needs to SEED state (a
+    /// capacity case, say) can reach the store the handlers write to.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
@@ -72,6 +75,12 @@ impl Reply {
             .unwrap_or_default()
             .to_string()
     }
+
+    /// The whole `jobTemplate` member, or `Value::Null` when it is absent — what every
+    /// job-template operation answers with.
+    pub(crate) fn template(&self) -> &Value {
+        self.at("/jobTemplate")
+    }
 }
 
 impl Emulator {
@@ -96,14 +105,14 @@ impl Emulator {
         // the credential scope out of it.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router }
+        Self { engine, router }
     }
 
     pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         self.send_in(REGION, method, uri, body).await
     }
 
-    async fn send_in(
+    pub(crate) async fn send_in(
         &self,
         region: &str,
         method: &str,
@@ -170,6 +179,39 @@ impl Emulator {
         };
         self.send("GET", &uri, None).await
     }
+
+    pub(crate) async fn create_job_template(&self, body: Value) -> Reply {
+        self.send("POST", "/2017-08-29/jobTemplates", Some(body))
+            .await
+    }
+
+    pub(crate) async fn get_job_template(&self, name: &str) -> Reply {
+        self.send("GET", &format!("/2017-08-29/jobTemplates/{name}"), None)
+            .await
+    }
+
+    pub(crate) async fn update_job_template(&self, name: &str, body: Value) -> Reply {
+        self.send(
+            "PUT",
+            &format!("/2017-08-29/jobTemplates/{name}"),
+            Some(body),
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_job_template(&self, name: &str) -> Reply {
+        self.send("DELETE", &format!("/2017-08-29/jobTemplates/{name}"), None)
+            .await
+    }
+
+    pub(crate) async fn list_job_templates(&self, query: &str) -> Reply {
+        let uri = if query.is_empty() {
+            "/2017-08-29/jobTemplates".to_string()
+        } else {
+            format!("/2017-08-29/jobTemplates?{query}")
+        };
+        self.send("GET", &uri, None).await
+    }
 }
 
 /// A minimal but structurally real `JobSettings`: one input file and one output group.
@@ -189,12 +231,12 @@ pub(crate) fn settings(input_uri: &str, name_modifier: &str) -> Value {
 
 /// `arn:aws:mediaconvert:<region>:<account>:<resource>`, built the way the emulator's
 /// own ARN helper builds it, so the expectation is not a second hand-written format.
-fn arn(resource: &str) -> String {
+pub(crate) fn arn(resource: &str) -> String {
     arn_in(REGION, resource)
 }
 
 /// As [`arn`], for a region other than the suite's default.
-fn arn_in(region: &str, resource: &str) -> String {
+pub(crate) fn arn_in(region: &str, resource: &str) -> String {
     engine::emulator_arn("mediaconvert", region, resource)
 }
 

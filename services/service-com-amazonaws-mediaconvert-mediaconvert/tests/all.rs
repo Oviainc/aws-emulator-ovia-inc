@@ -15,6 +15,8 @@
 mod account_endpoints;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
+#[path = "all/job_template_crud.rs"]
+mod job_template_crud;
 #[path = "all/job_templates.rs"]
 mod job_templates;
 #[path = "all/policy_lifecycle.rs"]
