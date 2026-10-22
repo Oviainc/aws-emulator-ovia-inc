@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an MSK Replicator from the submitted configuration and registers it in
+//! [`crate::state::ComAmazonawsKafkaKafkaState`]. A replicator name is unique
+//! within an account and region, so a second create under a name already taken is
+//! a `ConflictException`; a replication flow whose source and target resolve to
+//! one Kafka cluster is a `BadRequestException`, since the two cluster aliases are
+//! what distinguish the ends of a flow.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReplicator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The clusters a replicator names are NOT resolved against this service's cluster
+//! registry: `CreateReplicator` is asynchronous, so AWS accepts the request and
+//! reports the replicator `CREATING` whether or not the Kafka clusters it points
+//! at are reachable — only the replicator's own identity is validated here.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here. `NotFoundException` likewise: nothing this operation looks up
+//! can be missing.
+//!
+//! The scaffold notes below describe the framework; they are kept because they
+//! document the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +176,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateReplicatorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Checked BEFORE the state lock is taken: these depend on the request
+        // alone, so the registry mutex is held only for the state-dependent work.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicator"))
+        // The three ceilings come first, so the loops below — and every later
+        // read of the record they produce — walk a bounded request. A replicator
+        // stores both its cluster list and its replication list, and every reader
+        // resolves each replication against the cluster list, so a create with
+        // caller-sized lists would otherwise size the work of each later
+        // Describe/List call.
+        for (member, submitted, ceiling) in [
+            (
+                "KafkaClusters",
+                input.kafka_clusters.len(),
+                crate::state::MAX_CLUSTERS_PER_REPLICATOR,
+            ),
+            (
+                "ReplicationInfoList",
+                input.replication_info_list.len(),
+                crate::state::MAX_FLOWS_PER_REPLICATOR,
+            ),
+            (
+                "Tags",
+                input.tags.as_ref().map_or(0, std::collections::HashMap::len),
+                crate::state::MAX_TAGS_PER_REPLICATOR,
+            ),
+        ] {
+            if submitted > ceiling {
+                return Err(CreateReplicatorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some(member.to_string()),
+                        message: Some(format!(
+                            "{member} may hold at most {ceiling} entries, not {submitted}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A `KafkaClusters` entry that names neither an Amazon MSK cluster nor an
+        // Apache Kafka one identifies no cluster at all, so it has no alias to
+        // prefix replicated topic names with and no replication can be set up
+        // against it.
+        for (index, cluster) in input.kafka_clusters.iter().enumerate() {
+            if crate::state::kafka_cluster_alias(cluster).is_none() {
+                return Err(CreateReplicatorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some(format!("KafkaClusters[{index}]")),
+                        message: Some(
+                            "Each Kafka cluster must be identified, by an Amazon MSK cluster \
+                             ARN or by an Apache Kafka cluster id."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        for (index, info) in input.replication_info_list.iter().enumerate() {
+            let source = crate::state::flow_cluster_alias(
+                info.source_kafka_cluster_arn.as_deref(),
+                info.source_kafka_cluster_id.as_deref(),
+            );
+            let target = crate::state::flow_cluster_alias(
+                info.target_kafka_cluster_arn.as_deref(),
+                info.target_kafka_cluster_id.as_deref(),
+            );
+            // A flow that names no source, or no target, describes no replication
+            // at all: the model leaves both the ARN and the id optional because
+            // either one identifies a cluster, not because a flow may omit an end.
+            let (Some(source), Some(target)) = (source, target) else {
+                return Err(CreateReplicatorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some(format!("ReplicationInfoList[{index}]")),
+                        message: Some(
+                            "Each replication flow must name a source and a target Kafka \
+                             cluster, by ARN or by cluster id."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            // The two ends of a flow are told apart by their cluster aliases —
+            // the alias is what prefixes a replicated topic's name — so a flow
+            // whose ends resolve to one alias cannot be set up.
+            if source == target {
+                return Err(CreateReplicatorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some(format!("ReplicationInfoList[{index}]")),
+                        message: Some(format!(
+                            "The source and target of a replication flow must be different \
+                             Kafka clusters; both resolve to the alias '{source}'."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+
+        // A replicator name identifies a replicator within an account and region,
+        // so a name already in use IN THIS REGION is a conflict; the same name in
+        // another region is a different replicator.
+        if let Some(existing) = state.replicator_arn_for_name(&region, &input.replicator_name) {
+            return Err(
+                CreateReplicatorErrorModeled::ConflictException(ConflictException {
+                    invalid_parameter: Some("ReplicatorName".to_string()),
+                    message: Some(format!(
+                        "A replicator with the name '{}' already exists: {existing}",
+                        input.replicator_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The monotonic counter is what makes each replicator's ARN distinct; it
+        // advances whether or not anything else about the request repeats an
+        // earlier one.
+        let suffix = state.next_replicator_suffix;
+        state.next_replicator_suffix += 1;
+        let replicator = crate::state::Replicator::provisioned(
+            &region,
+            suffix,
+            std::time::SystemTime::now(),
+            input,
+        );
+
+        let output = CreateReplicatorOutput {
+            replicator_arn: Some(replicator.arn.clone()),
+            replicator_name: Some(replicator.name.clone()),
+            replicator_state: Some(replicator.state.clone()),
+        };
+        // The registry enforces its own ceiling on the one insertion path, so a
+        // create past it is refused there rather than growing the store by one
+        // more call. A refused create registers nothing, so the ordinal it
+        // reserved goes back: the counter counts replicators ever registered, not
+        // calls ever made.
+        if let Err(rejected) = state.register_replicator(replicator) {
+            state.next_replicator_suffix = suffix;
+            return Err(match rejected {
+                // No request member is at fault for a process-wide backstop, so
+                // this one names none.
+                crate::state::RegisterRejected::RegistryCeiling
+                | crate::state::RegisterRejected::RegionQuota => {
+                    CreateReplicatorErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            invalid_parameter: None,
+                            message: Some(format!(
+                                "This emulator holds its maximum of {} replicators.",
+                                crate::state::MAX_REPLICATORS_IN_REGISTRY
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                // Unreachable: the ordinal above is monotonic, so the ARN it mints
+                // is new. Reported as a server fault rather than overwriting a
+                // registered replicator.
+                crate::state::RegisterRejected::DuplicateArn => {
+                    CreateReplicatorErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "the minted replicator ARN is already registered".to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+        Ok(output)
     }
 }
