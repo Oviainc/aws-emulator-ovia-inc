@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BadRequestException, ConflictException, InternalServerErrorException, NotFoundException,
-    PreconditionFailedException,
+    BadRequestException, ConflictException, ForbiddenException, InternalServerErrorException,
+    NotFoundException, PreconditionFailedException,
 };
 
 /// Per-service state for com-amazonaws-schemas-schemas. A handler reaches it through [`service_state`].
@@ -21,9 +21,10 @@ use crate::ops::types::{
 /// `BTreeMap` rather than `HashMap`: every listing operation this service models is
 /// `@paginated` with an opaque `NextToken`, and a token can only resume a page
 /// deterministically if the underlying order is stable. `BTreeMap`'s key order is.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsSchemasSchemasState {
-    /// Registries by `RegistryName`.
+    /// Registries by `RegistryName`, of both scopes: the ones callers create and the
+    /// service-owned catalogue [`AWS_MANAGED_CATALOG`] seeds.
     pub registries: BTreeMap<String, Registry>,
     /// Source of resource-policy revision ids, so every revision this process mints
     /// is distinct. See [`ComAmazonawsSchemasSchemasState::mint_policy_revision_id`].
@@ -47,14 +48,50 @@ impl ComAmazonawsSchemasSchemasState {
     }
 }
 
-/// A schema registry, as `CreateRegistry` persisted it.
+/// A fresh store already holds the service-owned registries: they exist in every
+/// account before any call is made, so they are part of what "empty" means here.
+/// Only [`RegistryScope::Local`] registries are a caller's.
+impl Default for ComAmazonawsSchemasSchemasState {
+    fn default() -> Self {
+        Self {
+            registries: aws_managed_registries(),
+            next_policy_revision_seq: 0,
+        }
+    }
+}
+
+/// Who owns a registry — what `ListRegistries`' `Scope` selects between.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RegistryScope {
+    /// A caller's own registry, created through `CreateRegistry`.
+    #[default]
+    Local,
+    /// A service-owned registry, present before any call: AWS owns its contents, so a
+    /// caller may read it but not write to it.
+    Aws,
+}
+
+impl RegistryScope {
+    /// Whether AWS, rather than the caller, owns what is in this registry.
+    pub fn is_managed(self) -> bool {
+        matches!(self, Self::Aws)
+    }
+}
+
+/// A schema registry, as `CreateRegistry` persisted it or as the service-owned
+/// catalogue seeded it.
 #[derive(Debug, Clone)]
 pub struct Registry {
     pub name: String,
-    /// `arn:aws:schemas:<region>:<account>:registry/<name>`, minted once at create time.
+    /// `arn:aws:schemas:<region>:<account>:registry/<name>` as minted at create time,
+    /// for a registry a caller created. Read it through [`Registry::arn_in`], which is
+    /// what a service-owned registry — created in no single request, so signed for no
+    /// single region — needs.
     pub arn: String,
     pub description: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// Whether AWS or the caller owns this registry.
+    pub scope: RegistryScope,
     /// Schemas by `SchemaName`.
     pub schemas: BTreeMap<String, Schema>,
     /// The resource-based policy attached to this registry, as `PutResourcePolicy`
@@ -74,6 +111,30 @@ pub struct ResourcePolicy {
     pub revision_id: String,
 }
 
+impl Registry {
+    /// The ARN this registry reports to a request signed for `region`.
+    ///
+    /// A caller's registry reports the ARN its `CreateRegistry` call minted. A
+    /// service-owned one was created by no request, so no request's region is stored
+    /// for it: it is present in every region, and reports the region of the request
+    /// asking.
+    pub fn arn_in(&self, region: &str) -> String {
+        match self.scope {
+            RegistryScope::Local => self.arn.clone(),
+            RegistryScope::Aws => registry_arn(region, &self.name),
+        }
+    }
+
+    /// The ARN one of this registry's schemas reports, for the same reason as
+    /// [`Registry::arn_in`].
+    pub fn schema_arn_in(&self, region: &str, schema: &Schema) -> String {
+        match self.scope {
+            RegistryScope::Local => schema.arn.clone(),
+            RegistryScope::Aws => schema_arn(region, &self.name, &schema.name),
+        }
+    }
+}
+
 /// A schema and all of its versions.
 #[derive(Debug, Clone)]
 pub struct Schema {
@@ -91,6 +152,15 @@ pub struct Schema {
     /// Versions by number. Numeric keys, so the map's order is the version order —
     /// a string key would sort `"10"` before `"2"`.
     pub versions: BTreeMap<u64, SchemaVersion>,
+    /// The version each `ClientTokenId` already minted, so a RETRIED `UpdateSchema`
+    /// answers the version its first attempt wrote instead of writing a second copy
+    /// of the same definition — what the member's `@idempotencyToken` trait is for.
+    ///
+    /// Bounded by the version map: only a call that mints a version records a token,
+    /// so there is at most one entry per version ever minted. An entry whose version
+    /// has since been deleted names nothing, and `UpdateSchema` ignores it rather
+    /// than answering a version the store no longer holds.
+    pub minted_by_token: BTreeMap<String, u64>,
     /// The code bindings `PutCodeBinding` has started for this schema, keyed by the
     /// schema version they were generated from and the language they were generated
     /// for: a binding is identified by that pair, so one schema version can carry a
@@ -98,7 +168,14 @@ pub struct Schema {
     pub code_bindings: BTreeMap<(u64, String), CodeBinding>,
 }
 
-/// One immutable version of a schema: the content a caller sent for it.
+/// One version of a schema: the content a caller sent for it.
+///
+/// The `content`, the `type` and the `created_date` are written once and never
+/// rewritten — a reader of version N gets the bytes version N was minted with. The
+/// `description` is the schema's own metadata as it stood for this version, so an
+/// `UpdateSchema` that changes only the description writes it onto the version that
+/// IS the schema's current definition (the latest) and leaves earlier ones with the
+/// description they were written under.
 #[derive(Debug, Clone)]
 pub struct SchemaVersion {
     pub version: u64,
@@ -216,6 +293,132 @@ impl Schema {
             Some(raw) => self.versions.get(&raw.parse::<u64>().ok()?),
         }
     }
+
+    /// Store `content` as this schema's NEXT version and answer the version stored.
+    ///
+    /// The number is taken from `latest_version`, which only ever rises — so it is
+    /// unique over the life of the schema even when a `DeleteSchemaVersion` freed an
+    /// earlier number, and two writers cannot be handed the same one, because the
+    /// whole mint-and-insert happens under the one state lock the caller already
+    /// holds. An existing version is never rewritten.
+    pub fn add_version(
+        &mut self,
+        content: String,
+        r#type: String,
+        description: Option<String>,
+        now: SystemTime,
+    ) -> &SchemaVersion {
+        let version = self.latest_version.saturating_add(1);
+        self.latest_version = version;
+        self.last_modified = now;
+        self.r#type = r#type.clone();
+        self.description = description.clone();
+        self.versions.insert(
+            version,
+            SchemaVersion {
+                version,
+                content,
+                r#type,
+                description,
+                created_date: now,
+            },
+        );
+        self.versions
+            .get(&version)
+            .expect("the version inserted above is present")
+    }
+}
+
+/// The service-owned schema catalogue every account sees: one entry per AWS-managed
+/// registry, each holding the AWS event schemas AWS publishes in it, as the
+/// `OpenApi3` documents AWS stores them as.
+///
+/// This is seeded content, not a response: `ListRegistries`, `ListSchemas` and
+/// `DescribeSchema` report it from the store like any other registry, and
+/// `ExportSchema` converts it. A caller cannot write to it — see
+/// [`RegistryScope::Aws`].
+///
+/// The names are AWS's own (`aws.events`, and the `<source>@<DetailType>` schema
+/// naming EventBridge uses). Each document is an AWS event envelope: an `AWSEvent`
+/// component whose `detail` references the event-specific component, which is the
+/// shape `ExportSchema`'s draft-4 conversion walks.
+pub const AWS_MANAGED_CATALOG: &[(&str, &[(&str, &str)])] = &[(
+    "aws.events",
+    &[
+        (
+            "aws.autoscaling@EC2InstanceLaunchSuccessful",
+            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"EC2InstanceLaunchSuccessful"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","required":["detail-type","resources","detail","id","source","time","region","version","account"],"x-amazon-events-detail-type":"EC2 Instance Launch Successful","x-amazon-events-source":"aws.autoscaling","properties":{"detail":{"$ref":"#/components/schemas/EC2InstanceLaunchSuccessful"},"detail-type":{"type":"string"},"resources":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"source":{"type":"string"},"time":{"type":"string","format":"date-time"},"region":{"type":"string"},"version":{"type":"string"},"account":{"type":"string"}}},"EC2InstanceLaunchSuccessful":{"type":"object","required":["AutoScalingGroupName","EC2InstanceId","RequestId"],"properties":{"AutoScalingGroupName":{"type":"string"},"EC2InstanceId":{"type":"string"},"RequestId":{"type":"string"}}}}}}"##,
+        ),
+        (
+            "aws.ec2@EC2InstanceStateChangeNotification",
+            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"EC2InstanceStateChangeNotification"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","required":["detail-type","resources","detail","id","source","time","region","version","account"],"x-amazon-events-detail-type":"EC2 Instance State-change Notification","x-amazon-events-source":"aws.ec2","properties":{"detail":{"$ref":"#/components/schemas/EC2InstanceStateChangeNotification"},"detail-type":{"type":"string"},"resources":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"source":{"type":"string"},"time":{"type":"string","format":"date-time"},"region":{"type":"string"},"version":{"type":"string"},"account":{"type":"string"}}},"EC2InstanceStateChangeNotification":{"type":"object","required":["instance-id","state"],"properties":{"instance-id":{"type":"string"},"state":{"type":"string"}}}}}}"##,
+        ),
+        (
+            "aws.s3@ObjectCreated",
+            r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"ObjectCreated"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","required":["detail-type","resources","detail","id","source","time","region","version","account"],"x-amazon-events-detail-type":"Object Created","x-amazon-events-source":"aws.s3","properties":{"detail":{"$ref":"#/components/schemas/ObjectCreated"},"detail-type":{"type":"string"},"resources":{"type":"array","items":{"type":"string"}},"id":{"type":"string"},"source":{"type":"string"},"time":{"type":"string","format":"date-time"},"region":{"type":"string"},"version":{"type":"string"},"account":{"type":"string"}}},"Bucket":{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}},"Object":{"type":"object","required":["key","size"],"properties":{"key":{"type":"string"},"size":{"type":"integer","format":"int64"},"etag":{"type":"string"}}},"ObjectCreated":{"type":"object","required":["bucket","object","reason","version"],"properties":{"bucket":{"$ref":"#/components/schemas/Bucket"},"object":{"$ref":"#/components/schemas/Object"},"reason":{"type":"string"},"version":{"type":"string"}}}}}}"##,
+        ),
+    ],
+)];
+
+/// The `Type` every schema in [`AWS_MANAGED_CATALOG`] is stored as: AWS stores its
+/// event schemas as OpenAPI 3 documents, and `ExportSchema` is what converts one to
+/// JSON Schema draft 4.
+pub const AWS_MANAGED_SCHEMA_TYPE: &str = "OpenApi3";
+
+/// Build the service-owned registries [`AWS_MANAGED_CATALOG`] describes.
+///
+/// Their ARNs are left empty: a service-owned registry is minted by no request, so no
+/// request's region is stored for it, and [`Registry::arn_in`] derives the ARN from
+/// the region of the request asking.
+fn aws_managed_registries() -> BTreeMap<String, Registry> {
+    // One clock reading for the whole catalogue: it materialises with the store, in
+    // one instant, rather than one instant per entry.
+    let now = SystemTime::now();
+    AWS_MANAGED_CATALOG
+        .iter()
+        .map(|(registry_name, schemas)| {
+            let registry = Registry {
+                name: (*registry_name).to_string(),
+                arn: String::new(),
+                description: None,
+                tags: BTreeMap::new(),
+                scope: RegistryScope::Aws,
+                // A service-owned registry carries no caller-written policy.
+                policy: None,
+                schemas: schemas
+                    .iter()
+                    .map(|(schema_name, content)| {
+                        (
+                            (*schema_name).to_string(),
+                            Schema {
+                                name: (*schema_name).to_string(),
+                                arn: String::new(),
+                                description: None,
+                                r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
+                                tags: BTreeMap::new(),
+                                latest_version: 1,
+                                last_modified: now,
+                                versions: ::std::iter::once((
+                                    1,
+                                    SchemaVersion {
+                                        version: 1,
+                                        content: (*content).to_string(),
+                                        r#type: AWS_MANAGED_SCHEMA_TYPE.to_string(),
+                                        description: None,
+                                        created_date: now,
+                                    },
+                                ))
+                                .collect(),
+                                minted_by_token: BTreeMap::new(),
+                                code_bindings: BTreeMap::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            ((*registry_name).to_string(), registry)
+        })
+        .collect()
 }
 
 /// The languages this service generates code bindings for, in the identifiers the
@@ -440,13 +643,23 @@ pub const MAX_REGISTRIES: usize = 500;
 pub const MAX_SCHEMAS_PER_REGISTRY: usize = 500;
 
 /// See [`MAX_REGISTRIES`]. Counted over every version of every schema in every
-/// registry, which is everything a caller's `Content` can make this service retain.
+/// registry a CALLER owns, which is everything a caller's `Content` can make this
+/// service retain; the service-owned catalogue is fixed at compile time, so it is not
+/// part of what this budget bounds.
 ///
-/// This slice stores exactly one version per schema (only `CreateSchema` writes a
-/// version), so the version map is bounded at one entry per schema today; an
-/// `UpdateSchema` that mints further versions needs its own per-schema version cap
-/// beside this budget.
+/// `CreateSchema` writes a schema's first version and `UpdateSchema` writes every
+/// later one, so a single schema's versions are bounded on their own by
+/// [`MAX_VERSIONS_PER_SCHEMA`] beside this byte budget.
 pub const MAX_STORED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most versions one schema may hold. See [`MAX_REGISTRIES`] for why the store
+/// needs explicit maxima at all: `UpdateSchema` mints a version per call, so without
+/// this one schema grows for as long as a client keeps updating it, under the byte
+/// budget alone.
+///
+/// Like the other entry caps this is the emulator's own bound, not a published AWS
+/// default, and is set high enough that no ordinary workflow meets it.
+pub const MAX_VERSIONS_PER_SCHEMA: usize = 500;
 
 /// The largest `Policy` document `PutResourcePolicy` will store for one registry.
 ///
@@ -508,9 +721,9 @@ pub fn requested_page_size(limit: Option<i32>) -> Result<usize, BadRequestExcept
     }
 }
 
-/// How many bytes of schema `Content` this store currently retains, across every
-/// version of every schema in every registry — what [`MAX_STORED_CONTENT_BYTES`]
-/// bounds.
+/// How many bytes of schema `Content` this store currently retains on a caller's
+/// behalf, across every version of every schema in every registry the caller owns —
+/// what [`MAX_STORED_CONTENT_BYTES`] bounds.
 ///
 /// Walked on demand rather than tracked in a counter: a counter has to be decremented
 /// on every delete path too, and a counter that drifts reports a budget the store is
@@ -519,11 +732,31 @@ pub fn stored_content_bytes(state: &ComAmazonawsSchemasSchemasState) -> usize {
     state
         .registries
         .values()
+        .filter(|registry| !registry.scope.is_managed())
         .flat_map(|registry| registry.schemas.values())
         .flat_map(|schema| schema.versions.values())
         .map(|version| version.content.len())
         .sum()
 }
+
+/// How many registries the caller owns — what [`MAX_REGISTRIES`] bounds. The
+/// service-owned catalogue is not a caller's and does not consume the caller's
+/// allowance.
+pub fn local_registry_count(state: &ComAmazonawsSchemasSchemasState) -> usize {
+    state
+        .registries
+        .values()
+        .filter(|registry| !registry.scope.is_managed())
+        .count()
+}
+
+/// The `$schema` a JSON Schema draft-4 document carries — what makes a document
+/// draft 4 rather than some other draft.
+///
+/// Shared: `GetDiscoveredSchema` stamps it on the document it infers and
+/// `ExportSchema` on the document it converts, so one constant keeps the two from
+/// naming two different drafts.
+pub const JSON_SCHEMA_DRAFT4_URI: &str = "http://json-schema.org/draft-04/schema#";
 
 /// The `Code` member of this service's error shapes is documented as "the error
 /// code", and the code a restJson1 client matches on is the error's shape name, so
@@ -547,6 +780,14 @@ pub fn conflict(message: impl Into<String>) -> ConflictException {
 pub fn bad_request(message: impl Into<String>) -> BadRequestException {
     BadRequestException {
         code: "BadRequestException".to_string(),
+        message: message.into(),
+    }
+}
+
+/// See [`not_found`] for the `Code` member.
+pub fn forbidden(message: impl Into<String>) -> ForbiddenException {
+    ForbiddenException {
+        code: "ForbiddenException".to_string(),
         message: message.into(),
     }
 }
@@ -626,6 +867,34 @@ pub fn policy_not_json(detail: &str) -> BadRequestException {
 pub fn schema_not_found(registry: &str, schema: &str) -> NotFoundException {
     not_found(format!(
         "Schema {schema} does not exist in registry {registry}."
+    ))
+}
+
+/// Refuse a `CreateRegistry` for a name the store already holds. The template is
+/// AWS's own, built from the request's `RegistryName`.
+pub fn registry_already_exists(registry: &str) -> ConflictException {
+    conflict(format!("Registry with name {registry} already exists."))
+}
+
+/// Refuse a `CreateSchema` for a name its registry already holds. The template is
+/// AWS's own, built from the request's `SchemaName` — and from that member ALONE:
+/// AWS keeps the registry out of this sentence.
+pub fn schema_already_exists(schema: &str) -> ConflictException {
+    conflict(format!("Schema with name {schema} already exists."))
+}
+
+/// Refuse a `DeleteRegistry` that would take a registry's schemas with it. Names no
+/// request member: AWS's sentence for this refusal names none.
+pub fn registry_not_empty() -> ConflictException {
+    conflict("The registry you tried to delete is not empty.")
+}
+
+/// Refuse a caller's write to a service-owned registry or one of its schemas: AWS
+/// owns that content, so a caller may read it but never change it.
+pub fn managed_registry_is_read_only(registry: &str) -> ForbiddenException {
+    forbidden(format!(
+        "Registry {registry} is an AWS-managed registry; its contents are owned by AWS \
+         and cannot be created, updated or deleted."
     ))
 }
 
@@ -879,7 +1148,7 @@ mod tests {
         assert_eq!(
             stored_content_bytes(&state),
             0,
-            "an empty store retains nothing"
+            "a store holding nothing of the caller's retains nothing on their behalf"
         );
 
         let now = std::time::SystemTime::now();
@@ -889,6 +1158,7 @@ mod tests {
                 arn: registry_arn(DEFAULT_REGION, registry_name),
                 description: None,
                 tags: BTreeMap::new(),
+                scope: RegistryScope::Local,
                 schemas: BTreeMap::new(),
                 policy: None,
             };
@@ -916,6 +1186,7 @@ mod tests {
                             },
                         ))
                         .collect(),
+                        minted_by_token: BTreeMap::new(),
                     },
                 );
             }
@@ -927,6 +1198,145 @@ mod tests {
             stored_content_bytes(&state),
             10,
             "every stored version's content counts towards the budget"
+        );
+    }
+
+    /// A fresh store already holds the service-owned catalogue, with every entry
+    /// AWS-scoped and carrying one stored version of the type AWS stores it as.
+    #[test]
+    fn a_fresh_store_holds_the_aws_managed_catalogue() {
+        let state = ComAmazonawsSchemasSchemasState::default();
+        assert!(
+            !AWS_MANAGED_CATALOG.is_empty(),
+            "the catalogue must name at least one registry"
+        );
+        for (registry_name, schemas) in AWS_MANAGED_CATALOG {
+            let registry = state
+                .registries
+                .get(*registry_name)
+                .unwrap_or_else(|| panic!("case {registry_name:?}: must be seeded"));
+            assert_eq!(
+                registry.scope,
+                RegistryScope::Aws,
+                "case {registry_name:?}: a seeded registry is AWS-scoped, got {:?}",
+                registry.scope
+            );
+            assert!(
+                !schemas.is_empty(),
+                "case {registry_name:?}: a seeded registry must hold schemas"
+            );
+            for (schema_name, content) in *schemas {
+                let schema = registry
+                    .schemas
+                    .get(*schema_name)
+                    .unwrap_or_else(|| panic!("case {schema_name:?}: must be seeded"));
+                assert_eq!(
+                    schema.r#type, AWS_MANAGED_SCHEMA_TYPE,
+                    "case {schema_name:?}: expected {AWS_MANAGED_SCHEMA_TYPE}, got {:?}",
+                    schema.r#type
+                );
+                let version = schema
+                    .version_for(None)
+                    .unwrap_or_else(|| panic!("case {schema_name:?}: has a latest version"));
+                assert_eq!(
+                    version.content, *content,
+                    "case {schema_name:?}: the seeded content is stored verbatim"
+                );
+                // The catalogue's documents are what ExportSchema converts, so each
+                // one has to BE an OpenAPI 3 document with component schemas.
+                let parsed: ::serde_json::Value = ::serde_json::from_str(content)
+                    .unwrap_or_else(|e| panic!("case {schema_name:?}: must be JSON: {e}"));
+                assert!(
+                    parsed["components"]["schemas"].is_object(),
+                    "case {schema_name:?}: must carry components.schemas, got {parsed:?}"
+                );
+            }
+        }
+    }
+
+    /// A service-owned registry reports the region of the request asking, because no
+    /// request created it; a caller's reports the ARN its create minted.
+    #[test]
+    fn a_managed_registry_reports_the_asking_region() {
+        let state = ComAmazonawsSchemasSchemasState::default();
+        let (managed_name, _) = AWS_MANAGED_CATALOG[0];
+        let managed = &state.registries[managed_name];
+        for region in ["us-east-1", "eu-west-2", "ap-southeast-1"] {
+            assert_eq!(
+                managed.arn_in(region),
+                registry_arn(region, managed_name),
+                "case {region:?}: a managed registry's ARN names the asking region"
+            );
+        }
+
+        let local = Registry {
+            name: "mine".to_string(),
+            arn: registry_arn("us-west-2", "mine"),
+            description: None,
+            tags: BTreeMap::new(),
+            scope: RegistryScope::Local,
+            policy: None,
+            schemas: BTreeMap::new(),
+        };
+        assert_eq!(
+            local.arn_in("eu-west-2"),
+            registry_arn("us-west-2", "mine"),
+            "a caller's registry keeps the ARN its create minted"
+        );
+    }
+
+    /// Minting versions hands out strictly increasing, never-repeated numbers, even
+    /// across a delete of the newest one.
+    #[test]
+    fn minting_a_version_never_repeats_a_number() {
+        let now = SystemTime::now();
+        let mut schema = Schema {
+            name: "s".to_string(),
+            arn: schema_arn(DEFAULT_REGION, "r", "s"),
+            description: None,
+            r#type: "OpenApi3".to_string(),
+            tags: BTreeMap::new(),
+            latest_version: 1,
+            last_modified: now,
+            versions: std::iter::once((
+                1,
+                SchemaVersion {
+                    version: 1,
+                    content: "one".to_string(),
+                    r#type: "OpenApi3".to_string(),
+                    description: None,
+                    created_date: now,
+                },
+            ))
+            .collect(),
+            minted_by_token: BTreeMap::new(),
+            code_bindings: BTreeMap::new(),
+        };
+
+        let mut minted = vec![1];
+        for round in 0..4 {
+            let version = schema
+                .add_version(
+                    format!("content-{round}"),
+                    "OpenApi3".to_string(),
+                    None,
+                    now,
+                )
+                .version;
+            assert!(
+                !minted.contains(&version),
+                "case round={round}: version {version} was minted twice ({minted:?})"
+            );
+            minted.push(version);
+            // Deleting the newest version must not let the next mint reuse it.
+            if round == 1 {
+                schema.versions.remove(&version);
+            }
+        }
+        assert_eq!(
+            minted,
+            vec![1, 2, 3, 4, 5],
+            "versions are minted in sequence, got {minted:?}"
         );
     }
 }

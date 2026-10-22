@@ -145,8 +145,10 @@ const OPENAPI_VERSION: &str = "3.0.0";
 /// itself, which discovery mints fresh on every call, so it is always the first.
 const DOCUMENT_VERSION: &str = "1.0.0";
 
-/// The `$schema` of the document `Type=JSONSchemaDraft4` asks for.
-const JSON_SCHEMA_DRAFT4: &str = "http://json-schema.org/draft-04/schema#";
+/// The `$schema` of the document `Type=JSONSchemaDraft4` asks for. Shared with
+/// `ExportSchema`, which stamps the same dialect marker on what it converts, so the
+/// two documents cannot name two different drafts.
+use crate::state::JSON_SCHEMA_DRAFT4_URI as JSON_SCHEMA_DRAFT4;
 
 /// The `format` both dialects give a string that carries an RFC-3339 timestamp.
 const DATE_TIME_FORMAT: &str = "date-time";

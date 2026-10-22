@@ -650,8 +650,12 @@ async fn discovery_is_deterministic_and_changes_nothing() {
     }
 
     // Discovery names no resource and creates none: the store is untouched, so the
-    // registry listing is as empty after the calls as it was before them.
-    let listed = emulator.call("GET", "/v1/registries", None).await;
+    // caller's registry listing is as empty after the calls as it was before them.
+    // Scoped to `Local`: an unscoped listing also reports the service-owned
+    // catalogue, which is there whether or not anybody calls discovery.
+    let listed = emulator
+        .call("GET", "/v1/registries?scope=Local", None)
+        .await;
     assert_eq!(
         listed.status, 200,
         "expected 200 from ListRegistries, got {} {:?}",

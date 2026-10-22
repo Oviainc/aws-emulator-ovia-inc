@@ -44,7 +44,7 @@ impl Emulator {
         self.call_signed_for(REGION, method, uri, body).await
     }
 
-    async fn call_signed_for(
+    pub(crate) async fn call_signed_for(
         &self,
         region: &str,
         method: &str,
@@ -609,7 +609,24 @@ async fn a_delete_removes_the_resource_from_every_read() {
         "case delete-schema: the deleted schema is gone from ListSchemas, the other is not"
     );
 
-    // Deleting the registry takes the remaining schema with it.
+    // Deleting the registry is refused while it still holds a schema (the rule is
+    // asserted over a table in `aws_managed_and_versions.rs`), so the last schema
+    // goes first.
+    let refused = emulator.call("DELETE", &registry_uri(registry), None).await;
+    assert_eq!(
+        refused.status, 409,
+        "case delete-registry: a registry that still holds a schema is refused, got {} {:?}",
+        refused.status, refused.body
+    );
+    let deleted = emulator
+        .call("DELETE", &schema_uri(registry, "beta"), None)
+        .await;
+    assert_eq!(
+        deleted.status, 204,
+        "case delete-schema: expected 204, got {} {:?}",
+        deleted.status, deleted.body
+    );
+
     let deleted = emulator.call("DELETE", &registry_uri(registry), None).await;
     assert_eq!(
         deleted.status, 204,
@@ -627,7 +644,9 @@ async fn a_delete_removes_the_resource_from_every_read() {
             "case delete-registry: {case} must 404 once the registry is gone"
         );
     }
-    let registries = emulator.call("GET", "/v1/registries", None).await;
+    let registries = emulator
+        .call("GET", "/v1/registries?scope=Local", None)
+        .await;
     assert_eq!(
         registry_names(&registries),
         Vec::<String>::new(),
@@ -644,7 +663,7 @@ pub(crate) fn schema_names(answer: &Answer) -> Vec<String> {
         .collect()
 }
 
-fn registry_names(answer: &Answer) -> Vec<String> {
+pub(crate) fn registry_names(answer: &Answer) -> Vec<String> {
     answer.body["Registries"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a Registries array in {:?}", answer.body))
@@ -682,7 +701,13 @@ async fn following_next_token_walks_each_listing_exactly_once() {
         for limit in [None, Some(1), Some(2), Some(total.max(1)), Some(total + 3)] {
             let case = format!("total={total} limit={limit:?}");
 
-            let walked = walk(&emulator, "/v1/registries", limit, registry_names).await;
+            let walked = walk(
+                &emulator,
+                "/v1/registries?scope=Local",
+                limit,
+                registry_names,
+            )
+            .await;
             let mut expected = names.clone();
             expected.push("holder".to_string());
             expected.sort();
@@ -789,7 +814,7 @@ async fn a_name_prefix_selects_exactly_the_names_that_start_with_it() {
         let answer = emulator
             .call(
                 "GET",
-                &format!("/v1/registries?registryNamePrefix={prefix}"),
+                &format!("/v1/registries?scope=Local&registryNamePrefix={prefix}"),
                 None,
             )
             .await;
@@ -836,22 +861,36 @@ async fn a_name_prefix_selects_exactly_the_names_that_start_with_it() {
     }
 }
 
-/// RULE: `Scope` selects custom registries (`Local`) or AWS-provided ones (`AWS`);
-/// everything this emulator holds was created by a caller, so it is custom.
+/// RULE: `Scope` LIMITS a listing that otherwise reports every registry — `Local`
+/// selects the ones a caller created, `AWS` the service-owned ones, and a value that
+/// is neither is refused.
 #[tokio::test]
-async fn scope_selects_custom_registries_only() {
+async fn scope_selects_between_custom_and_aws_managed_registries() {
+    use service_com_amazonaws_schemas_schemas::state::AWS_MANAGED_CATALOG;
+
     let emulator = Emulator::new();
     create_registry(&emulator, "mine").await;
+
+    // Source: `crate::state::AWS_MANAGED_CATALOG`, the service-owned catalogue every
+    // account sees.
+    let mut managed: Vec<String> = AWS_MANAGED_CATALOG
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    managed.sort();
+    let mut everything = managed.clone();
+    everything.push("mine".to_string());
+    everything.sort();
 
     // Rows: the two documented values in both casings, absent, and a value that is
     // neither.
     for (scope, expected) in [
-        (Some("Local"), Some(vec!["mine"])),
-        (Some("local"), Some(vec!["mine"])),
-        (Some("LOCAL"), Some(vec!["mine"])),
-        (Some("AWS"), Some(vec![])),
-        (Some("aws"), Some(vec![])),
-        (None, Some(vec!["mine"])),
+        (Some("Local"), Some(vec!["mine".to_string()])),
+        (Some("local"), Some(vec!["mine".to_string()])),
+        (Some("LOCAL"), Some(vec!["mine".to_string()])),
+        (Some("AWS"), Some(managed.clone())),
+        (Some("aws"), Some(managed.clone())),
+        (None, Some(everything.clone())),
         (Some("Everything"), None),
     ] {
         let uri = match scope {
@@ -1271,7 +1310,7 @@ async fn each_emulator_keeps_its_own_store() {
     create_registry(&first, "only-in-first").await;
 
     assert_eq!(
-        registry_names(&first.call("GET", "/v1/registries", None).await),
+        registry_names(&first.call("GET", "/v1/registries?scope=Local", None).await),
         vec!["only-in-first".to_string()],
         "case first: the registry it created is in its own listing"
     );

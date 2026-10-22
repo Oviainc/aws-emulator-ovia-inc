@@ -152,13 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         // A registry name identifies the registry, so creating one that already
-        // exists is a conflict, not a silent overwrite of its schemas.
+        // exists is a conflict, not a silent overwrite of its schemas. That holds for
+        // a service-owned name too: the registry is there, whoever owns it.
         if state.registries.contains_key(&input.registry_name) {
             return Err(CreateRegistryErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "Registry {} already exists.",
-                    input.registry_name
-                )),
+                crate::state::registry_already_exists(&input.registry_name),
             )
             .into());
         }
@@ -166,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lives for the life of the process and only a create adds to it,
         // so the number of registries a caller can accumulate is capped. See
         // `crate::state::MAX_REGISTRIES`.
-        if state.registries.len() >= crate::state::MAX_REGISTRIES {
+        if crate::state::local_registry_count(&state) >= crate::state::MAX_REGISTRIES {
             return Err(CreateRegistryErrorModeled::BadRequestException(
                 crate::state::store_cap_reached("registries", crate::state::MAX_REGISTRIES),
             )
@@ -178,6 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::registry_arn(&region, &input.registry_name),
             description: input.description.clone(),
             tags: crate::state::tags_from_input(input.tags.as_ref()),
+            // A registry a caller creates is the caller's own: the `Local` scope.
+            scope: crate::state::RegistryScope::Local,
             schemas: std::collections::BTreeMap::new(),
             // A new registry carries no resource-based policy until
             // `PutResourcePolicy` attaches one.
@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the registry inserted above is present");
         Ok(CreateRegistryOutput {
             description: stored.description.clone(),
-            registry_arn: Some(stored.arn.clone()),
+            registry_arn: Some(stored.arn_in(&region)),
             registry_name: Some(stored.name.clone()),
             tags: crate::state::tags_to_output(&stored.tags),
         })

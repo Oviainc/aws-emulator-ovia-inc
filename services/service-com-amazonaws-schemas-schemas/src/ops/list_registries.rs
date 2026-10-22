@@ -145,17 +145,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; a listing mints no ARN, so there is
-        // nothing in it this operation needs.
-        let _ = ctx;
+        // A registry a caller created reports the ARN that create stored; a
+        // service-owned one was created by no request, so its ARN names the region
+        // THIS request is signed for.
+        let region = crate::state::request_region(ctx.parts());
         // `Scope` is documented as "Local or AWS to limit responses to your custom
-        // registries, or the ones provided by AWS". Every registry this emulator
-        // holds was created through CreateRegistry, so all of them are custom: the
-        // `AWS` scope selects none of them, and any other value is not a scope.
-        let include_custom = match input.scope.as_deref() {
-            None => true,
-            Some(scope) if scope.eq_ignore_ascii_case("local") => true,
-            Some(scope) if scope.eq_ignore_ascii_case("aws") => false,
+        // registries, or the ones provided by AWS" — so it LIMITS a listing that
+        // otherwise reports both: a caller's own registries and the service-owned
+        // ones. Any other value is not a scope.
+        let selected_scope = match input.scope.as_deref() {
+            None => None,
+            Some(scope) if scope.eq_ignore_ascii_case("local") => {
+                Some(crate::state::RegistryScope::Local)
+            }
+            Some(scope) if scope.eq_ignore_ascii_case("aws") => {
+                Some(crate::state::RegistryScope::Aws)
+            }
             Some(_) => {
                 return Err(ListRegistriesErrorModeled::BadRequestException(
                     crate::state::bad_request("Scope must be either Local or AWS."),
@@ -174,8 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The members that decide WHICH registries this listing contains. Bound into
         // the `NextToken`, so a token cannot resume a differently-selected listing.
         let selection = format!(
-            "registryNamePrefix={};custom={include_custom}",
-            input.registry_name_prefix.as_deref().unwrap_or_default()
+            "registryNamePrefix={};scope={}",
+            input.registry_name_prefix.as_deref().unwrap_or_default(),
+            match selected_scope {
+                None => "all",
+                Some(crate::state::RegistryScope::Local) => "Local",
+                Some(crate::state::RegistryScope::Aws) => "AWS",
+            }
         );
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -185,19 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = store.lock();
 
-        // `AWS` scope: this emulator holds no AWS-provided registry, so the listing
-        // is empty. Answered before the walk rather than as a per-item predicate.
-        let empty = std::collections::BTreeMap::new();
-        let selected = if include_custom {
-            &state.registries
-        } else {
-            &empty
-        };
-        let matching = selected.iter().filter(|(name, _)| {
-            input
-                .registry_name_prefix
-                .as_deref()
-                .is_none_or(|prefix| name.starts_with(prefix))
+        let matching = state.registries.iter().filter(|(name, registry)| {
+            selected_scope.is_none_or(|scope| registry.scope == scope)
+                && input
+                    .registry_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| name.starts_with(prefix))
         });
         let page = crate::state::page_by_key(
             matching,
@@ -217,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 page.items
                     .into_iter()
                     .map(|registry| RegistrySummary {
-                        registry_arn: Some(registry.arn.clone()),
+                        registry_arn: Some(registry.arn_in(&region)),
                         registry_name: Some(registry.name.clone()),
                         tags: crate::state::tags_to_output(&registry.tags),
                     })

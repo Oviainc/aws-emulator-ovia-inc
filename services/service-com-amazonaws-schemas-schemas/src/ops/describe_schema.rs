@@ -148,9 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reports the ARN the
-        // create stored rather than deriving one, so it needs nothing from it.
-        let _ = ctx;
+        // A schema a caller created reports the ARN that create stored; one in a
+        // service-owned registry was created by no request, so its ARN names the
+        // region THIS request is signed for.
+        let region = crate::state::request_region(ctx.parts());
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeSchemaError::from(DescribeSchemaErrorModeled::InternalServerErrorException(
                 crate::state::internal_error(),
@@ -188,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             content: Some(version.content.clone()),
             description: version.description.clone(),
             last_modified: Some(schema.last_modified.into()),
-            schema_arn: Some(schema.arn.clone()),
+            schema_arn: Some(registry.schema_arn_in(&region, schema)),
             schema_name: Some(schema.name.clone()),
             schema_version: Some(version.version.to_string()),
             tags: crate::state::tags_to_output(&schema.tags),
