@@ -16,6 +16,10 @@
 //!   of growing the store. `idempotency` holds at most one entry per stored job, so it
 //!   is bounded by `MAX_JOBS` too, and `endpoints` \u2014 one account endpoint per region a
 //!   request was signed for \u2014 is capped at [`MAX_ENDPOINTS`] the same way.
+//! * `job_templates` is seeded once, at state construction, with the built-in system
+//!   templates and is not grown by any request path yet, so its size is a constant;
+//!   the cap on caller-created templates belongs with `CreateJobTemplate`, which is
+//!   still a scaffold stub.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::settle`] — the only work a reporting
 //!   operation does — touches ONLY the jobs whose due instant has already passed, by
@@ -23,7 +27,8 @@
 //!   O(k log n) in the number k of jobs actually settling, which is zero on the
 //!   overwhelming majority of calls; it is never a sweep of the job set.
 //! * `ListJobs` is the one operation that orders the jobs, over at most `MAX_JOBS`
-//!   records, and returns at most one page of twenty.
+//!   records, and returns at most one page of twenty. `ListJobTemplates` orders the
+//!   job templates the same way and pages them the same way.
 //!
 //! # No panic on caller-supplied input
 //!
@@ -39,8 +44,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccelerationSettings, HopDestination, Job, JobSettings, Queue, ReservationPlan,
-    ReservationPlanSettings, Timing,
+    AccelerationSettings, HopDestination, Job, JobSettings, JobTemplate, JobTemplateSettings,
+    Queue, ReservationPlan, ReservationPlanSettings, Timing,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -49,11 +54,19 @@ use crate::ops::types::{
 /// sends all jobs through the default queue."
 pub const DEFAULT_QUEUE_NAME: &str = "Default";
 
+/// `Type` values (`smithy_query(query="shape",shape="Type")`), the two kinds every
+/// named MediaConvert resource comes in. `JobTemplate$Type`'s doc: "A job template can
+/// be of two types: system or custom. System or built-in job templates can't be modified
+/// or deleted by the user."
+pub const TYPE_SYSTEM: &str = "SYSTEM";
+/// See [`TYPE_SYSTEM`]: the type of a resource a caller created.
+pub const TYPE_CUSTOM: &str = "CUSTOM";
+
 /// `Type` for the built-in queue. Its doc: "System queues are built in. You can't
 /// modify or delete system queues."
-pub const QUEUE_TYPE_SYSTEM: &str = "SYSTEM";
+pub const QUEUE_TYPE_SYSTEM: &str = TYPE_SYSTEM;
 /// `Type` for a queue a caller created with `CreateQueue`.
-pub const QUEUE_TYPE_CUSTOM: &str = "CUSTOM";
+pub const QUEUE_TYPE_CUSTOM: &str = TYPE_CUSTOM;
 
 /// `QueueStatus` values (`smithy_query(query="shape",shape="QueueStatus")`).
 pub const QUEUE_STATUS_ACTIVE: &str = "ACTIVE";
@@ -76,6 +89,16 @@ pub const JOB_STATUS_ERROR: &str = "ERROR";
 pub const ORDER_ASCENDING: &str = "ASCENDING";
 /// See [`ORDER_ASCENDING`].
 pub const ORDER_DESCENDING: &str = "DESCENDING";
+
+/// `JobTemplateListBy` values (`smithy_query(query="shape",shape="JobTemplateListBy")`).
+/// Its doc: "you can choose to list them alphabetically by NAME or chronologically by
+/// CREATION_DATE. If you don't specify, the service will list them by name."
+pub const LIST_BY_NAME: &str = "NAME";
+/// See [`LIST_BY_NAME`].
+pub const LIST_BY_CREATION_DATE: &str = "CREATION_DATE";
+/// See [`LIST_BY_NAME`]: the third `JobTemplateListBy` value, which selects the built-in
+/// ([`TYPE_SYSTEM`]) templates instead of the account's own ([`TYPE_CUSTOM`]) ones.
+pub const LIST_BY_SYSTEM: &str = "SYSTEM";
 
 /// `AccelerationMode`/`AccelerationStatus`: "For jobs that have Acceleration
 /// (AccelerationMode) set to DISABLED, AccelerationStatus is always NOT_APPLICABLE."
@@ -178,6 +201,11 @@ pub fn job_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("jobs/{id}"))
 }
 
+/// `arn:aws:mediaconvert:<region>:<account>:jobTemplates/<name>`.
+pub fn job_template_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("jobTemplates/{name}"))
+}
+
 /// The account's MediaConvert API endpoint URL in `region`.
 ///
 /// MediaConvert gives an account its own subdomain of the regional service host —
@@ -219,11 +247,44 @@ pub fn epoch_seconds(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
-/// A timestamp as nanoseconds since the epoch — the ordering key `ListJobs` pages on.
-/// Reads `duration_since` through `map_or`, so a pre-epoch instant cannot panic.
+/// A timestamp as nanoseconds since the epoch — half of the ordering key the paged
+/// listings resume on. Reads `duration_since` through `map_or`, so a pre-epoch instant
+/// cannot panic.
 pub fn epoch_nanos(at: SystemTime) -> u128 {
     at.duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos())
+}
+
+/// The page size a listing uses when the caller gives no `maxResults`.
+///
+/// Twenty, which is what `ListJobs` ("up to twenty of your most recently created jobs"),
+/// `ListJobTemplates` ("up to twenty of your job templates") and the `__integerMin1Max20`
+/// range on both `MaxResults` members all say.
+pub const DEFAULT_PAGE_SIZE: i32 = 20;
+
+/// The opaque `nextToken` of a paged listing: the hex of `<creation instant in epoch
+/// nanoseconds>:<id>` — the ORDERING KEY of the last record of the page just returned.
+///
+/// Encoding the key rather than an index means the next page resumes at the first record
+/// strictly past that key in the requested direction, so a record that changed, appeared
+/// or went away between two pages cannot duplicate or skip one the caller has already
+/// seen. It is hex so it is opaque to a caller: the documented contract is only that the
+/// string returned by one request is handed back to the next one.
+///
+/// Defined ONCE here, so every listing in this service issues and reads the same cursor
+/// format.
+pub fn encode_cursor(created_at: SystemTime, id: &str) -> String {
+    ::hex::encode(format!("{}:{id}", epoch_nanos(created_at)))
+}
+
+/// The `(creation instant, id)` ordering key inside a cursor, or `None` when the token is
+/// not one [`encode_cursor`] produced — which a handler answers with its modelled
+/// `BadRequestException`. Decoded with `ok()?` throughout, so a hostile token cannot
+/// panic.
+pub fn decode_cursor(token: &str) -> Option<(u128, String)> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (nanos, id) = decoded.split_once(':')?;
+    Some((nanos.parse().ok()?, id.to_string()))
 }
 
 /// One transcoding queue.
@@ -286,6 +347,101 @@ pub fn reservation_plan(
     }
 }
 
+/// The built-in ([`TYPE_SYSTEM`]) job templates this store is seeded with.
+///
+/// That an account holds templates it did not create is what `JobTemplate$Type` ("A job
+/// template can be of two types: system or custom. System or built-in job templates
+/// can't be modified or deleted by the user.") and `JobTemplateListBy`'s `SYSTEM` value
+/// say. The model carries no catalogue of them, so this SET is the emulator's own, named
+/// after the system job templates AWS Elemental MediaConvert publishes; nothing in the
+/// emulator or its tests keys on a particular entry, because a built-in template is
+/// recognised by its `Type` and never by its name.
+///
+/// They carry no encoder settings: this emulator has no transcoding engine, so an
+/// output-group graph here would be settings invented for work nothing can run. What the
+/// control plane reports about them — name, type, ARN, timestamps — is stored state, read
+/// back by every operation that reads a job template.
+const SYSTEM_JOB_TEMPLATES: [&str; 4] = [
+    "System-Avc_16x9_1080p_29_97fps_8500kbps",
+    "System-Avc_16x9_720p_29_97fps_5000kbps",
+    "System-Ott_Dash_Mp4_Avc_Aac",
+    "System-Ott_Hls_Ts_Avc_Aac",
+];
+
+/// One job template: "a pre-made set of encoding instructions that you can use to
+/// quickly create a job".
+///
+/// The ARN is NOT stored, for the reason [`QueueRecord`]'s is not: it is derived from the
+/// region of the request that reads the template.
+#[derive(Debug, Clone)]
+pub struct JobTemplateRecord {
+    pub name: String,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub queue: Option<String>,
+    pub priority: Option<i32>,
+    pub settings: JobTemplateSettings,
+    pub status_update_interval: Option<String>,
+    pub acceleration_settings: Option<AccelerationSettings>,
+    pub hop_destinations: Vec<HopDestination>,
+    /// [`TYPE_SYSTEM`] for a built-in template, [`TYPE_CUSTOM`] for one a caller created.
+    pub template_type: String,
+    pub created_at: SystemTime,
+    pub last_updated: SystemTime,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl JobTemplateRecord {
+    /// A built-in template, as [`SYSTEM_JOB_TEMPLATES`] ships it.
+    fn system(name: &str, at: SystemTime) -> Self {
+        Self {
+            name: name.to_string(),
+            category: None,
+            description: None,
+            queue: None,
+            priority: None,
+            settings: JobTemplateSettings::default(),
+            status_update_interval: None,
+            acceleration_settings: None,
+            hop_destinations: Vec::new(),
+            template_type: TYPE_SYSTEM.to_string(),
+            created_at: at,
+            last_updated: at,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// The modelled `JobTemplate`.
+    pub fn view(&self, region: &str) -> JobTemplate {
+        JobTemplate {
+            acceleration_settings: self.acceleration_settings.clone(),
+            arn: Some(job_template_arn(region, &self.name)),
+            category: self.category.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            description: self.description.clone(),
+            hop_destinations: Some(self.hop_destinations.clone()),
+            last_updated: Some(epoch_seconds(self.last_updated)),
+            name: self.name.clone(),
+            priority: self.priority,
+            queue: self.queue.clone(),
+            settings: self.settings.clone(),
+            status_update_interval: self.status_update_interval.clone(),
+            r#type: Some(self.template_type.clone()),
+        }
+    }
+
+    /// The pair a paged listing orders this template on: its creation instant and its
+    /// name, which is unique within the account, so the pair is a total order.
+    pub fn ordering_key(&self) -> (u128, &str) {
+        (epoch_nanos(self.created_at), self.name.as_str())
+    }
+
+    /// This template's [`encode_cursor`] token.
+    pub fn cursor(&self) -> String {
+        encode_cursor(self.created_at, &self.name)
+    }
+}
+
 /// One transcoding job, exactly as `CreateJob` persisted it plus whatever its status
 /// has become since. The ARN is derived from the reading request's region, as
 /// [`QueueRecord`]'s is.
@@ -334,6 +490,17 @@ impl JobTiming {
 }
 
 impl JobRecord {
+    /// The pair a paged listing orders this job on: its creation instant and its id,
+    /// which is unique, so the pair is a total order.
+    pub fn ordering_key(&self) -> (u128, &str) {
+        (epoch_nanos(self.created_at), self.id.as_str())
+    }
+
+    /// This job's [`encode_cursor`] token.
+    pub fn cursor(&self) -> String {
+        encode_cursor(self.created_at, &self.id)
+    }
+
     /// The modelled `Job`.
     pub fn view(&self, region: &str) -> Job {
         Job {
@@ -423,6 +590,10 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     pub queues: BTreeMap<String, QueueRecord>,
     /// Jobs by `Id`. At most [`MAX_JOBS`] entries.
     pub jobs: BTreeMap<String, JobRecord>,
+    /// Job templates by `Name`; "Each name must be unique within your account". Seeded
+    /// with the built-in [`SYSTEM_JOB_TEMPLATES`]; a caller's own templates join them
+    /// through `CreateJobTemplate`, which is where that growth gets its cap.
+    pub job_templates: BTreeMap<String, JobTemplateRecord>,
     /// The account's API endpoint URL per region, keyed by the region of the request
     /// that first asked for it in `DEFAULT` mode. At most [`MAX_ENDPOINTS`] entries.
     /// Only `DescribeEndpoints` in `DEFAULT` mode adds one; nothing ever rewrites one,
@@ -449,8 +620,10 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
 
 impl Default for ComAmazonawsMediaconvertMediaconvertState {
     /// A store holding the built-in `Default` queue, as every MediaConvert account does
-    /// before any call is made. Seeded here, at state construction, so no request ever
-    /// has to create it and no reporting operation writes to put it there.
+    /// before any call is made, and the built-in system job templates, which an account
+    /// likewise has without creating them. Seeded here, at state construction, so no
+    /// request ever has to create them and no reporting operation writes to put them
+    /// there.
     fn default() -> Self {
         let now = SystemTime::now();
         let mut queues = BTreeMap::new();
@@ -473,6 +646,10 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
         Self {
             queues,
             jobs: BTreeMap::new(),
+            job_templates: SYSTEM_JOB_TEMPLATES
+                .iter()
+                .map(|name| ((*name).to_string(), JobTemplateRecord::system(name, now)))
+                .collect(),
             // No account endpoint exists until a `DescribeEndpoints` in `DEFAULT` mode
             // creates one, so `GET_ONLY` on a fresh account answers an empty list.
             endpoints: BTreeMap::new(),

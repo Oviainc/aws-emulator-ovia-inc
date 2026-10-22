@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +122,32 @@ impl From<ListJobTemplatesErrorModeled> for ListJobTemplatesError {
     }
 }
 
+/// Which key the listing is ordered on, as `listBy` chooses it: "you can choose to list
+/// them alphabetically by NAME or chronologically by CREATION_DATE. If you don't specify,
+/// the service will list them by name."
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    /// Alphabetically by `Name`. Names are unique within the account, so this key alone
+    /// is a total order.
+    Name,
+    /// Chronologically by `CreatedAt`, with the name breaking ties.
+    CreationDate,
+}
+
+/// Where one template falls against another in the ordering `sort_key` names, reading the
+/// `(creation instant, name)` key the shared cursor
+/// ([`crate::state::encode_cursor`]) carries.
+fn compare(
+    sort_key: SortKey,
+    left: (u128, &str),
+    right: (u128, &str),
+) -> ::std::cmp::Ordering {
+    match sort_key {
+        SortKey::Name => left.1.cmp(right.1),
+        SortKey::CreationDate => left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)),
+    }
+}
+
 /// The `ListJobTemplates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +184,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobTemplates"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListJobTemplatesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        // Reporting only, and nothing about a job template is owed by the clock, so this
+        // handler takes the store to read it and writes nothing at all.
+        let state = state.lock();
+
+        // `listBy` chooses BOTH which templates are listed and how they are ordered: its
+        // `SYSTEM` value selects the built-in templates, which `JobTemplate$Type`
+        // describes as the ones a user "can't modify or delete", while `NAME` and
+        // `CREATION_DATE` list the account's own templates on that key.
+        let list_by = input
+            .list_by
+            .as_deref()
+            .unwrap_or(crate::state::LIST_BY_NAME);
+        let wanted_type = if list_by == crate::state::LIST_BY_SYSTEM {
+            crate::state::TYPE_SYSTEM
+        } else {
+            crate::state::TYPE_CUSTOM
+        };
+        let sort_key = if list_by == crate::state::LIST_BY_CREATION_DATE {
+            SortKey::CreationDate
+        } else {
+            SortKey::Name
+        };
+
+        // `category`: "specify a job template category to limit responses to only job
+        // templates from that category" — so a template with no category matches no
+        // category the caller can name.
+        let category = input.category.as_deref();
+        let mut matching: Vec<&crate::state::JobTemplateRecord> = state
+            .job_templates
+            .values()
+            .filter(|record| record.template_type == wanted_type)
+            .filter(|record| {
+                category.is_none_or(|want| record.category.as_deref() == Some(want))
+            })
+            .collect();
+        matching.sort_by(|left, right| {
+            compare(sort_key, left.ordering_key(), right.ordering_key())
+        });
+        // "Default varies by resource": a job template listing runs up the key it is
+        // ordered on — alphabetically from the start of the alphabet, chronologically
+        // from the oldest — unless the caller asks for DESCENDING.
+        let order = input
+            .order
+            .as_deref()
+            .unwrap_or(crate::state::ORDER_ASCENDING);
+        let ascending = order != crate::state::ORDER_DESCENDING;
+        if !ascending {
+            matching.reverse();
+        }
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some((nanos, name)) = crate::state::decode_cursor(token) else {
+                    return Err(ListJobTemplatesErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "nextToken is not a token this service issued.".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                let anchor = (nanos, name.as_str());
+                // Resume at the first template strictly past the anchor key in this
+                // direction. The anchor itself need not still be stored, so a template
+                // deleted between pages is skipped rather than failing the token.
+                matching
+                    .iter()
+                    .position(|record| {
+                        let side = compare(sort_key, record.ordering_key(), anchor);
+                        if ascending {
+                            side == ::std::cmp::Ordering::Greater
+                        } else {
+                            side == ::std::cmp::Ordering::Less
+                        }
+                    })
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        // `maxResults` carries the model's own 1..20 range, so the framework has already
+        // refused anything outside it; the fallback only covers the absent case.
+        let page_size =
+            usize::try_from(input.max_results.unwrap_or(crate::state::DEFAULT_PAGE_SIZE))
+                .unwrap_or(crate::state::DEFAULT_PAGE_SIZE as usize);
+        let page = &matching[start.min(matching.len())..];
+        let page = &page[..page_size.min(page.len())];
+        // A token only when there is a further page to fetch.
+        let next_token = (start + page.len() < matching.len())
+            .then(|| page.last().map(|record| record.cursor()))
+            .flatten();
+        let job_templates = page.iter().map(|record| record.view(&region)).collect();
+
+        Ok(ListJobTemplatesOutput {
+            job_templates: Some(job_templates),
+            next_token,
+        })
     }
 }
