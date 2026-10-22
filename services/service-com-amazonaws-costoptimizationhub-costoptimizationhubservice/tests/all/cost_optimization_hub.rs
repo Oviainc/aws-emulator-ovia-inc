@@ -60,7 +60,7 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Va
 }
 
 /// Call one operation, requiring success.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, payload) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -70,7 +70,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
 }
 
 /// The wire error code (`__type`) of an error body, without its namespace.
-fn error_code(payload: &Value) -> String {
+pub(crate) fn error_code(payload: &Value) -> String {
     payload["__type"]
         .as_str()
         .unwrap_or_default()
@@ -114,14 +114,16 @@ async fn all_ids(router: &MultiServiceRouter) -> Vec<String> {
 
 /// How long a test waits for the analysis an enrollment starts to come due.
 /// Longer than the span the service owes it, so the wait is not a race.
-const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_millis(750);
+pub(crate) const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// A router whose account is enrolled and whose recommendations have come due.
 ///
 /// Cost Optimization Hub reports recommendations for an ENROLLED account only,
 /// and only once the analysis that enrollment starts has had time to produce
 /// them, so every test about the catalog has to establish both first.
-async fn enrolled_router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the other suites in this target establish it the one way.
+pub(crate) async fn enrolled_router() -> MultiServiceRouter {
     let router = router();
     ok(
         &router,
@@ -1044,24 +1046,18 @@ async fn reads_do_not_change_what_a_later_caller_sees() {
     );
 }
 
-/// The two operations this slice leaves unimplemented still answer 501, so a
+/// The operation this slice leaves unimplemented still answers 501, so a
 /// caller can tell "not written yet" from an empty success.
 #[tokio::test]
 async fn the_remaining_operations_are_still_scaffolded() {
     let router = router();
-    let cases: [(&str, Value); 2] = [
-        (
-            "ListRecommendationSummaries",
-            json!({"groupBy": "ActionType"}),
-        ),
-        (
-            "ListEfficiencyMetrics",
-            json!({
-                "granularity": "Monthly",
-                "timePeriod": {"start": "2026-01-01", "end": "2026-02-01"},
-            }),
-        ),
-    ];
+    let cases: [(&str, Value); 1] = [(
+        "ListEfficiencyMetrics",
+        json!({
+            "granularity": "Monthly",
+            "timePeriod": {"start": "2026-01-01", "end": "2026-02-01"},
+        }),
+    )];
     for (operation, body) in &cases {
         let (status, payload) = call(&router, operation, body).await;
         assert_eq!(
