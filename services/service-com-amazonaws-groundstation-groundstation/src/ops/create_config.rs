@@ -177,12 +177,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Checked before the store bound below, so what the caller hears is what is
         // wrong with the request.
         if let ConfigTypeData::uplinkEchoConfig(echo) = &stored.config_data {
+            // The one capability type an `uplinkEchoConfig`'s reference may name — the
+            // member's own name and the `antenna-uplink` segment of a `ConfigArn` are
+            // what say so.
+            const ECHOED_TYPE: &str = "antenna-uplink";
+
             let echoed = guard.config_by_arn(&echo.antenna_uplink_config_arn);
-            if echoed.is_none_or(|config| config.config_type != "antenna-uplink") {
+            if echoed.is_none_or(|config| config.config_type != ECHOED_TYPE) {
                 return Err(CreateConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
+                        // This service's `CreateConfig` text names the capability the
+                        // reference required, spelled as the model spells that
+                        // capability's shape, and the ARN the request gave — not the
+                        // wire enum token, which is an on-the-wire spelling rather than
+                        // a user-facing one.
                         message: Some(format!(
-                            "No antenna-uplink config exists with ARN {}",
+                            "Unable to find {} Config with ARN: {}",
+                            crate::state::capability_display_name(ECHOED_TYPE),
                             echo.antenna_uplink_config_arn
                         )),
                     },

@@ -210,12 +210,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 required_type.is_none_or(|wanted| config.config_type == wanted)
             });
             if !matches {
+                // This service's `CreateMissionProfile` text identifies the config the
+                // lookup looked FOR — its id, the config type it searched under, and
+                // the account the search was scoped to — rather than echoing the ARN
+                // back. The id is the one the ARN the request gave names; the type is
+                // the one the member requires, falling back to the type the ARN itself
+                // names for a dataflow edge, whose endpoints may be of any type.
+                let from_arn = crate::state::config_arn_parts(arn);
+                let searched_type = required_type.map(str::to_string).or_else(|| {
+                    from_arn
+                        .as_ref()
+                        .map(|(config_type, _)| config_type.clone())
+                });
+                let message = match (&from_arn, &searched_type) {
+                    (Some((_, config_id)), Some(config_type)) => format!(
+                        "No config found with ID {config_id} and config type: \
+                         {config_type} for customer {}",
+                        ::engine::emulator_account_id()
+                    ),
+                    // Not one of this service's config ARNs, so it names no id to
+                    // report and the ARN is all the request gave.
+                    _ => format!("Unable to find Config with ARN: {arn}"),
+                };
                 return Err(CreateMissionProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(match required_type {
-                            Some(wanted) => format!("No {wanted} config exists with ARN {arn}"),
-                            None => format!("No config exists with ARN {arn}"),
-                        }),
+                        message: Some(message),
                     },
                 )
                 .into());

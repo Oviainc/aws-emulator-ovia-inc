@@ -8,9 +8,15 @@
 //! `trackingConfigArn` / `missionProfileArn` reference resolves without scanning a map.
 //!
 //! The helpers beside the struct are the pieces every handler of this service needs —
-//! the request's region, the union-member-to-`ConfigCapabilityType` mapping, uuid
-//! minting and the opaque pagination token codec — so they are written once here rather
-//! than in each `src/ops/<operation>.rs`.
+//! the request's region, the union-member-to-`ConfigCapabilityType` mapping, the
+//! capability's user-facing spelling, the `ConfigArn` reader, uuid minting and the
+//! opaque pagination token codec — so they are written once here rather than in each
+//! `src/ops/<operation>.rs`.
+//!
+//! Error TEXT, on the other hand, is per operation: this service answers a
+//! `ResourceNotFoundException` with the text of the operation that raised it, so each
+//! `src/ops/<operation>.rs` carries its own (see [`MISSION_PROFILE_NOT_FOUND`] for the
+//! one literal two operations genuinely share).
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -54,6 +60,57 @@ pub fn config_type_of(config_data: &ConfigTypeData) -> &'static str {
         ConfigTypeData::uplinkEchoConfig(_) => "uplink-echo",
     }
 }
+
+/// The capability's name as this service spells it in user-facing text: the
+/// UpperCamelCase form of a `ConfigCapabilityType` token.
+///
+/// That form is not a second naming scheme — it is exactly the name of the shape the
+/// matching `ConfigTypeData` member targets, minus its `Config` suffix:
+/// `antenna-uplink` -> `AntennaUplinkConfig` -> `AntennaUplink`, `s3-recording` ->
+/// `S3RecordingConfig` -> `S3Recording`, `antenna-downlink-demod-decode` ->
+/// `AntennaDownlinkDemodDecodeConfig` -> `AntennaDownlinkDemodDecode`. Source:
+/// `smithy_query(query="shape", shape="ConfigTypeData,ConfigCapabilityType")` lists the
+/// eight member targets beside the eight tokens, and the two agree segment for segment —
+/// so the spelling is DERIVED from the token rather than tabulated here, and holds for
+/// every capability type including any the model gains later.
+pub fn capability_display_name(config_type: &str) -> String {
+    config_type
+        .split('-')
+        .map(|segment| {
+            let mut characters = segment.chars();
+            match characters.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// The `(configType, configId)` pair a `ConfigArn` addresses, or `None` when `arn` is
+/// not one of this service's config ARNs.
+///
+/// The modelled `ConfigArn` pattern ends in `config/<type>/<uuid>(/<suffix>)?` (it is on
+/// `configArn` in `smithy_query(query="operation", operation="GetConfig")`), so the two
+/// segments after `:config/` are the very pair [`ComAmazonawsGroundstationGroundstationState::configs`]
+/// is keyed on — which is what lets an ARN-valued reference be reported by the id and
+/// type it names rather than echoed back whole.
+pub fn config_arn_parts(arn: &str) -> Option<(String, String)> {
+    let (_, resource) = arn.split_once(":config/")?;
+    let mut segments = resource.split('/');
+    let config_type = segments.next()?;
+    let config_id = segments.next()?;
+    (!config_type.is_empty() && !config_id.is_empty())
+        .then(|| (config_type.to_string(), config_id.to_string()))
+}
+
+/// What this service answers when a mission profile a request names does not exist: a
+/// fixed literal that discloses neither the id nor the ARN that was asked for.
+///
+/// It lives here rather than in one handler because BOTH operations that resolve a
+/// mission profile answer it — `GetMissionProfile`, which resolves one by
+/// `{missionProfileId}`, and `ReserveContact`, which resolves one by `missionProfileArn`
+/// — so it is one text of the service, not one text per operation.
+pub const MISSION_PROFILE_NOT_FOUND: &str = "MissionProfile not found";
 
 /// The region to mint this request's ARNs in: the SigV4 credential scope's region,
 /// which is the region the caller addressed, falling back to [`DEFAULT_REGION`].
