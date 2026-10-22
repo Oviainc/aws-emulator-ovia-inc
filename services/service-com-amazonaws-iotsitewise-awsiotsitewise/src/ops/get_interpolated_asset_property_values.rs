@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInterpolatedAssetPropertyValues
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInterpolatedAssetPropertyValues`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInterpolatedAssetPropertyValues::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation computes interpolated values of an asset property's
+//! stored time series (`crate::state`) at the interval timestamps the request names;
+//! this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +200,459 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInterpolatedAssetPropertyValues` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInterpolatedAssetPropertyValuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInterpolatedAssetPropertyValues"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetInterpolatedAssetPropertyValuesError::Modeled(
+                GetInterpolatedAssetPropertyValuesErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        let store = state.lock();
+
+        // "To identify an asset property, you must specify one of the following: The
+        // assetId and propertyId of an asset property. A propertyAlias" — so exactly
+        // one of the two forms names the property, resolved through the SAME resolvers
+        // `GetAssetPropertyValue` and `BatchPutAssetPropertyValue` use.
+        let (asset_id, property_id) = match (
+            input.asset_id.as_deref(),
+            input.property_id.as_deref(),
+            input.property_alias.as_deref(),
+        ) {
+            (Some(asset_label), Some(property_id), None) => {
+                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                    not_found(format!("The asset {asset_label} could not be found."))
+                })?;
+                (asset_id, property_id.to_string())
+            }
+            (None, None, Some(alias)) => {
+                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
+                    not_found(format!("The property alias {alias} could not be found."))
+                })?
+            }
+            _ => {
+                return Err(invalid_request(
+                    "Specify either assetId and propertyId, or propertyAlias.".to_string(),
+                ))
+            }
+        };
+
+        // The property's declared `PropertyDataType` comes from the same lookup that
+        // proves the property exists, so an interpolation can never be computed for a
+        // property no stored asset declares. `AssetRecord::property` is the shared
+        // resolver every property reader in this crate uses, so one property is named
+        // one way across the service.
+        let data_type = store
+            .assets
+            .get(&asset_id)
+            .and_then(|asset| asset.property(&property_id))
+            .map(|property| property.data_type.clone())
+            .ok_or_else(|| {
+                not_found(format!(
+                    "The asset {asset_id} has no property {property_id}."
+                ))
+            })?;
+
+        // "Valid values: LINEAR_INTERPOLATION | LOCF_INTERPOLATION". `type` is modelled
+        // as a plain string, so the value is checked here rather than by the runtime's
+        // enum validation.
+        let locf = match input.r#type.as_str() {
+            LINEAR_INTERPOLATION => false,
+            LOCF_INTERPOLATION => true,
+            other => {
+                return Err(invalid_request(format!(
+                    "The type must be {LINEAR_INTERPOLATION} or {LOCF_INTERPOLATION}, \
+                     not {other}."
+                )))
+            }
+        };
+        // "If you specify a value for the intervalWindowInSeconds parameter, the value
+        // for the type parameter must be LINEAR_INTERPOLATION."
+        if input.interval_window_in_seconds.is_some() && locf {
+            return Err(invalid_request(format!(
+                "intervalWindowInSeconds requires a type of {LINEAR_INTERPOLATION}."
+            )));
+        }
+        // Linear interpolation is arithmetic on the two surrounding readings, so it is
+        // defined only where the property's readings are numbers. Carrying the last
+        // observation forward copies a reading and needs no arithmetic, so it is
+        // defined for every data type. The model documents no error for the
+        // combination, so refusing it is the emulator's own rule — the honest answer
+        // for a request whose arithmetic has no meaning, rather than an empty page.
+        if !locf && !matches!(data_type.as_str(), "INTEGER" | "DOUBLE") {
+            return Err(invalid_request(format!(
+                "{LINEAR_INTERPOLATION} requires a property whose data type is INTEGER \
+                 or DOUBLE, but this property's data type is {data_type}."
+            )));
+        }
+
+        // "The quality of the asset property value. You can use this parameter as a
+        // filter": like `type`, the member arrives as a plain string, so the value is
+        // checked here against the GENERATED `Quality` value list rather than being
+        // left to match nothing and report an empty page for a request the real
+        // service refuses. The quality a stored reading that names none reports is
+        // `crate::state::quality_of`'s default, the same one the quality-aware write
+        // in `BatchPutAssetPropertyValue` compares against.
+        if !QUALITY_VALUES.contains(&input.quality.as_str()) {
+            return Err(invalid_request(format!(
+                "The quality must be one of {}, not {}.",
+                QUALITY_VALUES.join(" | "),
+                input.quality
+            )));
+        }
+
+        let start = nanos(
+            input.start_time_in_seconds,
+            input.start_time_offset_in_nanos,
+        );
+        let end = nanos(input.end_time_in_seconds, input.end_time_offset_in_nanos);
+        if end < start {
+            return Err(invalid_request(
+                "The end of the range must not be earlier than its start.".to_string(),
+            ));
+        }
+        // `intervalInSeconds` and `intervalWindowInSeconds` both carry a modelled range
+        // of 1.., which the runtime has already enforced. The interval is a divisor
+        // below, so the precondition is asserted HERE rather than inherited: a
+        // non-positive one is refused instead of reaching the arithmetic.
+        if input.interval_in_seconds < 1 {
+            return Err(invalid_request(
+                "The intervalInSeconds must be at least 1 second.".to_string(),
+            ));
+        }
+        let interval = i128::from(input.interval_in_seconds) * NANOS_PER_SECOND;
+        let window = input
+            .interval_window_in_seconds
+            .map(|seconds| i128::from(seconds) * NANOS_PER_SECOND);
+
+        // "Each interval starts when the previous one ends", so the instants reported
+        // are the interval grid anchored at the request's start: `start + k * interval`
+        // for k >= 0, up to the last one at or before the (inclusive) end. The recorded
+        // behaviour of the real service is what puts the start instant itself on that
+        // grid: a range whose first reading sits exactly at `startTimeInSeconds` is
+        // answered with a value AT that instant. (The prose example on the `type` member
+        // — a 24-hour interval starting July 1 at 9 AM whose "first interpolated value"
+        // falls on July 2 — reads as though the start were off the grid; the recording
+        // disagrees, and it wins.)
+        let last_index = u64::try_from((end - start) / interval).unwrap_or(0);
+
+        // The data points an interpolation may use: this property's series, filtered to
+        // the requested quality. "If not specified, the window ranges between the start
+        // time minus the interval and the end time plus the interval" — with an explicit
+        // window each interval carries its own bounds, so the series is narrowed here
+        // only when the request gave none.
+        let mut samples: Vec<Sample<'_>> = store
+            .property_values
+            .get(&asset_id)
+            .and_then(|properties| properties.get(&property_id))
+            .map(|series| {
+                series
+                    .iter()
+                    .filter(|value| crate::state::quality_of(value) == input.quality)
+                    .map(|value| {
+                        (
+                            nanos(
+                                value.timestamp.time_in_seconds,
+                                value.timestamp.offset_in_nanos,
+                            ),
+                            value,
+                        )
+                    })
+                    .filter(|(at, _)| {
+                        window.is_some() || (*at >= start - interval && *at <= end + interval)
+                    })
+                    // Linear interpolation reads the two surrounding numbers; a
+                    // `nullValue` reading carries no number ("the type of null asset
+                    // property data"), so it is an absent data point here, not an
+                    // endpoint.
+                    .filter(|(_, value)| locf || numeric(&value.value).is_some())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The stored series is kept ascending by timestamp; make the order this code
+        // relies on explicit rather than inherited.
+        samples.sort_by_key(|(at, _)| *at);
+
+        let plan = Interpolation {
+            start,
+            interval,
+            window,
+            locf,
+            integer_valued: data_type == "INTEGER",
+            samples,
+        };
+
+        // "The maximum number of results to return for each paginated request. If not
+        // specified, the default value is 10." The modelled range is 1.., already
+        // enforced by the runtime, so `max(1)` only keeps the arithmetic total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+
+        // `nextToken` is this enumeration's resume point: the ordinal of the interval
+        // the next page starts at, hex-encoded so it matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token that names no interval of this range is refused
+        // rather than answered with an empty page; the first page's own ordinal (0) is
+        // not one this operation ever issues.
+        let mut cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                if resume < 1 || resume > last_index {
+                    return Err(invalid_token());
+                }
+                resume
+            }
+            None => 0,
+        };
+
+        // One extra value is computed on purpose: it is what a page's `nextToken`
+        // resumes from, so a token issued because the page FILLED always has a further
+        // value behind it. The per-page instant ceiling below can also issue one, and
+        // that page may be short or even empty — nothing is dropped either way, the
+        // caller simply pages again.
+        let mut produced: Vec<(u64, InterpolatedAssetPropertyValue)> = Vec::new();
+        let mut examined = 0usize;
+        let mut resume_at = None;
+        while cursor <= last_index {
+            // Intervals no data point can reach are skipped in one step instead of
+            // being walked one by one, so a wide range with a sparse series costs the
+            // number of data points, not the number of intervals.
+            let Some(candidate) = plan.next_candidate(cursor) else {
+                break;
+            };
+            if candidate > last_index {
+                break;
+            }
+            cursor = candidate;
+            if examined >= MAX_INTERVALS_PER_PAGE {
+                resume_at = Some(cursor);
+                break;
+            }
+            examined += 1;
+            if let Some(value) = plan.value_at(cursor) {
+                produced.push((cursor, value));
+                if produced.len() > max_results {
+                    break;
+                }
+            }
+            cursor += 1;
+        }
+
+        let next_token = if produced.len() > max_results {
+            produced.pop().map(|(resume, _)| encode_token(resume))
+        } else {
+            resume_at.map(encode_token)
+        };
+
+        Ok(GetInterpolatedAssetPropertyValuesOutput {
+            interpolated_asset_property_values: produced
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect(),
+            next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`: "If not specified, the default value is 10."
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
+/// The `InterpolationType` value that estimates a reading from the two readings
+/// around it.
+const LINEAR_INTERPOLATION: &str = "LINEAR_INTERPOLATION";
+
+/// The `InterpolationType` value that carries the last observed reading forward.
+const LOCF_INTERPOLATION: &str = "LOCF_INTERPOLATION";
+
+/// Nanoseconds in a second: both `intervalInSeconds` and the window are expressed
+/// in seconds, while a `TimeInNanos` has nanosecond granularity.
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+/// How many intervals one page evaluates.
+///
+/// The modelled range of `startTimeInSeconds`/`endTimeInSeconds` lets a request span
+/// billions of intervals, so a page needs a ceiling on the work it does under the
+/// shared state lock. Past this many evaluated intervals the page stops and reports
+/// where it stopped in `nextToken`, so nothing is dropped — the caller simply pages
+/// again. The emulator's own bound; AWS publishes none.
+const MAX_INTERVALS_PER_PAGE: usize = 20_000;
+
+/// One data point of the series an interpolation reads: its instant in nanoseconds
+/// since the Unix epoch, and the stored value at it.
+type Sample<'a> = (i128, &'a AssetPropertyValue);
+
+/// Everything the interval arithmetic needs: the range's start, the interval and
+/// optional query window, which interpolation was asked for, whether the property's
+/// values are integers, and the data points (ascending, already filtered to the
+/// requested quality).
+struct Interpolation<'a> {
+    start: i128,
+    interval: i128,
+    window: Option<i128>,
+    locf: bool,
+    integer_valued: bool,
+    samples: Vec<Sample<'a>>,
+}
+
+impl Interpolation<'_> {
+    /// The instant interval `index` falls on.
+    fn instant(&self, index: u64) -> i128 {
+        self.start + i128::from(index) * self.interval
+    }
+
+    /// The lowest interval ordinal at or after `index` that any data point can reach,
+    /// or `None` when no later interval can.
+    ///
+    /// With an explicit window a data point reaches interval `t` only while
+    /// `t - window <= point <= t + window`; with no window the window spans the whole
+    /// range, so linear interpolation needs a point on each side of `t` and carrying
+    /// forward needs one at or before it.
+    fn next_candidate(&self, index: u64) -> Option<u64> {
+        let at = self.instant(index);
+        let (first, _) = *self.samples.first()?;
+        let (last, _) = *self.samples.last()?;
+        match self.window {
+            Some(window) => {
+                let next = self.samples.partition_point(|(point, _)| *point < at - window);
+                let (point, _) = *self.samples.get(next)?;
+                if point <= at + window {
+                    Some(index)
+                } else {
+                    Some(self.index_at_or_after(point - window).max(index))
+                }
+            }
+            None if at < first => Some(self.index_at_or_after(first).max(index)),
+            // Past the last data point there is nothing to interpolate between, but
+            // there is still one to carry forward.
+            None if at > last && !self.locf => None,
+            None => Some(index),
+        }
+    }
+
+    /// The lowest interval ordinal whose instant is at or after `target`. Ordinal 0
+    /// is the start instant itself, which is on the grid.
+    fn index_at_or_after(&self, target: i128) -> u64 {
+        let ahead = target - self.start;
+        if ahead <= 0 {
+            return 0;
+        }
+        u64::try_from((ahead + self.interval - 1) / self.interval).unwrap_or(u64::MAX)
+    }
+
+    /// The interpolated value at interval `index`, or `None` when the data points the
+    /// interpolation needs are missing — "this indicates that there's a gap in the
+    /// ingested data points".
+    fn value_at(&self, index: u64) -> Option<InterpolatedAssetPropertyValue> {
+        let at = self.instant(index);
+        let timestamp = TimeInNanos {
+            time_in_seconds: i64::try_from(at.div_euclid(NANOS_PER_SECOND)).ok()?,
+            offset_in_nanos: Some(i32::try_from(at.rem_euclid(NANOS_PER_SECOND)).ok()?),
+        };
+
+        // The data point at or before `at`, and the one at or after it. A point
+        // exactly at `at` is both.
+        let at_or_before = self.samples.partition_point(|(point, _)| *point <= at);
+        let previous = self.samples[..at_or_before]
+            .last()
+            .filter(|(point, _)| self.window.is_none_or(|window| *point >= at - window))?;
+        if self.locf {
+            // "IoT SiteWise returns the last observed data point for the previous interval
+            // and carries forward this interpolated value until a new data point is
+            // found."
+            return Some(InterpolatedAssetPropertyValue {
+                timestamp,
+                value: previous.1.value.clone(),
+            });
+        }
+
+        let at_or_after = self.samples.partition_point(|(point, _)| *point < at);
+        let following = self
+            .samples
+            .get(at_or_after)
+            .filter(|(point, _)| self.window.is_none_or(|window| *point <= at + window))?;
+
+        let (before_at, before) = *previous;
+        let (after_at, after) = *following;
+        let before_value = numeric(&before.value)?;
+        let after_value = numeric(&after.value)?;
+        let interpolated = if after_at == before_at {
+            before_value
+        } else {
+            let fraction = (at - before_at) as f64 / (after_at - before_at) as f64;
+            before_value + (after_value - before_value) * fraction
+        };
+
+        // A property's values carry the property's own data type, so an interpolated
+        // value of an INTEGER property is an integer: the computed value rounded to
+        // the nearest one.
+        let value = if self.integer_valued {
+            Variant {
+                integer_value: Some(
+                    interpolated.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
+                ),
+                ..Variant::default()
+            }
+        } else {
+            Variant {
+                double_value: Some(interpolated),
+                ..Variant::default()
+            }
+        };
+        Some(InterpolatedAssetPropertyValue { timestamp, value })
+    }
+}
+
+/// A `TimeInNanos`'s two members as one instant in nanoseconds since the Unix
+/// epoch. `i128` because the modelled second range reaches 9223372036854774, which
+/// overflows `i64` once scaled to nanoseconds.
+fn nanos(seconds: i64, offset_in_nanos: Option<i32>) -> i128 {
+    i128::from(seconds) * NANOS_PER_SECOND + i128::from(offset_in_nanos.unwrap_or(0))
+}
+
+/// The number a `Variant` holds, or `None` when it holds no number at all (a
+/// string, a boolean or a null reading).
+fn numeric(value: &Variant) -> Option<f64> {
+    value
+        .double_value
+        .or_else(|| value.integer_value.map(f64::from))
+}
+
+/// A `nextToken` for the interval the next page resumes from: its ordinal, written
+/// out and hex-encoded so the token matches the modelled `^[A-Za-z0-9+/=]+$`.
+fn encode_token(resume: u64) -> String {
+    ::hex::encode(resume.to_string().as_bytes())
+}
+
+/// Decode a `nextToken` back into the interval ordinal it resumes from.
+fn decode_token(token: &str) -> Result<u64, GetInterpolatedAssetPropertyValuesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|resume| resume.parse().ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> GetInterpolatedAssetPropertyValuesError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> GetInterpolatedAssetPropertyValuesError {
+    GetInterpolatedAssetPropertyValuesError::Modeled(
+        GetInterpolatedAssetPropertyValuesErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> GetInterpolatedAssetPropertyValuesError {
+    GetInterpolatedAssetPropertyValuesError::Modeled(
+        GetInterpolatedAssetPropertyValuesErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException { message },
+        ),
+    )
 }
