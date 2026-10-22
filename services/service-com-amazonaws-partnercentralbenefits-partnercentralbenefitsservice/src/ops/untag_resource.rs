@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! `UntagResource` removes the tag keys its `tagKeys` names from the tag set stored on
+//! the resource its `resourceArn` names — a set difference, so a key the resource does
+//! not carry leaves the set as it was and a repeat of the same call changes nothing — and
+//! reports the modelled empty response. What remains is read back through
+//! `ListTagsForResource`.
+//!
+//! A `resourceArn` that names no resource this service holds is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404), with the same message as the other tagging
+//! operations: see `crate::ops::tag_resource`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,23 +157,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The partner-entitlement gate (`crate::state::entitlement_refusal`) is NOT
-        // applied on the tagging path: the recorded tagging calls are answered by the
-        // resource lookup rather than by the gate — see the citation in
-        // `crate::ops::tag_resource`. So this operation is still simply unwritten, and a
-        // caller gets the 501 below whether its account holds a partner benefit or not.
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `resourceArn`'s pattern and length, and `tagKeys`' length and member pattern,
+        // are modelled, so the centralized walk has already refused anything outside
+        // them; `ctx` carries nothing this operation needs (the resource is named by
+        // ARN, not by region).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The partner-entitlement gate is NOT applied here, for the reason given in
+        // `crate::ops::tag_resource`: recorded behaviour, corpus
+        // `simparity-behavioral-aws-v1`, unit
+        // `partnercentral-benefits.untag-resource-malformed-arn-rejected` — a well-formed
+        // `UntagResource` naming a resource that does not exist is answered
+        // ``("ResourceNotFoundException", "Catalog `null` not found")``, the resource
+        // lookup's own answer, from the same account whose benefit operations record the
+        // 403 entitlement refusal.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(resource) = store.taggable_resource_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // This operation binds no `Catalog` member, so the lookup reports
+                    // the catalog the request named: none.
+                    message: crate::state::catalog_not_found_message(None),
+                },
+            )
+            .into());
+        };
+
+        // A set difference: every named key is dropped, a key the resource never carried
+        // leaves the set unchanged rather than failing the call, and the keys this request
+        // did not name keep their values. No tag bound can be exceeded by a removal, so
+        // the quota `TagResource` checks has nothing to say here.
+        //
+        // `Revision` and `UpdatedAt` describe the application's own content, which the
+        // update operations move; a tag set is resource metadata the model binds on no
+        // application output, so untagging leaves both as they were — the same rule
+        // `crate::ops::tag_resource` applies — and is observed through
+        // `ListTagsForResource`.
+        for key in &input.tag_keys {
+            resource.tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }
