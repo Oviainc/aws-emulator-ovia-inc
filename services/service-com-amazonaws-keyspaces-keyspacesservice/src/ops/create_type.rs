@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one user-defined type in a keyspace: the type is stored in the keyspace's
+//! [`crate::state::Keyspace::types`] under its FORMATTED name
+//! ([`crate::state::format_type_name`]), in the transient `CREATING` status the clock
+//! settles into `ACTIVE`, and `GetType` reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `keyspaceName`'s pattern and length, `typeName`'s length and
+        // `fieldDefinitions`' non-emptiness are modelled, so the boundary validator has
+        // already refused a request that breaks one with 400 `ValidationException`. What
+        // is left here is what the model cannot state.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+        let invalid = |message: String| -> CreateTypeError {
+            CreateTypeErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // The formatted name is what this operation answers with and what every other
+        // operation takes; `TypeName` models only its length, so the two name forms are
+        // resolved here.
+        let type_name = crate::state::format_type_name(&input.type_name).map_err(invalid)?;
+
+        // `fieldDefinitions` is modelled `len 1..` with NO maximum, so the cap is this
+        // emulator's: it bounds what one call can store AND the work every later
+        // `GetType` pays to derive its answers from those fields. Checked before the scan
+        // below, so what a refused request costs stays proportional to the cap.
+        if input.field_definitions.len() > crate::state::MAX_FIELDS_PER_TYPE {
+            return Err(CreateTypeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "fieldDefinitions carries {} fields, which exceeds the limit of {} \
+                         fields per type",
+                        input.field_definitions.len(),
+                        crate::state::MAX_FIELDS_PER_TYPE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A field definition consists out of a name and a type" (`FieldDefinition`), and
+        // a type holds each of its fields once: there is no value of the type in which one
+        // field name addresses two fields. Two names are the same field name under the
+        // same identifier rule the type name follows, so `Id` and `id` collide while
+        // `"Id"` is its own name. The model expresses only that the list is non-empty.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateType"))
+        // The FORM of a field name is deliberately not refused here: `GenericString`
+        // constrains only its length, the service documents the identifier rule for a
+        // UDT's NAME and not for its fields, and nothing recorded shows which error a
+        // malformed field name takes — so this slice stores what it was given rather
+        // than inventing a refusal.
+        let mut declared: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for field in &input.field_definitions {
+            if !declared.insert(crate::state::identifier_identity(&field.name)) {
+                return Err(invalid(format!(
+                    "fieldDefinitions declares field '{}' more than once",
+                    field.name
+                )));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
+            return Err(CreateTypeErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+
+        // A type name is taken once per keyspace: creating "a resource that already
+        // exists" is the `ConflictException` this operation models. Checked before the
+        // cap below, because a name already taken adds no entry.
+        if keyspace.types.contains_key(&type_name) {
+            return Err(CreateTypeErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Type '{}.{type_name}' already exists.",
+                    input.keyspace_name
+                )),
+            })
+            .into());
+        }
+
+        // The store grows by one type per call and lives for the life of the process, so
+        // the growth is capped; past the cap the service answers the quota error it models
+        // rather than accepting another entry.
+        if keyspace.types.len() >= crate::state::MAX_TYPES_PER_KEYSPACE {
+            return Err(CreateTypeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of types in keyspace '{}' would exceed the limit of {}",
+                        input.keyspace_name,
+                        crate::state::MAX_TYPES_PER_KEYSPACE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A field's type may name "other user-defined types that are contained in the
+        // same keyspace" (`FieldDefinition$type`) — so a name that is not a type of THIS
+        // keyspace, or that names one which is not `ACTIVE` yet, is a type "that doesn't
+        // exist. The resource might not be specified correctly, or its status might not
+        // be ACTIVE" (`ResourceNotFoundException`). Nothing is stored in that case.
+        for field in &input.field_definitions {
+            for referenced in crate::state::referenced_type_names(&field.r#type) {
+                let usable = keyspace
+                    .types
+                    .get(&referenced)
+                    .is_some_and(|udt| udt.status == crate::state::TYPE_STATUS_ACTIVE);
+                if !usable {
+                    return Err(CreateTypeErrorModeled::ResourceNotFoundException(
+                        crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let keyspace_arn = keyspace.resource_arn.clone();
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        keyspace.types.insert(
+            type_name.clone(),
+            crate::state::UserDefinedType {
+                keyspace_name: input.keyspace_name,
+                type_name: type_name.clone(),
+                field_definitions: input.field_definitions,
+                last_modified_timestamp: now,
+                // `TypeStatus` models `CREATING` and `GetType` reports it: a type whose
+                // creation has just been accepted is not usable yet. The clock owes it
+                // the `ACTIVE` transition one span from now; `settle` materialises it,
+                // and nothing sleeps for it.
+                status: crate::state::TYPE_STATUS_CREATING.to_string(),
+                status_due_at: Some(settles_at),
+            },
+        );
+        // The clock now owes this type its ACTIVE transition; tell the store the earliest
+        // instant at which `settle` has to look at the keyspaces again.
+        store.note_transition_due(settles_at);
+
+        Ok(CreateTypeOutput {
+            keyspace_arn,
+            type_name,
+        })
     }
 }

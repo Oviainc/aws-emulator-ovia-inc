@@ -21,5 +21,7 @@ mod list_keyspaces;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/type_lifecycle.rs"]
+mod type_lifecycle;
 #[path = "all/update_table.rs"]
 mod update_table;

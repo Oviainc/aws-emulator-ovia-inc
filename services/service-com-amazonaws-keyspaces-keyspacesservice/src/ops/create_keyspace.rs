@@ -247,6 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: crate::state::KEYSPACE_STATUS_CREATING.to_string(),
                 status_due_at: Some(settles_at),
                 tables: ::std::collections::BTreeMap::new(),
+                types: ::std::collections::BTreeMap::new(),
             },
         );
         // The clock now owes this keyspace its ACTIVE transition; tell the store the

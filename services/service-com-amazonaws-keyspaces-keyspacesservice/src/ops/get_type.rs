@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one user-defined type of a keyspace: its fields as stored, the status the
+//! clock has settled it into, and the three members derived from the rest of the
+//! keyspace on read — the types and tables that refer to it, and its nesting depth.
+//! Reporting only: the one write is [`crate::state::ComAmazonawsKeyspacesKeyspacesserviceState::settle`],
+//! which materialises the transitions the clock already owed at this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetType"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // This operation takes "the formatted name of the type" (`GetTypeRequest$typeName`),
+        // so the supplied name is put through the same formatting `CreateType` applied
+        // before it is looked up: an unquoted name is case-folded, a double-quoted one is
+        // used verbatim. A string that is neither form names no type at all.
+        let type_name = crate::state::format_type_name(&input.type_name).map_err(|message| {
+            GetTypeErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // Reporting, not mutating: `settle` only materialises the status changes the clock
+        // had already made due at this instant, so this report shows what any caller would
+        // have seen now whether or not anybody read the type.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+            return Err(GetTypeErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+        let Some(udt) = keyspace.types.get(&type_name) else {
+            return Err(GetTypeErrorModeled::ResourceNotFoundException(
+                crate::state::type_not_found(&region, &input.keyspace_name, &type_name),
+            )
+            .into());
+        };
+
+        Ok(GetTypeOutput {
+            keyspace_name: udt.keyspace_name.clone(),
+            type_name: udt.type_name.clone(),
+            keyspace_arn: keyspace.resource_arn.clone(),
+            field_definitions: Some(udt.field_definitions.clone()),
+            last_modified_timestamp: Some(::aws_smithy_types::DateTime::from(
+                udt.last_modified_timestamp,
+            )),
+            status: Some(udt.status.clone()),
+            // Derived from the keyspace as it stands now, so a type created, or a table
+            // created or deleted, after this type is reflected the next time it is read.
+            //
+            // Each of the three is ONE bounded pass over what the keyspace holds — the
+            // nesting walk is memoised, so a type is expanded at most once however often
+            // it is referred to — which is why they are derived under the state lock, as
+            // `settle` is, rather than from a copy of the store.
+            direct_parent_types: Some(keyspace.direct_parent_types(&type_name)),
+            direct_referring_tables: Some(keyspace.direct_referring_tables(&type_name)),
+            max_nesting_depth: crate::state::nesting_depth(&keyspace.types, &type_name),
+        })
     }
 }
