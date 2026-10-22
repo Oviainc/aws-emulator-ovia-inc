@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBillingAdjustmentRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBillingAdjustmentRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBillingAdjustmentRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored billing adjustment requests that match every filter the
+//! request names, in creation order, one page at a time.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBillingAdjustmentRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBillingAdjustmentRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBillingAdjustmentRequests"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListBillingAdjustmentRequestsErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let created_after = input.created_after.map(|bound| bound.as_secs_f64());
+        let created_before = input.created_before.map(|bound| bound.as_secs_f64());
+        // The token resumes THIS listing: one minted for a different set of
+        // filters would index into a different sequence.
+        let scope = crate::state::billing_adjustment_scope(
+            input.agreement_id.as_deref(),
+            input.status.as_deref(),
+            input.catalog.as_deref(),
+            input.agreement_type.as_deref(),
+            created_after,
+            created_before,
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::page_offset(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(
+                        ListBillingAdjustmentRequestsErrorModeled::ValidationException(
+                            crate::state::validation_exception(
+                                "INVALID_NEXT_TOKEN",
+                                "nextToken",
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A report, so the only write is the status change the clock had already
+        // made due before this call: the processing of a submitted adjustment
+        // was owed at its own instant whether or not anybody listed.
+        store.settle_billing_adjustments(now);
+
+        let mut matched: Vec<&crate::state::BillingAdjustmentRequest> = store
+            .billing_adjustment_requests
+            .values()
+            .filter(|request| {
+                // Every member the input carries is an AND over the stored
+                // request's own value, so the documented combinations select.
+                input
+                    .agreement_id
+                    .as_deref()
+                    .is_none_or(|id| id == request.agreement_id)
+                    && input
+                        .status
+                        .as_deref()
+                        .is_none_or(|status| status == request.status)
+                    && input
+                        .catalog
+                        .as_deref()
+                        .is_none_or(|catalog| catalog == request.catalog)
+                    && input
+                        .agreement_type
+                        .as_deref()
+                        .is_none_or(|kind| kind == request.agreement_type)
+                    // "created after"/"created before" the instant named, so a
+                    // request created AT the bound is on neither side of it.
+                    && created_after.is_none_or(|bound| {
+                        crate::state::epoch_secs(request.created_at) > bound
+                    })
+                    && created_before.is_none_or(|bound| {
+                        crate::state::epoch_secs(request.created_at) < bound
+                    })
+            })
+            .collect();
+        // Creation order, then id, so the order is total and a page token
+        // indexes into the same sequence on every call.
+        matched.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // Only the page the caller asked for is projected into summaries; the
+        // rest of what the listing selects is never cloned.
+        let Some((page, next_token)) = crate::state::paginate(
+            &matched,
+            &scope,
+            offset,
+            crate::state::page_size(input.max_results),
+        ) else {
+            // The offset is past the end of what this listing selects, which no
+            // token this operation minted for it ever named.
+            return Err(
+                ListBillingAdjustmentRequestsErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "INVALID_NEXT_TOKEN",
+                        "nextToken",
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        let items: Vec<BillingAdjustmentSummary> =
+            page.iter().map(|request| request.to_summary()).collect();
+        Ok(ListBillingAdjustmentRequestsOutput { next_token, items })
     }
 }
