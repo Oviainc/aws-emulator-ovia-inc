@@ -15,6 +15,8 @@
 mod bucket_encryption;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
+#[path = "all/bucket_location.rs"]
+mod bucket_location;
 #[path = "all/bucket_notification_configuration.rs"]
 mod bucket_notification_configuration;
 #[path = "all/bucket_ownership_controls.rs"]
@@ -29,6 +31,8 @@ mod bucket_public_access_block;
 mod bucket_tagging;
 #[path = "all/bucket_versioning.rs"]
 mod bucket_versioning;
+#[path = "all/error_message_envelope.rs"]
+mod error_message_envelope;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
 #[path = "all/object_and_policy.rs"]
