@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBillingView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBillingView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBillingView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the persisted billing view, so the next caller no longer sees it. A
+//! view other views draw from is refused with `ConflictException` (409) unless
+//! `force` is set; an ARN no view is stored under is a `ValidationException`
+//! (400), the only client error this operation models for it.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBillingView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBillingViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBillingView"))
+        // The modeled `arn` pattern is refused by the boundary validator before
+        // this runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteBillingViewErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `DeleteBillingView` models no `ResourceNotFoundException`, so an ARN
+        // that names no stored view is refused as invalid input rather than with
+        // an error this operation never declares.
+        if !state.billing_views.contains_key(&input.arn) {
+            return Err(DeleteBillingViewErrorModeled::ValidationException(ValidationException {
+                message: format!("Billing view {} does not exist", input.arn),
+                reason: "fieldValidationFailed".to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "arn".to_string(),
+                    message: "The specified ARN in the request doesn't exist.".to_string(),
+                }]),
+            })
+            .into());
+        }
+
+        // `force`: "If set to true, forces deletion of the billing view even if
+        // it has derived resources (e.g. other billing views or budgets)" — so
+        // without it, a view another view draws from is a conflict.
+        let derived = state.derived_view_arns(&input.arn);
+        if !input.force && !derived.is_empty() {
+            return Err(DeleteBillingViewErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Billing view {} is a source view of {} billing view(s); retry with force set to true",
+                    input.arn,
+                    derived.len()
+                ),
+                resource_id: input.arn.clone(),
+                resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // Removing the view also reclaims the idempotency tokens that named it,
+        // so a create/delete loop frees everything it allocated.
+        state.forget_view(&input.arn);
+
+        Ok(DeleteBillingViewOutput { arn: input.arn })
     }
 }

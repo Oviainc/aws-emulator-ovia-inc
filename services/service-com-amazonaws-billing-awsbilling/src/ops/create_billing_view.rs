@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBillingView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBillingView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBillingView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `CUSTOM` billing view, persists it in this service's state keyed by the
+//! ARN it mints, and answers with that ARN and the record's `createdAt`.
+//! `clientToken` makes the call idempotent: a replay returns the ARN the first
+//! call minted and creates no second view.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBillingView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBillingViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBillingView"))
+        // Every modeled constraint (`name` length/pattern, `description`,
+        // `sourceViews` 1..10, `resourceTags` 0..200, the `clientToken` pattern)
+        // is refused by the boundary validator before this runs, so reaching
+        // here means the input satisfies all of them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBillingViewErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `clientToken` is modeled `@httpHeader("X-Amzn-Client-Token")`, but this
+        // service speaks awsJson1_0, where HTTP bindings are inert and the member
+        // travels in the body. Read the body member first and fall back to the
+        // header, so a client sending either one is idempotent.
+        let client_token = input.client_token.clone().or_else(|| {
+            ctx.parts()
+                .headers
+                .get("x-amzn-client-token")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+
+        // An idempotent replay: the token already named a view that still
+        // exists, so answer with that view and create nothing.
+        if let Some(arn) = client_token
+            .as_deref()
+            .and_then(|token| state.idempotency_tokens.get(token))
+            .cloned()
+        {
+            if let Some(view) = state.billing_views.get(&arn) {
+                return Ok(CreateBillingViewOutput {
+                    arn,
+                    created_at: Some(crate::state::timestamp(view.created_at)),
+                });
+            }
+        }
+
+        let created_at = std::time::SystemTime::now();
+        // The store grows with every create, so it carries an explicit ceiling:
+        // past it the request is refused with the modeled quota error rather
+        // than letting a caller's request rate size the process.
+        if !state.has_room_for_another_view(client_token.is_some()) {
+            return Err(CreateBillingViewErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This account already holds the maximum of {} billing views",
+                        crate::state::MAX_BILLING_VIEWS
+                    ),
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+                    service_code: crate::state::BILLING_SERVICE_CODE.to_string(),
+                    quota_code: crate::state::BILLING_VIEWS_QUOTA_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+        let arn = state.mint_view_arn();
+        let view = crate::state::BillingView {
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            billing_view_type: crate::state::BILLING_VIEW_TYPE_CUSTOM.to_string(),
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+            source_account_id: None,
+            source_views: input.source_views,
+            data_filter_expression: input.data_filter_expression,
+            created_at,
+            updated_at: None,
+            view_definition_last_updated_at: None,
+            health_status_code: crate::state::BILLING_VIEW_STATUS_HEALTHY.to_string(),
+            tags: input
+                .resource_tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value.unwrap_or_default()))
+                .collect(),
+        };
+        state.billing_views.insert(arn.clone(), view);
+        if let Some(token) = client_token {
+            state.idempotency_tokens.insert(token, arn.clone());
+        }
+
+        Ok(CreateBillingViewOutput {
+            arn,
+            created_at: Some(crate::state::timestamp(created_at)),
+        })
     }
 }

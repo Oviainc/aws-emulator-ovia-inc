@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBillingViews
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBillingViews`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBillingViews::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the persisted billing views, filtered by the request's `arns`,
+//! `billingViewTypes`, `names`, `ownerAccountId`, `sourceAccountId` and
+//! `activeTimeRange`, ordered by ARN, and paginated with `maxResults` and an
+//! opaque `nextToken` that resumes after the last ARN the previous page returned.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +134,102 @@ pub struct ListBillingViews<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+fn invalid_field(member: &str, why: &str) -> ListBillingViewsError {
+    ListBillingViewsErrorModeled::ValidationException(ValidationException {
+        message: format!("{member}: {why}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: why.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// The opaque `nextToken` for a page that ended at `arn`.
+///
+/// Hex keeps the token inside the modeled `PageToken` pattern
+/// (`^[-a-zA-Z0-9+=/_]+$`) and length (1..4095) for every ARN the service mints,
+/// and carries no meaning a client could construct one from.
+fn encode_page_token(arn: &str) -> String {
+    hex::encode(arn.as_bytes())
+}
+
+/// The ARN a `nextToken` resumes after, or a `ValidationException` when the
+/// token is not one this service issued.
+fn decode_page_token(token: &str) -> Result<String, ListBillingViewsError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| {
+            ListBillingViewsErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a token this service issued".to_string(),
+                reason: "cannotParse".to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: "The pagination token is not valid.".to_string(),
+                }]),
+            })
+            .into()
+        })
+}
+
+/// Whether `view` satisfies every filter the request carries. A filter the
+/// request omits (or sends empty) selects everything.
+fn matches_filters(
+    view: &crate::state::BillingView,
+    input: &ListBillingViewsInput,
+) -> Result<bool, ListBillingViewsError> {
+    if let Some(arns) = &input.arns {
+        if !arns.is_empty() && !arns.contains(&view.arn) {
+            return Ok(false);
+        }
+    }
+    if let Some(types) = &input.billing_view_types {
+        if !types.is_empty() && !types.contains(&view.billing_view_type) {
+            return Ok(false);
+        }
+    }
+    if let Some(owner) = &input.owner_account_id {
+        if *owner != view.owner_account_id {
+            return Ok(false);
+        }
+    }
+    if let Some(source_account) = &input.source_account_id {
+        if view.source_account_id.as_deref() != Some(source_account.as_str()) {
+            return Ok(false);
+        }
+    }
+    if let Some(searches) = &input.names {
+        for search in searches {
+            // `SearchOption` declares exactly one value, `STARTS_WITH`; the
+            // boundary validator refuses any other, so an unknown one here can
+            // only mean the model gained a value this handler has not learned.
+            if search.search_option != crate::state::SEARCH_OPTION_STARTS_WITH {
+                return Err(invalid_field(
+                    "names",
+                    "searchOption is not one this service supports",
+                ));
+            }
+            if !view.name.starts_with(&search.search_value) {
+                return Ok(false);
+            }
+        }
+    }
+    if let Some(range) = &input.active_time_range {
+        // A view is active over a period once it exists: one created after the
+        // period ended was not available during it.
+        if crate::state::epoch_secs(view.created_at)
+            > crate::state::date_time_secs(&range.active_before_inclusive)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl<Eng> ListBillingViews<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -165,18 +256,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBillingViews` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBillingViewsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBillingViews"))
+        // Every modeled constraint (`maxResults` 1..100, `arns` 0..10, the
+        // `nextToken` pattern, the `names` search option enum) is refused by the
+        // boundary validator before this runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBillingViewsErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+
+        if let Some(range) = &input.active_time_range {
+            if crate::state::date_time_secs(&range.active_after_inclusive)
+                > crate::state::date_time_secs(&range.active_before_inclusive)
+            {
+                return Err(invalid_field(
+                    "activeTimeRange",
+                    "activeAfterInclusive must not be later than activeBeforeInclusive",
+                ));
+            }
+        }
+
+        // The page resumes strictly after the last ARN the previous page
+        // returned, so a view inserted or removed between pages cannot make the
+        // walk skip or repeat another one.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token)?),
+            None => None,
+        };
+
+        let mut matched: Vec<&crate::state::BillingView> = Vec::new();
+        // `billing_views` is a BTreeMap keyed by ARN, so this walk is in ARN
+        // order and the page boundary is stable.
+        for view in state.billing_views.values() {
+            if resume_after
+                .as_deref()
+                .is_some_and(|after| view.arn.as_str() <= after)
+            {
+                continue;
+            }
+            if matches_filters(view, &input)? {
+                matched.push(view);
+            }
+        }
+
+        // `maxResults` is the page size; absent, the whole result set is one page.
+        let next_token = match input.max_results.and_then(|max| usize::try_from(max).ok()) {
+            Some(limit) if matched.len() > limit => {
+                matched.truncate(limit);
+                matched
+                    .last()
+                    .map(|view| encode_page_token(&view.arn))
+            }
+            _ => None,
+        };
+
+        Ok(ListBillingViewsOutput {
+            billing_views: matched
+                .into_iter()
+                .map(|view| BillingViewListElement {
+                    arn: Some(view.arn.clone()),
+                    name: Some(view.name.clone()),
+                    description: view.description.clone(),
+                    owner_account_id: Some(view.owner_account_id.clone()),
+                    source_account_id: view.source_account_id.clone(),
+                    billing_view_type: Some(view.billing_view_type.clone()),
+                    health_status: Some(BillingViewHealthStatus {
+                        status_code: Some(view.health_status_code.clone()),
+                        status_reasons: None,
+                    }),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

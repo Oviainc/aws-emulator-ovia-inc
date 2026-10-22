@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBillingView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBillingView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBillingView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one persisted billing view out of this service's state and renders it as
+//! a `BillingViewElement`, with `sourceViewCount` and `derivedViewCount` derived
+//! from the stored records. An ARN no view is stored under is a
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBillingView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBillingViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBillingView"))
+        // The modeled `arn` pattern is refused by the boundary validator before
+        // this runs; what is left to decide is whether a view is stored under it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBillingViewErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+
+        let view = state.billing_views.get(&input.arn).ok_or_else(|| {
+            GetBillingViewErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Billing view {} does not exist", input.arn),
+                resource_id: input.arn.clone(),
+                resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+            })
+        })?;
+
+        // `sourceViewCount` is "the number of source views associated with this
+        // billing view" and `derivedViewCount` "the number of billing views that
+        // use this billing view as a source": both are derived from the stored
+        // records on every read, never kept as a copy that could go stale.
+        let source_view_count = i32::try_from(view.source_views.len()).unwrap_or(i32::MAX);
+        let derived_view_count =
+            i32::try_from(state.derived_view_arns(&view.arn).len()).unwrap_or(i32::MAX);
+
+        Ok(GetBillingViewOutput {
+            billing_view: BillingViewElement {
+                arn: Some(view.arn.clone()),
+                name: Some(view.name.clone()),
+                description: view.description.clone(),
+                billing_view_type: Some(view.billing_view_type.clone()),
+                owner_account_id: Some(view.owner_account_id.clone()),
+                source_account_id: view.source_account_id.clone(),
+                data_filter_expression: view.data_filter_expression.clone(),
+                created_at: Some(crate::state::timestamp(view.created_at)),
+                updated_at: view.updated_at.map(crate::state::timestamp),
+                derived_view_count: Some(derived_view_count),
+                source_view_count: Some(source_view_count),
+                view_definition_last_updated_at: view
+                    .view_definition_last_updated_at
+                    .map(crate::state::timestamp),
+                health_status: Some(BillingViewHealthStatus {
+                    status_code: Some(view.health_status_code.clone()),
+                    status_reasons: None,
+                }),
+            },
+        })
     }
 }

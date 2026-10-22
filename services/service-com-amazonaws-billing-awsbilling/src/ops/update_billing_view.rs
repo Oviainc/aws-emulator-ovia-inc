@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBillingView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBillingView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBillingView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the persisted billing view in place — only the members the request
+//! carries — stamps `updatedAt`, and answers with the ARN and that instant. An ARN
+//! no view is stored under is a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBillingView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBillingViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBillingView"))
+        // The modeled `arn`, `name` and `description` constraints are refused by
+        // the boundary validator before this runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateBillingViewErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing view store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let view = state.billing_views.get_mut(&input.arn).ok_or_else(|| {
+            UpdateBillingViewErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Billing view {} does not exist", input.arn),
+                resource_id: input.arn.clone(),
+                resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
+            })
+        })?;
+
+        let updated_at = std::time::SystemTime::now();
+        if let Some(name) = input.name {
+            view.name = name;
+        }
+        if let Some(description) = input.description {
+            view.description = Some(description);
+        }
+        if let Some(expression) = input.data_filter_expression {
+            view.data_filter_expression = Some(expression);
+            // `viewDefinitionLastUpdatedAt` is "the timestamp of when the billing
+            // view definition was last updated": the data filter expression IS
+            // that definition, so only a request that changes it moves this.
+            view.view_definition_last_updated_at = Some(updated_at);
+        }
+        view.updated_at = Some(updated_at);
+
+        Ok(UpdateBillingViewOutput {
+            arn: view.arn.clone(),
+            updated_at: Some(crate::state::timestamp(updated_at)),
+        })
     }
 }
