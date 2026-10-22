@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation persists a new DB subnet group in this service's store
+//! and answers from the stored record. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled `DBSubnetGroup` wire shape live
+//! in [`crate::state`], shared with `DescribeDBSubnetGroups` and with the DB instance
+//! operations that RESOLVE a `DBSubnetGroupName` against them.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBSubnetGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(CreateDBSubnetGroupError::validation)?;
+        // "This value is stored as a lowercase string" — so the name is folded before it
+        // is validated, stored or echoed, and every later lookup folds the same way.
+        let name = input.db_subnet_group_name.to_ascii_lowercase();
+        check_subnet_group_name(&name)
+            .map_err(CreateDBSubnetGroupError::invalid_parameter_value)?;
+
+        // "The request would result in the user exceeding the allowed number of subnets
+        // in a DB subnet groups" — the published allowance for ONE group.
+        if input.subnet_ids.len() > crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP {
+            return Err(CreateDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
+                DBSubnetQuotaExceededFault {
+                    message: Some(format!(
+                        "the request names {} subnets: a DB subnet group holds at most {}",
+                        input.subnet_ids.len(),
+                        crate::state::MAX_SUBNETS_PER_DB_SUBNET_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+        // A value that is not an EC2 subnet id names no subnet at all, which is what
+        // `InvalidSubnet` says: "The requested subnet is invalid".
+        for subnet_id in &input.subnet_ids {
+            crate::state::check_subnet_id(subnet_id).map_err(|message| {
+                CreateDBSubnetGroupError::from(CreateDBSubnetGroupErrorModeled::InvalidSubnet(
+                    InvalidSubnet {
+                        message: Some(message),
+                    },
+                ))
+            })?;
+        }
+        // "DB subnet groups must contain at least one subnet in at least two AZs in the
+        // Amazon Web Services Region." A subnet lies in exactly ONE Availability Zone,
+        // so a group naming fewer than two DISTINCT subnets cannot cover two zones
+        // whatever those subnets are — that much follows from the request alone, and is
+        // the modelled `DBSubnetGroupDoesNotCoverEnoughAZs`. Which zones the named
+        // subnets actually lie in is an EC2 fact this service does not hold, so no
+        // further coverage claim is made.
+        let distinct: std::collections::BTreeSet<&str> =
+            input.subnet_ids.iter().map(String::as_str).collect();
+        if distinct.len() < 2 {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
+                    DBSubnetGroupDoesNotCoverEnoughAZs {
+                        message: Some(format!(
+                            "the request names {} distinct subnet(s): a DB subnet group must \
+                             cover at least two Availability Zones, so it must name at least \
+                             two subnets",
+                            distinct.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope, so
+        // one name can be a different DB subnet group in each region.
+        let key = (region.clone(), name.clone());
+        if store.db_subnet_groups.contains_key(&key) {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::DBSubnetGroupAlreadyExistsFault(
+                    DBSubnetGroupAlreadyExistsFault {
+                        message: Some(format!("DB subnet group already exists: {name}")),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The region's DB subnet group quota, and the number of regions this store keeps
+        // records for at all: the store cannot be grown without bound, and the modelled
+        // fault says exactly this.
+        if store.db_subnet_groups_in(&region).len()
+            >= crate::state::DB_SUBNET_GROUP_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::DBSubnetGroupQuotaExceededFault(
+                    DBSubnetGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of DB subnet groups \
+                             ({} per region, in at most {} regions)",
+                            crate::state::DB_SUBNET_GROUP_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::DbSubnetGroupRecord {
+            name,
+            region,
+            description: input.db_subnet_group_description,
+            subnet_ids: input.subnet_ids,
+            tags: input.tags.unwrap_or_default(),
+        };
+        let db_subnet_group = record.to_wire();
+        store.db_subnet_groups.insert(key, record);
+
+        Ok(CreateDBSubnetGroupOutput {
+            db_subnet_group: Some(db_subnet_group),
+        })
     }
+}
+
+/// The longest `DBSubnetGroupName` this operation accepts, as its member documents
+/// ("Must contain no more than 255 letters, numbers, periods, underscores, spaces, or
+/// hyphens").
+const MAX_NAME_LEN: usize = 255;
+
+/// The name AWS reserves for the DB subnet group of an account's default VPC, which
+/// `DBSubnetGroupName` refuses: "Must not be default."
+const RESERVED_NAME: &str = "default";
+
+/// Refuse a `DBSubnetGroupName` outside the constraints its member documents, naming
+/// the member and the constraint it broke. The alphabet is wider than the one the
+/// identifier members share (`crate::state::check_identifier`): this member also admits
+/// periods, underscores and spaces.
+fn check_subnet_group_name(name: &str) -> Result<(), String> {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ' ' | '-'))
+    {
+        return Err(format!(
+            "DBSubnetGroupName must contain only letters, numbers, periods, underscores, \
+             spaces, or hyphens; got '{name}'"
+        ));
+    }
+    let length = name.chars().count();
+    if length == 0 || length > MAX_NAME_LEN {
+        return Err(format!(
+            "DBSubnetGroupName must contain no more than {MAX_NAME_LEN} letters, numbers, \
+             periods, underscores, spaces, or hyphens; got {length} characters"
+        ));
+    }
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return Err(format!(
+            "the first character of DBSubnetGroupName must be a letter; got '{name}'"
+        ));
+    }
+    if name == RESERVED_NAME {
+        return Err(format!(
+            "DBSubnetGroupName must not be {RESERVED_NAME}: that name is reserved for the \
+             DB subnet group of the account's default VPC"
+        ));
+    }
+    Ok(())
 }

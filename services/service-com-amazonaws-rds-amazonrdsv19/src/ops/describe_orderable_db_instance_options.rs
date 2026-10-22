@@ -269,7 +269,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         matching.sort_by(|(left, _), (right, _)| left.cmp(right));
-        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeOrderableDBInstanceOptionsError::invalid_parameter_value)?;
         Ok(DescribeOrderableDBInstanceOptionsOutput {
             marker: page.next_marker,
             orderable_db_instance_options: Some(page.items),
