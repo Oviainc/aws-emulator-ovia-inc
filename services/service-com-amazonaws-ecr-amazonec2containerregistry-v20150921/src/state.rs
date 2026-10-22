@@ -1462,9 +1462,14 @@ pub fn repository_policy_not_found_message(name: &str) -> String {
 /// The wording ECR uses when the registry carries no signing configuration — the state
 /// `SigningConfigurationNotFoundException` documents: "attempting to retrieve or delete a
 /// signing configuration that does not exist".
+///
+/// One wording for both readers of the record (`GetSigningConfiguration` and
+/// `DeleteSigningConfiguration`), shaped like [`repository_not_found_message`]'s "… does
+/// not exist in the registry with id '<registry id>'", which is also the text the
+/// recorded ECR refusal carries.
 pub fn signing_configuration_not_found_message() -> String {
     format!(
-        "The registry with id '{}' does not have an associated signing configuration",
+        "The signing configuration does not exist in the registry with id '{}'",
         registry_id()
     )
 }
