@@ -59,7 +59,11 @@ fn authorization(region: &str) -> String {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     call_in(router, operation, body, REGION).await
 }
 
