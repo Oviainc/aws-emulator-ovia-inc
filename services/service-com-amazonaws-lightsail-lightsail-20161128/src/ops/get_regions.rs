@@ -8,11 +8,13 @@
 //! This is the ONLY file to touch for this operation.
 //!
 //! The Region catalog is service-level configuration, not per-account state: the
-//! Regions Lightsail serves are the modelled `RegionName` enum, so the answer is
-//! the same for every caller and this reporting operation writes nothing. The
-//! catalog lives in [`crate::state`], beside the Region and Availability Zone
-//! helpers the instance operations already validate against, so one Region list
-//! serves the whole service.
+//! Regions Lightsail serves are the same for every caller and this reporting
+//! operation writes nothing. The catalog lives in [`crate::state`], beside the
+//! Region and Availability Zone helpers the instance operations already validate
+//! against, so one Region list serves the whole service. The ANSWER still
+//! depends on the request's own Region: a regional endpoint reports the
+//! Availability Zones of the Region it serves and empty zone lists for the
+//! others.
 //!
 //! ## Shape of an operation
 //!
@@ -168,9 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this answer depends on the store or on request metadata: it
-        // reports the service's Region catalog, which no call changes.
-        let _ = (ctx, &self.engine);
+        // Nothing in this answer depends on the store: it reports the service's
+        // Region catalog, which no call changes. The request's own Region does
+        // matter, though — a Lightsail endpoint reports the Availability Zones
+        // of the Region it serves.
+        let _ = &self.engine;
 
         // Both members are optional booleans, so an absent one means "do not
         // include": each zone list is opt-in, per this operation's own
@@ -181,14 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(false);
 
         // Every Region the service serves, in the catalog's own order, so two
-        // calls answer the same list in the same order.
+        // calls answer the same list in the same order. Both zone lists are
+        // always present — empty unless the caller asked for them AND the entry
+        // is the Region this request was served in.
         Ok(GetRegionsOutput {
-            regions: Some(
-                crate::state::REGION_SPECS
-                    .iter()
-                    .map(|region| region.view(include_zones, include_relational_database_zones))
-                    .collect(),
-            ),
+            regions: Some(crate::state::regions_view(
+                include_zones,
+                include_relational_database_zones,
+                &crate::state::request_region(ctx.parts()),
+            )),
         })
     }
 }

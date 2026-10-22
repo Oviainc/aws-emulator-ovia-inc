@@ -408,16 +408,28 @@ pub const BUCKET_BUNDLE_SPECS: &[BucketBundleSpec] = &[
     },
 ];
 
+/// The label Lightsail gives an object-storage plan, with `storage` the plan's
+/// storage quota in GB.
+///
+/// SOURCE: the `BucketBundle$name` values Lightsail reports — `Object Storage
+/// 5GB` for the 5 GB plan, `Object Storage 100GB` for the 100 GB one and `Object
+/// Storage 250GB` for the 250 GB one. The label names the product and the plan's
+/// storage size, so it is DERIVED from the size rather than carried per entry: a
+/// plan added to [`BUCKET_BUNDLE_SPECS`] is labelled the same way.
+pub fn bucket_bundle_name(storage_per_month_in_gb: i32) -> String {
+    format!("Object Storage {storage_per_month_in_gb}GB")
+}
+
 impl BucketBundleSpec {
     /// This plan as the modelled `BucketBundle`.
     ///
     /// `name` is "The name of the bundle" — the label Lightsail gives an object
-    /// storage plan, which is its storage size — so it is DERIVED from
-    /// [`Self::storage_per_month_in_gb`] rather than carried a second time.
+    /// storage plan — so it is DERIVED from [`Self::storage_per_month_in_gb`] by
+    /// [`bucket_bundle_name`] rather than carried a second time.
     pub fn view(&self) -> BucketBundle {
         BucketBundle {
             bundle_id: Some(self.bundle_id.to_string()),
-            name: Some(format!("{} GB", self.storage_per_month_in_gb)),
+            name: Some(bucket_bundle_name(self.storage_per_month_in_gb)),
             price: Some(self.price_usd_per_month),
             storage_per_month_in_gb: Some(self.storage_per_month_in_gb),
             transfer_per_month_in_gb: Some(self.transfer_per_month_in_gb),
@@ -768,9 +780,16 @@ pub fn blueprint_is_creatable(blueprint_id: &str) -> bool {
 /// `engineVersion` names the patch level that major version is served at.
 #[derive(Debug, Clone, Copy)]
 pub struct RelationalDatabaseBlueprintSpec {
-    /// The database software, from the modelled `RelationalDatabaseEngine` enum
-    /// (`smithy_query(query="shape",shape="RelationalDatabaseEngine")`), whose
-    /// only value is `mysql`.
+    /// The database software this blueprint installs.
+    ///
+    /// The modelled `RelationalDatabaseEngine` enum
+    /// (`smithy_query(query="shape",shape="RelationalDatabaseEngine")`) still
+    /// carries the single value `mysql`, which the service has outgrown:
+    /// Lightsail also serves PostgreSQL managed databases, and the recorded
+    /// `GetRelationalDatabaseBlueprints` answer reports `postgres` blueprints
+    /// beside the MySQL ones. The catalog reports the engines the service
+    /// serves — the member is the engine of the blueprint, not of the enum's
+    /// last revision.
     pub engine: &'static str,
     /// How the engine is written in prose, as the engine descriptions show it
     /// (`MySQL`).
@@ -787,44 +806,78 @@ pub struct RelationalDatabaseBlueprintSpec {
     pub is_engine_default: bool,
 }
 
-/// The database blueprints this service serves, oldest major version first.
+/// The database blueprints this service serves: the MySQL blueprint first, then
+/// the PostgreSQL ones by ascending major version — the order the recorded
+/// `GetRelationalDatabaseBlueprints` answer reports them in, whose first entry is
+/// `mysql_8_4`.
 ///
-/// Source: the MySQL major versions the Lightsail user guide's "Database engines
-/// in Amazon Lightsail" lists for a managed database, each pinned to the final (or
-/// current) MySQL Community Edition patch release of that series. The modelled
-/// `RelationalDatabaseEngine` enum has exactly one value, `mysql`, so no other
-/// engine is serveable here; adding one is adding a row.
+/// Source: the engines and major versions the Lightsail user guide's "Database
+/// engines in Amazon Lightsail" lists for a managed database — MySQL 8.4 and
+/// PostgreSQL 13 through 18 — each pinned to the patch release of that series the
+/// service serves it at (`mysql_8_4` at the recorded `8.4.11`; each PostgreSQL
+/// series at the latest community patch release of that series). A major version
+/// the service retires or adds is a row removed or added here, and the default
+/// flag moves with the engine's default version — the series the service creates
+/// a database at when the caller names no other, which for PostgreSQL is the
+/// newest series that is not the opt-in latest.
+///
+/// Both engines are served even though the modelled `RelationalDatabaseEngine`
+/// enum still names only `mysql`: see [`RelationalDatabaseBlueprintSpec::engine`].
 pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &[
     RelationalDatabaseBlueprintSpec {
         engine: "mysql",
         engine_display: "MySQL",
         engine_description: "MySQL Community Edition",
-        major_version: "5.6",
-        engine_version: "5.6.51",
-        is_engine_default: false,
-    },
-    RelationalDatabaseBlueprintSpec {
-        engine: "mysql",
-        engine_display: "MySQL",
-        engine_description: "MySQL Community Edition",
-        major_version: "5.7",
-        engine_version: "5.7.44",
-        is_engine_default: false,
-    },
-    RelationalDatabaseBlueprintSpec {
-        engine: "mysql",
-        engine_display: "MySQL",
-        engine_description: "MySQL Community Edition",
-        major_version: "8.0",
-        engine_version: "8.0.41",
+        major_version: "8.4",
+        engine_version: "8.4.11",
         is_engine_default: true,
     },
     RelationalDatabaseBlueprintSpec {
-        engine: "mysql",
-        engine_display: "MySQL",
-        engine_description: "MySQL Community Edition",
-        major_version: "8.4",
-        engine_version: "8.4.4",
+        engine: "postgres",
+        engine_display: "PostgreSQL",
+        engine_description: "PostgreSQL",
+        major_version: "13",
+        engine_version: "13.21",
+        is_engine_default: false,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "postgres",
+        engine_display: "PostgreSQL",
+        engine_description: "PostgreSQL",
+        major_version: "14",
+        engine_version: "14.18",
+        is_engine_default: false,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "postgres",
+        engine_display: "PostgreSQL",
+        engine_description: "PostgreSQL",
+        major_version: "15",
+        engine_version: "15.13",
+        is_engine_default: false,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "postgres",
+        engine_display: "PostgreSQL",
+        engine_description: "PostgreSQL",
+        major_version: "16",
+        engine_version: "16.9",
+        is_engine_default: false,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "postgres",
+        engine_display: "PostgreSQL",
+        engine_description: "PostgreSQL",
+        major_version: "17",
+        engine_version: "17.5",
+        is_engine_default: true,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "postgres",
+        engine_display: "PostgreSQL",
+        engine_description: "PostgreSQL",
+        major_version: "18",
+        engine_version: "18.1",
         is_engine_default: false,
     },
 ];
@@ -895,6 +948,10 @@ pub fn relational_database_blueprint_ids() -> String {
 /// zone's region must be one of that enum's values, and the catalog is that enum
 /// (`smithy_query(query="shape",shape="RegionName")`, generated here as
 /// `REGION_NAME_VALUES`).
+///
+/// The enum, not [`REGION_SPECS`]: this is the set of Region names a stored
+/// `ResourceLocation` may carry, which is wider than the Regions `GetRegions`
+/// lists as served.
 pub fn region_of_availability_zone(availability_zone: &str) -> Option<&'static str> {
     let zone_letter = availability_zone.chars().next_back()?;
     if !zone_letter.is_ascii_lowercase() {
@@ -919,16 +976,17 @@ pub fn region_names() -> String {
 
 /// One Region Lightsail serves, as `GetRegions` reports it.
 ///
-/// The catalog of Regions is the modelled `RegionName` enum
-/// (`smithy_query(query="shape",shape="RegionName")`, generated here as
-/// `REGION_NAME_VALUES`) — those are exactly the Regions this API accepts, so
-/// those are the Regions it lists. Each entry adds the two human-facing values
+/// The catalog is the Regions the service SERVES, which is a subset of the
+/// modelled `RegionName` enum (`smithy_query(query="shape",shape="RegionName")`,
+/// generated here as `REGION_NAME_VALUES`): the enum is the set of Region names
+/// a `ResourceLocation` may carry, and it still admits `us-west-1`, which
+/// Lightsail does not operate in and does not list. Each entry adds the values
 /// the enum cannot carry: the place AWS names the Region after
-/// (`Region$displayName` — "The display name (`Ohio`)") and the area AWS
+/// (`Region$displayName` — "The display name (`Ohio`)"), the area AWS
 /// recommends it for (`Region$description` — "This region is recommended to
-/// serve users in the eastern United States and eastern Canada"). The
-/// continent code is not stored, because it follows from the name: see
-/// [`continent_code_of_region`].
+/// serve users in the eastern United States and eastern Canada") and the
+/// Availability Zones the Region publishes. The continent code is not stored,
+/// because it follows from the name: see [`continent_code_of_region`].
 #[derive(Debug, Clone, Copy)]
 pub struct RegionSpec {
     /// The `RegionName` value, as `Region$name` reports it.
@@ -938,6 +996,15 @@ pub struct RegionSpec {
     /// The area the Region is recommended for: the clause `Region$description`
     /// puts after "This region is recommended to serve users in".
     pub serves: &'static str,
+    /// The zone letters of this Region's Availability Zones, in order: a zone
+    /// name is the Region's name followed by one of these letters, the format
+    /// `AvailabilityZone$zoneName` documents ("The format is `us-east-2a`
+    /// (case-sensitive)").
+    ///
+    /// Per Region, because the count and the letters differ per Region and are
+    /// not a run of `a`, `b`, `c`: `us-west-2` publishes four zones and Tokyo
+    /// publishes `a`, `c` and `d` with no `b`.
+    pub availability_zone_letters: &'static str,
 }
 
 impl RegionSpec {
@@ -950,133 +1017,233 @@ impl RegionSpec {
         )
     }
 
-    /// This Region as the modelled `Region`.
+    /// The Availability Zones this Region publishes, as `GetRegions` reports
+    /// them to a caller that asked for them: one per letter in
+    /// [`Self::availability_zone_letters`], each named `<region><letter>` and
+    /// serving.
+    pub fn availability_zones(&self) -> Vec<AvailabilityZone> {
+        self.availability_zone_letters
+            .chars()
+            .map(|letter| AvailabilityZone {
+                zone_name: Some(format!("{}{letter}", self.name)),
+                state: Some(AVAILABILITY_ZONE_STATE_AVAILABLE.to_string()),
+            })
+            .collect()
+    }
+
+    /// This Region as the modelled `Region`, for a request served in
+    /// `request_region`.
     ///
-    /// Each zone list is filled only when the caller asked for it: `GetRegions`
-    /// documents both as opt-in ("Use the include availability zones parameter
-    /// to ALSO return the Availability Zones in a region"), so a caller that did
-    /// not ask is told nothing about them rather than handed an empty list it
-    /// could read as "this Region has no zones".
-    pub fn view(&self, include_zones: bool, include_relational_database_zones: bool) -> Region {
+    /// BOTH zone lists are ALWAYS reported, empty when they carry nothing: they
+    /// are list members, and an absent member is not an empty list to a typed
+    /// caller — it hands an SDK a null where the caller iterates a collection,
+    /// instead of saying "no zones to report here".
+    ///
+    /// A list carries zones only when the request asked for that list AND this
+    /// Region is the one the request was served in: a Lightsail endpoint is
+    /// regional and reports the Availability Zones of its OWN Region, so every
+    /// other Region in the catalog answers an empty zone list however the
+    /// include flags are set. That is what the recorded answer shows — the zones
+    /// of one Region, the request's own, and empty lists for all the others.
+    pub fn view(
+        &self,
+        include_zones: bool,
+        include_relational_database_zones: bool,
+        request_region: &str,
+    ) -> Region {
+        let is_request_region = self.name == request_region;
+        let zones = |include: bool| {
+            if include && is_request_region {
+                self.availability_zones()
+            } else {
+                Vec::new()
+            }
+        };
         Region {
             continent_code: continent_code_of_region(self.name).map(str::to_string),
             description: Some(self.description()),
             display_name: Some(self.display_name.to_string()),
             name: Some(self.name.to_string()),
-            availability_zones: include_zones.then(|| availability_zones_of_region(self.name)),
-            relational_database_availability_zones: include_relational_database_zones
-                .then(|| availability_zones_of_region(self.name)),
+            availability_zones: Some(zones(include_zones)),
+            // Lightsail publishes no zone list for databases separate from a
+            // Region's own, so both lists draw on the same zones.
+            relational_database_availability_zones: Some(zones(
+                include_relational_database_zones,
+            )),
         }
     }
 }
 
-/// Every Region this service serves, one per `REGION_NAME_VALUES` entry and in
-/// that list's order, so `GetRegions` walks a stable total order.
+/// Every Region this service serves, in the order `GetRegions` reports them:
+/// the US Regions first — the recorded answer opens with `us-east-1` — then the
+/// rest in the order AWS lists its Regions in, with the Regions opened later
+/// appended. `GetRegions` walks this slice, so two calls answer one stable
+/// order.
 ///
-/// `display_name` is the city, state or country AWS names each Region after;
-/// `serves` is the geography that Region is the closest one to.
+/// MEMBERSHIP: the Regions Lightsail operates in. That is a subset of the
+/// modelled `RegionName` enum, which also admits `us-west-1`: Lightsail serves
+/// no resources there and the recorded answer carries no such entry, so the
+/// catalog has no row for it.
+///
+/// `display_name` is the city, state or country AWS names each Region after
+/// (ASCII, as AWS reports it: `Sao Paulo`). `serves` is the geography that
+/// Region is the closest one to — the clause after the sentence stem
+/// `Region$description` documents. `us-east-1`, `us-east-2`, `us-west-2`,
+/// `ap-northeast-1` and `ap-northeast-2` carry the clause AWS's own answer gives
+/// for them (the two eastern US Regions share one clause); the rest name the
+/// geography the Lightsail documentation recommends that Region for, because the
+/// per-Region clause AWS writes follows no rule the model or the documentation
+/// states.
+///
+/// `availability_zone_letters` is the Availability Zones the Lightsail user
+/// guide's "Regions and Availability Zones" table lists for each Region: six in
+/// `us-east-1`, four in `us-west-2` (`a` through `d`, the recorded set), two in
+/// `ca-central-1`, and `a`, `c`, `d` in `ap-northeast-1`, which publishes no
+/// `b`.
 pub const REGION_SPECS: &[RegionSpec] = &[
     RegionSpec {
-        name: "ap-east-1",
-        display_name: "Hong Kong",
-        serves: "Hong Kong and southern China",
+        name: "us-east-1",
+        display_name: "Virginia",
+        serves: "the eastern United States",
+        availability_zone_letters: "abcdef",
     },
     RegionSpec {
-        name: "ap-northeast-1",
-        display_name: "Tokyo",
-        serves: "Japan",
+        name: "us-east-2",
+        display_name: "Ohio",
+        serves: "the eastern United States",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
-        name: "ap-northeast-2",
-        display_name: "Seoul",
-        serves: "South Korea",
+        name: "us-west-2",
+        display_name: "Oregon",
+        serves: "the northwestern United States, Alaska, and western Canada",
+        availability_zone_letters: "abcd",
     },
     RegionSpec {
         name: "ap-south-1",
         display_name: "Mumbai",
         serves: "India",
+        availability_zone_letters: "abc",
+    },
+    RegionSpec {
+        name: "ap-northeast-2",
+        display_name: "Seoul",
+        serves: "South Korea",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-southeast-1",
         display_name: "Singapore",
         serves: "Singapore and southeast Asia",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-southeast-2",
         display_name: "Sydney",
         serves: "Australia and New Zealand",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
-        name: "ap-southeast-3",
-        display_name: "Jakarta",
-        serves: "Indonesia",
-    },
-    RegionSpec {
-        name: "ap-southeast-5",
-        display_name: "Malaysia",
-        serves: "Malaysia",
+        name: "ap-northeast-1",
+        display_name: "Tokyo",
+        serves: "Japan",
+        availability_zone_letters: "acd",
     },
     RegionSpec {
         name: "ca-central-1",
         display_name: "Montreal",
         serves: "Canada",
+        availability_zone_letters: "ab",
     },
     RegionSpec {
         name: "eu-central-1",
         display_name: "Frankfurt",
         serves: "Germany and central Europe",
-    },
-    RegionSpec {
-        name: "eu-north-1",
-        display_name: "Stockholm",
-        serves: "the Nordic countries",
-    },
-    RegionSpec {
-        name: "eu-south-2",
-        display_name: "Spain",
-        serves: "Spain and Portugal",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-west-1",
         display_name: "Ireland",
         serves: "Ireland and western Europe",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-west-2",
         display_name: "London",
         serves: "the United Kingdom",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-west-3",
         display_name: "Paris",
         serves: "France",
+        availability_zone_letters: "abc",
+    },
+    RegionSpec {
+        name: "eu-north-1",
+        display_name: "Stockholm",
+        serves: "the Nordic countries",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "sa-east-1",
-        display_name: "São Paulo",
+        display_name: "Sao Paulo",
         serves: "Brazil and eastern South America",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
-        name: "us-east-1",
-        display_name: "Virginia",
-        serves: "the eastern United States and eastern Canada",
+        name: "ap-east-1",
+        display_name: "Hong Kong",
+        serves: "Hong Kong and southern China",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
-        name: "us-east-2",
-        display_name: "Ohio",
-        serves: "the midwestern United States",
+        name: "eu-south-2",
+        display_name: "Spain",
+        serves: "Spain and Portugal",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
-        name: "us-west-1",
-        display_name: "California",
-        serves: "California and the southwestern United States",
+        name: "ap-southeast-3",
+        display_name: "Jakarta",
+        serves: "Indonesia",
+        availability_zone_letters: "abc",
     },
     RegionSpec {
-        name: "us-west-2",
-        display_name: "Oregon",
-        serves: "the northwestern United States and western Canada",
+        name: "ap-southeast-5",
+        display_name: "Malaysia",
+        serves: "Malaysia",
+        availability_zone_letters: "abc",
     },
 ];
+
+/// The Regions `GetRegions` reports, as the modelled `Region` list, for a
+/// request served in `request_region` — [`REGION_SPECS`] viewed in its own
+/// order.
+///
+/// One function, so the catalog is walked the same way wherever it is reported.
+pub fn regions_view(
+    include_zones: bool,
+    include_relational_database_zones: bool,
+    request_region: &str,
+) -> Vec<Region> {
+    REGION_SPECS
+        .iter()
+        .map(|spec| {
+            spec.view(
+                include_zones,
+                include_relational_database_zones,
+                request_region,
+            )
+        })
+        .collect()
+}
+
+/// The catalog entry for the Region `name`, or `None` when this service serves
+/// no such Region.
+pub fn region_spec(name: &str) -> Option<&'static RegionSpec> {
+    REGION_SPECS.iter().find(|spec| spec.name == name)
+}
 
 /// The continent code of the Region `name`, or `None` when its geography prefix
 /// is not one this service serves.
@@ -1098,46 +1265,11 @@ pub fn continent_code_of_region(name: &str) -> Option<&'static str> {
     }
 }
 
-/// How many Availability Zones each Region advertises.
-///
-/// CHOSEN, not an AWS figure: the model declares no count, and AWS's own count
-/// differs per Region and even per account. Three is the fewest any Lightsail
-/// Region offers, so every zone this catalog names is one the real Region has
-/// too.
-pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
-
 /// The `state` a serving Availability Zone reports.
 ///
 /// A Lightsail Availability Zone is an EC2 one, and `available` is EC2's state
 /// for a zone that is operating normally.
 pub const AVAILABILITY_ZONE_STATE_AVAILABLE: &str = "available";
-
-/// The Availability Zones of `region`.
-///
-/// A zone name is its Region's name followed by a lowercase letter, counted from
-/// `a`, which is the format the modelled `AvailabilityZone$zoneName` documents:
-/// "The format is `us-east-2a` (case-sensitive)".
-pub fn availability_zones_of_region(region: &str) -> Vec<AvailabilityZone> {
-    (0..AVAILABILITY_ZONES_PER_REGION)
-        .filter_map(availability_zone_letter)
-        .map(|letter| AvailabilityZone {
-            zone_name: Some(format!("{region}{letter}")),
-            state: Some(AVAILABILITY_ZONE_STATE_AVAILABLE.to_string()),
-        })
-        .collect()
-}
-
-/// The zone letter at `index`, counting from `a`. Indices past the alphabet
-/// would collide, so they are a programming error rather than a value to render:
-/// a debug build trips, and a release build reports no zone for them.
-fn availability_zone_letter(index: usize) -> Option<char> {
-    debug_assert!(
-        index < 26,
-        "an availability zone index past the alphabet has no letter: {index}"
-    );
-    let offset = u8::try_from(index).ok()?;
-    (offset < 26).then(|| char::from(b'a' + offset))
-}
 
 /// Where a stored record lives.
 ///
