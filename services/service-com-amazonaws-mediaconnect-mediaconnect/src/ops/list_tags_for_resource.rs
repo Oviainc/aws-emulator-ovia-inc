@@ -76,7 +76,7 @@ use super::types::*;
 /// `ResourceArn` the same way.
 fn not_found(resource_arn: &str) -> ListTagsForResourceError {
     ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
-        message: format!("Resource with ARN {resource_arn} was not found."),
+        message: crate::state::not_found_message(resource_arn),
     })
     .into()
 }

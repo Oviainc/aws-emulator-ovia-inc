@@ -47,6 +47,8 @@ mod profile_lifecycle;
 mod resource_resolution_refusals;
 #[path = "all/security_policy_catalog.rs"]
 mod security_policy_catalog;
+#[path = "all/security_policy_listing.rs"]
+mod security_policy_listing;
 #[path = "all/server_config_and_state.rs"]
 mod server_config_and_state;
 #[path = "all/server_logging_configuration.rs"]

@@ -30,8 +30,10 @@ hex = { workspace = true }
 # generated client is needed — the emulator supplies the transport, so the SDK's
 # own HTTPS stack and runtime are left out.
 aws-sdk-iam = { version = "1", default-features = false }
-# Decodes the URL-encoded form IAM reports a trust-policy document in.
-percent-encoding = "2"
+# `iam_trust_policy`: the one reading of an IAM trust policy — including the decode of
+# the URL-encoded form IAM reports a document in — shared with every other service that
+# resolves a caller-supplied execution role.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
