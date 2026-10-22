@@ -115,3 +115,40 @@ Model evidence: smithy_query on services/service-com-amazonaws-ram-amazonresourc
 8. Cause 6: fixture ram-resource-share-lifecycle step teardown#7 — DeleteResourceShare against the already-deleted share; observe 400 instead of 200.
 9. Cause 7: fixture ram-principal-association-workflow step task#3 — GetResourceShareAssociations with associationType PRINCIPAL while the association is ASSOCIATING; inspect statusMessage.
 10. Cause 8: fixture ram-resource-share-not-found-errors steps task#1..task#4 — call GetResourceShares/UpdateResourceShare/DeleteResourceShare/AssociateResourceShare with an unknown resource-share ARN and compare the message against AWS's template.
+
+## Resolution notes
+
+All eight causes are implemented in `services/service-com-amazonaws-ram-amazonresourcesharing`,
+with the rules asserted over tables in `tests/all/share_tags_and_configuration.rs`:
+
+- Cause 1: `ShareRecord.resource_share_configuration` is stored unconditionally
+  (`state::share_configuration` fills each member from the request or from this
+  service's default) and `ShareRecord::view` always emits it.
+- Cause 2: `view` always emits the tag list, empty when the share carries no tags.
+- Causes 3 and 4: `TagResource` and `UntagResource` are implemented; they write the
+  one stored share (`ShareRecord::merge_tags` / `remove_tags`).
+- Cause 5: `GetResourceShares` filters only on the status the request names, so a
+  tombstoned share is reported in `DELETED`.
+- Cause 6: `DeleteResourceShare` answers 200 with `returnValue` for a share already
+  in `DELETED`; only an ARN no record ever had is `UnknownResourceException`.
+- Cause 7: a pending principal association reports
+  `state::ASSOCIATING_PRINCIPAL_STATUS_MESSAGE`, dropped when the owed move to
+  `ASSOCIATED` falls due. The wording is this emulator's — AWS publishes none, and
+  the recorded sentence is an example of the rule.
+- Cause 8: one constructor, `state::unknown_share_message`, renders the template for
+  every operation that takes a `resourceShareArn`.
+
+### Model change: `ResourceShareConfiguration$exclusiveAccountAccess`
+
+The member was ADDED to this service's on-disk Smithy model (and to the generated
+`ResourceShareConfiguration` shape in `src/ops/types/shared_types.rs`), because the
+shipped model predates it while AWS returns it. Evidence: the recorded AWS responses
+in corpus `simparity-wire-aws-v1` carry
+`resourceShareConfiguration = {'exclusiveAccountAccess': False,
+'retainSharingOnAccountLeaveOrganization': False}` on `CreateResourceShare` and on
+every `GetResourceShares` (quoted in the Evidence section above, cause 1), i.e. a
+boolean member named `exclusiveAccountAccess` whose default is `false`; a
+schema-driven serializer cannot emit a member the model does not declare, so the
+member was declared as a `com.amazonaws.ram#Boolean`. With it, five of the seven
+recorded fixtures replay clean; without it, every fixture that reads a share
+diverges on that member.

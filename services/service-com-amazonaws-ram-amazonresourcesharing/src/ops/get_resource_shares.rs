@@ -247,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(GetResourceSharesErrorModeled::UnknownResourceException(
                 UnknownResourceException {
-                    message: format!("no resource share with the ARN '{unknown}' exists"),
+                    message: crate::state::unknown_share_message(unknown),
                 },
             )
             .into());
@@ -274,21 +274,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !requested_arns.is_empty() && !requested_arns.contains(arn) {
                 continue;
             }
-            match input.resource_share_status.as_deref() {
-                // A share the caller asked for by status is reported in exactly that
-                // status, deleted ones included.
-                Some(status) => {
-                    if share.status != status {
-                        continue;
-                    }
-                }
-                // With no status asked for, a share `DeleteResourceShare` removed is
-                // gone.
-                None => {
-                    if share.is_deleted() {
-                        continue;
-                    }
-                }
+            // The status filter selects by the status the share is IN, so a share
+            // `DeleteResourceShare` removed is reported as `DELETED` to a read that
+            // asks for that status. A read that names no status reports every share
+            // this account owns, whatever status it is in, deleted ones included:
+            // the record survives the delete, so the terminal state of a share a
+            // caller deleted stays observable.
+            if input
+                .resource_share_status
+                .as_deref()
+                .is_some_and(|status| share.status != status)
+            {
+                continue;
             }
             if input
                 .name

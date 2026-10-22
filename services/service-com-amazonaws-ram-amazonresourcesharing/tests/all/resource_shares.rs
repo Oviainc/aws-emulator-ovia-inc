@@ -12,238 +12,15 @@
 //! `GetResourceShareAssociations` reports, and anything deleted is gone.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ram_amazonresourcesharing::state::{
     ASSOCIATION_READY_AFTER_MILLIS, MAX_ENTITIES_PER_CALL, MAX_PAGE_SIZE, MAX_TAGS_PER_SHARE,
 };
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request below signs for; the ARNs must carry exactly this one.
-const REGION: &str = "us-west-2";
-/// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries,
-/// and the account that owns every share these tests create.
-const ACCOUNT: &str = "000000000000";
-
-/// A resource ARN in the account that owns the shares: an internal entity.
-const LOCAL_RESOURCE: &str = "arn:aws:ec2:us-west-2:000000000000:subnet/subnet-1111";
-/// A second one, so a row can carry more than one resource.
-const LOCAL_RESOURCE_TWO: &str = "arn:aws:ec2:us-west-2:000000000000:subnet/subnet-2222";
-/// A resource ARN in another account: an external entity.
-const FOREIGN_RESOURCE: &str = "arn:aws:ec2:us-west-2:111122223333:subnet/subnet-3333";
-
-/// One emulator with an empty store, mounted exactly as the router mounts it.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_ram_amazonresourcesharing::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// A request signed for `ram` in [`REGION`], the signal the router routes on and the
-/// handlers read the region from.
-fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
-    let mut builder = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", format!("ram.{REGION}.amazonaws.com"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDRAMTEST/20260101/{REGION}/ram/aws4_request, \
-                 SignedHeaders=host, Signature=0000"
-            ),
-        );
-    let payload = match body {
-        Some(value) => {
-            builder = builder.header("content-type", "application/json");
-            bytes::Bytes::from(serde_json::to_vec(value).expect("serialize the request body"))
-        }
-        None => bytes::Bytes::new(),
-    };
-    builder.body(payload).expect("a well-formed test request")
-}
-
-/// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<&Value>,
-) -> (u16, Value) {
-    let response = router.dispatch(request(method, uri, body)).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let raw = response.into_body();
-    let mut parsed: Value = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&raw)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).to_string()))
-    };
-    // restJson1 carries the error shape in `__type`, and the framework also sets the
-    // `x-amzn-errortype` header; fold the header in so one accessor reads either.
-    if let (Some(error_type), Value::Object(map)) = (error_type, &mut parsed) {
-        map.entry("__type")
-            .or_insert_with(|| Value::String(error_type));
-    }
-    (status, parsed)
-}
-
-/// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        // An error `__type` may be namespaced (`com.amazonaws.ram#Foo`).
-        .rsplit('#')
-        .next()
-        .unwrap_or("<no __type>")
-        .to_string()
-}
-
-/// Percent-encode a value for use in a query string, which is what an SDK does with
-/// an `@httpQuery` member.
-fn query_escape(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn create(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    call(router, "POST", "/createresourceshare", Some(body)).await
-}
-
-async fn get_shares(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    call(router, "POST", "/getresourceshares", Some(body)).await
-}
-
-async fn associate(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    call(router, "POST", "/associateresourceshare", Some(body)).await
-}
-
-async fn get_associations(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    call(router, "POST", "/getresourceshareassociations", Some(body)).await
-}
-
-async fn update(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    call(router, "POST", "/updateresourceshare", Some(body)).await
-}
-
-async fn delete(
-    router: &MultiServiceRouter,
-    resource_share_arn: &str,
-    client_token: Option<&str>,
-) -> (u16, Value) {
-    let mut uri = format!(
-        "/deleteresourceshare?resourceShareArn={}",
-        query_escape(resource_share_arn)
-    );
-    if let Some(token) = client_token {
-        uri.push_str(&format!("&clientToken={}", query_escape(token)));
-    }
-    call(router, "DELETE", &uri, None).await
-}
-
-/// Create a share that must succeed, and answer the `resourceShare` it reported.
-async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
-    let (status, created) = create(router, body).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: create expected 200, got {status} with {created:?}"
-    );
-    created
-        .get("resourceShare")
-        .cloned()
-        .unwrap_or_else(|| panic!("case {case:?}: create reported no resourceShare, got {created:?}"))
-}
-
-/// The ARN of a reported share.
-fn arn_of(case: &str, share: &Value) -> String {
-    share
-        .get("resourceShareArn")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("case {case:?}: share carried no resourceShareArn, got {share:?}"))
-        .to_string()
-}
-
-/// Assert `arn` is a resource-share ARN of this service in this region and account,
-/// and answer its id segment.
-fn assert_share_arn(case: &str, arn: &str) -> String {
-    let prefix = format!("arn:aws:ram:{REGION}:{ACCOUNT}:resource-share/");
-    let id = arn
-        .strip_prefix(&prefix)
-        .unwrap_or_else(|| panic!("case {case:?}: expected an ARN starting {prefix}, got {arn:?}"));
-    // The id segment RAM uses is a UUID: 8-4-4-4-12 lowercase hex.
-    let groups: Vec<&str> = id.split('-').collect();
-    assert_eq!(
-        groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
-        vec![8, 4, 4, 4, 12],
-        "case {case:?}: expected a UUID id segment, got {id:?}"
-    );
-    assert!(
-        id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
-        "case {case:?}: expected a lowercase-hex UUID id segment, got {id:?}"
-    );
-    id.to_string()
-}
-
-/// The shares a `GetResourceShares` response reported.
-fn shares_of(case: &str, body: &Value) -> Vec<Value> {
-    body.get("resourceShares")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_else(|| panic!("case {case:?}: response carried no resourceShares, got {body:?}"))
-}
-
-/// The associations a response reported (either operation reports them the same way).
-fn associations_of(case: &str, body: &Value) -> Vec<Value> {
-    body.get("resourceShareAssociations")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: response carried no resourceShareAssociations, got {body:?}")
-        })
-}
-
-/// A timestamp member, as restJson1 renders it: epoch seconds.
-fn timestamp(case: &str, value: &Value, member: &str) -> f64 {
-    value
-        .get(member)
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("case {case:?}: expected a {member} timestamp, got {value:?}"))
-}
-
-/// The names of the shares a response reported, sorted.
-fn names_of(case: &str, body: &Value) -> Vec<String> {
-    let mut names: Vec<String> = shares_of(case, body)
-        .iter()
-        .map(|share| {
-            share
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("<no name>")
-                .to_string()
-        })
-        .collect();
-    names.sort();
-    names
-}
+// Every suite in this crate calls the service the one way: through `tests/all/harness.rs`.
+use super::harness::*;
 
 /// A row of the create/read-back table.
 struct ShareCase {
@@ -253,11 +30,24 @@ struct ShareCase {
     request: Value,
     /// `allowExternalPrincipals` the stored share must carry.
     allow_external_principals: bool,
-    /// The tags the stored share must carry, in key order.
+    /// The tags the stored share must carry, in key order. A share with no tags
+    /// reports the empty list, never an absent member.
     tags: Value,
+    /// The `resourceShareConfiguration` the stored share must report: the one the
+    /// request named, with this service's default for every member it left out.
+    configuration: Value,
     /// `(associationType, associatedEntity, external)` for every association the
     /// create must have materialised.
     associations: Vec<(&'static str, &'static str, bool)>,
+}
+
+/// The configuration a share created without an explicit one reports: the modelled
+/// `ResourceShareConfiguration` with both members at this service's defaults.
+fn default_configuration() -> Value {
+    json!({
+        "exclusiveAccountAccess": false,
+        "retainSharingOnAccountLeaveOrganization": false,
+    })
 }
 
 /// The table. The rule is "a read reports what the create stored", so the rows differ
@@ -272,7 +62,8 @@ fn share_cases() -> Vec<ShareCase> {
             name: "share-minimal",
             request: json!({ "name": "share-minimal" }),
             allow_external_principals: true,
-            tags: Value::Null,
+            tags: json!([]),
+            configuration: default_configuration(),
             associations: vec![],
         },
         // One resource inside the owning account: an internal association.
@@ -283,7 +74,8 @@ fn share_cases() -> Vec<ShareCase> {
                 "resourceArns": [LOCAL_RESOURCE],
             }),
             allow_external_principals: true,
-            tags: Value::Null,
+            tags: json!([]),
+            configuration: default_configuration(),
             associations: vec![("RESOURCE", LOCAL_RESOURCE, false)],
         },
         // Two resources — one of them owned elsewhere — two principals, external
@@ -305,6 +97,7 @@ fn share_cases() -> Vec<ShareCase> {
                 { "key": "Env", "value": "test" },
                 { "key": "Team", "value": "platform" },
             ]),
+            configuration: default_configuration(),
             associations: vec![
                 ("RESOURCE", LOCAL_RESOURCE, false),
                 ("RESOURCE", FOREIGN_RESOURCE, true),
@@ -327,6 +120,7 @@ fn share_cases() -> Vec<ShareCase> {
             }),
             allow_external_principals: true,
             tags: json!([{ "key": "Owner", "value": "" }]),
+            configuration: default_configuration(),
             associations: vec![
                 ("PRINCIPAL", "lambda.amazonaws.com", true),
                 ("SOURCE", "111122223333", true),
@@ -349,7 +143,11 @@ fn share_cases() -> Vec<ShareCase> {
                 },
             }),
             allow_external_principals: true,
-            tags: Value::Null,
+            tags: json!([]),
+            configuration: json!({
+                "exclusiveAccountAccess": false,
+                "retainSharingOnAccountLeaveOrganization": true,
+            }),
             associations: vec![("RESOURCE", LOCAL_RESOURCE_TWO, false)],
         },
     ]
@@ -394,6 +192,14 @@ async fn a_create_is_reported_by_every_later_read() {
             created.get("tags").cloned().unwrap_or(Value::Null),
             case.tags,
             "case {label:?}: wrong tags, got {created:?}"
+        );
+        assert_eq!(
+            created
+                .get("resourceShareConfiguration")
+                .cloned()
+                .unwrap_or(Value::Null),
+            case.configuration,
+            "case {label:?}: wrong resourceShareConfiguration, got {created:?}"
         );
         let created_at = timestamp(label, &created, "creationTime");
         let updated_at = timestamp(label, &created, "lastUpdatedTime");
@@ -1123,13 +929,20 @@ async fn a_delete_removes_the_share_and_everything_it_shared() {
         "case {case:?}: RAM generates a clientToken when the request omits one, got {deleted:?}"
     );
 
-    // Gone from the default read.
+    // The record survives the delete: a read that names no status reports it in its
+    // terminal DELETED state, so a caller can still observe the share it deleted.
     let (_, listed) = get_shares(&router, &json!({ "resourceOwner": "SELF" })).await;
-    assert!(
-        names_of(case, &listed).is_empty(),
-        "case {case:?}: a deleted share must not be reported, got {listed:?}"
+    assert_eq!(
+        names_of(case, &listed),
+        vec!["share-deleted".to_string()],
+        "case {case:?}: a deleted share stays retrievable, got {listed:?}"
     );
-    // Still visible to a read that asks for deleted shares, in that status.
+    assert_eq!(
+        shares_of(case, &listed)[0].get("status").and_then(Value::as_str),
+        Some("DELETED"),
+        "case {case:?}: the retained record must report DELETED, got {listed:?}"
+    );
+    // And to a read that asks for deleted shares by status.
     let (_, tombstoned) = get_shares(
         &router,
         &json!({ "resourceOwner": "SELF", "resourceShareStatus": "DELETED" }),
@@ -1159,16 +972,18 @@ async fn a_delete_removes_the_share_and_everything_it_shared() {
         );
     }
 
-    // And nothing can act on it any more.
+    // And nothing can act on it any more — but deleting it again is the same
+    // success, because the share RAM is asked to delete is already deleted.
     let (status, body) = delete(&router, &arn, None).await;
     assert_eq!(
-        status, 400,
-        "case {case:?}: a second delete expected 400, got {status} with {body:?}"
+        status, 200,
+        "case {case:?}: a repeat delete of a deleted share expected 200, got {status} with \
+         {body:?}"
     );
     assert_eq!(
-        error_code(&body),
-        "UnknownResourceException",
-        "case {case:?}: wrong error for a second delete, got {body:?}"
+        body.get("returnValue").and_then(Value::as_bool),
+        Some(true),
+        "case {case:?}: a repeat delete reports returnValue true, got {body:?}"
     );
     let (status, body) = update(
         &router,

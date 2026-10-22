@@ -186,6 +186,7 @@ pub struct ResourceSharePermissionDetail {
 #[smithy_macros::smithy(shape = "com.amazonaws.ram#ResourceShareConfiguration")]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceShareConfiguration {
+    pub exclusive_account_access: Option<bool>,
     pub retain_sharing_on_account_leave_organization: Option<bool>,
 }
 

@@ -269,10 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(share) = store.live_share_mut(&input.resource_share_arn) else {
             return Err(UpdateResourceShareErrorModeled::UnknownResourceException(
                 UnknownResourceException {
-                    message: format!(
-                        "no resource share with the ARN '{}' exists",
-                        input.resource_share_arn
-                    ),
+                    message: crate::state::unknown_share_message(&input.resource_share_arn),
                 },
             )
             .into());

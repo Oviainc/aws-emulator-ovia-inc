@@ -304,15 +304,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(crate::state::DEFAULT_ALLOW_EXTERNAL_PRINCIPALS);
         let tags = crate::state::tag_map(&supplied_tags);
         let rendered_tags = crate::state::fingerprint_map(&tags);
-        let rendered_configuration = match input
-            .resource_share_configuration
-            .as_ref()
-            .and_then(|configuration| configuration.retain_sharing_on_account_leave_organization)
-        {
-            Some(true) => "retain=true",
-            Some(false) => "retain=false",
-            None => "retain=",
-        };
+        // The configuration the share will carry, with the defaults filled in, so two
+        // requests that ask for the same configuration in different words share one
+        // fingerprint and one that asks for a different one does not.
+        let configuration =
+            crate::state::share_configuration(input.resource_share_configuration.as_ref());
+        let rendered_configuration = format!(
+            "retain={:?}{}exclusive={:?}",
+            configuration.retain_sharing_on_account_leave_organization,
+            '\u{1}',
+            configuration.exclusive_account_access
+        );
 
         let mut store = state.lock();
         let now = store.tick();
@@ -332,7 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::fingerprint_list(&sources),
             &crate::state::fingerprint_list(&permission_arns),
             &rendered_tags,
-            rendered_configuration,
+            &rendered_configuration,
         ]);
 
         if let Some(token) = input.client_token.clone() {
@@ -388,7 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_time: now,
             feature_set: crate::state::FEATURE_SET_STANDARD.to_string(),
             permission_arns,
-            resource_share_configuration: input.resource_share_configuration,
+            resource_share_configuration: configuration,
         };
         store.insert_share(share.clone());
 

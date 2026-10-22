@@ -267,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetResourceShareAssociationsErrorModeled::UnknownResourceException(
                     UnknownResourceException {
-                        message: format!("no resource share with the ARN '{unknown}' exists"),
+                        message: crate::state::unknown_share_message(unknown),
                     },
                 )
                 .into(),

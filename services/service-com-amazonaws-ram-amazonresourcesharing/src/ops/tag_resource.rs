@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches tag pairs to the stored resource share named by `resourceShareArn`, so
+//! a later `GetResourceShares` reports them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Exactly one of `resourceShareArn` and `resourceArn` may be named ("You must
+//! specify either resourceArn, or resourceShareArn, but not both"). `resourceArn`
+//! names a MANAGED PERMISSION, and this emulator holds no managed permissions (every
+//! permission operation in this crate is still a stub), so that form is answered with
+//! the modelled `ResourceArnNotFoundException` rather than with a tag set no read
+//! could report.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +163,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        let tags = input.tags.clone();
+
+        // "You must specify either resourceShareArn, or resourceArn, but not both"
+        // (both members' own documentation).
+        let target = match (
+            input.resource_share_arn.as_deref(),
+            input.resource_arn.as_deref(),
+        ) {
+            (Some(share_arn), None) => Ok(share_arn),
+            (None, Some(resource_arn)) => Err(resource_arn),
+            (Some(_), Some(_)) => {
+                return Err(TagResourceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: "you must specify either resourceShareArn or resourceArn, \
+                                  but not both"
+                            .to_string(),
+                    },
+                )
+                .into())
+            }
+            (None, None) => {
+                return Err(TagResourceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: "you must specify either resourceShareArn or resourceArn"
+                            .to_string(),
+                    },
+                )
+                .into())
+            }
+        };
+
+        match crate::state::tags_rejection(&tags) {
+            None => {}
+            Some(crate::state::TagRejection::Invalid(why)) => {
+                return Err(TagResourceErrorModeled::InvalidParameterException(
+                    InvalidParameterException { message: why },
+                )
+                .into())
+            }
+            Some(crate::state::TagRejection::LimitExceeded(why)) => {
+                return Err(TagResourceErrorModeled::TagLimitExceededException(
+                    TagLimitExceededException { message: why },
+                )
+                .into())
+            }
+            Some(crate::state::TagRejection::PolicyViolation(why)) => {
+                return Err(TagResourceErrorModeled::TagPolicyViolationException(
+                    TagPolicyViolationException { message: why },
+                )
+                .into())
+            }
+        }
+
+        let share_arn = match target {
+            Ok(share_arn) => share_arn,
+            Err(resource_arn) => {
+                if !crate::state::is_arn(resource_arn) {
+                    return Err(TagResourceErrorModeled::MalformedArnException(
+                        MalformedArnException {
+                            message: "resourceArn is not an ARN of the form \
+                                      arn:<partition>:<service>:<region>:<account>:<resource>"
+                                .to_string(),
+                        },
+                    )
+                    .into());
+                }
+                // `resourceArn` names a managed permission, and this emulator holds
+                // none, so no ARN a caller can pass here names one.
+                return Err(TagResourceErrorModeled::ResourceArnNotFoundException(
+                    ResourceArnNotFoundException {
+                        message: format!("ManagedPermission {resource_arn} could not be found."),
+                    },
+                )
+                .into());
+            }
+        };
+        if let Some(why) = crate::state::share_arn_rejection("resourceShareArn", share_arn) {
+            return Err(TagResourceErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        let Some(share) = store.live_share_mut(share_arn) else {
+            return Err(TagResourceErrorModeled::UnknownResourceException(
+                UnknownResourceException {
+                    message: crate::state::unknown_share_message(share_arn),
+                },
+            )
+            .into());
+        };
+
+        // The cap is on the share, so what is checked is the tag set the share would
+        // end up carrying - a pair whose key the share already has replaces it
+        // rather than adding to the count.
+        let arriving = crate::state::tag_map(&tags);
+        let total = share
+            .tags
+            .keys()
+            .chain(arriving.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if let Some(why) = crate::state::tag_count_rejection(total) {
+            return Err(TagResourceErrorModeled::TagLimitExceededException(
+                TagLimitExceededException { message: why },
+            )
+            .into());
+        }
+
+        // A tag change is a change to the share, so it moves `lastUpdatedTime` -
+        // but a call that attaches exactly what the share already carries changes
+        // nothing, so it leaves the stamp alone.
+        if share.merge_tags(&tags) {
+            share.last_updated_time = now;
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

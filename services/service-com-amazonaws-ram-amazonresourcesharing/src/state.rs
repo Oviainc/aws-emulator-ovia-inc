@@ -39,6 +39,25 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// From that member's own documentation: "The default value is true."
 pub const DEFAULT_ALLOW_EXTERNAL_PRINCIPALS: bool = true;
 
+/// `ResourceShareConfiguration$retainSharingOnAccountLeaveOrganization` when the
+/// create request names no configuration, or names one that leaves the member out.
+///
+/// That member "specifies whether the consumer account retains access to the
+/// resource share after leaving the organization" (its own documentation); a share
+/// gets no such retention unless it is asked for, so the service default is false.
+/// A share's configuration is part of its record either way: RAM reports the
+/// structure on every `ResourceShare` it returns, with the defaults for a share
+/// created without an explicit one.
+pub const DEFAULT_RETAIN_SHARING_ON_ACCOUNT_LEAVE_ORGANIZATION: bool = false;
+
+/// `ResourceShareConfiguration$exclusiveAccountAccess` when the create request does
+/// not name it.
+///
+/// Access to a share is not exclusive to the accounts it is shared with unless that
+/// is asked for, so the service default is false — the value RAM reports for a share
+/// created without an explicit configuration.
+pub const DEFAULT_EXCLUSIVE_ACCOUNT_ACCESS: bool = false;
+
 /// The `featureSet` of a share created through the RAM API.
 ///
 /// From the modelled `ResourceShare$featureSet` documentation: `STANDARD` is "a
@@ -60,6 +79,18 @@ pub const SHARE_STATUS_DELETED: &str = "DELETED";
 pub const ASSOCIATION_STATUS_ASSOCIATING: &str = "ASSOCIATING";
 /// The status an association reaches once the move RAM owes it falls due.
 pub const ASSOCIATION_STATUS_ASSOCIATED: &str = "ASSOCIATED";
+
+/// The message RAM reports on a principal association that has not settled yet.
+///
+/// RAM invites the principal to the share, and the principal accepts or rejects the
+/// invitation, so what a pending principal association is waiting for is that
+/// answer. The member that reports it is the modelled
+/// `ResourceShareAssociation$statusMessage` ("A message about the status of the
+/// association"); AWS publishes no wording, so this sentence is this emulator's and
+/// the RULE — a principal association that has not completed says what it is waiting
+/// for, and a settled one reports nothing — is what is pinned.
+pub const ASSOCIATING_PRINCIPAL_STATUS_MESSAGE: &str =
+    "Waiting for the principal to either accept or reject the resource share invitation.";
 
 /// `ResourceShareAssociationType` values, from
 /// `smithy_query(query="shape",shape="ResourceShareAssociationType")`.
@@ -174,7 +205,9 @@ pub struct ShareRecord {
     /// The managed-permission ARNs the create request named, which
     /// `GetResourceShares`' `permissionArn` filter reads.
     pub permission_arns: Vec<String>,
-    pub resource_share_configuration: Option<ResourceShareConfiguration>,
+    /// The share's configuration, always stored: a create that names none stores
+    /// the service defaults, so every read reports the structure.
+    pub resource_share_configuration: ResourceShareConfiguration,
 }
 
 impl ShareRecord {
@@ -187,19 +220,47 @@ impl ShareRecord {
             allow_external_principals: Some(self.allow_external_principals),
             status: Some(self.status.clone()),
             status_message: self.status_message.clone(),
-            // A share carrying no tags omits the member rather than reporting an
-            // empty list.
-            tags: (!self.tags.is_empty()).then(|| tag_list(&self.tags)),
+            // `tags` reports the share's tag set, which is a list that may be
+            // empty: a share carrying no tags reports `[]`, so a caller can tell
+            // "no tags" from "tags not reported".
+            tags: Some(tag_list(&self.tags)),
             creation_time: Some(to_date_time(self.creation_time)),
             last_updated_time: Some(to_date_time(self.last_updated_time)),
             feature_set: Some(self.feature_set.clone()),
-            resource_share_configuration: self.resource_share_configuration.clone(),
+            resource_share_configuration: Some(self.resource_share_configuration.clone()),
         }
     }
 
     /// Whether `DeleteResourceShare` has already removed this share.
     pub fn is_deleted(&self) -> bool {
         self.status == SHARE_STATUS_DELETED
+    }
+
+    /// Attach `tags` to this share, replacing the value of a key it already
+    /// carries, and answer whether the stored tag set changed.
+    ///
+    /// Call it only after [`tags_rejection`] has passed, which is what guarantees
+    /// every pair has a key.
+    pub fn merge_tags(&mut self, tags: &[Tag]) -> bool {
+        let mut changed = false;
+        for (key, value) in tag_map(tags) {
+            if self.tags.insert(key, value.clone()).as_ref() != Some(&value) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Detach every key in `keys` from this share, and answer whether the stored tag
+    /// set changed. A key the share does not carry is not an error: removing it
+    /// leaves the share exactly as it was.
+    pub fn remove_tags(&mut self, keys: &[String]) -> bool {
+        // Every key is removed, not just up to the first that was present, so this
+        // counts the removals rather than short-circuiting on one.
+        keys.iter()
+            .filter(|key| self.tags.remove(*key).is_some())
+            .count()
+            > 0
     }
 }
 
@@ -294,6 +355,9 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                 continue;
             }
             record.status = ASSOCIATION_STATUS_ASSOCIATED.to_string();
+            // A settled association is waiting for nothing, so it reports no
+            // status message.
+            record.status_message = None;
             // The move happened when it fell due, not when somebody noticed.
             record.last_updated_time = due;
             record.ready_at = None;
@@ -338,6 +402,13 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// Associate `entity` with the share under `association_type`, returning the
     /// record as it now stands.
     ///
+    /// A new association starts in the non-terminal `ASSOCIATING` status, and a
+    /// principal association says in its `statusMessage` that it is waiting for the
+    /// invitation to be answered ([`associating_status_message`]). The move to
+    /// `ASSOCIATED` is one the clock owes, [`ASSOCIATION_READY_AFTER_MILLIS`] after
+    /// this call; [`Self::settle_due_associations`] materialises it and drops the
+    /// message with it.
+    ///
     /// An entity already associated with that share under that type is left exactly
     /// as it is — re-associating it changes nothing, so neither its status nor its
     /// timestamps move — except for the share's name, which an update may have
@@ -363,7 +434,8 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                 associated_entity: entity.to_string(),
                 association_type: association_type.to_string(),
                 status: ASSOCIATION_STATUS_ASSOCIATING.to_string(),
-                status_message: None,
+                status_message: associating_status_message(association_type)
+                    .map(str::to_string),
                 creation_time: now,
                 last_updated_time: now,
                 external: entity_is_external(&share.owning_account_id, entity),
@@ -468,6 +540,56 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     }
 }
 
+/// The configuration to store for a share created with `requested`.
+///
+/// Every member the request leaves out takes this service's default, so the stored
+/// record is complete and a read never has to invent one.
+pub fn share_configuration(
+    requested: Option<&ResourceShareConfiguration>,
+) -> ResourceShareConfiguration {
+    ResourceShareConfiguration {
+        exclusive_account_access: Some(
+            requested
+                .and_then(|configuration| configuration.exclusive_account_access)
+                .unwrap_or(DEFAULT_EXCLUSIVE_ACCOUNT_ACCESS),
+        ),
+        retain_sharing_on_account_leave_organization: Some(
+            requested
+                .and_then(|configuration| {
+                    configuration.retain_sharing_on_account_leave_organization
+                })
+                .unwrap_or(DEFAULT_RETAIN_SHARING_ON_ACCOUNT_LEAVE_ORGANIZATION),
+        ),
+    }
+}
+
+/// The message of the `UnknownResourceException` every operation that takes a
+/// `resourceShareArn` renders when no share has it.
+///
+/// One template across every such operation, built from the ARN the request named,
+/// so a caller can read the ARN back out of the message it gets.
+pub fn unknown_share_message(arn: &str) -> String {
+    format!("ResourceShare {arn} could not be found.")
+}
+
+/// The `statusMessage` an association of this type carries while it has not settled
+/// yet, or `None` when there is nothing to report.
+///
+/// RAM shares with a principal by INVITATION: the invited principal accepts or
+/// rejects it (the modelled `AcceptResourceShareInvitation` /
+/// `RejectResourceShareInvitation` operations, and the invitations
+/// `GetResourceShareInvitations` reports), so what a principal association that has
+/// not completed is waiting for is that answer, and
+/// `ResourceShareAssociation$statusMessage` ("A message about the status of the
+/// association") is the member that says so. A resource or a source association
+/// names no principal, waits for nobody, and reports no message. A settled
+/// association waits for nothing either, so the member is dropped when it reaches
+/// `ASSOCIATED`.
+pub fn associating_status_message(association_type: &str) -> Option<&'static str> {
+    (association_type == ASSOCIATION_TYPE_PRINCIPAL)
+        .then_some(ASSOCIATING_PRINCIPAL_STATUS_MESSAGE)
+}
+
 /// Tags as the wire shape wants them, ordered by key.
 pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
     tags.iter()
@@ -504,13 +626,23 @@ pub enum TagRejection {
     PolicyViolation(String),
 }
 
+/// Why a resource share cannot carry `total` tags, or `None` when it can.
+///
+/// The cap is on the share, not on one request, so an operation that ADDS tags to a
+/// share that already has some passes the total it would end up with.
+pub fn tag_count_rejection(total: usize) -> Option<String> {
+    (total > MAX_TAGS_PER_SHARE).then(|| {
+        format!(
+            "the resource share would carry {total} tags, more than the \
+             {MAX_TAGS_PER_SHARE} a resource share accepts"
+        )
+    })
+}
+
 /// Why `tags` cannot be attached to a resource share, or `None` when they can.
 pub fn tags_rejection(tags: &[Tag]) -> Option<TagRejection> {
-    if tags.len() > MAX_TAGS_PER_SHARE {
-        return Some(TagRejection::LimitExceeded(format!(
-            "the request carries {} tags, more than the {MAX_TAGS_PER_SHARE} a resource share accepts",
-            tags.len()
-        )));
+    if let Some(why) = tag_count_rejection(tags.len()) {
+        return Some(TagRejection::LimitExceeded(why));
     }
     for tag in tags {
         // "Every tag must have a key" (modelled `Tag$key` documentation).
@@ -542,6 +674,25 @@ pub fn tags_rejection(tags: &[Tag]) -> Option<TagRejection> {
         }
     }
     None
+}
+
+/// Why `tagKeys` cannot be detached from a resource share, or `None` when they can.
+///
+/// Rendered as `InvalidParameterException`: the same shape rules the keys of a
+/// `TagList` must satisfy, applied to the bare keys an untag names.
+pub fn tag_keys_rejection(keys: &[String]) -> Option<String> {
+    keys.iter()
+        .find(|key| key.is_empty() || key.len() > MAX_NAME_LEN)
+        .map(|key| {
+            if key.is_empty() {
+                "every entry in tagKeys must be a non-empty key".to_string()
+            } else {
+                format!(
+                    "tag key '{}' is longer than the {MAX_NAME_LEN} characters this service accepts",
+                    truncate(key)
+                )
+            }
+        })
 }
 
 /// Whether `tags` satisfies `filters`.

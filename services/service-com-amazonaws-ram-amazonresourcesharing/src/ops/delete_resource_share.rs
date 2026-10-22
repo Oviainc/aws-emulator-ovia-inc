@@ -232,20 +232,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A share already deleted is gone, so a second delete under a different (or
-        // no) client token finds nothing to delete.
-        if store.live_share(&input.resource_share_arn).is_none() {
-            return Err(DeleteResourceShareErrorModeled::UnknownResourceException(
-                UnknownResourceException {
-                    message: format!(
-                        "no resource share with the ARN '{}' exists",
-                        input.resource_share_arn
-                    ),
-                },
-            )
-            .into());
+        // Deleting a share is idempotent for as long as its record exists: a share
+        // already in the DELETED state is deleted, so a repeat of the call reports
+        // the same success instead of a client error. Only an ARN no share ever had
+        // is the `UnknownResourceException` case.
+        match store.share(&input.resource_share_arn) {
+            None => {
+                return Err(DeleteResourceShareErrorModeled::UnknownResourceException(
+                    UnknownResourceException {
+                        message: crate::state::unknown_share_message(&input.resource_share_arn),
+                    },
+                )
+                .into())
+            }
+            // Already deleted: nothing left to delete, so the record keeps the
+            // `lastUpdatedTime` the delete that removed it stored.
+            Some(share) if share.is_deleted() => {}
+            Some(_) => store.delete_share(&input.resource_share_arn, now),
         }
-        store.delete_share(&input.resource_share_arn, now);
 
         let client_token = match input.client_token {
             Some(token) => token,
