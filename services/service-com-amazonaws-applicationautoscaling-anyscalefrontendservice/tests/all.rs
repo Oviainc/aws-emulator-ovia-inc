@@ -15,3 +15,5 @@
 mod scalable_target_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tags.rs"]
+mod tags;
