@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record.application.state = "STARTING".to_string();
                 record.application.updated_at = crate::state::now_timestamp(now);
                 record.pending = Some(crate::state::PendingState {
-                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
                     state: "STARTED".to_string(),
                     state_details: None,
                 });
@@ -309,19 +309,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::JobRunRecord {
                 job_run,
                 job_run_type: record.application.r#type.clone(),
-                // This emulator runs no Spark or Hive workload, so the clock owes the
-                // job run the modelled failure state with a reason that says so — it
-                // can never be reported as a success nothing computed.
-                pending: Some(crate::state::PendingState {
-                    due: now + crate::state::LIFECYCLE_TRANSITION,
-                    state: "FAILED".to_string(),
-                    state_details: Some(crate::state::NOT_EXECUTED_STATE_DETAILS.to_string()),
-                }),
+                // A submitted run is not finished the instant the submit returns: the
+                // clock owes it each stage it passes through
+                // (`crate::state::JOB_RUN_STAGES`), so a client polling or filtering
+                // for in-flight runs observes it in them. This emulator runs no Spark
+                // or Hive workload, so the last of those stages is the modelled failure
+                // state with a reason that says so — it can never be reported as a
+                // success nothing computed.
+                pending: crate::state::job_run_stages(now),
+                dashboard: None,
+                dashboard_grants: 0,
             },
         );
         record
             .job_run_tokens
             .insert(input.client_token, job_run_id.clone());
+        // Submitting work is activity: the idle span the application's
+        // `autoStopConfiguration` bounds starts again here.
+        record.mark_activity(now);
 
         Ok(StartJobRunOutput {
             application_id: input.application_id,

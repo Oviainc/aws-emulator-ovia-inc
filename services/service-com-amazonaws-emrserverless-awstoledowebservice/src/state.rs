@@ -9,26 +9,37 @@
 //! members a request names to it, `StartApplication` /
 //! `StopApplication` move its state, `DeleteApplication` terminates it (the record is
 //! retained in the terminal `TERMINATED` state rather than dropped, so a client reading
-//! the application back after a delete observes that state), and
+//! the application back after a delete observes that state, while the unfiltered
+//! `ListApplications` inventory drops it — see [`is_live_application_state`]), and
 //! `StartJobRun` / `GetJobRun` / `ListJobRuns` / `CancelJobRun` work on the job runs it
 //! owns. An interactive session lives inside one application the same way a job run
 //! does: `StartSession` mints a [`SessionRecord`] on the application it names and
 //! `GetSession` reports it.
 //!
+//! Two things here move with the CLOCK rather than with a call, and both are stored as a
+//! due instant that the next read materialises (nothing sleeps): the stages a submitted
+//! job run passes through before it settles ([`JOB_RUN_STAGES`]), and the automatic stop
+//! an application's `autoStopConfiguration` owes it once it has been idle past the idle
+//! timeout it names ([`ApplicationRecord::auto_stop_due`]).
+//!
 //! Each record holds the MODELLED shape (`Application`, `JobRun`) verbatim, so a
 //! reporting operation returns exactly what the mutating one stored rather than
 //! re-deriving anything from a request.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt::Debug;
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
+use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Application, ApplicationSummary, AutoStartConfig, AutoStopConfig, IdentityCenterConfiguration,
-    IdentityCenterConfigurationInput, ImageConfiguration, ImageConfigurationInput, JobRun,
-    JobRunSummary, JobLevelCostAllocationConfiguration, MonitoringConfiguration,
-    ResourceNotFoundException, Session, WorkerTypeSpecification, WorkerTypeSpecificationInput,
+    Application, ApplicationSummary, AutoStartConfig, AutoStopConfig, CloudWatchLoggingConfiguration,
+    Configuration, ConflictException, CreateApplicationInput, DiskEncryptionConfiguration,
+    IdentityCenterConfiguration, IdentityCenterConfigurationInput, ImageConfiguration,
+    ImageConfigurationInput, JobRun, JobRunSummary, JobLevelCostAllocationConfiguration,
+    MonitoringConfiguration, ResourceNotFoundException, Session, WorkerTypeSpecification,
+    WorkerTypeSpecificationInput,
 };
 
 /// This service's ARN namespace, and the `sigv4Name` the model declares
@@ -109,6 +120,48 @@ pub const DEFAULT_IDLE_TIMEOUT_MINUTES: i32 = 15;
 /// whichever later call reads it — nothing sleeps.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
+/// How long a submitted job run spends in EACH of the non-terminal `JobRunState` values
+/// it passes through ([`JOB_RUN_STAGES`]) before the clock owes it the next one.
+///
+/// A real job run spends real time being admitted, queued and scheduled; the emulator
+/// CHOOSES this span, deliberately not zero, so a caller that submits work and then
+/// polls or filters for in-flight runs observes every stage it passes through. The due
+/// instants are stored on the record and materialised by whichever later call reads it —
+/// nothing sleeps.
+pub const JOB_RUN_STAGE_TRANSITION: Duration = Duration::from_millis(750);
+
+/// How long the URL `GetDashboardForJobRun` mints stays usable.
+///
+/// Source: the operation's own documentation — "The URL is valid for one hour after you
+/// generate it. To access the application UI after that hour elapses, you must invoke
+/// the API again to generate a new URL."
+pub const DASHBOARD_URL_VALIDITY: Duration = Duration::from_secs(60 * 60);
+
+/// The longest span this emulator ever holds a resource in a transient state for,
+/// whatever a request asks.
+///
+/// `CancelJobRunRequest$shutdownGracePeriodInSeconds` carries no modelled range, so a
+/// caller can name a wait of any length; a span longer than this is held to it. A
+/// century is past the lifetime of any emulator process, so a caller asking for longer
+/// observes the same thing either way — a wait that never ends — while the due instant
+/// stays an instant the platform clock can represent.
+pub const MAX_TRANSIENT_SPAN: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// The instant `span` after `instant`, saturating instead of overflowing.
+///
+/// Every due instant this service stores goes through here: `SystemTime`'s `+` PANICS
+/// when the sum is not representable, and some of these spans come from a request
+/// member the model puts no bound on, so a single request must not be able to reach
+/// that. The span is first held to [`MAX_TRANSIENT_SPAN`], and a sum the platform
+/// still cannot represent falls back to the furthest instant this function can reach.
+pub fn due_at(instant: SystemTime, span: Duration) -> SystemTime {
+    let span = span.min(MAX_TRANSIENT_SPAN);
+    instant
+        .checked_add(span)
+        .or_else(|| instant.checked_add(LIFECYCLE_TRANSITION))
+        .unwrap_or(instant)
+}
+
 /// The CPU architecture an application runs on when `CreateApplication` names none.
 ///
 /// `Architecture` is `ARM64 | X86_64` and `CreateApplicationRequest$architecture` is
@@ -170,6 +223,53 @@ pub const NOT_EXECUTED_STATE_DETAILS: &str =
 /// `JobRun$stateDetails` for a job run a caller cancelled.
 pub const CANCELLED_STATE_DETAILS: &str = "Job run cancelled at the request of the caller.";
 
+/// `JobRun$stateDetails` for each stage of [`JOB_RUN_STAGES`].
+pub const PENDING_STATE_DETAILS: &str = "Job run accepted and pending admission.";
+pub const QUEUED_STATE_DETAILS: &str = "Job run queued, waiting for capacity.";
+pub const SCHEDULED_STATE_DETAILS: &str = "Job run scheduled on the application.";
+
+/// The states a submitted job run passes through, in order, with the `stateDetails`
+/// each one carries.
+///
+/// A job run is NOT terminal the instant it is submitted: it is admitted, queued and
+/// scheduled before anything runs, and each of those is a value of the `JobRunState`
+/// enum (`SUBMITTED`, `PENDING`, `SCHEDULED`, `QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`,
+/// `CANCELLING`, `CANCELLED`), so a client that submits work and then polls or filters
+/// for in-flight runs observes it in them.
+///
+/// `RUNNING` is NOT among them, and neither is `SUCCESS`: this emulator is a control
+/// plane that executes no Spark or Hive workload, so it never reports a run as running
+/// or succeeded — once scheduled, the clock owes it the modelled failure state with
+/// [`NOT_EXECUTED_STATE_DETAILS`], which says exactly that.
+pub const JOB_RUN_STAGES: &[(&str, &str)] = &[
+    ("PENDING", PENDING_STATE_DETAILS),
+    ("QUEUED", QUEUED_STATE_DETAILS),
+    ("SCHEDULED", SCHEDULED_STATE_DETAILS),
+    ("FAILED", NOT_EXECUTED_STATE_DETAILS),
+];
+
+/// The state changes the clock owes a job run submitted at `now`: one per entry of
+/// [`JOB_RUN_STAGES`], each [`JOB_RUN_STAGE_TRANSITION`] after the one before it.
+pub fn job_run_stages(now: SystemTime) -> VecDeque<PendingState> {
+    JOB_RUN_STAGES
+        .iter()
+        .enumerate()
+        .map(|(index, (state, details))| PendingState {
+            due: due_at(
+                now,
+                JOB_RUN_STAGE_TRANSITION * (u32::try_from(index).unwrap_or(0) + 1),
+            ),
+            state: (*state).to_string(),
+            state_details: Some((*details).to_string()),
+        })
+        .collect()
+}
+
+/// `Application$stateDetails` for an application the service stopped itself, because it
+/// sat idle past the idle timeout its `autoStopConfiguration` names.
+pub const AUTO_STOPPED_STATE_DETAILS: &str =
+    "Application stopped automatically after being idle past its configured idle timeout.";
+
 /// The `JobRunState` values from which a job run never moves again.
 ///
 /// Source: the `JobRunState` enum (`SUBMITTED`, `PENDING`, `SCHEDULED`, `RUNNING`,
@@ -222,6 +322,21 @@ pub fn release_supports_sessions(release_label: &str) -> bool {
 /// or created state in order to be deleted."
 pub const DELETABLE_APPLICATION_STATES: &[&str] = &["CREATED", "STOPPED"];
 
+/// The `ApplicationState` a deleted application is retained in: the terminal value of
+/// the enum.
+pub const TERMINATED_APPLICATION_STATE: &str = "TERMINATED";
+
+/// True when `state` names an application that is still part of the account's
+/// inventory, rather than one a delete has terminated.
+///
+/// `DeleteApplication` is a SOFT delete here: the record is retained so a read reports
+/// the terminal state. The inventory a list reports with no `states` filter is therefore
+/// the applications that have not been deleted — naming `TERMINATED` explicitly is how a
+/// caller asks for the deleted ones.
+pub fn is_live_application_state(state: &str) -> bool {
+    state != TERMINATED_APPLICATION_STATE
+}
+
 /// The `ApplicationState` values `UpdateApplication` admits, judged against the state
 /// the application has SETTLED on ([`ApplicationRecord::settled_state`]).
 ///
@@ -250,25 +365,70 @@ pub fn release_version(release_label: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 
-/// The canonical engine type to store for a create naming `engine_type` at
-/// `release_label`, or `None` when that release supports no engine of that name — which
-/// the caller answers with its modelled `ValidationException`.
+/// Which MEMBER of a create this service could not serve: the two members
+/// [`resolve_engine_type`] judges, each with its own refusal wording.
 ///
-/// The engine is matched WITHOUT case, because the service reports it in its own
-/// casing rather than the caller's; a release label carrying no readable version is
-/// judged on the engine name alone rather than refused for a version nothing can order.
-pub fn supported_engine_type(engine_type: &str, release_label: &str) -> Option<&'static str> {
+/// A refusal has to point the caller at the member it must fix, so an unrecognised
+/// engine type and a release label that names no release this service offers are
+/// distinct answers rather than one shared message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedEngine {
+    /// `type` names no engine this service serves at any release.
+    Type,
+    /// `type` is an engine this service serves, but `releaseLabel` names no release
+    /// that offers it — including a label that names no Amazon EMR release at all.
+    ReleaseLabel,
+}
+
+/// The release a label must reach for EMR Serverless to serve anything at all: the
+/// earliest release any engine in [`SUPPORTED_ENGINES`] is offered from.
+///
+/// Source: "EMR Serverless is available with Amazon EMR releases 6.6.0 and later", which
+/// is what each engine's `min_release` records.
+fn earliest_served_release() -> (u32, u32, u32) {
+    SUPPORTED_ENGINES
+        .iter()
+        .map(|engine| engine.min_release)
+        .min()
+        .unwrap_or((0, 0, 0))
+}
+
+/// True when `release_label` names an Amazon EMR release this service serves: a label
+/// this emulator can read an `emr-<major>.<minor>.<patch>` version out of, at or after
+/// the earliest release EMR Serverless is offered from.
+///
+/// A label carrying no readable version (and one naming a release older than the service
+/// itself) names no release that exists here, which is the `releaseLabel` refusal.
+pub fn release_label_is_served(release_label: &str) -> bool {
+    release_version(release_label).is_some_and(|version| version >= earliest_served_release())
+}
+
+/// The canonical engine type to store for a create naming `engine_type` at
+/// `release_label`, or which MEMBER made the pair unservable.
+///
+/// The engine is matched WITHOUT case, because the service reports it in its own casing
+/// rather than the caller's. The type is judged first: a value that names no engine at
+/// all is that member's own refusal whatever release it was asked for. Otherwise the
+/// release label has to name a release that offers that engine.
+pub fn resolve_engine_type(
+    engine_type: &str,
+    release_label: &str,
+) -> Result<&'static str, UnsupportedEngine> {
     let engine = SUPPORTED_ENGINES
         .iter()
-        .find(|engine| engine.canonical_type.eq_ignore_ascii_case(engine_type))?;
+        .find(|engine| engine.canonical_type.eq_ignore_ascii_case(engine_type))
+        .ok_or(UnsupportedEngine::Type)?;
+    if !release_label_is_served(release_label) {
+        return Err(UnsupportedEngine::ReleaseLabel);
+    }
     match release_version(release_label) {
-        Some(version) if version < engine.min_release => None,
-        _ => Some(engine.canonical_type),
+        Some(version) if version < engine.min_release => Err(UnsupportedEngine::ReleaseLabel),
+        _ => Ok(engine.canonical_type),
     }
 }
 
-/// The `ValidationException` message for a `type`/`releaseLabel` pair the service does
-/// not support: built from the request, naming the `type` member value it refused.
+/// The `ValidationException` message for a `type` that names no engine this service
+/// serves: built from the request, naming the `type` member value it refused.
 ///
 /// The wording is the one this service uses for the refusal, which names the rejected
 /// type and nothing else of the request — as its other refusals do (its
@@ -277,6 +437,16 @@ pub fn supported_engine_type(engine_type: &str, release_label: &str) -> Option<&
 pub fn unsupported_engine_type_message(engine_type: &str) -> String {
     format!("Type {engine_type} is not supported for release label")
 }
+
+/// The `ValidationException` message for a `releaseLabel` that names no release offering
+/// the engine asked for.
+///
+/// Unlike [`unsupported_engine_type_message`] it interpolates nothing: the engine type
+/// the request named is valid, so quoting it would point the caller at the member that
+/// is not the problem. The phrase states both ways the release label can fail — the
+/// release exists but does not offer that engine, or it does not exist at all.
+pub const UNSUPPORTED_RELEASE_LABEL_MESSAGE: &str =
+    "Type is not supported for the release label or release label does not exist";
 
 /// True when `state` names a `JobRunState` a job run never leaves.
 pub fn is_terminal_job_run_state(state: &str) -> bool {
@@ -300,35 +470,60 @@ pub struct JobRunRecord {
     /// `JobRunSummary$type` — the engine type of the application the run was
     /// submitted to. `JobRun` carries no such member, so it is held beside it.
     pub job_run_type: String,
-    /// The state change the clock owes this job run, if any.
-    pub pending: Option<PendingState>,
+    /// The state changes the clock owes this job run, in the order they fall due: a
+    /// submitted run passes through several states ([`JOB_RUN_STAGES`]) before it
+    /// settles, and a cancel replaces whatever is left of them.
+    pub pending: VecDeque<PendingState>,
+    /// The dashboard URL grant the last `GetDashboardForJobRun` minted for this run,
+    /// if any, and how many it has minted. The counter is what makes each URL a fresh
+    /// one rather than a repeat of the last.
+    pub dashboard: Option<DashboardGrant>,
+    pub dashboard_grants: u64,
+}
+
+/// A dashboard URL this service minted for one job run: the token the URL carries and
+/// the instant it stops being usable.
+///
+/// `GetDashboardForJobRun` is not a report — it "Creates and returns a URL" — so the
+/// grant it mints is recorded here rather than recomputed per read.
+#[derive(Debug, Clone)]
+pub struct DashboardGrant {
+    pub token: String,
+    pub expires_at: SystemTime,
 }
 
 impl JobRunRecord {
-    /// Materialise the state change the clock owes this job run, if `now` is past its
-    /// due instant.
+    /// Materialise every state change the clock owes this job run, in order, for each
+    /// one whose due instant `now` is past; answers the instant the run FINISHED when
+    /// one of them settled it in a state it never leaves.
     ///
     /// `updatedAt` moves to the DUE instant rather than to `now`: the change happened
     /// when it fell due, whether or not anybody was reading. `endedAt` is set only
-    /// when the settled state is one a job run never leaves.
-    pub fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending.as_ref() else {
-            return;
-        };
-        if now < pending.due {
-            return;
+    /// when the settled state is one a job run never leaves, and the stages left over
+    /// behind it are dropped — nothing moves a finished run again.
+    pub fn settle(&mut self, now: SystemTime) -> Option<SystemTime> {
+        let mut finished_at = None;
+        while let Some(next) = self.pending.front() {
+            if now < next.due {
+                break;
+            }
+            let Some(pending) = self.pending.pop_front() else {
+                break;
+            };
+            let at = DateTime::from(pending.due);
+            self.job_run.state = pending.state.clone();
+            if let Some(details) = pending.state_details.as_ref() {
+                self.job_run.state_details = details.clone();
+            }
+            self.job_run.updated_at = at;
+            self.job_run.attempt_updated_at = Some(at);
+            if is_terminal_job_run_state(&self.job_run.state) {
+                self.job_run.ended_at = Some(at);
+                self.pending.clear();
+                finished_at = Some(pending.due);
+            }
         }
-        let at = DateTime::from(pending.due);
-        self.job_run.state = pending.state.clone();
-        if let Some(details) = pending.state_details.as_ref() {
-            self.job_run.state_details = details.clone();
-        }
-        self.job_run.updated_at = at;
-        self.job_run.attempt_updated_at = Some(at);
-        if is_terminal_job_run_state(&self.job_run.state) {
-            self.job_run.ended_at = Some(at);
-        }
-        self.pending = None;
+        finished_at
     }
 
     /// The `JobRunSummary` projection `ListJobRuns` returns: the stored record's own
@@ -367,16 +562,17 @@ pub struct SessionRecord {
 
 impl SessionRecord {
     /// Materialise every state change the clock owes this session, if `now` is past
-    /// their due instants.
+    /// their due instants; answers the instant the session ENDED when one of them
+    /// settled it in a state it never leaves.
     ///
     /// `updatedAt` moves to the DUE instant rather than to `now`: the change happened
     /// when it fell due, whether or not anybody was reading. A session that comes up
     /// owes a further change when its idle timeout falls due, so this settles in a loop
     /// rather than once: a reader arriving after both instants observes the later state.
-    pub fn settle(&mut self, now: SystemTime) {
+    pub fn settle(&mut self, now: SystemTime) -> Option<SystemTime> {
         while let Some(pending) = self.pending.clone() {
             if now < pending.due {
-                return;
+                return None;
             }
             let at = DateTime::from(pending.due);
             self.session.state = pending.state;
@@ -394,9 +590,10 @@ impl SessionRecord {
             }
             if is_terminal_session_state(&self.session.state) {
                 self.session.ended_at = Some(at);
-                return;
+                return Some(pending.due);
             }
         }
+        None
     }
 
     /// The termination the session's idle timeout owes it, measured from `idle_since`.
@@ -412,7 +609,7 @@ impl SessionRecord {
             return None;
         }
         Some(PendingState {
-            due: idle_since + Duration::from_secs(minutes * 60),
+            due: due_at(idle_since, Duration::from_secs(minutes * 60)),
             state: "TERMINATED".to_string(),
             state_details: Some(SESSION_IDLE_TIMEOUT_STATE_DETAILS.to_string()),
         })
@@ -444,11 +641,19 @@ pub struct ApplicationRecord {
     pub session_tokens: HashMap<String, String>,
     /// The counter session ids are minted from.
     pub next_session_seq: u64,
+    /// When this application was last ACTIVE: the instant it was created, the instant a
+    /// start brought it up, and the instant its last job run or session was started or
+    /// finished.
+    ///
+    /// `AutoStopConfig` is stated in terms of "a certain amount of time being idle", so
+    /// the idle span the configuration bounds is measured from here.
+    pub last_activity_at: SystemTime,
 }
 
 impl ApplicationRecord {
     /// Materialise every state change the clock owes this application and its job
-    /// runs, if `now` is past their due instants.
+    /// runs, if `now` is past their due instants — including the automatic stop its
+    /// `autoStopConfiguration` owes an application that has been idle too long.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(pending) = self.pending.as_ref() {
             if now >= pending.due {
@@ -461,11 +666,85 @@ impl ApplicationRecord {
             }
         }
         for record in self.job_runs.values_mut() {
-            record.settle(now);
+            if let Some(finished_at) = record.settle(now) {
+                // A job run finishing is the application's last activity: the idle
+                // span the auto-stop bounds starts when the work stopped, not when
+                // somebody happened to read it.
+                self.last_activity_at = self.last_activity_at.max(finished_at);
+            }
         }
         for record in self.sessions.values_mut() {
-            record.settle(now);
+            // A session ending is activity on the application, the same way a job run
+            // finishing is: the idle span the auto-stop bounds starts when the session
+            // was over, not when somebody happened to read it.
+            if let Some(ended_at) = record.settle(now) {
+                self.last_activity_at = self.last_activity_at.max(ended_at);
+            }
         }
+        // `AutoStopConfig$enabled`: "Enables the application to automatically stop
+        // after a certain amount of time being idle. Defaults to true." The stop falls
+        // due at the end of that idle span, so it is materialised at the DUE instant
+        // rather than at `now`.
+        if let Some(due) = self.auto_stop_due() {
+            if now >= due {
+                self.application.state = "STOPPED".to_string();
+                self.application.state_details = Some(AUTO_STOPPED_STATE_DETAILS.to_string());
+                self.application.updated_at = DateTime::from(due);
+            }
+        }
+    }
+
+    /// Whether this application stops by itself once it has been idle long enough.
+    ///
+    /// `AutoStopConfig$enabled` documents the default as true, and `CreateApplication`
+    /// materialises it, so an absent configuration here is read the same way.
+    pub fn auto_stop_enabled(&self) -> bool {
+        self.application
+            .auto_stop_configuration
+            .as_ref()
+            .and_then(|config| config.enabled)
+            .unwrap_or(DEFAULT_AUTO_STOP_ENABLED)
+    }
+
+    /// How long this application may sit idle before it stops itself.
+    ///
+    /// `AutoStopConfig$idleTimeoutMinutes` is "the amount of idle time in minutes after
+    /// which your application will automatically stop" (`@range(min: 1, max: 10080)`,
+    /// "Defaults to 15 minutes"), so the caller's value is the span that applies.
+    pub fn idle_timeout(&self) -> Duration {
+        let minutes = self
+            .application
+            .auto_stop_configuration
+            .as_ref()
+            .and_then(|config| config.idle_timeout_minutes)
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES);
+        let minutes = u64::try_from(minutes).unwrap_or(1).max(1);
+        Duration::from_secs(minutes * 60)
+    }
+
+    /// The instant the clock owes this application a `STOPPED` state with no
+    /// `StopApplication` call, or `None` when nothing is owed.
+    ///
+    /// Only a RUNNING application can be stopped for being idle, and only one that is
+    /// actually idle: an application holding a job run or an interactive session that
+    /// has not finished is working, however long ago the last call reached it.
+    pub fn auto_stop_due(&self) -> Option<SystemTime> {
+        if self.application.state != "STARTED" || self.pending.is_some() {
+            return None;
+        }
+        if !self.auto_stop_enabled() {
+            return None;
+        }
+        if !self.unfinished_job_run_ids().is_empty() || !self.unfinished_session_ids().is_empty() {
+            return None;
+        }
+        Some(due_at(self.last_activity_at, self.idle_timeout()))
+    }
+
+    /// Record that something ran on this application at `now`, which is what restarts
+    /// the idle span its `autoStopConfiguration` bounds.
+    pub fn mark_activity(&mut self, now: SystemTime) {
+        self.last_activity_at = self.last_activity_at.max(now);
     }
 
     /// The lifecycle state this application has SETTLED on: the state the clock
@@ -559,6 +838,15 @@ impl ApplicationRecord {
             .collect()
     }
 
+    /// The interactive sessions of this application that have not finished.
+    pub fn unfinished_session_ids(&self) -> Vec<String> {
+        self.sessions
+            .values()
+            .filter(|record| !is_terminal_session_state(&record.session.state))
+            .map(|record| record.session.session_id.clone())
+            .collect()
+    }
+
     /// The `ApplicationSummary` projection `ListApplications` returns.
     pub fn summary(&self) -> ApplicationSummary {
         let application = &self.application;
@@ -584,9 +872,11 @@ pub struct ComAmazonawsEmrserverlessAwstoledowebserviceState {
     /// walks them in one stable order and a cursor taken on one page resumes in the
     /// right place on the next.
     pub applications: BTreeMap<String, ApplicationRecord>,
-    /// A `CreateApplication` `clientToken` to the application that token created, so a
-    /// repeated create answers with the first application instead of a second one.
-    pub create_application_tokens: HashMap<String, String>,
+    /// A `CreateApplication` `clientToken` to what that token already created: the
+    /// application, and the fingerprint of the request that created it, so a repeated
+    /// create answers with the first application when the request matches and is
+    /// refused as a conflict when it does not.
+    pub create_application_tokens: HashMap<String, CreateApplicationReplay>,
     /// The counter application ids are minted from.
     pub next_application_seq: u64,
 }
@@ -785,6 +1075,245 @@ pub fn caller_arn(parts: &::http::request::Parts) -> String {
         user
     };
     ::engine::emulator_arn("iam", "", &format!("user/{user}"))
+}
+
+/// What a `CreateApplication` `clientToken` already named: the application that token
+/// created, and the fingerprint of the request that created it.
+///
+/// `clientToken` is `@idempotencyToken` on an `@idempotent` operation, which makes the
+/// token name ONE request rather than one application: the fingerprint is what tells a
+/// retry of that request from a different request reusing its token.
+#[derive(Debug, Clone)]
+pub struct CreateApplicationReplay {
+    pub application_id: String,
+    pub fingerprint: String,
+}
+
+/// What a `ConflictException` says when a `clientToken` is replayed with a request that
+/// is not the one it already created.
+///
+/// It quotes nothing of either request: the condition is that the two differ, not which
+/// member differed, and the token is the caller's own value.
+pub const IDEMPOTENCY_CONFLICT_MESSAGE: &str = "Request did not match the original";
+
+/// The `ConflictException` payload for a `clientToken` replayed with different
+/// parameters.
+pub fn request_did_not_match() -> ConflictException {
+    ConflictException {
+        message: IDEMPOTENCY_CONFLICT_MESSAGE.to_string(),
+    }
+}
+
+/// A fingerprint of every member of a `CreateApplication` request EXCEPT its
+/// `clientToken`: two requests fingerprint alike exactly when they ask for the same
+/// application.
+///
+/// The members are rendered in a FIXED order, and every map in them in sorted key order,
+/// so the fingerprint depends on the values a request carries and not on the order they
+/// arrived in or on how a `HashMap` happens to iterate. The digest keeps the stored
+/// token table small whatever the request carried.
+pub fn create_application_fingerprint(input: &CreateApplicationInput) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("name={:?}", input.name));
+    parts.push(format!("releaseLabel={:?}", input.release_label));
+    parts.push(format!("type={:?}", input.r#type));
+    parts.push(format!("architecture={:?}", input.architecture));
+    parts.push(format!("initialCapacity={}", sorted_map(&input.initial_capacity)));
+    parts.push(format!("maximumCapacity={:?}", input.maximum_capacity));
+    parts.push(format!("tags={}", sorted_map(&input.tags)));
+    parts.push(format!(
+        "autoStartConfiguration={:?}",
+        input.auto_start_configuration
+    ));
+    parts.push(format!(
+        "autoStopConfiguration={:?}",
+        input.auto_stop_configuration
+    ));
+    parts.push(format!(
+        "networkConfiguration={:?}",
+        input.network_configuration
+    ));
+    parts.push(format!(
+        "imageConfiguration={:?}",
+        input.image_configuration
+    ));
+    parts.push(format!(
+        "workerTypeSpecifications={}",
+        sorted_map(&input.worker_type_specifications)
+    ));
+    parts.push(format!(
+        "runtimeConfiguration={}",
+        fingerprint_configurations(input.runtime_configuration.as_deref())
+    ));
+    parts.push(format!(
+        "monitoringConfiguration={}",
+        fingerprint_monitoring(input.monitoring_configuration.as_ref())
+    ));
+    parts.push(format!(
+        "diskEncryptionConfiguration={}",
+        fingerprint_disk_encryption(input.disk_encryption_configuration.as_ref())
+    ));
+    parts.push(format!(
+        "interactiveConfiguration={:?}",
+        input.interactive_configuration
+    ));
+    parts.push(format!(
+        "schedulerConfiguration={:?}",
+        input.scheduler_configuration
+    ));
+    parts.push(format!(
+        "identityCenterConfiguration={:?}",
+        input.identity_center_configuration
+    ));
+    parts.push(format!(
+        "jobLevelCostAllocationConfiguration={:?}",
+        input.job_level_cost_allocation_configuration
+    ));
+    digest(&parts.join("\n"))
+}
+
+/// A map rendered in sorted key order, so its fingerprint does not depend on iteration
+/// order. Values that themselves hold a map have their own renderer below.
+fn sorted_map<V: Debug>(map: &Option<HashMap<String, V>>) -> String {
+    match map {
+        None => "none".to_string(),
+        Some(map) => {
+            let sorted: BTreeMap<&String, &V> = map.iter().collect();
+            format!("{sorted:?}")
+        }
+    }
+}
+
+/// A `Configuration` list rendered with each entry's `properties` map sorted, and the
+/// same applied to the nested lists each entry may carry.
+fn fingerprint_configurations(configurations: Option<&[Configuration]>) -> String {
+    match configurations {
+        None => "none".to_string(),
+        Some(list) => {
+            let rendered: Vec<String> = list.iter().map(fingerprint_configuration).collect();
+            format!("[{}]", rendered.join(","))
+        }
+    }
+}
+
+fn fingerprint_configuration(configuration: &Configuration) -> String {
+    format!(
+        "{{classification={:?},properties={},configurations={}}}",
+        configuration.classification,
+        sorted_map(&configuration.properties),
+        fingerprint_configurations(configuration.configurations.as_deref())
+    )
+}
+
+/// The monitoring configuration, with the CloudWatch block's `logTypes` map sorted.
+fn fingerprint_monitoring(configuration: Option<&MonitoringConfiguration>) -> String {
+    match configuration {
+        None => "none".to_string(),
+        Some(configuration) => format!(
+            "{{s3={:?},managedPersistence={:?},prometheus={:?},cloudWatch={}}}",
+            configuration.s3_monitoring_configuration,
+            configuration.managed_persistence_monitoring_configuration,
+            configuration.prometheus_monitoring_configuration,
+            fingerprint_cloud_watch(configuration.cloud_watch_logging_configuration.as_ref())
+        ),
+    }
+}
+
+fn fingerprint_cloud_watch(configuration: Option<&CloudWatchLoggingConfiguration>) -> String {
+    match configuration {
+        None => "none".to_string(),
+        Some(configuration) => format!(
+            "{{enabled={:?},logGroupName={:?},logStreamNamePrefix={:?},encryptionKeyArn={:?},\
+             logTypes={}}}",
+            configuration.enabled,
+            configuration.log_group_name,
+            configuration.log_stream_name_prefix,
+            configuration.encryption_key_arn,
+            sorted_map(&configuration.log_types)
+        ),
+    }
+}
+
+/// The disk encryption configuration, with its `encryptionContext` map sorted.
+fn fingerprint_disk_encryption(configuration: Option<&DiskEncryptionConfiguration>) -> String {
+    match configuration {
+        None => "none".to_string(),
+        Some(configuration) => format!(
+            "{{encryptionContext={},encryptionKeyArn={:?}}}",
+            sorted_map(&configuration.encryption_context),
+            configuration.encryption_key_arn
+        ),
+    }
+}
+
+/// The SHA-256 of `value`, hex-encoded: a fixed-size stand-in for the rendered request.
+fn digest(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// The dashboard grant to record for the `sequence`-th URL this job run has been
+/// granted, generated at `now`.
+///
+/// The token is derived from the run's own ARN, the attempt the URL is for and the
+/// grant counter, so every call mints a DIFFERENT token for the same run (the
+/// operation documents exactly that: "The URL is valid for one hour after you generate
+/// it. To access the application UI after that hour elapses, you must invoke the API
+/// again to generate a new URL").
+pub fn mint_dashboard_grant(
+    job_run_arn: &str,
+    attempt: i32,
+    sequence: u64,
+    now: SystemTime,
+) -> DashboardGrant {
+    let since_epoch = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let token = digest(&format!("{job_run_arn}|{attempt}|{sequence}|{since_epoch}"));
+    DashboardGrant {
+        // `Url` is `@length(1..2048)`, and a 32-character token leaves the URL far
+        // inside it while staying unguessable.
+        token: token[..32].to_string(),
+        expires_at: due_at(now, DASHBOARD_URL_VALIDITY),
+    }
+}
+
+/// The URL a caller views one job run's dashboard at: the endpoint this request reached
+/// the emulator on, the run it names, and the grant minted for this call.
+///
+/// The emulator serves no live Spark or Tez UI (it runs no workload), so the URL names
+/// the dashboard path of the endpoint the caller is already talking to rather than an
+/// Amazon EMR Studio host nothing here answers for.
+pub fn job_run_dashboard_url(
+    parts: &::http::request::Parts,
+    region: &str,
+    application_id: &str,
+    job_run_id: &str,
+    attempt: i32,
+    grant: &DashboardGrant,
+) -> String {
+    let endpoint = request_endpoint(parts, region);
+    format!(
+        "{endpoint}/dashboard/applications/{application_id}/jobruns/{job_run_id}\
+         ?attempt={attempt}&authToken={}",
+        grant.token
+    )
+}
+
+/// The endpoint this request arrived on, falling back to the public EMR Serverless
+/// endpoint for `region` when the request names no authority at all.
+fn request_endpoint(parts: &::http::request::Parts, region: &str) -> String {
+    let authority = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| parts.uri.authority().map(ToString::to_string));
+    match authority {
+        Some(authority) => format!("https://{authority}"),
+        None => format!("https://{ARN_NAMESPACE}.{region}.amazonaws.com"),
+    }
 }
 
 /// The `autoStartConfiguration` to persist: the caller's, with
@@ -992,8 +1521,21 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// not to the operation — hence one constant every handler shares.
 pub const APPLICATION_NOT_FOUND_MESSAGE: &str = "Application does not exist";
 
-/// The same, for the job run (or job run attempt) a request names.
+/// The same, for the job run a request names.
 pub const JOB_RUN_NOT_FOUND_MESSAGE: &str = "Job Run with given ID doesn't exist";
+
+/// The same, for a job run ATTEMPT a request names that the run does not have.
+///
+/// A not-found refusal states which part of the request was not found, so an attempt
+/// number naming no attempt of an existing job run is its own phrase: a caller told the
+/// ID does not exist would discard an id that is in fact valid.
+pub const JOB_RUN_ATTEMPT_NOT_FOUND_MESSAGE: &str = "Job Run with given attempt doesn't exist";
+
+/// What a `ValidationException` says when a job run cannot be cancelled.
+///
+/// State-agnostic on purpose: it states the condition the operation refuses on (the run
+/// is not in a state a cancel can act on), not the state the run happens to be in.
+pub const JOB_RUN_NOT_CANCELLABLE_MESSAGE: &str = "Job run is not in a cancellable state";
 
 /// The same, for the session a request names: one phrase for the resource class, naming
 /// no identifier, as this service's other not-found refusals do.
@@ -1013,6 +1555,14 @@ pub fn application_not_found() -> ResourceNotFoundException {
 pub fn job_run_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: JOB_RUN_NOT_FOUND_MESSAGE.to_string(),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an attempt number that names no attempt
+/// of a job run that DOES exist.
+pub fn job_run_attempt_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: JOB_RUN_ATTEMPT_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 

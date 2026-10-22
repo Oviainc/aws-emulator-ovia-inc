@@ -158,51 +158,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::application_not_found(),
                 )
             })?;
-        let job_run = record.job_runs.get_mut(&input.job_run_id).ok_or_else(|| {
-            CancelJobRunErrorModeled::ResourceNotFoundException(
-                crate::state::job_run_not_found(),
-            )
-        })?;
-
-        // A job run that has already finished cannot be cancelled; there is nothing
-        // left to stop and its terminal state must not be overwritten.
-        if crate::state::is_terminal_job_run_state(&job_run.job_run.state) {
-            return Err(CancelJobRunErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Job run is in {} state and cannot be cancelled",
-                    job_run.job_run.state
-                ),
-            })
-            .into());
-        }
 
         // `shutdownGracePeriodInSeconds` is "the duration in seconds to wait before
         // forcefully terminating the job after cancellation is requested" — a wait the
         // CALLER asked for, so it keeps its value. With none named, the emulator's own
-        // transition span applies.
+        // transition span applies. The model puts no bound on the member, so the due
+        // instant is computed with `state::due_at`, which holds a span the platform
+        // clock could not represent to one it can rather than overflowing it.
         let grace = input
             .shutdown_grace_period_in_seconds
             .and_then(|seconds| u64::try_from(seconds).ok())
             .map(::std::time::Duration::from_secs)
             .unwrap_or(crate::state::LIFECYCLE_TRANSITION);
 
-        // `@idempotent`: a job run already cancelling keeps the cancellation it has,
-        // so a retried cancel neither restarts the grace period nor moves the state
-        // back.
-        if job_run.job_run.state != "CANCELLING" {
-            job_run.job_run.state = "CANCELLING".to_string();
-            job_run.job_run.updated_at = crate::state::now_timestamp(now);
-            job_run.job_run.attempt_updated_at = Some(crate::state::now_timestamp(now));
-            job_run.pending = Some(crate::state::PendingState {
-                due: now + grace,
-                state: "CANCELLED".to_string(),
-                state_details: Some(crate::state::CANCELLED_STATE_DETAILS.to_string()),
-            });
-        }
+        let output = {
+            let job_run = record.job_runs.get_mut(&input.job_run_id).ok_or_else(|| {
+                CancelJobRunErrorModeled::ResourceNotFoundException(
+                    crate::state::job_run_not_found(),
+                )
+            })?;
 
-        Ok(CancelJobRunOutput {
-            application_id: job_run.job_run.application_id.clone(),
-            job_run_id: job_run.job_run.job_run_id.clone(),
-        })
+            // `@idempotent`: a job run that is ALREADY cancelled is the success this
+            // operation promises, so a retried cancel answers 200 with the same ids and
+            // changes nothing — the output requires only `applicationId` and
+            // `jobRunId`, and the state stays `CANCELLED`.
+            //
+            // Any OTHER finished state is a refusal: the run reached its end on its own,
+            // there is nothing left to stop and its terminal state must not be
+            // overwritten. The refusal states the condition rather than the state it
+            // found, so a caller cannot read the run's state out of an error message
+            // instead of reading it.
+            let state_now = job_run.job_run.state.as_str();
+            if state_now != "CANCELLED" && crate::state::is_terminal_job_run_state(state_now) {
+                return Err(CancelJobRunErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::JOB_RUN_NOT_CANCELLABLE_MESSAGE.to_string(),
+                    },
+                )
+                .into());
+            }
+
+            // `@idempotent`: a job run already cancelling keeps the cancellation it has,
+            // so a retried cancel neither restarts the grace period nor moves the state
+            // back; an already-cancelled one is left exactly as it settled. Otherwise the
+            // cancel replaces whatever stages the clock still owed the run.
+            if !matches!(job_run.job_run.state.as_str(), "CANCELLING" | "CANCELLED") {
+                job_run.job_run.state = "CANCELLING".to_string();
+                job_run.job_run.updated_at = crate::state::now_timestamp(now);
+                job_run.job_run.attempt_updated_at = Some(crate::state::now_timestamp(now));
+                job_run.pending.clear();
+                job_run.pending.push_back(crate::state::PendingState {
+                    due: crate::state::due_at(now, grace),
+                    state: "CANCELLED".to_string(),
+                    state_details: Some(crate::state::CANCELLED_STATE_DETAILS.to_string()),
+                });
+            }
+
+            CancelJobRunOutput {
+                application_id: job_run.job_run.application_id.clone(),
+                job_run_id: job_run.job_run.job_run_id.clone(),
+            }
+        };
+
+        // An ACCEPTED cancel is activity on the application: the idle span its
+        // `autoStopConfiguration` bounds starts again here. A refused call (an id that
+        // names nothing, a run that cannot be cancelled) writes nothing at all, so it
+        // must not push the automatic stop out either.
+        record.mark_activity(now);
+
+        Ok(output)
     }
 }

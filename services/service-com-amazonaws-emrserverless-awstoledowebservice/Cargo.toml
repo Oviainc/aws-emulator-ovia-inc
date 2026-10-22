@@ -23,12 +23,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque `ListApplications` / `ListJobRuns` pagination cursors.
 hex = { workspace = true }
+# Digests the rendered `CreateApplication` request behind the idempotency-token
+# fingerprint, and the grant behind a `GetDashboardForJobRun` URL's token.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDashboardForJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDashboardForJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDashboardForJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDashboardForJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDashboardForJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDashboardForJobRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDashboardForJobRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The operation "Creates and returns a URL": it MINTS a grant rather than
+        // reporting one, so the grant it mints is recorded on the job run. The only
+        // other write is materialising the state changes the clock already owed.
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                GetDashboardForJobRunErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(),
+                )
+            })?;
+        let job_run = record.job_runs.get_mut(&input.job_run_id).ok_or_else(|| {
+            GetDashboardForJobRunErrorModeled::ResourceNotFoundException(
+                crate::state::job_run_not_found(),
+            )
+        })?;
+
+        // `attempt` is "an optimal parameter that indicates the amount of attempts for
+        // the job. If not specified, this value defaults to the attempt of the latest
+        // job." Nothing here retries a run, so it has exactly the one attempt the record
+        // holds: an absent `attempt` is that one, and any other number names no attempt
+        // of a run that does exist.
+        let latest_attempt = job_run.job_run.attempt.unwrap_or(1);
+        let attempt = input.attempt.unwrap_or(latest_attempt);
+        if attempt != latest_attempt {
+            return Err(
+                GetDashboardForJobRunErrorModeled::ResourceNotFoundException(
+                    crate::state::job_run_attempt_not_found(),
+                )
+                .into(),
+            );
+        }
+
+        // A fresh grant per call, which is what the documented one-hour validity means:
+        // "To access the application UI after that hour elapses, you must invoke the API
+        // again to generate a new URL." The emulator serves no live Spark or Tez UI —
+        // it runs no workload — so the URL names the dashboard path of the endpoint the
+        // caller reached this service on.
+        job_run.dashboard_grants = job_run.dashboard_grants.wrapping_add(1);
+        let grant = crate::state::mint_dashboard_grant(
+            &job_run.job_run.arn,
+            attempt,
+            job_run.dashboard_grants,
+            now,
+        );
+        let url = crate::state::job_run_dashboard_url(
+            ctx.parts(),
+            &region,
+            &job_run.job_run.application_id,
+            &job_run.job_run.job_run_id,
+            attempt,
+            &grant,
+        );
+        job_run.dashboard = Some(grant);
+
+        Ok(GetDashboardForJobRunOutput { url: Some(url) })
     }
 }

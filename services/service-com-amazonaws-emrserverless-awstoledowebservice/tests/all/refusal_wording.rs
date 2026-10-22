@@ -41,8 +41,12 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
 /// not exist, whichever operation refused.
 const APPLICATION_NOT_FOUND: &str = "Application does not exist";
 
-/// The same, for a job run (or one of its attempts).
+/// The same, for a job run.
 const JOB_RUN_NOT_FOUND: &str = "Job Run with given ID doesn't exist";
+
+/// The same again, for an attempt a job run that DOES exist does not have: a not-found
+/// refusal states which part of the request was not found, so this is its own phrase.
+const JOB_RUN_ATTEMPT_NOT_FOUND: &str = "Job Run with given attempt doesn't exist";
 
 /// The message the resource-ARN vendor check states. The vendor is this service's ARN
 /// namespace (`smithy_query(query="service_info")` → `arnNamespace` /
@@ -311,8 +315,9 @@ async fn a_not_found_refusal_states_the_resource_class_and_never_the_requested_i
         }
     }
 
-    // An attempt that names none is the same job-run refusal: nothing retries here, so
-    // the stored run has exactly its first attempt.
+    // An attempt that names none is refused for the ATTEMPT, not for the id: nothing
+    // retries here, so the stored run has exactly its first attempt, and the id the
+    // request named is valid.
     for attempt in [2, 7, 99] {
         let case = format!("GetJobRun(attempt {attempt})");
         let answer = call(
@@ -329,8 +334,8 @@ async fn a_not_found_refusal_states_the_resource_class_and_never_the_requested_i
         );
         assert_eq!(
             answer.message(),
-            JOB_RUN_NOT_FOUND,
-            "case {case:?}: expected the fixed phrase {JOB_RUN_NOT_FOUND:?}, got {:?}",
+            JOB_RUN_ATTEMPT_NOT_FOUND,
+            "case {case:?}: expected the fixed phrase {JOB_RUN_ATTEMPT_NOT_FOUND:?}, got {:?}",
             answer.message()
         );
         assert!(
@@ -339,6 +344,20 @@ async fn a_not_found_refusal_states_the_resource_class_and_never_the_requested_i
             answer.message()
         );
     }
+
+    // The attempt the run DOES have is not a not-found at all.
+    let found = call(
+        &router,
+        "GET",
+        &format!("/applications/{application_id}/jobruns/{job_run_id}?attempt=1"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        found.status, 200,
+        "case GetJobRun(attempt 1): the run's own attempt must be reported, got {} with {:?}",
+        found.status, found.body
+    );
 }
 
 /// Rule 2: a `@range` violation names the member and the bound and does NOT quote the

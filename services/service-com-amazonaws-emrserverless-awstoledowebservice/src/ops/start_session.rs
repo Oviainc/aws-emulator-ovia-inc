@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 record.application.state = "STARTING".to_string();
                 record.application.updated_at = crate::state::now_timestamp(now);
                 record.pending = Some(crate::state::PendingState {
-                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
                     state: "STARTED".to_string(),
                     state_details: None,
                 });
@@ -324,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::SessionRecord {
                 session,
                 pending: Some(crate::state::PendingState {
-                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
                     state: "STARTED".to_string(),
                     state_details: Some(
                         crate::state::SESSION_STARTED_STATE_DETAILS.to_string(),
@@ -335,6 +335,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record
             .session_tokens
             .insert(input.client_token, session_id.clone());
+        // Starting a session is activity: the idle span the application's
+        // `autoStopConfiguration` bounds starts again here, and the live session keeps
+        // the application out of the idle state until it ends.
+        record.mark_activity(now);
 
         Ok(StartSessionOutput {
             application_id: input.application_id,

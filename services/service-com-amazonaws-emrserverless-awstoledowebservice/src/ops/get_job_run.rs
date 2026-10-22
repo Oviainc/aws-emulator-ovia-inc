@@ -164,12 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `attempt` selects one attempt of the job run. Only an application's own retry
         // policy creates a second attempt, and nothing here retries, so a job run has
-        // exactly the one attempt this record holds; any other number names none — the
-        // same not-found refusal as an unknown job run, stated the same way.
+        // exactly the one attempt this record holds; any other number names no attempt
+        // of a run that DOES exist, which is its own not-found phrase — a caller told
+        // the ID does not exist would discard an id that is in fact valid.
         if let Some(requested) = input.attempt {
             if Some(requested) != job_run.job_run.attempt {
                 return Err(GetJobRunErrorModeled::ResourceNotFoundException(
-                    crate::state::job_run_not_found(),
+                    crate::state::job_run_attempt_not_found(),
                 )
                 .into());
             }

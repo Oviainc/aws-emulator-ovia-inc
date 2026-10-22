@@ -202,22 +202,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+        let fingerprint = crate::state::create_application_fingerprint(&input);
         let mut store = state.lock();
 
-        // `clientToken` is `@idempotencyToken` on an `@idempotent` operation: the same
-        // token names the same application, so a retried create reports the first one
-        // rather than minting a second.
+        // `clientToken` is `@idempotencyToken` on an `@idempotent` operation, so the
+        // token names ONE request: replayed with the SAME parameters it reports the
+        // application it already created, and replayed with different ones it is a
+        // conflict — the second request is refused with the modelled
+        // `ConflictException` (HTTP 409) and the first application is left untouched.
         let replayed = store
             .create_application_tokens
             .get(&input.client_token)
             .cloned();
-        if let Some(application_id) = replayed {
-            if let Some(record) = store.settled_mut(&application_id, now) {
-                return Ok(CreateApplicationOutput {
-                    application_id: record.application.application_id.clone(),
-                    name: record.application.name.clone(),
-                    arn: record.application.arn.clone(),
-                });
+        if let Some(replay) = replayed {
+            if store.applications.contains_key(&replay.application_id) {
+                if replay.fingerprint != fingerprint {
+                    return Err(CreateApplicationErrorModeled::ConflictException(
+                        crate::state::request_did_not_match(),
+                    )
+                    .into());
+                }
+                if let Some(record) = store.settled_mut(&replay.application_id, now) {
+                    return Ok(CreateApplicationOutput {
+                        application_id: record.application.application_id.clone(),
+                        name: record.application.name.clone(),
+                        arn: record.application.arn.clone(),
+                    });
+                }
             }
         }
 
@@ -236,20 +247,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `EngineType` is an open string, so which engines a release label supports is a
-        // service-side rule rather than a model constraint: a pair the service does not
-        // support is refused with this operation's modelled `ValidationException`, and
-        // an engine it does support is stored in the canonical casing the API reports
-        // rather than in the casing the request asked in.
-        let Some(engine_type) =
-            crate::state::supported_engine_type(&input.r#type, &input.release_label)
-        else {
-            return Err(CreateApplicationErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::unsupported_engine_type_message(&input.r#type),
-                },
-            )
-            .into());
+        // `EngineType` is an open string and `ReleaseLabel` a free string, so which
+        // engines exist and which releases serve them is a service-side rule rather
+        // than a model constraint: a pair the service cannot serve is refused with this
+        // operation's modelled `ValidationException`, naming the MEMBER that failed —
+        // the engine type when it names no engine at all, the release label when the
+        // engine is real but the release does not offer it (or does not exist). An
+        // engine it does serve is stored in the canonical casing the API reports rather
+        // than in the casing the request asked in.
+        let engine_type = match crate::state::resolve_engine_type(
+            &input.r#type,
+            &input.release_label,
+        ) {
+            Ok(engine_type) => engine_type,
+            Err(crate::state::UnsupportedEngine::Type) => {
+                return Err(CreateApplicationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::unsupported_engine_type_message(&input.r#type),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::UnsupportedEngine::ReleaseLabel) => {
+                return Err(CreateApplicationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::UNSUPPORTED_RELEASE_LABEL_MESSAGE.to_string(),
+                    },
+                )
+                .into())
+            }
         };
 
         let application_id = store.mint_application_id();
@@ -306,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ApplicationRecord {
                 application,
                 pending: Some(crate::state::PendingState {
-                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
                     state: "CREATED".to_string(),
                     state_details: None,
                 }),
@@ -316,11 +342,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sessions: ::std::collections::BTreeMap::new(),
                 session_tokens: ::std::collections::HashMap::new(),
                 next_session_seq: 0,
+                // The idle span `autoStopConfiguration` bounds is measured from the
+                // application's last activity, and it has just been created.
+                last_activity_at: now,
             },
         );
-        store
-            .create_application_tokens
-            .insert(input.client_token, application_id.clone());
+        store.create_application_tokens.insert(
+            input.client_token,
+            crate::state::CreateApplicationReplay {
+                application_id: application_id.clone(),
+                fingerprint,
+            },
+        );
 
         Ok(CreateApplicationOutput {
             application_id,
