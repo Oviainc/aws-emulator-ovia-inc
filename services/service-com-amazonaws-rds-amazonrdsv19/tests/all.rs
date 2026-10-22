@@ -27,6 +27,8 @@ mod existence_and_parameter_guards;
 mod not_found_paths;
 #[path = "all/option_group_options.rs"]
 mod option_group_options;
+#[path = "all/option_group_setting_catalog.rs"]
+mod option_group_setting_catalog;
 #[path = "all/option_groups.rs"]
 mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]

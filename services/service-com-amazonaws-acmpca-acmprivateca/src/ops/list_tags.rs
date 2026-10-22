@@ -77,6 +77,17 @@
 //! * `RequestFailedException` (HTTP 400) — The request has failed for an unspecified reason.
 //! * `ResourceNotFoundException` (HTTP 400) — A resource such as a private CA, S3 bucket,
 //!   certificate, audit report, or policy cannot be found.
+//!
+//! ## What this handler does
+//!
+//! Reports the tag set `TagCertificateAuthority`, `UntagCertificateAuthority` and
+//! `CreateCertificateAuthority` persisted on the CA, in tag-key order, a page at a time:
+//! `MaxResults` tags per page, and a `NextToken` carrying the key the next page resumes
+//! after whenever tags are left over. A CA that holds no tags is reported with no `Tags`
+//! member, because `TagList` is modelled `len 1..50` and so has no empty value.
+//!
+//! Reporting only: nothing here writes, beyond the CREATING -> PENDING_CERTIFICATE
+//! transition the clock already owed.
 
 #[allow(unused_imports)]
 use super::types::*;

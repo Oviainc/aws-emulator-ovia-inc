@@ -45,7 +45,7 @@ type Params = Vec<(String, String)>;
 
 /// One `OptionsToInclude` entry: the option name as the request spells it, and the
 /// `(setting name, value)` pairs it sets.
-type IncludeSpec<'a> = (&'a str, &'a [(&'a str, &'a str)]);
+pub(crate) type IncludeSpec<'a> = (&'a str, &'a [(&'a str, &'a str)]);
 
 /// A major engine version in the form the engine family writes it — free-form input as
 /// far as `CreateOptionGroup` is concerned, so this only keeps the test's groups
@@ -67,7 +67,7 @@ fn major_engine_version(engine_name: &str) -> &'static str {
 }
 
 /// `CreateOptionGroup` for `engine_name`, asserting the 200 and handing back the body.
-async fn create_group(
+pub(crate) async fn create_group(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -116,7 +116,7 @@ fn modify_params(group: &str, include: &[IncludeSpec<'_>], remove: &[&str]) -> P
 
 /// `ModifyOptionGroup`, returning the raw status and body so a refusal row can read
 /// them.
-async fn modify(
+pub(crate) async fn modify(
     router: &MultiServiceRouter,
     group: &str,
     include: &[IncludeSpec<'_>],
@@ -131,7 +131,7 @@ async fn modify(
 }
 
 /// `DescribeOptionGroups` for one group, asserting the 200 and handing back the body.
-async fn describe(router: &MultiServiceRouter, case: &str, group: &str) -> String {
+pub(crate) async fn describe(router: &MultiServiceRouter, case: &str, group: &str) -> String {
     let params: Params = vec![("OptionGroupName".to_string(), group.to_string())];
     expect_ok(case, call(router, "DescribeOptionGroups", &params).await)
 }
@@ -180,7 +180,7 @@ fn reported_option_names(xml: &str) -> Vec<String> {
 }
 
 /// The one `<Option>` subtree named `option_name`.
-fn the_option(case: &str, xml: &str, option_name: &str) -> String {
+pub(crate) fn the_option(case: &str, xml: &str, option_name: &str) -> String {
     let found: Vec<String> = subtrees(xml, "Option")
         .into_iter()
         .filter(|option| text(option, "OptionName") == option_name)
