@@ -794,11 +794,15 @@ async fn an_unknown_identifier_is_resource_not_found_on_every_rule_addressed_ope
                 status, 404,
                 "case {case:?}: expected HTTP 404, got {status} / {body:?}"
             );
+            // Recycle Bin composes the 404 from the identifier the request addressed
+            // and populates no `Reason` on this path; `tests/all/error_response_bodies.rs`
+            // asserts that body over the whole class.
+            let expected = format!("Recycle Bin Rule '{identifier}' does not exist.");
             assert_eq!(
-                body["Reason"].as_str(),
-                Some("RULE_NOT_FOUND"),
-                "case {case:?}: expected reason RULE_NOT_FOUND, got {:?}",
-                body["Reason"]
+                body["Message"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: expected Message {expected:?}, got {:?}",
+                body["Message"]
             );
         }
     }
