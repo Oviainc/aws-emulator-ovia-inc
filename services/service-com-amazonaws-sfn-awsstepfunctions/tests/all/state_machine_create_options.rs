@@ -145,17 +145,25 @@ async fn create_state_machine_checks_the_encryption_configuration() {
              body {body:?}"
         );
 
-        // The configuration is PERSISTED, not echoed: the describe reads the record.
+        // The configuration is PERSISTED, not echoed: the describe reads the record,
+        // and a create that named no encryption configuration reads back the type
+        // its data IS encrypted under (`tests/all/state_machine_projection.rs` pins
+        // that effective-configuration rule over the whole class).
         let described = emulator
             .ok(
                 "DescribeStateMachine",
                 &json!({ "stateMachineArn": string(&body, "stateMachineArn") }),
             )
             .await;
+        let expected = options
+            .get("encryptionConfiguration")
+            .cloned()
+            .unwrap_or(json!({ "type": "AWS_OWNED_KEY" }));
         assert_eq!(
             described.get("encryptionConfiguration"),
-            options.get("encryptionConfiguration"),
-            "case {case:?}: expected the stored encryption configuration, got {described:?}"
+            Some(&expected),
+            "case {case:?}: expected the stored encryption configuration {expected}, got \
+             {described:?}"
         );
     }
 
@@ -391,13 +399,19 @@ async fn create_state_machine_checks_the_logging_configuration() {
             .await;
         // The record, not the request: `includeExecutionData` is a modelled default
         // member, so the response always carries it, and the members the request set
-        // are compared one by one.
+        // are compared one by one. A create that named no logging configuration reads
+        // back the level it EFFECTIVELY logs at, which is `OFF`
+        // (`tests/all/state_machine_projection.rs` pins that rule over the class).
         let supplied = options.get("loggingConfiguration");
         let stored = described.get("loggingConfiguration");
+        let expected_level = supplied
+            .and_then(|supplied| supplied.get("level"))
+            .cloned()
+            .unwrap_or(json!("OFF"));
         assert_eq!(
             stored.and_then(|stored| stored.get("level")),
-            supplied.and_then(|supplied| supplied.get("level")),
-            "case {case:?}: expected the stored log level, got {described:?}"
+            Some(&expected_level),
+            "case {case:?}: expected the stored log level {expected_level}, got {described:?}"
         );
         assert_eq!(
             stored.and_then(|stored| stored.get("destinations")),
