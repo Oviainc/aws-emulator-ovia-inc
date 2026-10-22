@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination tokens: the NextToken cursors are hex-encoded, so a token this
+# service did not mint fails to decode and is refused as InvalidNextTokenException.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `time` is a TEST-only feature: one integration test waits out the real lifecycle
+# settle span with `tokio::time::sleep`. The production build does not need it.
+tokio = { workspace = true, features = ["time"] }
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

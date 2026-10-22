@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDeliveryStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDeliveryStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDeliveryStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored `DeliveryStreamDescription`, rendering each destination from the
+//! configuration its create supplied.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,326 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDeliveryStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDeliveryStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDeliveryStream"))
+        // Unreachable through the router, which mounts every service on one shared
+        // `InMemoryEngine`; this operation models no server-side error to report it with.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeDeliveryStream",
+            ));
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        // Reporting only: this applies the transitions the clock has ALREADY made due
+        // (`CREATING` -> `ACTIVE`, the removal of a deleted stream), which were owed at
+        // this instant whether or not anybody described the stream.
+        store.materialise_due(::std::time::SystemTime::now());
+
+        let Some(stream) = store.streams.get(&input.delivery_stream_name) else {
+            return Err(DescribeDeliveryStreamErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Firehose stream {} not found",
+                        input.delivery_stream_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The list ... will start with the destination whose id comes after
+        // ExclusiveStartDestinationId"; `Limit` caps how many of those are returned and
+        // `HasMoreDestinations` reports whether any were left.
+        let start_after = input.exclusive_start_destination_id.as_deref();
+        let remaining: Vec<&crate::state::Destination> = stream
+            .destinations
+            .iter()
+            .filter(|destination| {
+                start_after.is_none_or(|start| destination.destination_id.as_str() > start)
+            })
+            .collect();
+        let limit = input
+            .limit
+            .map_or(remaining.len(), |limit| usize::try_from(limit).unwrap_or(0));
+        let destinations: Vec<DestinationDescription> = remaining
+            .iter()
+            .take(limit)
+            .map(|destination| destination_description(destination))
+            .collect();
+
+        Ok(DescribeDeliveryStreamOutput {
+            delivery_stream_description: DeliveryStreamDescription {
+                delivery_stream_name: stream.name.clone(),
+                delivery_stream_arn: stream.arn.clone(),
+                delivery_stream_status: stream.status.as_wire().to_string(),
+                // Nothing in this emulator fails a create, a delete or an encryption
+                // change, so no stream carries a KMS failure description.
+                failure_description: None,
+                delivery_stream_encryption_configuration: stream.encryption.clone(),
+                delivery_stream_type: stream.stream_type.clone(),
+                version_id: stream.version_id.to_string(),
+                create_timestamp: Some(::aws_smithy_types::DateTime::from(
+                    stream.create_timestamp,
+                )),
+                last_update_timestamp: Some(::aws_smithy_types::DateTime::from(
+                    stream.last_update_timestamp,
+                )),
+                source: stream.source.clone(),
+                has_more_destinations: remaining.len() > destinations.len(),
+                destinations,
+            },
+        })
     }
+}
+
+/// `CompressionFormat` "If no value is specified, the default is UNCOMPRESSED."
+const DEFAULT_COMPRESSION_FORMAT: &str = "UNCOMPRESSED";
+/// `BufferingHints.SizeInMBs`: "The default value is 5."
+const DEFAULT_BUFFERING_SIZE_IN_MBS: i32 = 5;
+/// `BufferingHints.IntervalInSeconds`: "The default value is 300."
+const DEFAULT_BUFFERING_INTERVAL_IN_SECONDS: i32 = 300;
+
+/// Render one stored destination: its assigned id plus the `*DestinationDescription`
+/// matching the configuration variant the create supplied.
+fn destination_description(destination: &crate::state::Destination) -> DestinationDescription {
+    use crate::state::DestinationConfigKind as Kind;
+
+    let rendered = DestinationDescription {
+        destination_id: destination.destination_id.clone(),
+        ..DestinationDescription::default()
+    };
+    match &destination.config {
+        Kind::S3(config) => DestinationDescription {
+            s3_destination_description: Some(s3_description(config)),
+            ..rendered
+        },
+        Kind::ExtendedS3(config) => DestinationDescription {
+            extended_s3_destination_description: Some(ExtendedS3DestinationDescription {
+                role_arn: config.role_arn.clone(),
+                bucket_arn: config.bucket_arn.clone(),
+                prefix: config.prefix.clone(),
+                error_output_prefix: config.error_output_prefix.clone(),
+                buffering_hints: buffering_hints(config.buffering_hints.as_ref()),
+                compression_format: compression_format(config.compression_format.as_ref()),
+                encryption_configuration: encryption_configuration(
+                    config.encryption_configuration.as_ref(),
+                ),
+                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                processing_configuration: config.processing_configuration.clone(),
+                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_backup_description: config
+                    .s3_backup_configuration
+                    .as_ref()
+                    .map(s3_description),
+                data_format_conversion_configuration: config
+                    .data_format_conversion_configuration
+                    .clone(),
+                dynamic_partitioning_configuration: config
+                    .dynamic_partitioning_configuration
+                    .clone(),
+                file_extension: config.file_extension.clone(),
+                custom_time_zone: config.custom_time_zone.clone(),
+            }),
+            ..rendered
+        },
+        Kind::Redshift(config) => DestinationDescription {
+            redshift_destination_description: Some(RedshiftDestinationDescription {
+                role_arn: config.role_arn.clone(),
+                cluster_jdbcurl: config.cluster_jdbcurl.clone(),
+                copy_command: config.copy_command.clone(),
+                username: config.username.clone(),
+                retry_options: config.retry_options.clone(),
+                s3_destination_description: s3_description(&config.s3_configuration),
+                processing_configuration: config.processing_configuration.clone(),
+                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_backup_description: config
+                    .s3_backup_configuration
+                    .as_ref()
+                    .map(s3_description),
+                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                secrets_manager_configuration: config.secrets_manager_configuration.clone(),
+            }),
+            ..rendered
+        },
+        Kind::Elasticsearch(config) => DestinationDescription {
+            elasticsearch_destination_description: Some(ElasticsearchDestinationDescription {
+                role_arn: Some(config.role_arn.clone()),
+                domain_arn: config.domain_arn.clone(),
+                cluster_endpoint: config.cluster_endpoint.clone(),
+                index_name: Some(config.index_name.clone()),
+                type_name: config.type_name.clone(),
+                index_rotation_period: config.index_rotation_period.clone(),
+                buffering_hints: config.buffering_hints.clone(),
+                retry_options: config.retry_options.clone(),
+                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_destination_description: Some(s3_description(&config.s3_configuration)),
+                processing_configuration: config.processing_configuration.clone(),
+                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                vpc_configuration_description: None,
+                document_id_options: config.document_id_options.clone(),
+            }),
+            ..rendered
+        },
+        Kind::AmazonOpenSearchService(config) => DestinationDescription {
+            amazonopensearchservice_destination_description: Some(
+                AmazonopensearchserviceDestinationDescription {
+                    role_arn: Some(config.role_arn.clone()),
+                    domain_arn: config.domain_arn.clone(),
+                    cluster_endpoint: config.cluster_endpoint.clone(),
+                    index_name: Some(config.index_name.clone()),
+                    type_name: config.type_name.clone(),
+                    index_rotation_period: config.index_rotation_period.clone(),
+                    buffering_hints: config.buffering_hints.clone(),
+                    retry_options: config.retry_options.clone(),
+                    s3_backup_mode: config.s3_backup_mode.clone(),
+                    s3_destination_description: Some(s3_description(&config.s3_configuration)),
+                    processing_configuration: config.processing_configuration.clone(),
+                    cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                    vpc_configuration_description: None,
+                    document_id_options: config.document_id_options.clone(),
+                },
+            ),
+            ..rendered
+        },
+        Kind::Splunk(config) => DestinationDescription {
+            splunk_destination_description: Some(SplunkDestinationDescription {
+                hec_endpoint: Some(config.hec_endpoint.clone()),
+                hec_endpoint_type: Some(config.hec_endpoint_type.clone()),
+                hec_token: config.hec_token.clone(),
+                hec_acknowledgment_timeout_in_seconds: config
+                    .hec_acknowledgment_timeout_in_seconds,
+                retry_options: config.retry_options.clone(),
+                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_destination_description: Some(s3_description(&config.s3_configuration)),
+                processing_configuration: config.processing_configuration.clone(),
+                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                buffering_hints: config.buffering_hints.clone(),
+                secrets_manager_configuration: config.secrets_manager_configuration.clone(),
+            }),
+            ..rendered
+        },
+        Kind::HttpEndpoint(config) => DestinationDescription {
+            http_endpoint_destination_description: Some(HttpEndpointDestinationDescription {
+                // `HttpEndpointDescription` carries no access key: the configuration's is
+                // `@sensitive` and never reported back.
+                endpoint_configuration: Some(HttpEndpointDescription {
+                    url: Some(config.endpoint_configuration.url.clone()),
+                    name: config.endpoint_configuration.name.clone(),
+                }),
+                buffering_hints: config.buffering_hints.clone(),
+                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                request_configuration: config.request_configuration.clone(),
+                processing_configuration: config.processing_configuration.clone(),
+                role_arn: config.role_arn.clone(),
+                retry_options: config.retry_options.clone(),
+                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_destination_description: Some(s3_description(&config.s3_configuration)),
+                secrets_manager_configuration: config.secrets_manager_configuration.clone(),
+            }),
+            ..rendered
+        },
+        Kind::Snowflake(config) => DestinationDescription {
+            snowflake_destination_description: Some(SnowflakeDestinationDescription {
+                account_url: Some(config.account_url.clone()),
+                user: config.user.clone(),
+                database: Some(config.database.clone()),
+                schema: Some(config.schema.clone()),
+                table: Some(config.table.clone()),
+                snowflake_role_configuration: config.snowflake_role_configuration.clone(),
+                data_loading_option: config.data_loading_option.clone(),
+                meta_data_column_name: config.meta_data_column_name.clone(),
+                content_column_name: config.content_column_name.clone(),
+                snowflake_vpc_configuration: config.snowflake_vpc_configuration.clone(),
+                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                processing_configuration: config.processing_configuration.clone(),
+                role_arn: Some(config.role_arn.clone()),
+                retry_options: config.retry_options.clone(),
+                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_destination_description: Some(s3_description(&config.s3_configuration)),
+                secrets_manager_configuration: config.secrets_manager_configuration.clone(),
+                buffering_hints: config.buffering_hints.clone(),
+            }),
+            ..rendered
+        },
+        Kind::AmazonOpenSearchServerless(config) => DestinationDescription {
+            amazon_open_search_serverless_destination_description: Some(
+                AmazonOpenSearchServerlessDestinationDescription {
+                    role_arn: Some(config.role_arn.clone()),
+                    collection_endpoint: config.collection_endpoint.clone(),
+                    index_name: Some(config.index_name.clone()),
+                    buffering_hints: config.buffering_hints.clone(),
+                    retry_options: config.retry_options.clone(),
+                    s3_backup_mode: config.s3_backup_mode.clone(),
+                    s3_destination_description: Some(s3_description(&config.s3_configuration)),
+                    processing_configuration: config.processing_configuration.clone(),
+                    cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                    vpc_configuration_description: None,
+                },
+            ),
+            ..rendered
+        },
+        Kind::Iceberg(config) => DestinationDescription {
+            iceberg_destination_description: Some(IcebergDestinationDescription {
+                destination_table_configuration_list: config
+                    .destination_table_configuration_list
+                    .clone(),
+                schema_evolution_configuration: config.schema_evolution_configuration.clone(),
+                table_creation_configuration: config.table_creation_configuration.clone(),
+                buffering_hints: config.buffering_hints.clone(),
+                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                processing_configuration: config.processing_configuration.clone(),
+                s3_backup_mode: config.s3_backup_mode.clone(),
+                retry_options: config.retry_options.clone(),
+                role_arn: Some(config.role_arn.clone()),
+                append_only: config.append_only,
+                catalog_configuration: Some(config.catalog_configuration.clone()),
+                s3_destination_description: Some(s3_description(&config.s3_configuration)),
+            }),
+            ..rendered
+        },
+    }
+}
+
+/// The S3 description for an `S3DestinationConfiguration`, applying the documented
+/// defaults for the three members the description requires but the configuration leaves
+/// optional.
+fn s3_description(config: &S3DestinationConfiguration) -> S3DestinationDescription {
+    S3DestinationDescription {
+        role_arn: config.role_arn.clone(),
+        bucket_arn: config.bucket_arn.clone(),
+        prefix: config.prefix.clone(),
+        error_output_prefix: config.error_output_prefix.clone(),
+        buffering_hints: buffering_hints(config.buffering_hints.as_ref()),
+        compression_format: compression_format(config.compression_format.as_ref()),
+        encryption_configuration: encryption_configuration(
+            config.encryption_configuration.as_ref(),
+        ),
+        cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+    }
+}
+
+/// "The buffering option. If no value is specified, BufferingHints object default values
+/// are used."
+fn buffering_hints(hints: Option<&BufferingHints>) -> BufferingHints {
+    BufferingHints {
+        size_in_m_bs: hints
+            .and_then(|hints| hints.size_in_m_bs)
+            .or(Some(DEFAULT_BUFFERING_SIZE_IN_MBS)),
+        interval_in_seconds: hints
+            .and_then(|hints| hints.interval_in_seconds)
+            .or(Some(DEFAULT_BUFFERING_INTERVAL_IN_SECONDS)),
+    }
+}
+
+fn compression_format(format: Option<&String>) -> String {
+    format.cloned().unwrap_or_else(|| DEFAULT_COMPRESSION_FORMAT.to_string())
+}
+
+/// "The encryption configuration. If no value is specified, the default is no
+/// encryption."
+fn encryption_configuration(config: Option<&EncryptionConfiguration>) -> EncryptionConfiguration {
+    config.cloned().unwrap_or_else(|| EncryptionConfiguration {
+        no_encryption_config: Some("NoEncryption".to_string()),
+        kms_encryption_config: None,
+    })
 }

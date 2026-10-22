@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages the stored workflows in creation order, honouring the
+//! `templateId`, `status`, `name` and `adsApplicationConfigurationName` filters.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkflows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflows"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListWorkflowsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the migration workflow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `nextToken` is this service's own cursor; a token it did not mint names no
+        // page, which the model has no error for, so it is refused as invalid input.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "nextToken is not a pagination token issued by ListWorkflows",
+                    ))
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 0..100` with `default 0`; 0 (the value an
+        // absent member takes) asks for the service's default page size, so one
+        // request's response and work stay bounded however large the store is.
+        let limit = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => crate::state::DEFAULT_PAGE_SIZE,
+            Ok(requested) => requested,
+        };
+
+        let mut store = state.lock();
+        // Clock-owed status transitions are materialised before filtering, so a
+        // `status` filter sees the status a GetWorkflow would report at this instant.
+        store.settle_all();
+
+        let matches = |workflow: &crate::state::Workflow| {
+            input
+                .template_id
+                .as_ref()
+                .is_none_or(|wanted| *wanted == workflow.template_id)
+                && input
+                    .status
+                    .as_ref()
+                    .is_none_or(|wanted| *wanted == workflow.status)
+                && input
+                    .name
+                    .as_ref()
+                    .is_none_or(|wanted| *wanted == workflow.name)
+                && input
+                    .ads_application_configuration_name
+                    .as_ref()
+                    .is_none_or(|wanted| {
+                        workflow
+                            .ads_application_configuration_name
+                            .as_ref()
+                            .is_some_and(|known| known == wanted)
+                    })
+        };
+
+        // The cursor names the creation position of the LAST entry of the previous
+        // page, so this page resumes after it whether or not that workflow still
+        // exists. Only the page itself is copied out of the store.
+        let mut page = Vec::with_capacity(limit.min(store.workflows.len()));
+        let mut last_included = None;
+        let mut next_token = None;
+        for workflow in store.workflows_in_creation_order() {
+            if resume_after.is_some_and(|position| workflow.seq <= position) {
+                continue;
+            }
+            if !matches(workflow) {
+                continue;
+            }
+            if page.len() == limit {
+                next_token = last_included.map(crate::state::encode_page_token);
+                break;
+            }
+            last_included = Some(workflow.seq);
+            page.push(workflow.summary());
+        }
+
+        Ok(ListWorkflowsOutput {
+            next_token,
+            migration_workflow_summary: page,
+        })
     }
 }

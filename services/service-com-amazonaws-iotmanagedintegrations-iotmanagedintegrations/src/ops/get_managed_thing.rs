@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetManagedThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetManagedThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetManagedThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the record `crate::state`'s `managed_things` store holds under
+//! `Identifier` onto this operation's output shape. A reporting operation: it never
+//! writes. An id the store does not hold answers `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +202,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetManagedThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetManagedThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetManagedThing"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetManagedThingErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the managed-thing store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // A managed thing is regional: only the region that created it resolves it.
+        let region = crate::state::request_region(ctx.parts());
+        let thing = store
+            .managed_thing_in(&region, &input.identifier)
+            .ok_or_else(|| {
+                GetManagedThingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!("Managed thing {} was not found", input.identifier)),
+                    resource_id: Some(input.identifier.clone()),
+                    resource_type: Some("ManagedThing".to_string()),
+                })
+            })?;
+
+        Ok(GetManagedThingOutput {
+            id: Some(thing.id.clone()),
+            arn: Some(thing.arn.clone()),
+            owner: thing.owner.clone(),
+            credential_locker_id: thing.credential_locker_id.clone(),
+            // Members no operation in this slice writes stay absent rather than
+            // carrying a value nothing set.
+            advertised_product_id: None,
+            role: Some(thing.role.clone()),
+            provisioning_status: Some(thing.provisioning_status.clone()),
+            name: thing.name.clone(),
+            model: thing.model.clone(),
+            brand: thing.brand.clone(),
+            serial_number: thing.serial_number.clone(),
+            universal_product_code: None,
+            international_article_number: None,
+            connector_policy_id: None,
+            connector_destination_id: None,
+            connector_device_id: None,
+            device_specific_key: None,
+            mac_address: None,
+            parent_controller_id: None,
+            classification: thing.classification.clone(),
+            created_at: Some(crate::state::timestamp(thing.created_at)),
+            updated_at: Some(crate::state::timestamp(thing.updated_at)),
+            activated_at: thing.activated_at.map(crate::state::timestamp),
+            hub_network_mode: thing.hub_network_mode.clone(),
+            meta_data: (!thing.meta_data.is_empty()).then(|| thing.meta_data.clone()),
+            tags: (!thing.tags.is_empty()).then(|| thing.tags.clone()),
+            wi_fi_simple_setup_configuration: thing.wifi_simple_setup_configuration.clone(),
+        })
     }
 }

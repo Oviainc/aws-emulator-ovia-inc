@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDiscoverableRegistryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDiscoverableRegistryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDiscoverableRegistryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +79,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::RegistryRecord;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +154,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDiscoverableRegistryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDiscoverableRegistryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDiscoverableRegistryRecords"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDiscoverableRegistryRecordsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Agent Registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let Some(registry) = state.registry(&input.registry_id) else {
+            return Err(
+                ListDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Registry {} was not found.", input.registry_id)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(field_validation(
+                "filters",
+                &format!(
+                    "at most {MAX_FILTERS} filters may be applied, got {}.",
+                    filters.len()
+                ),
+            ));
+        }
+        for filter in &filters {
+            if !REGISTRY_RECORD_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
+                return Err(field_validation(
+                    "filters",
+                    &format!(
+                        "'{}' is not a supported filter name; supported names are {}.",
+                        filter.name,
+                        REGISTRY_RECORD_FILTER_NAME_VALUES.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        // Resume exactly after the record the previous page stopped on, so no record
+        // is repeated or skipped. A token minted for another registry is refused.
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => match decode_next_token(token, &registry.registry_id) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(
+                        ListDiscoverableRegistryRecordsErrorModeled::ValidationException(
+                            crate::state::cannot_parse(
+                                "nextToken is not a pagination token this service issued for this registry.",
+                            ),
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        let max_results = match input.max_results {
+            Some(requested) => {
+                if !(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) {
+                    return Err(field_validation(
+                        "maxResults",
+                        &format!(
+                            "{requested} is outside the valid range {MIN_MAX_RESULTS} through {MAX_MAX_RESULTS}."
+                        ),
+                    ));
+                }
+                usize::try_from(requested).unwrap_or(DEFAULT_MAX_RESULTS)
+            }
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let mut matching = registry
+            .discoverable_records()
+            .filter(|record| matches_filters(record, &filters))
+            // Resume strictly after the record the previous page stopped on. A
+            // `filter` rather than a `skip_while`, so resumption does not depend on
+            // the iteration being ordered.
+            .filter(|record| {
+                start_after
+                    .as_deref()
+                    .is_none_or(|after| record.record_id.as_str() > after)
+            });
+
+        let mut registry_records = Vec::new();
+        let mut next_token = None;
+        let mut last_record_id: Option<&str> = None;
+        for record in &mut matching {
+            if registry_records.len() == max_results {
+                // At least one more record matches, so this page is truncated and the
+                // caller gets a token that resumes after the last one returned.
+                next_token = last_record_id
+                    .map(|last| encode_next_token(&registry.registry_id, last));
+                break;
+            }
+            registry_records.push(record.discoverable_summary());
+            last_record_id = Some(record.record_id.as_str());
+        }
+
+        Ok(ListDiscoverableRegistryRecordsOutput {
+            registry_records,
+            next_token,
+        })
     }
+}
+
+/// The page size used when the caller names no `maxResults`. The model documents
+/// `maxResults` as "Valid values are 1 through 100" and declares no default, so an
+/// unbounded request is served at that documented maximum — which is also what
+/// bounds the page: at most [`MAX_MAX_RESULTS`] summaries per response.
+const DEFAULT_MAX_RESULTS: usize = MAX_MAX_RESULTS as usize;
+
+/// `ListDiscoverableRegistryRecordsRequest$maxResults` is modelled
+/// `@range{min:1,max:100}`.
+const MIN_MAX_RESULTS: i32 = 1;
+const MAX_MAX_RESULTS: i32 = 100;
+
+/// `ListDiscoverableRegistryRecordsRequest$filters` is modelled `@length{max:10}`.
+const MAX_FILTERS: usize = 10;
+
+/// Version tag inside the opaque pagination token, so a token in any other shape is
+/// refused rather than misread as a record id.
+const TOKEN_PREFIX: &str = "v1:";
+
+/// The `recordType` member of `RegistryRecordFilterName`; validated against the
+/// model's own `REGISTRY_RECORD_FILTER_NAME_VALUES` before it is matched here.
+const FILTER_RECORD_TYPE: &str = "recordType";
+
+/// The `descriptorType` member of `RegistryRecordFilterName`.
+const FILTER_DESCRIPTOR_TYPE: &str = "descriptorType";
+
+/// Mint the opaque `nextToken` that resumes after `last_record_id` in
+/// `registry_id`.
+///
+/// The token encodes a position in one registry's record-id order, and the registry
+/// it was issued for, so it cannot be replayed against another registry. It is
+/// never an echo of anything the caller sent.
+fn encode_next_token(registry_id: &str, last_record_id: &str) -> String {
+    hex::encode(format!("{TOKEN_PREFIX}{registry_id}:{last_record_id}"))
+}
+
+/// The record id a `nextToken` resumes after, or `None` when the token was not
+/// issued by [`encode_next_token`] for `registry_id`.
+///
+/// Splitting the payload at its first `:` is unambiguous because a registry id is
+/// modelled `^[a-zA-Z0-9]{12,16}$` (`RegistryIdentifier`), so it can carry no `:`.
+fn decode_next_token(token: &str, registry_id: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (named_registry, record_id) = decoded.strip_prefix(TOKEN_PREFIX)?.split_once(':')?;
+    (named_registry == registry_id).then(|| record_id.to_string())
+}
+
+/// Whether `record` satisfies every filter: filters are conjunctive, and one
+/// filter's own `values` are disjunctive.
+fn matches_filters(record: &RegistryRecord, filters: &[RegistryRecordFilter]) -> bool {
+    filters.iter().all(|filter| match filter.name.as_str() {
+        FILTER_RECORD_TYPE => filter.values.contains(&record.record_type),
+        FILTER_DESCRIPTOR_TYPE => {
+            let descriptor_types = record.descriptor_types();
+            filter
+                .values
+                .iter()
+                .any(|value| descriptor_types.iter().any(|present| present == value))
+        }
+        // Unreachable: an unsupported filter name is refused above.
+        _ => false,
+    })
+}
+
+/// A 400 `ValidationException` naming the member that failed and why, in this
+/// service's own modelled error shape.
+fn field_validation(member: &str, message: &str) -> ListDiscoverableRegistryRecordsError {
+    ListDiscoverableRegistryRecordsErrorModeled::ValidationException(
+        crate::state::field_validation(member, message),
+    )
+    .into()
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScalableTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScalableTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScalableTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -181,20 +172,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScalableTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScalableTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScalableTargets"))
+        use crate::state::{
+            check_dimension_namespace, check_enum, decode_next_token, encode_next_token, page_size,
+            scalable_target_of, take_page, TargetKey,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeScalableTargetsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        check_enum(
+            "serviceNamespace",
+            &input.service_namespace,
+            SERVICE_NAMESPACE_VALUES,
+        )
+        .map_err(validation)?;
+        if let Some(dimension) = input.scalable_dimension.as_deref() {
+            check_enum("scalableDimension", dimension, SCALABLE_DIMENSION_VALUES)
+                .map_err(validation)?;
+            check_dimension_namespace(&input.service_namespace, dimension).map_err(validation)?;
+        }
+        let page_size = page_size(input.max_results).map_err(validation)?;
+
+        // A `NextToken` carries the identity of the last target the previous page
+        // emitted, so this page resumes at the next key in order. A token this service
+        // did not issue is refused rather than silently read as "from the start".
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let Some(fields) = decode_next_token(token, 3) else {
+                    return Err(DescribeScalableTargetsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some("The next token supplied was invalid.".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                Some(TargetKey {
+                    service_namespace: fields[0].clone(),
+                    resource_id: fields[1].clone(),
+                    scalable_dimension: fields[2].clone(),
+                })
+            }
+        };
+
+        let state = state.lock();
+        let matching: Vec<ScalableTarget> = state
+            .targets
+            .iter()
+            .filter(|(key, _)| key.service_namespace == input.service_namespace)
+            .filter(|(key, _)| match input.resource_ids.as_deref() {
+                // An absent or empty `ResourceIds` does not narrow the result: the
+                // model's own bound on the list is 0..50, so the empty list is legal and
+                // means "every resource in the namespace".
+                None | Some([]) => true,
+                Some(ids) => ids.contains(&key.resource_id),
+            })
+            .filter(|(key, _)| {
+                input
+                    .scalable_dimension
+                    .as_ref()
+                    .is_none_or(|dimension| &key.scalable_dimension == dimension)
+            })
+            .filter(|(key, _)| resume_after.as_ref().is_none_or(|after| *key > after))
+            .map(|(key, record)| scalable_target_of(key, record))
+            .collect();
+
+        let (scalable_targets, next_token) = take_page(matching, page_size, |target| {
+            encode_next_token(&[
+                &target.service_namespace,
+                &target.resource_id,
+                &target.scalable_dimension,
+            ])
+        });
+
+        Ok(DescribeScalableTargetsOutput {
+            scalable_targets: Some(scalable_targets),
+            next_token,
+        })
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> DescribeScalableTargetsError {
+    DescribeScalableTargetsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists an organization's users out of this service's store, one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +144,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsers"))
+        let _ = ctx;
+        // Absent only when this service is mounted on an engine that carries no store,
+        // in which case the operation genuinely cannot be served here.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("ListUsers"))?;
+        let store = state.lock();
+
+        let organization = store
+            .organizations
+            .get(&input.organization_id)
+            .ok_or_else(|| {
+                ListUsersErrorModeled::OrganizationNotFoundException(
+                    OrganizationNotFoundException {
+                        message: Some(format!(
+                            "An organization with the identifier {} was not found.",
+                            input.organization_id
+                        )),
+                    },
+                )
+            })?;
+
+        // The cursor is opaque and this service minted it, so anything it cannot decode
+        // is a bad parameter rather than an empty page.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListUsersErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some("NextToken is not a token this service issued.".to_string()),
+                })
+            })?),
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        // `MaxResults` is modelled 1..100, so an absent page size is the modelled
+        // maximum. The lower bound is re-applied here so a zero that ever reached the
+        // handler could not answer an empty page beside a cursor, which would make a
+        // paginating client loop forever.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .max(1);
+
+        let matching: Vec<&crate::state::UserRecord> = organization
+            .users_by_name()
+            .into_iter()
+            .skip_while(|user| {
+                resume_at
+                    .as_deref()
+                    .is_some_and(|start| user.name.to_ascii_lowercase().as_str() < start)
+            })
+            .filter(|user| matches_filters(user, &filters))
+            .collect();
+
+        let users: Vec<User> = matching
+            .iter()
+            .take(page_size)
+            .map(|user| User {
+                id: Some(user.user_id.clone()),
+                email: user.email.clone(),
+                name: Some(user.name.clone()),
+                display_name: Some(user.display_name.clone()),
+                state: Some(user.state.clone()),
+                user_role: Some(user.role.clone()),
+                enabled_date: user.enabled_date.map(crate::state::as_date_time),
+                disabled_date: user.disabled_date.map(crate::state::as_date_time),
+                identity_provider_user_id: user.identity_provider_user_id.clone(),
+                identity_provider_identity_store_id: None,
+            })
+            .collect();
+
+        // A cursor is returned only when a further user matches; it resumes AT that
+        // user's name, so the next page starts exactly where this one stopped.
+        let next_token = matching
+            .get(page_size)
+            .map(|user| crate::state::encode_page_token(&user.name.to_ascii_lowercase()));
+
+        Ok(ListUsersOutput {
+            users: Some(users),
+            next_token,
+        })
     }
+}
+
+/// The `MaxResults` ceiling the model declares (range 1..100), also the page size for a
+/// request that names none.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// Whether `user` satisfies every filter the request set. The prefix filters compare
+/// case-insensitively: a user name and a mail address are case-insensitive identifiers,
+/// and the display-name filter follows them so one request does not mix both rules. The
+/// `State` filter targets `EntityState`, a closed enum the boundary validator has already
+/// checked against its own catalog, so it is compared exactly — a value of another casing
+/// never reaches this handler.
+fn matches_filters(user: &crate::state::UserRecord, filters: &ListUsersFilters) -> bool {
+    let has_prefix = |value: Option<&str>, prefix: &Option<String>| match prefix {
+        None => true,
+        Some(prefix) => value.is_some_and(|value| {
+            value
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+        }),
+    };
+
+    has_prefix(Some(user.name.as_str()), &filters.username_prefix)
+        && has_prefix(Some(user.display_name.as_str()), &filters.display_name_prefix)
+        && has_prefix(user.email.as_deref(), &filters.primary_email_prefix)
+        && has_prefix(
+            user.identity_provider_user_id.as_deref(),
+            &filters.identity_provider_user_id_prefix,
+        )
+        && filters.state.as_ref().is_none_or(|want| &user.state == want)
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDeliveryStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDeliveryStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDeliveryStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Marks the stream for deletion: it goes to `DELETING` and the clock owes its removal
+//! from [`crate::state`], after which the name is free again.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDeliveryStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDeliveryStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDeliveryStream"))
+        // Unreachable through the router, which mounts every service on one shared
+        // `InMemoryEngine`; this operation models no server-side error to report it with.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteDeliveryStream",
+            ));
+        };
+        // `AllowForceDelete` governs deleting a stream whose KMS grant cannot be retired.
+        // Nothing in this emulator holds a grant, so no delete is ever blocked by one and
+        // the flag changes nothing.
+        let _ = (ctx, input.allow_force_delete);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        let Some(stream) = store.streams.get_mut(&input.delivery_stream_name) else {
+            return Err(DeleteDeliveryStreamErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Firehose stream {} not found",
+                        input.delivery_stream_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        match stream.status {
+            // "You can't delete a Firehose stream that is in the CREATING state."
+            crate::state::StreamStatus::Creating => {
+                return Err(DeleteDeliveryStreamErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "Firehose stream {} is in status CREATING; it cannot be deleted \
+                             until it is ACTIVE",
+                            input.delivery_stream_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            // Already marked for deletion: the removal the clock owes stands as it is, so
+            // a repeated delete neither postpones it nor fails.
+            crate::state::StreamStatus::Deleting => {}
+            crate::state::StreamStatus::Active => {
+                // "DeleteDeliveryStream is an asynchronous API. When an API request to
+                // DeleteDeliveryStream succeeds, the Firehose stream is marked for
+                // deletion, and it goes into the DELETING state."
+                stream.status = crate::state::StreamStatus::Deleting;
+                stream.pending = Some((
+                    crate::state::PendingTransition::Remove,
+                    now + crate::state::TRANSITION_DELAY,
+                ));
+                stream.last_update_timestamp = now;
+            }
+        }
+
+        Ok(DeleteDeliveryStreamOutput {})
     }
 }

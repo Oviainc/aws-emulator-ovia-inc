@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateManagedThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateManagedThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateManagedThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the managed thing into `crate::state`'s `managed_things` store under a
+//! freshly generated `ManagedThingId`, and answers with that id, its ARN and the
+//! insert time. A replayed `ClientToken` (`@idempotencyToken`) answers with the
+//! record the first call created instead of creating a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +197,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateManagedThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateManagedThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateManagedThing"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateManagedThingErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the managed-thing store is unavailable".to_string()),
+            })
+        })?;
+
+        // `Role` and `AuthenticationMaterialType` are modelled enums, so a value
+        // outside the enum is a client error rather than a stored record.
+        if !crate::state::ROLE_VALUES.contains(&input.role.as_str()) {
+            return Err(CreateManagedThingErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Role must be one of {:?}, got {:?}",
+                    crate::state::ROLE_VALUES, input.role
+                )),
+            })
+            .into());
+        }
+        if !crate::state::AUTH_MATERIAL_TYPE_VALUES
+            .contains(&input.authentication_material_type.as_str())
+        {
+            return Err(CreateManagedThingErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "AuthenticationMaterialType must be one of {:?}, got {:?}",
+                    crate::state::AUTH_MATERIAL_TYPE_VALUES, input.authentication_material_type
+                )),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything
+        // reads them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call
+        // created, performing no further action. The token is scoped to the region
+        // that minted the record, as the record itself is.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency_tokens.get(token))
+            .map(|record| record.managed_thing_id.clone());
+        if let Some(created) = replayed.and_then(|id| store.managed_thing_in(&region, &id)) {
+            return Ok(CreateManagedThingOutput {
+                id: Some(created.id.clone()),
+                arn: Some(created.arn.clone()),
+                created_at: Some(crate::state::timestamp(created.created_at)),
+            });
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than
+        // grown into. The operation models no quota error, so the refusal is the
+        // modelled error closest to "this service will not take another one now".
+        if store.managed_things.len() >= crate::state::MAX_MANAGED_THINGS {
+            return Err(CreateManagedThingErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(format!(
+                    "this service holds the maximum of {} managed things; delete one before \
+                     creating another",
+                    crate::state::MAX_MANAGED_THINGS
+                )),
+            })
+            .into());
+        }
+
+        let sequence = store.take_sequence();
+        let id = crate::state::opaque_id(sequence);
+        let arn = crate::state::managed_thing_arn(&region, &id);
+
+        let thing = crate::state::ManagedThing {
+            id: id.clone(),
+            arn: arn.clone(),
+            region: region.clone(),
+            role: input.role,
+            provisioning_status: crate::state::INITIAL_PROVISIONING_STATUS.to_string(),
+            authentication_material: input.authentication_material,
+            authentication_material_type: input.authentication_material_type,
+            owner: input.owner,
+            credential_locker_id: input.credential_locker_id,
+            serial_number: input.serial_number,
+            brand: input.brand,
+            model: input.model,
+            name: input.name,
+            classification: input.classification,
+            capabilities: input.capabilities,
+            capability_report: input.capability_report,
+            capability_schemas: input.capability_schemas.unwrap_or_default(),
+            // Only `UpdateManagedThing` carries `HubNetworkMode`.
+            hub_network_mode: None,
+            wifi_simple_setup_configuration: input.wi_fi_simple_setup_configuration,
+            meta_data: input.meta_data.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default(),
+            created_at,
+            updated_at: created_at,
+            activated_at: None,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            // Keep the map under its cap before minting one more record.
+            store.make_room_for_idempotency_token();
+            store.idempotency_tokens.insert(
+                token,
+                crate::state::IdempotencyRecord {
+                    managed_thing_id: id.clone(),
+                    minted_at: created_at,
+                },
+            );
+        }
+        store.managed_thing_order.push(id.clone());
+        store.managed_things.insert(id.clone(), thing);
+
+        Ok(CreateManagedThingOutput {
+            id: Some(id),
+            arn: Some(arn),
+            created_at: Some(crate::state::timestamp(created_at)),
+        })
     }
 }

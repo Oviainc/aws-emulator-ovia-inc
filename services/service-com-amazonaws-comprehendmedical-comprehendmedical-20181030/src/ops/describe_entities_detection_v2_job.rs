@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEntitiesDetectionV2Job
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEntitiesDetectionV2Job`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEntitiesDetectionV2Job::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The answer is reconstructed from the stored job: exactly what
+//! `StartEntitiesDetectionV2Job` was given, plus the status the clock has moved the job
+//! to. An unknown (or expired) `JobId` is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEntitiesDetectionV2Job` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEntitiesDetectionV2JobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEntitiesDetectionV2Job"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeEntitiesDetectionV2JobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("The service's job store is unavailable.".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = crate::state::now_epoch_secs();
+        let mut state = store.lock();
+        // Both writes below are changes the CLOCK already made due at an instant fixed
+        // when the job was started — metadata expiry and the job's own status
+        // progression — so materialising them while reporting shows a later caller
+        // nothing it would not otherwise have seen.
+        state.expire_jobs(now);
+        let Some(job) = state.entities_detection_v2_jobs.get_mut(&input.job_id) else {
+            return Err(
+                DescribeEntitiesDetectionV2JobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No entities detection job was found for JobId '{}'.",
+                            input.job_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        job.advance(now);
+
+        Ok(DescribeEntitiesDetectionV2JobOutput {
+            comprehend_medical_async_job_properties: Some(job.to_properties()),
+        })
     }
 }

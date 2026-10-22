@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a user of an organization in this service's store, in the `DISABLED` state a
+//! `RegisterToWorkMail` call later moves to `ENABLED`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +172,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        let _ = ctx;
+        // Absent only when this service is mounted on an engine that carries no store,
+        // in which case the operation genuinely cannot be served here.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateUser"))?;
+        let mut store = state.lock();
+
+        let organization = store
+            .organizations
+            .get_mut(&input.organization_id)
+            .ok_or_else(|| {
+                CreateUserErrorModeled::OrganizationNotFoundException(
+                    OrganizationNotFoundException {
+                        message: Some(format!(
+                            "An organization with the identifier {} was not found.",
+                            input.organization_id
+                        )),
+                    },
+                )
+            })?;
+        if organization.state != crate::state::ORGANIZATION_STATE_ACTIVE {
+            return Err(CreateUserErrorModeled::OrganizationStateException(
+                OrganizationStateException {
+                    message: Some(format!(
+                        "The organization {} is in state {} and cannot own new users.",
+                        organization.organization_id, organization.state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You cannot pass SYSTEM_USER or RESOURCE role in a single request. When a user
+        // role is not selected, the default role of USER is selected."
+        // (`CreateUserRequest$Role`).
+        let role = input
+            .role
+            .unwrap_or_else(|| crate::state::DEFAULT_USER_ROLE.to_string());
+        if role == "SYSTEM_USER" || role == "RESOURCE" {
+            return Err(CreateUserErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Role {role} cannot be requested for a user; pass USER or REMOTE_USER."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's own ceiling on store growth, since nothing evicts a user.
+        // `CreateUser` models no limit error, so the refusal is a `ValidationException`.
+        if organization.users.len() >= crate::state::MAX_USERS_PER_ORGANIZATION {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "This emulator holds at most {} users per organization.",
+                crate::state::MAX_USERS_PER_ORGANIZATION
+            )));
+        }
+
+        // "The user, group, or resource name isn't unique in WorkMail"
+        // (`NameAvailabilityException`).
+        if organization.user_id_for_name(&input.name).is_some() {
+            return Err(CreateUserErrorModeled::NameAvailabilityException(
+                NameAvailabilityException {
+                    message: Some(format!(
+                        "The name {} is already in use in this organization.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Created, not registered: no mailbox and no email address until
+        // `RegisterToWorkMail` runs, so the user enters `DISABLED` now.
+        let now = ::std::time::SystemTime::now();
+        let user_id = crate::state::new_entity_id();
+        organization.insert_user(crate::state::UserRecord {
+            user_id: user_id.clone(),
+            name: input.name,
+            display_name: input.display_name,
+            email: None,
+            first_name: input.first_name,
+            last_name: input.last_name,
+            role,
+            state: crate::state::entity_state::DISABLED.to_string(),
+            hidden_from_global_address_list: input.hidden_from_global_address_list,
+            enabled_date: None,
+            disabled_date: Some(now),
+            identity_provider_user_id: input.identity_provider_user_id,
+            password: input.password,
+        });
+
+        Ok(CreateUserOutput {
+            user_id: Some(user_id),
+        })
     }
 }

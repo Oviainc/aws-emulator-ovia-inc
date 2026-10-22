@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateManagedThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateManagedThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateManagedThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the record `crate::state`'s `managed_things` store holds under
+//! `Identifier` in place: every member the request carries replaces the stored one,
+//! an absent member is left untouched, and `UpdatedAt` is bumped. An id the store
+//! does not hold answers `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +193,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateManagedThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateManagedThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateManagedThing"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateManagedThingErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the managed-thing store is unavailable".to_string()),
+            })
+        })?;
+
+        // `HubNetworkMode` is a modelled enum, so a value outside it is a client error.
+        if let Some(mode) = input.hub_network_mode.as_deref() {
+            if !crate::state::HUB_NETWORK_MODE_VALUES.contains(&mode) {
+                return Err(UpdateManagedThingErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "HubNetworkMode must be one of {:?}, got {mode:?}",
+                            crate::state::HUB_NETWORK_MODE_VALUES
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // A managed thing is regional: only the region that created it resolves it.
+        let region = crate::state::request_region(ctx.parts());
+        let thing = store
+            .managed_thing_in_mut(&region, &input.identifier)
+            .ok_or_else(|| {
+                UpdateManagedThingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Managed thing {} was not found", input.identifier)),
+                        resource_id: Some(input.identifier.clone()),
+                        resource_type: Some("ManagedThing".to_string()),
+                    },
+                )
+            })?;
+
+        // Present replaces stored, absent leaves stored alone — for every updatable
+        // member the model declares.
+        if input.owner.is_some() {
+            thing.owner = input.owner;
+        }
+        if input.credential_locker_id.is_some() {
+            thing.credential_locker_id = input.credential_locker_id;
+        }
+        if input.serial_number.is_some() {
+            thing.serial_number = input.serial_number;
+        }
+        if input.wi_fi_simple_setup_configuration.is_some() {
+            thing.wifi_simple_setup_configuration = input.wi_fi_simple_setup_configuration;
+        }
+        if input.brand.is_some() {
+            thing.brand = input.brand;
+        }
+        if input.model.is_some() {
+            thing.model = input.model;
+        }
+        if input.name.is_some() {
+            thing.name = input.name;
+        }
+        if input.capability_report.is_some() {
+            thing.capability_report = input.capability_report;
+        }
+        if let Some(schemas) = input.capability_schemas {
+            thing.capability_schemas = schemas;
+        }
+        if input.capabilities.is_some() {
+            thing.capabilities = input.capabilities;
+        }
+        if input.classification.is_some() {
+            thing.classification = input.classification;
+        }
+        if input.hub_network_mode.is_some() {
+            thing.hub_network_mode = input.hub_network_mode;
+        }
+        if let Some(meta_data) = input.meta_data {
+            thing.meta_data = meta_data;
+        }
+        thing.updated_at = ::std::time::SystemTime::now();
+
+        Ok(UpdateManagedThingOutput)
     }
 }

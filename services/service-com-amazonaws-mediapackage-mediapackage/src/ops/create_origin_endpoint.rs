@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOriginEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOriginEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOriginEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an OriginEndpoint on an existing Channel and stores it, including every
+//! packaging configuration the caller supplied and the playback URL derived for it.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +195,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOriginEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOriginEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOriginEndpoint"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOriginEndpointErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the mediapackage state store is unavailable".into()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // Bound what the caller may make this record cost, before anything is stored:
+        // the store copies these collections and strings verbatim, so one request must
+        // not decide how much memory its record occupies.
+        let refuse = |message: String| {
+            CreateOriginEndpointError::from(
+                CreateOriginEndpointErrorModeled::UnprocessableEntityException(
+                    UnprocessableEntityException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+        for (member, value) in [
+            ("Id", Some(&input.id)),
+            ("ChannelId", Some(&input.channel_id)),
+            ("Description", input.description.as_ref()),
+            ("ManifestName", input.manifest_name.as_ref()),
+        ] {
+            if let Some(value) = value {
+                crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)
+                    .map_err(refuse)?;
+            }
+        }
+        crate::state::bound_tags(&input.tags).map_err(refuse)?;
+        if let Some(whitelist) = &input.whitelist {
+            crate::state::bound_entries(
+                "Whitelist",
+                whitelist.len(),
+                crate::state::MAX_WHITELIST_ENTRIES,
+            )
+            .map_err(refuse)?;
+            for entry in whitelist {
+                crate::state::bound_chars(
+                    "a Whitelist entry",
+                    entry,
+                    crate::state::MAX_STRING_CHARS,
+                )
+                .map_err(refuse)?;
+            }
+        }
+        if let Some(manifests) = input
+            .cmaf_package
+            .as_ref()
+            .and_then(|package| package.hls_manifests.as_ref())
+        {
+            crate::state::bound_entries(
+                "CmafPackage.HlsManifests",
+                manifests.len(),
+                crate::state::MAX_CMAF_HLS_MANIFESTS,
+            )
+            .map_err(refuse)?;
+            for manifest in manifests {
+                crate::state::bound_chars(
+                    "a CmafPackage.HlsManifests id",
+                    &manifest.id,
+                    crate::state::MAX_STRING_CHARS,
+                )
+                .map_err(refuse)?;
+                if let Some(name) = &manifest.manifest_name {
+                    crate::state::bound_chars(
+                        "a CmafPackage.HlsManifests ManifestName",
+                        name,
+                        crate::state::MAX_STRING_CHARS,
+                    )
+                    .map_err(refuse)?;
+                }
+            }
+        }
+
+        // An OriginEndpoint packages ONE Channel: a ChannelId naming no stored channel
+        // has nothing to package, so the endpoint is not created.
+        if !state.channels.contains_key(&input.channel_id) {
+            return Err(CreateOriginEndpointErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Channel with ID \"{}\" not found.",
+                    input.channel_id
+                )),
+            })
+            .into());
+        }
+
+        // The ID must be unique: a second create on an id already in use is refused,
+        // never an overwrite.
+        if state.origin_endpoints.contains_key(&input.id) {
+            return Err(CreateOriginEndpointErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!(
+                        "An origin endpoint with ID \"{}\" already exists.",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store lives for the life of the process and only a create adds to it, so
+        // it is capped by entry count; past the cap the resource limit is reported.
+        if state.origin_endpoints.len() >= crate::state::MAX_ORIGIN_ENDPOINTS {
+            return Err(CreateOriginEndpointErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "The origin endpoint limit of {} for this account has been reached.",
+                        crate::state::MAX_ORIGIN_ENDPOINTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An endpoint packages its channel in exactly one format, and its playback URL
+        // ends in that format's manifest, so exactly one packaging configuration must be
+        // supplied. Neither none nor several can be packaged.
+        let supplied: Vec<(crate::state::PackagingKind, &str)> = [
+            (crate::state::PackagingKind::Hls, "HlsPackage", input.hls_package.is_some()),
+            (crate::state::PackagingKind::Dash, "DashPackage", input.dash_package.is_some()),
+            (crate::state::PackagingKind::Cmaf, "CmafPackage", input.cmaf_package.is_some()),
+            (crate::state::PackagingKind::Mss, "MssPackage", input.mss_package.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(kind, name, present)| present.then_some((kind, name)))
+        .collect();
+        let [(kind, _)] = supplied[..] else {
+            let names: Vec<&str> = supplied.iter().map(|(_, name)| *name).collect();
+            return Err(CreateOriginEndpointErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!(
+                        "Exactly one of HlsPackage, DashPackage, CmafPackage or MssPackage is \
+                         required; got {}.",
+                        if names.is_empty() {
+                            "none".to_string()
+                        } else {
+                            names.join(", ")
+                        }
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let manifest_name = input
+            .manifest_name
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
+        let record = crate::state::OriginEndpointRecord {
+            arn: crate::state::origin_endpoint_arn(&region, &input.id),
+            channel_id: input.channel_id.clone(),
+            description: input.description.clone(),
+            url: crate::state::playback_url(
+                &region,
+                &input.channel_id,
+                &input.id,
+                &manifest_name,
+                kind,
+            ),
+            created_at: crate::state::now_iso8601(),
+            hls_package: input.hls_package.clone(),
+            dash_package: input.dash_package.clone(),
+            cmaf_package: input.cmaf_package.as_ref().map(|params| {
+                crate::state::stored_cmaf_package(params, &region, &input.channel_id, &input.id)
+            }),
+            mss_package: input.mss_package.clone(),
+            authorization: input.authorization.clone(),
+            origination: input.origination.clone(),
+            startover_window_seconds: input.startover_window_seconds,
+            time_delay_seconds: input.time_delay_seconds,
+            whitelist: input.whitelist.clone().unwrap_or_default(),
+            tags: crate::state::tags_from_wire(&input.tags),
+            manifest_name: Some(manifest_name),
+            id: input.id.clone(),
+        };
+        // `insert` + the read back below: the record returned is always the STORED one,
+        // and the id is free (refused as a duplicate above), so nothing is replaced.
+        let id = input.id.clone();
+        state.origin_endpoints.insert(id.clone(), record);
+        let stored = state
+            .origin_endpoints
+            .get(&id)
+            .expect("the record just inserted under this id");
+
+        // Rendered from the STORED record, so the create response and every later
+        // DescribeOriginEndpoint/ListOriginEndpoints are the same bytes.
+        let endpoint = stored.to_origin_endpoint();
+        Ok(CreateOriginEndpointOutput {
+            arn: endpoint.arn,
+            authorization: endpoint.authorization,
+            channel_id: endpoint.channel_id,
+            cmaf_package: endpoint.cmaf_package,
+            created_at: endpoint.created_at,
+            dash_package: endpoint.dash_package,
+            description: endpoint.description,
+            hls_package: endpoint.hls_package,
+            id: endpoint.id,
+            manifest_name: endpoint.manifest_name,
+            mss_package: endpoint.mss_package,
+            origination: endpoint.origination,
+            startover_window_seconds: endpoint.startover_window_seconds,
+            tags: endpoint.tags,
+            time_delay_seconds: endpoint.time_delay_seconds,
+            url: endpoint.url,
+            whitelist: endpoint.whitelist,
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetAccountStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetAccountStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetAccountStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Amazon Inspector enablement `Enable` recorded for each
+//! requested account. A reporting operation: it reads the shared state and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetAccountStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetAccountStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetAccountStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetAccountStatusErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector account state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // Like `Enable`, an absent (or empty) `accountIds` means the calling account; and
+        // `AccountIdSet` is `@uniqueItems`, so a repeated id was already refused at the
+        // boundary and each account here is named exactly once.
+        let requested: Vec<String> = match input.account_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => vec![::engine::emulator_account_id().to_string()],
+        };
+
+        let guard = state.lock();
+        let accounts = requested
+            .into_iter()
+            .map(|account_id| {
+                // An account Amazon Inspector was never enabled for has no record, and
+                // reports the same thing a disabled account does: everything off.
+                let enablement = guard.accounts.get(&account_id).cloned().unwrap_or_default();
+                let scan_state = |resource_type: &str| State {
+                    status: enablement.status_of(resource_type).to_string(),
+                };
+                AccountState {
+                    account_id,
+                    state: State {
+                        status: enablement.account_status().to_string(),
+                    },
+                    resource_state: ResourceState {
+                        ec2: scan_state("EC2"),
+                        ecr: scan_state("ECR"),
+                        lambda: Some(scan_state("LAMBDA")),
+                        lambda_code: Some(scan_state("LAMBDA_CODE")),
+                        code_repository: Some(scan_state("CODE_REPOSITORY")),
+                    },
+                }
+            })
+            .collect();
+
+        Ok(BatchGetAccountStatusOutput {
+            accounts,
+            // Every requested account was reported, so nothing failed.
+            failed_accounts: None,
+        })
     }
 }

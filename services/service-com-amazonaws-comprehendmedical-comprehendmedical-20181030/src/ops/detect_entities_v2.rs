@@ -11,6 +11,14 @@
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
+//! NOTE for whoever implements it: `DetectEntitiesV2` is machine-learning inference over
+//! clinical text — it reports the entities a trained model finds and "the level of
+//! confidence in the detection and analysis". This emulator runs no such model, and a
+//! hand-written term list with a digest-derived confidence would be output nothing
+//! computed, so the honest answer stays the 501 below until a real, maintained inference
+//! component is wired into the workspace. The same holds for its siblings
+//! `DetectEntities`, `DetectPHI` and the `Infer*` operations.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

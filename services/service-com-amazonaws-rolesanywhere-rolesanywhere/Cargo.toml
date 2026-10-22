@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the modelled 36-character `Uuid` resource ids.
+sha2 = { workspace = true }
+# Hex codec for the minted ids and the opaque list `nextToken`.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

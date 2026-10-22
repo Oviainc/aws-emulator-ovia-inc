@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives the per-cluster endpoint label AWS generates randomly, so the address a
+# create returns is the one every later describe returns.
+sha2 = { workspace = true }
+# Renders that digest as the hex label, rather than re-deriving the encoding here.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

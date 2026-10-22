@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a profile naming the roles a session may assume and stores it in
+//! [`crate::state::ComAmazonawsRolesanywhereRolesanywhereState::profiles`], so
+//! `GetProfile`, `ListProfiles` and `DeleteProfile` all see the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProfile"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // A profile vends credentials for the roles it names, so every entry has to be
+        // an IAM role ARN. `RoleArnList`'s member carries no `@pattern` for the
+        // boundary validator to enforce, so the check lives here.
+        for (index, role_arn) in input.role_arns.iter().enumerate() {
+            if !is_iam_role_arn(role_arn) {
+                return Err(validation(
+                    &format!("roleArns.{index}.member"),
+                    "Member must be an IAM role ARN of the form \
+                     arn:<partition>:iam::<account>:role/<name>",
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Both caller-driven stores are bounded by an entry count, refused here before
+        // anything is inserted, so repeating this call cannot grow the store without
+        // limit. This operation models no quota error, so the refusal is its own
+        // `ValidationException`.
+        if store.profiles.len() >= crate::state::MAX_PROFILES {
+            return Err(CreateProfileErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "This account already holds the maximum of {} profiles in this Region",
+                    crate::state::MAX_PROFILES
+                )),
+            })
+            .into());
+        }
+        let profile_id = store.mint_uuid();
+        let record = crate::state::ProfileRecord {
+            profile_arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("profile/{profile_id}"),
+            ),
+            profile_id: profile_id.clone(),
+            name: input.name,
+            role_arns: input.role_arns,
+            managed_policy_arns: input.managed_policy_arns.unwrap_or_default(),
+            session_policy: input.session_policy,
+            // "In requests, if this value is not provided, the default value will be
+            // 3600" (`ProfileDetail$durationSeconds` doc). The modelled
+            // `@range(900, 43200)` on the request member is already enforced by the
+            // time this handler runs.
+            duration_seconds: input
+                .duration_seconds
+                .unwrap_or(crate::state::DEFAULT_PROFILE_DURATION_SECONDS),
+            // A request that says nothing about `enabled` creates a usable profile:
+            // the member is optional, and `DisableProfile` is the way to turn one off
+            // afterwards.
+            enabled: input.enabled.unwrap_or(true),
+            require_instance_properties: input.require_instance_properties.unwrap_or(false),
+            accept_role_session_name: input.accept_role_session_name.unwrap_or(false),
+            // "The Amazon Web Services account that created the profile"
+            // (`ProfileDetail$createdBy` doc).
+            created_by: ::engine::emulator_account_id().to_string(),
+            created_at: now,
+            updated_at: now,
+            attribute_mappings: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+        };
+        let profile = record.to_detail();
+        store.profiles.insert(profile_id, record);
+
+        Ok(CreateProfileOutput {
+            profile: Some(profile),
+        })
     }
+}
+
+/// Whether `candidate` is an IAM role ARN: `arn:<partition>:iam::<account>:role/<path>`.
+///
+/// IAM is a global service, so the region segment of an IAM ARN is empty — which is
+/// why the segments are checked rather than just the prefix.
+fn is_iam_role_arn(candidate: &str) -> bool {
+    let mut segments = candidate.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(""), Some(account), Some(resource)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    !partition.is_empty()
+        && account.chars().all(|c| c.is_ascii_digit())
+        && !account.is_empty()
+        && resource.starts_with("role/")
+        && resource.len() > "role/".len()
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400), worded the way the boundary validator words a constraint failure.
+fn validation(member: &str, constraint: &str) -> CreateProfileError {
+    CreateProfileErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::validation_message(member, constraint)),
+    })
+    .into()
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the stored workflow record, or `ResourceNotFoundException`
+//! when no workflow is stored under the requested id. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflow"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetWorkflowErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the migration workflow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // `settled_workflow` applies only a status transition the clock already made
+        // due — a change that was owed at this instant whether or not anybody read
+        // the workflow — so this report changes nothing a later caller would not
+        // have seen anyway.
+        let Some(workflow) = store.settled_workflow(&input.id) else {
+            return Err(GetWorkflowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Migration workflow {} was not found", input.id),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetWorkflowOutput {
+            id: Some(workflow.id.clone()),
+            arn: Some(workflow.arn.clone()),
+            name: Some(workflow.name.clone()),
+            description: workflow.description.clone(),
+            template_id: Some(workflow.template_id.clone()),
+            ads_application_configuration_id: workflow.ads_application_configuration_id.clone(),
+            ads_application_name: workflow.ads_application_configuration_name.clone(),
+            status: Some(workflow.status.clone()),
+            status_message: workflow.status_message.clone(),
+            creation_time: Some(workflow.creation_time),
+            last_start_time: workflow.last_start_time,
+            last_stop_time: workflow.last_stop_time,
+            last_modified_time: workflow.last_modified_time,
+            end_time: workflow.end_time,
+            // Tools come from the workflow's template; no template is stored until
+            // the template operations are implemented, so there is none to report.
+            tools: None,
+            total_steps: workflow.total_steps,
+            completed_steps: workflow.completed_steps,
+            workflow_inputs: Some(workflow.workflow_inputs.clone()),
+            tags: Some(workflow.tags.clone()),
+            workflow_bucket: workflow.workflow_bucket.clone(),
+        })
     }
 }
