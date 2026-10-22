@@ -15,6 +15,11 @@
 //! * `TagResource` merges by `TagKey`;
 //! * an ARN the store does not hold is a `ResourceNotFoundException`, and a duplicate
 //!   `ConfigurationName` is a `ConflictException`.
+//!
+//! The create rule's other half — that a configuration can only be created for a Slack
+//! workspace authorized with the account — lives in
+//! `tests/all/slack_workspace_authorization.rs`; the workspaces the rows below name are
+//! authorized by [`router`] through the state seam before any create runs.
 
 use std::sync::Arc;
 
@@ -40,10 +45,32 @@ fn authorization(region: &str) -> String {
     )
 }
 
+/// The Slack workspaces the requests below name, each with the display name it is
+/// authorized under.
+///
+/// A workspace has to be authorized with the account before a channel can be configured
+/// in it, and on AWS that happens through the one-time Slack client (OAuth) handshake,
+/// which no operation in this model performs — so [`router`] registers these through the
+/// state seam, exactly as the console handshake would.
+const AUTHORIZED_WORKSPACES: [(&str, &str); 4] = [
+    ("T0123ABCD", "Primary Workspace"),
+    ("T9999ZZZZ", "Secondary Workspace"),
+    ("T2", "Two"),
+    ("T3", "Three"),
+];
+
 /// A router mounting only this service, over one shared engine — the same assembly the
 /// production router performs, minus the other services.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    for (slack_team_id, slack_team_name) in AUTHORIZED_WORKSPACES {
+        service_com_amazonaws_chatbot_wheatleyorchestration_20171011::state::authorize_slack_workspace(
+            &*engine,
+            slack_team_id,
+            slack_team_name,
+        )
+        .expect("the shared engine holds the chatbot store");
+    }
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -132,7 +159,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "ChatConfigurationArn": expected_arn("minimal"),
                 "ConfigurationName": "minimal",
                 "SlackTeamId": "T0123ABCD",
-                "SlackTeamName": "T0123ABCD",
+                "SlackTeamName": "Primary Workspace",
                 "SlackChannelId": "C0123ABCD",
                 "SlackChannelName": "C0123ABCD",
                 "IamRoleArn": IAM_ROLE_ARN,
@@ -166,7 +193,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "ChatConfigurationArn": expected_arn("full-config_1"),
                 "ConfigurationName": "full-config_1",
                 "SlackTeamId": "T9999ZZZZ",
-                "SlackTeamName": "T9999ZZZZ",
+                "SlackTeamName": "Secondary Workspace",
                 "SlackChannelId": "C9999ZZZZ",
                 "SlackChannelName": "ops-alerts",
                 "IamRoleArn": IAM_ROLE_ARN,
@@ -203,7 +230,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "ChatConfigurationArn": expected_arn("logging-error"),
                 "ConfigurationName": "logging-error",
                 "SlackTeamId": "T2",
-                "SlackTeamName": "T2",
+                "SlackTeamName": "Two",
                 "SlackChannelId": "C2",
                 "SlackChannelName": "a",
                 "IamRoleArn": IAM_ROLE_ARN,
@@ -229,7 +256,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "ChatConfigurationArn": expected_arn("logging-none"),
                 "ConfigurationName": "logging-none",
                 "SlackTeamId": "T3",
-                "SlackTeamName": "T3",
+                "SlackTeamName": "Three",
                 "SlackChannelId": "C3",
                 "SlackChannelName": "C3",
                 "IamRoleArn": OTHER_IAM_ROLE_ARN,
