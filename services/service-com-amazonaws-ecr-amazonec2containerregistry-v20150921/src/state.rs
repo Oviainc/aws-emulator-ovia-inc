@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     EncryptionConfiguration, ImageDetail, ImageIdentifier, ImageScanningConfiguration,
-    ImageTagMutabilityExclusionFilter, Repository, Tag,
+    ImageTagMutabilityExclusionFilter, Repository, RepositoryScanningConfiguration, Tag,
 };
 
 /// `CreateRepository`'s documented default: "If this parameter is omitted, the default
@@ -56,6 +56,17 @@ pub const MAX_TAGS_PER_REPOSITORY: usize = 10_000;
 /// stores is in standard storage (moving one to archive is `UpdateImageStorageClass`,
 /// still a 501 stub), so every stored image reports `ACTIVE`.
 pub const ACTIVE_IMAGE_STATUS: &str = "ACTIVE";
+
+/// The `ScanFrequency` of a repository whose scan on push is switched on: a push is what
+/// triggers its scan. (`ScanFrequency`'s modelled values are `SCAN_ON_PUSH`,
+/// `CONTINUOUS_SCAN` and `MANUAL`; `CONTINUOUS_SCAN` belongs to `ENHANCED` registry
+/// scanning, which no operation configures here yet.)
+pub const SCAN_ON_PUSH_FREQUENCY: &str = "SCAN_ON_PUSH";
+
+/// The `ScanFrequency` of a repository that is scanned only when asked: "If scan on push
+/// is not specified, then the MANUAL scan frequency is set by default"
+/// (`RegistryScanningRule.scanFrequency`).
+pub const MANUAL_SCAN_FREQUENCY: &str = "MANUAL";
 
 /// Page size used when a paginated operation's `maxResults` is absent, and the ceiling
 /// on the page a request may ask for: the ECR API reference documents 100 as the default
@@ -190,6 +201,37 @@ impl Repo {
             },
             image_scanning_configuration: self.image_scanning_config.clone(),
             encryption_configuration: Some(self.encryption_config.clone()),
+        }
+    }
+
+    /// The scanning configuration reported for this repository.
+    ///
+    /// Derived from what is stored, never from the request: `scanOnPush` is the flag the
+    /// repository's own `imageScanningConfiguration` carries (absent means not
+    /// configured, so `false`, the member's modelled default), and the frequency follows
+    /// from it — a repository scanned on push has the `SCAN_ON_PUSH` frequency, and one
+    /// that is not has the `MANUAL` one. `appliedScanFilters` lists the registry
+    /// scanning rules' filters that match this repository; a registry nobody has
+    /// configured carries no rules (`PutRegistryScanningConfiguration` is still a 501
+    /// stub), so no filter applies and the list is empty.
+    pub fn to_scanning_configuration(&self) -> RepositoryScanningConfiguration {
+        let scan_on_push = self
+            .image_scanning_config
+            .as_ref()
+            .is_some_and(|config| config.scan_on_push);
+        RepositoryScanningConfiguration {
+            repository_arn: Some(self.arn.clone()),
+            repository_name: Some(self.name.clone()),
+            scan_on_push,
+            scan_frequency: Some(
+                if scan_on_push {
+                    SCAN_ON_PUSH_FREQUENCY
+                } else {
+                    MANUAL_SCAN_FREQUENCY
+                }
+                .to_string(),
+            ),
+            applied_scan_filters: Some(Vec::new()),
         }
     }
 
