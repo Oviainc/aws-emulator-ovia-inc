@@ -202,10 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        if !guard.clusters.contains_key(&cluster_name) {
+        if !guard.has_active_cluster(&cluster_name) {
             return Err(DeleteServiceErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -215,9 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = guard.services.get(&key) else {
             return Err(DeleteServiceErrorModeled::ServiceNotFoundException(
                 ServiceNotFoundException {
-                    message: Some(format!(
-                        "service {name:?} was not found in cluster {cluster_name:?}"
-                    )),
+                    message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -227,16 +225,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // task count is zero. If the service is actively maintaining tasks, you can't
         // delete it, and you must update the service to a desired task count of zero" —
         // unless `force` is set: "If true, allows you to delete a service even if it
-        // wasn't scaled down to zero tasks."
+        // wasn't scaled down to zero tasks." The refusal carries the FIXED sentence for
+        // that condition, which names no resource from the request.
         let force = input.force.unwrap_or_default();
         if !force && stored.desired_count > 0 {
             return Err(DeleteServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "the service cannot be deleted while it is scaled above 0; \
-                         service {name:?} wants {} tasks",
-                        stored.desired_count
-                    )),
+                    message: Some(crate::state::SERVICE_SCALED_ABOVE_ZERO_MESSAGE.to_string()),
                 },
             )
             .into());
