@@ -23,5 +23,7 @@ mod policy_lifecycle;
 mod preset_lifecycle;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
