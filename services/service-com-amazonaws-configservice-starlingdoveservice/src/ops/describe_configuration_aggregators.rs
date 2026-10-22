@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationAggregators
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationAggregators`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationAggregators::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configuration aggregators in [`crate::state`]: the ones the request
+//! names, or every one this account holds when it names none, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationAggregators` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationAggregatorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationAggregators"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let names = input.configuration_aggregator_names.unwrap_or_default();
+        let store = state.lock();
+
+        // A requested name that names no aggregator is a failure, not an empty page.
+        for name in &names {
+            if !store.configuration_aggregators.contains_key(name) {
+                return Err(
+                    DescribeConfigurationAggregatorsErrorModeled::NoSuchConfigurationAggregatorException(
+                        NoSuchConfigurationAggregatorException {
+                            message: Some(
+                                crate::state::no_such_configuration_aggregator_message(name),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The default is maximum. If you specify 0, Config uses the default." Any
+        // value outside the modelled 0..100 range is refused before this handler runs.
+        let page_size = if input.limit == 0 {
+            crate::state::DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE
+        } else {
+            input.limit
+        };
+        let page_size = usize::try_from(page_size).unwrap_or_default();
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeConfigurationAggregatorsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous DescribeConfigurationAggregators response \
+                                     returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // Page over the store's own name ordering, so a token holds the NAME the next
+        // page resumes at and survives aggregators created or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (name, entry) in &store.configuration_aggregators {
+            if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                continue;
+            }
+            if !names.is_empty() && !names.iter().any(|requested| requested == name) {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(name));
+                break;
+            }
+            page.push(entry.to_shape());
+        }
+
+        Ok(DescribeConfigurationAggregatorsOutput {
+            configuration_aggregators: Some(page),
+            next_token,
+        })
     }
 }

@@ -161,20 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ResourceNotFoundException` (404).
             if store.component_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
                 return Err(GetComponentErrorModeled::InvalidParameterException(
-                    crate::state::component_wrong_scope(
-                        &input.app_id,
-                        &input.environment_name,
-                        &input.id,
-                    ),
+                    crate::state::item_wrong_scope(),
                 )
                 .into());
             }
             return Err(GetComponentErrorModeled::ResourceNotFoundException(
-                crate::state::component_not_found(
-                    &input.app_id,
-                    &input.environment_name,
-                    &input.id,
-                ),
+                crate::state::item_not_found(),
             )
             .into());
         };

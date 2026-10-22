@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -105,13 +96,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateClusterParameterGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateClusterParameterGroup")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateClusterParameterGroup",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateClusterParameterGroupErrorModeled {
     ClusterParameterGroupAlreadyExistsFault(ClusterParameterGroupAlreadyExistsFault),
     ClusterParameterGroupQuotaExceededFault(ClusterParameterGroupQuotaExceededFault),
     InvalidTagFault(InvalidTagFault),
     TagLimitExceededFault(TagLimitExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -163,20 +161,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClusterParameterGroup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateClusterParameterGroupErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The request's own values first: a name that cannot be a parameter group
+        // name, and a family no engine version offers, are refused before the
+        // store is changed at all.
+        if let Err(message) = st::check_identifier(
+            st::PARAMETER_GROUP_NAME_RULE,
+            "ParameterGroupName",
+            &input.parameter_group_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // "This value is stored as a lower-case string", so the stored name — the
+        // one uniqueness is decided on and the one every read reports — is the
+        // folded form, not what the request spelled.
+        let name = st::normalized_parameter_group_name(&input.parameter_group_name);
+
+        let mut store = state.lock();
+
+        let families = store.parameter_group_families();
+        if !families.contains(&input.parameter_group_family.as_str()) {
+            let message = format!(
+                "Invalid value for ParameterGroupFamily: '{}'. Valid Values: {}",
+                input.parameter_group_family,
+                families.join(" | ")
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // Identity before capacity: a request that would create nothing keeps the
+        // more specific fault even when the account is at its quota.
+        if store.parameter_group(&name).is_some() {
+            return Err(
+                CreateClusterParameterGroupErrorModeled::ClusterParameterGroupAlreadyExistsFault(
+                    ClusterParameterGroupAlreadyExistsFault {
+                        message: Some(format!("Cluster parameter group already exists: {name}")),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.owned_parameter_group_count() >= st::PARAMETER_GROUP_QUOTA {
+            return Err(
+                CreateClusterParameterGroupErrorModeled::ClusterParameterGroupQuotaExceededFault(
+                    ClusterParameterGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of cluster parameter groups ({}).",
+                            st::PARAMETER_GROUP_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record a later `DescribeClusterParameterGroups` reports verbatim:
+        // the folded name, the family and description as given, and the tags the
+        // request carried (an empty list when it carried none, which is what the
+        // group then has).
+        let group = ClusterParameterGroup {
+            parameter_group_name: Some(name),
+            parameter_group_family: Some(input.parameter_group_family.clone()),
+            description: Some(input.description.clone()),
+            tags: Some(input.tags.clone().unwrap_or_default()),
+        };
+        store.parameter_groups.push(st::StoredParameterGroup {
+            group: group.clone(),
+            default_group: false,
+        });
+
+        Ok(CreateClusterParameterGroupOutput {
+            cluster_parameter_group: Some(group),
+        })
     }
 }

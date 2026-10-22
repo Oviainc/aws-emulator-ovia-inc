@@ -29,9 +29,29 @@ whatlang = "0.16"
 # VADER sentiment engine behind DetectSentiment: a rule-based English sentiment
 # analyser returning positive/negative/neutral proportions and a compound score.
 vader_sentiment = "0.1"
+# Amazon S3 client the asynchronous dominant-language detection job reads its input
+# documents with and writes its `output.tar.gz` back through, over the in-process
+# callback into this same emulator (no network client feature is enabled: the
+# transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# tar writer and gzip codec for the `output.tar.gz` archive an analysis job's
+# `OutputDataConfig` documents ("a compressed archive that contains the output of
+# the operation").
+tar = "0.4"
+flate2 = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The dominant-language job suite mounts the S3 service beside Comprehend on one
+# engine, because StartDominantLanguageDetectionJob reads its input documents from S3
+# and writes its output archive back there by calling it in process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Reads the `output.tar.gz` the job wrote back out, to assert the archive really
+# holds the analysed documents.
+tar = "0.4"
+flate2 = "1"
 
 [lints]
 workspace = true

@@ -203,6 +203,21 @@ pub struct WorkloadEstimate {
     pub tags: BTreeMap<String, String>,
 }
 
+impl WorkloadEstimate {
+    /// The value a `ListWorkloadEstimatesFilter` name selects on this estimate, or
+    /// `None` when this estimate carries nothing for it.
+    ///
+    /// Names are the `ListWorkloadEstimatesFilterName` enum's own values (smithy_query:
+    /// `shape="ListWorkloadEstimatesFilterName"`, values `STATUS | NAME`).
+    pub fn filter_value(&self, name: &str) -> Option<&str> {
+        match name {
+            "STATUS" => Some(self.status.as_str()),
+            "NAME" => Some(self.name.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// One stored bill scenario.
 #[derive(Debug, Clone)]
 pub struct BillScenario {

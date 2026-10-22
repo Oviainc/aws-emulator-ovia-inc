@@ -1,15 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDominantLanguageDetectionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDominantLanguageDetectionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDominantLanguageDetectionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Mints the job's id and ARN, persists the whole submitted record in
+//! [`crate::state`], answers `SUBMITTED`, and RUNS the job: it reads the input
+//! documents from the Amazon S3 location `InputDataConfig` names, identifies each
+//! document's dominant language with the same in-process engine `DetectDominantLanguage`
+//! uses, and writes the `output.tar.gz` archive `OutputDataConfig` documents back to
+//! S3 — all through the emulator's own in-process callback, so the objects it reads
+//! and writes are the ones the emulated S3 service holds.
+//!
+//! The job's terminal status is therefore the outcome of work that actually ran:
+//! `COMPLETED` when every document was read and the archive was written, and the
+//! modelled `FAILED` with a `Message` naming what stopped it otherwise (no object
+//! storage answering, an empty input prefix, a document this emulator cannot extract
+//! text from). Nothing is reported for work nothing performed.
+//!
+//! ## When the run happens, and when its outcome shows
+//!
+//! The record is persisted and the response answered `SUBMITTED` (which is what AWS
+//! answers), the run is performed within this same call, and its outcome is recorded
+//! against the stored job. The STATUS it produces is not visible immediately: the
+//! clock owes the job `IN_PROGRESS` and then its terminal status over the spans in
+//! [`crate::state`], so a caller that reads the job straight back still observes the
+//! transient state, and a job whose run has not reported yet reads as `IN_PROGRESS`
+//! — it is still running. Running inside the submitting call is what keeps the
+//! outcome honest without a background task: there is no timer driver to resume one
+//! and no status is ever invented for a run that never happened.
+//!
+//! The work one submission can do is bounded — the objects and bytes it READS
+//! ([`MAX_INPUT_OBJECTS`], [`MAX_INPUT_OBJECT_BYTES`], [`MAX_TOTAL_INPUT_BYTES`],
+//! decided from the listing before anything is fetched) and the documents and bytes
+//! it PRODUCES ([`MAX_OUTPUT_DOCUMENTS`], [`MAX_OUTPUT_BYTES`], checked as each entry
+//! is appended, because one bounded input can ask for an unbounded multiple of itself
+//! in output). A run that reaches a bound ends in the modelled `FAILED` state naming
+//! it, so no request can make this process hold an unbounded amount of memory, and the
+//! identification pass yields every [`DOCUMENTS_PER_YIELD`] documents so it stays
+//! interruptible.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +145,70 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::io::Write;
+use std::time::SystemTime;
+
+use crate::state::{
+    output_archive_key, AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey,
+    PROCESSING_SPAN, QUEUE_SPAN,
+};
+
+/// The family every job this operation creates belongs to.
+const FAMILY: JobFamily = JobFamily::DominantLanguageDetection;
+
+/// The most tags a Comprehend resource can carry.
+///
+/// From the modelled documentation of the `TooManyTagsException` this operation
+/// declares: "The request contains more tags than can be associated with a resource
+/// (50 tags per resource)."
+const MAX_TAGS: usize = 50;
+
+/// How each input file is split into documents when the submission sets no
+/// `InputFormat`.
+///
+/// The model declares no default for `InputDataConfig$InputFormat`, so this is the
+/// emulator's choice, and it is the coarser of the two: each file is one document
+/// (`ONE_DOC_PER_FILE`), so an output entry names the file it came from and carries
+/// no line number.
+const DEFAULT_INPUT_FORMAT: &str = "ONE_DOC_PER_FILE";
+
+/// The most input objects one job reads, and the most bytes it reads from one object
+/// and in total.
+///
+/// AWS publishes its own per-job document and size quotas; these are the EMULATOR's
+/// bounds on work done inside one request, so no submission can make this process
+/// read an unbounded amount of object storage or hold the service for an unbounded
+/// time. A submission that points past them is not silently truncated: the run ends
+/// in the modelled `FAILED` state naming the bound it hit.
+const MAX_INPUT_OBJECTS: usize = 200;
+/// The most bytes read from one input object (see [`MAX_INPUT_OBJECTS`]).
+const MAX_INPUT_OBJECT_BYTES: usize = 1024 * 1024;
+/// The most bytes read across a job's whole input (see [`MAX_INPUT_OBJECTS`]).
+const MAX_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most documents one job analyses, and the most output bytes it accumulates.
+///
+/// The input bounds above do NOT bound these: `ONE_DOC_PER_LINE` makes every line of
+/// an input object its own document, and every document costs an output entry that
+/// repeats the object's key, so a bounded input can ask for an unbounded multiple of
+/// itself in output. These bounds are on what the run PRODUCES, checked as each
+/// entry is appended, so the archive this request builds can never outgrow them; a
+/// run that reaches one ends in the modelled `FAILED` state naming it.
+const MAX_OUTPUT_DOCUMENTS: usize = 100_000;
+/// The most output bytes one job accumulates (see [`MAX_OUTPUT_DOCUMENTS`]).
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// How many documents the identification pass analyses between yields.
+///
+/// Identifying a document is CPU work with no await of its own, so the pass hands
+/// the runtime a yield point this often: a cancelled request or a shutdown has
+/// somewhere to land even while one object of many documents is being analysed.
+const DOCUMENTS_PER_YIELD: usize = 256;
+
+/// The single file an analysis job's output archive holds, one JSON document per
+/// line — the form Comprehend's asynchronous analysis output takes inside the
+/// `output.tar.gz` that `OutputDataConfig$S3Uri` documents.
+const OUTPUT_ARCHIVE_ENTRY: &str = "output";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,6 +244,447 @@ impl From<StartDominantLanguageDetectionJobErrorModeled> for StartDominantLangua
     fn from(modeled: StartDominantLanguageDetectionJobErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// An `s3://bucket/key` URI split into its parts.
+///
+/// The modelled `S3Uri` pattern (`^s3://[a-z0-9][\.\-a-z0-9]{1,61}[a-z0-9](/.*)?$`)
+/// is enforced before this handler runs, so a URI reaching here always has a bucket
+/// and may have a key.
+struct S3Location {
+    bucket: String,
+    key: String,
+}
+
+/// Split a modelled `S3Uri` into bucket and key; `None` for a string the pattern
+/// would not have admitted.
+fn parse_s3_uri(uri: &str) -> Option<S3Location> {
+    let rest = uri.strip_prefix("s3://")?;
+    let (bucket, key) = match rest.split_once('/') {
+        Some((bucket, key)) => (bucket, key),
+        None => (rest, ""),
+    };
+    (!bucket.is_empty()).then(|| S3Location {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    })
+}
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes in process, so no network client is configured here and this
+/// crate names no other service's crate. `region` is the request's own signing
+/// region, so the job reads and writes where the caller's own S3 requests go.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a
+        // virtual-host bucket name is not a host this emulator resolves, so every
+        // request addresses its bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch
+        // for a stalled stream, and each of those would need a sleep implementation
+        // this client is not given. The same goes for caching the identity: the
+        // credentials are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Records against the stored job what the run reported — and, if it is dropped
+/// without a report, the modelled failure for a run that will never report.
+///
+/// A job's terminal status is only revealed once its outcome is recorded, so a run
+/// whose handler never gets to report (the future dropped because the client went
+/// away, a panic the server contains) would otherwise leave the job in `IN_PROGRESS`
+/// for the life of the process. `Drop` runs on EVERY exit from the handler, which is
+/// what makes that unreachable.
+///
+/// `Drop` takes the state lock, so a recorder must not be dropped while a
+/// [`::engine::ServiceState::lock`] guard is alive in the same scope.
+struct RunOutcomeRecorder {
+    store: ::engine::ServiceState<crate::state::ComAmazonawsComprehendComprehend20171127State>,
+    job_id: String,
+    reported: bool,
+}
+
+impl RunOutcomeRecorder {
+    /// Record `outcome` as what this job's run reported. The clock reveals it once
+    /// the job's processing span is over, never before.
+    fn report(&mut self, outcome: JobOutcome) {
+        self.reported = true;
+        let mut store = self.store.lock();
+        if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, self.job_id.clone())) {
+            job.terminal_outcome = Some(outcome);
+        }
+    }
+}
+
+impl Drop for RunOutcomeRecorder {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        let mut store = self.store.lock();
+        if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, self.job_id.clone())) {
+            if job.terminal_outcome.is_none() {
+                job.terminal_outcome = Some(JobOutcome::failed(
+                    "The analysis run did not complete: the request that started it ended \
+                     before the run reported an outcome.",
+                ));
+            }
+        }
+    }
+}
+
+/// One document the run analysed: where it came from, and the line it was on for a
+/// `ONE_DOC_PER_LINE` input.
+///
+/// Borrows the object's key and body rather than copying them, so splitting an
+/// object into documents allocates nothing per document.
+struct Document<'a> {
+    /// The input object's key with the submitted prefix removed — the file the
+    /// output entry names.
+    file: &'a str,
+    /// The document's line within that file, for `ONE_DOC_PER_LINE` only.
+    line: Option<usize>,
+    text: &'a str,
+}
+
+/// Split one input object into the documents its `InputFormat` says it holds.
+///
+/// `ONE_DOC_PER_FILE` — "Each file is considered a separate document";
+/// `ONE_DOC_PER_LINE` — "Each line in a file is considered a separate document",
+/// where a blank line holds no document.
+///
+/// Lazy: the documents are yielded one at a time, so a file of a million lines never
+/// exists as a million values at once.
+fn documents_in<'a>(
+    file: &'a str,
+    body: &'a str,
+    input_format: &str,
+) -> Box<dyn Iterator<Item = Document<'a>> + Send + 'a> {
+    if input_format == "ONE_DOC_PER_LINE" {
+        return Box::new(
+            body.lines()
+                .enumerate()
+                .filter(|(_, line)| !line.trim().is_empty())
+                .map(move |(index, line)| Document {
+                    file,
+                    line: Some(index),
+                    text: line,
+                }),
+        );
+    }
+    Box::new(::std::iter::once(Document {
+        file,
+        line: None,
+        text: body,
+    }))
+}
+
+/// The output line for one analysed document: the file it came from, its line for a
+/// `ONE_DOC_PER_LINE` input, and the languages the engine identified in it.
+fn output_entry(document: &Document<'_>) -> ::serde_json::Value {
+    let languages: Vec<::serde_json::Value> =
+        super::detect_dominant_language::detect_languages(document.text)
+            .into_iter()
+            .map(|language| {
+                ::serde_json::json!({
+                    "LanguageCode": language.language_code,
+                    "Score": language.score,
+                })
+            })
+            .collect();
+    let mut entry = ::serde_json::json!({ "File": document.file, "Languages": languages });
+    if let Some(line) = document.line {
+        entry["Line"] = ::serde_json::json!(line);
+    }
+    entry
+}
+
+/// The `output.tar.gz` bytes for `body`: a gzip-compressed tar holding the single
+/// [`OUTPUT_ARCHIVE_ENTRY`] file, which is what `OutputDataConfig$S3Uri` documents
+/// ("a compressed archive that contains the output of the operation").
+fn output_archive(body: &str) -> ::std::io::Result<Vec<u8>> {
+    let encoder = ::flate2::write::GzEncoder::new(Vec::new(), ::flate2::Compression::default());
+    let mut archive = ::tar::Builder::new(encoder);
+    let mut header = ::tar::Header::new_gnu();
+    header.set_path(OUTPUT_ARCHIVE_ENTRY)?;
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    // The archive is a function of the analysed documents alone: nothing about the
+    // machine or the moment it was built takes part, so the same input produces the
+    // same bytes.
+    header.set_mtime(0);
+    header.set_cksum();
+    archive.append(&header, body.as_bytes())?;
+    let mut encoder = archive.into_inner()?;
+    encoder.flush()?;
+    encoder.finish()
+}
+
+/// The input objects at `input` with their listed sizes, in listing order, or the
+/// reason the listing could not be used.
+///
+/// The SIZE is carried so a run can refuse an object, or a whole input, that is past
+/// its byte bounds BEFORE fetching and buffering any of it.
+async fn input_objects(
+    client: &::aws_sdk_s3::Client,
+    input: &S3Location,
+) -> Result<Vec<(String, usize)>, String> {
+    let mut objects: Vec<(String, usize)> = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let page = client
+            .list_objects_v2()
+            .bucket(&input.bucket)
+            .prefix(&input.key)
+            .set_continuation_token(continuation.clone())
+            .send()
+            .await
+            .map_err(|error| {
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+            })?;
+        for object in page.contents() {
+            let Some(key) = object.key() else { continue };
+            // A key ending in the delimiter is a folder marker rather than a
+            // document. An EMPTY object is a document: the engine's answer for text
+            // it can place nowhere is an empty `Languages` list, which is the honest
+            // result for an empty file.
+            if key.ends_with('/') {
+                continue;
+            }
+            objects.push((key.to_string(), object.size().unwrap_or_default().max(0) as usize));
+            if objects.len() > MAX_INPUT_OBJECTS {
+                return Err(format!(
+                    "The input at s3://{}/{} holds more than the {MAX_INPUT_OBJECTS} input \
+                     objects this emulator reads in one job.",
+                    input.bucket, input.key,
+                ));
+            }
+        }
+        match page.next_continuation_token() {
+            Some(token) => continuation = Some(token.to_string()),
+            None => break,
+        }
+    }
+    Ok(objects)
+}
+
+/// Run one dominant-language detection job: read every input document, identify its
+/// language with the in-process engine, and write the output archive.
+///
+/// Answers a [`JobOutcome`] rather than an error channel: the run is the job's own
+/// work, so what it could not do is the job's modelled `FAILED` state and its
+/// `Message`, never a failure of the `StartDominantLanguageDetectionJob` request
+/// that submitted it.
+async fn run_job(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    job_id: &str,
+    input_data_config: &InputDataConfig,
+    output_data_config: &OutputDataConfig,
+) -> JobOutcome {
+    let Some(input) = parse_s3_uri(&input_data_config.s3_uri) else {
+        return JobOutcome::failed(format!(
+            "The input location {} is not an Amazon S3 URI.",
+            input_data_config.s3_uri
+        ));
+    };
+    let Some(output) = parse_s3_uri(&output_data_config.s3_uri) else {
+        return JobOutcome::failed(format!(
+            "The output location {} is not an Amazon S3 URI.",
+            output_data_config.s3_uri
+        ));
+    };
+    // Extracting text from PDF and image files is Amazon Textract's work, which this
+    // emulator does not perform, so a job configured for it is not reported as
+    // having analysed anything.
+    if input_data_config.document_reader_config.is_some() {
+        return JobOutcome::failed(
+            "DocumentReaderConfig asks for Amazon Textract text extraction, which this \
+             emulator does not perform, so no document was analyzed."
+                .to_string(),
+        );
+    }
+
+    let client = s3_client(ctx, region);
+    let objects = match input_objects(&client, &input).await {
+        Ok(objects) => objects,
+        Err(reason) => {
+            return JobOutcome::failed(format!(
+                "Could not list the input documents at {}: {reason}",
+                input_data_config.s3_uri
+            ))
+        }
+    };
+    if objects.is_empty() {
+        return JobOutcome::failed(format!(
+            "No input documents were found at {}.",
+            input_data_config.s3_uri
+        ));
+    }
+    // The byte bounds are decided from the LISTED sizes, before a single object is
+    // fetched, so an input past them costs no buffering at all.
+    if let Some((key, size)) = objects
+        .iter()
+        .find(|(_, size)| *size > MAX_INPUT_OBJECT_BYTES)
+    {
+        return JobOutcome::failed(format!(
+            "The input document s3://{}/{key} is {size} bytes, more than the \
+             {MAX_INPUT_OBJECT_BYTES} bytes this emulator reads from one document.",
+            input.bucket,
+        ));
+    }
+    let listed_bytes: usize = objects.iter().map(|(_, size)| *size).sum();
+    if listed_bytes > MAX_TOTAL_INPUT_BYTES {
+        return JobOutcome::failed(format!(
+            "The input at {} is {listed_bytes} bytes, more than the {MAX_TOTAL_INPUT_BYTES} \
+             bytes this emulator reads in one job.",
+            input_data_config.s3_uri,
+        ));
+    }
+
+    let input_format = input_data_config
+        .input_format
+        .as_deref()
+        .unwrap_or(DEFAULT_INPUT_FORMAT);
+    // The output is accumulated as the single archive member it becomes, entry by
+    // entry, so it is never held twice and never grows past [`MAX_OUTPUT_BYTES`].
+    let mut output_body = String::new();
+    let mut documents = 0usize;
+    let mut total_bytes = 0usize;
+    for (key, _) in &objects {
+        let object = match client
+            .get_object()
+            .bucket(&input.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(object) => object,
+            Err(error) => {
+                return JobOutcome::failed(format!(
+                    "Could not read the input document s3://{}/{key}: {}",
+                    input.bucket,
+                    ::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                ))
+            }
+        };
+        let body = match object.body.collect().await {
+            Ok(body) => body.into_bytes(),
+            Err(error) => {
+                return JobOutcome::failed(format!(
+                    "Could not read the input document s3://{}/{key}: {error}",
+                    input.bucket,
+                ))
+            }
+        };
+        // The listed size is what the bounds above were decided from; this is the
+        // backstop for an object whose fetched bytes disagree with its listing.
+        if body.len() > MAX_INPUT_OBJECT_BYTES {
+            return JobOutcome::failed(format!(
+                "The input document s3://{}/{key} is {} bytes, more than the \
+                 {MAX_INPUT_OBJECT_BYTES} bytes this emulator reads from one document.",
+                input.bucket,
+                body.len(),
+            ));
+        }
+        total_bytes += body.len();
+        if total_bytes > MAX_TOTAL_INPUT_BYTES {
+            return JobOutcome::failed(format!(
+                "The input at {} is larger than the {MAX_TOTAL_INPUT_BYTES} bytes this \
+                 emulator reads in one job.",
+                input_data_config.s3_uri,
+            ));
+        }
+        let Ok(text) = String::from_utf8(body.to_vec()) else {
+            return JobOutcome::failed(format!(
+                "The input document s3://{}/{key} is not UTF-8 text; this emulator extracts \
+                 text from plain-text documents only.",
+                input.bucket,
+            ));
+        };
+        // The file an output entry names is the key under the submitted prefix, so an
+        // entry points back at the document it was produced from. An input URI that
+        // names ONE file — "if the prefix is a single file, Amazon Comprehend uses
+        // that file as input" (`InputDataConfig$S3Uri`) — leaves nothing under the
+        // prefix, so the entry names that object.
+        let relative = key
+            .strip_prefix(input.key.as_str())
+            .unwrap_or(key)
+            .trim_start_matches('/');
+        let file = if relative.is_empty() {
+            key.split('/').next_back().unwrap_or(key)
+        } else {
+            relative
+        };
+        for document in documents_in(file, &text, input_format) {
+            documents += 1;
+            if documents > MAX_OUTPUT_DOCUMENTS {
+                return JobOutcome::failed(format!(
+                    "The input at {} holds more than the {MAX_OUTPUT_DOCUMENTS} documents this \
+                     emulator analyzes in one job.",
+                    input_data_config.s3_uri,
+                ));
+            }
+            // Identification is CPU work with no await of its own, so the pass hands
+            // the runtime a yield point every [`DOCUMENTS_PER_YIELD`] documents.
+            if documents.is_multiple_of(DOCUMENTS_PER_YIELD) {
+                ::tokio::task::yield_now().await;
+            }
+            let entry = output_entry(&document).to_string();
+            if output_body.len() + entry.len() + 1 > MAX_OUTPUT_BYTES {
+                return JobOutcome::failed(format!(
+                    "The output for {} is larger than the {MAX_OUTPUT_BYTES} bytes this \
+                     emulator writes in one job.",
+                    input_data_config.s3_uri,
+                ));
+            }
+            output_body.push_str(&entry);
+            output_body.push('\n');
+        }
+    }
+
+    let archive = match output_archive(&output_body) {
+        Ok(archive) => archive,
+        Err(error) => {
+            return JobOutcome::failed(format!("Could not build the output archive: {error}"))
+        }
+    };
+    let archive_key = output_archive_key(&output.key, FAMILY, job_id);
+    if let Err(error) = client
+        .put_object()
+        .bucket(&output.bucket)
+        .key(&archive_key)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(archive))
+        .content_type("application/x-gzip")
+        .send()
+        .await
+    {
+        return JobOutcome::failed(format!(
+            "Analyzed {documents} document(s) but could not write the output to \
+             s3://{}/{archive_key}: {}",
+            output.bucket,
+            ::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        ));
+    }
+
+    JobOutcome::completed(format!("s3://{}/{archive_key}", output.bucket))
 }
 
 /// The `StartDominantLanguageDetectionJob` operation.
@@ -191,18 +723,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDominantLanguageDetectionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDominantLanguageDetectionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartDominantLanguageDetectionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > MAX_TAGS {
+            return Err(
+                StartDominantLanguageDetectionJobErrorModeled::TooManyTagsException(
+                    TooManyTagsException {
+                        message: Some(format!(
+                            "The request contains {} tags, more than the {MAX_TAGS} tags that \
+                             can be associated with a resource.",
+                            tags.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        let request_digest = JobSubmission {
+            family: FAMILY,
+            job_name: input.job_name.as_deref(),
+            input_data_config: &input.input_data_config,
+            output_data_config: &input.output_data_config,
+            // This operation models no `LanguageCode`: identifying the language is
+            // the job's own work.
+            language_code: None,
+            data_access_role_arn: &input.data_access_role_arn,
+            volume_kms_key_id: input.volume_kms_key_id.as_deref(),
+            vpc_config: input.vpc_config.as_ref(),
+            tags: &tags,
+        }
+        .digest();
+        let submission_key = input
+            .client_request_token
+            .as_ref()
+            .map(|token| SubmissionKey {
+                family: FAMILY,
+                client_request_token: token.clone(),
+                request_digest: request_digest.clone(),
+            });
+
+        // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
+        // with the same request names the job it already created, which is what an
+        // SDK retrying a submission needs to make "did my first attempt land?"
+        // answerable. A request that carries none is a fresh submission, as the
+        // member's documentation says, and so is the same token carrying a
+        // DIFFERENT request: the pair identifies the submission, and the model
+        // declares no error for a token reused on another request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDominantLanguageDetectionJob"))
+        // The guard is scoped so the store lock is released before this handler
+        // awaits the job's own S3 work below.
+        let (job_id, job_arn) = {
+            let mut store = state.lock();
+            if let Some(existing) = submission_key
+                .as_ref()
+                .and_then(|key| store.replayed_job_id(key))
+            {
+                if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
+                    // Report the status the clock already owed this job, so a
+                    // retried token and a Describe an instant apart cannot disagree.
+                    job.settle(now);
+                    return Ok(StartDominantLanguageDetectionJobOutput {
+                        job_id: Some(job.job_id.clone()),
+                        job_arn: Some(job.job_arn.clone()),
+                        job_status: Some(job.job_status.clone()),
+                    });
+                }
+            }
+
+            let (seq, job_id) = store.mint_job_id(now);
+            let job_arn = ::emulator_server::emulator_arn(
+                "comprehend",
+                &region,
+                &format!("{}/{job_id}", FAMILY.arn_resource_type()),
+            );
+            // The record is persisted BEFORE the run starts, so the job exists (and
+            // its token is claimed) from the instant the submission is accepted. Its
+            // terminal outcome is unknown until the run reports, which is exactly
+            // what a job still being processed has.
+            store.insert_analysis_job(
+                FAMILY,
+                AnalysisJob {
+                    seq,
+                    job_id: job_id.clone(),
+                    job_arn: job_arn.clone(),
+                    job_name: input.job_name.clone(),
+                    job_status: "SUBMITTED".to_string(),
+                    message: None,
+                    submit_time: now,
+                    end_time: None,
+                    in_progress_due_at: now + QUEUE_SPAN,
+                    terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
+                    stopped_due_at: None,
+                    terminal_outcome: None,
+                    input_data_config: input.input_data_config.clone(),
+                    output_data_config: input.output_data_config.clone(),
+                    language_code: None,
+                    data_access_role_arn: input.data_access_role_arn.clone(),
+                    volume_kms_key_id: input.volume_kms_key_id.clone(),
+                    vpc_config: input.vpc_config.clone(),
+                    tags,
+                    client_request_token: input.client_request_token.clone(),
+                    request_digest,
+                },
+            );
+            (job_id, job_arn)
+        };
+
+        // From here on the job exists, so whatever the run does — including this
+        // handler never getting to report it — is recorded against the record by the
+        // recorder's `Drop`.
+        let mut recorder = RunOutcomeRecorder {
+            store: state.clone(),
+            job_id: job_id.clone(),
+            reported: false,
+        };
+        let outcome = run_job(
+            ctx,
+            &region,
+            &job_id,
+            &input.input_data_config,
+            &input.output_data_config,
+        )
+        .await;
+        // The outcome is RECORDED, not revealed: the clock owes the terminal status
+        // (and, with it, the archive's location in `OutputDataConfig$S3Uri`) only
+        // once the job's processing span is over, which `AnalysisJob::settle` applies.
+        recorder.report(outcome);
+        drop(recorder);
+
+        let store = state.lock();
+        // The record can only be missing if the store's own bound evicted it while
+        // the run was in flight — a job no later Describe can report, so the
+        // submission cannot be answered as accepted: the store could not keep it.
+        let Some(job) = store.analysis_jobs.get(&(FAMILY, job_id.clone())) else {
+            return Err(
+                StartDominantLanguageDetectionJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "The job {job_id} ({job_arn}) could not be retained. Retry your \
+                             request."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(StartDominantLanguageDetectionJobOutput {
+            job_id: Some(job.job_id.clone()),
+            job_arn: Some(job.job_arn.clone()),
+            job_status: Some(job.job_status.clone()),
+        })
     }
 }

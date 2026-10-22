@@ -119,10 +119,17 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{AnalysisJob, JobFamily, Submission, PROCESSING_SPAN, QUEUE_SPAN};
+use crate::state::{
+    AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
+};
 
 /// The family every job this operation creates belongs to.
 const FAMILY: JobFamily = JobFamily::KeyPhrasesDetection;
+
+/// The analysis a key-phrases-detection job's run would carry out, for the reason a
+/// job of a family this emulator does not run ends `FAILED`
+/// ([`crate::state::unperformed_run_message`]).
+const ANALYSIS: &str = "Key-phrase extraction";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -224,10 +231,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = SystemTime::now();
         // The submission's identity, beside its token: what makes a second call a
-        // RETRY of this one rather than a new job (see `state::Submission`).
-        let fingerprint = Submission {
+        // RETRY of this one rather than a new job (see `state::JobSubmission`).
+        let request_digest = JobSubmission {
+            family: FAMILY,
             job_name: input.job_name.as_deref(),
-            language_code: &input.language_code,
+            language_code: Some(input.language_code.as_str()),
             input_data_config: &input.input_data_config,
             output_data_config: &input.output_data_config,
             data_access_role_arn: &input.data_access_role_arn,
@@ -235,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_config: input.vpc_config.as_ref(),
             tags: &tags,
         }
-        .fingerprint();
+        .digest();
         let mut store = state.lock();
 
         // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
@@ -247,11 +255,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the same token carrying different parameters is a different
         // submission, which gets a job of its own.
         if let Some(token) = input.client_request_token.as_ref() {
-            if let Some(existing) = store
-                .idempotency_tokens
-                .get(&(FAMILY, token.clone(), fingerprint.clone()))
-                .cloned()
-            {
+            let key = SubmissionKey {
+                family: FAMILY,
+                client_request_token: token.clone(),
+                request_digest: request_digest.clone(),
+            };
+            if let Some(existing) = store.replayed_job_id(&key) {
                 if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
                     // Report the status the clock already owed this job, so a
                     // retried token and a Describe an instant apart cannot disagree.
@@ -271,6 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("{}/{job_id}", FAMILY.arn_resource_type()),
         );
+        let terminal_outcome = JobOutcome::failed(crate::state::unperformed_run_message(
+            ANALYSIS,
+            &input.input_data_config,
+            &input.output_data_config,
+        ));
         let job = AnalysisJob {
             seq,
             job_id: job_id.clone(),
@@ -283,15 +297,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             in_progress_due_at: now + QUEUE_SPAN,
             terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
             stopped_due_at: None,
+            terminal_outcome: Some(terminal_outcome),
             input_data_config: input.input_data_config,
             output_data_config: input.output_data_config,
-            language_code: input.language_code,
+            language_code: Some(input.language_code),
             data_access_role_arn: input.data_access_role_arn,
             volume_kms_key_id: input.volume_kms_key_id,
             vpc_config: input.vpc_config,
             tags,
             client_request_token: input.client_request_token,
-            submission_fingerprint: fingerprint,
+            request_digest,
         };
         let job_status = job.job_status.clone();
         store.insert_analysis_job(FAMILY, job);

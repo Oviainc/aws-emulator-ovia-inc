@@ -28,12 +28,13 @@ use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID
 
 /// The lifecycle order a job's status may only move forward along.
 ///
-/// The terminal status of a started job is `FAILED`, not `COMPLETED`: running the
-/// job means reading the documents from the Amazon S3 location `InputDataConfig`
-/// names and writing analysed output back, and this emulator serves no object
-/// storage for batch jobs, so nothing reads the input and nothing writes the
-/// output. The suites below assert that modelled failure and the `Message` that
-/// names what is unsupported.
+/// The terminal status of a started sentiment-detection job is `FAILED`, not
+/// `COMPLETED`: running it means reading the documents from the Amazon S3 location
+/// `InputDataConfig` names, scoring each one's sentiment and writing the scored
+/// output back, and this emulator does not perform that batch run for the sentiment
+/// family (`StartDominantLanguageDetectionJob` is the family whose run it does
+/// perform — see `dominant_language_jobs`). The suites below assert that modelled
+/// failure and the `Message` that names what was not performed.
 const LIFECYCLE: &[&str] = &["SUBMITTED", "IN_PROGRESS", "FAILED"];
 
 /// The terminal status a started job reaches, as `JOB_STATUS_VALUES` spells it.
@@ -408,7 +409,7 @@ async fn a_job_status_only_moves_forward_and_ends_in_the_modelled_failure() {
             for expected in [
                 "s3://other-bucket/corpus/",
                 "s3://other-bucket/results/",
-                "no object storage",
+                "was not performed",
             ] {
                 assert!(
                     message.contains(expected),

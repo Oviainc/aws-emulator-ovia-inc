@@ -22,7 +22,7 @@ use crate::comprehend_client::{error_code, Comprehend};
 /// the issue cited only `fr` and `en`, so every other row is an entry it did not
 /// cite. `zh-TW` is absent on purpose: the identification engine does not tell the
 /// traditional-script variant of Chinese apart, so it is never reported.
-const DOCUMENTS: &[(&str, &str, &str)] = &[
+pub(crate) const DOCUMENTS: &[(&str, &str, &str)] = &[
     (
         "arabic",
         "ar",
