@@ -1,11 +1,462 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-mpa-awsfluffycoreservice service.
+//!
+//! The approval team is this service's primary resource, and this module is the one
+//! place it is stored: `CreateApprovalTeam` mints a record here, and
+//! `GetApprovalTeam` / `ListApprovalTeams` / `UpdateApprovalTeam` /
+//! `StartActiveApprovalTeamDeletion` all compute their answers from it.
+//!
+//! # The clock, and who materialises it
+//!
+//! Two changes are owed by the passage of time alone, so they are recorded as DUE
+//! INSTANTS on the stored record and materialised by [`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`],
+//! which every handler calls before it reads or writes. Nothing sleeps.
+//!
+//! * An invited approver's response ([`INVITATION_RESPONSE_DELAY`]). A team whose every
+//!   approver has accepted their invitation is `ACTIVE`; until then it is `PENDING`
+//!   with status code `PENDING_ACTIVATION`, which is what AWS reports for a team whose
+//!   approvers have not all answered.
+//! * The end of a pending deletion window ([`DEFAULT_PENDING_WINDOW_DAYS`]). Once it
+//!   elapses the team is gone, so `GetApprovalTeam` answers 404 and
+//!   `ListApprovalTeams` omits it.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+/// Region stamped into a minted ARN when the request carries no SigV4 credential
+/// scope to read one from.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// How long after an approver is invited the emulator reports their invitation
+/// response (and therefore how long a new team stays `PENDING`).
+///
+/// CHOSEN, not documented: a real approver answers an invitation whenever they
+/// answer it. It sits inside the 250–750 ms window this project fixes for a
+/// clock-owed transition, so a caller that reads the team back immediately still
+/// observes the transient `PENDING` state and the errors that go with it.
+pub const INVITATION_RESPONSE_DELAY: Duration = Duration::from_millis(500);
+
+/// Days between the delete request and the team's removal when
+/// `StartActiveApprovalTeamDeletion` omits `PendingWindowDays`.
+///
+/// `PendingWindowDays` is documented as "Number of days between when the team
+/// approves the delete request and when the team is deleted"; AWS applies a 7-day
+/// window when the request does not name one.
+pub const DEFAULT_PENDING_WINDOW_DAYS: i32 = 7;
+
+/// Seconds in one day, the unit `PendingWindowDays` counts in.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// Largest pending deletion window this emulator will record, in days (~100 years).
+///
+/// `PendingWindowDays` carries no modelled `range`, and AWS's own maximum is not in the
+/// model, so this is NOT a claim about what the real service accepts: it is the bound
+/// past which the window's end would stop being a timestamp this service can report, the
+/// response member being an `IsoTimestamp` (`@timestampFormat("date-time")`). A request
+/// past it is refused rather than answered with a completion instant that cannot be
+/// rendered.
+pub const MAX_PENDING_WINDOW_DAYS: i32 = 36_500;
+
+/// Largest number of approval teams the store will hold.
+///
+/// A ceiling, not a fidelity claim: nothing authenticates a caller of this emulator, so
+/// without one a client looping on `CreateApprovalTeam` grows this process's heap (and
+/// the per-request [`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] walk)
+/// without bound. `CreateApprovalTeam` reports it through the
+/// `ServiceQuotaExceededException` (402) the model already declares for it, and
+/// `name_index` / `idempotency_tokens` are bounded with it because
+/// [`ComAmazonawsMpaAwsfluffycoreserviceState::remove_team`] frees a team's entries in
+/// both when the team goes.
+pub const MAX_APPROVAL_TEAMS: usize = 1_000;
+
+/// Largest page `ListApprovalTeams` returns, from `MaxResults`' modelled
+/// `range(min: 1, max: 20)` / `default: 20`.
+pub const MAX_LIST_PAGE: i32 = 20;
+
+/// The pending deletion window `days` names, or `None` when `days` is not a day count
+/// this service can turn into a duration.
+#[must_use]
+pub fn pending_window(days: i32) -> Option<Duration> {
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(SECONDS_PER_DAY)
+        .map(Duration::from_secs)
+}
+
+/// The instant a pending deletion window of `days` started at `start` ends, or `None`
+/// when `days` names no instant this service can record and report.
+///
+/// Every step is checked, so no request can make this arithmetic panic the handler.
+#[must_use]
+pub fn deletion_completion(start: SystemTime, days: i32) -> Option<SystemTime> {
+    if !(1..=MAX_PENDING_WINDOW_DAYS).contains(&days) {
+        return None;
+    }
+    start.checked_add(pending_window(days)?)
+}
+
+/// Status of an approval team, in the tokens `ApprovalTeamStatus` declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamStatus {
+    Active,
+    Inactive,
+    Deleting,
+    Pending,
+}
+
+impl TeamStatus {
+    /// The wire token, as `ApprovalTeamStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Inactive => "INACTIVE",
+            Self::Deleting => "DELETING",
+            Self::Pending => "PENDING",
+        }
+    }
+}
+
+/// Status code of an approval team, in the tokens `ApprovalTeamStatusCode` declares.
+/// Only the codes this slice of the lifecycle can reach are modelled here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamStatusCode {
+    PendingActivation,
+    DeletePendingApproval,
+}
+
+impl TeamStatusCode {
+    /// The wire token, as `ApprovalTeamStatusCode` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::PendingActivation => "PENDING_ACTIVATION",
+            Self::DeletePendingApproval => "DELETE_PENDING_APPROVAL",
+        }
+    }
+}
+
+/// Status of an approver's identity, in the tokens `IdentityStatus` declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproverIdentityStatus {
+    Pending,
+    Accepted,
+    Rejected,
+    Invalid,
+}
+
+impl ApproverIdentityStatus {
+    /// The wire token, as `IdentityStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Accepted => "ACCEPTED",
+            Self::Rejected => "REJECTED",
+            Self::Invalid => "INVALID",
+        }
+    }
+}
+
+/// An approver's last activity, in the tokens `ApproverLastActivity` declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproverLastActivity {
+    Baselined,
+    RespondedToInvitation,
+    Voted,
+}
+
+impl ApproverLastActivity {
+    /// The wire token, as `ApproverLastActivity` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Baselined => "BASELINED",
+            Self::RespondedToInvitation => "RESPONDED_TO_INVITATION",
+            Self::Voted => "VOTED",
+        }
+    }
+}
+
+/// How a team grants approval. Mirrors the `ApprovalStrategy` union, which today
+/// declares the single `MofN` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredApprovalStrategy {
+    MofN { min_approvals_required: i32 },
+}
+
+impl StoredApprovalStrategy {
+    /// Minimum approvals (M) the strategy requires.
+    #[must_use]
+    pub fn min_approvals_required(self) -> i32 {
+        match self {
+            Self::MofN {
+                min_approvals_required,
+            } => min_approvals_required,
+        }
+    }
+}
+
+/// One approver on a team.
+#[derive(Debug, Clone)]
+pub struct Approver {
+    /// Service-minted id for this participant, stable for as long as the approver
+    /// stays on the team.
+    pub approver_id: String,
+    pub primary_identity_id: String,
+    pub primary_identity_source_arn: String,
+    pub primary_identity_status: ApproverIdentityStatus,
+    pub response_time: Option<SystemTime>,
+    pub last_activity: Option<ApproverLastActivity>,
+    pub last_activity_time: Option<SystemTime>,
+    /// Instant at which this approver's invitation response becomes due. `None`
+    /// once it has been materialised.
+    pub invitation_response_due: Option<SystemTime>,
+}
+
+impl Approver {
+    /// A freshly invited approver: `PENDING` until the clock owes its response.
+    #[must_use]
+    pub fn invited(
+        approver_id: String,
+        primary_identity_id: String,
+        primary_identity_source_arn: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            approver_id,
+            primary_identity_id,
+            primary_identity_source_arn,
+            primary_identity_status: ApproverIdentityStatus::Pending,
+            response_time: None,
+            last_activity: None,
+            last_activity_time: None,
+            invitation_response_due: Some(now + INVITATION_RESPONSE_DELAY),
+        }
+    }
+}
+
+/// A stored approval team: everything the lifecycle operations report.
+#[derive(Debug, Clone)]
+pub struct ApprovalTeam {
+    pub arn: String,
+    pub name: String,
+    pub description: String,
+    pub approval_strategy: StoredApprovalStrategy,
+    pub approvers: Vec<Approver>,
+    /// The `PolicyArn` of each attached policy, in the order the request listed them.
+    pub policies: Vec<String>,
+    /// Wire version id: the decimal rendering of [`ApprovalTeam::version`].
+    pub version_id: String,
+    /// Monotonic version counter, bumped by every applied update.
+    pub version: u64,
+    pub status: TeamStatus,
+    pub status_code: Option<TeamStatusCode>,
+    pub status_message: Option<String>,
+    pub creation_time: SystemTime,
+    pub last_update_time: Option<SystemTime>,
+    pub deletion_start_time: Option<SystemTime>,
+    /// Instant at which the pending deletion window ends and the team is removed.
+    pub deletion_completion_time: Option<SystemTime>,
+    pub tags: BTreeMap<String, String>,
+    /// Creation order, the stable ordering `ListApprovalTeams` pages over.
+    pub seq: u64,
+}
+
+impl ApprovalTeam {
+    /// Record a new version of the team: bump the version id and the update time.
+    pub fn bump_version(&mut self, now: SystemTime) {
+        self.version += 1;
+        self.version_id = self.version.to_string();
+        self.last_update_time = Some(now);
+    }
+
+    /// Total number of approvers (N), as `NumberOfApprovers` reports it.
+    #[must_use]
+    pub fn number_of_approvers(&self) -> i32 {
+        i32::try_from(self.approvers.len()).unwrap_or(i32::MAX)
+    }
+}
 
 /// Per-service state for com-amazonaws-mpa-awsfluffycoreservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
-    // TODO: add service-specific state fields
+    /// Every live team, keyed by its ARN.
+    pub approval_teams: BTreeMap<String, ApprovalTeam>,
+    /// Team name -> ARN. Backs the `ConflictException` a duplicate name earns.
+    pub name_index: BTreeMap<String, String>,
+    /// `ClientToken` -> ARN. Backs the idempotent replay of `CreateApprovalTeam`.
+    pub idempotency_tokens: BTreeMap<String, String>,
+    /// Source of [`ApprovalTeam::seq`].
+    next_team_seq: u64,
+    /// Source of [`Approver::approver_id`].
+    next_approver_seq: u64,
+}
+
+impl ComAmazonawsMpaAwsfluffycoreserviceState {
+    /// Apply every change the clock already owes at `now`, so each handler reads a
+    /// store that is current. Idempotent, and a no-op when nothing is due.
+    ///
+    /// Only clock-owed changes happen here: a deletion window that has run out, and
+    /// an invitation response that has come due. Nothing a caller has to ask for.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        // A team whose pending deletion window has elapsed is gone.
+        let elapsed: Vec<String> = self
+            .approval_teams
+            .values()
+            .filter(|team| {
+                team.deletion_completion_time
+                    .is_some_and(|due| due <= now)
+            })
+            .map(|team| team.arn.clone())
+            .collect();
+        for arn in elapsed {
+            self.remove_team(&arn);
+        }
+
+        for team in self.approval_teams.values_mut() {
+            for approver in &mut team.approvers {
+                if approver.primary_identity_status != ApproverIdentityStatus::Pending {
+                    continue;
+                }
+                let Some(due) = approver.invitation_response_due else {
+                    continue;
+                };
+                if due > now {
+                    continue;
+                }
+                // The response is stamped with the instant it was DUE, not with
+                // `now`, so a materialised value does not move between reads.
+                approver.primary_identity_status = ApproverIdentityStatus::Accepted;
+                approver.response_time = Some(due);
+                approver.last_activity = Some(ApproverLastActivity::RespondedToInvitation);
+                approver.last_activity_time = Some(due);
+                approver.invitation_response_due = None;
+            }
+
+            // A team is active once every approver has accepted their invitation. A team
+            // with NO approvers never activates: `Approvers` is `length(1..20)`, so such
+            // a team cannot be created, and a vacuous `all()` must not promote one.
+            if team.status == TeamStatus::Pending
+                && !team.approvers.is_empty()
+                && team
+                    .approvers
+                    .iter()
+                    .all(|a| a.primary_identity_status == ApproverIdentityStatus::Accepted)
+            {
+                team.status = TeamStatus::Active;
+                team.status_code = None;
+            }
+        }
+    }
+
+    /// Drop a team and everything that indexes it.
+    pub fn remove_team(&mut self, arn: &str) {
+        if let Some(team) = self.approval_teams.remove(arn) {
+            if self.name_index.get(&team.name).is_some_and(|a| a == arn) {
+                self.name_index.remove(&team.name);
+            }
+        }
+        self.idempotency_tokens.retain(|_, stored| stored != arn);
+    }
+
+    /// The stored team with this ARN.
+    #[must_use]
+    pub fn team(&self, arn: &str) -> Option<&ApprovalTeam> {
+        self.approval_teams.get(arn)
+    }
+
+    /// The stored team with this ARN, for update.
+    pub fn team_mut(&mut self, arn: &str) -> Option<&mut ApprovalTeam> {
+        self.approval_teams.get_mut(arn)
+    }
+
+    /// Every stored team in creation order — the stable ordering
+    /// `ListApprovalTeams` pages over.
+    #[must_use]
+    pub fn teams_in_creation_order(&self) -> Vec<&ApprovalTeam> {
+        let mut teams: Vec<&ApprovalTeam> = self.approval_teams.values().collect();
+        teams.sort_by_key(|team| team.seq);
+        teams
+    }
+
+    /// Store a team and index it by name.
+    ///
+    /// Replacing a team already stored under this ARN drops the name entry the previous
+    /// record held, so the index can never point at a name no stored team carries.
+    pub fn insert_team(&mut self, team: ApprovalTeam) {
+        if let Some(previous) = self.approval_teams.get(&team.arn) {
+            if previous.name != team.name
+                && self
+                    .name_index
+                    .get(&previous.name)
+                    .is_some_and(|arn| arn == &team.arn)
+            {
+                self.name_index.remove(&previous.name);
+            }
+        }
+        self.name_index.insert(team.name.clone(), team.arn.clone());
+        self.approval_teams.insert(team.arn.clone(), team);
+    }
+
+    /// The next creation-order sequence number.
+    pub fn next_team_seq(&mut self) -> u64 {
+        self.next_team_seq += 1;
+        self.next_team_seq
+    }
+
+    /// A fresh, never-reused approver id.
+    pub fn mint_approver_id(&mut self) -> String {
+        self.next_approver_seq += 1;
+        format!("approver-{}", self.next_approver_seq)
+    }
+}
+
+/// The `(PrimaryIdentityId, PrimaryIdentitySourceArn)` pair that `approvers` names more
+/// than once, rendered for a refusal message, or `None` when every pair is distinct.
+///
+/// One identity cannot hold two seats on a team: a repeat would inflate the approver
+/// count (N) that `MofN` is measured against without adding anyone who can approve.
+#[must_use]
+pub fn repeated_identity<'a, I>(approvers: I) -> Option<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut seen = ::std::collections::BTreeSet::new();
+    for (identity_id, source_arn) in approvers {
+        if !seen.insert((identity_id, source_arn)) {
+            return Some(format!("{identity_id} from {source_arn}"));
+        }
+    }
+    None
+}
+
+/// ARN of an approval team, in the form `ApprovalTeamArn`'s pattern fixes:
+/// `arn:aws:mpa:<region>:<account>:approval-team/<name>`.
+#[must_use]
+pub fn team_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("mpa", region, &format!("approval-team/{name}"))
+}
+
+/// The region to stamp into a minted ARN: the one this request's SigV4 credential
+/// scope names, or [`DEFAULT_REGION`] when it names none the ARN grammar accepts.
+#[must_use]
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| is_arn_region(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` fits the `[a-z0-9-]{1,20}` region segment every `mpa` ARN
+/// pattern declares.
+fn is_arn_region(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= 20
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
