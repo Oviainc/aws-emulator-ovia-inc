@@ -24,7 +24,7 @@
 //! 6. A repeated `clientToken` answers with the grant the first request created instead
 //!    of adding a second one.
 
-use crate::domain_project_lifecycle::{Emulator, SETTLED};
+use crate::harness::{Emulator, SETTLED};
 use serde_json::{json, Value};
 
 /// `GrantIdentifier`'s modelled pattern, `^[A-Za-z0-9+/]{10}$`

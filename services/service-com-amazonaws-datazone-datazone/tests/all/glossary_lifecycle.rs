@@ -4,7 +4,7 @@
 //!
 //! Every case drives the service the way a client does — a real `restJson1` request
 //! through the router, with only the response body as evidence — and reuses the
-//! `Emulator` harness from [`crate::domain_project_lifecycle`], so nothing here reaches
+//! `Emulator` harness from [`crate::harness`], so nothing here reaches
 //! into `crate::state` and a handler answering from a hardcoded value would fail.
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one request:
@@ -18,7 +18,7 @@
 //! 4. A glossary is scoped to its domain and disappears with it.
 //! 5. A repeated `clientToken` returns the first glossary instead of a second one.
 
-use crate::domain_project_lifecycle::{Emulator, SETTLED};
+use crate::harness::{Emulator, SETTLED};
 use serde_json::{json, Value};
 // The `GlossaryStatus` members as the service stores them, so a drift between the
 // constant and the value on the wire fails here.

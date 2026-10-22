@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a catalog asset under a PERSISTED, available domain and an existing project in
+//! that domain, and stores it there, so `GetAsset` answers from the stored record and
+//! the asset disappears with its domain.
+//!
+//! `createdBy`/`firstRevisionCreatedBy` are the CALLER's principal (derived from the
+//! request's SigV4 scope), not anything the request body carries. A created asset is at
+//! revision one and owes the clock no transition: `CreateAssetOutput` has no status
+//! member, and `listing` stays absent until the asset is published with
+//! `CreateListingChangeSet`.
+//!
+//! An asset names its asset type, and each of its forms a form type, by identifier.
+//! An identifier may name a type stored in the domain (`CreateAssetType`) or one the
+//! SERVICE defines, which no store holds — so an identifier that is not in the store is
+//! not thereby absent, and this handler records and reports the identifiers the request
+//! names rather than refusing them. A `typeRevision` is resolved against the STORED
+//! asset type: a request that pins none takes the revision that type is at, one that
+//! pins another revision of it is refused, and a type no store holds carries no
+//! revision to check against, so there the request's own value (or the first revision)
+//! stands. The asset itself is real state.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +222,286 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAsset"))
+        use crate::state::{
+            caller_principal, now_ms, Asset, IdempotencyKey, StoredBusinessNameGeneration,
+            StoredForm, StoredPredictionConfiguration, DOMAIN_STATUS_AVAILABLE, FIRST_REVISION,
+        };
+
+        // A form is identified on the asset by its `formName` — that is the only way
+        // `formsOutput` names one — so two forms in one request cannot share a name.
+        // A rule about the request's own shape, so it is answered before anything is
+        // looked up in the store.
+        let forms_input = input.forms_input.unwrap_or_default();
+        let mut seen_form_names = std::collections::BTreeSet::new();
+        for form in &forms_input {
+            if !seen_form_names.insert(form.form_name.as_str()) {
+                return Err(CreateAssetErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "formsInput names the form {} more than once; a form name is unique within an asset",
+                        form.form_name
+                    ),
+                })
+                .into());
+            }
+        }
+        let forms: Vec<StoredForm> = forms_input
+            .into_iter()
+            .map(|form| StoredForm {
+                type_name: form.type_identifier.clone(),
+                // A form bound to a type whose revision the request did not name is
+                // bound to that type's first revision. A form that names no type has
+                // no type revision either.
+                type_revision: form.type_revision.or_else(|| {
+                    form.type_identifier
+                        .as_ref()
+                        .map(|_| FIRST_REVISION.to_string())
+                }),
+                form_name: form.form_name,
+                content: form.content,
+            })
+            .collect();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // The `@idempotencyToken`: a repeat of the SAME request returns the asset the
+        // first one created, so a retry never leaves two assets behind.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotent_asset(&input.domain_identifier, token))
+        {
+            return Ok(asset_output(existing));
+        }
+
+        let domain = store
+            .domains
+            .get(&input.domain_identifier)
+            .ok_or_else(|| {
+                CreateAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Domain {} was not found", input.domain_identifier),
+                })
+            })?;
+        // A domain still being created, or already being deleted, cannot take an asset:
+        // the request conflicts with the domain's current state.
+        if domain.status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateAssetErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {}, so it cannot accept an asset",
+                    input.domain_identifier, domain.status
+                ),
+            })
+            .into());
+        }
+        // The asset is owned by a project IN that domain; a project that is not there
+        // cannot own anything.
+        if !domain.projects.contains_key(&input.owning_project_identifier) {
+            return Err(CreateAssetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Project {} was not found in domain {}",
+                        input.owning_project_identifier, input.domain_identifier
+                    ),
+                },
+            )
+            .into());
+        }
+        // `externalIdentifier` "must be a unique value" (smithy_query doc
+        // shape="CreateAssetInput" member="externalIdentifier"): the identifier of the
+        // asset in the system it was imported from identifies at most one asset here.
+        if let Some(external) = input.external_identifier.as_deref() {
+            if let Some(clash) = domain
+                .assets
+                .values()
+                .find(|asset| asset.external_identifier.as_deref() == Some(external))
+            {
+                return Err(CreateAssetErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "externalIdentifier {external} is already used by asset {}",
+                        clash.id
+                    ),
+                })
+                .into());
+            }
+        }
+        // A `typeIdentifier` this domain STORES resolves to that asset type's own
+        // revision; one it does not store names a type the SERVICE defines, which no
+        // store holds, so that resolves to the first revision below.
+        let stored_type_revision = domain
+            .asset_types
+            .get(&input.type_identifier)
+            .map(|asset_type| asset_type.revision.clone());
+        // "--type-revision (if used) must match a valid revision of the asset type"
+        // (smithy_query doc shape="CreateAsset"): a pinned revision is checked against
+        // the revision the STORED type is at. A type no store holds carries no revision
+        // to check against, so a pinned one is taken as given there.
+        if let (Some(pinned), Some(stored)) = (
+            input.type_revision.as_deref(),
+            stored_type_revision.as_deref(),
+        ) {
+            if pinned != stored {
+                return Err(CreateAssetErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "typeRevision {pinned} is not a revision of asset type {}, which is at revision {stored}",
+                        input.type_identifier
+                    ),
+                })
+                .into());
+            }
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is the error the operation already models.
+        if domain.assets.len() >= crate::state::MAX_ASSETS_PER_DOMAIN {
+            return Err(CreateAssetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {} assets in one domain",
+                        crate::state::MAX_ASSETS_PER_DOMAIN
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let created_by = caller_principal(ctx);
+        let id = store.mint_id(now);
+        let asset = Asset {
+            id: id.clone(),
+            domain_id: input.domain_identifier.clone(),
+            owning_project_id: input.owning_project_identifier,
+            name: input.name,
+            description: input.description,
+            external_identifier: input.external_identifier,
+            type_identifier: input.type_identifier,
+            // `typeRevision` is optional on input but REQUIRED on output: a request
+            // that names none takes the revision the named asset type is at, or the
+            // first revision when the type is one no store holds.
+            type_revision: input
+                .type_revision
+                .or(stored_type_revision)
+                .unwrap_or_else(|| FIRST_REVISION.to_string()),
+            // A created asset IS its own first revision.
+            revision: FIRST_REVISION.to_string(),
+            first_revision_created_by: created_by.clone(),
+            first_revision_created_at_ms: now,
+            created_by,
+            created_at_ms: now,
+            glossary_terms: input.glossary_terms.unwrap_or_default(),
+            forms,
+            // Mirrored member for member, so a read reports exactly what the request
+            // set — including a `businessNameGeneration` that named no `enabled`.
+            prediction_configuration: input.prediction_configuration.map(|config| {
+                StoredPredictionConfiguration {
+                    business_name_generation: config.business_name_generation.map(|generation| {
+                        StoredBusinessNameGeneration {
+                            enabled: generation.enabled,
+                        }
+                    }),
+                }
+            }),
+        };
+
+        // The domain was proved present above, but the lookup is answered rather than
+        // assumed: the response is built from the record that was actually inserted, so
+        // a 201 can never report an asset this call did not persist.
+        let Some(domain) = store.domains.get_mut(&input.domain_identifier) else {
+            return Err(CreateAssetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "Domain {} is no longer in the DataZone store",
+                        input.domain_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+        // `mint_id` never repeats within one process, so this slot is vacant; were it
+        // ever not, inserting would silently replace a stored asset, so that is
+        // refused loudly instead.
+        if domain.assets.contains_key(&id) {
+            return Err(CreateAssetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("the minted asset id {id} is already in use"),
+                },
+            )
+            .into());
+        }
+        // Built from the record that was actually stored, so a 201 can never report an
+        // asset this call did not persist.
+        domain.assets.insert(id.clone(), asset);
+        let output = asset_output(&domain.assets[&id]);
+        // Recorded AFTER the asset is stored: the bound this applies releases a token
+        // whose asset is not in the store.
+        if let Some(token) = input.client_token {
+            store.record_idempotency(
+                IdempotencyKey::asset(&input.domain_identifier, &token),
+                id,
+                now,
+            );
+        }
+        Ok(output)
+    }
+}
+
+/// The stored asset, as this operation reports it.
+///
+/// Every member is read off the stored record, so the response a retry gets (through
+/// the idempotency token) is the response the first call got.
+fn asset_output(asset: &crate::state::Asset) -> CreateAssetOutput {
+    use crate::state::date_time;
+
+    CreateAssetOutput {
+        id: asset.id.clone(),
+        name: asset.name.clone(),
+        type_identifier: asset.type_identifier.clone(),
+        type_revision: asset.type_revision.clone(),
+        external_identifier: asset.external_identifier.clone(),
+        revision: asset.revision.clone(),
+        description: asset.description.clone(),
+        created_at: Some(date_time(asset.created_at_ms)),
+        created_by: Some(asset.created_by.clone()),
+        first_revision_created_at: Some(date_time(asset.first_revision_created_at_ms)),
+        first_revision_created_by: Some(asset.first_revision_created_by.clone()),
+        glossary_terms: (!asset.glossary_terms.is_empty()).then(|| asset.glossary_terms.clone()),
+        // Governed glossary terms are attached by `AssociateGovernedTerms`, never by
+        // the create call.
+        governed_glossary_terms: None,
+        owning_project_id: asset.owning_project_id.clone(),
+        domain_id: asset.domain_id.clone(),
+        // An asset is published into the catalog by `CreateListingChangeSet`, so a
+        // freshly created one has no listing.
+        listing: None,
+        forms_output: asset
+            .forms
+            .iter()
+            .map(|form| FormOutput {
+                form_name: form.form_name.clone(),
+                type_name: form.type_name.clone(),
+                type_revision: form.type_revision.clone(),
+                content: form.content.clone(),
+            })
+            .collect(),
+        // Read-only forms come from the asset type's own definition, and an asset
+        // type's form entry carries no read-only flag (`FormEntryOutput` is
+        // `typeName`/`typeRevision`/`required`), so no stored type marks one.
+        read_only_forms_output: None,
+        // Time series data points are imported by `PostTimeSeriesDataPoints`, so a
+        // freshly created asset has none.
+        latest_time_series_data_point_forms_output: None,
+        prediction_configuration: asset.prediction_configuration.as_ref().map(|config| {
+            PredictionConfiguration {
+                business_name_generation: config.business_name_generation.as_ref().map(
+                    |generation| BusinessNameGenerationConfiguration {
+                        enabled: generation.enabled,
+                    },
+                ),
+            }
+        }),
     }
 }

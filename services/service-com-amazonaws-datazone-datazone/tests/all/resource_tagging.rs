@@ -24,7 +24,8 @@
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-use crate::domain_project_lifecycle::{urlencode, Answer, Emulator};
+use crate::domain_project_lifecycle::urlencode;
+use crate::harness::{Answer, Emulator};
 
 /// The `/tags/{resourceArn}` URI for `arn` (smithy_query operation="TagResource":
 /// `resourceArn` is an `@httpLabel`, so it occupies exactly one path segment).

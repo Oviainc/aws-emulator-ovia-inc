@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the asset `CreateAsset` stored, from the store and nothing else. A
+//! reporting operation: it writes only the domain lifecycle steps the clock already
+//! owes (`crate::state::settle_clock`).
+//!
+//! `revision` selects a revision of the asset. This slice stores the latest revision
+//! only — `CreateAssetRevision` is still a scaffold, with its own issue — so a request
+//! naming a revision the asset does not have is answered the way a missing resource is.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +187,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAsset"))
+        use crate::state::{date_time, now_ms};
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        let asset = store
+            .live_domain(&input.domain_identifier)
+            .ok_or_else(|| {
+                GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Domain {} was not found", input.domain_identifier),
+                })
+            })?
+            .assets
+            .get(&input.identifier)
+            .ok_or_else(|| {
+                GetAssetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Asset {} was not found", input.identifier),
+                })
+            })?;
+        // A revision the asset does not have names no stored resource.
+        if let Some(wanted) = input.revision.as_deref() {
+            if wanted != asset.revision {
+                return Err(GetAssetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Asset {} has no revision {wanted}",
+                            input.identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(GetAssetOutput {
+            id: asset.id.clone(),
+            name: asset.name.clone(),
+            type_identifier: asset.type_identifier.clone(),
+            type_revision: asset.type_revision.clone(),
+            external_identifier: asset.external_identifier.clone(),
+            revision: asset.revision.clone(),
+            description: asset.description.clone(),
+            created_at: Some(date_time(asset.created_at_ms)),
+            created_by: Some(asset.created_by.clone()),
+            first_revision_created_at: Some(date_time(asset.first_revision_created_at_ms)),
+            first_revision_created_by: Some(asset.first_revision_created_by.clone()),
+            glossary_terms: (!asset.glossary_terms.is_empty())
+                .then(|| asset.glossary_terms.clone()),
+            // Governed glossary terms are attached by `AssociateGovernedTerms`, which
+            // this emulator does not serve yet, so no asset carries any.
+            governed_glossary_terms: None,
+            owning_project_id: asset.owning_project_id.clone(),
+            domain_id: asset.domain_id.clone(),
+            // An asset is published into the catalog by `CreateListingChangeSet`, so no
+            // stored asset has a listing yet.
+            listing: None,
+            forms_output: asset
+                .forms
+                .iter()
+                .map(|form| FormOutput {
+                    form_name: form.form_name.clone(),
+                    type_name: form.type_name.clone(),
+                    type_revision: form.type_revision.clone(),
+                    content: form.content.clone(),
+                })
+                .collect(),
+            // Read-only forms come from the asset type's own definition, and an asset
+            // type's form entry carries no read-only flag (`FormEntryOutput` is
+            // `typeName`/`typeRevision`/`required`), so no stored type marks one.
+            read_only_forms_output: None,
+            // Time series data points are imported by `PostTimeSeriesDataPoints`, which
+            // is still a scaffold, so no stored asset has any.
+            latest_time_series_data_point_forms_output: None,
+        })
     }
 }

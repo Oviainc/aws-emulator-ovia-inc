@@ -27,7 +27,7 @@
 //! 7. The memberships are the ones `ListProjects`'s principal filters select on, and
 //!    the ones `CreateProject`'s `membershipAssignments` store.
 
-use crate::domain_project_lifecycle::{Answer, Emulator};
+use crate::harness::{Answer, Emulator};
 use serde_json::{json, Value};
 
 /// Every `UserDesignation` the model declares (smithy_query shape="UserDesignation":

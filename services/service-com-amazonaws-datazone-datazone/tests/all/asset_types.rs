@@ -20,143 +20,15 @@
 //!    refused, and a domain that has not finished creating cannot take an asset type.
 //! 4. An asset type is stored under its domain, so it disappears when the domain does.
 
+use crate::harness::{Answer, Emulator, SETTLED};
 use serde_json::{json, Map, Value};
-use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
-
-/// The span `crate::state::LIFECYCLE_SETTLE_MS` gives a domain lifecycle step, plus
-/// slack, so a test that waits for a settled domain is not racing the clock.
-const SETTLED: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// The principal every request here signs as: `crate::state::caller_principal` derives
 /// it from the SigV4 credential scope's access key id.
 const CALLER: &str = "arn:aws:iam::000000000000:user/AKIAEXAMPLETESTKEY";
 
-/// One emulator: a single shared engine behind the DataZone service, driven over HTTP.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
-/// What a call answered: the HTTP status, the parsed body (`Value::Null` for an empty
-/// one) and the wire error code when the answer was a failure.
-struct Answer {
-    status: u16,
-    body: Value,
-    error_code: String,
-}
-
-impl Answer {
-    /// A member of the response body as a string, or `"<absent>"` so an assertion
-    /// message says which member was missing.
-    fn s(&self, member: &str) -> String {
-        self.body
-            .get(member)
-            .and_then(Value::as_str)
-            .unwrap_or("<absent>")
-            .to_string()
-    }
-}
-
+/// The two asset-type calls this suite drives, on the shared [`Emulator`] harness.
 impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.register_service(
-            service_com_amazonaws_datazone_datazone::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// Send one request. The `Authorization` header carries a SigV4 credential scope,
-    /// which is both how the router picks this service and where the handlers read the
-    /// caller's region and principal from.
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
-        let payload = body.map(|b| serde_json::to_vec(&b).expect("a JSON body serializes"));
-        let mut request = http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", "datazone.us-west-2.amazonaws.com")
-            .header(
-                "authorization",
-                "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLETESTKEY/20261021/us-west-2/datazone/aws4_request, SignedHeaders=host, Signature=0",
-            );
-        if payload.is_some() {
-            request = request.header("content-type", "application/json");
-        }
-        let request = request
-            .body(bytes::Bytes::from(payload.unwrap_or_default()))
-            .expect("a valid request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_code = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .rsplit('#')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        let bytes = response.into_body();
-        let body: Value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        let error_code = if error_code.is_empty() {
-            body.get("__type")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .rsplit('#')
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        } else {
-            error_code
-        };
-        Answer {
-            status,
-            body,
-            error_code,
-        }
-    }
-
-    /// Create a domain and wait until it has settled to `AVAILABLE`, which every asset
-    /// type case needs.
-    async fn available_domain(&self, name: &str) -> String {
-        let created = self
-            .call("POST", "/v2/domains", Some(json!({ "name": name })))
-            .await;
-        assert_eq!(
-            created.status, 201,
-            "creating domain {name:?}: expected 201, got {} {:?}",
-            created.status, created.body
-        );
-        tokio::time::sleep(SETTLED).await;
-        created.s("id")
-    }
-
-    /// Create a project in `domain` and answer its id.
-    async fn project(&self, domain: &str, name: &str) -> String {
-        let created = self
-            .call(
-                "POST",
-                &format!("/v2/domains/{domain}/projects"),
-                Some(json!({ "name": name })),
-            )
-            .await;
-        assert_eq!(
-            created.status, 201,
-            "creating project {name:?}: expected 201, got {} {:?}",
-            created.status, created.body
-        );
-        created.s("id")
-    }
-
     async fn create_asset_type(&self, domain: &str, body: Value) -> Answer {
         self.call(
             "POST",

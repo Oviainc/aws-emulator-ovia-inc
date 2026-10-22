@@ -96,6 +96,9 @@ pub struct Domain {
     /// The projects stored in this domain, so they go with it when it is deleted.
     /// Bounded by [`MAX_PROJECTS_PER_DOMAIN`].
     pub projects: BTreeMap<String, Project>,
+    /// The catalog assets stored in this domain, keyed by their `AssetId`, so they go
+    /// with the domain when it is deleted. Bounded by [`MAX_ASSETS_PER_DOMAIN`].
+    pub assets: BTreeMap<String, Asset>,
     /// The policy grants stored in this domain, keyed by `grantId`, so they go with it
     /// when it is deleted. A `BTreeMap` so every `ListPolicyGrants` iterates in one
     /// stable order and a pagination token can resume from a key. Bounded by
@@ -333,6 +336,59 @@ pub fn membership_from_request(
     ))
 }
 
+/// One stored DataZone catalog asset.
+///
+/// An asset is versioned: `revision` is the newest revision's number and the
+/// `first_revision_*` fields remember who made revision one. This slice stores the
+/// latest revision only — `CreateAssetRevision` and `ListAssetRevisions` are still
+/// scaffolds — so the two agree until a revision is added.
+#[derive(Debug, Clone)]
+pub struct Asset {
+    pub id: String,
+    pub domain_id: String,
+    pub owning_project_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub external_identifier: Option<String>,
+    pub type_identifier: String,
+    pub type_revision: String,
+    pub revision: String,
+    pub created_by: String,
+    pub created_at_ms: i64,
+    pub first_revision_created_by: String,
+    pub first_revision_created_at_ms: i64,
+    pub glossary_terms: Vec<String>,
+    /// The metadata forms attached to the asset, in the order the request listed them
+    /// and keyed by form name (a name appears at most once).
+    pub forms: Vec<StoredForm>,
+    /// The `predictionConfiguration` the request set, mirrored member for member so a
+    /// read reports exactly what was written.
+    pub prediction_configuration: Option<StoredPredictionConfiguration>,
+}
+
+/// One metadata form attached to an asset: the stored form of the modelled
+/// `FormInput`/`FormOutput` pair.
+#[derive(Debug, Clone, Default)]
+pub struct StoredForm {
+    pub form_name: String,
+    pub type_name: Option<String>,
+    pub type_revision: Option<String>,
+    pub content: Option<String>,
+}
+
+/// The stored form of the modelled `PredictionConfiguration`: present-or-absent is
+/// meaningful at every level, so the structure is kept rather than flattened.
+#[derive(Debug, Clone, Default)]
+pub struct StoredPredictionConfiguration {
+    pub business_name_generation: Option<StoredBusinessNameGeneration>,
+}
+
+/// The stored form of the modelled `BusinessNameGenerationConfiguration`.
+#[derive(Debug, Clone, Default)]
+pub struct StoredBusinessNameGeneration {
+    pub enabled: Option<bool>,
+}
+
 /// One stored policy grant: an authorization policy of one `policyType`, held by one
 /// principal, on one entity (`entityType` + `entityIdentifier`) inside a domain.
 ///
@@ -487,6 +543,10 @@ pub const MAX_DOMAINS: usize = 100;
 /// the same refusal (`CreateProject` models `ServiceQuotaExceededException` too).
 pub const MAX_PROJECTS_PER_DOMAIN: usize = 500;
 
+/// The most assets this emulator stores in one domain, for the same reason and with the
+/// same refusal (`CreateAsset` models `ServiceQuotaExceededException` too).
+pub const MAX_ASSETS_PER_DOMAIN: usize = 500;
+
 /// The most policy grants this emulator stores in one domain, for the same reason and
 /// with the same refusal (`AddPolicyGrant` models `ServiceQuotaExceededException` too).
 pub const MAX_POLICY_GRANTS_PER_DOMAIN: usize = 500;
@@ -555,6 +615,7 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_DOMAINS * 16;
 pub enum IdempotentResource {
     Domain,
     Glossary,
+    Asset,
 }
 
 /// The key one remembered `@idempotencyToken` is filed under.
@@ -586,6 +647,16 @@ impl IdempotencyKey {
     pub fn glossary(domain_id: &str, token: &str) -> Self {
         Self {
             kind: IdempotentResource::Glossary,
+            domain_id: domain_id.to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    /// The key a `CreateAsset` token is filed under, scoped the same way: an asset is
+    /// created IN a domain, so the same token in another domain is a different key.
+    pub fn asset(domain_id: &str, token: &str) -> Self {
+        Self {
+            kind: IdempotentResource::Asset,
             domain_id: domain_id.to_string(),
             token: token.to_string(),
         }
@@ -640,6 +711,15 @@ impl ComAmazonawsDatazoneDatazoneState {
             .get(&record.resource_id)
     }
 
+    /// The asset a `clientToken` already created in `domain_id`, if it is still stored.
+    /// Scoped to the domain the same way a glossary token is.
+    pub fn idempotent_asset(&self, domain_id: &str, token: &str) -> Option<&Asset> {
+        let record = self
+            .idempotency
+            .get(&IdempotencyKey::asset(domain_id, token))?;
+        self.domains.get(domain_id)?.assets.get(&record.resource_id)
+    }
+
     /// Whether a remembered token still resolves to something this store holds. One
     /// lookup per level, because the key carries the owning domain.
     fn record_resolves(&self, key: &IdempotencyKey, record: &IdempotencyRecord) -> bool {
@@ -649,6 +729,10 @@ impl ComAmazonawsDatazoneDatazoneState {
                 .domains
                 .get(&key.domain_id)
                 .is_some_and(|domain| domain.glossaries.contains_key(&record.resource_id)),
+            IdempotentResource::Asset => self
+                .domains
+                .get(&key.domain_id)
+                .is_some_and(|domain| domain.assets.contains_key(&record.resource_id)),
         }
     }
 

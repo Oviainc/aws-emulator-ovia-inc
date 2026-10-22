@@ -19,7 +19,7 @@
 //! The harness (`Emulator`, `Answer`) is the one the sibling lifecycle suite already
 //! drives this service with.
 
-use crate::domain_project_lifecycle::{Emulator, SETTLED};
+use crate::harness::{Emulator, SETTLED};
 use serde_json::{json, Value};
 
 /// A `DomainId` that no domain in the store has, satisfying the modelled pattern

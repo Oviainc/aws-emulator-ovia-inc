@@ -13,7 +13,7 @@
 //! `crate::state`: every assertion is made on a response body, so a handler answering
 //! from anything but the store would fail here.
 
-use crate::domain_project_lifecycle::{Answer, Emulator};
+use crate::harness::{Answer, Emulator};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
