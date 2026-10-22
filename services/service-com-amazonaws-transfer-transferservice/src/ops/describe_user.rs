@@ -161,26 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
 
         if !guard.servers.contains_key(&input.server_id) {
-            return Err(DescribeUserErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Unknown server {}", input.server_id),
-                    resource: input.server_id.clone(),
-                    resource_type: "server".to_string(),
-                },
-            )
-            .into());
+            return Err(st::not_found(
+                DescribeUserErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
         }
 
         let key = (input.server_id.clone(), input.user_name.clone());
         let stored = guard.users.get(&key).ok_or_else(|| {
-            DescribeUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Unknown user {} on server {}",
-                    input.user_name, input.server_id
-                ),
-                resource: input.user_name.clone(),
-                resource_type: "user".to_string(),
-            })
+            st::not_found(DescribeUserErrorModeled::ResourceNotFoundException(
+                st::unknown_user(&input.user_name),
+            ))
         })?;
 
         let user = DescribedUser {

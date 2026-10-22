@@ -175,29 +175,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
 
         if !guard.servers.contains_key(&input.server_id) {
-            return Err(DeleteUserErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Unknown server {}", input.server_id),
-                    resource: input.server_id.clone(),
-                    resource_type: "server".to_string(),
-                },
-            )
-            .into());
+            return Err(st::not_found(
+                DeleteUserErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
         }
 
         let key = (input.server_id.clone(), input.user_name.clone());
         if guard.users.remove(&key).is_none() {
-            return Err(DeleteUserErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "Unknown user {} on server {}",
-                        input.user_name, input.server_id
-                    ),
-                    resource: input.user_name.clone(),
-                    resource_type: "user".to_string(),
-                },
-            )
-            .into());
+            return Err(st::not_found(
+                DeleteUserErrorModeled::ResourceNotFoundException(st::unknown_user(
+                    &input.user_name,
+                )),
+            ));
         }
 
         Ok(DeleteUserOutput)
