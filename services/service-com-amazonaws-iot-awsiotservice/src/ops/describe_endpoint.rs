@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the account's IoT endpoint identifier for the region the
+//! request was signed for — creating and persisting it on the first call, reading the
+//! persisted one on every later call — and renders the address of the requested
+//! endpoint type from it.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +110,156 @@ impl From<DescribeEndpointErrorModeled> for DescribeEndpointError {
     }
 }
 
+/// Longest region token this operation will put in an endpoint address.
+///
+/// The region comes from the caller's credential scope, and the address is a
+/// hostname, so the token is bounded like the DNS label it becomes (RFC 1035 §2.3.4:
+/// 63 octets).
+const MAX_REGION_LENGTH: usize = 63;
+
+/// The endpoint types `DescribeEndpoint` serves.
+///
+/// The catalog is the `endpointType` member's own documentation — "Valid endpoint
+/// types include: `iot:Data` ... `iot:Data-ATS` ... `iot:CredentialProvider` ...
+/// `iot:Jobs`" — read with:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeEndpointRequest",member="endpointType",model_path="services/service-com-amazonaws-iot-awsiotservice/smithy-model/com-amazonaws-iot-awsiotservice.json")
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointType {
+    /// `iot:Data` — the VeriSign signed data endpoint, and the type a request that
+    /// names none asks for.
+    Data,
+    /// `iot:Data-ATS` — the ATS signed data endpoint.
+    DataAts,
+    /// `iot:CredentialProvider` — the IoT credentials provider API endpoint.
+    CredentialProvider,
+    /// `iot:Jobs` — the IoT device management Jobs API endpoint.
+    Jobs,
+}
+
+impl EndpointType {
+    /// Every endpoint type, in the order the model documents them.
+    pub const ALL: &'static [Self] = &[
+        Self::Data,
+        Self::DataAts,
+        Self::CredentialProvider,
+        Self::Jobs,
+    ];
+
+    /// The endpoint type a request asking for no particular one gets: the data
+    /// endpoint. The member's documentation recommends asking for `iot:Data-ATS`
+    /// *instead of* the default, which is what makes the default the plain
+    /// `iot:Data` type.
+    pub const DEFAULT: Self = Self::Data;
+
+    /// The wire token for this endpoint type.
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Data => "iot:Data",
+            Self::DataAts => "iot:Data-ATS",
+            Self::CredentialProvider => "iot:CredentialProvider",
+            Self::Jobs => "iot:Jobs",
+        }
+    }
+
+    /// The endpoint type `requested` names, or `None` when it names none.
+    pub fn parse(requested: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.token() == requested)
+    }
+
+    /// The hostname of this endpoint type for `identifier` in `region`.
+    ///
+    /// The forms are the ones the AWS IoT Developer Guide publishes for an account's
+    /// endpoints ("AWS IoT device data and service endpoints"): the data endpoint is
+    /// the `<identifier>.iot.<region>.amazonaws.com` the `endpointAddress` member
+    /// documents, its ATS variant suffixes the identifier with `-ats`, and the
+    /// credential-provider and Jobs endpoints insert their own `credentials` /
+    /// `jobs` label. Every one of them is built from the same account identifier.
+    pub fn address(self, identifier: &str, region: &str) -> String {
+        match self {
+            Self::Data => format!("{identifier}.iot.{region}.amazonaws.com"),
+            Self::DataAts => format!("{identifier}-ats.iot.{region}.amazonaws.com"),
+            Self::CredentialProvider => {
+                format!("{identifier}.credentials.iot.{region}.amazonaws.com")
+            }
+            Self::Jobs => format!("{identifier}.jobs.iot.{region}.amazonaws.com"),
+        }
+    }
+}
+
+/// The region this request's endpoint address names: the region of its SigV4
+/// credential scope ([`crate::state::request_region`], the same region this service
+/// scopes a minted ARN to), lowercased because a hostname label is.
+///
+/// A region that is not a hostname label (an endpoint address is a hostname) falls
+/// back to [`crate::state::DEFAULT_REGION`] rather than rendering an address that is
+/// not a name.
+fn endpoint_region(parts: &::http::request::Parts) -> String {
+    let region = crate::state::request_region(parts).to_ascii_lowercase();
+    let is_label = !region.is_empty()
+        && region.len() <= MAX_REGION_LENGTH
+        && region.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && region.ends_with(|c: char| c.is_ascii_alphanumeric())
+        && region
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if is_label {
+        region
+    } else {
+        crate::state::DEFAULT_REGION.to_string()
+    }
+}
+
+/// Longest request-derived value one audit field carries.
+///
+/// The access key id, the request target and the requested endpoint type are all
+/// caller-controlled, so an unbounded echo would let one request emit an
+/// arbitrarily long log line.
+const MAX_AUDIT_FIELD: usize = 128;
+
+/// A request-derived value as it may appear in an audit record: control characters
+/// (above all CR and LF, which would forge a second record) replaced, and the whole
+/// thing bounded by [`MAX_AUDIT_FIELD`] on a character boundary.
+fn audit_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .take(MAX_AUDIT_FIELD)
+        .collect()
+}
+
+/// Emit the structured access record for one `DescribeEndpoint` call.
+///
+/// Called on EVERY branch this handler returns from, because one of them creates
+/// state (the account's endpoint identifier) whose effect is otherwise invisible
+/// after the fact. The record carries the operation, the identity the request
+/// PRESENTED (the SigV4 access key id, an identifier and not a secret), the request
+/// target, what was asked for and the outcome; the subscriber supplies the timestamp.
+/// The endpoint address itself is NOT logged — it is what the caller is told, not
+/// metadata about the call.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: &'static str,
+    endpoint_type: Option<&str>,
+) {
+    let parts = ctx.parts();
+    tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DescribeEndpoint",
+        access_key_id = %audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target = %audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        endpoint_type = %audit_field(endpoint_type.unwrap_or("")),
+        outcome,
+        "iot api call"
+    );
+}
+
 /// The `DescribeEndpoint` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +296,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEndpoint"))
+        // Which endpoint the caller asked for. `endpointType` is optional, so a
+        // request that names none asks for the default data endpoint; one that names
+        // a token outside the documented catalog is refused with the operation's own
+        // modelled client error rather than served some other endpoint.
+        let endpoint_type = match input.endpoint_type.as_deref() {
+            None => EndpointType::DEFAULT,
+            Some(requested) => match EndpointType::parse(requested) {
+                Some(endpoint_type) => endpoint_type,
+                None => {
+                    audit(ctx, "validation-refused", input.endpoint_type.as_deref());
+                    let valid = EndpointType::ALL
+                        .iter()
+                        .map(|candidate| candidate.token())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(DescribeEndpointErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "endpointType must be one of [{valid}], got '{requested}'"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            audit(ctx, "store-unavailable", Some(endpoint_type.token()));
+            return Err(DescribeEndpointErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "the IoT endpoint store is unavailable in this emulator".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The region is read from the request's credential scope, so the address
+        // names the region the caller addressed; the account is the emulator's own.
+        let region = endpoint_region(ctx.parts());
+        let account_id = ::engine::emulator_account_id();
+
+        // "Returns or creates": the first call in a region creates the account's
+        // endpoint identifier and records it, every later call answers from that
+        // record, so all of this account's endpoint addresses share one prefix and
+        // repeating the call returns the same endpoint.
+        let (identifier, created) = {
+            let mut store = state.lock();
+            let already_created = store.endpoint_identifier(&region).is_some();
+            (
+                store.endpoint_identifier_or_create(account_id, &region),
+                !already_created,
+            )
+        };
+
+        let endpoint_address = endpoint_type.address(&identifier, &region);
+
+        audit(
+            ctx,
+            if created {
+                "endpoint-created"
+            } else {
+                "endpoint-returned"
+            },
+            Some(endpoint_type.token()),
+        );
+
+        Ok(DescribeEndpointOutput {
+            endpoint_address: Some(endpoint_address),
+        })
     }
 }

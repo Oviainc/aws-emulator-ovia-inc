@@ -13,8 +13,19 @@
 //! One record carries everything a reader hands back, so `DescribeThing` after
 //! `CreateThing` returns the created thing member-for-member: a reader clones what
 //! the writer stored and the two cannot drift.
+//!
+//! Beside the registry it holds the account's IoT ENDPOINT IDENTIFIERS — the
+//! `<identifier>` of `<identifier>.iot.<region>.amazonaws.com`, the account-specific
+//! prefix every IoT endpoint address is built from. `DescribeEndpoint` is documented
+//! as "returns or creates a unique endpoint specific to the Amazon Web Services
+//! account making the call. The first time DescribeEndpoint is called, an endpoint is
+//! created. All subsequent calls to DescribeEndpoint return the same endpoint", so the
+//! identifier is recorded here on the call that creates it and read back by every
+//! later call.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use sha2::{Digest, Sha256};
 
 /// The configuration of a thing: the members of a `CreateThing` request that
 /// describe the thing rather than name it.
@@ -101,6 +112,66 @@ impl RegisteredThing {
     }
 }
 
+/// Length of an account's IoT endpoint identifier.
+///
+/// The identifier is one DNS label of lowercase alphanumerics (the AWS IoT
+/// Developer Guide's "account-specific prefix", e.g. `a3qexamplesffut`), so 14
+/// characters is the length this emulator mints. The exact length is this
+/// emulator's choice; what callers depend on is that it is a single, stable,
+/// lowercase-alphanumeric label.
+pub const ENDPOINT_IDENTIFIER_LENGTH: usize = 14;
+
+/// Upper bound on the number of regions whose endpoint identifier is recorded.
+///
+/// The region comes from the caller's SigV4 credential scope, so the set of keys is
+/// client-influenced and has to be bounded. Exceeding the bound costs nothing
+/// observable: an identifier is a pure function of the account and the region (see
+/// [`derive_endpoint_identifier`]), so a region whose record did not fit is handed
+/// the same identifier every later call derives for it.
+pub const MAX_ENDPOINT_REGIONS: usize = 64;
+
+/// The alphabet an endpoint identifier's first character is drawn from.
+///
+/// A hostname label is read case-insensitively and AWS writes these prefixes in
+/// lowercase; starting with a letter keeps the label in the preferred form of
+/// RFC 1035 §2.3.1.
+const IDENTIFIER_LEADING_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// The alphabet the rest of an endpoint identifier is drawn from.
+const IDENTIFIER_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// The endpoint identifier for `account_id` in `region`.
+///
+/// An AWS account's IoT endpoint prefix is permanent and differs per region, so it is
+/// derived rather than drawn at random: the SHA-256 of the account id and the region,
+/// mapped onto the lowercase-alphanumeric label alphabet. It carries nothing from the
+/// request but the region the request was signed for, and — the digest being
+/// domain-separated and truncated to one label — two regions (or two accounts) are
+/// overwhelmingly unlikely to derive the same label, though the truncation means that
+/// is a probability and not a guarantee: nothing downstream treats the label as a
+/// unique key.
+pub fn derive_endpoint_identifier(account_id: &str, region: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(account_id.as_bytes());
+    // A separator, so ("00", "0-x") and ("000", "-x") cannot hash alike.
+    hasher.update(b"/iot-endpoint/");
+    hasher.update(region.as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(ENDPOINT_IDENTIFIER_LENGTH)
+        .enumerate()
+        .map(|(position, byte)| {
+            let alphabet = if position == 0 {
+                IDENTIFIER_LEADING_ALPHABET
+            } else {
+                IDENTIFIER_ALPHABET
+            };
+            char::from(alphabet[usize::from(*byte) % alphabet.len()])
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-iot-awsiotservice. A handler reaches it through [`service_state`].
 ///
 /// The registry is NOT partitioned by region: a thing's ARN records the region of
@@ -122,6 +193,11 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// same reason as [`ComAmazonawsIotAwsiotserviceState::thing_types`];
     /// `CreateBillingGroup` is still a scaffold and will populate it.
     pub billing_groups: BTreeSet<String>,
+    /// The endpoint identifier created for each region this account has called
+    /// `DescribeEndpoint` in. The call that finds no record creates one; every later
+    /// call in that region answers from the record, which is what makes all of an
+    /// account's endpoint addresses share one prefix.
+    pub endpoint_identifiers: HashMap<String, String>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -142,6 +218,26 @@ impl ComAmazonawsIotAwsiotserviceState {
                 return candidate;
             }
         }
+    }
+
+    /// The endpoint identifier recorded for `region`, if an endpoint has been created
+    /// there.
+    pub fn endpoint_identifier(&self, region: &str) -> Option<&str> {
+        self.endpoint_identifiers.get(region).map(String::as_str)
+    }
+
+    /// The endpoint identifier for `region`, creating and recording it on the first
+    /// call — the "returns or creates" half of `DescribeEndpoint`.
+    pub fn endpoint_identifier_or_create(&mut self, account_id: &str, region: &str) -> String {
+        if let Some(created) = self.endpoint_identifiers.get(region) {
+            return created.clone();
+        }
+        let identifier = derive_endpoint_identifier(account_id, region);
+        if self.endpoint_identifiers.len() < MAX_ENDPOINT_REGIONS {
+            self.endpoint_identifiers
+                .insert(region.to_string(), identifier.clone());
+        }
+        identifier
     }
 }
 
