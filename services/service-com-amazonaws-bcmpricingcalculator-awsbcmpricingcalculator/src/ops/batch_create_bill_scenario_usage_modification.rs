@@ -128,22 +128,15 @@ impl From<BatchCreateBillScenarioUsageModificationErrorModeled> for BatchCreateB
     }
 }
 
-/// How deep a `filterExpression` is digested before the digest stops descending.
-///
-/// `Expression` nests through caller-supplied `and`/`or`/`not`, so the recursion below
-/// is bounded rather than trusting the request's depth. A request deeper than this
-/// digests to the same value past the cap, which costs only that two such requests
-/// could share one idempotency token — never a crash.
-const MAX_EXPRESSION_DEPTH: usize = 32;
-
 /// Push the digest parts of one batch entry.
 ///
 /// Written member by member rather than from a derived `Debug`, so the digest is a
 /// contract this file owns: ADD A LINE HERE when the model gives
-/// `BatchCreateBillScenarioUsageModificationEntry` (or `HistoricalUsageEntity`, or
-/// `Expression`) another member, or two requests differing only in that member will
-/// share one fingerprint. `request_fingerprint` length-prefixes every part, so parts
-/// cannot run together.
+/// `BatchCreateBillScenarioUsageModificationEntry` another member, or two requests
+/// differing only in that member will share one fingerprint.
+/// `request_fingerprint` length-prefixes every part, so parts cannot run together; the
+/// `historicalUsage` half is `crate::state`'s, so every batch operation of this service
+/// fingerprints that shape the same way.
 fn push_entry_digest(parts: &mut Vec<String>, entry: &BatchCreateBillScenarioUsageModificationEntry) {
     parts.push(entry.key.clone());
     parts.push(entry.service_code.clone());
@@ -157,58 +150,7 @@ fn push_entry_digest(parts: &mut Vec<String>, entry: &BatchCreateBillScenarioUsa
         parts.push(amount.amount.to_string());
     }
     if let Some(historical) = &entry.historical_usage {
-        parts.push(historical.service_code.clone());
-        parts.push(historical.usage_type.clone());
-        parts.push(historical.operation.clone());
-        parts.push(historical.location.clone().unwrap_or_default());
-        parts.push(historical.usage_account_id.clone());
-        parts.push(
-            historical
-                .bill_interval
-                .start
-                .map(|start| start.secs())
-                .unwrap_or_default()
-                .to_string(),
-        );
-        parts.push(
-            historical
-                .bill_interval
-                .end
-                .map(|end| end.secs())
-                .unwrap_or_default()
-                .to_string(),
-        );
-        push_expression_digest(parts, &historical.filter_expression, 0);
-    }
-}
-
-/// Push the digest parts of a filter expression, descending at most
-/// [`MAX_EXPRESSION_DEPTH`] levels.
-fn push_expression_digest(parts: &mut Vec<String>, expression: &Expression, depth: usize) {
-    if depth > MAX_EXPRESSION_DEPTH {
-        return;
-    }
-    for (member, filter) in [
-        ("costCategories", &expression.cost_categories),
-        ("dimensions", &expression.dimensions),
-        ("tags", &expression.tags),
-    ] {
-        if let Some(filter) = filter {
-            parts.push(member.to_string());
-            parts.push(filter.key.clone().unwrap_or_default());
-            parts.extend(filter.match_options.clone().unwrap_or_default());
-            parts.extend(filter.values.clone().unwrap_or_default());
-        }
-    }
-    for (member, branch) in [("and", &expression.and), ("or", &expression.or)] {
-        for child in branch.iter().flatten() {
-            parts.push(member.to_string());
-            push_expression_digest(parts, child, depth + 1);
-        }
-    }
-    if let Some(negated) = &expression.not {
-        parts.push("not".to_string());
-        push_expression_digest(parts, negated, depth + 1);
+        crate::state::push_historical_usage_digest(parts, historical);
     }
 }
 
