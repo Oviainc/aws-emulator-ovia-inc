@@ -55,7 +55,7 @@ fn access_points(reply: &Reply) -> Vec<Value> {
 }
 
 /// The ids of those descriptions, in the order they were reported.
-fn ids_of(reply: &Reply) -> Vec<String> {
+pub(crate) fn ids_of(reply: &Reply) -> Vec<String> {
     access_points(reply)
         .iter()
         .map(|description| {

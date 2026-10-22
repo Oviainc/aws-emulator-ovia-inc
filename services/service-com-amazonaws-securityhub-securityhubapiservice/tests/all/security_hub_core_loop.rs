@@ -836,42 +836,59 @@ async fn string_filters_select_findings_by_the_documented_comparisons() {
 /// window it names — between `Start` and `End` inclusive, or `WITHIN` / `OLDER_THAN`
 /// a `DateRange` measured back from now ("If you don't specify a value, the default
 /// is `WITHIN`" — `DateRange$Comparison`).
+///
+/// A `DateRange` is measured back from the CURRENT instant, so every fixture and every
+/// window here is placed relative to that instant ([`iso8601_before_now`]) rather than
+/// at a fixed calendar date, which would drift out of the window it was written for as
+/// the clock moves past it.
 #[tokio::test]
 async fn date_filters_select_findings_inside_the_window_they_name() {
+    /// One day and one hour in seconds, the units the spans below are written in.
+    const DAY: u64 = 24 * 60 * 60;
+    /// See [`DAY`].
+    const HOUR: u64 = 60 * 60;
+
     // Two findings a known distance apart, so an absolute window and a relative one
     // can each pick out exactly one of them. The recent one's timestamps are taken
     // from the CLOCK rather than written down: a `DateRange` is "measured back from
     // now", so a fixed instant would stop being inside a one-day window as soon as
     // the day it was written passed.
     let mut old = base_finding("date-old");
-    old["CreatedAt"] = json!("2020-01-01T00:00:00Z");
-    old["UpdatedAt"] = json!("2020-01-02T00:00:00Z");
+    old["CreatedAt"] = json!(iso8601_before_now(400 * DAY));
+    old["UpdatedAt"] = json!(iso8601_before_now(399 * DAY));
 
     // The recent finding's instants are relative to NOW, because the `DateRange` row
     // below is: "OLDER_THAN one day" is measured back from the moment the request runs,
     // so a hard-coded "recent" timestamp stops being recent once the wall clock passes
     // it and the row starts selecting both findings.
     let mut recent = base_finding("date-recent");
-    recent["CreatedAt"] = json!(iso8601_before_now(2 * 60 * 60));
-    recent["UpdatedAt"] = json!(iso8601_before_now(60 * 60));
+    recent["CreatedAt"] = json!(iso8601_before_now(2 * HOUR));
+    recent["UpdatedAt"] = json!(iso8601_before_now(HOUR));
 
     let harness = Harness::with_findings(vec![old, recent]).await;
+
+    // The boundary both single-ended windows are taken at: one day back, between the
+    // two findings' timestamps.
+    let one_day_ago = iso8601_before_now(DAY);
 
     // (case, Filters, expected ids)
     let cases: [(&str, Value, Vec<&str>); 6] = [
         (
             "Start and End bracket the old finding",
-            json!({ "CreatedAt": [{ "Start": "2019-01-01T00:00:00Z", "End": "2021-01-01T00:00:00Z" }] }),
+            json!({ "CreatedAt": [{
+                "Start": iso8601_before_now(401 * DAY),
+                "End": iso8601_before_now(398 * DAY),
+            }] }),
             vec!["date-old"],
         ),
         (
             "Start alone excludes the old finding",
-            json!({ "CreatedAt": [{ "Start": "2025-01-01T00:00:00Z" }] }),
+            json!({ "CreatedAt": [{ "Start": one_day_ago }] }),
             vec!["date-recent"],
         ),
         (
             "End alone excludes the recent finding",
-            json!({ "CreatedAt": [{ "End": "2021-01-01T00:00:00Z" }] }),
+            json!({ "CreatedAt": [{ "End": one_day_ago }] }),
             vec!["date-old"],
         ),
         (
@@ -887,8 +904,8 @@ async fn date_filters_select_findings_inside_the_window_they_name() {
         (
             "two windows on one field are joined by OR",
             json!({ "CreatedAt": [
-                { "End": "2021-01-01T00:00:00Z" },
-                { "Start": "2025-01-01T00:00:00Z" },
+                { "End": one_day_ago },
+                { "Start": one_day_ago },
             ] }),
             vec!["date-old", "date-recent"],
         ),
