@@ -161,10 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // named does not exist.
             return Err(
                 GetTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::target_account_configuration_not_found(
-                        &input.experiment_template_id,
-                        &input.account_id,
-                    ),
+                    crate::state::target_account_configuration_not_found(),
                 )
                 .into(),
             );

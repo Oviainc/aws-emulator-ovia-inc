@@ -154,8 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every modelled constraint on this input — the required `experimentTemplateId`
         // and `accountId`, and the lengths and patterns on all four members — was already
-        // refused at the boundary, and the model states no further rule this handler
-        // could check.
+        // refused at the boundary. What the model cannot express is that `roleArn` names
+        // an IAM ROLE: a value inside `RoleArn`'s bounds that is not a well-formed IAM
+        // role ARN is refused here, BEFORE the lookup and before any state write, so the
+        // configuration this call names keeps the `roleArn` it already held.
+        if let Some(refusal) = crate::state::role_arn_refusal("roleArn", input.role_arn.as_deref())
+        {
+            return Err(
+                UpdateTargetAccountConfigurationErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
         let mut store = state.lock();
 
         // The configuration lives on the template that owns it, so one lookup resolves
@@ -174,10 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // this account, the resource the request named does not exist.
             return Err(
                 UpdateTargetAccountConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::target_account_configuration_not_found(
-                        &input.experiment_template_id,
-                        &input.account_id,
-                    ),
+                    crate::state::target_account_configuration_not_found(),
                 )
                 .into(),
             );

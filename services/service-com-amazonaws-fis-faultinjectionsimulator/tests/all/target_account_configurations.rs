@@ -28,8 +28,10 @@
 //!   (HTTP 404);
 //! * the template's `targetAccountConfigurationsCount` is the number of configurations it
 //!   holds, and an experiment carries the count its template had when it was started;
-//! * a request outside a modelled constraint on `accountId`, `roleArn` or `description`
-//!   is refused with HTTP 400 before any of that.
+//! * a request outside a modelled constraint on `accountId`, `roleArn` or `description`,
+//!   or carrying a `roleArn` that is not a well-formed IAM role ARN, is refused with HTTP
+//!   400 before any of that (the ARN rule itself is asserted in
+//!   `target_account_configuration_errors.rs`).
 //!
 //! The HTTP harness below is local to this suite: the one in `experiment_lifecycle.rs`
 //! is private to that suite, and a test harness is not shared state.
@@ -52,6 +54,13 @@ const ACCOUNT_ID_CEILING: usize = 48;
 const ROLE_ARN_FLOOR: usize = 20;
 /// See [`ROLE_ARN_FLOOR`].
 const ROLE_ARN_CEILING: usize = 2048;
+
+/// The length of the SHORTEST well-formed IAM role ARN:
+/// `arn:aws:iam::<12 digits>:role/<one character>` — `"arn:aws:iam::"` (13) plus the
+/// twelve-digit account id, `":role/"` (6) and a one-character role name. It is above
+/// `RoleArn`'s modelled floor, so a `roleArn` at that floor is within the shape's bounds
+/// and still not an ARN.
+const SHORTEST_ROLE_ARN: usize = 32;
 
 /// `TargetAccountConfigurationDescription`'s published bounds
 /// (`@length(min: 0, max: 512)`).
@@ -259,6 +268,10 @@ fn account_id_of(len: usize) -> String {
 }
 
 /// An IAM role ARN of exactly `len` characters, padded in the role name.
+///
+/// WELL-FORMED only from [`SHORTEST_ROLE_ARN`] characters up: under that length the value
+/// is still `arn:`-shaped (and still satisfies `pattern ^[\S]+$`) but is not an IAM role
+/// ARN, which is exactly what the rows at and below `RoleArn`'s modelled floor need.
 fn role_arn_of(len: usize) -> String {
     let prefix = "arn:aws:iam::000000000000:role/";
     if len <= prefix.len() {
@@ -283,8 +296,8 @@ struct Row {
 ///
 /// They differ along everything that rule generalises over: the length and shape of the
 /// `accountId` naming the configuration (both published bounds of `TargetAccountId`),
-/// the length and shape of the `roleArn` (the published floor, a role with a path, a
-/// role at the published ceiling), whether a `description` is absent, empty, plain
+/// the length and shape of the `roleArn` (the shortest WELL-FORMED ARN, a role with a
+/// path, a role at the published ceiling), whether a `description` is absent, empty, plain
 /// text, non-ASCII, or at `TargetAccountConfigurationDescription`'s published ceiling,
 /// and whether the request carries a `clientToken` at all.
 fn rows() -> Vec<Row> {
@@ -304,9 +317,9 @@ fn rows() -> Vec<Row> {
             client_token: Some("token-empty-description".to_string()),
         },
         Row {
-            case: "plain-description-role-arn-at-the-floor",
+            case: "plain-description-role-arn-at-the-shortest-well-formed-length",
             account_id: "333333333333".to_string(),
-            role_arn: role_arn_of(ROLE_ARN_FLOOR),
+            role_arn: role_arn_of(SHORTEST_ROLE_ARN),
             description: Some("the staging account".to_string()),
             client_token: Some("token-floor-role".to_string()),
         },
@@ -767,10 +780,21 @@ async fn a_request_outside_a_modelled_bound_is_refused() {
         );
     }
 
-    // `roleArn` on each of its published bounds, and one past each.
+    // `roleArn` on each of its published bounds, and one past each. A value at the
+    // modelled floor is INSIDE the shape's bounds and still shorter than any IAM role
+    // ARN, so it is refused as a malformed ARN rather than accepted.
     for (case, len, expected) in [
-        ("roleArn at the floor", ROLE_ARN_FLOOR, 200),
+        (
+            "roleArn at the shortest well-formed ARN",
+            SHORTEST_ROLE_ARN,
+            200,
+        ),
         ("roleArn at the ceiling", ROLE_ARN_CEILING, 200),
+        (
+            "roleArn at the floor, too short to be an ARN",
+            ROLE_ARN_FLOOR,
+            400,
+        ),
         ("roleArn below the floor", ROLE_ARN_FLOOR - 1, 400),
         ("roleArn above the ceiling", ROLE_ARN_CEILING + 1, 400),
     ] {
@@ -836,8 +860,8 @@ impl UpdateRow {
 /// They differ along everything that rule generalises over: WHICH members the update
 /// carries (neither, `roleArn` only, `description` only, both), what the record already
 /// held (a description, or none at all), and the value and shape of each carried member —
-/// a role with a path, a role at `RoleArn`'s published floor and at its published
-/// ceiling, a description that is empty, non-ASCII, or at
+/// a role with a path, a role at the shortest WELL-FORMED ARN length and at `RoleArn`'s
+/// published ceiling, a description that is empty, non-ASCII, or at
 /// `TargetAccountConfigurationDescription`'s published ceiling.
 fn update_rows() -> Vec<UpdateRow> {
     vec![
@@ -860,9 +884,9 @@ fn update_rows() -> Vec<UpdateRow> {
             description: None,
         },
         UpdateRow {
-            case: "role-arn-only-at-the-floor",
+            case: "role-arn-only-at-the-shortest-well-formed-length",
             baseline_description: None,
-            role_arn: Some(role_arn_of(ROLE_ARN_FLOOR)),
+            role_arn: Some(role_arn_of(SHORTEST_ROLE_ARN)),
             description: None,
         },
         UpdateRow {
@@ -1139,8 +1163,8 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
     let template_id = template(&router, "update-member-bounds").await;
     let cases: Vec<(String, Option<String>, Option<String>, u16)> = vec![
         (
-            format!("roleArn at the floor ({ROLE_ARN_FLOOR})"),
-            Some(role_arn_of(ROLE_ARN_FLOOR)),
+            format!("roleArn at the shortest well-formed ARN ({SHORTEST_ROLE_ARN})"),
+            Some(role_arn_of(SHORTEST_ROLE_ARN)),
             None,
             200,
         ),
@@ -1149,6 +1173,12 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
             Some(role_arn_of(ROLE_ARN_CEILING)),
             None,
             200,
+        ),
+        (
+            format!("roleArn at the floor ({ROLE_ARN_FLOOR}), too short to be an ARN"),
+            Some(role_arn_of(ROLE_ARN_FLOOR)),
+            None,
+            400,
         ),
         (
             "roleArn below the floor".to_string(),
