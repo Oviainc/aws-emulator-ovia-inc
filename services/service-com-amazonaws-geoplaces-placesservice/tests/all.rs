@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/places_catalog.rs"]
 mod places_catalog;
+#[path = "all/result_item_composition.rs"]
+mod result_item_composition;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

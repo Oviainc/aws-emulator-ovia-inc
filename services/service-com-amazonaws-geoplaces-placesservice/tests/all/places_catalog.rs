@@ -33,17 +33,17 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The response header `PricingBucket` is bound to on every output
 /// (`@httpHeader(x-amz-geo-pricing-bucket)`).
-const PRICING_BUCKET_HEADER: &str = "x-amz-geo-pricing-bucket";
+pub(crate) const PRICING_BUCKET_HEADER: &str = "x-amz-geo-pricing-bucket";
 
 /// One HTTP exchange.
-struct Call {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Call {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Call {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.body.is_empty() {
             return Value::Null;
         }
@@ -55,7 +55,7 @@ impl Call {
         })
     }
 
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -65,7 +65,7 @@ impl Call {
 
     /// The wire error code: the `x-amzn-errortype` header restJson1 sets on a
     /// boundary refusal, or the body's `__type` for an error a handler returned.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let raw = if self.headers.contains_key("x-amzn-errortype") {
             self.header("x-amzn-errortype")
         } else {
@@ -87,22 +87,28 @@ impl Call {
 
 /// One place as the seeded catalog holds it: the rows of every catalog-wide table.
 #[derive(Debug, Clone)]
-struct Place {
-    place_id: String,
-    place_type: String,
-    title: String,
-    label: String,
-    position: [f64; 2],
+pub(crate) struct Place {
+    pub(crate) place_id: String,
+    pub(crate) place_type: String,
+    /// The catalog record's own name, which is how a test names the place it
+    /// wants. For a point of interest this is also the reported `Title`; for an
+    /// address or an administrative area the reported `Title` is the assembled
+    /// `label` below.
+    pub(crate) name: String,
+    /// The `Title` the service reports for this place.
+    pub(crate) title: String,
+    pub(crate) label: String,
+    pub(crate) position: [f64; 2],
 }
 
 /// A router with only this service mounted — one emulator "session".
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -112,7 +118,7 @@ impl Emulator {
 
     /// The catalog the emulator serves, read from the shared engine's own state —
     /// the table every "for every place" test iterates.
-    fn catalog(&self) -> Vec<Place> {
+    pub(crate) fn catalog(&self) -> Vec<Place> {
         let state = self.engine.state::<Catalog>();
         let catalog = state.lock();
         catalog
@@ -121,8 +127,9 @@ impl Emulator {
             .map(|place| Place {
                 place_id: place.place_id.clone(),
                 place_type: place.place_type.clone(),
-                title: place.title.clone(),
-                label: place.address.label.clone(),
+                name: place.title.clone(),
+                title: place.title_modeled(),
+                label: place.assembled_label(),
                 position: place.position,
             })
             .collect()
@@ -153,23 +160,23 @@ impl Emulator {
         }
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Call {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> Call {
         self.send("POST", path, Some(body)).await
     }
 
-    async fn get(&self, path: &str) -> Call {
+    pub(crate) async fn get(&self, path: &str) -> Call {
         self.send("GET", path, None).await
     }
 
     /// POST and require a success: HTTP 200 plus the required pricing-bucket header.
-    async fn post_ok(&self, case: &str, path: &str, body: &Value) -> Value {
+    pub(crate) async fn post_ok(&self, case: &str, path: &str, body: &Value) -> Value {
         let call = self.post(path, body).await;
         assert_success(case, &call);
         call.json()
     }
 
     /// GET and require a success.
-    async fn get_ok(&self, case: &str, path: &str) -> Value {
+    pub(crate) async fn get_ok(&self, case: &str, path: &str) -> Value {
         let call = self.get(path).await;
         assert_success(case, &call);
         call.json()
@@ -177,7 +184,7 @@ impl Emulator {
 }
 
 /// Every success carries HTTP 200 and the `@required` `PricingBucket` header.
-fn assert_success(case: &str, call: &Call) {
+pub(crate) fn assert_success(case: &str, call: &Call) {
     assert_eq!(
         call.status,
         200,
@@ -194,7 +201,7 @@ fn assert_success(case: &str, call: &Call) {
 }
 
 /// `ResultItems` of a search response.
-fn items(body: &Value) -> Vec<Value> {
+pub(crate) fn items(body: &Value) -> Vec<Value> {
     body.get("ResultItems")
         .and_then(Value::as_array)
         .cloned()
@@ -202,7 +209,7 @@ fn items(body: &Value) -> Vec<Value> {
 }
 
 /// A string member of a JSON object, or the empty string when absent.
-fn text(value: &Value, member: &str) -> String {
+pub(crate) fn text(value: &Value, member: &str) -> String {
     value
         .get(member)
         .and_then(Value::as_str)
@@ -212,7 +219,7 @@ fn text(value: &Value, member: &str) -> String {
 
 /// `Distance`, which carries a modeled `@default` of 0, so an absent member reads
 /// as zero.
-fn distance(item: &Value) -> i64 {
+pub(crate) fn distance(item: &Value) -> i64 {
     item.get("Distance").and_then(Value::as_i64).unwrap_or(0)
 }
 
@@ -262,8 +269,10 @@ struct GeocodeRow {
 /// query that matches nothing returns no items rather than an invented one.
 ///
 /// The rows differ along the query FORM (full label, abbreviated label, place name,
-/// postal code, structured components, country component, unmatchable text), which
-/// is what the matching rule generalises over.
+/// postal code, structured components at several granularities, unmatchable text),
+/// which is what the matching rule generalises over. A free-form query answers with
+/// whatever its words name; a structured query answers at the granularity of the
+/// finest component it supplies.
 #[tokio::test]
 async fn geocode_matches_the_catalog_by_text_and_by_component() {
     let emulator = Emulator::new();
@@ -271,12 +280,18 @@ async fn geocode_matches_the_catalog_by_text_and_by_component() {
         GeocodeRow {
             case: "full-label",
             body: json!({"QueryText": "1600 Pennsylvania Ave NW, Washington, DC 20500"}),
-            expected_titles: &["White House", "1600 Pennsylvania Avenue NW"],
+            expected_titles: &[
+                "White House",
+                "1600 Pennsylvania Ave NW, Washington, DC 20500, United States",
+            ],
         },
         GeocodeRow {
             case: "abbreviation-expanded",
             body: json!({"QueryText": "1600 Pennsylvania Avenue NW, Washington, DC"}),
-            expected_titles: &["White House", "1600 Pennsylvania Avenue NW"],
+            expected_titles: &[
+                "White House",
+                "1600 Pennsylvania Ave NW, Washington, DC 20500, United States",
+            ],
         },
         GeocodeRow {
             case: "place-name",
@@ -291,12 +306,45 @@ async fn geocode_matches_the_catalog_by_text_and_by_component() {
         GeocodeRow {
             case: "components-locality-and-number",
             body: json!({"QueryComponents": {"Locality": "Seattle", "AddressNumber": "400"}}),
-            expected_titles: &["Space Needle", "400 Broad Street"],
+            // The finest component is an address number, so the answer is the
+            // point address — not the point of interest that shares its number.
+            expected_titles: &["400 Broad St, Seattle, WA 98109, United States"],
         },
         GeocodeRow {
             case: "components-country-alpha3",
             body: json!({"QueryComponents": {"Country": "FRA"}}),
-            expected_titles: &["Tour Eiffel", "Paris"],
+            expected_titles: &["France"],
+        },
+        GeocodeRow {
+            case: "components-region",
+            body: json!({"QueryComponents": {"Country": "USA", "Region": "Washington"}}),
+            expected_titles: &["Washington, United States"],
+        },
+        GeocodeRow {
+            case: "components-sub-region",
+            body: json!({"QueryComponents": {"Region": "WA", "SubRegion": "King County"}}),
+            expected_titles: &["King County, WA, United States"],
+        },
+        GeocodeRow {
+            case: "components-locality",
+            body: json!({
+                "QueryComponents": {
+                    "Country": "USA",
+                    "Region": "Washington",
+                    "Locality": "Seattle",
+                },
+            }),
+            expected_titles: &["Seattle, WA, United States"],
+        },
+        GeocodeRow {
+            case: "components-district",
+            body: json!({"QueryComponents": {"Locality": "Seattle", "District": "Capitol Hill"}}),
+            expected_titles: &["Capitol Hill, Seattle, WA, United States"],
+        },
+        GeocodeRow {
+            case: "components-street",
+            body: json!({"QueryComponents": {"Locality": "Seattle", "Street": "Broad Street"}}),
+            expected_titles: &["400 Broad St, Seattle, WA 98109, United States"],
         },
         GeocodeRow {
             case: "text-and-component-must-both-hold",
@@ -304,6 +352,8 @@ async fn geocode_matches_the_catalog_by_text_and_by_component() {
                 "QueryText": "Pike Place Market",
                 "QueryComponents": {"Locality": "Seattle"},
             }),
+            // The free-form text and the component must BOTH hold; the structured
+            // granularity does not apply to a query that names a place in text.
             expected_titles: &["Pike Place Market"],
         },
         GeocodeRow {
@@ -314,6 +364,13 @@ async fn geocode_matches_the_catalog_by_text_and_by_component() {
         GeocodeRow {
             case: "component-no-match",
             body: json!({"QueryComponents": {"Locality": "Reykjavik"}}),
+            expected_titles: &[],
+        },
+        GeocodeRow {
+            case: "component-granularity-the-catalog-has-no-place-at",
+            // The catalog holds no place at postal-code granularity, so the honest
+            // answer is no items rather than a place of another granularity.
+            body: json!({"QueryComponents": {"PostalCode": "98109"}}),
             expected_titles: &[],
         },
     ];
@@ -404,7 +461,7 @@ async fn geocode_orders_by_distance_from_the_bias_position() {
     // Every row is a different bias position, so no single ordering can satisfy them
     // all: each must be ordered around its own bias.
     for place in emulator.catalog() {
-        let case = format!("bias-at-{}", place.title);
+        let case = format!("bias-at-{}", place.name);
         let body = emulator
             .post_ok(
                 &case,
@@ -466,7 +523,7 @@ async fn every_place_id_a_search_returns_resolves_through_get_place() {
                 }),
             ),
         ] {
-            let case = format!("{operation}-{}", place.title);
+            let case = format!("{operation}-{}", place.name);
             let found = emulator.post_ok(&case, path, &body).await;
             let item = items(&found)
                 .into_iter()
@@ -523,7 +580,7 @@ async fn every_place_id_a_search_returns_resolves_through_get_place() {
 async fn a_position_reverse_geocodes_to_the_place_it_came_from() {
     let emulator = Emulator::new();
     for place in emulator.catalog() {
-        let case = format!("reverse-{}", place.title);
+        let case = format!("reverse-{}", place.name);
         let body = emulator
             .post_ok(
                 &case,
@@ -565,7 +622,7 @@ async fn reverse_geocode_respects_the_query_radius() {
     let center = emulator
         .catalog()
         .into_iter()
-        .find(|place| place.title == "Seattle")
+        .find(|place| place.name == "Seattle" && place.place_type == "Locality")
         .expect("the catalog seeds the locality of Seattle");
 
     let mut previous: BTreeSet<String> = BTreeSet::new();
@@ -685,7 +742,7 @@ async fn paginated_searches_walk_the_whole_result_in_order() {
     let seattle = emulator
         .catalog()
         .into_iter()
-        .find(|place| place.title == "Seattle")
+        .find(|place| place.name == "Seattle" && place.place_type == "Locality")
         .expect("the catalog seeds the locality of Seattle");
 
     let queries: Vec<(&str, &str, Value)> = vec![
@@ -838,7 +895,7 @@ async fn search_nearby_applies_the_category_filter_inside_the_radius() {
     let center = emulator
         .catalog()
         .into_iter()
-        .find(|place| place.title == "Seattle")
+        .find(|place| place.name == "Seattle" && place.place_type == "Locality")
         .expect("the catalog seeds the locality of Seattle");
     let query_position = json!([center.position[0], center.position[1]]);
 
@@ -957,7 +1014,7 @@ async fn an_additional_feature_is_reported_only_when_requested() {
     let needle = emulator
         .catalog()
         .into_iter()
-        .find(|place| place.title == "Space Needle")
+        .find(|place| place.name == "Space Needle")
         .expect("the catalog seeds the Space Needle, which has all three features");
     let nearby = json!({
         "QueryPosition": [needle.position[0], needle.position[1]],
@@ -1104,7 +1161,7 @@ async fn pricing_bucket_is_a_response_header_that_tracks_intended_use() {
     let needle = emulator
         .catalog()
         .into_iter()
-        .find(|place| place.title == "Space Needle")
+        .find(|place| place.name == "Space Needle")
         .expect("the catalog seeds the Space Needle");
     let position = json!([needle.position[0], needle.position[1]]);
 

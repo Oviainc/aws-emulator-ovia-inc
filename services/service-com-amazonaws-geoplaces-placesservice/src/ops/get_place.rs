@@ -279,9 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetPlaceOutput {
             place_id: place.place_id.clone(),
             place_type: place.place_type.clone(),
-            title: place.title.clone(),
+            title: place.title_modeled(),
             pricing_bucket: state.pricing_bucket(Self::NAME, input.intended_use.as_deref()),
-            address: Some(place.address.to_modeled()),
+            address: Some(place.address_modeled()),
             position: Some(place.position_modeled()),
             map_view: Some(place.map_view_modeled()),
             categories: place.categories_modeled(),
