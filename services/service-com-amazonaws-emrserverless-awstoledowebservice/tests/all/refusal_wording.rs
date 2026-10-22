@@ -18,7 +18,8 @@
 //!    the submitted value.
 //! 3. A resource ARN is checked for its VENDOR: an ARN of another service is refused by
 //!    that check, naming the vendor that was expected rather than the caller's ARN or
-//!    the member's regex.
+//!    the member's regex, and carrying the front door's generic bad-request identity
+//!    rather than one of this service's modelled error shapes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +53,11 @@ const JOB_RUN_ATTEMPT_NOT_FOUND: &str = "Job Run with given attempt doesn't exis
 /// namespace (`smithy_query(query="service_info")` → `arnNamespace` /
 /// `sigv4Name` `emr-serverless`).
 const WRONG_VENDOR: &str = "Invalid input resource arn: expected vendor emr-serverless";
+
+/// The error code that refusal carries: the front door's generic bad-request identity,
+/// which no operation of this service declares — the ARN names a resource of another
+/// vendor, so the request is refused ahead of this service's own input validation.
+const WRONG_VENDOR_CODE: &str = "BadRequestException";
 
 /// An execution role ARN satisfying `IAMRoleArn`'s pattern.
 const EXECUTION_ROLE: &str = "arn:aws:iam::000000000000:role/EMRServerlessRole";
@@ -594,8 +600,8 @@ async fn a_resource_arn_of_another_vendor_is_refused_by_the_vendor_check() {
             );
             assert_eq!(
                 answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {:?}",
+                WRONG_VENDOR_CODE,
+                "case {case:?}: expected {WRONG_VENDOR_CODE}, got {:?}",
                 answer.body
             );
             assert_eq!(
@@ -646,6 +652,13 @@ async fn a_resource_arn_of_another_vendor_is_refused_by_the_vendor_check() {
         "ResourceNotFoundException",
         "case ListTagsForResource(own vendor): expected ResourceNotFoundException, got {:?}",
         listed.body
+    );
+    assert_eq!(
+        listed.message(),
+        APPLICATION_NOT_FOUND,
+        "case ListTagsForResource(own vendor): expected the class phrase {APPLICATION_NOT_FOUND:?}, \
+         got {:?}",
+        listed.message()
     );
 
     for (case, value) in [

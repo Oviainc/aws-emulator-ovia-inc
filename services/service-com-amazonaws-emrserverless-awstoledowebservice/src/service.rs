@@ -26,7 +26,9 @@
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. EDITED here: this service words two refusal classes
 //!   itself — a resource ARN of another vendor, and a `@range` violation — and
-//!   keeps the framework's wording for the rest. See `invalid_refusal` below.
+//!   keeps the framework's wording for the rest. The two classes also carry
+//!   DIFFERENT error-type identities, because two different layers refuse them:
+//!   see `WRONG_VENDOR_ERROR_TYPE` and `invalid_refusal` below.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -54,6 +56,26 @@ use std::sync::Arc;
 /// `httpError` 400), and it is the code the framework's own default picks, so rewording
 /// a refusal never moves the code a client branches on.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The error-type identity the resource-ARN vendor check answers with.
+///
+/// The vendor check is a FRONT-DOOR check: a resource ARN of another vendor names a
+/// resource this service's API cannot address at all, so the request is refused as a
+/// bad request before it is dispatched to an operation — and the identity it carries is
+/// the front door's generic one, not a shape this service's model declares. The
+/// distinction is client-visible, because restJson1 resolves the error SHAPE from
+/// `x-amzn-errortype` (and this body's `__type`): an SDK unmarshals a modelled
+/// `ValidationException` into a typed error and this identity into a generic service
+/// error, so a caller's `catch ValidationException` must NOT fire here.
+///
+/// RECORDED behaviour, not modelled: no operation declares this shape (every one
+/// declares `ValidationException` for the values it refuses itself), and the recorded
+/// answer to a tag request carrying an ARN of another vendor is this identity with the
+/// vendor-naming message below, while the recorded answer to a member-constraint
+/// refusal of this service's own surface (`maxResults` outside its `@range`) is the
+/// modelled `ValidationException` that [`VALIDATION_EXCEPTION`] names. The two layers
+/// keep their own identities here for that reason.
+const WRONG_VENDOR_ERROR_TYPE: &str = "BadRequestException";
 
 /// The modelled member that names the resource a tag operation targets.
 ///
@@ -133,13 +155,15 @@ fn reworded(violation: &Violation) -> bool {
 /// Two rules, in the order the service applies them:
 ///
 /// 1. A resource ARN of another vendor is refused by the ARN vendor check, which names
-///    the vendor that was expected and neither the caller's ARN nor the member's regex.
+///    the vendor that was expected and neither the caller's ARN nor the member's regex,
+///    and carries the front door's [`WRONG_VENDOR_ERROR_TYPE`] identity rather than a
+///    shape this service's model declares.
 /// 2. Otherwise the refusal keeps the `N validation error(s) detected: …` envelope, with
 ///    a `@range` clause stating the member and the bound but not the submitted value.
 fn invalid_refusal(violations: &[Violation]) -> Option<Refused> {
     if violations.iter().any(wrong_vendor_resource_arn) {
         return Some(Refused {
-            code: VALIDATION_EXCEPTION.to_string(),
+            code: WRONG_VENDOR_ERROR_TYPE.to_string(),
             message: format!(
                 "Invalid input resource arn: expected vendor {}",
                 crate::state::ARN_NAMESPACE
