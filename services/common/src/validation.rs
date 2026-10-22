@@ -236,7 +236,22 @@ fn is_elision_of(stored: &str, submitted: &str) -> bool {
 
 /// Every string-rendered leaf of `input` this walk is allowed to collect, in walk order,
 /// paired with the dotted member path the validating walk reports a violation on it at.
-fn submitted_leaves(input: &dyn SerializableStruct, schema: &Schema) -> Vec<(String, String)> {
+///
+/// Public because restoring a violation's echo is not the only thing a service needs the
+/// values a request SUBMITTED for: a service that runs its own check over a caller-
+/// supplied value — an ARN it parses itself, ahead of the constraints the model declares
+/// — needs the same (path, value) pairs for a value the framework never reports a
+/// violation on. Reading them here keeps ONE walk in the tree: a second copy would mirror
+/// the frozen crate's path bookkeeping twice and the two could drift apart.
+///
+/// The bounds the module docs state apply: at most [`MAX_RECORDED_LEAVES`] leaves and
+/// [`MAX_RECORDED_BYTES`] of collected bytes, so this is never a second full copy of a
+/// request's strings.
+#[must_use]
+pub fn submitted_leaves(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> Vec<(String, String)> {
     let mut walk = SubmittedValues::default();
     // The root input is a struct; drive it the way a codec — and the validating walk —
     // does.

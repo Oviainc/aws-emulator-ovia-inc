@@ -93,11 +93,13 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidRepositoryDescriptionException",
             "The specified repository description is not valid.",
         ),
-        ("branchName", _) if missing => (
+        // Every member that carries a `BranchName` names a branch, so each takes the
+        // branch errors: `defaultBranchName` is `UpdateDefaultBranch`'s name for one.
+        ("branchName" | "defaultBranchName", _) if missing => (
             "BranchNameRequiredException",
             "A branch name is required, but was not specified.",
         ),
-        ("branchName", _) => (
+        ("branchName" | "defaultBranchName", _) => (
             "InvalidBranchNameException",
             "The specified reference name is not valid.",
         ),

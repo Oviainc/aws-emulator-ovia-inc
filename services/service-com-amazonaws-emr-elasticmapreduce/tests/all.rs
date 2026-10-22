@@ -25,3 +25,5 @@ mod release_labels;
 mod security_configurations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/supported_instance_types.rs"]
+mod supported_instance_types;

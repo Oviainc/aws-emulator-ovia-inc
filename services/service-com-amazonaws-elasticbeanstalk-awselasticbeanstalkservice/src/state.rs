@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice service.
 //!
 //! This is the single store every handler in `src/ops/` reads and writes: the
-//! applications, the application versions and the environments the lifecycle
+//! applications, the application versions, the custom platform versions and the
+//! environments the lifecycle
 //! operations create, describe and delete, plus the managed platform branch
 //! catalog the service publishes. It also owns the few derivations all
 //! of them share — the server clock, the request's region, this service's ARN
@@ -15,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
-    ConfigurationOptionSetting, EnvironmentTier, PlatformBranchSummary, S3Location, Tag,
+    ConfigurationOptionSetting, EnvironmentTier, PlatformBranchSummary, PlatformDescription,
+    PlatformSummary, S3Location, Tag,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -29,7 +31,7 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// How long after the call that starts it a status change this service owes
 /// becomes due: `Launching` -> `Ready` after CreateEnvironment, `Terminating` ->
 /// `Terminated` after TerminateEnvironment, `Aborting` -> `Ready` after
-/// AbortEnvironmentUpdate.
+/// AbortEnvironmentUpdate, `Creating` -> `Ready` after CreatePlatformVersion.
 ///
 /// The real service takes minutes, so this span is CHOSEN, not documented. It is
 /// deliberately non-zero: a caller that describes the environment straight after
@@ -65,6 +67,18 @@ pub const HEALTH_GREEN: &str = "Green";
 pub const HEALTH_STATUS_PENDING: &str = "Pending";
 /// See [`HEALTH_STATUS_PENDING`].
 pub const HEALTH_STATUS_OK: &str = "Ok";
+
+/// `PlatformStatus` values this service writes (modelled set:
+/// `crate::ops::types::PLATFORM_STATUS_VALUES`). A custom platform version is
+/// `Creating` while the version is being built and `Ready` once it can be used.
+pub const PLATFORM_STATUS_CREATING: &str = "Creating";
+/// See [`PLATFORM_STATUS_CREATING`].
+pub const PLATFORM_STATUS_READY: &str = "Ready";
+
+/// The `PlatformOwner` a MANAGED platform version reports: Elastic Beanstalk
+/// itself publishes those, so they are owned by the service rather than by an
+/// account (a CUSTOM version reports the account id that created it).
+pub const MANAGED_PLATFORM_OWNER: &str = "AWSElasticBeanstalk";
 
 /// The support life-cycle states a platform branch reports, from
 /// `PlatformBranchSummary$LifecycleState`'s own documentation ("Possible values:
@@ -104,6 +118,14 @@ pub const MAX_APPLICATION_VERSIONS: usize = 1_000;
 /// See [`MAX_APPLICATIONS`]. Covers environments that have not reached
 /// `Terminated`, which is what the real quota counts.
 pub const MAX_ENVIRONMENTS: usize = 200;
+
+/// How many custom platform versions one account may hold here.
+///
+/// Elastic Beanstalk limits custom platform versions per account per region, but
+/// the figure is in neither the model nor this service's own documentation, so
+/// this bound is CHOSEN. It is what keeps the platform store bounded, and what
+/// makes the modelled `TooManyPlatformsException` reachable.
+pub const MAX_PLATFORM_VERSIONS: usize = 50;
 
 /// How many tags one Elastic Beanstalk resource can carry, from the service's
 /// published quota ("Tags per resource: 50" in the Elastic Beanstalk service
@@ -159,6 +181,65 @@ impl SolutionStack {
             None => self.branch_name.to_string(),
         }
     }
+
+    /// The `PlatformArn` this managed platform version is named by:
+    /// `arn:aws:elasticbeanstalk:<region>::platform/<branch name>/<version>`.
+    ///
+    /// A managed platform version belongs to the SERVICE, not to an account, so
+    /// its ARN carries no account id — which is why it is not built with
+    /// [`::engine::emulator_arn`], the form every account-owned resource of this
+    /// service uses.
+    pub fn platform_arn(&self, region: &str) -> String {
+        format!(
+            "arn:aws:{ARN_NAMESPACE}:{region}::platform/{}/{}",
+            self.branch_name, self.platform_version
+        )
+    }
+
+    /// The modelled `PlatformDescription` for this published version.
+    ///
+    /// What the catalog states is reported; what only a built platform's
+    /// definition carries (its category, maintainer, operating system, languages,
+    /// frameworks, creation dates) is left absent rather than guessed.
+    pub fn to_description(&self, region: &str) -> PlatformDescription {
+        PlatformDescription {
+            platform_arn: Some(self.platform_arn(region)),
+            platform_owner: Some(MANAGED_PLATFORM_OWNER.to_string()),
+            platform_name: Some(self.branch_name.to_string()),
+            platform_version: Some(self.platform_version.to_string()),
+            platform_branch_name: Some(self.branch_name.to_string()),
+            solution_stack_name: Some(self.name()),
+            // A published version is usable as it stands; nothing is building it.
+            platform_status: Some(PLATFORM_STATUS_READY.to_string()),
+            date_created: None,
+            date_updated: None,
+            platform_category: None,
+            description: None,
+            maintainer: None,
+            operating_system_name: None,
+            operating_system_version: None,
+            programming_languages: None,
+            frameworks: None,
+            custom_ami_list: None,
+            supported_tier_list: None,
+            supported_addon_list: None,
+            platform_lifecycle_state: None,
+            platform_branch_lifecycle_state: None,
+        }
+    }
+}
+
+/// The published managed platform version `platform_arn` names in `region`, if
+/// the catalog publishes one.
+///
+/// This is the other half of resolving a `PlatformArn`: a CUSTOM version lives in
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::platform_versions`],
+/// a MANAGED one in [`SOLUTION_STACKS`], and an ARN that answers to neither names
+/// no platform version this service can launch.
+pub fn managed_platform_version(region: &str, platform_arn: &str) -> Option<&'static SolutionStack> {
+    SOLUTION_STACKS
+        .iter()
+        .find(|stack| stack.platform_arn(region) == platform_arn)
 }
 
 /// The solution stacks this emulator offers, which is what
@@ -347,6 +428,18 @@ pub fn environment_arn(region: &str, application_name: &str, environment_name: &
     )
 }
 
+/// `arn:aws:elasticbeanstalk:<region>:<account>:platform/<name>/<version>` — the
+/// ARN of a CUSTOM platform version, which belongs to the account that created
+/// it (`CreateEnvironmentMessage$PlatformArn`: "The Amazon Resource Name (ARN) of
+/// the custom platform to use with the environment").
+pub fn platform_version_arn(region: &str, platform_name: &str, platform_version: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("platform/{platform_name}/{platform_version}"),
+    )
+}
+
 /// The DNS name an environment is reached at:
 /// `<cname prefix>.<region>.elasticbeanstalk.com`.
 pub fn environment_cname(cname_prefix: &str, region: &str) -> String {
@@ -521,6 +614,121 @@ impl ApplicationVersion {
             date_created: Some(self.date_created),
             date_updated: Some(self.date_updated),
             status: Some(self.status.clone()),
+        }
+    }
+}
+
+/// A stored custom platform version.
+#[derive(Debug, Clone)]
+pub struct PlatformVersion {
+    pub arn: String,
+    pub platform_name: String,
+    pub platform_version: String,
+    /// "PlatformOwner: The AWS account ID of the person who created the platform
+    /// version" — this account, for a platform version created here.
+    pub platform_owner: String,
+    pub status: String,
+    /// Where the platform definition archive was said to be. Nothing reads the
+    /// archive, so none of the values a built platform would report from it (its
+    /// category, maintainer, operating system, languages, frameworks) is
+    /// invented.
+    pub definition_bundle: Option<S3Location>,
+    pub option_settings: Vec<ConfigurationOptionSetting>,
+    /// The builder environment the caller named, carried so the record says what
+    /// was asked for. No builder environment is launched here.
+    pub builder_environment_name: Option<String>,
+    pub date_created: ::aws_smithy_types::DateTime,
+    pub date_updated: ::aws_smithy_types::DateTime,
+    pub tags: Vec<Tag>,
+    /// The move to `Ready` the clock owes this version. See [`PendingPlatformStatus`].
+    pub pending_status: Option<PendingPlatformStatus>,
+}
+
+/// The status change the clock owes a platform version: `Creating` -> `Ready`,
+/// due one [`STATUS_TRANSITION_SPAN`] after the call that started it.
+#[derive(Debug, Clone)]
+pub struct PendingPlatformStatus {
+    pub due_at: Instant,
+    pub status: String,
+}
+
+impl PendingPlatformStatus {
+    /// The move `CreatePlatformVersion` owes: `Creating` -> `Ready`.
+    pub fn build_completion() -> Self {
+        Self {
+            due_at: Instant::now() + STATUS_TRANSITION_SPAN,
+            status: PLATFORM_STATUS_READY.to_string(),
+        }
+    }
+}
+
+impl PlatformVersion {
+    /// Apply the pending status change if the clock has already made it due — the
+    /// same read-time materialisation [`Environment::materialize_due`] performs.
+    fn materialize_due(&mut self, at: Instant) {
+        let Some(pending) = self.pending_status.as_ref() else {
+            return;
+        };
+        if pending.due_at > at {
+            return;
+        }
+        let pending = self.pending_status.take().expect("checked above");
+        self.status = pending.status;
+        self.date_updated = now();
+    }
+
+    /// Whether this version can be launched into an environment.
+    pub fn is_ready(&self) -> bool {
+        self.status == PLATFORM_STATUS_READY
+    }
+
+    /// The modelled `PlatformSummary` for this record.
+    pub fn to_summary(&self) -> PlatformSummary {
+        PlatformSummary {
+            platform_arn: Some(self.arn.clone()),
+            platform_owner: Some(self.platform_owner.clone()),
+            platform_status: Some(self.status.clone()),
+            // Everything below is read off a built platform's definition archive,
+            // which this emulator does not read; a platform version it cannot
+            // derive reports no value rather than a guessed one.
+            platform_category: None,
+            operating_system_name: None,
+            operating_system_version: None,
+            supported_tier_list: None,
+            supported_addon_list: None,
+            platform_lifecycle_state: None,
+            platform_version: Some(self.platform_version.clone()),
+            platform_branch_name: None,
+            platform_branch_lifecycle_state: None,
+        }
+    }
+
+    /// The modelled `PlatformDescription` for this record.
+    pub fn to_description(&self) -> PlatformDescription {
+        PlatformDescription {
+            platform_arn: Some(self.arn.clone()),
+            platform_owner: Some(self.platform_owner.clone()),
+            platform_name: Some(self.platform_name.clone()),
+            platform_version: Some(self.platform_version.clone()),
+            platform_status: Some(self.status.clone()),
+            date_created: Some(self.date_created),
+            date_updated: Some(self.date_updated),
+            // As in [`Self::to_summary`]: not derivable without reading the
+            // platform definition archive.
+            solution_stack_name: None,
+            platform_category: None,
+            description: None,
+            maintainer: None,
+            operating_system_name: None,
+            operating_system_version: None,
+            programming_languages: None,
+            frameworks: None,
+            custom_ami_list: None,
+            supported_tier_list: None,
+            supported_addon_list: None,
+            platform_lifecycle_state: None,
+            platform_branch_name: None,
+            platform_branch_lifecycle_state: None,
         }
     }
 }
@@ -1034,6 +1242,10 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     pub applications: BTreeMap<String, Application>,
     /// Application versions by `(ApplicationName, VersionLabel)`.
     pub application_versions: BTreeMap<(String, String), ApplicationVersion>,
+    /// Custom platform versions by `PlatformArn`. Populated by
+    /// `CreatePlatformVersion`; a `PlatformArn` no entry here answers to names no
+    /// platform this account holds.
+    pub platform_versions: BTreeMap<String, PlatformVersion>,
     /// Environments by `EnvironmentId`.
     pub environments: BTreeMap<String, Environment>,
     /// `EnvironmentName` -> `EnvironmentId`, so an operation that takes either
@@ -1048,8 +1260,9 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     pub next_id_counter: u64,
 }
 
-/// The store a fresh engine starts from: no applications, versions or
-/// environments, and the managed platform catalog already published — the
+/// The store a fresh engine starts from: no applications, versions, custom
+/// platform versions or environments, and the managed platform catalog already
+/// published — the
 /// latter is service-owned data no caller creates, so `ListPlatformBranches`
 /// reads it rather than writing it on first use.
 impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
@@ -1057,6 +1270,7 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         Self {
             applications: BTreeMap::new(),
             application_versions: BTreeMap::new(),
+            platform_versions: BTreeMap::new(),
             environments: BTreeMap::new(),
             environment_name_index: BTreeMap::new(),
             platform_branches: managed_platform_branch_catalog(),
@@ -1247,13 +1461,17 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             .count()
     }
 
-    /// Materialise every environment status change the clock has already made
-    /// due. Every handler that reads or acts on an environment calls this first,
+    /// Materialise every status change the clock has already made due — an
+    /// environment's, and a platform version's. Every handler that reads or acts
+    /// on one of them calls this first,
     /// so no two of them disagree about what state the store is in.
     pub fn materialize_due_transitions(&mut self) {
         let at = Instant::now();
         for environment in self.environments.values_mut() {
             environment.materialize_due(at);
+        }
+        for platform_version in self.platform_versions.values_mut() {
+            platform_version.materialize_due(at);
         }
         self.evict_retired_environments();
     }

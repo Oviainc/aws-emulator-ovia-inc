@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNotebookInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNotebookInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNotebookInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the notebook instance `CreateNotebookInstance` stored,
+//! materialising the `Pending` -> `InService` transition the clock already owes, and
+//! refuses an unknown `NotebookInstanceName`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +195,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNotebookInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNotebookInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNotebookInstance"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(notebook) = store
+            .notebook_instances
+            .get_mut(&input.notebook_instance_name)
+        else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
+                &input.notebook_instance_name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "RecordNotFound. Notebook Instance Arn: {arn}"
+            )));
+        };
+
+        // The only write a reporting call makes: the provisioning the clock already
+        // owed. It was due at the stored instant whether or not anybody described the
+        // instance, so a waiter terminates and no caller's read changes the outcome.
+        let settled = notebook.settle_status(::std::time::SystemTime::now());
+        let notebook_arn = notebook.arn.clone();
+
+        // A list member is modelled `len 0..n`, so an instance created without one
+        // omits the member rather than reporting an empty list.
+        let security_groups = (!notebook.security_groups.is_empty())
+            .then(|| notebook.security_groups.clone());
+        let accelerator_types = (!notebook.accelerator_types.is_empty())
+            .then(|| notebook.accelerator_types.clone());
+        let additional_code_repositories = (!notebook.additional_code_repositories.is_empty())
+            .then(|| notebook.additional_code_repositories.clone());
+        // The Jupyter endpoint and the network interface exist once the instance has
+        // finished provisioning, so a `Pending` one reports neither.
+        let provisioned = notebook.is_provisioned();
+
+        let output = DescribeNotebookInstanceOutput {
+            notebook_instance_arn: Some(notebook_arn.clone()),
+            notebook_instance_name: Some(notebook.name.clone()),
+            notebook_instance_status: Some(notebook.status.clone()),
+            failure_reason: notebook.failure_reason.clone(),
+            url: provisioned.then(|| notebook.url.clone()),
+            instance_type: Some(notebook.instance_type.clone()),
+            ip_address_type: Some(notebook.ip_address_type.clone()),
+            subnet_id: notebook.subnet_id.clone(),
+            security_groups,
+            role_arn: Some(notebook.role_arn.clone()),
+            kms_key_id: notebook.kms_key_id.clone(),
+            network_interface_id: provisioned.then(|| notebook.network_interface_id.clone()),
+            last_modified_time: Some(crate::state::timestamp(notebook.last_modified_time)),
+            creation_time: Some(crate::state::timestamp(notebook.creation_time)),
+            notebook_instance_lifecycle_config_name: notebook.lifecycle_config_name.clone(),
+            direct_internet_access: Some(notebook.direct_internet_access.clone()),
+            volume_size_in_gb: Some(notebook.volume_size_in_gb),
+            accelerator_types,
+            default_code_repository: notebook.default_code_repository.clone(),
+            additional_code_repositories,
+            root_access: Some(notebook.root_access.clone()),
+            platform_identifier: Some(notebook.platform_identifier.clone()),
+            instance_metadata_service_configuration: Some(
+                notebook.instance_metadata_service_configuration.clone(),
+            ),
+        };
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &notebook_arn, ctx);
+        }
+        Ok(output)
     }
 }

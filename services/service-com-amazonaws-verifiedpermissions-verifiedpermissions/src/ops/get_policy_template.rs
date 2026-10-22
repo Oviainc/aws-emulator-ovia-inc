@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let template_not_found = || {
             GetPolicyTemplateErrorModeled::ResourceNotFoundException(
-                crate::ops::resource_not_found(&input.policy_template_id, "POLICY_TEMPLATE"),
+                crate::state::policy_template_reference(&input.policy_template_id).not_found(),
             )
         };
 

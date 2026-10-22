@@ -2,7 +2,9 @@
 
 //! @op ActivateSubscription
 //! IMPLEMENTED: moves the PERSISTED subscription to `ACTIVE`, stamping `activatedAt`
-//! and `lastUpdatedAt`, and returns the stored `SubscriptionDescription`. `@idempotent`:
+//! and `lastUpdatedAt`, and returns the stored `SubscriptionDescription`. Any
+//! `deactivatedAt` the record already carries is RETAINED: the stamps are a history of
+//! the transitions that happened, not a view of the current status. `@idempotent`:
 //! repeating the call on an already-active subscription changes nothing and still
 //! answers 200. An unknown domain or subscription is a 404.
 //!
@@ -173,6 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@idempotent`: activating an already-active subscription is a no-op, so the
         // stamps it already carries stay put rather than being rewritten per call.
+        //
+        // `deactivated_at` is deliberately NOT cleared here: each stamp records that its
+        // transition happened, so re-activating keeps the previous deactivation boundary
+        // readable and a caller can still reconstruct the inactive interval.
         if subscription.status != crate::state::SubscriptionStatus::Active {
             subscription.status = crate::state::SubscriptionStatus::Active;
             subscription.activated_at = Some(now);

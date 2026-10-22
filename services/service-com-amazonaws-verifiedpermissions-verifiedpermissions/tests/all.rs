@@ -33,6 +33,8 @@ mod policy_store_authorization;
 mod policy_store_settings;
 #[path = "all/policy_templates.rs"]
 mod policy_templates;
+#[path = "all/policy_update.rs"]
+mod policy_update;
 #[path = "all/policy_validation.rs"]
 mod policy_validation;
 #[path = "all/schema.rs"]
@@ -43,5 +45,7 @@ mod schema_lifecycle;
 mod state_roundtrip;
 #[path = "all/tagging.rs"]
 mod tagging;
+#[path = "all/template_linked_policies.rs"]
+mod template_linked_policies;
 #[path = "all/wire_fidelity.rs"]
 mod wire_fidelity;

@@ -8,6 +8,10 @@
 //! minting, the IdC application ARN, the modelled projections and the pagination cursor
 //! codec) are shared by those handlers rather than duplicated per operation.
 //!
+//! The agent space records sit beside them in the same struct, so `CreateAgentSpace`
+//! and `BatchGetAgentSpaces` — and every agent space operation implemented after them —
+//! read ONE copy of each agent space.
+//!
 //! The security requirement packs live here for the same reason:
 //! `CreateSecurityRequirementPack` and `GetSecurityRequirementPack` — and every pack
 //! operation implemented after them — read and write ONE copy of each pack record.
@@ -15,7 +19,9 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use crate::ops::types::{ApplicationSummary, IdCConfiguration};
+use crate::ops::types::{
+    AWSResources, AgentSpace, ApplicationSummary, CodeReviewSettings, IdCConfiguration,
+};
 
 /// The region every value this service derives from the request's region carries when
 /// the request arrived without a SigV4 credential scope to read one from.
@@ -45,6 +51,15 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 /// set far above any plausible client's application count, so normal use never meets
 /// it, while the store a caller can grow stays bounded.
 pub const MAX_APPLICATIONS: usize = 1_000;
+
+/// The most agent spaces this emulator stores for the account before
+/// `CreateAgentSpace` answers the service's `ServiceQuotaExceededException`.
+///
+/// CHOSEN, not cited, for the same reason as [`MAX_APPLICATIONS`]: the real service's
+/// agent space quota is not in the model. It is set far above any plausible client's
+/// agent space count, so normal use never meets it, while the store a caller can grow
+/// stays bounded.
+pub const MAX_AGENT_SPACES: usize = 1_000;
 
 /// The most security requirement packs this emulator stores for the account before
 /// `CreateSecurityRequirementPack` answers the service's
@@ -136,6 +151,54 @@ impl Application {
     }
 }
 
+/// One stored agent space: "a dedicated workspace for securing a specific
+/// application" (source: the `AgentSpace` shape doc), carrying the members the caller
+/// supplied plus the identity and the timestamps the service mints.
+///
+/// The modelled shapes are stored as they arrived rather than flattened into local
+/// mirrors, so a read projects the stored record and never reconstructs one from
+/// request text.
+#[derive(Debug, Clone)]
+pub struct AgentSpaceRecord {
+    pub agent_space_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub aws_resources: Option<AWSResources>,
+    pub target_domain_ids: Option<Vec<String>>,
+    pub code_review_settings: Option<CodeReviewSettings>,
+    pub kms_key_id: Option<String>,
+    /// The tags supplied at create time, persisted so the tagging operations have
+    /// state to read once they are implemented. `tags` is not a member of any agent
+    /// space response shape, so it is never projected below.
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl AgentSpaceRecord {
+    /// This agent space projected onto the modelled [`AgentSpace`] shape the batch read
+    /// returns: the stored record's own fields, never request input.
+    pub fn modelled(&self) -> AgentSpace {
+        AgentSpace {
+            agent_space_id: self.agent_space_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            aws_resources: self.aws_resources.clone(),
+            target_domain_ids: self.target_domain_ids.clone(),
+            code_review_settings: self.code_review_settings.clone(),
+            kms_key_id: self.kms_key_id.clone(),
+            created_at: Some(timestamp(self.created_at)),
+            updated_at: Some(timestamp(self.updated_at)),
+        }
+    }
+}
+
+/// A stored instant on the wire, as the modelled timestamp members of an agent space
+/// carry it (`smithy_query(query="shape",shape="AgentSpace")`).
+pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
+}
+
 /// One stored security requirement pack: the named collection of security
 /// requirements `CreateSecurityRequirementPack` mints and every other pack operation
 /// reads.
@@ -190,6 +253,13 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// Monotonic counter behind every minted `applicationId`, so two
     /// `CreateApplication` calls are two distinct records.
     pub next_application_seq: u64,
+    /// Every stored agent space, keyed by its `agentSpaceId`. A `BTreeMap` for the
+    /// same reason as [`Self::applications`]: one stable order for a list read to walk
+    /// and to resume a cursor in.
+    pub agent_spaces: BTreeMap<String, AgentSpaceRecord>,
+    /// Monotonic counter behind every minted `agentSpaceId`, so two `CreateAgentSpace`
+    /// calls are two distinct records whatever they were called with.
+    pub next_agent_space_seq: u64,
     /// Every stored security requirement pack, keyed by its `packId`. A `BTreeMap` for
     /// the same reason as [`Self::applications`]: one stable order for
     /// `ListSecurityRequirementPacks` to walk and to resume a cursor in.
@@ -218,6 +288,17 @@ impl ComAmazonawsSecurityagentSecurityagentState {
             application_id,
             sequence,
         }
+    }
+
+    /// Mint the `agentSpaceId` of a new agent space.
+    ///
+    /// Opaque to the caller — `AgentSpaceId` carries neither a `@pattern` nor a
+    /// `@length` in the model — and drawn from a monotonic counter, so it is unique
+    /// within the process and the stored order is the creation order. 32 lowercase hex
+    /// characters, the same form as a minted `applicationId`.
+    pub fn mint_agent_space_id(&mut self) -> String {
+        self.next_agent_space_seq = self.next_agent_space_seq.wrapping_add(1);
+        format!("{:032x}", self.next_agent_space_seq)
     }
 
     /// Mint the `packId` of a new security requirement pack.

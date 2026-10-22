@@ -119,12 +119,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The values `ClusterSetting$value` accepts, from that member's own doc: "The
-/// supported values are `enhanced`, `enabled`, and `disabled`." The setting NAME is a
-/// closed enum the boundary validator already refuses outside, but the value is a free
-/// string the service constrains itself.
-const CLUSTER_SETTING_VALUES: [&str; 3] = ["enhanced", "enabled", "disabled"];
-
 /// The member `clusterCount` is written under, beside the modelled `cluster`.
 ///
 /// RECORDED behaviour: `CreateClusterResponse` declares the single member `cluster`
@@ -244,15 +238,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        for setting in input.settings.iter().flatten() {
-            let value = setting.value.as_deref().unwrap_or_default();
-            if !CLUSTER_SETTING_VALUES.contains(&value) {
+        // The settings and the configuration are checked the same way whichever
+        // operation carries them, so a value `UpdateCluster` refuses is refused here.
+        if let Err(message) =
+            crate::state::validate_cluster_settings(input.settings.as_deref().unwrap_or_default())
+        {
+            return Err(CreateClusterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        if let Some(configuration) = &input.configuration {
+            if let Err(message) = crate::state::validate_cluster_configuration(configuration) {
                 return Err(CreateClusterErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "settings value must be one of {}; got {value:?}",
-                            CLUSTER_SETTING_VALUES.join(", ")
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into());
@@ -302,6 +304,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .default_capacity_provider_strategy
                 .clone()
                 .unwrap_or_default(),
+            service_connect_defaults: input
+                .service_connect_defaults
+                .as_ref()
+                .and_then(|defaults| crate::state::service_connect_defaults(&defaults.namespace)),
+            // The capacity providers this request associates are recorded above; the
+            // attachments update a LATER association starts is
+            // `PutClusterCapacityProviders`' business, and a cluster that was created
+            // with its providers has none in flight to report.
+            attachments_status: None,
+            attachments_update_due_at: None,
         };
         let view = guard.cluster_mutation_view(&record, true);
         guard.clusters.insert(name, record);

@@ -229,10 +229,12 @@ fn matches_filter(policy: &crate::state::Policy, filter: Option<&PolicyFilter>) 
             return false;
         }
     }
-    if filter.policy_template_id.is_some() {
-        // Only a template-linked policy was instantiated from a template, and no
-        // store holds one yet, so this filter selects nothing.
-        return false;
+    if let Some(policy_template_id) = filter.policy_template_id.as_deref() {
+        // Only a template-linked policy was instantiated from a template, so
+        // this member selects the policies that follow exactly that template.
+        if policy.policy_template_id() != Some(policy_template_id) {
+            return false;
+        }
     }
     if let Some(reference) = filter.principal.as_ref() {
         if !matches_entity_reference(policy.principal.as_ref(), reference) {
@@ -263,7 +265,9 @@ fn matches_entity_reference(
 }
 
 /// A persisted policy as the modeled `PolicyItem`. `PolicyDefinitionItem` carries
-/// the policy's description but not its statement, which is what the model says.
+/// the policy's description but not its statement, which is what the model says;
+/// for a template-linked policy it carries the template the policy follows and
+/// the entities it bound that template's placeholders to.
 fn policy_item(policy: &crate::state::Policy) -> PolicyItem {
     PolicyItem {
         policy_store_id: policy.policy_store_id.clone(),
@@ -284,9 +288,24 @@ fn policy_item(policy: &crate::state::Policy) -> PolicyItem {
                 .map(super::create_policy::action_identifier)
                 .collect()
         }),
-        definition: PolicyDefinitionItem::Static(StaticPolicyDefinitionItem {
-            description: policy.description.clone(),
-        }),
+        definition: match policy.template_link.as_ref() {
+            Some(link) => {
+                PolicyDefinitionItem::templateLinked(TemplateLinkedPolicyDefinitionItem {
+                    policy_template_id: link.policy_template_id.clone(),
+                    principal: link
+                        .principal
+                        .as_ref()
+                        .map(super::create_policy::entity_identifier),
+                    resource: link
+                        .resource
+                        .as_ref()
+                        .map(super::create_policy::entity_identifier),
+                })
+            }
+            None => PolicyDefinitionItem::Static(StaticPolicyDefinitionItem {
+                description: policy.description.clone(),
+            }),
+        },
         created_date: policy.created_date,
         last_updated_date: policy.last_updated_date,
         effect: policy.effect.clone(),

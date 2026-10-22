@@ -288,6 +288,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "PlatformArn: The Amazon Resource Name (ARN) of the custom platform to
+        // use with the environment." A platform version is either CUSTOM — created
+        // in this account by `CreatePlatformVersion` — or MANAGED, one of the
+        // versions this service publishes (`ListAvailableSolutionStacks`). An ARN
+        // that answers to neither names nothing that can be launched, so the
+        // request is refused rather than accepted against a platform that does not
+        // exist; a custom version still being built cannot be launched either.
+        if let Some(platform_arn) = input.platform_arn.as_ref() {
+            match store.platform_versions.get(platform_arn) {
+                Some(platform_version) if !platform_version.is_ready() => {
+                    return Err(CreateEnvironmentError::invalid_parameter_value(format!(
+                        "Platform '{platform_arn}' is not ready to be used; its status is {}.",
+                        platform_version.status
+                    )));
+                }
+                Some(_) => {}
+                None if crate::state::managed_platform_version(&region, platform_arn).is_some() => {}
+                None => {
+                    return Err(CreateEnvironmentError::invalid_parameter_value(format!(
+                        "No Platform named '{platform_arn}' found."
+                    )));
+                }
+            }
+        }
+
         // The CNAME a prefix forms is a DNS name, so it has to be one a host name
         // can carry, and it can be reserved by at most ONE live environment —
         // which is exactly what CheckDNSAvailability reports on. A prefix that

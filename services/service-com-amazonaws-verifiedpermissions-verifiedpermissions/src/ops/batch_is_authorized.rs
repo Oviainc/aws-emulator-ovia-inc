@@ -234,14 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let entities = crate::state::cedar::entities_to_cedar_json(input.entities.as_ref())
             .map_err(invalid)?;
 
-        let prepared = crate::state::cedar::load_policies(
-            &store.policies,
-            // The store's schema, when it holds one: it is what types the
-            // request's entities and context, so every evaluation in this batch
-            // is made against it rather than untyped.
-            store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
-        )
-        .map_err(refused)?;
+        // Every policy of the store, parsed ONCE for the whole batch: a static
+        // policy's own Cedar text and a template-linked one's link of its
+        // template, plus the store's schema when it holds one, which is what
+        // types the requests' entities and context.
+        let prepared = crate::state::cedar::load_policies(store).map_err(refused)?;
 
         let entities =
             crate::state::cedar::build_entities(entities, prepared.schema()).map_err(invalid)?;
@@ -318,6 +315,16 @@ fn refused(refusal: crate::state::cedar::Refusal) -> BatchIsAuthorizedError {
         crate::state::cedar::Refusal::ServiceFault(message) => {
             BatchIsAuthorizedErrorModeled::InternalServerException(InternalServerException {
                 message,
+            })
+            .into()
+        }
+        // An authorization request carries no policy content, so the store's
+        // schema has no member of this REQUEST to refuse: reasons reaching here
+        // are about policies the store already holds, which is service-side
+        // state and not something the caller sent.
+        crate::state::cedar::Refusal::SchemaValidation(reasons) => {
+            BatchIsAuthorizedErrorModeled::InternalServerException(InternalServerException {
+                message: reasons.join("; "),
             })
             .into()
         }

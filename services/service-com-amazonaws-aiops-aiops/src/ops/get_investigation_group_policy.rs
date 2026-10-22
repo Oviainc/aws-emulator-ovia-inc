@@ -159,22 +159,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let not_found = || {
-            GetInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no resource policy is associated with investigation group '{}'",
-                        input.identifier
-                    )),
-                },
-            )
-        };
-
         let store = state.lock();
-        let group = store.group(&input.identifier).ok_or_else(not_found)?;
-        // A group with no policy attached has no policy resource to report, which is
-        // the same 404 an unknown group gets.
-        let policy = group.policy.clone().ok_or_else(not_found)?;
+        // Which resource is missing decides which 404 this answers: an absent GROUP is
+        // reported as the absent group — the policy operations report the group they
+        // could not find, not a policy on a group that does not exist — and a group
+        // that exists with no policy attached is reported as the absent policy, so a
+        // client can tell the two conditions apart.
+        let group = store.group(&input.identifier).ok_or_else(|| {
+            GetInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::investigation_group_not_found(),
+            )
+        })?;
+        let policy = group.policy.clone().ok_or_else(|| {
+            GetInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::investigation_group_policy_not_found(),
+            )
+        })?;
 
         Ok(GetInvestigationGroupPolicyOutput {
             investigation_group_arn: Some(group.arn.clone()),

@@ -190,6 +190,51 @@ fn tag_map(count: usize, key_len: usize, value_len: usize) -> Value {
     Value::Object(tags)
 }
 
+/// Every read path's view of ONE subscription, labelled by the operation that produced
+/// it: `GetSubscription`'s `subscription` member and the element `ListSubscriptions`
+/// carries for the same id. Both project the same stored record through their own
+/// serializer, so both must report the same members.
+async fn read_paths(
+    emulator: &Emulator,
+    domain_id: &str,
+    subscription_id: &str,
+) -> Vec<(&'static str, Value)> {
+    let (status, fetched) = emulator
+        .send(
+            "GET",
+            &format!("/domains/{domain_id}/subscriptions/{subscription_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "GetSubscription {subscription_id} got {fetched:?}"
+    );
+    let described = fetched
+        .get("subscription")
+        .cloned()
+        .unwrap_or_else(|| panic!("GetSubscription must carry a subscription, got {fetched:?}"));
+
+    let (status, page) = emulator
+        .send(
+            "GET",
+            &format!("/domains/{domain_id}/subscriptions?maxResults=100"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "ListSubscriptions got {page:?}");
+    let element = page
+        .get("subscriptions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("ListSubscriptions must carry the required list, got {page:?}"))
+        .iter()
+        .find(|entry| string_at(entry, "subscriptionId") == subscription_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("ListSubscriptions must list {subscription_id}, got {page:?}"));
+
+    vec![("GetSubscription", described), ("ListSubscriptions", element)]
+}
+
 #[tokio::test]
 async fn create_domain_persists_every_member_and_get_domain_reads_it_back() {
     // The rows differ along what CreateDomain generalises over: which optional members
@@ -431,8 +476,8 @@ async fn minted_ids_and_arns_match_the_model_patterns_in_every_signed_region() {
         );
         assert_eq!(
             subscription.get("status").and_then(Value::as_str),
-            Some("INACTIVE"),
-            "case {signed_region:?}: a new subscription is INACTIVE, got {subscription:?}"
+            Some("ACTIVE"),
+            "case {signed_region:?}: a new subscription is ACTIVE, got {subscription:?}"
         );
         assert_eq!(
             subscription.get("createdAt"),
@@ -452,23 +497,32 @@ async fn minted_ids_and_arns_match_the_model_patterns_in_every_signed_region() {
 #[tokio::test]
 async fn subscription_status_transitions_are_persisted_and_idempotent() {
     // The rows differ along the sequence of transitions applied — including repeats,
-    // which `@idempotent` says must not error or change the stored record.
-    let cases: [(&str, &[&str], &str, bool, bool); 6] = [
-        ("no transition", &[], "INACTIVE", false, false),
-        ("activate", &["activate"], "ACTIVE", true, false),
-        ("activate twice", &["activate", "activate"], "ACTIVE", true, false),
-        ("deactivate first", &["deactivate"], "INACTIVE", false, false),
+    // which `@idempotent` says must not error or change the stored record. A new
+    // subscription is already ACTIVE, so an `activate` applied to one is the idempotent
+    // no-op and stamps nothing; `deactivate` is the first transition it can make.
+    let cases: [(&str, &[&str], &str, bool, bool); 7] = [
+        ("no transition", &[], "ACTIVE", false, false),
+        ("activate a new subscription", &["activate"], "ACTIVE", false, false),
+        ("activate twice", &["activate", "activate"], "ACTIVE", false, false),
+        ("deactivate first", &["deactivate"], "INACTIVE", false, true),
         (
-            "activate then deactivate",
-            &["activate", "deactivate"],
+            "deactivate twice",
+            &["deactivate", "deactivate"],
             "INACTIVE",
+            false,
+            true,
+        ),
+        (
+            "deactivate then activate",
+            &["deactivate", "activate"],
+            "ACTIVE",
             true,
             true,
         ),
         (
-            "activate, deactivate, activate again",
-            &["activate", "deactivate", "activate"],
-            "ACTIVE",
+            "deactivate, activate, deactivate again",
+            &["deactivate", "activate", "deactivate"],
+            "INACTIVE",
             true,
             true,
         ),
@@ -493,8 +547,8 @@ async fn subscription_status_transitions_are_persisted_and_idempotent() {
         let path = format!("/domains/{domain_id}/subscriptions/{subscription_id}");
 
         let mut last = created.clone();
-        let mut first_activated_at: Option<Value> = None;
         for transition in transitions {
+            let before = last.clone();
             let (status, answered) = emulator
                 .send("POST", &format!("{path}/{transition}"), Some(&json!({})))
                 .await;
@@ -506,8 +560,35 @@ async fn subscription_status_transitions_are_persisted_and_idempotent() {
                 .get("subscription")
                 .cloned()
                 .unwrap_or_else(|| panic!("case {case:?}: subscription in {answered:?}"));
-            if *transition == "activate" && first_activated_at.is_none() {
-                first_activated_at = last.get("activatedAt").cloned();
+
+            // The stamp this transition owns, and the one the OPPOSITE transition owns.
+            let (stamped, other) = match *transition {
+                "activate" => ("activatedAt", "deactivatedAt"),
+                _ => ("deactivatedAt", "activatedAt"),
+            };
+            if before.get("status") == last.get("status") {
+                // `@idempotent`: a call that does not move the status changes NOTHING,
+                // so nothing is restamped and the whole record comes back identical.
+                assert_eq!(
+                    last, before,
+                    "case {case:?}: a {transition} that does not move the status must \
+                     change nothing, got {last:?}"
+                );
+            } else {
+                // A real transition stamps its own boundary...
+                assert!(
+                    last.get(stamped).is_some(),
+                    "case {case:?}: {transition} must stamp {stamped}, got {last:?}"
+                );
+                // ...and RETAINS the opposite one, so the interval it just ended stays
+                // reconstructable.
+                assert!(
+                    before
+                        .get(other)
+                        .is_none_or(|kept| last.get(other) == Some(kept)),
+                    "case {case:?}: {transition} must retain {other}, got {last:?} \
+                     after {before:?}"
+                );
             }
         }
 
@@ -526,13 +607,6 @@ async fn subscription_status_transitions_are_persisted_and_idempotent() {
             deactivated,
             "case {case:?}: deactivatedAt presence after {transitions:?} is wrong, got {last:?}"
         );
-        if transitions == ["activate", "activate"] {
-            assert_eq!(
-                last.get("activatedAt").cloned(),
-                first_activated_at,
-                "case {case:?}: repeating an idempotent activate must not restamp activatedAt"
-            );
-        }
 
         // A read observes exactly what the transitions wrote.
         let (status, fetched) = emulator.send("GET", &path, None).await;
@@ -1070,4 +1144,176 @@ async fn delete_domain_moves_the_domain_to_deleting_then_purges_it() {
         .send("DELETE", &format!("/domain/{domain_id}"), None)
         .await;
     assert_eq!(status, 404, "DeleteDomain after the purge got {body:?}");
+}
+
+#[tokio::test]
+async fn a_new_subscription_is_active_everywhere_and_its_deactivation_stamp_is_retained() {
+    // The two rules this pins:
+    //
+    //   * a subscription is created in the enabled status `CreateSubscription` puts it
+    //     in ("Creates a new Subscription within a Domain for billing and user
+    //     management"), and EVERY projection of the stored record — the create response,
+    //     `GetSubscription`, `ListSubscriptions`, and the transition responses — reports
+    //     that one persisted status;
+    //   * `activatedAt` / `deactivatedAt` record that their transition HAPPENED: each is
+    //     stamped when the transition runs and is retained afterwards, so the opposite
+    //     transition does not clear it.
+    //
+    // The rows differ along how many subscriptions the domain holds, which of them the
+    // transitions are applied to, and the region the requests are signed for: the rules
+    // are about one resource's lifecycle, so its neighbours must be untouched however
+    // many there are and wherever the list puts them.
+    let cases: [(&str, usize, usize); 4] = [
+        ("one subscription", 1, 0),
+        ("three, first targeted", 3, 0),
+        ("three, last targeted", 3, 2),
+        ("five, middle targeted", 5, 2),
+    ];
+    // The signed regions are rotated across the rows so the rules are not checked in
+    // one region only; each is a value the `SubscriptionArn` pattern's `[a-z0-9-]+`
+    // region segment admits.
+    let regions = ["us-west-2", "us-east-1", "eu-central-1", "ap-southeast-4"];
+
+    for ((case, count, target_index), region) in cases.into_iter().zip(regions) {
+        let emulator = Emulator::new(region);
+        let domain_id = string_at(
+            &emulator
+                .create_domain(&json!({ "name": "clinic-billing" }))
+                .await,
+            "domainId",
+        );
+
+        let mut ids: Vec<String> = Vec::new();
+        for index in 0..count {
+            let (status, created) = emulator
+                .send(
+                    "POST",
+                    &format!("/domains/{domain_id}/subscriptions"),
+                    Some(&json!({})),
+                )
+                .await;
+            assert_eq!(
+                status, 201,
+                "case {case:?} #{index}: CreateSubscription got {created:?}"
+            );
+            assert_eq!(
+                created.get("status").and_then(Value::as_str),
+                Some("ACTIVE"),
+                "case {case:?} #{index}: a created subscription is ACTIVE, got {created:?}"
+            );
+            assert!(
+                created.get("activatedAt").is_none() && created.get("deactivatedAt").is_none(),
+                "case {case:?} #{index}: a created subscription has run neither transition, \
+                 so it carries neither stamp, got {created:?}"
+            );
+            ids.push(string_at(&created, "subscriptionId"));
+        }
+
+        // Every read path agrees with the create response, element by element.
+        for id in &ids {
+            for (op, view) in read_paths(&emulator, &domain_id, id).await {
+                assert_eq!(
+                    (
+                        view.get("status").and_then(Value::as_str),
+                        view.get("deactivatedAt")
+                    ),
+                    (Some("ACTIVE"), None),
+                    "case {case:?}: {op} must read the created subscription back as ACTIVE \
+                     with no deactivation stamp, got {view:?}"
+                );
+            }
+        }
+
+        // Deactivating stamps the billing-stop boundary, and the response carries it.
+        let target = ids[target_index].clone();
+        let path = format!("/domains/{domain_id}/subscriptions/{target}");
+        let (status, answered) = emulator
+            .send("POST", &format!("{path}/deactivate"), Some(&json!({})))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeactivateSubscription got {answered:?}"
+        );
+        let deactivated = answered
+            .get("subscription")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: subscription in {answered:?}"));
+        assert_eq!(
+            deactivated.get("status").and_then(Value::as_str),
+            Some("INACTIVE"),
+            "case {case:?}: a deactivated subscription is INACTIVE, got {deactivated:?}"
+        );
+        let stamp = deactivated.get("deactivatedAt").cloned().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: DeactivateSubscription must stamp deactivatedAt, \
+                 got {deactivated:?}"
+            )
+        });
+        assert!(
+            stamp.as_f64().is_some_and(|epoch| epoch > 0.0),
+            "case {case:?}: deactivatedAt must be an epoch-seconds timestamp, got {stamp:?}"
+        );
+
+        // Both read paths report the stored stamp...
+        for (op, view) in read_paths(&emulator, &domain_id, &target).await {
+            assert_eq!(
+                (
+                    view.get("status").and_then(Value::as_str),
+                    view.get("deactivatedAt")
+                ),
+                (Some("INACTIVE"), Some(&stamp)),
+                "case {case:?}: {op} must report the stored deactivation, got {view:?}"
+            );
+        }
+        // ...and the neighbours are untouched by it.
+        for id in ids.iter().filter(|id| **id != target) {
+            for (op, view) in read_paths(&emulator, &domain_id, id).await {
+                assert_eq!(
+                    (
+                        view.get("status").and_then(Value::as_str),
+                        view.get("deactivatedAt")
+                    ),
+                    (Some("ACTIVE"), None),
+                    "case {case:?}: {op} must leave the neighbours of the deactivated \
+                     subscription alone, got {view:?}"
+                );
+            }
+        }
+
+        // Re-activating RETAINS the deactivation stamp, so the inactive interval the
+        // subscription just left stays reconstructable.
+        let (status, answered) = emulator
+            .send("POST", &format!("{path}/activate"), Some(&json!({})))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ActivateSubscription got {answered:?}"
+        );
+        let activated = answered
+            .get("subscription")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: subscription in {answered:?}"));
+        assert_eq!(
+            (
+                activated.get("status").and_then(Value::as_str),
+                activated.get("deactivatedAt")
+            ),
+            (Some("ACTIVE"), Some(&stamp)),
+            "case {case:?}: re-activation must keep the prior deactivatedAt, got {activated:?}"
+        );
+        assert!(
+            activated.get("activatedAt").is_some(),
+            "case {case:?}: an explicit activation stamps activatedAt, got {activated:?}"
+        );
+        for (op, view) in read_paths(&emulator, &domain_id, &target).await {
+            assert_eq!(
+                (
+                    view.get("status").and_then(Value::as_str),
+                    view.get("deactivatedAt")
+                ),
+                (Some("ACTIVE"), Some(&stamp)),
+                "case {case:?}: {op} must still report the retained deactivatedAt, got {view:?}"
+            );
+        }
+    }
 }

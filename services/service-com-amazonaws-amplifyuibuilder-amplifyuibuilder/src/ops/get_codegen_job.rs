@@ -162,11 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(job) = store.codegen_job(&input.app_id, &input.environment_name, &input.id) else {
             return Err(GetCodegenJobErrorModeled::ResourceNotFoundException(
-                crate::state::codegen_job_not_found(
-                    &input.app_id,
-                    &input.environment_name,
-                    &input.id,
-                ),
+                crate::state::item_not_found(),
             )
             .into());
         };
