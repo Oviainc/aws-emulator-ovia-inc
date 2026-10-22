@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNetworkConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNetworkConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNetworkConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +201,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNetworkConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNetworkConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNetworkConnector"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetNetworkConnectorErrorModeled::ServiceException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Reporting the connector as of now materialises the changes the clock
+        // already owes it — provisioning finishing, an update finishing, a
+        // deletion completing. Each was due at this instant whether or not
+        // anybody called; nothing else here writes.
+        let Some((connector, qualified)) = store.settled_mut(&input.identifier, now) else {
+            return Err(GetNetworkConnectorErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        // An unqualified identifier "retrieve[s] the connector's latest
+        // version"; a version-qualified one retrieves "a specific historical
+        // version", which must be a version the connector still holds.
+        let Some(version) = connector.version(qualified) else {
+            return Err(GetNetworkConnectorErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        Ok(GetNetworkConnectorOutput {
+            arn: connector.arn.clone(),
+            name: connector.name.clone(),
+            id: connector.id.clone(),
+            // `VersionArn` "is populated only when you supply a
+            // version-qualified identifier", and `LatestVersion` /
+            // `LatestVersionArn` "only on a standard (unqualified) request" —
+            // so the two pairs are mutually exclusive. `Version` is reported
+            // either way: the requested version, or the connector's current
+            // one.
+            version_arn: qualified.map(|_| version.version_arn.clone()),
+            version: Some(version.version),
+            latest_version_arn: qualified.is_none().then(|| connector.latest_version_arn()),
+            latest_version: qualified.is_none().then_some(connector.latest_version),
+            configuration: Some(version.configuration.clone()),
+            operator_role: version.operator_role.clone(),
+            state: Some(connector.state.clone()),
+            // Both state reasons are "populated when the state is FAILED or
+            // DELETE_FAILED", which no connector this emulator provisions
+            // reaches, and both last-update reasons explain a failed update,
+            // which it never produces either — so each is whatever the record
+            // holds, which is nothing.
+            state_reason: connector.state_reason.clone(),
+            state_reason_code: connector.state_reason_code.clone(),
+            last_update_status: connector.last_update_status.clone(),
+            last_update_status_reason: connector.last_update_status_reason.clone(),
+            last_update_status_reason_code: connector.last_update_status_reason_code.clone(),
+            // "When the connector configuration was last modified": the
+            // requested version's own instant when one was named, else the
+            // connector's.
+            last_modified: Some(::aws_smithy_types::DateTime::from(if qualified.is_some() {
+                version.last_modified
+            } else {
+                connector.last_modified
+            })),
+        })
     }
 }

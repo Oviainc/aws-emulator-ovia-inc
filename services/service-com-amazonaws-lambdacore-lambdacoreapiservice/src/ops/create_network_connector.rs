@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +189,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkConnector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateNetworkConnectorErrorModeled::ServiceException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Every connector this call reads or conflicts with is reported as of
+        // now, so the changes the clock already owes them are materialised
+        // first — including a deletion that completed, which frees the name.
+        store.settle_all(now);
+
+        // `@idempotencyToken`: "if you retry a request that completed
+        // successfully using the same client token, the operation returns the
+        // existing connector without creating a duplicate".
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency.get(token).cloned());
+        if let Some(outcome) = replayed {
+            if let Some(connector) = store.connectors.get(&outcome.name) {
+                if let Some(version) = connector.version(Some(outcome.version)) {
+                    return Ok(CreateNetworkConnectorOutput {
+                        arn: connector.arn.clone(),
+                        name: connector.name.clone(),
+                        id: connector.id.clone(),
+                        version_arn: Some(version.version_arn.clone()),
+                        version: Some(version.version),
+                        configuration: Some(version.configuration.clone()),
+                        operator_role: version.operator_role.clone(),
+                        state: Some(connector.state.clone()),
+                    });
+                }
+            }
+        }
+
+        // The name is "a unique name for the network connector within your
+        // account and Region", so a second connector cannot take one that is
+        // already in use.
+        if store.connectors.contains_key(&input.name) {
+            return Err(CreateNetworkConnectorErrorModeled::ResourceConflictException(
+                crate::state::connector_conflict(format!(
+                    "A network connector named {} already exists in this account and Region",
+                    input.name
+                )),
+            )
+            .into());
+        }
+
+        if store.connectors.len() >= crate::state::CONNECTOR_QUOTA {
+            return Err(
+                CreateNetworkConnectorErrorModeled::NetworkConnectorLimitExceededException(
+                    NetworkConnectorLimitExceededException {
+                        r#type: None,
+                        message: Some(format!(
+                            "This account has reached the maximum of {} network connectors \
+                             allowed in this Region",
+                            crate::state::CONNECTOR_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_connector_id();
+        let arn = crate::state::connector_arn(&region, &input.name);
+        // The type follows from the configuration the request carries:
+        // `VPC_EGRESS` is the connector type a `VpcEgressConfiguration`
+        // configures.
+        let connector_type = match &input.configuration {
+            NetworkConnectorConfiguration::VpcEgressConfiguration(_) => {
+                crate::state::CONNECTOR_TYPE_VPC_EGRESS.to_string()
+            }
+        };
+        // "A newly created connector starts at version 1."
+        let version = 1_i64;
+        // "The network connector starts in PENDING state while ENIs are
+        // provisioned in your VPC": the clock owes it ACTIVE, and nothing a
+        // caller does brings that forward.
+        let provisioned = crate::state::PendingTransition {
+            due: now + crate::state::LIFECYCLE_TRANSITION,
+            change: crate::state::PendingChange::State(crate::state::STATE_ACTIVE.to_string()),
+        };
+        let connector = crate::state::NetworkConnector {
+            name: input.name.clone(),
+            id: id.clone(),
+            arn: arn.clone(),
+            connector_type,
+            state: crate::state::STATE_PENDING.to_string(),
+            pending: Some(provisioned.clone()),
+            // Both reason members explain a FAILED state, which a connector
+            // this emulator provisions never reaches.
+            state_reason: None,
+            state_reason_code: None,
+            // The update members report "the most recent update"; this
+            // connector has never been updated.
+            last_update_status: None,
+            last_update_status_reason: None,
+            last_update_status_reason_code: None,
+            pending_update: None,
+            last_modified: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            latest_version: version,
+            versions: [(
+                version,
+                crate::state::ConnectorVersion {
+                    version,
+                    version_arn: format!("{arn}:{version}"),
+                    configuration: input.configuration,
+                    operator_role: input.operator_role,
+                    state: crate::state::STATE_PENDING.to_string(),
+                    pending: Some(provisioned),
+                    last_modified: now,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let output = CreateNetworkConnectorOutput {
+            arn: connector.arn.clone(),
+            name: connector.name.clone(),
+            id: connector.id.clone(),
+            version_arn: Some(connector.version_arn(version)),
+            version: Some(version),
+            configuration: connector
+                .version(Some(version))
+                .map(|stored| stored.configuration.clone()),
+            operator_role: connector
+                .version(Some(version))
+                .and_then(|stored| stored.operator_role.clone()),
+            state: Some(connector.state.clone()),
+        };
+
+        let name = connector.name.clone();
+        store.connectors.insert(name.clone(), connector);
+        if let Some(token) = input.client_token {
+            store.remember_token(token, name, version);
+        }
+
+        Ok(output)
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNetworkConnectorVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNetworkConnectorVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNetworkConnectorVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNetworkConnectorVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNetworkConnectorVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNetworkConnectorVersions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListNetworkConnectorVersionsErrorModeled::ServiceException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // "Specify an unqualified identifier — this operation lists ALL
+        // versions of the connector, not a specific version."
+        let parsed = crate::state::parse_identifier(&input.identifier);
+        if parsed.version.is_some() {
+            return Err(
+                ListNetworkConnectorVersionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "Identifier {} is version-qualified; specify an unqualified \
+                             identifier to list every version of a connector",
+                            input.identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The marker is the version number the next page starts at, which is
+        // what a previous answer's `NextMarker` carried.
+        let resume_at = match input.marker.as_deref() {
+            None => None,
+            Some(marker) => match marker.parse::<i64>() {
+                Ok(version) if version >= 1 => Some(version),
+                _ => {
+                    return Err(
+                        ListNetworkConnectorVersionsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                r#type: None,
+                                message: Some(format!(
+                                    "Marker {marker} is not a token returned by \
+                                     ListNetworkConnectorVersions"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let page_size = crate::state::page_size(input.max_items, crate::state::VERSION_PAGE_LIMIT);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some((connector, _)) = store.settled_mut(&input.identifier, now) else {
+            return Err(
+                ListNetworkConnectorVersionsErrorModeled::ResourceNotFoundException(
+                    crate::state::connector_not_found(&input.identifier),
+                )
+                .into(),
+            );
+        };
+
+        let mut network_connector_versions =
+            Vec::with_capacity(page_size.min(connector.versions.len()));
+        let mut next_marker = None;
+        for (number, version) in &connector.versions {
+            if resume_at.is_some_and(|marker| *number < marker) {
+                continue;
+            }
+            // "Optional filter to return only versions in the specified
+            // state."
+            if input
+                .state
+                .as_deref()
+                .is_some_and(|wanted| version.state != wanted)
+            {
+                continue;
+            }
+            if network_connector_versions.len() == page_size {
+                // `NextMarker` "is null when there are no more results".
+                next_marker = Some(number.to_string());
+                break;
+            }
+            network_connector_versions.push(connector.to_version_summary(version));
+        }
+
+        Ok(ListNetworkConnectorVersionsOutput {
+            network_connector_versions,
+            next_marker,
+        })
     }
 }

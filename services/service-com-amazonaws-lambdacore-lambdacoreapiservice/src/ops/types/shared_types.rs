@@ -13,13 +13,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-lambdacore-lambdacoreap
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.lambdacore#NetworkConnectorConfiguration")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+// `PartialEq` is what lets `UpdateNetworkConnector` tell a configuration change
+// from the no-op update the model documents ("a no-op update returns the current
+// version number").
+#[derive(Debug, Clone, PartialEq)]
 pub enum NetworkConnectorConfiguration {
     VpcEgressConfiguration(NetworkConnectorVpcEgressConfiguration),
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.lambdacore#NetworkConnectorVpcEgressConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct NetworkConnectorVpcEgressConfiguration {
     pub subnet_ids: Option<Vec<String>>,
     pub security_group_ids: Option<Vec<String>>,
