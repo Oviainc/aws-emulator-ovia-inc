@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Cluster, Endpoint, Node, SecurityGroupMembership, Shard, Tag, ACL,
+    Cluster, Endpoint, EngineVersionInfo, Node, SecurityGroupMembership, Shard, Tag, ACL,
 };
 
 /// The region an ARN or endpoint carries when the request is unsigned, matching the
@@ -76,6 +76,100 @@ pub const TOTAL_SLOTS: i32 = 16_384;
 /// waits for the resource is quick. Never zero, and never slept on — the due instant
 /// is stored and materialised by whichever later call observes the resource.
 pub const SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// One engine version this service offers, as `DescribeEngineVersions` reports it.
+///
+/// The version is held as its NUMERIC parts rather than as strings, so every value the
+/// catalog answers with — `EngineVersion`, `EnginePatchVersion` and the
+/// `ParameterGroupFamily` the engine default parameters belong to — is DERIVED from the
+/// same three numbers and no two of them can disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineVersion {
+    /// `EngineVersionInfo$Engine`: "The name of the engine for which version
+    /// information is provided."
+    pub engine: &'static str,
+    pub major: u32,
+    pub minor: u32,
+    /// The patch release of `<major>.<minor>` this service runs.
+    pub patch: u32,
+}
+
+/// The engine versions MemoryDB offers, in catalog order.
+///
+/// SERVICE metadata, not per-caller state: the list is the same for every account (as a
+/// region's availability zones are), so it is a catalog rather than a map in
+/// [`ComAmazonawsMemorydbAmazonmemorydbState`]. It lives HERE, beside the store, so that
+/// every operation which has to resolve an engine version reads the one list and no two
+/// of them can publish different versions.
+///
+/// Source: the AWS MemoryDB *Supported engine versions* documentation — MemoryDB runs
+/// Redis OSS 6.2, 7.0 and 7.1, and Valkey 7.2 and 8.0, each at the patch release below.
+pub const ENGINE_VERSIONS: &[EngineVersion] = &[
+    EngineVersion { engine: ENGINE_REDIS, major: 6, minor: 2, patch: 6 },
+    EngineVersion { engine: ENGINE_REDIS, major: 7, minor: 0, patch: 7 },
+    EngineVersion { engine: ENGINE_REDIS, major: 7, minor: 1, patch: 1 },
+    EngineVersion { engine: ENGINE_VALKEY, major: 7, minor: 2, patch: 6 },
+    EngineVersion { engine: ENGINE_VALKEY, major: 8, minor: 0, patch: 0 },
+];
+
+/// `CreateCluster$Engine`: "The name of the engine to be used for the cluster." MemoryDB
+/// names its two engines with these lower-case tokens.
+pub const ENGINE_REDIS: &str = "redis";
+pub const ENGINE_VALKEY: &str = "valkey";
+
+/// The prefix every MemoryDB parameter group family carries, in front of the engine name
+/// and its major version (`memorydb_redis7`, `memorydb_valkey8`).
+const PARAMETER_GROUP_FAMILY_PREFIX: &str = "memorydb_";
+
+impl EngineVersion {
+    /// `EngineVersionInfo$EngineVersion` — "The engine version": `<major>.<minor>`.
+    pub fn version(&self) -> String {
+        format!("{}.{}", self.major, self.minor)
+    }
+
+    /// `EngineVersionInfo$EnginePatchVersion` — "The patched engine version":
+    /// `<major>.<minor>.<patch>`.
+    pub fn patch_version(&self) -> String {
+        format!("{}.{}.{}", self.major, self.minor, self.patch)
+    }
+
+    /// `EngineVersionInfo$ParameterGroupFamily` — "the name of the parameter group
+    /// family to which the engine default parameters apply". A MemoryDB family covers
+    /// one engine at one MAJOR version, so every minor version of an engine's major
+    /// version shares `memorydb_<engine><major>`.
+    pub fn parameter_group_family(&self) -> String {
+        format!("{PARAMETER_GROUP_FAMILY_PREFIX}{}{}", self.engine, self.major)
+    }
+
+    /// Whether this is the DEFAULT version of its parameter group family: the greatest
+    /// minor version the catalog publishes for this engine and major version. Default-ness
+    /// is a property of the family (the engine defaults a parameter group inherits), not
+    /// of one request, so `DescribeEngineVersions$DefaultOnly` narrows to these.
+    pub fn is_family_default(&self) -> bool {
+        !ENGINE_VERSIONS.iter().any(|other| {
+            other.engine == self.engine && other.major == self.major && other.minor > self.minor
+        })
+    }
+
+    /// This version's position in the catalog listing, for [`paginate`]'s token.
+    ///
+    /// Zero-padded, so the ordering the key gives is NUMERIC on the version parts: a
+    /// future `10.0` sorts after `8.0` rather than before it, which a bare `"10.0"`
+    /// string would not.
+    pub fn catalog_key(&self) -> String {
+        format!("{}/{:05}/{:05}", self.engine, self.major, self.minor)
+    }
+
+    /// The modelled `EngineVersionInfo` for this catalog entry.
+    pub fn to_api(&self) -> EngineVersionInfo {
+        EngineVersionInfo {
+            engine: Some(self.engine.to_string()),
+            engine_version: Some(self.version()),
+            engine_patch_version: Some(self.patch_version()),
+            parameter_group_family: Some(self.parameter_group_family()),
+        }
+    }
+}
 
 /// `Cluster$Status`: "The status of the cluster. For example, Available, Updating,
 /// Creating." MemoryDB renders them lower-case on the wire.

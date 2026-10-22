@@ -54,7 +54,10 @@ const MAX_REPLICAS: i64 = 5;
 
 /// A router with just this service mounted, on one shared engine — what
 /// `core/router` builds, narrowed to the service under test.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the other suites in this test crate drive the SAME harness rather
+/// than standing up a second one.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -67,7 +70,7 @@ fn router() -> MultiServiceRouter {
 /// The `Authorization` header carries a SigV4 credential scope naming `memorydb` in
 /// that region: that is how the router picks this service, and how the handler learns
 /// the region a resource it mints belongs to.
-async fn call_signed(
+pub(crate) async fn call_signed(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -102,12 +105,12 @@ async fn call_signed(
 }
 
 /// Call one operation signed for [`REGION`], and return `(status, body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     call_signed(router, REGION, operation, body).await
 }
 
 /// Call an operation that must succeed, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
     let (status, body) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -117,7 +120,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &s
 }
 
 /// The wire error code of a failure body (`__type`, with any namespace prefix dropped).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
