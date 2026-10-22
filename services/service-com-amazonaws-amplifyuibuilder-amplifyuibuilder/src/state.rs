@@ -1034,77 +1034,81 @@ pub fn is_known_metadata_feature(name: &str) -> bool {
     METADATA_FEATURES.contains(&name)
 }
 
-/// The `ResourceNotFoundException` payload for an id that names no component in
-/// the app environment the request addressed.
-pub fn component_not_found(app_id: &str, environment_name: &str, id: &str) -> ResourceNotFoundException {
+// The messages of this service's resource refusals.
+//
+// AmplifyUIBuilder answers a refused resource call with NO error-type
+// discriminator (see `crate::service::untyped_errors`): no `x-amzn-errortype`
+// header and no `__type` / `code` / `Code` member, so a client's `Error.Code`
+// degrades to the bare status string and the `message` is the ONLY
+// machine-readable name the failure class has. The service's own messages for
+// these classes are therefore part of its wire contract, and each is a FIXED
+// literal that interpolates nothing from the request — no app id, no
+// environment name, no resource id or name — and one literal per class, not per
+// resource kind. A message built out of the request would carry per-run text no
+// client can match, which is why the constants below take no arguments.
+
+/// The message of the not-found refusal of a REPORTING or UPDATING call — an id
+/// that names no resource the request could address.
+///
+/// Recorded behaviour: the model gives these exceptions a `message` member but
+/// no text for it, so the literal is the one the service is observed to answer.
+pub const ITEM_NOT_FOUND_MESSAGE: &str = "The item specified was not found";
+
+/// The message of the not-found refusal of a DELETE — a deliberately different
+/// literal from [`ITEM_NOT_FOUND_MESSAGE`], which is what lets a client tell a
+/// failed delete from a failed read apart on an otherwise identical untyped 404
+/// (idempotent-delete logic keys on it).
+///
+/// Recorded behaviour, like the read path's.
+pub const ITEM_TO_DELETE_NOT_FOUND_MESSAGE: &str = "Unable to find item to delete";
+
+/// The message of the conflict refusal of a call that would leave two live
+/// resources of one app environment sharing a name.
+///
+/// Recorded behaviour, like the not-found literals.
+pub const DUPLICATE_ITEM_NAME_MESSAGE: &str = "Item name already exists";
+
+/// The message of the wrong-scope refusal — an id that resolves, but under
+/// another app or backend environment than the one the request addressed.
+///
+/// Recorded behaviour: the message contains the fixed phrase "does not belong to
+/// that app or environment", which names no ids; it is what separates a scope
+/// violation from an ordinary malformed-parameter rejection, both untyped 400s.
+pub const WRONG_SCOPE_MESSAGE: &str =
+    "The item specified does not belong to that app or environment";
+
+/// The `ResourceNotFoundException` payload a reporting or updating call answers
+/// for an id that names no resource in the app environment the request
+/// addressed.
+pub fn item_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "no component {id} in app {app_id} environment {environment_name}"
-        )),
+        message: Some(ITEM_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 
-/// The `InvalidParameterException` payload for an id that names a component
+/// The `ResourceNotFoundException` payload a DELETE answers for an id that names
+/// no resource in the app environment the request addressed: the delete path has
+/// its own literal, so it is not the read path's payload.
+pub fn item_to_delete_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(ITEM_TO_DELETE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The `InvalidParameterException` payload for an id that names a resource
 /// another app environment owns: the request is addressed to the wrong scope,
 /// which is a different failure from an id that names nothing.
-pub fn component_wrong_scope(
-    app_id: &str,
-    environment_name: &str,
-    id: &str,
-) -> InvalidParameterException {
+pub fn item_wrong_scope() -> InvalidParameterException {
     InvalidParameterException {
-        message: Some(format!(
-            "component {id} does not belong to app {app_id} environment {environment_name}"
-        )),
+        message: Some(WRONG_SCOPE_MESSAGE.to_string()),
     }
 }
 
-/// The `ResourceConflictException` payload for a component name another live
-/// component of the same app environment already holds.
-pub fn duplicate_component_name(
-    app_id: &str,
-    environment_name: &str,
-    name: &str,
-) -> ResourceConflictException {
+/// The `ResourceConflictException` payload for a name another live resource of
+/// the same app environment already holds.
+pub fn duplicate_item_name() -> ResourceConflictException {
     ResourceConflictException {
-        message: Some(format!(
-            "a component named {name} already exists in app {app_id} environment \
-             {environment_name}"
-        )),
-    }
-}
-
-/// The `ResourceNotFoundException` payload for an id that names no codegen job in
-/// the app environment the request addressed.
-pub fn codegen_job_not_found(
-    app_id: &str,
-    environment_name: &str,
-    id: &str,
-) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "no codegen job {id} in app {app_id} environment {environment_name}"
-        )),
-    }
-}
-
-/// The `ResourceNotFoundException` payload for an id that names no form in the
-/// app environment the request addressed.
-pub fn form_not_found(app_id: &str, environment_name: &str, id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "no form {id} in app {app_id} environment {environment_name}"
-        )),
-    }
-}
-
-/// The `ResourceNotFoundException` payload for an id that names no theme in the
-/// app environment the request addressed.
-pub fn theme_not_found(app_id: &str, environment_name: &str, id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "no theme {id} in app {app_id} environment {environment_name}"
-        )),
+        message: Some(DUPLICATE_ITEM_NAME_MESSAGE.to_string()),
     }
 }
 

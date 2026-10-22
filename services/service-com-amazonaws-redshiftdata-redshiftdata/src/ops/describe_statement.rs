@@ -130,7 +130,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::to_timestamp;
+use crate::state::{to_timestamp, Statement};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -238,25 +238,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: Some(to_timestamp(statement.updated_at)),
             redshift_pid: statement.redshift_pid,
             has_result_set: statement.has_result_set(),
-            query_string: Some(statement.sql.clone()),
+            query_string: statement.query_string(),
             result_rows: statement.result_rows(),
             result_size: statement.result_size(),
             redshift_query_id: statement.redshift_query_id,
-            redshift_query_uuid: Some(statement.query_uuid.clone()),
+            redshift_query_uuid: statement.query_uuid.clone(),
             // `SqlParametersList` is modelled with a minimum length of 1, so a
             // statement submitted without parameters reports the member absent
             // rather than as an empty list.
             query_parameters: (!statement.parameters.is_empty())
                 .then(|| statement.parameters.clone()),
-            // `SubStatements` describes the statements of a batch request;
-            // `ExecuteStatement` submits exactly one statement, so there are
-            // none. `BatchExecuteStatement` is a separate operation and is still
-            // scaffolded.
-            sub_statements: None,
+            // `SubStatements` describes "the SQL statements from a multiple
+            // statement run", so it is reported for a batch submission and
+            // only for one: a single `ExecuteStatement` ran exactly one
+            // statement, which it reports as `QueryString`.
+            sub_statements: statement.is_batch.then(|| {
+                statement
+                    .sub_statements
+                    .iter()
+                    .map(sub_statement_data)
+                    .collect()
+            }),
             workgroup_name: statement.target.workgroup_name(),
             result_format: Some(statement.result_format.clone()),
             session_id: statement.session_id.clone(),
             execution_mode: Some(statement.execution_mode().to_string()),
         })
+    }
+}
+
+/// One entry of `SubStatements`: one statement of a batch, reported from what
+/// that statement itself did.
+fn sub_statement_data(sub_statement: &Statement) -> SubStatementData {
+    SubStatementData {
+        id: sub_statement.id.clone(),
+        duration: sub_statement.duration_nanos(),
+        error: sub_statement.error(),
+        status: Some(sub_statement.status.as_str().to_string()),
+        created_at: Some(to_timestamp(sub_statement.created_at)),
+        updated_at: Some(to_timestamp(sub_statement.updated_at)),
+        query_string: sub_statement.query_string(),
+        result_rows: sub_statement.result_rows(),
+        result_size: sub_statement.result_size(),
+        redshift_query_id: sub_statement.redshift_query_id,
+        redshift_query_uuid: sub_statement.query_uuid.clone(),
+        has_result_set: sub_statement.has_result_set(),
     }
 }

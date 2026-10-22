@@ -38,6 +38,9 @@ mod input_deletion;
 #[path = "all/input_lifecycle.rs"]
 mod input_lifecycle;
 
+#[path = "all/input_push_endpoints.rs"]
+mod input_push_endpoints;
+
 #[path = "all/input_security_group.rs"]
 mod input_security_group;
 

@@ -182,20 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // anywhere is absent (the modelled `ResourceNotFoundException`, 404).
             if store.component_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
                 return Err(DeleteComponentErrorModeled::InvalidParameterException(
-                    crate::state::component_wrong_scope(
-                        &input.app_id,
-                        &input.environment_name,
-                        &input.id,
-                    ),
+                    crate::state::item_wrong_scope(),
                 )
                 .into());
             }
+            // The refusals carry no error type, so the message is the only name
+            // the failure class has — and the delete path's not-found message is
+            // its OWN literal, not the read path's: that is what lets a client
+            // tell a failed delete from a failed read apart.
             return Err(DeleteComponentErrorModeled::ResourceNotFoundException(
-                crate::state::component_not_found(
-                    &input.app_id,
-                    &input.environment_name,
-                    &input.id,
-                ),
+                crate::state::item_to_delete_not_found(),
             )
             .into());
         }

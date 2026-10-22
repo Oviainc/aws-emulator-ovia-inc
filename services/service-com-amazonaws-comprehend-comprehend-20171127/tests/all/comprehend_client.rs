@@ -37,12 +37,32 @@ pub struct Comprehend {
 impl Comprehend {
     /// A fresh emulator with an empty store.
     pub fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        Self::over_engine(Arc::new(engine::InMemoryEngine::new()), false)
+    }
+
+    /// A fresh emulator with the S3 service mounted beside Comprehend on the SAME
+    /// engine — what the assembled emulator does.
+    ///
+    /// `StartDominantLanguageDetectionJob` reads its input documents from the Amazon
+    /// S3 location `InputDataConfig` names and writes its output archive back to the
+    /// one `OutputDataConfig` names, by calling S3 in process, so the suites that
+    /// exercise a job's run need object storage answering.
+    pub fn with_object_storage() -> Self {
+        Self::over_engine(Arc::new(engine::InMemoryEngine::new()), true)
+    }
+
+    /// The one construction path both constructors use, so they cannot drift.
+    fn over_engine(engine: Arc<engine::InMemoryEngine>, with_object_storage: bool) -> Self {
         let mut router = MultiServiceRouter::new();
         // The suites assert on service behaviour, not on signature verification, and
         // sign with a fixed scope so the region is deterministic.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        if with_object_storage {
+            router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+        }
         Self { router, engine }
     }
 
@@ -87,6 +107,32 @@ impl Comprehend {
             })
         };
         (status, parsed)
+    }
+
+    /// Send one path-style request to the emulator's S3 front door, returning the
+    /// HTTP status and the raw response body.
+    ///
+    /// S3 is a REST service: the bucket and key live in the URI and the body is the
+    /// object's own bytes, so this is a raw request rather than an `x-amz-target`
+    /// call. The credential scope names `s3`, which is what the router claims on.
+    pub async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/s3/\
+                     aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
+                ),
+            )
+            .body(::bytes::Bytes::copy_from_slice(body))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        (
+            response.status().as_u16(),
+            response.body().as_ref().to_vec(),
+        )
     }
 
     /// Call `operation` expecting success, returning the parsed output.

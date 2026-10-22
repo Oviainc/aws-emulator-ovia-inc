@@ -29,7 +29,7 @@ pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the router handed the service, so a suite can seed a
     /// record no implemented operation mints.
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 /// A served response, reduced to what the assertions read.

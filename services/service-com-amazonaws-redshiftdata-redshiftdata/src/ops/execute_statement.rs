@@ -155,7 +155,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{non_empty, to_timestamp, ConnectionTarget, NoDatabase, Statement, Submission};
+use crate::state::{
+    non_empty, to_timestamp, BadConnection, ConnectionRequest, NoDatabase, Statement, Submission,
+    SubmissionKind,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -235,61 +238,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(unavailable());
         };
 
-        // A statement runs against exactly one data warehouse: the documented
-        // authorization combinations name either a provisioned cluster
-        // (`ClusterIdentifier`) or a serverless workgroup (`WorkgroupName`),
-        // never both and never neither.
-        //
-        // The session-reuse form, where a caller that already holds a
-        // `SessionId` names neither, is a VALID request this slice cannot serve
-        // faithfully: the warehouse and database such a call runs against are
-        // the ones its session was opened with, and no session store exists yet
-        // (`ListSessions` is still scaffolded), so the only way to answer it
-        // would be to invent a connection target. It is answered with the
-        // scaffold's `NotImplemented` — the gap is this emulator's, not the
-        // caller's, so it is not dressed up as a malformed request — while a
-        // request that names no warehouse AND no session really is missing a
-        // required member and gets the modelled `ValidationException`.
-        let cluster_identifier = non_empty(input.cluster_identifier.as_ref());
-        let workgroup_name = non_empty(input.workgroup_name.as_ref());
-        let target = match (cluster_identifier, workgroup_name) {
-            (Some(cluster), None) => ConnectionTarget::Cluster(cluster),
-            (None, Some(workgroup)) => ConnectionTarget::Workgroup(workgroup),
-            (Some(_), Some(_)) => {
-                return Err(validation(
-                    "ClusterIdentifier and WorkgroupName cannot both be supplied: a statement \
-                     runs against either a provisioned cluster or a serverless workgroup",
-                ))
-            }
-            (None, None) if non_empty(input.session_id.as_ref()).is_some() => {
+        // A statement runs against exactly one data warehouse, one database and
+        // one authorization method, which `ConnectionRequest::resolve` is the
+        // single place that decides for every submit operation. The
+        // session-reuse form, where a caller that already holds a `SessionId`
+        // names neither warehouse, is a VALID request this slice cannot serve
+        // (no session store exists yet), so it is answered with the scaffold's
+        // `NotImplemented` rather than dressed up as a malformed request.
+        let connection = match (ConnectionRequest {
+            cluster_identifier: input.cluster_identifier.as_ref(),
+            workgroup_name: input.workgroup_name.as_ref(),
+            session_id: input.session_id.as_ref(),
+            database: input.database.as_ref(),
+            db_user: input.db_user.as_ref(),
+            secret_arn: input.secret_arn.as_ref(),
+        })
+        .resolve()
+        {
+            Ok(connection) => connection,
+            Err(BadConnection::SessionOnly) => {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(
                     "ExecuteStatement with only a SessionId as its connection target",
                 ))
             }
-            (None, None) => {
-                return Err(validation(
-                    "one of ClusterIdentifier (a provisioned cluster) or WorkgroupName (a \
-                     serverless workgroup) is required",
-                ))
-            }
+            Err(problem) => return Err(validation(problem.message())),
         };
-
-        // Every documented authorization combination also supplies the database.
-        let Some(database) = non_empty(input.database.as_ref()) else {
-            return Err(validation("Database is required"));
-        };
-
-        // `SecretArn` selects Secrets Manager authorization and `DbUser` selects
-        // temporary credentials; they are alternatives, so supplying both names
-        // two authorization methods for one statement.
-        let db_user = non_empty(input.db_user.as_ref());
-        let secret_arn = non_empty(input.secret_arn.as_ref());
-        if db_user.is_some() && secret_arn.is_some() {
-            return Err(validation(
-                "DbUser and SecretArn cannot both be supplied: DbUser authenticates with \
-                 temporary credentials and SecretArn with Secrets Manager",
-            ));
-        }
 
         if input.sql.trim().is_empty() {
             return Err(validation("Sql must contain a SQL statement"));
@@ -298,7 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let client_token = non_empty(input.client_token.as_ref());
 
         // An idempotent replay answers with the statement the first call
-        // submitted, read back out of state — it never submits a second one.
+        // submitted, read back out of state — it never submits a second one. A
+        // token that names a BATCH submission is not a replay of one statement,
+        // so it is not answered as one.
         if let Some(token) = client_token.as_deref() {
             let mut store = state.lock();
             store.materialise_due_transitions();
@@ -306,6 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(output) = replayed
                 .as_deref()
                 .and_then(|id| store.statement(id))
+                .filter(|statement| !statement.is_batch)
                 .map(output_for)
             {
                 return Ok(output);
@@ -328,11 +304,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         let submission = Submission {
-            sql: input.sql.clone(),
-            target,
-            database,
-            db_user,
-            secret_arn,
+            statements: vec![input.sql.clone()],
+            kind: SubmissionKind::Single,
+            target: connection.target,
+            database: connection.database,
+            db_user: connection.db_user,
+            secret_arn: connection.secret_arn,
             statement_name: non_empty(input.statement_name.as_ref()),
             parameters: input.parameters.unwrap_or_default(),
             with_event: input.with_event.unwrap_or(false),
@@ -381,7 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
-        let sql = submission.sql.clone();
+        let sql = input.sql.clone();
         let parameters = submission.parameters.clone();
         // The engine bounds its own execution (a wall-clock deadline and a step
         // budget, enforced by its progress handler), and THIS bounds how long the
@@ -437,7 +414,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        let id = store.record(submission, pid, execution);
+        let id = store.record(submission, pid, vec![execution]);
         let Some(statement) = store.statement(&id) else {
             return Err(unavailable());
         };
