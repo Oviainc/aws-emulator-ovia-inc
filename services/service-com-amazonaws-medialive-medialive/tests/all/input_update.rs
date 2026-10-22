@@ -129,12 +129,17 @@ async fn an_update_replaces_only_the_members_the_request_names() {
             )],
         ),
         (
-            // `Ip` is the request's `StaticIpAddress`; the push endpoint's port
-            // and URL are infrastructure this emulator does not allocate, so a
-            // destination reports neither.
+            // The baseline input is `URL_PULL`, a type with no push ingest
+            // protocol, so the destination reports no port or URL; `Ip` is the
+            // request's own `StaticIpAddress`, and the route list is reported
+            // empty rather than unset. The push rows live in
+            // `input_push_endpoints.rs`.
             "one push destination",
             json!({ "destinations": [{ "streamName": "live/x", "staticIpAddress": "10.0.0.5" }] }),
-            vec![("destinations", json!([{ "ip": "10.0.0.5" }]))],
+            vec![(
+                "destinations",
+                json!([{ "ip": "10.0.0.5", "networkRoutes": [] }]),
+            )],
         ),
         (
             "two media connect flows",
