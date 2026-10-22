@@ -537,12 +537,12 @@ async fn every_ivs_signed_request_is_dispatched_instead_of_refused_as_ambiguous(
             "ValidationException",
         ),
         (
-            "ivs ImportPlaybackKeyPair, still scaffolded",
+            "ivs ImportPlaybackKeyPair with material that is not a public key",
             "POST",
             "/ImportPlaybackKeyPair",
             json!({"publicKeyMaterial": "-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----"}),
-            501,
-            "NotImplemented",
+            400,
+            "ValidationException",
         ),
         (
             "realtime CreateStage, still scaffolded",
