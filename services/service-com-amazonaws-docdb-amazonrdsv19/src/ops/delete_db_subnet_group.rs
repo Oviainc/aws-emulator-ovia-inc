@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the subnet-group record `DBSubnetGroupName` names
+//! from this service's state, so a later `DescribeDBSubnetGroups` reports the modelled 404
+//! for it. A group a cluster is still placed in is refused rather than removed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBSubnetGroup"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+
+        // "Constraints: Must match the name of an existing DBSubnetGroup" — a name that
+        // names nothing in state is the modelled 404. This emulator seeds no `default`
+        // subnet group (that group belongs to a VPC, and there is no VPC inventory here),
+        // so `default` names nothing either and takes the same answer.
+        let Some(key) = store.resolve_subnet_group_key(&input.db_subnet_group_name) else {
+            return Err(
+                DeleteDBSubnetGroupErrorModeled::DBSubnetGroupNotFoundFault(
+                    DBSubnetGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBSubnetGroup not found: {}",
+                            input.db_subnet_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The specified database subnet group must not be associated with any DB
+        // instances": a group a cluster is still placed in is in use, so the delete is
+        // refused with the modelled state fault and the record stays.
+        let users = store.subnet_group_users(&key);
+        if !users.is_empty() {
+            return Err(
+                DeleteDBSubnetGroupErrorModeled::InvalidDBSubnetGroupStateFault(
+                    InvalidDBSubnetGroupStateFault {
+                        message: Some(format!(
+                            "DB subnet group '{key}' is in use by {}",
+                            users.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.subnet_groups.remove(&key);
+        Ok(DeleteDBSubnetGroupOutput)
     }
 }

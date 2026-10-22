@@ -4,7 +4,10 @@
 //! IMPLEMENTED: this operation inserts a cluster record into this service's state, keyed
 //! by the lowercased `DBClusterIdentifier`, and answers with the stored record. A new
 //! cluster is born `creating`; the clock owes it `available`, which the next call that
-//! reports the cluster materialises (see `crate::state::PROVISIONING_DELAY`).
+//! reports the cluster materialises (see `crate::state::PROVISIONING_DELAY`). A request
+//! that names a resource this service does not hold (a subnet group, a cluster parameter
+//! group) or an engine version the engine does not offer is refused before anything is
+//! stored.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -349,6 +352,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DBClusterIdentifier`: "This parameter is stored as a lowercase string."
         let identifier = input.db_cluster_identifier.to_ascii_lowercase();
 
+        // `EngineVersion`: "The version number of the database engine to use." A version
+        // the requested engine does not offer cannot be run, so the request is refused with
+        // the awsQuery common code for parameters that cannot hold together, and the
+        // message is built from the request — the version asked for and the engine it was
+        // asked for. An absent version takes the documented default: "The --engine-version
+        // will default to the latest major engine version."
+        let engine_version = match &input.engine_version {
+            Some(requested) => docdb::resolve_engine_version(requested)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::query_common(
+                        crate::scaffolded::QueryCommonError::InvalidParameterCombination,
+                        format!("Cannot find version {requested} for {}", input.engine),
+                    )
+                })?
+                .to_string(),
+            None => docdb::DEFAULT_ENGINE_VERSION.to_string(),
+        };
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The emulator's own failure, not the caller's: a 500 `InternalFailure`
             // rather than a 400 that would blame the request or a 501 that would claim
@@ -379,6 +400,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // `DBSubnetGroupName`: "Must match the name of an existing DBSubnetGroup." A name
+        // that matches none is the modelled 404, and nothing is stored: a cluster must not
+        // come into being holding a reference to a resource that does not exist. The
+        // RESOLVED key is what the record keeps — the member accepts a name in any case and
+        // the group's ARN, and the record must name the group the way the group is stored,
+        // or the reference is invisible to `DeleteDBSubnetGroup`'s in-use rule and the
+        // cluster reports a name AWS would not.
+        let db_subnet_group = match &input.db_subnet_group_name {
+            Some(requested) => {
+                let Some(key) = store.resolve_subnet_group_key(requested) else {
+                    return Err(CreateDBClusterErrorModeled::DBSubnetGroupNotFoundFault(
+                        DBSubnetGroupNotFoundFault {
+                            message: Some(format!(
+                                "DB subnet group '{requested}' does not exist."
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                Some(key)
+            }
+            None => None,
+        };
+
+        // The same rule for the other resource this create names by name: the cluster
+        // parameter group must exist, or the modelled 404 says which one did not. Its
+        // resolved name is kept for the same reason.
+        let db_cluster_parameter_group = match &input.db_cluster_parameter_group_name {
+            Some(requested) => {
+                let Some(group) = docdb::resolve_parameter_group(requested, &region) else {
+                    return Err(
+                        CreateDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
+                            DBClusterParameterGroupNotFoundFault {
+                                message: Some(format!(
+                                    "DBClusterParameterGroup not found: {requested}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                group.db_cluster_parameter_group_name
+            }
+            None => None,
+        };
 
         // The store's own cap: an over-quota create is refused, never stored.
         if store.clusters.len() >= docdb::MAX_DB_CLUSTERS {
@@ -422,9 +489,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: docdb::STATUS_CREATING.to_string(),
             available_at: Some(::std::time::Instant::now() + docdb::PROVISIONING_DELAY),
             engine: input.engine.to_ascii_lowercase(),
-            engine_version: input
-                .engine_version
-                .unwrap_or_else(|| docdb::DEFAULT_ENGINE_VERSION.to_string()),
+            engine_version,
             port: input.port.unwrap_or(docdb::DEFAULT_PORT),
             master_username: input.master_username,
             cluster_create_time: docdb::now(),
@@ -442,8 +507,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deletion_protection: input.deletion_protection.unwrap_or(false),
             availability_zones,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
-            db_subnet_group: input.db_subnet_group_name,
-            db_cluster_parameter_group: input.db_cluster_parameter_group_name,
+            db_subnet_group,
+            db_cluster_parameter_group,
             enabled_cloudwatch_logs_exports: input
                 .enable_cloudwatch_logs_exports
                 .unwrap_or_default(),

@@ -528,7 +528,9 @@ const QUIET_CATALOG: &[QuietRow] = &[
     },
     QuietRow {
         case: "a lower floor only",
-        patch: || json!({"MinCapacity": 0}),
+        // The floor of a DynamoDB capacity dimension is one provisioned unit, so this is
+        // as low as the window goes; the stored capacity of 2 stays inside it.
+        patch: || json!({"MinCapacity": 1}),
     },
     QuietRow {
         case: "a ceiling still above the capacity",
