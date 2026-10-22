@@ -153,6 +153,37 @@ impl ComAmazonawsB2biB2biState {
         }
     }
 
+    /// The tags stored on the resource `arn` names, or `None` when this service holds
+    /// no resource with that ARN.
+    ///
+    /// Every taggable resource this service persists — profile, capability,
+    /// partnership — keeps the tags it was created with on its own record, so the tag
+    /// list is looked up by the very ARN the create stored and handed back. An ARN that
+    /// differs from a stored one in any field (its region or its account, say) names no
+    /// resource here, which is what AWS reports as `ResourceNotFoundException`: "the
+    /// resource exists in a region other than the region specified in the API call".
+    ///
+    /// The scan is linear over at most three times [`MAX_RECORDS_PER_STORE`] records,
+    /// the same bound the List operations' scans carry.
+    pub fn tags_by_arn(&self, arn: &str) -> Option<&Vec<Tag>> {
+        self.profiles
+            .values()
+            .find(|profile| profile.profile_arn == arn)
+            .map(|profile| &profile.tags)
+            .or_else(|| {
+                self.capabilities
+                    .values()
+                    .find(|capability| capability.capability_arn == arn)
+                    .map(|capability| &capability.tags)
+            })
+            .or_else(|| {
+                self.partnerships
+                    .values()
+                    .find(|partnership| partnership.partnership_arn == arn)
+                    .map(|partnership| &partnership.tags)
+            })
+    }
+
     /// Drop every remembered token that minted `id`, called when `id`'s resource is
     /// deleted: a replay of that token mints a fresh resource anyway, so keeping the
     /// entry would hold memory for a resource that no longer exists.
@@ -182,6 +213,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// `CreatePartnership` the profile that `CreateProfile` created under the same token.
 pub fn idempotency_key(resource_type: &str, client_token: &str) -> String {
     format!("{resource_type}#{client_token}")
+}
+
+/// Whether `candidate` satisfies the AWS ARN grammar
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`: six colon-delimited
+/// fields, the first literally `arn`, with a non-empty partition, service and
+/// resource. `region` and `account-id` are the two fields AWS itself leaves empty on
+/// the ARNs of global services, so neither is required to be filled in; the resource
+/// field may itself contain colons and slashes, so it is whatever follows the fifth
+/// colon.
+///
+/// This is a SYNTAX test only, and the tagging operations keep it separate from the
+/// lookup on purpose: a candidate that is not an ARN at all is a client-side mistake
+/// (400 `ValidationException`), which is a different answer from a well-formed ARN
+/// that names no resource this service holds (404 `ResourceNotFoundException`).
+pub fn is_arn(candidate: &str) -> bool {
+    let fields: Vec<&str> = candidate.splitn(6, ':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && !fields[2].is_empty()
+        && !fields[5].is_empty()
 }
 
 /// The current wall-clock instant, as the modelled `CreatedDate`/`ModifiedDate` timestamp.

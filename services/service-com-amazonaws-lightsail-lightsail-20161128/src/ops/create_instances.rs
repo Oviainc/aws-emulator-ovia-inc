@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one instance record per requested name into this service's store and
+//! answers the operation-log entry each insert appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +189,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstances"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the instance's region is the region of the availability
+        // zone the request names, not the one the request signed for.
+        let _ = ctx;
+
+        // `instanceNames`, `availabilityZone`, `blueprintId` and `bundleId` are
+        // modelled `@required` members and every pattern on this input is a
+        // modelled constraint, so the centralized walk refused anything outside
+        // them before this body ran. What is left is what the model cannot
+        // express: the bundle and the availability zone must name things this
+        // service serves, no name may already be taken, and the caller-sized
+        // lists must be within the store's bounds. Every one of those is checked
+        // BEFORE the first write, so a refused request creates nothing.
+        let bundle = crate::state::bundle_spec(&input.bundle_id).ok_or_else(|| {
+            invalid(format!(
+                "bundleId '{}' names no Lightsail bundle: its leading size token must be \
+                 one of [{}]",
+                input.bundle_id,
+                crate::state::bundle_sizes()
+            ))
+        })?;
+        let region = crate::state::region_of_availability_zone(&input.availability_zone)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
+                     a region name followed by a zone letter, for one of [{}]",
+                    input.availability_zone,
+                    crate::state::region_names()
+                ))
+            })?;
+        let ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
+        if !IP_ADDRESS_TYPE_VALUES.contains(&ip_address_type.as_str()) {
+            return Err(invalid(format!(
+                "ipAddressType must be one of [{}], got '{ip_address_type}'",
+                IP_ADDRESS_TYPE_VALUES.join(", ")
+            )));
+        }
+        if input.instance_names.is_empty() {
+            return Err(invalid(
+                "instanceNames must name at least one instance to create".to_string(),
+            ));
+        }
+        if input.instance_names.len() > crate::state::MAX_INSTANCE_NAMES_PER_REQUEST {
+            return Err(invalid(format!(
+                "instanceNames carries {} names, more than the {} this service accepts in \
+                 one request",
+                input.instance_names.len(),
+                crate::state::MAX_INSTANCE_NAMES_PER_REQUEST
+            )));
+        }
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        // The add-ons each new instance will carry, resolved before any write
+        // because an unacceptable add-on request must create no instance at all.
+        let add_on_requests = input.add_ons.clone().unwrap_or_default();
+        let mut planned: Vec<(String, Vec<AddOn>)> =
+            Vec::with_capacity(input.instance_names.len());
+        for name in &input.instance_names {
+            let add_ons =
+                crate::state::add_ons_from_requests(name, &add_on_requests).map_err(invalid)?;
+            planned.push((name.clone(), add_ons));
+        }
+
+        let location = crate::state::StoredLocation {
+            availability_zone: input.availability_zone.clone(),
+            region_name: region.to_string(),
+        };
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Every name is checked before anything is written, so a request that
+            // names one instance that already exists creates none of the others
+            // either — and never silently overwrites the existing record.
+            for (position, name) in input.instance_names.iter().enumerate() {
+                if store.instances.contains_key(name) {
+                    return Err(invalid(format!("an instance named '{name}' already exists")));
+                }
+                if input.instance_names[..position].contains(name) {
+                    return Err(invalid(format!(
+                        "instanceNames names '{name}' more than once"
+                    )));
+                }
+            }
+            if store.instances.len() + planned.len() > crate::state::MAX_INSTANCES {
+                return Err(invalid(format!(
+                    "creating {} instances would take this account past the {} this \
+                     emulator holds",
+                    planned.len(),
+                    crate::state::MAX_INSTANCES
+                )));
+            }
+
+            let mut operations = Vec::with_capacity(planned.len());
+            for (name, add_ons) in planned {
+                let id = store.mint_uuid();
+                let (private_ip_address, public_ip_address, ipv6_addresses) =
+                    store.fresh_addresses(&ip_address_type);
+                // A new instance is not serving yet: the clock owes it `running`,
+                // which is why a read straight after this call still reports
+                // `pending`, exactly as it does against AWS.
+                let due = crate::state::DueTransition::after(now, crate::state::RUNNING);
+                store.insert_instance(crate::state::StoredInstance {
+                    name: name.clone(),
+                    arn: crate::state::instance_arn(region, &id),
+                    support_code: crate::state::support_code(&id),
+                    created_at_ms: now,
+                    location: location.clone(),
+                    tags: tags.clone(),
+                    blueprint_id: input.blueprint_id.clone(),
+                    bundle_id: input.bundle_id.clone(),
+                    add_ons,
+                    is_static_ip: false,
+                    private_ip_address,
+                    public_ip_address,
+                    ipv6_addresses,
+                    ip_address_type: ip_address_type.clone(),
+                    bundle,
+                    ssh_key_name: input
+                        .key_pair_name
+                        .clone()
+                        .unwrap_or_else(|| crate::state::DEFAULT_SSH_KEY_NAME.to_string()),
+                    user_data: input.user_data.clone(),
+                    state: crate::state::PENDING,
+                    due: Some(due),
+                });
+                operations.push(
+                    store
+                        .start_operation(
+                            now,
+                            crate::state::OPERATION_TYPE_CREATE_INSTANCE,
+                            &name,
+                            &location,
+                            Some(due.at_ms),
+                        )
+                        .view(),
+                );
+            }
+            Ok(CreateInstancesOutput {
+                operations: Some(operations),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateInstancesError {
+    CreateInstancesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateInstancesError {
+    CreateInstancesErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
