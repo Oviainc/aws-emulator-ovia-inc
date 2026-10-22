@@ -161,6 +161,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::caller_region(ctx.parts());
         let mut store = state.lock();
+
+        // ENABLEMENT PRECONDITION: see `ListSubscribers`. Nothing is removed for an
+        // account that has Security Lake enabled in no Region — there is no subscriber
+        // collection to remove from.
+        if !store.enabled_in_any_region() {
+            return Err(DeleteSubscriberErrorModeled::ResourceNotFoundException(
+                crate::state::not_enabled_in_any_region(),
+            )
+            .into());
+        }
+
         // `remove_subscriber` keeps the creation order of the rest, which is the order
         // ListSubscribers pages over, and refuses an id that belongs to another Region.
         if !store.remove_subscriber(&region, input.subscriber_id.as_str()) {

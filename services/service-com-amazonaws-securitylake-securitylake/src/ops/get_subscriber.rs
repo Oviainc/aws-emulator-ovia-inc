@@ -165,6 +165,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: a subscriber is created ACTIVE, so there is no clock-owed
         // transition to materialise and this handler writes nothing.
         let store = state.lock();
+
+        // ENABLEMENT PRECONDITION: see `ListSubscribers`. An account with Security Lake
+        // enabled in no Region has no subscriber collection, so the documented remedy
+        // (enable Security Lake) is reported instead of "no such subscriber".
+        if !store.enabled_in_any_region() {
+            return Err(GetSubscriberErrorModeled::ResourceNotFoundException(
+                crate::state::not_enabled_in_any_region(),
+            )
+            .into());
+        }
+
         let Some(subscriber) = store.subscriber_in(&region, input.subscriber_id.as_str()) else {
             return Err(GetSubscriberErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

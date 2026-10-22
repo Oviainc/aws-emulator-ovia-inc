@@ -44,6 +44,15 @@ pub const ACCESS_TYPE_LAKEFORMATION: &str = "LAKEFORMATION";
 /// than slept on. Public so a test can key its timing off the same value.
 pub const DATA_LAKE_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 
+/// What Security Lake answers a subscriber-scoped call with when the account has Security
+/// Lake enabled in NO Region at all.
+///
+/// The wire REQUIREMENT is the pairing `ResourceNotFoundException` / HTTP 404 that
+/// `smithy_query operation="ListSubscribers"` lists for every subscriber operation; this
+/// string is the documented remedy wording that goes with it ("enable Security Lake, then
+/// try again") and is held in one place so the gate reads the same from every handler.
+pub const NOT_ENABLED_IN_ANY_REGION_MESSAGE: &str = "The request failed because Security Lake isn't enabled for your account in any Regions. Enable Security Lake for your account and then try again.";
+
 /// The most data lakes this emulator holds at once.
 ///
 /// A BOUND the emulator enforces, not a number AWS publishes. `DataLakeConfiguration$region`
@@ -190,6 +199,17 @@ impl ComAmazonawsSecuritylakeSecuritylakeState {
         self.data_lakes.len()
     }
 
+    /// Whether this account has Security Lake enabled in ANY Region.
+    ///
+    /// Enabling Security Lake in a Region IS creating that Region's data lake
+    /// (`CreateDataLake`), and deleting the last one disables it again, so the stored
+    /// data lakes are the whole of the account's enablement state. The subscriber
+    /// operations consult this before serving: an account with no data lake anywhere has
+    /// no subscriber collection to read or write.
+    pub fn enabled_in_any_region(&self) -> bool {
+        !self.data_lakes.is_empty()
+    }
+
     /// Every stored data lake, in creation order.
     pub fn data_lakes(&self) -> &[DataLake] {
         &self.data_lakes
@@ -312,6 +332,20 @@ impl ComAmazonawsSecuritylakeSecuritylakeState {
             &hex[16..20],
             &hex[20..32]
         )
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a subscriber-scoped call is refused with when
+/// [`ComAmazonawsSecuritylakeSecuritylakeState::enabled_in_any_region`] is false.
+///
+/// `resourceName`/`resourceType` name ONE missing resource, and this precondition is about
+/// the account rather than any single data lake, so both stay absent and the payload
+/// carries only `message`.
+pub fn not_enabled_in_any_region() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(NOT_ENABLED_IN_ANY_REGION_MESSAGE.to_string()),
+        resource_name: None,
+        resource_type: None,
     }
 }
 
