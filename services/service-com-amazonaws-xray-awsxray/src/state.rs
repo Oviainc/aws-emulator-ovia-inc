@@ -30,7 +30,11 @@
 //! documents (`smithy_query(query="doc",shape="PutTraceSegments")`): `name`,
 //! `id`, `trace_id` and `start_time` are required, `end_time`/`in_progress` say
 //! whether the segment is complete, and `error`/`fault`/`throttle`, `http`,
-//! `parent_id` and `annotations` are optional.
+//! `parent_id` and `annotations` are optional. Two more members come from the
+//! X-Ray Segment Documents reference that `PutTraceSegments` links to, because
+//! the service graph is derived from them: `type`, which is `subsegment` on a
+//! subsegment sent as its own document, and `namespace`, which is `aws` for an
+//! AWS SDK call and `remote` for any other call that left the process.
 //!
 //! Daemon telemetry (`PutTelemetryRecords`, "used by the Amazon Web Services
 //! X-Ray daemon to upload telemetry") is kept the same way: each submitted
@@ -286,6 +290,16 @@ pub const MAX_SEGMENT_DOCUMENTS_PER_CALL: usize = 500;
 /// [`limit_exceeded`](TraceRecord::limit_exceeded), which is what `Trace$LimitExceeded`
 /// reports.
 pub const MAX_SEGMENTS_PER_TRACE: usize = 1_000;
+
+/// The most subsegments one segment document contributes, counting every level
+/// of nesting, so one document can neither drive unbounded parsing nor hold
+/// unbounded state. Further ones are dropped.
+pub const MAX_SUBSEGMENTS_PER_SEGMENT: usize = 1_000;
+
+/// How deep into a document's nested `subsegments` arrays parsing walks, so a
+/// deeply nested document cannot drive unbounded recursion. Deeper levels are
+/// dropped.
+pub const MAX_SUBSEGMENT_DEPTH: usize = 16;
 
 /// The most traces the store keeps. Ingesting a new trace past this evicts the
 /// least recently ingested one.
@@ -851,6 +865,44 @@ pub struct SegmentRecord {
     pub origin: Option<String>,
     /// The segment's `account_id`, when it names one.
     pub account_id: Option<String>,
+    /// The document's `type`. `Some("subsegment")` marks a SUBSEGMENT sent as
+    /// its own document: it records work inside its parent's service, so it
+    /// reports no service of its own.
+    pub segment_type: Option<String>,
+    /// The document's `namespace`: `aws` for an AWS SDK call, `remote` for any
+    /// other call that left the process, absent for in-process work.
+    pub namespace: Option<String>,
+    /// The `subsegments` this document carries inline, recursively, at most
+    /// [`MAX_SUBSEGMENTS_PER_SEGMENT`] of them and at most
+    /// [`MAX_SUBSEGMENT_DEPTH`] levels deep.
+    pub subsegments: Vec<SubsegmentRecord>,
+}
+
+/// One subsegment, as carried inline in its segment's `subsegments` array.
+///
+/// A subsegment records work done INSIDE the segment's service, so — unlike a
+/// segment — it names a service of its own only when its `namespace` says the
+/// work left the process.
+#[derive(Debug, Clone, Default)]
+pub struct SubsegmentRecord {
+    /// The subsegment's `name`.
+    pub name: String,
+    /// The subsegment's `namespace`: `aws`, `remote`, or absent.
+    pub namespace: Option<String>,
+    /// `start_time`, when the subsegment carries one.
+    pub start_time: Option<f64>,
+    /// `end_time`, absent while the subsegment is in progress.
+    pub end_time: Option<f64>,
+    /// `error`: a client-side (400 series) error.
+    pub error: bool,
+    /// `fault`: a server-side (500 series) fault.
+    pub fault: bool,
+    /// `throttle`: a throttling (429) error.
+    pub throttle: bool,
+    /// The subsegment's `http` block, when it carries one.
+    pub http: Option<HttpRecord>,
+    /// The subsegments nested under this one.
+    pub subsegments: Vec<SubsegmentRecord>,
 }
 
 /// The parts of a segment's `http` block a `TraceSummary` reports.
@@ -1359,8 +1411,56 @@ pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord),
             .unwrap_or_default(),
         origin: optional_string(object, "origin"),
         account_id: optional_string(object, "account_id"),
+        segment_type: optional_string(object, "type"),
+        namespace: optional_string(object, "namespace"),
+        subsegments: parse_subsegments(object.get("subsegments"), 0, &mut 0),
     };
     Ok((trace_id, segment))
+}
+
+/// Parse a document's inline `subsegments` array, recursively.
+///
+/// Lenient where the segment itself is strict: a subsegment is part of an
+/// already accepted document, so an entry that is not an object, or carries no
+/// `name`, is dropped rather than failing the whole document. Bounded by
+/// [`MAX_SUBSEGMENTS_PER_SEGMENT`] entries (`budget`, shared across the whole
+/// nesting) and [`MAX_SUBSEGMENT_DEPTH`] levels.
+fn parse_subsegments(
+    value: Option<&serde_json::Value>,
+    depth: usize,
+    budget: &mut usize,
+) -> Vec<SubsegmentRecord> {
+    if depth >= MAX_SUBSEGMENT_DEPTH {
+        return Vec::new();
+    }
+    let Some(entries) = value.and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut parsed = Vec::new();
+    for entry in entries {
+        if *budget >= MAX_SUBSEGMENTS_PER_SEGMENT {
+            break;
+        }
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
+        let Some(name) = optional_string(object, "name") else {
+            continue;
+        };
+        *budget += 1;
+        parsed.push(SubsegmentRecord {
+            name,
+            namespace: optional_string(object, "namespace"),
+            start_time: object.get("start_time").and_then(serde_json::Value::as_f64),
+            end_time: object.get("end_time").and_then(serde_json::Value::as_f64),
+            error: flag(object, "error"),
+            fault: flag(object, "fault"),
+            throttle: flag(object, "throttle"),
+            http: parse_http(object.get("http")),
+            subsegments: parse_subsegments(object.get("subsegments"), depth + 1, budget),
+        });
+    }
+    parsed
 }
 
 /// Lift the `http.request` / `http.response` fields a `TraceSummary` reports.
@@ -1379,6 +1479,24 @@ fn parse_http(value: Option<&serde_json::Value>) -> Option<HttpRecord> {
             .and_then(serde_json::Value::as_i64)
             .and_then(|status| i32::try_from(status).ok()),
     })
+}
+
+/// Whether a recorded outcome is a 400-series error: the `error` flag, or an
+/// `http.response.status` in the 400 series.
+fn recorded_error(error: bool, status: Option<i32>) -> bool {
+    error || status.is_some_and(|status| (400..500).contains(&status))
+}
+
+/// Whether a recorded outcome is a 500-series fault: the `fault` flag, or an
+/// `http.response.status` of 500 or above.
+fn recorded_fault(fault: bool, status: Option<i32>) -> bool {
+    fault || status.is_some_and(|status| status >= 500)
+}
+
+/// Whether a recorded outcome is a throttling error: the `throttle` flag, or an
+/// `http.response.status` of 429.
+fn recorded_throttle(throttle: bool, status: Option<i32>) -> bool {
+    throttle || status == Some(429)
 }
 
 impl SegmentRecord {
@@ -1401,19 +1519,51 @@ impl SegmentRecord {
     /// Whether this segment recorded a 400-series error — its `error` flag, or
     /// an `http.response.status` in the 400 series (`TraceSummary$HasError`).
     pub fn is_error(&self) -> bool {
-        self.error || self.http_status().is_some_and(|status| (400..500).contains(&status))
+        recorded_error(self.error, self.http_status())
     }
 
     /// Whether this segment recorded a 500-series fault — its `fault` flag, or
     /// an `http.response.status` of 500 or above (`TraceSummary$HasFault`).
     pub fn is_fault(&self) -> bool {
-        self.fault || self.http_status().is_some_and(|status| status >= 500)
+        recorded_fault(self.fault, self.http_status())
     }
 
     /// Whether this segment recorded a throttling error — its `throttle` flag,
     /// or an `http.response.status` of 429 (`TraceSummary$HasThrottle`).
     pub fn is_throttle(&self) -> bool {
-        self.throttle || self.http_status() == Some(429)
+        recorded_throttle(self.throttle, self.http_status())
+    }
+
+    /// Whether this document is a SUBSEGMENT sent on its own, which the X-Ray
+    /// segment-document schema marks with `type: "subsegment"`.
+    ///
+    /// Such a document records work INSIDE its parent's service — a function
+    /// call, a query, a request that left the process — so it is not a service
+    /// of the graph in its own right.
+    pub fn is_subsegment(&self) -> bool {
+        self.segment_type.as_deref() == Some("subsegment")
+    }
+}
+
+impl SubsegmentRecord {
+    /// The `http.response.status` this subsegment recorded, if any.
+    pub fn http_status(&self) -> Option<i32> {
+        self.http.as_ref().and_then(|http| http.response_status)
+    }
+
+    /// Whether this subsegment recorded a 400-series error.
+    pub fn is_error(&self) -> bool {
+        recorded_error(self.error, self.http_status())
+    }
+
+    /// Whether this subsegment recorded a 500-series fault.
+    pub fn is_fault(&self) -> bool {
+        recorded_fault(self.fault, self.http_status())
+    }
+
+    /// Whether this subsegment recorded a throttling error.
+    pub fn is_throttle(&self) -> bool {
+        recorded_throttle(self.throttle, self.http_status())
     }
 }
 
@@ -2923,10 +3073,81 @@ pub fn sampling_rule_arn(region: &str, rule_name: &str) -> String {
 pub const SERVICE_STATE_ACTIVE: &str = "active";
 
 /// `Service$State` for a node whose every segment in the window is still in
-/// progress: nothing is known about how it answered.
+/// progress: nothing is known about how it answered. An INFERRED node — one no
+/// segment reported, such as a `client` — is always in this state.
 pub const SERVICE_STATE_UNKNOWN: &str = "unknown";
 
-/// The time span a node or an edge covers, widened segment by segment.
+/// `Service$Type` for the node that "represents the clients that sent requests
+/// to a root service".
+///
+/// The clients report no segment of their own, so the node carries the root
+/// service's name and the requests that service received.
+pub const SERVICE_TYPE_CLIENT: &str = "client";
+
+/// `Service$Type` for "a downstream service of indeterminate type", which is
+/// what a `remote`-namespace subsegment records.
+pub const SERVICE_TYPE_REMOTE: &str = "remote";
+
+/// The most inline subsegments one derivation walks, across every trace and
+/// segment it covers.
+///
+/// A trace holds at most [`MAX_SEGMENTS_PER_TRACE`] segments and a segment at
+/// most [`MAX_SUBSEGMENTS_PER_SEGMENT`] subsegments, so capping each factor
+/// still leaves their product to grow; this caps the product. Past it a graph
+/// reports the services its segments named, which is the whole topology a trace
+/// whose services are instrumented has.
+pub const MAX_GRAPH_SUBSEGMENT_VISITS: usize = 50_000;
+
+/// One recorded call, as a graph counts it: a segment the service reported, or
+/// a subsegment it recorded inside that segment. The two carry the same timing
+/// and the same outcome flags, so the accumulators below take this rather than
+/// one shape of document.
+#[derive(Debug, Clone, Copy)]
+struct Call {
+    start_time: f64,
+    end_time: Option<f64>,
+    error: bool,
+    fault: bool,
+    throttle: bool,
+}
+
+impl Call {
+    /// The call a stored segment records.
+    fn of_segment(segment: &SegmentRecord) -> Self {
+        Self {
+            start_time: segment.start_time,
+            end_time: segment.end_time,
+            error: segment.is_error(),
+            fault: segment.is_fault(),
+            throttle: segment.is_throttle(),
+        }
+    }
+
+    /// The call an inline subsegment records. A subsegment that carries no
+    /// `start_time` is timed from its segment, which is the only instant known
+    /// for it.
+    fn of_subsegment(subsegment: &SubsegmentRecord, segment: &SegmentRecord) -> Self {
+        Self {
+            start_time: subsegment.start_time.unwrap_or(segment.start_time),
+            end_time: subsegment.end_time,
+            error: subsegment.is_error(),
+            fault: subsegment.is_fault(),
+            throttle: subsegment.is_throttle(),
+        }
+    }
+
+    /// How long the call took, in seconds; `None` while it is in progress.
+    fn duration(&self) -> Option<f64> {
+        self.end_time.map(|end| end - self.start_time)
+    }
+
+    /// The latest instant this call is known to have reached.
+    fn latest(&self) -> f64 {
+        self.end_time.unwrap_or(self.start_time)
+    }
+}
+
+/// The time span a node or an edge covers, widened call by call.
 #[derive(Debug, Default)]
 struct Span {
     start: Option<f64>,
@@ -2934,16 +3155,13 @@ struct Span {
 }
 
 impl Span {
-    /// Widen this span to include one segment.
-    fn widen(&mut self, segment: &SegmentRecord) {
+    /// Widen this span to include one call.
+    fn widen(&mut self, call: Call) {
         self.start = Some(
             self.start
-                .map_or(segment.start_time, |start| start.min(segment.start_time)),
+                .map_or(call.start_time, |start| start.min(call.start_time)),
         );
-        self.end = Some(
-            self.end
-                .map_or(segment.latest(), |end| end.max(segment.latest())),
-        );
+        self.end = Some(self.end.map_or(call.latest(), |end| end.max(call.latest())));
     }
 
     /// The span's start as a modelled timestamp.
@@ -2985,22 +3203,22 @@ struct CallStatistics {
 }
 
 impl CallStatistics {
-    /// Count one segment. A fault outranks an error (a 500-series answer is not
+    /// Count one call. A fault outranks an error (a 500-series answer is not
     /// also a 400-series one), a throttled error is counted as a throttle rather
-    /// than as "other", and a segment that recorded neither is OK — the same
+    /// than as "other", and a call that recorded neither is OK — the same
     /// classification `TraceSummary$HasFault` / `HasError` / `HasThrottle` use.
-    fn record(&mut self, segment: &SegmentRecord) {
+    fn record(&mut self, call: Call) {
         self.total_count += 1;
-        if segment.is_fault() {
+        if call.fault {
             self.fault_count += 1;
-        } else if segment.is_throttle() {
+        } else if call.throttle {
             self.throttle_count += 1;
-        } else if segment.is_error() {
+        } else if call.error {
             self.error_other_count += 1;
         } else {
             self.ok_count += 1;
         }
-        self.total_response_time += segment.duration().unwrap_or(0.0);
+        self.total_response_time += call.duration().unwrap_or(0.0);
     }
 
     /// The 400-series counts.
@@ -3052,11 +3270,11 @@ struct EdgeAccumulator {
 }
 
 impl EdgeAccumulator {
-    /// Count one downstream segment on this edge.
-    fn record(&mut self, segment: &SegmentRecord) {
-        self.span.widen(segment);
-        self.statistics.record(segment);
-        if let Some(duration) = segment.duration() {
+    /// Count one downstream call on this edge.
+    fn record(&mut self, call: Call) {
+        self.span.widen(call);
+        self.statistics.record(call);
+        if let Some(duration) = call.duration() {
             self.response_times.push(duration);
         }
     }
@@ -3080,6 +3298,61 @@ impl EdgeAccumulator {
     }
 }
 
+/// What distinguishes one node of a service graph from another.
+///
+/// A node the stored segments REPORTED is the service of that `name`. Beside it
+/// a graph carries the node `Service$Type` documents as `client` — "represents
+/// the clients that sent requests to a root service" — which carries the root
+/// service's own name, so the name alone does not identify a node.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NodeKey {
+    /// The canonical service name, which is what `Service$Name` reports.
+    name: String,
+    /// `Service$Type` for a node no segment reported — `client`, `remote`, or
+    /// `AWS::<Service>` — and `None` for one a segment did report, whose type is
+    /// that segment's `origin`.
+    inferred_type: Option<String>,
+}
+
+impl NodeKey {
+    /// The node of the service whose segments report `name`.
+    fn reported(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            inferred_type: None,
+        }
+    }
+
+    /// The `client` node of the root service called `name`.
+    fn client(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            inferred_type: Some(SERVICE_TYPE_CLIENT.to_string()),
+        }
+    }
+}
+
+/// The downstream node a SUBSEGMENT names, or `None` when it names none.
+///
+/// The X-Ray segment-document schema gives a subsegment a `namespace` only when
+/// the work left the process: `aws` for an AWS SDK call, `remote` for any other
+/// downstream call. `Service$Type` names the matching node types: `remote` is
+/// "a downstream service of indeterminate type", and `AWS::<Service>` is what
+/// "downstream calls to Amazon Web Services ... that didn't target a specific
+/// table" report. A subsegment with neither namespace recorded in-process work
+/// and so names no service at all.
+fn downstream_node(name: &str, namespace: Option<&str>) -> Option<NodeKey> {
+    let inferred_type = match namespace? {
+        SERVICE_TYPE_REMOTE => SERVICE_TYPE_REMOTE.to_string(),
+        "aws" => format!("AWS::{name}"),
+        _ => return None,
+    };
+    Some(NodeKey {
+        name: name.to_string(),
+        inferred_type: Some(inferred_type),
+    })
+}
+
 /// One node of a service graph, under construction.
 #[derive(Debug, Default)]
 struct NodeAccumulator {
@@ -3091,15 +3364,29 @@ struct NodeAccumulator {
     statistics: CallStatistics,
     durations: Vec<f64>,
     response_times: Vec<f64>,
-    /// Downstream service name -> the edge that reaches it.
-    edges: BTreeMap<String, EdgeAccumulator>,
+    /// Downstream node -> the edge that reaches it.
+    edges: BTreeMap<NodeKey, EdgeAccumulator>,
 }
 
 impl NodeAccumulator {
+    /// Fold one request this node's service RECEIVED into it, without claiming
+    /// the request's own identity: what an INFERRED node — a `client`, or a
+    /// downstream service a subsegment named — knows about a call is its timing
+    /// and its outcome, because it reported no segment of its own.
+    fn record_call(&mut self, call: Call) {
+        self.span.widen(call);
+        self.statistics.record(call);
+        if let Some(duration) = call.duration() {
+            self.durations.push(duration);
+            self.response_times.push(duration);
+        }
+    }
+
     /// Fold one of this service's segments into the node.
     fn record(&mut self, segment: &SegmentRecord) {
-        self.span.widen(segment);
-        self.statistics.record(segment);
+        let call = Call::of_segment(segment);
+        self.span.widen(call);
+        self.statistics.record(call);
         if segment.parent_id.is_none() {
             // "Indicates that the service was the first service to process a
             // request" — a segment with no parent is the entry point of its
@@ -3122,16 +3409,24 @@ impl NodeAccumulator {
     }
 
     /// This node as the modelled `Service`.
-    fn to_service(&self, name: &str, reference_ids: &BTreeMap<String, i32>) -> Service {
+    fn to_service(&self, key: &NodeKey, reference_ids: &BTreeMap<NodeKey, i32>) -> Service {
         Service {
-            reference_id: reference_ids.get(name).copied(),
-            name: Some(name.to_string()),
-            names: Some(vec![name.to_string()]),
+            reference_id: reference_ids.get(key).copied(),
+            name: Some(key.name.clone()),
+            names: Some(vec![key.name.clone()]),
             root: Some(self.root),
             account_id: self.account_id.clone(),
-            r#type: self.service_type.clone(),
+            // An inferred node's type is what makes it that node; a reported
+            // one's is the `origin` its segments carried.
+            r#type: key
+                .inferred_type
+                .clone()
+                .or_else(|| self.service_type.clone()),
             state: Some(
-                if self.complete {
+                // An inferred node reported no segment of its own, so nothing
+                // about its state is known; a reported one is active once one of
+                // its segments completed.
+                if self.complete && key.inferred_type.is_none() {
                     SERVICE_STATE_ACTIVE
                 } else {
                     SERVICE_STATE_UNKNOWN
@@ -3188,10 +3483,20 @@ fn histogram(values: &[f64]) -> Option<Vec<HistogramEntry>> {
 /// describe the same stored segments differently.
 ///
 /// A node is one distinct segment `name` (the canonical name of the service that
-/// handled the request); an edge is a stored `parent_id` link between two
-/// segments of DIFFERENT services, counted on the upstream node and naming the
-/// downstream one by `ReferenceId`. Every count, time and histogram comes from
-/// the stored segment documents; nothing is echoed from the request.
+/// handled the request), plus the `client` node `Service$Type` documents for
+/// every root service — "represents the clients that sent requests to a root
+/// service" — which carries that service's own name and one edge into it, plus
+/// one node per SUBSEGMENT whose `namespace` says the call left the process
+/// (`remote`, "a downstream service of indeterminate type", or `aws` for an AWS
+/// service). A subsegment reports no service of its own otherwise: one with no
+/// such namespace records in-process work, so it adds neither a node nor an
+/// edge, and the work it did is already counted on the service that recorded it.
+///
+/// An edge is a stored `parent_id` link between two segments of DIFFERENT
+/// services, counted on the upstream node and naming the downstream one by
+/// `ReferenceId`; a `parent_id` that names a subsegment resolves to the service
+/// that reported it. Every count, time and histogram comes from the stored
+/// segment documents; nothing is echoed from the request.
 ///
 /// `window` selects which segments take part: `Some((start, end))` keeps the
 /// segments whose `start_time` falls in the half-open interval [start, end) —
@@ -3206,59 +3511,167 @@ pub fn service_graph<'a>(
         None => true,
     };
 
-    let mut nodes: BTreeMap<String, NodeAccumulator> = BTreeMap::new();
+    let mut nodes: BTreeMap<NodeKey, NodeAccumulator> = BTreeMap::new();
+    // Inline subsegments are walked under one budget across the whole
+    // derivation, so a graph over many traces of many segments, each carrying
+    // many subsegments, cannot multiply into unbounded work: past the budget a
+    // graph reports the services its SEGMENTS named.
+    let mut subsegment_budget = MAX_GRAPH_SUBSEGMENT_VISITS;
     for trace in traces {
         for segment in &trace.segments {
-            if selects(segment) {
-                nodes.entry(segment.name.clone()).or_default().record(segment);
+            if !selects(segment) || segment.is_subsegment() {
+                continue;
+            }
+            let call = Call::of_segment(segment);
+            nodes
+                .entry(NodeKey::reported(&segment.name))
+                .or_default()
+                .record(segment);
+            if segment.parent_id.is_none() {
+                // The entry point of a trace was reached by a client the stored
+                // data names nowhere, which is exactly the node the model
+                // documents as `client`: it carries the root service's name,
+                // reports the requests it sent, and reaches that service by one
+                // edge.
+                let client = nodes.entry(NodeKey::client(&segment.name)).or_default();
+                client.record_call(call);
+                client
+                    .edges
+                    .entry(NodeKey::reported(&segment.name))
+                    .or_default()
+                    .record(call);
+            }
+            // The downstream services this segment's subsegments named: each is
+            // one inferred node, reached by one edge from this service.
+            let mut pending: Vec<&SubsegmentRecord> = segment.subsegments.iter().rev().collect();
+            while let Some(subsegment) = pending.pop() {
+                if subsegment_budget == 0 {
+                    break;
+                }
+                subsegment_budget -= 1;
+                pending.extend(subsegment.subsegments.iter().rev());
+                let Some(downstream) = downstream_node(&subsegment.name, subsegment.namespace.as_deref())
+                else {
+                    continue;
+                };
+                if downstream == NodeKey::reported(&segment.name) {
+                    continue;
+                }
+                let subsegment_call = Call::of_subsegment(subsegment, segment);
+                nodes
+                    .entry(NodeKey::reported(&segment.name))
+                    .or_default()
+                    .edges
+                    .entry(downstream.clone())
+                    .or_default()
+                    .record(subsegment_call);
+                nodes
+                    .entry(downstream)
+                    .or_default()
+                    .record_call(subsegment_call);
             }
         }
         // Edges need both ends, so they are walked once this trace's nodes are
         // known: a segment whose `parent_id` names nothing stored, or whose
-        // parent is outside the window, is on no edge.
+        // parent is outside the window, is on no edge. Which service reported
+        // each stored id is resolved ONCE for the whole trace, so this pass is
+        // linear in the trace's segments however long a chain of subsegment
+        // documents is.
+        let reporting = reporting_segments(trace);
         for segment in &trace.segments {
             if !selects(segment) {
                 continue;
             }
+            // The service that recorded this segment's parent: a `parent_id`
+            // naming a subsegment belongs to the service that reported it.
             let Some(parent) = segment
                 .parent_id
                 .as_deref()
-                .and_then(|parent_id| trace.segment(parent_id))
+                .and_then(|parent_id| reporting.get(parent_id).copied())
             else {
                 continue;
             };
-            if parent.name == segment.name || !selects(parent) {
+            if !selects(parent) {
                 continue;
             }
-            let Some(upstream) = nodes.get_mut(&parent.name) else {
+            let Some(upstream) = nodes.get_mut(&NodeKey::reported(&parent.name)) else {
                 continue;
             };
-            upstream
-                .edges
-                .entry(segment.name.clone())
-                .or_default()
-                .record(segment);
+            // A subsegment names a downstream service only through its
+            // `namespace`; a segment names the service that handled it.
+            let downstream = if segment.is_subsegment() {
+                match downstream_node(&segment.name, segment.namespace.as_deref()) {
+                    Some(key) => key,
+                    None => continue,
+                }
+            } else {
+                NodeKey::reported(&segment.name)
+            };
+            if downstream == NodeKey::reported(&parent.name) {
+                continue;
+            }
+            let call = Call::of_segment(segment);
+            upstream.edges.entry(downstream.clone()).or_default().record(call);
+            // A downstream service a subsegment named reported nothing itself,
+            // so the call is what the node knows about it.
+            if segment.is_subsegment() {
+                nodes.entry(downstream).or_default().record_call(call);
+            }
         }
     }
 
     // "Identifier for the service. Unique within the service map": assigned over
-    // the nodes in name order, so one stored graph always answers with the same
-    // ids — across pages of one walk, and across calls.
-    let reference_ids: BTreeMap<String, i32> = nodes
+    // the nodes in key order — name, then the inferred type that distinguishes a
+    // `client` node from the service it calls — so one stored graph always
+    // answers with the same ids, across pages of one walk and across calls.
+    let reference_ids: BTreeMap<NodeKey, i32> = nodes
         .keys()
         .enumerate()
-        .map(|(at, name)| {
-            (
-                name.clone(),
-                i32::try_from(at).unwrap_or(i32::MAX),
-            )
-        })
+        .map(|(at, key)| (key.clone(), i32::try_from(at).unwrap_or(i32::MAX)))
         .collect();
 
     nodes
         .iter()
-        .map(|(name, node)| node.to_service(name, &reference_ids))
+        .map(|(key, node)| node.to_service(key, &reference_ids))
         .collect()
+}
+
+/// Every stored id of one trace mapped to the segment that REPORTED the service
+/// it belongs to.
+///
+/// A `type: "subsegment"` document records work inside its parent's service, so
+/// it belongs to whichever segment its `parent_id` chain reaches. Resolving that
+/// by walking the chain per segment would be quadratic in the trace's segments,
+/// so the map is built ONCE: the segments a service reported seed it, and the
+/// subsegment documents are attached by walking OUT from the ids already
+/// resolved, which visits each document at most twice and ends by itself on a
+/// chain that names itself (each parent's children are consumed once).
+fn reporting_segments(trace: &TraceRecord) -> BTreeMap<&str, &SegmentRecord> {
+    let mut reporting: BTreeMap<&str, &SegmentRecord> = BTreeMap::new();
+    let mut attached: BTreeMap<&str, Vec<&SegmentRecord>> = BTreeMap::new();
+    for segment in &trace.segments {
+        if segment.is_subsegment() {
+            if let Some(parent) = segment.parent_id.as_deref() {
+                attached.entry(parent).or_default().push(segment);
+            }
+        } else {
+            reporting.insert(segment.id.as_str(), segment);
+        }
+    }
+    let mut frontier: Vec<&str> = reporting.keys().copied().collect();
+    while let Some(id) = frontier.pop() {
+        let Some(children) = attached.remove(id) else {
+            continue;
+        };
+        let Some(owner) = reporting.get(id).copied() else {
+            continue;
+        };
+        for child in children {
+            reporting.insert(child.id.as_str(), owner);
+            frontier.push(child.id.as_str());
+        }
+    }
+    reporting
 }
 
 /// One page of a service graph: the `Service` values to answer with, and the
@@ -3278,19 +3691,25 @@ pub struct ServiceGraphPage {
 ///
 /// The page is cut after the graph is derived, so every page of one walk reports
 /// the same `ReferenceId` for the same service and an edge's `ReferenceId` names
-/// a node whichever page that node lands on. `Err` is the one refusal this makes
-/// possible: a `NextToken` that names no service at or after it, which is a
-/// token this service never issued.
+/// a node whichever page that node lands on. The token is the `ReferenceId` the
+/// next page starts at, which is what identifies a node: a `client` node carries
+/// the same `Name` as the root service it calls, so a name would not. `Err` is
+/// the one refusal this makes possible: a token that is not a `ReferenceId` of
+/// this graph, which is a token this service never issued.
 pub fn page_service_graph(
     services: &[Service],
     resume: Option<&str>,
     page_size: usize,
 ) -> Result<ServiceGraphPage, String> {
+    let unissued = |token: &str| format!("NextToken `{token}` was not issued by this service");
     let from = match resume {
-        Some(token) => services
-            .iter()
-            .position(|service| service.name.as_deref().is_some_and(|name| name >= token))
-            .ok_or_else(|| format!("NextToken `{token}` was not issued by this service"))?,
+        Some(token) => {
+            let reference: i32 = token.parse().map_err(|_| unissued(token))?;
+            services
+                .iter()
+                .position(|service| service.reference_id.is_some_and(|id| id >= reference))
+                .ok_or_else(|| unissued(token))?
+        }
         None => 0,
     };
     let remaining = &services[from..];
@@ -3298,7 +3717,8 @@ pub fn page_service_graph(
         services: remaining.iter().take(page_size).cloned().collect(),
         next_token: remaining
             .get(page_size)
-            .and_then(|service| service.name.clone()),
+            .and_then(|service| service.reference_id)
+            .map(|reference| reference.to_string()),
     })
 }
 

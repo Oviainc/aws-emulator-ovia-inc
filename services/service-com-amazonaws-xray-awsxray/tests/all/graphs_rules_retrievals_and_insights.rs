@@ -494,15 +494,62 @@ async fn the_service_graph_is_derived_from_the_stored_segments() {
         graph.status, 200,
         "GetServiceGraph over the fixture's window must succeed, got {graph:?}"
     );
-    let services = array(&graph.body, "Services").to_vec();
+    // The whole graph, across pages: a root service's `client` node pages beside
+    // it, so the fixture's nodes no longer fit in one page.
+    let mut services: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = window.clone();
+        if let Some(token) = token.as_deref() {
+            body["NextToken"] = json!(token);
+        }
+        let page = xray.call("/ServiceGraph", &body).await;
+        assert_eq!(
+            page.status, 200,
+            "every page of the fixture's window must succeed, got {page:?}"
+        );
+        services.extend(array(&page.body, "Services").iter().cloned());
+        token = page.get("NextToken").as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+        assert!(
+            services.len() < 100,
+            "paging the fixture's window did not terminate, got {services:?}"
+        );
+    }
+    // One node per distinct segment name, plus the `client` node of every root
+    // service — "represents the clients that sent requests to a root service".
+    let roots = node_cases().iter().filter(|case| case.root).count();
     assert_eq!(
         service_names(&services).len(),
-        node_cases().len(),
-        "the graph must carry one node per distinct segment name, got {:?}",
+        node_cases().len() + roots,
+        "the graph must carry one node per distinct segment name and one client node per root, got {:?}",
         service_names(&services)
     );
     for case in node_cases() {
         assert_node("the fixture's window", &services, &case);
+    }
+    // Every root service's clients are a node of their own, typed `client`,
+    // carrying that service's name and reporting nothing about its own state.
+    for case in node_cases().iter().filter(|case| case.root) {
+        let client = services.iter().find(|service| {
+            service.get("Name").and_then(Value::as_str) == Some(case.name)
+                && service.get("Type").and_then(Value::as_str) == Some("client")
+        });
+        let Some(client) = client else {
+            panic!(
+                "the fixture's window: the root service {:?} must have a client node, got {:?}",
+                case.name,
+                services
+            );
+        };
+        assert_eq!(
+            client.get("State").and_then(Value::as_str),
+            Some("unknown"),
+            "the client node of {:?} reported no segment of its own, got {client:?}",
+            case.name
+        );
     }
 
     // `ReferenceId` is unique within the map, and `Names` carries the canonical
@@ -632,7 +679,11 @@ async fn the_service_graph_pages_and_resumes_exactly_once() {
                 break;
             }
         }
-        let expected: Vec<String> = (0..count).map(|index| format!("svc-{index:02}")).collect();
+        let expected: Vec<String> = std::iter::once("svc-00".to_string())
+            // The root service's `client` node carries the root's own name, so
+            // it pages beside it.
+            .chain((0..count).map(|index| format!("svc-{index:02}")))
+            .collect();
         assert_eq!(
             seen, expected,
             "count {count}: paging must yield every service exactly once, got {seen:?}"
@@ -668,14 +719,21 @@ async fn the_trace_graph_is_per_trace_and_an_unstored_trace_id_is_refused() {
         (
             "one trace",
             vec![chain.clone()],
-            vec!["backend", "db", "frontend"],
+            // The root service's `client` node carries that service's own name,
+            // so `frontend` appears twice: the service, and the clients that
+            // sent it the request.
+            vec!["backend", "db", "frontend", "frontend"],
         ),
         (
             "two traces",
             vec![chain.clone(), fanned.clone()],
-            vec!["backend", "cache", "db", "frontend"],
+            vec!["backend", "cache", "db", "frontend", "frontend"],
         ),
-        ("another trace alone", vec![fanned.clone()], vec!["cache", "frontend"]),
+        (
+            "another trace alone",
+            vec![fanned.clone()],
+            vec!["cache", "frontend", "frontend"],
+        ),
         ("no trace at all", vec![], vec![]),
     ];
     for (label, ids, expected) in rows {

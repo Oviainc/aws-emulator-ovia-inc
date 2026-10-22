@@ -5,7 +5,10 @@
 //! Derives the topology of the NAMED traces from their stored segment
 //! documents, through the same derivation `GetServiceGraph` answers from
 //! ([`crate::state::service_graph`]) — with no time window, because the request
-//! names the traces rather than a timeframe.
+//! names the traces rather than a timeframe. That derivation reports one node
+//! per service the segments named, the `client` node of every root service, and
+//! one downstream node per subsegment whose `namespace` says the call left the
+//! process.
 //!
 //! A trace id that is not stored is REFUSED with `InvalidRequestException`
 //! (400): unlike `BatchGetTraces`, whose output models `UnprocessedTraceIds`,
@@ -165,16 +168,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let store = state.lock();
-        let mut traces = Vec::with_capacity(input.trace_ids.len());
-        for trace_id in &input.trace_ids {
-            let Some(trace) = store.traces.get(trace_id) else {
-                return Err(refuse(TRACE_ID_NOT_FOUND.to_string()));
-            };
-            traces.push(trace);
-        }
+        // The derivation is linear in the stored segments of the named traces
+        // and bounded in the subsegments it walks, and the store is held only
+        // for it: the page is cut after the lock is dropped.
+        let services = {
+            let store = state.lock();
+            let mut traces = Vec::with_capacity(input.trace_ids.len());
+            for trace_id in &input.trace_ids {
+                let Some(trace) = store.traces.get(trace_id) else {
+                    return Err(refuse(TRACE_ID_NOT_FOUND.to_string()));
+                };
+                traces.push(trace);
+            }
+            crate::state::service_graph(traces, None)
+        };
+        // A point for a cancellation or a timeout to land once the lock is
+        // released, before this response is assembled.
+        ::tokio::task::yield_now().await;
 
-        let services = crate::state::service_graph(traces, None);
         let page = crate::state::page_service_graph(
             &services,
             input.next_token.as_deref(),

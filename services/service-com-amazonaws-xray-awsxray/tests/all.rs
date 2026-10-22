@@ -47,6 +47,9 @@ mod telemetry_records;
 #[path = "all/time_series_service_statistics.rs"]
 mod time_series_service_statistics;
 
+#[path = "all/trace_graph.rs"]
+mod trace_graph;
+
 #[path = "all/trace_ingest_and_groups.rs"]
 mod trace_ingest_and_groups;
 

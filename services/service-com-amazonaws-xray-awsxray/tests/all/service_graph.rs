@@ -156,9 +156,16 @@ async fn whole_graph(case: &str, xray: &Xray, start: f64, end: f64) -> Vec<Value
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // A node is its NAME and its TYPE: a root service's `client` node
+            // carries that service's own name, so the name alone no longer
+            // identifies a node.
+            let node = match service.get("Type").and_then(Value::as_str) {
+                Some(node_type) => format!("{name}#{node_type}"),
+                None => name,
+            };
             assert!(
-                seen.insert(name.clone()),
-                "case {case:?}: service {name:?} must appear on exactly one page"
+                seen.insert(node.clone()),
+                "case {case:?}: node {node:?} must appear on exactly one page"
             );
             services.push(service.clone());
         }
@@ -435,19 +442,34 @@ async fn the_graph_of_any_stored_topology_counts_every_request_once_and_names_it
             })
             .collect();
         let mut pairs: BTreeSet<(&str, &str)> = BTreeSet::new();
+        // A `client` node's edge reaches the root service of its own name; the
+        // case enumerates the edges BETWEEN services, so the two are collected
+        // apart and each asserted for what it is.
+        let mut client_edges: BTreeSet<(&str, &str)> = BTreeSet::new();
         for service in &services {
             let source = service
                 .get("Name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let from_client = service.get("Type").and_then(Value::as_str) == Some("client");
             for edge in array(service, "Edges") {
                 let destination = edge
                     .get("ReferenceId")
                     .and_then(Value::as_i64)
                     .and_then(|id| by_reference.get(&id).copied())
                     .unwrap_or("<unknown>");
-                pairs.insert((source, destination));
+                if from_client {
+                    client_edges.insert((source, destination));
+                } else {
+                    pairs.insert((source, destination));
+                }
             }
+        }
+        for (source, destination) in &client_edges {
+            assert_eq!(
+                source, destination,
+                "case {label:?}: a client node must reach the root service of its own name, got {services:?}"
+            );
         }
         let expected_pairs: BTreeSet<(&str, &str)> = case.edges.iter().copied().collect();
         assert_eq!(
@@ -500,15 +522,19 @@ async fn a_graph_wider_than_a_page_is_answered_page_by_page_with_stable_referenc
         let services = whole_graph(&label, &xray, base - 60.0, base + 60.0).await;
         assert_eq!(
             services.len(),
-            total,
-            "case {label:?}: paging must answer every service exactly once, got {services:?}"
+            // The hub's `client` node pages beside the services themselves.
+            total + 1,
+            "case {label:?}: paging must answer every node exactly once, got {services:?}"
         );
         assert_graph_invariants(&label, &services);
 
         // The hub's edges name every leaf, whichever page that leaf landed on.
         let hub = services
             .iter()
-            .find(|service| service.get("Name").and_then(Value::as_str) == Some("hub"))
+            .find(|service| {
+                service.get("Name").and_then(Value::as_str) == Some("hub")
+                    && service.get("Type").and_then(Value::as_str) != Some("client")
+            })
             .unwrap_or_else(|| panic!("case {label:?}: the hub must be on the map"));
         assert_eq!(
             array(hub, "Edges").len(),
