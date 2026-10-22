@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AnalyzeExpense
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AnalyzeExpense`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives its answer from stored state; see the modelled contract below.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AnalyzeExpense::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Synchronous expense analysis. The document is registered in this service's state
+//! exactly as `AnalyzeDocument` registers it, and one `ExpenseDocument` is derived per
+//! page of the text really read out of it: every labelled line outside a table becomes a
+//! `SummaryField` under its normalized `Type`, and every table becomes a `LineItemGroup`
+//! whose rows become `LineItems`. The derivation lives in
+//! [`crate::state::expense_documents`], beside the block model the other read paths
+//! share.
 //!
 //! ## Shape of an operation
 //!
@@ -176,20 +178,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AnalyzeExpense` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AnalyzeExpenseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AnalyzeExpense"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AnalyzeExpenseErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        let reference = match crate::state::reference_for_document(&input.document) {
+            Ok(reference) => reference,
+            Err(message) => {
+                return Err(AnalyzeExpenseErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                        code: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        // A document is read once and stored, so this answer and every other read path's
+        // answer for the same document describe the same text.
+        let key = reference.identity_key();
+        let stored = state.lock().stored_content(&key);
+        let content = match stored {
+            Some(content) => content,
+            None => match crate::state::read_content(&reference, input.document.bytes.as_deref()) {
+                Ok(content) => state.lock().register_document(reference, content),
+                Err(reason) => return Err(unreadable_error(&reason)),
+            },
+        };
+
+        Ok(AnalyzeExpenseOutput {
+            document_metadata: Some(content.metadata()),
+            expense_documents: Some(crate::state::expense_documents(&key, &content)),
+        })
     }
+}
+
+/// The modelled answer for a document whose text cannot be read.
+fn unreadable_error(reason: &crate::state::Unreadable) -> AnalyzeExpenseError {
+    let message = Some(reason.message().to_string());
+    match reason {
+        crate::state::Unreadable::UnsupportedFormat(_) => {
+            AnalyzeExpenseErrorModeled::UnsupportedDocumentException(
+                UnsupportedDocumentException {
+                    message,
+                    code: None,
+                },
+            )
+        }
+        crate::state::Unreadable::S3Unreadable(_) => {
+            AnalyzeExpenseErrorModeled::InvalidS3ObjectException(InvalidS3ObjectException {
+                message,
+                code: None,
+            })
+        }
+        crate::state::Unreadable::TooLarge(_) => {
+            AnalyzeExpenseErrorModeled::DocumentTooLargeException(DocumentTooLargeException {
+                message,
+                code: None,
+            })
+        }
+    }
+    .into()
 }
