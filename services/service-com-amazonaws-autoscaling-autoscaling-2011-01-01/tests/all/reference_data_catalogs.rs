@@ -17,15 +17,17 @@
 //! Every assertion drives the service the way the router does — one
 //! `MultiServiceRouter` holding this service over one shared engine — so what is
 //! under test is the HTTP behaviour (status, response element, XML members), not a
-//! handler called directly. The wire helpers are shared with
-//! `auto_scaling_group_lifecycle`.
+//! handler called directly. The wire helpers are shared, from `support`.
 
-use crate::auto_scaling_group_lifecycle::{
-    create_launch_configuration, new_engine, query, router_with, tag_value, tag_values,
-};
+use crate::support::{new_engine, query, router_with, tag_value, tag_values};
 
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use autoscaling::state;
+
+/// The launch source every group in this suite is created from: a launch
+/// TEMPLATE, because no account can create a launch configuration
+/// (`CreateLaunchConfiguration` is refused with `UnsupportedOperation`).
+const LAUNCH_SOURCE: (&str, &str) = ("LaunchTemplate.LaunchTemplateName", "lt-1");
 
 /// One zero-input reference-data read: the action, the element each entry of its
 /// list is reported in, and the catalog the service publishes for it.
@@ -131,7 +133,7 @@ async fn every_zero_input_reference_read_answers_its_published_catalog() {
 
 /// A catalog is SERVICE data: it does not depend on the store, and reading it
 /// changes nothing a later caller sees. Same six rows, read before and after the
-/// store has gained a launch configuration and a group.
+/// store has gained a group.
 #[tokio::test]
 async fn a_catalog_read_is_independent_of_state_and_changes_none_of_it() {
     let engine = new_engine();
@@ -148,13 +150,12 @@ async fn a_catalog_read_is_independent_of_state_and_changes_none_of_it() {
         first.push(tag_values(&body, case.entry_tag));
     }
 
-    create_launch_configuration(&router, "lc-catalog").await;
     let (status, body) = query(
         &router,
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-catalog"),
-            ("LaunchConfigurationName", "lc-catalog"),
+            LAUNCH_SOURCE,
             ("MinSize", "0"),
             ("MaxSize", "1"),
             ("DesiredCapacity", "0"),
@@ -231,7 +232,6 @@ async fn the_published_catalog_is_the_list_the_mutating_operations_accept() {
         state::TERMINATION_POLICY_TYPE_LAMBDA
     );
 
-    create_launch_configuration(&router, "lc-policies").await;
     for (index, policy) in published
         .iter()
         .filter(|entry| *entry != state::TERMINATION_POLICY_TYPE_LAMBDA)
@@ -243,7 +243,7 @@ async fn the_published_catalog_is_the_list_the_mutating_operations_accept() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", &name),
-                ("LaunchConfigurationName", "lc-policies"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "1"),
                 ("DesiredCapacity", "0"),
@@ -286,17 +286,18 @@ async fn the_published_catalog_is_the_list_the_mutating_operations_accept() {
     }
 }
 
-/// `DescribeAccountLimits` reports the quotas this service enforces beside counts
-/// COMPUTED from the store: a table over how many launch configurations and groups
-/// exist, walked by creating and then deleting them, with the maxima unchanged
-/// throughout.
+/// `DescribeAccountLimits` reports the quotas this service publishes beside counts
+/// COMPUTED from the store: a table over how many groups exist, walked by creating
+/// and then deleting them, with the maxima unchanged throughout. The launch
+/// configuration count stays 0 because no account can create one.
 #[tokio::test]
 async fn account_limits_count_what_the_store_holds() {
     let router = router_with(new_engine());
 
-    // The maxima the answer must carry: the ceilings `CreateLaunchConfiguration`
-    // and `CreateAutoScalingGroup` answer `LimitExceededFault` past, so the quota
-    // this operation reports is the quota the service enforces.
+    // The maxima the answer must carry: the ceiling `CreateAutoScalingGroup`
+    // answers `LimitExceededFault` past, and the launch configuration quota the
+    // service publishes for the account (which nothing can reach, since
+    // `CreateLaunchConfiguration` is refused outright).
     let expected_max_groups = state::MAX_GROUPS.to_string();
     let expected_max_configurations = state::MAX_LAUNCH_CONFIGURATIONS.to_string();
 
@@ -333,22 +334,36 @@ async fn account_limits_count_what_the_store_holds() {
     );
     assert_counts(&body, 0, 0, "an empty store");
 
-    // Launch configurations: the count follows each create.
-    for expected in 1..=3usize {
-        create_launch_configuration(&router, &format!("lc-{expected}")).await;
+    // Launch configurations: a refused create adds nothing to count.
+    for attempt in 1..=3usize {
+        let name = format!("lc-{attempt}");
+        let (status, body) = query(
+            &router,
+            "CreateLaunchConfiguration",
+            &[
+                ("LaunchConfigurationName", name.as_str()),
+                ("ImageId", "ami-12345678"),
+                ("InstanceType", "t3.micro"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "attempt {attempt}: CreateLaunchConfiguration is refused, got {status}: {body}"
+        );
         let (status, body) = query(&router, "DescribeAccountLimits", &[]).await;
         assert_eq!(status, 200, "DescribeAccountLimits: got {status}: {body}");
-        assert_counts(&body, expected, 0, "after creating a launch configuration");
+        assert_counts(&body, 0, 0, "after a refused launch configuration create");
     }
 
-    // Groups: the same, and the two counts are independent.
+    // Groups: the count follows each create, and the two counts are independent.
     for expected in 1..=2usize {
         let (status, body) = query(
             &router,
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", &format!("asg-{expected}")),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "1"),
                 ("DesiredCapacity", "0"),
@@ -359,7 +374,7 @@ async fn account_limits_count_what_the_store_holds() {
         assert_eq!(status, 200, "CreateAutoScalingGroup: got {status}: {body}");
         let (status, body) = query(&router, "DescribeAccountLimits", &[]).await;
         assert_eq!(status, 200, "DescribeAccountLimits: got {status}: {body}");
-        assert_counts(&body, 3, expected, "after creating a group");
+        assert_counts(&body, 0, expected, "after creating a group");
     }
 
     // A delete moves the count back down: the numbers are computed, not counted up.
@@ -370,14 +385,18 @@ async fn account_limits_count_what_the_store_holds() {
     )
     .await;
     assert_eq!(status, 200, "DeleteAutoScalingGroup: got {status}: {body}");
+    // And a delete of a launch configuration is refused, leaving the count at 0.
     let (status, body) = query(
         &router,
         "DeleteLaunchConfiguration",
         &[("LaunchConfigurationName", "lc-3")],
     )
     .await;
-    assert_eq!(status, 200, "DeleteLaunchConfiguration: got {status}: {body}");
+    assert_eq!(
+        status, 400,
+        "DeleteLaunchConfiguration on a name nothing holds: got {status}: {body}"
+    );
     let (status, body) = query(&router, "DescribeAccountLimits", &[]).await;
     assert_eq!(status, 200, "DescribeAccountLimits: got {status}: {body}");
-    assert_counts(&body, 2, 1, "after deleting one of each");
+    assert_counts(&body, 0, 1, "after deleting a group");
 }

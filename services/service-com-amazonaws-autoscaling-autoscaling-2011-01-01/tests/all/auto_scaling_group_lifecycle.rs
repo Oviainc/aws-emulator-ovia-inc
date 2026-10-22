@@ -10,95 +10,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use smithy_server_runtime::MultiServiceRouter;
-
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 
-/// The region the test signs for, so the ARNs the service stamps are checked
-/// against the region the request names rather than a default.
-const REGION: &str = "us-west-2";
-
-/// `pub(crate)`: `tests/all.rs` is one test target, so the suites beside this one
-/// drive the service through these helpers rather than copying them.
-pub(crate) fn new_engine() -> Arc<engine::InMemoryEngine> {
-    Arc::new(engine::InMemoryEngine::new())
-}
-
-pub(crate) fn router_with(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
-    let mut router = MultiServiceRouter::new();
-    router.register_service(autoscaling::EmulatedService::new(engine));
-    router
-}
-
-/// Percent-encode one form value, so a parameter can carry a space or a colon.
-///
-/// Hand-written rather than pulled from `percent_encoding`: this crate's
-/// `Cargo.toml` is kept free of dev-dependencies the workspace lock does not
-/// already record for it, so that landing this change does not touch `Cargo.lock`
-/// — the one file every other change in this repository also rewrites.
-fn form_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
-/// POST one awsQuery action and return its status and body.
-pub(crate) async fn query(
-    router: &MultiServiceRouter,
-    action: &str,
-    params: &[(&str, &str)],
-) -> (u16, String) {
-    let mut body = format!("Action={action}&Version=2011-01-01");
-    for (key, value) in params {
-        body.push('&');
-        body.push_str(key);
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://autoscaling.{REGION}.amazonaws.com/"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/autoscaling/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("a valid request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let text = String::from_utf8_lossy(response.body()).to_string();
-    (status, text)
-}
-
-/// The text of every `<tag>…</tag>` in document order.
-pub(crate) fn tag_values(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        let after = &rest[start + open.len()..];
-        let Some(end) = after.find(&close) else { break };
-        out.push(after[..end].to_string());
-        rest = &after[end + close.len()..];
-    }
-    out
-}
-
-/// The text of the first `<tag>…</tag>`, or `""` when the member is absent.
-pub(crate) fn tag_value(xml: &str, tag: &str) -> String {
-    tag_values(xml, tag).first().cloned().unwrap_or_default()
-}
+use crate::support::{new_engine, query, router_with, tag_value, tag_values, REGION};
 
 /// Wait past the lifecycle transition the service owes, so what the clock made
 /// due is the state the next read reports.
@@ -106,22 +20,13 @@ fn wait_for_the_lifecycle_transition() {
     std::thread::sleep(autoscaling::state::LIFECYCLE_TRANSITION + Duration::from_millis(150));
 }
 
-pub(crate) async fn create_launch_configuration(router: &MultiServiceRouter, name: &str) {
-    let (status, body) = query(
-        router,
-        "CreateLaunchConfiguration",
-        &[
-            ("LaunchConfigurationName", name),
-            ("ImageId", "ami-12345678"),
-            ("InstanceType", "t3.micro"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "CreateLaunchConfiguration {name}: expected 200, got {status}: {body}"
-    );
-}
+/// The launch source every group in this suite is created from.
+///
+/// A launch TEMPLATE, not a launch configuration: no account can create a launch
+/// configuration (`CreateLaunchConfiguration` is refused — see
+/// `launch_configurations_are_unavailable.rs`), so a group that named one could
+/// never be created either.
+const LAUNCH_SOURCE: (&str, &str) = ("LaunchTemplate.LaunchTemplateName", "lt-1");
 
 /// The happy path the bootstrap plan lays out: create, read back, scale, update,
 /// refuse a duplicate, refuse a delete that would drop live instances, force the
@@ -131,51 +36,12 @@ async fn the_group_lifecycle_round_trips_over_the_wire() {
     let engine = new_engine();
     let router = router_with(engine.clone());
 
-    create_launch_configuration(&router, "lc-1").await;
-
-    // The launch configuration reads back as created, with the ARN and creation
-    // time the service stamped.
-    let (status, body) = query(
-        &router,
-        "DescribeLaunchConfigurations",
-        &[("LaunchConfigurationNames.member.1", "lc-1")],
-    )
-    .await;
-    assert_eq!(status, 200, "DescribeLaunchConfigurations: got {status}: {body}");
-    assert_eq!(
-        tag_values(&body, "LaunchConfigurationName"),
-        vec!["lc-1".to_string()],
-        "DescribeLaunchConfigurations: expected exactly lc-1, got {body}"
-    );
-    assert_eq!(
-        tag_value(&body, "ImageId"),
-        "ami-12345678",
-        "launch configuration ImageId: got {body}"
-    );
-    assert_eq!(
-        tag_value(&body, "InstanceType"),
-        "t3.micro",
-        "launch configuration InstanceType: got {body}"
-    );
-    let configuration_arn = tag_value(&body, "LaunchConfigurationARN");
-    assert!(
-        configuration_arn.contains(&format!(
-            "arn:aws:autoscaling:{REGION}:{}:launchConfiguration:",
-            engine::EMULATOR_ACCOUNT_ID
-        )),
-        "launch configuration ARN: expected the signed region and the emulator account, got {configuration_arn:?}"
-    );
-    assert!(
-        !tag_value(&body, "CreatedTime").is_empty(),
-        "launch configuration CreatedTime: expected a timestamp, got {body}"
-    );
-
     let (status, body) = query(
         &router,
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-1"),
-            ("LaunchConfigurationName", "lc-1"),
+            LAUNCH_SOURCE,
             ("MinSize", "1"),
             ("MaxSize", "4"),
             ("DesiredCapacity", "2"),
@@ -214,7 +80,7 @@ async fn the_group_lifecycle_round_trips_over_the_wire() {
         ("MaxSize", "4"),
         ("DesiredCapacity", "2"),
         ("HealthCheckType", "EC2"),
-        ("LaunchConfigurationName", "lc-1"),
+        ("LaunchTemplateName", "lt-1"),
     ] {
         assert_eq!(
             tag_value(&body, tag),
@@ -332,7 +198,7 @@ async fn the_group_lifecycle_round_trips_over_the_wire() {
         ("HealthCheckGracePeriod", "300"),
         ("MinSize", "1"),
         ("DesiredCapacity", "3"),
-        ("LaunchConfigurationName", "lc-1"),
+        ("LaunchTemplateName", "lt-1"),
     ] {
         assert_eq!(
             tag_value(&body, tag),
@@ -347,7 +213,7 @@ async fn the_group_lifecycle_round_trips_over_the_wire() {
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-1"),
-            ("LaunchConfigurationName", "lc-1"),
+            LAUNCH_SOURCE,
             ("MinSize", "1"),
             ("MaxSize", "2"),
             ("AvailabilityZones.member.1", "us-west-2a"),
@@ -360,20 +226,7 @@ async fn the_group_lifecycle_round_trips_over_the_wire() {
         "a duplicate group name must answer the AlreadyExists query error code, got {body}"
     );
 
-    // A launch configuration an existing group launches from cannot be deleted.
-    let (status, body) = query(
-        &router,
-        "DeleteLaunchConfiguration",
-        &[("LaunchConfigurationName", "lc-1")],
-    )
-    .await;
-    assert_eq!(status, 400, "deleting an attached launch configuration: got {status}: {body}");
-    assert!(
-        body.contains("<Code>ResourceInUse</Code>"),
-        "an attached launch configuration must answer ResourceInUse, got {body}"
-    );
-
-    // Nor can a group that still holds instances, without ForceDelete.
+    // A group that still holds instances cannot be deleted without ForceDelete.
     let (status, body) = query(
         &router,
         "DeleteAutoScalingGroup",
@@ -402,20 +255,6 @@ async fn the_group_lifecycle_round_trips_over_the_wire() {
     assert!(
         tag_values(&body, "AutoScalingGroupName").is_empty(),
         "a deleted group must no longer be listed, got {body}"
-    );
-
-    // With the group gone, its launch configuration can be deleted.
-    let (status, body) = query(
-        &router,
-        "DeleteLaunchConfiguration",
-        &[("LaunchConfigurationName", "lc-1")],
-    )
-    .await;
-    assert_eq!(status, 200, "DeleteLaunchConfiguration: got {status}: {body}");
-    let (_, body) = query(&router, "DescribeLaunchConfigurations", &[]).await;
-    assert!(
-        tag_values(&body, "LaunchConfigurationName").is_empty(),
-        "a deleted launch configuration must no longer be listed, got {body}"
     );
 
     // And a name that names nothing is refused, not silently accepted.
@@ -461,13 +300,12 @@ struct GroupCase {
 async fn created_group_members_read_back_as_created() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     let cases = [
         GroupCase {
             case: "defaults: only the required members plus a launch source and a zone",
             params: vec![
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "1"),
                 ("MaxSize", "4"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -487,7 +325,7 @@ async fn created_group_members_read_back_as_created() {
         GroupCase {
             case: "every size and schedule member set explicitly, two zones",
             params: vec![
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "10"),
                 ("DesiredCapacity", "3"),
@@ -526,7 +364,7 @@ async fn created_group_members_read_back_as_created() {
         GroupCase {
             case: "a group that asks for no capacity holds no instances",
             params: vec![
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -553,7 +391,7 @@ async fn created_group_members_read_back_as_created() {
         GroupCase {
             case: "tags are reported against the group that carries them",
             params: vec![
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "1"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -650,7 +488,6 @@ async fn created_group_members_read_back_as_created() {
 async fn capacity_outside_the_group_bounds_is_refused() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // (case, MinSize, MaxSize, DesiredCapacity, accepted)
     let creates = [
@@ -668,7 +505,7 @@ async fn capacity_outside_the_group_bounds_is_refused() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", min),
                 ("MaxSize", max),
                 ("DesiredCapacity", desired),
@@ -709,13 +546,15 @@ async fn capacity_outside_the_group_bounds_is_refused() {
             "neither Availability Zones nor subnets",
             vec![
                 ("AutoScalingGroupName", "no-placement"),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "1"),
             ],
         ),
         (
-            "a launch configuration that does not exist",
+            // No launch configuration can exist, so a group naming one names a
+            // configuration that is not there.
+            "a launch configuration, which this account cannot have",
             vec![
                 ("AutoScalingGroupName", "no-config"),
                 ("LaunchConfigurationName", "lc-missing"),
@@ -743,7 +582,7 @@ async fn capacity_outside_the_group_bounds_is_refused() {
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-bounds"),
-            ("LaunchConfigurationName", "lc-1"),
+            LAUNCH_SOURCE,
             ("MinSize", "1"),
             ("MaxSize", "4"),
             ("AvailabilityZones.member.1", "us-west-2a"),
@@ -808,7 +647,6 @@ async fn capacity_outside_the_group_bounds_is_refused() {
 async fn an_update_clamps_the_capacity_into_the_new_bounds() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // (case, the update's members, the capacity and bounds afterwards)
     let cases = [
@@ -824,7 +662,7 @@ async fn an_update_clamps_the_capacity_into_the_new_bounds() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "6"),
                 ("DesiredCapacity", "2"),
@@ -871,14 +709,13 @@ async fn an_update_clamps_the_capacity_into_the_new_bounds() {
 async fn scaling_in_terminates_the_surplus_instances() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     let (status, body) = query(
         &router,
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-in"),
-            ("LaunchConfigurationName", "lc-1"),
+            LAUNCH_SOURCE,
             ("MinSize", "0"),
             ("MaxSize", "4"),
             ("DesiredCapacity", "3"),
@@ -959,7 +796,6 @@ async fn scaling_in_terminates_the_surplus_instances() {
 async fn honoring_the_cooldown_defers_the_capacity_change() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // A one-second cooldown, so the deferral is observable either side of it.
     let (status, body) = query(
@@ -967,7 +803,7 @@ async fn honoring_the_cooldown_defers_the_capacity_change() {
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-cooldown"),
-            ("LaunchConfigurationName", "lc-1"),
+            LAUNCH_SOURCE,
             ("MinSize", "0"),
             ("MaxSize", "4"),
             ("DesiredCapacity", "1"),
@@ -1079,7 +915,6 @@ async fn honoring_the_cooldown_defers_the_capacity_change() {
 async fn describes_page_by_max_records_and_next_token() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // 51 groups: one more than the documented default page size. They ask for no
     // capacity, so the page itself is what is under test.
@@ -1091,7 +926,7 @@ async fn describes_page_by_max_records_and_next_token() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -1184,38 +1019,13 @@ async fn describes_page_by_max_records_and_next_token() {
             body.contains("<Code>InvalidNextToken</Code>"),
             "case {case:?}: expected the InvalidNextToken code, got {body}"
         );
+        // The refusal names the token the caller sent: that is what it has to
+        // stop using.
+        assert!(
+            body.contains(token),
+            "case {case:?}: the refusal must quote the token {token:?}, got {body}"
+        );
     }
-
-    // The launch configurations page the same way.
-    for index in 0..3 {
-        create_launch_configuration(&router, &format!("lc-page-{index}")).await;
-    }
-    let (status, body) = query(
-        &router,
-        "DescribeLaunchConfigurations",
-        &[("MaxRecords", "2")],
-    )
-    .await;
-    assert_eq!(status, 200, "DescribeLaunchConfigurations: got {status}: {body}");
-    assert_eq!(
-        tag_values(&body, "LaunchConfigurationName").len(),
-        2,
-        "MaxRecords must bound the launch configuration page too, got {body}"
-    );
-    let token = tag_value(&body, "NextToken");
-    assert!(!token.is_empty(), "a bounded page must carry a NextToken, got {body}");
-    let (status, body) = query(
-        &router,
-        "DescribeLaunchConfigurations",
-        &[("MaxRecords", "2"), ("NextToken", token.as_str())],
-    )
-    .await;
-    assert_eq!(status, 200, "DescribeLaunchConfigurations page 2: got {status}: {body}");
-    assert_eq!(
-        tag_values(&body, "LaunchConfigurationName"),
-        vec!["lc-page-1".to_string(), "lc-page-2".to_string()],
-        "the second page continues where the first stopped, got {body}"
-    );
 }
 
 /// One row of the tag-filter table: the filter parameters a describe carries, and
@@ -1229,7 +1039,6 @@ type FilterCase = (&'static str, Vec<(&'static str, &'static str)>, Vec<&'static
 async fn tag_filters_select_the_groups_that_carry_the_tags() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // (group, tag key, tag value)
     for (name, key, value) in [
@@ -1242,7 +1051,7 @@ async fn tag_filters_select_the_groups_that_carry_the_tags() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -1349,7 +1158,6 @@ async fn tag_filters_select_the_groups_that_carry_the_tags() {
 async fn deletion_protection_refuses_the_deletes_it_names() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // (case, DeletionProtection, ForceDelete, the status to expect)
     let cases = [
@@ -1367,7 +1175,7 @@ async fn deletion_protection_refuses_the_deletes_it_names() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -1421,7 +1229,6 @@ type RefusalCase = (&'static str, &'static str, Vec<(&'static str, &'static str)
 async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // A group that names only subnets can be created while it asks for no
     // capacity: there is nothing to place yet.
@@ -1430,7 +1237,7 @@ async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "subnets-only"),
-            ("LaunchConfigurationName", "lc-1"),
+            LAUNCH_SOURCE,
             ("MinSize", "0"),
             ("MaxSize", "4"),
             ("VPCZoneIdentifier", "subnet-1"),
@@ -1448,7 +1255,7 @@ async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
             "CreateAutoScalingGroup",
             vec![
                 ("AutoScalingGroupName", "subnets-only-2"),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "2"),
                 ("MaxSize", "4"),
                 ("VPCZoneIdentifier", "subnet-1"),
@@ -1466,14 +1273,6 @@ async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
             "an update that raises the minimum of a group that names only subnets",
             "UpdateAutoScalingGroup",
             vec![("AutoScalingGroupName", "subnets-only"), ("MinSize", "1")],
-        ),
-        (
-            "a launch configuration copied from a running EC2 instance",
-            "CreateLaunchConfiguration",
-            vec![
-                ("LaunchConfigurationName", "lc-from-instance"),
-                ("InstanceId", "i-0123456789abcdef0"),
-            ],
         ),
         (
             "a group built from a running EC2 instance",
@@ -1529,7 +1328,6 @@ async fn what_the_emulator_cannot_answer_faithfully_is_refused() {
 async fn sizes_past_the_capacity_ceiling_are_refused() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     let ceiling = autoscaling::state::MAX_GROUP_CAPACITY;
     let on_the_ceiling = ceiling.to_string();
@@ -1579,7 +1377,7 @@ async fn sizes_past_the_capacity_ceiling_are_refused() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", min),
                 ("MaxSize", max),
                 ("DesiredCapacity", desired),
@@ -1651,30 +1449,6 @@ async fn sizes_past_the_capacity_ceiling_are_refused() {
         body.contains("<Code>ValidationError</Code>"),
         "a capacity change past the ceiling must answer ValidationError, got {body}"
     );
-
-    // And the store holds a bounded number of each named resource: one past the
-    // limit is the modelled LimitExceededFault.
-    for index in 1..autoscaling::state::MAX_LAUNCH_CONFIGURATIONS {
-        create_launch_configuration(&router, &format!("lc-fill-{index:04}")).await;
-    }
-    let (status, body) = query(
-        &router,
-        "CreateLaunchConfiguration",
-        &[
-            ("LaunchConfigurationName", "lc-one-too-many"),
-            ("ImageId", "ami-12345678"),
-            ("InstanceType", "t3.micro"),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "one launch configuration past the limit: got {status}: {body}"
-    );
-    assert!(
-        body.contains("<Code>LimitExceeded</Code>"),
-        "one launch configuration past the limit must answer LimitExceeded, got {body}"
-    );
 }
 
 /// The member constraints the model documents in prose — which the boundary
@@ -1685,7 +1459,6 @@ async fn sizes_past_the_capacity_ceiling_are_refused() {
 async fn documented_member_rules_are_enforced() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // "The name can contain any ASCII character 33 to 126 ... You cannot use a
     // colon (:) in the name."
@@ -1701,7 +1474,7 @@ async fn documented_member_rules_are_enforced() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -1739,7 +1512,7 @@ async fn documented_member_rules_are_enforced() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -1783,7 +1556,7 @@ async fn documented_member_rules_are_enforced() {
             "CreateAutoScalingGroup",
             vec![
                 ("AutoScalingGroupName", "both-zones"),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -1815,7 +1588,6 @@ async fn documented_member_rules_are_enforced() {
 async fn scale_in_leaves_protected_instances_running() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // (case, NewInstancesProtectedFromScaleIn, the instances left after scaling in)
     for (index, (case, protected, left)) in [
@@ -1831,7 +1603,7 @@ async fn scale_in_leaves_protected_instances_running() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "4"),
                 ("DesiredCapacity", "2"),
@@ -1975,13 +1747,12 @@ async fn state_changing_operations_emit_an_audit_record() {
     let engine = new_engine();
     let router = router_with(engine.clone());
 
-    create_launch_configuration(&router, "lc-audit").await;
     let (status, body) = query(
         &router,
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-audit"),
-            ("LaunchConfigurationName", "lc-audit"),
+            LAUNCH_SOURCE,
             ("MinSize", "0"),
             ("MaxSize", "2"),
             ("DesiredCapacity", "1"),
@@ -2026,12 +1797,6 @@ async fn state_changing_operations_emit_an_audit_record() {
 
     // (case, the operation, the resource, the outcome)
     for (case, operation, resource, outcome) in [
-        (
-            "the launch configuration create",
-            "CreateLaunchConfiguration",
-            "lc-audit",
-            "created",
-        ),
         ("the group create", "CreateAutoScalingGroup", "asg-audit", "created"),
         ("the capacity change", "SetDesiredCapacity", "asg-audit", "capacity set"),
         (
@@ -2088,7 +1853,6 @@ async fn state_changing_operations_emit_an_audit_record() {
 async fn instances_still_terminating_occupy_the_group_ceiling() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     let ceiling = autoscaling::state::MAX_GROUP_CAPACITY;
     let full = ceiling.to_string();
@@ -2097,7 +1861,7 @@ async fn instances_still_terminating_occupy_the_group_ceiling() {
         "CreateAutoScalingGroup",
         &[
             ("AutoScalingGroupName", "asg-full"),
-            ("LaunchConfigurationName", "lc-1"),
+            LAUNCH_SOURCE,
             ("MinSize", "0"),
             ("MaxSize", full.as_str()),
             ("DesiredCapacity", full.as_str()),
@@ -2206,7 +1970,6 @@ async fn instances_still_terminating_occupy_the_group_ceiling() {
 async fn members_outside_their_documented_value_sets_are_refused() {
     let engine = new_engine();
     let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
 
     // (case, the member, the value, accepted) — the accepted rows are drawn from
     // the model's own value lists, including entries the issue never cited.
@@ -2250,7 +2013,7 @@ async fn members_outside_their_documented_value_sets_are_refused() {
             "CreateAutoScalingGroup",
             &[
                 ("AutoScalingGroupName", name.as_str()),
-                ("LaunchConfigurationName", "lc-1"),
+                LAUNCH_SOURCE,
                 ("MinSize", "0"),
                 ("MaxSize", "0"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
@@ -2282,49 +2045,4 @@ async fn members_outside_their_documented_value_sets_are_refused() {
             "UpdateAutoScalingGroup {case:?}: expected {expected}, got {status}: {body}"
         );
     }
-}
-
-/// A second create under a name already taken is `AlreadyExists` for a launch
-/// configuration as well as for a group, and leaves the stored resource alone.
-#[tokio::test]
-async fn a_duplicate_launch_configuration_name_is_refused() {
-    let engine = new_engine();
-    let router = router_with(engine.clone());
-    create_launch_configuration(&router, "lc-1").await;
-
-    let (status, body) = query(
-        &router,
-        "CreateLaunchConfiguration",
-        &[
-            ("LaunchConfigurationName", "lc-1"),
-            ("ImageId", "ami-99999999"),
-            ("InstanceType", "m5.large"),
-        ],
-    )
-    .await;
-    assert_eq!(status, 400, "a duplicate launch configuration: got {status}: {body}");
-    assert!(
-        body.contains("<Code>AlreadyExists</Code>"),
-        "a duplicate launch configuration must answer AlreadyExists, got {body}"
-    );
-
-    let (_, body) = query(&router, "DescribeLaunchConfigurations", &[]).await;
-    assert_eq!(
-        tag_value(&body, "ImageId"),
-        "ami-12345678",
-        "a refused create must not overwrite the stored configuration, got {body}"
-    );
-
-    // And a create that names neither an image nor an instance to copy is refused.
-    let (status, body) = query(
-        &router,
-        "CreateLaunchConfiguration",
-        &[("LaunchConfigurationName", "lc-2")],
-    )
-    .await;
-    assert_eq!(status, 400, "a launch configuration with no image: got {status}: {body}");
-    assert!(
-        body.contains("<Code>ValidationError</Code>"),
-        "a launch configuration with no image must answer ValidationError, got {body}"
-    );
 }

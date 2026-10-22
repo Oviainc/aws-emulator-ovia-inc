@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(DescribeAutoScalingGroupsErrorModeled::InvalidNextToken(
                         InvalidNextToken {
-                            message: Some("The NextToken value is not valid.".to_string()),
+                            message: Some(crate::state::invalid_next_token_message(token)),
                         },
                     )
                     .into())
@@ -235,7 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if offset > 0 && offset >= matching.len() {
             return Err(DescribeAutoScalingGroupsErrorModeled::InvalidNextToken(
                 InvalidNextToken {
-                    message: Some("The NextToken value is not valid.".to_string()),
+                    message: Some(crate::state::invalid_next_token_message(
+                        input.next_token.as_deref().unwrap_or_default(),
+                    )),
                 },
             )
             .into());

@@ -416,8 +416,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(configuration) = input.launch_configuration_name.as_deref() {
             if !state.launch_configurations.contains_key(configuration) {
                 return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                    "Launch configuration name not found - No launch configuration found with the \
-                     name {configuration}"
+                    "Launch configuration name not found - Launch configuration {configuration} \
+                     not found"
                 )));
             }
         }

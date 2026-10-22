@@ -2,9 +2,10 @@
 
 //! @op CreateLaunchConfiguration
 //!
-//! Stores a launch configuration under its name, stamping the ARN and creation
-//! time the service reports for it. A second create under a name already taken is
-//! `AlreadyExistsFault`.
+//! Refused outright: launch configurations are not a resource this account can
+//! create, so no request stores one. The refusal is HTTP 400 with the error code
+//! `UnsupportedOperation` (a `Sender` fault), and it does not depend on the
+//! request or on this service's state.
 //!
 //! ## Shape of an operation
 //!
@@ -259,121 +260,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(CreateLaunchConfigurationErrorModeled::ResourceContentionFault(
-                ResourceContentionFault {
-                    message: Some(
-                        "the Auto Scaling store is not mounted on this engine".to_string(),
-                    ),
-                },
-            )
-            .into());
-        };
+        // Nothing is read and nothing is written: the refusal is the whole
+        // behaviour, so it depends neither on the request's members nor on this
+        // service's state. Touching the store here is exactly the fault this
+        // handler had — a refused create must leave no resource behind. The three
+        // bindings are discarded the way the scaffold does it, which is also what
+        // keeps the constructor-injected `engine` field read somewhere.
+        let _ = (&input, ctx, &self.engine);
 
-        // Basing a launch configuration on a running EC2 instance means reading
-        // that instance's own configuration, which lives in EC2's state and not in
-        // this service's: it is not something this emulator can answer faithfully,
-        // so say so rather than invent the instance's attributes.
-        if input.instance_id.is_some() {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "CreateLaunchConfiguration with InstanceId needs the configuration \
-                              of a running EC2 instance, which this emulator does not hold"
-                        .to_string(),
-                },
-            ));
-        }
-
-        // Without `InstanceId` the image and instance type are what the
-        // configuration launches from, and the `LaunchConfiguration` resource
-        // reports both as required members, so neither can be left unset.
-        let (Some(image_id), Some(instance_type)) =
-            (input.image_id.clone(), input.instance_type.clone())
-        else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Valid requests must contain either ImageId and InstanceType, or InstanceId",
-            ));
-        };
-
-        let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.materialize_due(now);
-
-        if state
-            .launch_configurations
-            .contains_key(&input.launch_configuration_name)
-        {
-            return Err(CreateLaunchConfigurationErrorModeled::AlreadyExistsFault(
-                AlreadyExistsFault {
-                    message: Some(format!(
-                        "Launch configuration name already exists - A launch configuration already exists with the name {}",
-                        input.launch_configuration_name
-                    )),
-                },
-            )
-            .into());
-        }
-        // Bound what one caller can make this process store, the way the service
-        // bounds it with a quota.
-        if state.launch_configurations.len() >= crate::state::MAX_LAUNCH_CONFIGURATIONS {
-            return Err(CreateLaunchConfigurationErrorModeled::LimitExceededFault(
-                LimitExceededFault {
-                    message: Some(format!(
-                        "You have already reached the limit of {} launch configurations",
-                        crate::state::MAX_LAUNCH_CONFIGURATIONS
-                    )),
-                },
-            )
-            .into());
-        }
-
-        let resource_id = state.mint_resource_id();
-        let arn = crate::state::launch_configuration_arn(
-            &region,
-            &resource_id,
-            &input.launch_configuration_name,
-        );
-        let stored = crate::state::StoredLaunchConfiguration {
-            name: input.launch_configuration_name.clone(),
-            arn,
-            image_id,
-            instance_type,
-            key_name: input.key_name,
-            security_groups: input.security_groups.unwrap_or_default(),
-            classic_link_vpc_id: input.classic_link_vpc_id,
-            classic_link_vpc_security_groups: input
-                .classic_link_vpc_security_groups
-                .unwrap_or_default(),
-            user_data: input.user_data,
-            kernel_id: input.kernel_id,
-            ramdisk_id: input.ramdisk_id,
-            spot_price: input.spot_price,
-            iam_instance_profile: input.iam_instance_profile,
-            block_device_mappings: input.block_device_mappings.unwrap_or_default(),
-            metadata_options: input.metadata_options,
-            instance_monitoring_enabled: input
-                .instance_monitoring
-                .as_ref()
-                .and_then(|monitoring| monitoring.enabled)
-                // `InstanceMonitoring` defaults to enabled (detailed monitoring)
-                // when the request does not say otherwise.
-                .unwrap_or(true),
-            ebs_optimized: input.ebs_optimized.unwrap_or(false),
-            associate_public_ip: input.associate_public_ip_address,
-            placement_tenancy: input.placement_tenancy,
-            created_time: now,
-        };
-        state
-            .launch_configurations
-            .insert(stored.name.clone(), stored);
-
-        crate::state::audit(
-            ctx.parts(),
-            "CreateLaunchConfiguration",
-            &input.launch_configuration_name,
-            "created",
-        );
-        Ok(CreateLaunchConfigurationOutput)
+        Err(crate::scaffolded::Scaffolded::unsupported_operation(
+            CREATION_UNAVAILABLE,
+        ))
     }
 }
+
+/// What the service answers a `CreateLaunchConfiguration` call with.
+///
+/// Launch configurations are not available to an account that has not already
+/// been using them, and the service points the caller at launch templates
+/// instead; this emulator models such an account, so the refusal is
+/// unconditional. The wording is the service's own for this refusal, not derived
+/// from any request.
+const CREATION_UNAVAILABLE: &str = "The Launch Configuration creation operation is not available \
+                                    in your account. Use launch templates to create configuration \
+                                    templates for your Auto Scaling groups.";

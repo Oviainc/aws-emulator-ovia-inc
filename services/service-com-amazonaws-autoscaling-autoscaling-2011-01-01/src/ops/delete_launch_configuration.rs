@@ -2,9 +2,10 @@
 
 //! @op DeleteLaunchConfiguration
 //!
-//! Removes a stored launch configuration. A configuration an Auto Scaling group
-//! still references is `ResourceInUseFault`; a name that names nothing is
-//! refused.
+//! Removes a stored launch configuration. A name that names nothing is refused
+//! with `ValidationError`; a configuration an Auto Scaling group still launches
+//! from is `ResourceInUseFault`. The account this emulator models holds none
+//! (`CreateLaunchConfiguration` is refused), so every name is unknown.
 //!
 //! ## Shape of an operation
 //!
@@ -170,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !state.launch_configurations.contains_key(&name) {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Launch configuration name not found - No launch configuration found with the name {name}"
+                "Launch configuration name not found - Launch configuration {name} not found"
             )));
         }
 

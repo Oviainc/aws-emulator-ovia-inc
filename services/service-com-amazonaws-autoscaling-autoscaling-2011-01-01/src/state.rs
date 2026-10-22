@@ -107,9 +107,13 @@ pub const MAX_GROUP_CAPACITY: i32 = 1_000;
 /// answers its modelled `LimitExceededFault`.
 pub const MAX_GROUPS: usize = 500;
 
-/// The most launch configurations this emulator will hold, past which
-/// `CreateLaunchConfiguration` answers its modelled `LimitExceededFault`. Same
-/// reason as [`MAX_GROUPS`].
+/// The launch-configuration limit this service REPORTS for the account, through
+/// `DescribeAccountLimits`'s `MaxNumberOfLaunchConfigurations`.
+///
+/// Same order as the service's own adjustable per-Region quota, like
+/// [`MAX_GROUPS`]. Nothing enforces it: `CreateLaunchConfiguration` is refused
+/// with `UnsupportedOperation`, so the reported count stays 0 and no caller can
+/// approach the limit.
 pub const MAX_LAUNCH_CONFIGURATIONS: usize = 200;
 
 /// The most scaling activities this service retains; appending past it drops the
@@ -121,7 +125,13 @@ pub const MAX_LAUNCH_CONFIGURATIONS: usize = 200;
 /// six weeks, so a retention bound is the shape of the real behaviour too.
 pub const MAX_RETAINED_ACTIVITIES: usize = 10_000;
 
-/// A stored launch configuration — the `LaunchConfiguration` resource, as created.
+/// A stored launch configuration — the `LaunchConfiguration` resource.
+///
+/// NOTHING in this crate constructs one: `CreateLaunchConfiguration` is refused
+/// with `UnsupportedOperation`, so [`ComAmazonawsAutoscalingAutoscaling20110101State::launch_configurations`]
+/// stays empty. This is the shape its readers project from
+/// (`DescribeLaunchConfigurations`, a group's launch source), which is why they
+/// report what the store holds instead of assuming it is empty.
 #[derive(Debug, Clone)]
 pub struct StoredLaunchConfiguration {
     pub name: String,
@@ -279,6 +289,13 @@ pub struct StoredActivity {
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     /// Launch configurations, keyed by `LaunchConfigurationName`.
+    ///
+    /// Empty for the life of the process: `CreateLaunchConfiguration` is refused
+    /// with `UnsupportedOperation` because the account this emulator models cannot
+    /// create a launch configuration at all. The collection stays here because
+    /// `DescribeLaunchConfigurations`, `DeleteLaunchConfiguration` and a group's
+    /// `LaunchConfigurationName` all answer FROM it rather than from a constant,
+    /// so each of them reports what the store holds.
     pub launch_configurations: BTreeMap<String, StoredLaunchConfiguration>,
     /// Auto Scaling groups, keyed by `AutoScalingGroupName`.
     pub groups: BTreeMap<String, StoredGroup>,
@@ -827,16 +844,6 @@ pub fn group_arn(region: &str, resource_id: &str, name: &str) -> String {
     )
 }
 
-/// The ARN of a launch configuration, in the form the service reports:
-/// `arn:aws:autoscaling:{region}:{account}:launchConfiguration:{id}:launchConfigurationName/{name}`.
-pub fn launch_configuration_arn(region: &str, resource_id: &str, name: &str) -> String {
-    ::engine::emulator_arn(
-        "autoscaling",
-        region,
-        &format!("launchConfiguration:{resource_id}:launchConfigurationName/{name}"),
-    )
-}
-
 /// Decode a `NextToken` into the offset it names, or `None` when the token is not
 /// one this service issued.
 ///
@@ -853,6 +860,16 @@ pub fn decode_next_token(token: &str) -> Option<usize> {
         .filter(|offset| *offset > 0)
 }
 
+/// The message a paginated read refuses an unusable `NextToken` with.
+///
+/// The REQUIREMENT here is that the refusal quotes the token the caller sent —
+/// that is the only thing the caller can act on, since the token it is holding is
+/// not one this service will resume from. The surrounding wording is an example,
+/// not something the model or a recording pins down.
+pub fn invalid_next_token_message(token: &str) -> String {
+    format!("The token '{token}' was invalid")
+}
+
 /// Encode the offset the next page starts at as a `NextToken`.
 pub fn encode_next_token(offset: usize) -> String {
     format!("{NEXT_TOKEN_MARKER}{offset}")
@@ -867,15 +884,25 @@ const NEXT_TOKEN_MARKER: &str = "next-";
 /// `max_records` is the request's `MaxRecords`; absent or out of range it falls
 /// back to [`DEFAULT_MAX_RECORDS`], and it is capped at [`MAX_MAX_RECORDS`].
 pub fn page<T: Clone>(items: &[T], offset: usize, max_records: Option<i32>) -> (Vec<T>, Option<String>) {
-    let limit = max_records
-        .filter(|value| *value > 0)
-        .map_or(DEFAULT_MAX_RECORDS, |value| {
-            (value as usize).min(MAX_MAX_RECORDS)
-        });
+    let limit = page_limit(max_records);
     let start = offset.min(items.len());
     let end = start.saturating_add(limit).min(items.len());
     let next = (end < items.len()).then(|| encode_next_token(end));
     (items[start..end].to_vec(), next)
+}
+
+/// How many items one page holds, from the request's `MaxRecords`: absent or
+/// non-positive it falls back to [`DEFAULT_MAX_RECORDS`], and it is capped at
+/// [`MAX_MAX_RECORDS`].
+///
+/// Separate from [`page`] because a describe that pages over its own cursor
+/// rather than over an offset still bounds its page the same way.
+pub fn page_limit(max_records: Option<i32>) -> usize {
+    max_records
+        .filter(|value| *value > 0)
+        .map_or(DEFAULT_MAX_RECORDS, |value| {
+            (value as usize).min(MAX_MAX_RECORDS)
+        })
 }
 
 /// A request's `MaxRecords` when it is outside the range the model documents

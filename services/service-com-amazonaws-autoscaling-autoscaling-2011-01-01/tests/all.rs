@@ -13,7 +13,13 @@
 // points it into `tests/all/`.
 #[path = "all/auto_scaling_group_lifecycle.rs"]
 mod auto_scaling_group_lifecycle;
+#[path = "all/launch_configurations_are_unavailable.rs"]
+mod launch_configurations_are_unavailable;
 #[path = "all/reference_data_catalogs.rs"]
 mod reference_data_catalogs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// The shared harness the suites above drive the service through: the awsQuery POST
+// and the XML readers, defined once.
+#[path = "all/support.rs"]
+mod support;

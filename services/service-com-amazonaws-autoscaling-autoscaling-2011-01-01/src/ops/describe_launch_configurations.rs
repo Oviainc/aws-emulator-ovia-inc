@@ -3,7 +3,10 @@
 //! @op DescribeLaunchConfigurations
 //!
 //! Reports the stored launch configurations, name-ordered, filtered by the
-//! requested names and paged by `MaxRecords`/`NextToken`.
+//! requested names and paged by `MaxRecords`/`NextToken` — where `NextToken` is
+//! the name the next page resumes after, so no token is refused. The account this
+//! emulator models can create none (`CreateLaunchConfiguration` is refused), so
+//! this read answers the required-but-empty element.
 //!
 //! ## Shape of an operation
 //!
@@ -159,21 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match crate::state::decode_next_token(token) {
-                Some(offset) => offset,
-                None => {
-                    return Err(DescribeLaunchConfigurationsErrorModeled::InvalidNextToken(
-                        InvalidNextToken {
-                            message: Some("The NextToken value is not valid.".to_string()),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
-
         let wanted = input.launch_configuration_names.unwrap_or_default();
         // `MaxRecords` has a documented range; a page size outside it is refused,
         // not quietly reshaped.
@@ -194,24 +182,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(::std::time::SystemTime::now());
 
-        let matching: Vec<LaunchConfiguration> = state
+        // This operation's `NextToken` is the launch configuration name the next
+        // page resumes AFTER: the store is name-ordered, so every value names a
+        // position in that order and none of them can be invalid. That is why this
+        // read answers a token it never issued with the first page rather than
+        // refusing it, while a describe whose token is an opaque cursor still
+        // answers `InvalidNextToken` for one it did not issue. The real service's
+        // token is opaque; a start-after key is this emulator's encoding of it,
+        // and it is unobservable while no launch configuration can exist.
+        let resume_after = input.next_token.unwrap_or_default();
+        let limit = crate::state::page_limit(input.max_records);
+        // The store is keyed by name, so the cursor IS the key order: `range` from
+        // just past the token positions the page without walking what it skips.
+        // One item past the page is read, so whether anything follows it is known
+        // without walking the rest of the collection either.
+        let mut launch_configurations: Vec<LaunchConfiguration> = state
             .launch_configurations
-            .values()
+            .range::<str, _>((
+                ::std::ops::Bound::Excluded(resume_after.as_str()),
+                ::std::ops::Bound::Unbounded,
+            ))
+            .map(|(_, config)| config)
             .filter(|config| wanted.is_empty() || wanted.contains(&config.name))
+            .take(limit.saturating_add(1))
             .map(launch_configuration_view)
             .collect();
-        // A token the service issued always points inside the list it was issued
-        // for; one that points past the end was not issued for this list.
-        if offset > 0 && offset >= matching.len() {
-            return Err(DescribeLaunchConfigurationsErrorModeled::InvalidNextToken(
-                InvalidNextToken {
-                    message: Some("The NextToken value is not valid.".to_string()),
-                },
-            )
-            .into());
-        }
-        let (launch_configurations, next_token) =
-            crate::state::page(&matching, offset, input.max_records);
+        let more_follow = launch_configurations.len() > limit;
+        launch_configurations.truncate(limit);
+        let next_token = more_follow
+            .then(|| {
+                launch_configurations
+                    .last()
+                    .map(|config| config.launch_configuration_name.clone())
+            })
+            .flatten();
 
         Ok(DescribeLaunchConfigurationsOutput {
             launch_configurations,

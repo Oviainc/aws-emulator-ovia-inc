@@ -208,6 +208,38 @@ pub static VALIDATION_ERROR_SCHEMA: Schema = Schema::new_struct(
     &[&VALIDATION_ERROR_MESSAGE],
 );
 
+/// The `message` member of the synthetic `UnsupportedOperation` error shape.
+static UNSUPPORTED_OPERATION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnsupportedOperation$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `UnsupportedOperation` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`:
+/// the shape is not in any service's model, so it must not collide with a modeled
+/// one. It exists because Amazon EC2 Auto Scaling refuses an operation its own
+/// model still declares — a resource type the account cannot use at all — with the
+/// error code `UnsupportedOperation`, and the error code is what a client branches
+/// on. It is a CLIENT fault (HTTP 400), so the query envelope reports it as
+/// `<Type>Sender</Type>`.
+pub static UNSUPPORTED_OPERATION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#UnsupportedOperation",
+        "smithy.framework",
+        "UnsupportedOperation",
+    ),
+    ShapeType::Structure,
+    &[&UNSUPPORTED_OPERATION_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -233,6 +265,12 @@ pub enum Scaffolded<E> {
     /// `message` member; only the wire code differs from
     /// [`Scaffolded::ValidationException`].
     ValidationError(ValidationException),
+    /// The operation is not available to this account at all, with HTTP 400 and
+    /// the error code `UnsupportedOperation`. Not a bad request and not an
+    /// unwritten one: the service itself refuses every call, whatever the request
+    /// carries. The payload is the same single `message` member as the refusals
+    /// above.
+    UnsupportedOperation(ValidationException),
 }
 
 impl<E> Scaffolded<E> {
@@ -271,6 +309,16 @@ impl<E> Scaffolded<E> {
     pub fn validation_error(message: impl Into<String>) -> Self {
         Self::ValidationError(ValidationException::new(message))
     }
+
+    /// Refuse the operation outright with HTTP 400 `UnsupportedOperation`.
+    ///
+    /// For an operation Amazon EC2 Auto Scaling still models but no longer serves
+    /// to this account, so no request can succeed and nothing is stored. Say what
+    /// is unavailable and what to use instead, because the caller has to change
+    /// which operation it calls — not which values it sends.
+    pub fn unsupported_operation(message: impl Into<String>) -> Self {
+        Self::UnsupportedOperation(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -280,6 +328,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::ValidationError(e) => write!(f, "{e}"),
+            Self::UnsupportedOperation(e) => write!(f, "{e}"),
         }
     }
 }
@@ -293,6 +342,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::ValidationError(e) => e.source(),
+            Self::UnsupportedOperation(e) => e.source(),
         }
     }
 }
@@ -308,6 +358,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::ValidationError(e) => e,
+            Self::UnsupportedOperation(e) => e,
         }
     }
 
@@ -317,6 +368,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::ValidationError(_) => &VALIDATION_ERROR_SCHEMA,
+            Self::UnsupportedOperation(_) => &UNSUPPORTED_OPERATION_SCHEMA,
         }
     }
 
@@ -330,6 +382,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::ValidationError(_) => "ValidationError",
+            Self::UnsupportedOperation(_) => "UnsupportedOperation",
         }
     }
 
@@ -343,6 +396,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::ValidationError(_) => 400,
+            Self::UnsupportedOperation(_) => 400,
         }
     }
 
@@ -358,6 +412,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // on the query protocols is exactly the code the service answers with.
             Self::ValidationException(_) => None,
             Self::ValidationError(_) => None,
+            Self::UnsupportedOperation(_) => None,
         }
     }
 }
