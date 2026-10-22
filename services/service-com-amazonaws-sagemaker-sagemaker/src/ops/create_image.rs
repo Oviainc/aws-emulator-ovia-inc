@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers an image in `crate::state` under its `ImageName`, minting the
+//! `ImageArn` from the request's region, and refuses a name already in use with the
+//! modelled `ResourceInUse`. A created image is reported `CREATING` until the instant
+//! the clock owes it the move to `CREATED`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImage"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "image", &input.image_name);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `ImageName` cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.images_below_quota() {
+            return Err(CreateImageErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(format!(
+                    "The account-level service limit for images is {}, with current \
+                     utilization of {} and a request delta of 1.",
+                    crate::state::IMAGE_QUOTA,
+                    store.images.len()
+                )),
+            })
+            .into());
+        }
+        // The model documents `ImageName` as "must be unique to your account", so a name
+        // already in use is refused with the modelled in-use error rather than
+        // overwritten: otherwise the caller reads a 200 for an image it did not create,
+        // and the image it did create is gone.
+        if store.images.contains_key(&input.image_name) {
+            return Err(CreateImageErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!("Cannot create already existing image \"{arn}\".")),
+            })
+            .into());
+        }
+
+        store.images.insert(
+            input.image_name.clone(),
+            crate::state::Image {
+                name: input.image_name.clone(),
+                arn: arn.clone(),
+                description: input.description,
+                display_name: input.display_name,
+                role_arn: input.role_arn,
+                status: crate::state::IMAGE_STATUS_CREATING.to_string(),
+                failure_reason: None,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                created_at: now + crate::state::IMAGE_CREATED_AFTER,
+                // The first version of this image takes number 1.
+                next_version: 1,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateImageOutput {
+            image_arn: Some(arn),
+        })
     }
 }
