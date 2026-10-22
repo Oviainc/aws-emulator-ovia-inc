@@ -155,9 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM entity names "are not distinguished by case", so the case-folded name is the
         // identity the store is keyed by — the same key `CreateInstanceProfile` wrote under.
         // This is a pure read: nothing is written, so two calls report the same profile.
+        // The roles the profile reports are resolved from the role store, so what comes
+        // back is the role as the account holds it now, not a copy taken when it was bound.
         let store = state.lock();
         let key = crate::state::name_key(&input.instance_profile_name);
-        let Some(instance_profile) = store.instance_profiles.get(&key).cloned() else {
+        let Some(instance_profile) = store.instance_profile_report(&key) else {
             return Err(GetInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

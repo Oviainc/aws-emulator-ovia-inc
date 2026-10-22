@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountAggregationSource, AggregatorFilters, ComplianceContributorCount, ComplianceSummary,
-    ConfigExportDeliveryInfo, ConfigRule, ConfigSnapshotDeliveryProperties,
+    AccountAggregationSource, AggregatorFilters, Compliance, ComplianceContributorCount,
+    ComplianceSummary, ConfigExportDeliveryInfo, ConfigRule, ConfigSnapshotDeliveryProperties,
     ConfigStreamDeliveryInfo, ConfigurationAggregator, ConfigurationRecorder,
     ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
     DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
@@ -120,6 +120,13 @@ pub const COMPLIANCE_TYPE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 /// Reaching it is what sets `ComplianceContributorCount.CapExceeded`.
 pub const COMPLIANCE_SUMMARY_RULE_CAP: i32 = 25;
 
+/// The cap a count of contributing RESOURCES is reported up to
+/// (`ComplianceSummary$NonCompliantResourceCount`: "The number of Config rules or
+/// Amazon Web Services resources that are noncompliant, up to a maximum of 25 for
+/// rules and 100 for resources"). A rule's `Compliance$ComplianceContributorCount`
+/// counts resources, so it is reported up to this cap.
+pub const COMPLIANCE_RESOURCE_CAP: i32 = 100;
+
 /// `Owner` value for a Custom Policy rule (`com.amazonaws.configservice#Owner`).
 pub const OWNER_CUSTOM_POLICY: &str = "CUSTOM_POLICY";
 
@@ -200,6 +207,12 @@ pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// How many rules one `DescribeComplianceByConfigRule` page carries.
+///
+/// That operation models no `Limit` member either, and it pages over the same rules
+/// `DescribeConfigRules` does, so it serves them at the same page size.
+pub const DESCRIBE_COMPLIANCE_BY_CONFIG_RULE_PAGE_SIZE: usize = DESCRIBE_CONFIG_RULES_PAGE_SIZE;
 
 /// The most retention configurations this account and Region can hold
 /// (`DescribeRetentionConfigurations` and `PutRetentionConfiguration`: "Currently,
@@ -532,6 +545,32 @@ impl ConfigRuleEntry {
             COMPLIANCE_TYPE_COMPLIANT
         } else {
             COMPLIANCE_TYPE_INSUFFICIENT_DATA
+        }
+    }
+
+    /// This rule's modelled `Compliance`: the `ComplianceType` it rolls up to
+    /// ([`Self::compliance`]) and how many resources contribute that result.
+    ///
+    /// `Compliance$ComplianceContributorCount` is "the number of Amazon Web Services
+    /// resources or Config rules that cause a result of NON_COMPLIANT", so it is
+    /// reported only where such resources exist — a rule no evaluation result places
+    /// as noncompliant carries no contributor count — and it is counted up to
+    /// [`COMPLIANCE_RESOURCE_CAP`] because the contributors counted here are
+    /// resources.
+    pub fn compliance_shape(&self) -> Compliance {
+        let contributors = self
+            .resource_compliance
+            .values()
+            .filter(|recorded| recorded.as_str() == COMPLIANCE_TYPE_NON_COMPLIANT)
+            .count();
+        Compliance {
+            compliance_type: Some(self.compliance().to_string()),
+            compliance_contributor_count: (contributors > 0).then(|| {
+                capped_count(
+                    i64::try_from(contributors).unwrap_or(i64::MAX),
+                    COMPLIANCE_RESOURCE_CAP,
+                )
+            }),
         }
     }
 }
@@ -902,19 +941,27 @@ pub fn summarise_rule_compliance<'a>(
         }
     }
     ComplianceSummary {
-        compliant_resource_count: Some(capped_count(compliant)),
-        non_compliant_resource_count: Some(capped_count(non_compliant)),
+        compliant_resource_count: Some(capped_count(compliant, COMPLIANCE_SUMMARY_RULE_CAP)),
+        non_compliant_resource_count: Some(capped_count(
+            non_compliant,
+            COMPLIANCE_SUMMARY_RULE_CAP,
+        )),
         compliance_summary_timestamp: Some(timestamp(at)),
     }
 }
 
-/// `count` reported as a `ComplianceContributorCount`: capped at
-/// [`COMPLIANCE_SUMMARY_RULE_CAP`], with `CapExceeded` set once the cap is reached.
-fn capped_count(count: i64) -> ComplianceContributorCount {
-    let cap = i64::from(COMPLIANCE_SUMMARY_RULE_CAP);
+/// `count` contributors reported as a `ComplianceContributorCount` against `cap`: the
+/// count itself while it is under the cap, the cap once it is past it, and
+/// `CapExceeded` set exactly then.
+///
+/// The cap is a parameter because Config reports a count of rules and a count of
+/// resources up to different maxima ([`COMPLIANCE_SUMMARY_RULE_CAP`] and
+/// [`COMPLIANCE_RESOURCE_CAP`]), while the capping rule itself is the same one.
+fn capped_count(count: i64, cap: i32) -> ComplianceContributorCount {
+    let limit = i64::from(cap);
     ComplianceContributorCount {
-        capped_count: i32::try_from(count.min(cap)).unwrap_or(COMPLIANCE_SUMMARY_RULE_CAP),
-        cap_exceeded: count > cap,
+        capped_count: i32::try_from(count.min(limit)).unwrap_or(cap),
+        cap_exceeded: count > limit,
     }
 }
 

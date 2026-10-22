@@ -17,6 +17,8 @@ mod cleanrooms_collaboration_lifecycle;
 mod cleanrooms_configured_table;
 #[path = "all/cleanrooms_created_resource_defaults.rs"]
 mod cleanrooms_created_resource_defaults;
+#[path = "all/membership_updates.rs"]
+mod membership_updates;
 #[path = "all/protected_queries.rs"]
 mod protected_queries;
 #[path = "all/state_roundtrip.rs"]

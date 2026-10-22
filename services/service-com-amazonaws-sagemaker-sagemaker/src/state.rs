@@ -1161,6 +1161,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub trial_components: BTreeMap<String, TrialComponent>,
     /// Keyed by `ProcessingJobName`.
     pub processing_jobs: BTreeMap<String, ProcessingJob>,
+    /// Keyed by the partner app's `app-...` id. See [`PartnerApp`], at the end of this
+    /// module with the rest of the partner-AI-app slice.
+    pub partner_apps: BTreeMap<String, PartnerApp>,
     /// Keyed by `ImageName`. See [`Image`], at the end of this module with the rest of
     /// the custom-image slice.
     pub images: BTreeMap<String, Image>,
@@ -2204,6 +2207,67 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// own types rather than in the one above.
     pub fn ai_workload_configs_below_quota(&self) -> bool {
         self.ai_workload_configs.len() < AI_WORKLOAD_CONFIG_QUOTA
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SageMaker Partner AI Apps: the store `ListPartnerApps` pages. Kept together at the
+// end of this module, the way the lineage-action and workload-configuration slices
+// above are, so this resource kind reads as one slice — and merges as one block.
+// ---------------------------------------------------------------------------
+
+/// `PartnerAppStatus`'s members this emulator moves a partner AI app through (both are
+/// members of `crate::ops::types::PARTNER_APP_STATUS_VALUES`; the modelled enum also
+/// carries the update, failure and delete states, which this slice does not reach).
+/// A separate pair from [`STATUS_CREATING`], which names `EndpointStatus`'s members.
+pub const PARTNER_APP_STATUS_CREATING: &str = "Creating";
+/// See [`PARTNER_APP_STATUS_CREATING`].
+pub const PARTNER_APP_STATUS_AVAILABLE: &str = "Available";
+
+/// `ListPartnerApps`' documented `MaxResults` default, applied when the caller names
+/// none: "The default value for MaxResults is 10."
+/// (`smithy_query(query="doc",shape="ListPartnerAppsRequest",member="MaxResults")`).
+/// [`MAX_PAGE_SIZE`] still caps the page above it, as it does for every listing here.
+pub const PARTNER_APP_DEFAULT_PAGE_SIZE: i32 = 10;
+
+/// A SageMaker Partner AI App, as `ListPartnerApps` summarises it.
+///
+/// Keyed in state by [`PartnerApp::app_id`] (the ARN's `app-...` resource id), which AWS
+/// mints and every later call addresses the app by. `CreatePartnerApp` is still a
+/// scaffold stub, so nothing in this emulator fills the store yet; `ListPartnerApps`
+/// pages whatever it holds, and the creating, updating and deleting handlers extend
+/// [`ComAmazonawsSagemakerSagemakerState::partner_apps`] rather than adding a second map.
+///
+/// `available_at` is the instant the clock owes the `Creating` -> `Available` transition;
+/// it is stored, never slept on, and materialised by whichever reporting call first runs
+/// at or after it.
+#[derive(Debug, Clone)]
+pub struct PartnerApp {
+    pub app_id: String,
+    pub arn: String,
+    pub name: String,
+    pub app_type: String,
+    pub status: String,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub available_at: SystemTime,
+}
+
+impl PartnerApp {
+    /// Materialise the `Creating` -> `Available` transition the clock already owes, the
+    /// same way [`Endpoint::settle_status`] does for an endpoint: it was due at
+    /// `available_at` whether or not anybody listed the apps, so the observer makes no
+    /// difference to the result, and `LastModifiedTime` moves to the instant the
+    /// transition was due rather than to "now".
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == PARTNER_APP_STATUS_CREATING && now >= self.available_at {
+            self.status = PARTNER_APP_STATUS_AVAILABLE.to_string();
+            self.last_modified_time = self.available_at;
+            return true;
+        }
+        false
     }
 }
 

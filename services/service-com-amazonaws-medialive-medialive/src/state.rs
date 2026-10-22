@@ -117,17 +117,19 @@ pub(crate) use alarm_template_groups::alarm_template_group_output;
 
 /// The multiplex slice: its record, its bounds, its refusals, the store's
 /// methods and its output projection, in one module of its own for the same
-/// reason as the alarm template group slice above. What stays in this file is
-/// the part the rest of the state needs: the store members on
-/// [`ComAmazonawsMedialiveMedialiveState`].
+/// reason as the alarm template group slice above. The PROGRAMS a multiplex
+/// holds are part of that slice: they live on the multiplex record that owns
+/// them. What stays in this file is the part the rest of the state needs: the
+/// store members on [`ComAmazonawsMedialiveMedialiveState`].
 pub mod multiplexes;
 
 pub use multiplexes::{
-    multiplex_state, MultiplexRecord, MultiplexRefusal, MAX_MULTIPLEXES, MAX_MULTIPLEX_TOKENS,
-    MULTIPLEX_AVAILABILITY_ZONES,
+    multiplex_state, MultiplexProgramRecord, MultiplexProgramRefusal, MultiplexRecord,
+    MultiplexRefusal, MAX_MULTIPLEXES, MAX_MULTIPLEX_PROGRAMS, MAX_MULTIPLEX_PROGRAM_TOKENS,
+    MAX_MULTIPLEX_TOKENS, MAX_SERVICE_DESCRIPTOR_NAME_LEN, MULTIPLEX_AVAILABILITY_ZONES,
 };
 
-pub(crate) use multiplexes::multiplex_description_output;
+pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_description_output};
 
 /// The eventbridge rule TEMPLATE slice: its record, its bounds, its refusal, the
 /// store's methods and its output projection, in one module of its own for the
@@ -1113,6 +1115,12 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// `CreateMultiplex`'s `RequestId` (`@idempotencyToken`) -> the multiplex it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     multiplex_tokens: IdempotencyTokens,
+    /// `CreateMultiplexProgram`'s `RequestId` (`@idempotencyToken`) -> the
+    /// program it created, keyed by the multiplex slice's
+    /// `multiplex_program_key` because a program is named by its multiplex and
+    /// its own name rather than by an id. PRIVATE for the same reason as
+    /// [`Self::channel_tokens`].
+    multiplex_program_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {

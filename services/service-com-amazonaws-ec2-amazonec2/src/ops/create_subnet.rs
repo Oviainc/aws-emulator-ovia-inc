@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSubnet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSubnet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a subnet inside a stored VPC from the request's IPv4 CIDR block
+//! and Availability Zone, stores it as the modelled [`Subnet`] shape, and answers it in
+//! `pending` with the instant the clock owes it `available` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_available_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSubnet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,242 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSubnet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSubnetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSubnet"))
+        use crate::state;
+        use std::time::Instant;
+
+        // Request shapes this emulator holds no state for at all, so a 501 ("nobody has
+        // written this yet") is the honest answer rather than a refusal that blames the
+        // caller: there is no IPAM pool store to allocate a block out of (every IPAM
+        // operation is still a scaffold), no Outpost resource to place a subnet on
+        // (`CreateLocalGatewayRouteTableVpcAssociation` and the Outpost operations are
+        // scaffolds too), and no IPv6 subnet in this store — `insert_subnet` writes an
+        // IPv4 subnet, so an IPv6-only or dual-stack subnet would be answered with an
+        // IPv6 association it does not hold.
+        if input.ipv4_ipam_pool_id.is_some()
+            || input.ipv6_ipam_pool_id.is_some()
+            || input.ipv4_netmask_length.is_some()
+            || input.ipv6_netmask_length.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSubnet with an IPAM-allocated CIDR block",
+            ));
+        }
+        if input.outpost_arn.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSubnet on an Outpost",
+            ));
+        }
+        if input.ipv6_cidr_block.is_some() || input.ipv6_native.unwrap_or(false) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSubnet with an IPv6 CIDR block",
+            ));
+        }
+
+        // "For an IPv4 only subnet, specify an IPv4 CIDR block" — no IPv6 block was named
+        // and no IPAM pool either, so the request has to carry the block itself.
+        let Some(requested_cidr) = input.cidr_block.as_deref().filter(|cidr| !cidr.is_empty())
+        else {
+            return Err(state::missing_parameter(
+                "Either 'cidrBlock' or 'ipv6CidrBlock' must be specified",
+            ));
+        };
+        // "We modify the specified CIDR block to its canonical form"
+        // (`CreateSubnetRequest$CidrBlock`), within the published subnet block size: "The
+        // allowed size for an IPv4 subnet is between a /28 netmask (16 IP addresses) and a
+        // /16 netmask (65,536 IP addresses)" (`CreateSubnet`).
+        let cidr_block = match state::canonical_subnet_ipv4_cidr(requested_cidr) {
+            Ok(canonical) => canonical,
+            Err(state::CidrProblem::Malformed) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({requested_cidr}) for parameter cidrBlock is invalid. \
+                     This is not a valid CIDR block."
+                )))
+            }
+            Err(state::CidrProblem::PrefixLength) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "The CIDR '{requested_cidr}' is invalid. The allowed block size is \
+                     between a /{min} netmask and /{max} netmask.",
+                    min = state::MIN_SUBNET_IPV4_PREFIX,
+                    max = state::MAX_SUBNET_IPV4_PREFIX,
+                )))
+            }
+        };
+
+        // "The tags to assign to the subnet" — the shared reader refuses a specification
+        // naming any other resource type and holds the payload to the documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_SUBNET,
+            Self::NAME,
+        )?;
+        let payload_bytes = state::tag_list_bytes(&tags);
+
+        let region = state::request_region(ctx.parts());
+        let zones = state::availability_zones_in_region(&region);
+
+        // "The Availability Zone or Local Zone for the subnet. Default: Amazon Web Services
+        // selects one for you" (`CreateSubnetRequest$AvailabilityZone`) — the Region's first
+        // zone, "we do not necessarily select a different zone for each subnet". A zone the
+        // Region does not have is refused rather than stored, so a subnet never reports a
+        // zone `DescribeAvailabilityZones` does not list.
+        let zone = match (
+            input.availability_zone.as_deref(),
+            input.availability_zone_id.as_deref(),
+        ) {
+            (None, None) => zones.first().cloned().ok_or_else(|| {
+                state::internal_error(format!("region {region} has no Availability Zone"))
+            })?,
+            (Some(zone_name), None) => zones
+                .iter()
+                .find(|zone| zone.zone_name == zone_name)
+                .cloned()
+                .ok_or_else(|| unknown_zone("availabilityZone", zone_name, zone_names(&zones)))?,
+            (None, Some(zone_id)) => zones
+                .iter()
+                .find(|zone| zone.zone_id == zone_id)
+                .cloned()
+                .ok_or_else(|| unknown_zone("availabilityZoneId", zone_id, zone_ids(&zones)))?,
+            (Some(zone_name), Some(zone_id)) => {
+                // Both members name the same zone from two sides, so they have to agree:
+                // honouring one and ignoring the other would put the subnet somewhere the
+                // request did not ask for.
+                let by_name = zones
+                    .iter()
+                    .find(|zone| zone.zone_name == zone_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        unknown_zone("availabilityZone", zone_name, zone_names(&zones))
+                    })?;
+                if by_name.zone_id != zone_id {
+                    return Err(state::invalid_parameter_combination(format!(
+                        "The Availability Zone '{zone_name}' is '{held}', \
+                         not the requested '{zone_id}'",
+                        held = by_name.zone_id,
+                    )));
+                }
+                by_name
+            }
+        };
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Creates a subnet in the specified VPC": a VPC id this account holds no VPC for
+        // is a refusal, not a subnet in no VPC.
+        let Some(vpc) = store.vpcs.get(&input.vpc_id) else {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        };
+        // A subnet's block is a block OF its VPC's, so it has to sit inside one of the
+        // IPv4 blocks associated with the VPC — the primary one or any block a later
+        // association added.
+        let within_vpc = vpc
+            .cidr_block_association_set
+            .iter()
+            .flatten()
+            .filter_map(|association| association.cidr_block.as_deref())
+            .any(|associated| state::ipv4_cidr_block_contains(associated, &cidr_block));
+        if !within_vpc {
+            return Err(state::invalid_subnet_range(&cidr_block, &input.vpc_id));
+        }
+        // "A subnet CIDR block must not overlap the CIDR block of an existing subnet in the
+        // VPC" (`CreateSubnet`) — the conflict is per VPC, so the same block in another VPC
+        // is not one.
+        if let Some(conflicting) = store
+            .subnets
+            .iter()
+            .filter(|(_, subnet)| subnet.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
+            .find(|(_, subnet)| {
+                subnet
+                    .cidr_block
+                    .as_deref()
+                    .is_some_and(|held| state::ipv4_cidr_blocks_overlap(held, &cidr_block))
+            })
+            .map(|(subnet_id, _)| subnet_id.clone())
+        {
+            return Err(state::invalid_subnet_conflict(&cidr_block, &conflicting));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_subnet_capacity() {
+            return Err(state::subnet_limit_exceeded());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The record itself. Only a default VPC's own subnets are `DefaultForAz`, and a
+        // subnet a caller creates does not auto-assign a public IPv4 address ("the
+        // auto-assign public IPv4 address attribute set to `true`" is a property of a
+        // DEFAULT subnet — Amazon VPC User Guide, "Default VPCs"), so both are false here
+        // until something modifies the subnet.
+        let subnet_id = store.insert_subnet(state::SubnetSpec {
+            vpc_id: input.vpc_id.clone(),
+            cidr_block,
+            availability_zone: zone.zone_name,
+            availability_zone_id: zone.zone_id,
+            region,
+            state: state::SUBNET_STATE_PENDING.to_string(),
+            default_for_az: false,
+            map_public_ip_on_launch: false,
+            tags,
+        });
+        // What the clock now owes this subnet: `available`, one TRANSITION_DELAY from now —
+        // the same span, off the same monotonic clock, as a `pending` VPC's own move.
+        store
+            .subnet_available_at
+            .insert(subnet_id.clone(), Instant::now() + state::TRANSITION_DELAY);
+
+        // The answer is the record as it was stored, so `CreateSubnet` and
+        // `DescribeSubnets` cannot drift apart.
+        let Some(subnet) = store.subnets.get(&subnet_id).cloned() else {
+            return Err(state::internal_error(
+                "the subnet just created could not be read back",
+            ));
+        };
+        Ok(CreateSubnetOutput {
+            subnet: Some(subnet),
+        })
     }
+}
+
+/// The zone NAMES of `zones`, which is what a request naming a zone by name is compared
+/// against.
+fn zone_names(zones: &[crate::state::AvailabilityZoneRecord]) -> Vec<String> {
+    zones.iter().map(|zone| zone.zone_name.clone()).collect()
+}
+
+/// The zone IDS of `zones`, which is what a request naming a zone by id is compared
+/// against.
+fn zone_ids(zones: &[crate::state::AvailabilityZoneRecord]) -> Vec<String> {
+    zones.iter().map(|zone| zone.zone_id.clone()).collect()
+}
+
+/// Refuse a zone the Region does not have, naming the member at fault and the values that
+/// Region offers for it — EC2 answers `InvalidParameterValue` for a zone outside the set
+/// `DescribeAvailabilityZones` reports. `known` is the zone names or the zone ids, picked
+/// by the caller to match the member it is refusing, so this helper never has to read
+/// `member` to decide what to list.
+fn unknown_zone<E>(
+    member: &str,
+    requested: &str,
+    known: Vec<String>,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::state::invalid_parameter_value(format!(
+        "Value ({requested}) for parameter {member} is invalid. \
+         Subnets can currently only be created in the following Availability Zones: {known}.",
+        known = known.join(", "),
+    ))
 }
