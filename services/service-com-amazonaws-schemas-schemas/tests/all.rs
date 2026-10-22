@@ -19,6 +19,8 @@ mod code_bindings;
 mod discovered_schema_inference;
 #[path = "all/registry_schema_lifecycle.rs"]
 mod registry_schema_lifecycle;
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
 #[path = "all/search_schemas.rs"]
 mod search_schemas;
 #[path = "all/state_roundtrip.rs"]

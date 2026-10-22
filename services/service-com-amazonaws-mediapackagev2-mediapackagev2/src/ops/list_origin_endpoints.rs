@@ -236,25 +236,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
             return Err(ListOriginEndpointsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Channel group {} not found",
-                        input.channel_group_name
-                    )),
-                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                },
+                crate::state::ResourceKind::ChannelGroup.not_found(),
             )
             .into());
         };
         let Some(channel) = group.channels.get(&input.channel_name) else {
             return Err(ListOriginEndpointsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Channel {} not found in channel group {}",
-                        input.channel_name, input.channel_group_name
-                    )),
-                    resource_type_not_found: Some("CHANNEL".to_string()),
-                },
+                crate::state::ResourceKind::Channel.not_found(),
             )
             .into());
         };
@@ -270,12 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(ListOriginEndpointsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(crate::state::invalid_pagination_token_message()),
-                            validation_exception_type: Some(
-                                "INVALID_PAGINATION_TOKEN".to_string(),
-                            ),
-                        },
+                        crate::state::validation_failed(
+                            "nextToken",
+                            crate::state::INVALID_PAGINATION_TOKEN_DETAIL,
+                            "INVALID_PAGINATION_TOKEN",
+                        ),
                     )
                     .into());
                 }

@@ -178,13 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
             return Err(GetChannelGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Channel group {} not found",
-                        input.channel_group_name
-                    )),
-                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                },
+                crate::state::ResourceKind::ChannelGroup.not_found(),
             )
             .into());
         };

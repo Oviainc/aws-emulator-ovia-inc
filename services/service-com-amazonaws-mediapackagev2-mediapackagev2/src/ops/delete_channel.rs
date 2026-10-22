@@ -171,16 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeleteChannelOutput {});
         };
         // Deleting a channel that still has origin endpoints would orphan them, so the
-        // service refuses while any child is left.
+        // service refuses while any child is left — the same refusal, one level down.
         if !channel.origin_endpoints.is_empty() {
-            return Err(DeleteChannelErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel {} still has {} origin endpoint(s); delete them first",
-                    channel.name,
-                    channel.origin_endpoints.len()
-                )),
-                conflict_exception_type: Some("RESOURCE_IN_USE".to_string()),
-            })
+            return Err(DeleteChannelErrorModeled::ConflictException(
+                crate::state::children_attached(
+                    crate::state::ResourceKind::Channel,
+                    crate::state::ResourceKind::OriginEndpoint,
+                ),
+            )
             .into());
         }
         group.channels.remove(&input.channel_name);

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEmailIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEmailIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEmailIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the persisted email identity: its type, verification and feedback
+//! status, DKIM attributes, tags, configuration set and policies, exactly as they
+//! were created. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEmailIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEmailIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEmailIdentity"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetEmailIdentity without the shared emulator state",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting-only, with one exception: a verification transition that the
+        // clock already owed is materialised before reading, so this read answers
+        // what every later caller sees too.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(record) = store
+            .identities
+            .get(&crate::state::identity_key(&input.email_identity))
+        else {
+            return Err(GetEmailIdentityErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Email identity {} does not exist.",
+                    input.email_identity
+                )),
+            })
+            .into());
+        };
+
+        Ok(GetEmailIdentityOutput {
+            identity_type: Some(record.identity_kind.as_str().to_string()),
+            feedback_forwarding_status: record.feedback_forwarding,
+            verified_for_sending_status: record.verified_for_sending,
+            dkim_attributes: Some(record.dkim_attributes()),
+            // A custom MAIL FROM domain is configured by
+            // `PutEmailIdentityMailFromAttributes`; nothing has set one here.
+            mail_from_attributes: None,
+            policies: Some(record.policies.clone().into_iter().collect()),
+            tags: Some(record.tag_list()),
+            configuration_set_name: record.configuration_set_name.clone(),
+            verification_status: Some(record.verification_status.as_str().to_string()),
+            // `VerificationInfo` reports what SES found while probing the domain's
+            // DNS; this emulator probes nothing, so it reports nothing.
+            verification_info: None,
+        })
     }
 }

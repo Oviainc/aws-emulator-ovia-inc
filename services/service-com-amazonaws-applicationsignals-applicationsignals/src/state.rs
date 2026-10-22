@@ -15,12 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 
 use crate::ops::types::{
-    DependencyConfig, Goal, GroupingAttributeDefinition, GroupingConfiguration, Interval,
-    MetricDataQuery, MetricSource, MonitoredRequestCountMetricDataQueries,
-    RequestBasedServiceLevelIndicator, RequestBasedServiceLevelIndicatorConfig,
-    RequestBasedServiceLevelIndicatorMetric, ResourceNotFoundException, RollingInterval,
-    ServiceLevelIndicator, ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric,
-    ServiceLevelObjective, ServiceLevelObjectiveSummary,
+    ConflictException, DependencyConfig, Goal, GroupingAttributeDefinition,
+    GroupingConfiguration, Interval, MetricDataQuery, MetricSource,
+    MonitoredRequestCountMetricDataQueries, RequestBasedServiceLevelIndicator,
+    RequestBasedServiceLevelIndicatorConfig, RequestBasedServiceLevelIndicatorMetric,
+    ResourceNotFoundException, RollingInterval, ServiceLevelIndicator,
+    ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric, ServiceLevelObjective,
+    ServiceLevelObjectiveSummary,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace
@@ -31,8 +32,14 @@ use crate::ops::types::{
 pub const SIGNING_NAME: &str = "application-signals";
 
 /// The resource-type segment of an SLO ARN, from the modelled `ServiceLevelObjectiveArn`
-/// pattern (`:slo/<name>`). Also the `ResourceType` a not-found failure reports.
-pub const SLO_RESOURCE_TYPE: &str = "slo";
+/// pattern (`:slo/<name>`), which spells that segment in lower case.
+pub const SLO_ARN_RESOURCE: &str = "slo";
+
+/// The `ResourceType` an SLO failure reports, and the type token its message names: the
+/// resource's TYPE NAME, which is capitalised — not the lower-case segment an ARN spells
+/// (`SLO_ARN_RESOURCE`). The two are different strings for one resource kind, and a client
+/// comparing `ResourceType` is comparing against the type name.
+pub const SLO_RESOURCE_TYPE: &str = "Slo";
 
 /// Region for a minted ARN when the request carries no SigV4 credential scope to read one
 /// from; the emulator's documented default region (`AGENTS.md`).
@@ -237,7 +244,21 @@ pub fn slo_name_of(id: &str) -> &str {
 /// The ARN of the SLO called `name` in `region`, in the shape the modelled
 /// `ServiceLevelObjectiveArn` pattern requires.
 pub fn slo_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(SIGNING_NAME, region, &format!("{SLO_RESOURCE_TYPE}/{name}"))
+    ::engine::emulator_arn(SIGNING_NAME, region, &format!("{SLO_ARN_RESOURCE}/{name}"))
+}
+
+/// The ARN of the SLO an `Id` denotes, for either form the modelled
+/// `ServiceLevelObjectiveId` pattern admits: an `Id` already in ARN form IS that ARN, and a
+/// bare name is rendered into the ARN it would carry in `region` (this account's, since the
+/// store is one account's — see [`slo_name_of`]).
+///
+/// This is how an error identifies an SLO that is not stored: there is no record to read an
+/// ARN off, so the ARN is derived from the identity the request named.
+pub fn slo_arn_of(region: &str, id: &str) -> String {
+    match id.split_once(&format!(":{SLO_ARN_RESOURCE}/")) {
+        Some((prefix, _)) if prefix.starts_with("arn:") => id.to_string(),
+        _ => slo_arn(region, id),
+    }
 }
 
 /// The region an ARN minted for this request names: the one in the caller's SigV4
@@ -251,11 +272,89 @@ pub fn region_of(parts: &::http::request::Parts) -> String {
 }
 
 /// The modelled `ResourceNotFoundException` for an `Id` that names no stored SLO.
-pub fn slo_not_found(id: &str) -> ResourceNotFoundException {
+///
+/// The failure identifies the SLO by its ARN — the full resource identifier, which is what
+/// `ResourceId`'s doc ("Can't find the resource id") names and what a client parses to
+/// resolve the resource — and reports the capitalised type name in `ResourceType`. Both are
+/// `@required` members a client branches on, so a bare name there would hand it an
+/// un-namespaced id and a type token that no equality test against the type name matches.
+/// The message states the same two facts, so a caller reading only the prose sees the ARN
+/// too.
+pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
+    let arn = slo_arn_of(region, id);
     ResourceNotFoundException {
+        message: format!("{SLO_RESOURCE_TYPE} with arn '{arn}' does not exist."),
         resource_type: SLO_RESOURCE_TYPE.to_string(),
-        resource_id: id.to_string(),
-        message: format!("Service level objective {id} does not exist"),
+        resource_id: arn,
+    }
+}
+
+/// The modelled `ConflictException` for a create that names an SLO already stored.
+///
+/// `ConflictException` carries only `Message`, so the message is the only place the
+/// conflicting resource can be identified — and it identifies it the same way the not-found
+/// failure does, by the ARN of the resource that already exists (read off the stored
+/// record, since there IS one), not by the bare name the request happened to send.
+pub fn slo_already_exists(arn: &str) -> ConflictException {
+    ConflictException {
+        message: format!("{SLO_RESOURCE_TYPE} with arn '{arn}' already exists."),
+    }
+}
+
+/// One clause of a `ValidationException` message: the member whose value violated a
+/// constraint, and the requirement it violated.
+///
+/// The ONE place this service words a constraint violation, reached both by the
+/// framework-level refusal renderer (`crate::service`) and by a handler that enforces a
+/// constraint itself, so the two cannot drift.
+///
+/// The clause names the member path and the requirement and NOTHING of the value that was
+/// rejected: `ValidationException` carries only `message`, so this text is the whole
+/// machine-readable detail a client gets, and the rejected value is caller input that would
+/// otherwise be copied into every client log recording the failure.
+pub fn constraint_clause(member_path: &str, requirement: &str) -> String {
+    format!("Value at '{member_path}' failed to satisfy constraint: {requirement}")
+}
+
+/// [`constraint_clause`] for a member that was ABSENT. Reported as the null it was, which is
+/// a fact of the request's shape rather than a rendering of a value the caller sent.
+pub fn absent_member_clause(member_path: &str) -> String {
+    format!("Value null at '{member_path}' failed to satisfy constraint: Member must not be null")
+}
+
+/// The `ValidationException` message over one or more clauses: the count of violated
+/// constraints, then the clauses.
+pub fn validation_envelope(clauses: &[String]) -> String {
+    match clauses.len() {
+        1 => format!("1 validation error detected: {}", clauses[0]),
+        n => format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        ),
+    }
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with: the requirement
+/// stated is the expression a value must satisfy, not the anchoring the model uses to make
+/// the match total. A `$` escaped by a backslash is a literal dollar sign inside the
+/// expression, not the end anchor, so it stays.
+///
+/// Only the expression's OUTER anchors are stripped: a `@pattern` that anchors each branch
+/// of an alternation separately (`^a$|^b$`, as `ServiceLevelObjectiveId` does) keeps the
+/// inner ones, because they are part of the expression's own structure rather than a wrapper
+/// around it — dropping them would change which strings the reported expression describes.
+pub fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
     }
 }
 

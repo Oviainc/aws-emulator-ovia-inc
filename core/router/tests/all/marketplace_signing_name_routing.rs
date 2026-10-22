@@ -55,16 +55,18 @@ const FOREIGN_RESOURCE_ARN: &str = "arn:aws:aws-marketplace:us-east-1:0000000000
 /// `Send`).
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
-/// Every service of this emulator, over one shared engine — the production router.
-fn router() -> MultiServiceRouter {
+/// Every service of this emulator, over one shared engine — the production router —
+/// beside that engine, so a row needing a resource created out of band of its
+/// service's API can be given one.
+fn router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     std::thread::Builder::new()
         .name("marketplace-routing".to_string())
         .stack_size(BOOT_STACK_SIZE)
         .spawn(|| {
             let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-            let mut router = aws_emulator_router::build_router(engine);
+            let mut router = aws_emulator_router::build_router(engine.clone());
             router.set_request_authentication(false);
-            router
+            (router, engine)
         })
         .expect("spawn the router-assembly thread")
         .join()
@@ -129,7 +131,27 @@ async fn dispatch(
 /// one request.
 #[tokio::test]
 async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_surface() {
-    let router = router();
+    let (router, engine) = router();
+
+    // The deployment row below writes a deployment parameter, which is targeted at
+    // an agreement of the account for the product its URI names. An agreement is
+    // created out of band of that API (a buyer accepts a seller's offer), so this
+    // suite provisions the one its row writes against — otherwise the write is that
+    // service's own `ResourceNotFoundException` rather than the 200 the row pins.
+    let held = service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::seed_agreements(
+        &*engine,
+        [
+            service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::ProvisionedAgreement::new(
+                CATALOG, "agmt-1",
+            )
+            .with_product("prod-1"),
+        ],
+    );
+    assert_eq!(
+        held,
+        Some(1),
+        "the shared engine must hold the deployment service's store"
+    );
 
     // (case, method, uri, x-amz-target, body, expected status, expected error code)
     //
@@ -328,7 +350,7 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
 /// produced, and never one service's answer to another's traffic.
 #[tokio::test]
 async fn a_request_on_no_marketplace_surface_is_unclaimed() {
-    let router = router();
+    let (router, _engine) = router();
 
     // (case, method, uri, x-amz-target)
     let rows: [(&str, &str, &str, Option<&str>); 6] = [

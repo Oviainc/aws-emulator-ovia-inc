@@ -330,13 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Channel group {} not found",
-                        input.channel_group_name
-                    )),
-                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                },
+                crate::state::ResourceKind::ChannelGroup.not_found(),
             )
             .into());
         };
@@ -344,13 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group_name = group.name.clone();
         let Some(channel) = group.channels.get_mut(&input.channel_name) else {
             return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Channel {} not found in channel group {}",
-                        input.channel_name, group_name
-                    )),
-                    resource_type_not_found: Some("CHANNEL".to_string()),
-                },
+                crate::state::ResourceKind::Channel.not_found(),
             )
             .into());
         };
@@ -412,13 +400,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .origin_endpoints
             .contains_key(&input.origin_endpoint_name)
         {
-            return Err(CreateOriginEndpointErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Origin endpoint {} already exists on channel {}",
-                    input.origin_endpoint_name, channel.name
-                )),
-                conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
-            })
+            return Err(CreateOriginEndpointErrorModeled::ConflictException(
+                crate::state::resource_already_exists(),
+            )
             .into());
         }
 
