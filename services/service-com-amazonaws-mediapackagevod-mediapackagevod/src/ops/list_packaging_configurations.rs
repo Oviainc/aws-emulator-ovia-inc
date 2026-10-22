@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPackagingConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPackagingConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages the stored PackagingConfigurations in ascending `Id` order,
+//! filtered by the `packagingGroupId` query parameter when present, `maxResults` per
+//! page, with an opaque `NextToken` the next call resumes strictly after.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPackagingConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +148,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPackagingConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPackagingConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPackagingConfigurations"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListPackagingConfigurationsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some(
+                            "the MediaPackage VOD state store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A cursor this listing did not issue cannot name a resume point.
+        let resume_after = crate::state::resume_after(
+            crate::state::LISTING_PACKAGING_CONFIGURATIONS,
+            input.next_token.as_deref(),
+        )?;
+        let page_size = crate::state::page_size(input.max_results)?;
+
+        let state = store.lock();
+        let group_filter = input.packaging_group_id.as_deref();
+        // `packaging_configurations` is a `BTreeMap`, so this is one stable id order
+        // across pages: a cursor resumes strictly after the id the previous page
+        // ended on, so no configuration is reported twice and none is skipped.
+        let matching: Vec<&crate::state::PackagingConfigurationRecord> = state
+            .packaging_configurations
+            .values()
+            .filter(|cfg| group_filter.is_none_or(|group| cfg.packaging_group_id == group))
+            .filter(|cfg| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| cfg.id.as_str() > after)
+            })
+            .collect();
+
+        let page_records: Vec<&crate::state::PackagingConfigurationRecord> =
+            matching.iter().take(page_size).copied().collect();
+        let page: Vec<PackagingConfiguration> = page_records
+            .iter()
+            .map(|cfg| PackagingConfiguration {
+                arn: Some(cfg.arn.clone()),
+                cmaf_package: cfg.cmaf_package.clone(),
+                created_at: Some(cfg.created_at.clone()),
+                dash_package: cfg.dash_package.clone(),
+                hls_package: cfg.hls_package.clone(),
+                id: Some(cfg.id.clone()),
+                mss_package: cfg.mss_package.clone(),
+                packaging_group_id: Some(cfg.packaging_group_id.clone()),
+                tags: Some(state.tags_of(&cfg.arn)),
+            })
+            .collect();
+        // A cursor only when something is left to read, so a caller that follows
+        // tokens stops rather than asking for an empty page.
+        let next_token = if matching.len() > page_records.len() {
+            page_records.last().map(|last| {
+                crate::state::encode_page_token(
+                    crate::state::LISTING_PACKAGING_CONFIGURATIONS,
+                    &last.id,
+                )
+            })
+        } else {
+            None
+        };
+
+        Ok(ListPackagingConfigurationsOutput {
+            next_token,
+            packaging_configurations: Some(page),
+        })
     }
 }

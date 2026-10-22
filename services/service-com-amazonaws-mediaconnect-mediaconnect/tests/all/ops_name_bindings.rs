@@ -11,6 +11,10 @@
 //! input/output shape through — and an operation's handler struct is reached at
 //! `crate::ops::<snake_op>::<Op>` as well as through its glob.
 //!
+//! Over the wire, the answer that identifies the handler a request reached is the
+//! scaffold's 501 for an operation nobody has written yet, and that operation's own
+//! modelled error for an implemented one (see [`Reached`]).
+//!
 //! This model is one that could break the rule twice: `UpdateBridgeOutput` and
 //! `UpdateFlowOutput` are operations AND the `<Op>Output` form of the `UpdateBridge` /
 //! `UpdateFlow` operations' output structs. It does not, because those output structs
@@ -232,36 +236,68 @@ impl Emulator {
     }
 }
 
+/// What identifies the handler a request reached.
+///
+/// A SCAFFOLDED operation answers HTTP 501 `NotImplemented` with a message naming the
+/// operation. An IMPLEMENTED one answers its own modelled error for the resource the
+/// request names — every ARN below names a flow or bridge no store holds — so the row
+/// carries the status and wire code that answer has.
+enum Reached {
+    ScaffoldedStub,
+    ModelledError { status: u16, code: &'static str },
+}
+
 /// One VALID request per operation — method, URI and body from each operation's own
 /// `@http` binding (`smithy_query(query="operation")`), valid so the boundary validator
 /// passes it and it reaches that operation's own handler.
-fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str)> {
+fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Reached)> {
     vec![
-        ("UpdateBridge", "PUT", format!("/v1/bridges/{BRIDGE_ARN}"), "{}"),
+        (
+            "UpdateBridge",
+            "PUT",
+            format!("/v1/bridges/{BRIDGE_ARN}"),
+            "{}",
+            Reached::ScaffoldedStub,
+        ),
         (
             "UpdateBridgeOutput",
             "PUT",
             format!("/v1/bridges/{BRIDGE_ARN}/outputs/output-1"),
             "{}",
+            Reached::ScaffoldedStub,
         ),
-        ("UpdateFlow", "PUT", format!("/v1/flows/{FLOW_ARN}"), "{}"),
+        (
+            // Implemented: it answers the modelled `NotFoundException` (404) for a flow
+            // ARN this store does not hold.
+            "UpdateFlow",
+            "PUT",
+            format!("/v1/flows/{FLOW_ARN}"),
+            "{}",
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
+        ),
         (
             "UpdateFlowOutput",
             "PUT",
             format!("/v1/flows/{FLOW_ARN}/outputs/{OUTPUT_ARN}"),
             "{}",
+            Reached::ScaffoldedStub,
         ),
         (
             "UpdateBridgeSource",
             "PUT",
             format!("/v1/bridges/{BRIDGE_ARN}/sources/source-1"),
             "{}",
+            Reached::ScaffoldedStub,
         ),
         (
             "RemoveFlowOutput",
             "DELETE",
             format!("/v1/flows/{FLOW_ARN}/outputs/{OUTPUT_ARN}"),
             "",
+            Reached::ScaffoldedStub,
         ),
     ]
 }
@@ -270,29 +306,48 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str)> {
 async fn every_operation_dispatches_to_the_handler_that_bears_its_name() {
     let emulator = Emulator::new();
 
-    for (operation, method, path, body) in dispatch_table() {
+    for (operation, method, path, body, reached) in dispatch_table() {
         let (status, code, parsed) = emulator.send(method, &path, body).await;
-
-        // Each of these operations is still a scaffold, so the answer that identifies the
-        // handler the request reached is its 501 — which names the operation.
-        assert_eq!(
-            status, 501,
-            "case {operation:?} ({method} {path}): expected HTTP 501 from the scaffolded \
-             handler, got {status} with {parsed:?}"
-        );
-        assert!(
-            code.ends_with("NotImplemented"),
-            "case {operation:?}: expected the error code NotImplemented, got {code:?} with {parsed:?}"
-        );
-
         let message = parsed
             .get("message")
             .or_else(|| parsed.get("Message"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        assert!(
-            message.contains(&format!("operation {operation} is")),
-            "case {operation:?}: expected the 501 to name {operation}, got {message:?}"
-        );
+
+        match reached {
+            Reached::ScaffoldedStub => {
+                assert_eq!(
+                    status, 501,
+                    "case {operation:?} ({method} {path}): expected HTTP 501 from the \
+                     scaffolded handler, got {status} with {parsed:?}"
+                );
+                assert!(
+                    code.ends_with("NotImplemented"),
+                    "case {operation:?}: expected the error code NotImplemented, got \
+                     {code:?} with {parsed:?}"
+                );
+                assert!(
+                    message.contains(&format!("operation {operation} is")),
+                    "case {operation:?}: expected the 501 to name {operation}, got {message:?}"
+                );
+            }
+            Reached::ModelledError {
+                status: expected_status,
+                code: expected_code,
+            } => {
+                assert_eq!(
+                    (status, code.as_str()),
+                    (expected_status, expected_code),
+                    "case {operation:?} ({method} {path}): expected the implemented \
+                     handler's {expected_status} {expected_code}, got {status} {code:?} \
+                     with {parsed:?}"
+                );
+                assert!(
+                    !message.contains("is scaffolded"),
+                    "case {operation:?}: an implemented handler never answers the \
+                     scaffold's wording, got {message:?}"
+                );
+            }
+        }
     }
 }

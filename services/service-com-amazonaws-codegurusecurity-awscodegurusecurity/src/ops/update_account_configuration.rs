@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WRITES the account's encryption configuration into the store
+//! ([`crate::state::Store::encryption_kms_key_arn`]) — the single copy
+//! `GetAccountConfiguration` reports and `CreateUploadUrl` derives an upload's
+//! server-side-encryption headers from.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountConfiguration"))
+        // The request carries the configuration itself; no request metadata takes part.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateAccountConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        error: Some("state unavailable".to_string()),
+                        message: Some(
+                            "the CodeGuru Security store is not reachable from this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The customer-managed KMS key ARN you want to use for encryption. If not
+        // specified, CodeGuru Security will use an AWS-managed key for encryption. If you
+        // previously specified a customer-managed KMS key and want CodeGuru Security to
+        // use an AWS-managed key for encryption instead, pass nothing"
+        // (`UpdateAccountConfigurationRequest$encryptionConfig`): the member's presence
+        // is the whole instruction, so an `encryptionConfig` without a `kmsKeyArn` CLEARS
+        // any key the account had. The modelled length (1..2048) and pattern of
+        // `EncryptionConfig$kmsKeyArn` are refused at the boundary before this handler
+        // runs, so a value that arrives here is a well-formed KMS key ARN.
+        let requested = input.encryption_config.kms_key_arn.clone();
+
+        // ONE lock for the write and the read-back, so the configuration this call
+        // reports is the one it committed rather than a value a concurrent update
+        // replaced in between.
+        let mut store = state.lock();
+        store.encryption_kms_key_arn = requested;
+
+        // "An EncryptionConfig object that contains the KMS key ARN that is used for
+        // encryption. If you did not specify a customer-managed KMS key in the request,
+        // returns empty" (`UpdateAccountConfigurationResponse$encryptionConfig`): built
+        // from the STORE, so what this answers and what GetAccountConfiguration answers
+        // are the same value by construction.
+        Ok(UpdateAccountConfigurationOutput {
+            encryption_config: EncryptionConfig {
+                kms_key_arn: store.encryption_kms_key_arn.clone(),
+            },
+        })
     }
 }

@@ -190,11 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A set of key-value pairs that contain the required headers when uploading
         // your resource" (`CreateUploadUrlResponse$requestHeaders`): the content type of
         // the code archive, plus the server-side-encryption headers the account's
-        // `encryptionConfig.kmsKeyArn` requires. That configuration is reached through
-        // GetAccountConfiguration / UpdateAccountConfiguration, which are still
-        // scaffolded, so no customer-managed key is configured and the encryption
-        // headers are correctly absent until that slice lands; the set is built from the
-        // store rather than fixed.
+        // `encryptionConfig.kmsKeyArn` requires. That configuration is the one
+        // UpdateAccountConfiguration wrote and GetAccountConfiguration reports, so the
+        // header set is built from the store rather than fixed: an account using the
+        // default AWS-managed key carries no encryption header at all.
         let mut request_headers = std::collections::BTreeMap::from([(
             "Content-Type".to_string(),
             "application/zip".to_string(),

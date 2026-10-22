@@ -79,6 +79,13 @@ pub const SHARE_STATUS_DELETED: &str = "DELETED";
 pub const ASSOCIATION_STATUS_ASSOCIATING: &str = "ASSOCIATING";
 /// The status an association reaches once the move RAM owes it falls due.
 pub const ASSOCIATION_STATUS_ASSOCIATED: &str = "ASSOCIATED";
+/// The status an association that is being torn down carries while the teardown is
+/// still owed.
+pub const ASSOCIATION_STATUS_DISASSOCIATING: &str = "DISASSOCIATING";
+/// The terminal status of an association RAM has torn down. The record survives in
+/// it, so a read still reports the association and a caller polling for the teardown
+/// to finish sees it complete.
+pub const ASSOCIATION_STATUS_DISASSOCIATED: &str = "DISASSOCIATED";
 
 /// The message RAM reports on a principal association that has not settled yet.
 ///
@@ -118,6 +125,17 @@ pub const RESOURCE_OWNER_OTHER_ACCOUNTS: &str = "OTHER-ACCOUNTS";
 /// straight back still observes `ASSOCIATING`. Nothing sleeps for it: the due
 /// instant is stored and the move is materialised by the first call at or after it.
 pub const ASSOCIATION_READY_AFTER_MILLIS: i64 = 500;
+
+/// How long after the call that tears an association down RAM takes to move it from
+/// `DISASSOCIATING` to `DISASSOCIATED`.
+///
+/// The mirror of [`ASSOCIATION_READY_AFTER_MILLIS`], and owed on the same terms: a
+/// teardown that has something to revoke is answered in the non-terminal
+/// `DISASSOCIATING` status, so reaching `DISASSOCIATED` is a move the clock owes
+/// rather than something a caller asks for. AWS publishes no duration for it either,
+/// so this span is this emulator's own choice; it is deliberately not zero, and
+/// nothing sleeps for it.
+pub const DISASSOCIATION_READY_AFTER_MILLIS: i64 = 500;
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -251,17 +269,39 @@ impl ShareRecord {
         changed
     }
 
-    /// Detach every key in `keys` from this share, and answer whether the stored tag
-    /// set changed. A key the share does not carry is not an error: removing it
-    /// leaves the share exactly as it was.
-    pub fn remove_tags(&mut self, keys: &[String]) -> bool {
+    /// Detach every key in `keys` from this share, and answer the keys that were
+    /// actually carried and so were removed, in key order. A key the share does not
+    /// carry is not an error: removing it leaves the share exactly as it was, and it
+    /// is not reported as removed — which is what lets a caller tell an untag that
+    /// was a no-op from one that detached a tag.
+    pub fn remove_tags(&mut self, keys: &[String]) -> Vec<String> {
         // Every key is removed, not just up to the first that was present, so this
-        // counts the removals rather than short-circuiting on one.
+        // collects the removals rather than short-circuiting on one. A key named
+        // twice is removed once and reported once.
         keys.iter()
             .filter(|key| self.tags.remove(*key).is_some())
-            .count()
-            > 0
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
+}
+
+/// A status move the clock owes a record: the status it reaches, and the instant it
+/// falls due.
+///
+/// RAM answers the call that starts the move with the record in a NON-TERMINAL status
+/// (`ASSOCIATING` while an association is being made, `DISASSOCIATING` while one is
+/// being torn down), so reaching the terminal status is something the clock owes and
+/// not something a caller asks for. The due instant is stored and nothing sleeps for
+/// it: [`ComAmazonawsRamAmazonresourcesharingState::settle_due_associations`]
+/// materialises the move on the first call at or after it.
+#[derive(Debug, Clone)]
+pub struct OwedMove {
+    /// The status the record reaches when the move falls due.
+    pub status: String,
+    /// When it falls due, in epoch milliseconds.
+    pub due_at: i64,
 }
 
 /// One stored association between a resource share and an entity.
@@ -277,9 +317,9 @@ pub struct AssociationRecord {
     pub creation_time: i64,
     pub last_updated_time: i64,
     pub external: bool,
-    /// The instant the `ASSOCIATING` -> `ASSOCIATED` move falls due, while it is
-    /// still owed; `None` once it has been made.
-    pub ready_at: Option<i64>,
+    /// The move the clock still owes this record, or `None` when its status is
+    /// terminal and nothing further is owed.
+    pub owed_move: Option<OwedMove>,
 }
 
 impl AssociationRecord {
@@ -291,11 +331,21 @@ impl AssociationRecord {
             associated_entity: Some(self.associated_entity.clone()),
             association_type: Some(self.association_type.clone()),
             status: Some(self.status.clone()),
-            status_message: self.status_message.clone(),
+            // A message about the status only belongs on a record whose status is
+            // still moving: a terminal association is waiting for nothing, so
+            // whatever it was waiting for no longer applies and the member is
+            // dropped. The store clears the message when it makes the move, and this
+            // is the same rule at the serializer, so no read can report a stale one.
+            status_message: self.status_message.clone().filter(|_| !self.is_terminal()),
             creation_time: Some(to_date_time(self.creation_time)),
             last_updated_time: Some(to_date_time(self.last_updated_time)),
             external: Some(self.external),
         }
+    }
+
+    /// Whether this record's status is one no further move is owed from.
+    pub fn is_terminal(&self) -> bool {
+        association_status_is_terminal(&self.status)
     }
 }
 
@@ -347,20 +397,24 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// This is the only write a reporting operation performs, and it only
     /// materialises what was already due: an association RAM accepted in
     /// `ASSOCIATING` reaches `ASSOCIATED` [`ASSOCIATION_READY_AFTER_MILLIS`] after
-    /// the call that created it, whether or not anybody asks.
+    /// the call that created it, and one it accepted in `DISASSOCIATING` reaches
+    /// `DISASSOCIATED` [`DISASSOCIATION_READY_AFTER_MILLIS`] after the call that
+    /// started the teardown — whether or not anybody asks.
     pub fn settle_due_associations(&mut self, now: i64) {
         for record in self.associations.values_mut() {
-            let Some(due) = record.ready_at else { continue };
-            if due > now {
+            let Some(owed) = record.owed_move.clone() else {
+                continue;
+            };
+            if owed.due_at > now {
                 continue;
             }
-            record.status = ASSOCIATION_STATUS_ASSOCIATED.to_string();
-            // A settled association is waiting for nothing, so it reports no
-            // status message.
+            record.status = owed.status;
+            // A record that has reached its terminal status is waiting for nothing,
+            // so it reports no status message.
             record.status_message = None;
             // The move happened when it fell due, not when somebody noticed.
-            record.last_updated_time = due;
-            record.ready_at = None;
+            record.last_updated_time = owed.due_at;
+            record.owed_move = None;
         }
     }
 
@@ -409,10 +463,13 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// this call; [`Self::settle_due_associations`] materialises it and drops the
     /// message with it.
     ///
-    /// An entity already associated with that share under that type is left exactly
-    /// as it is — re-associating it changes nothing, so neither its status nor its
-    /// timestamps move — except for the share's name, which an update may have
-    /// changed since.
+    /// An entity already on the attach path — `ASSOCIATING` or `ASSOCIATED` — is left
+    /// exactly as it is: re-associating it changes nothing, so neither its status nor
+    /// its timestamps move, except for the share's name, which an update may have
+    /// changed since. An entity whose association was torn down (or whose teardown is
+    /// still in flight) is associated AGAIN: the record restarts the attach, so the
+    /// status leaves `DISASSOCIATED`/`DISASSOCIATING`, the owed teardown is dropped
+    /// and the record is dated from this call.
     pub fn associate(
         &mut self,
         share: &ShareRecord,
@@ -425,6 +482,10 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             association_type.to_string(),
             entity.to_string(),
         );
+        let attaching = |record: &AssociationRecord| {
+            record.status == ASSOCIATION_STATUS_ASSOCIATING
+                || record.status == ASSOCIATION_STATUS_ASSOCIATED
+        };
         let record = self
             .associations
             .entry(key)
@@ -433,16 +494,83 @@ impl ComAmazonawsRamAmazonresourcesharingState {
                 resource_share_name: share.name.clone(),
                 associated_entity: entity.to_string(),
                 association_type: association_type.to_string(),
-                status: ASSOCIATION_STATUS_ASSOCIATING.to_string(),
-                status_message: associating_status_message(association_type)
-                    .map(str::to_string),
+                status: String::new(),
+                status_message: None,
                 creation_time: now,
                 last_updated_time: now,
                 external: entity_is_external(&share.owning_account_id, entity),
-                ready_at: Some(now + ASSOCIATION_READY_AFTER_MILLIS),
+                owed_move: None,
             });
+        if !attaching(record) {
+            // Either the record was just created, or it had left the attach path; in
+            // both cases this call is what associates the entity, so the attach
+            // starts here.
+            record.status = ASSOCIATION_STATUS_ASSOCIATING.to_string();
+            record.status_message = associating_status_message(association_type).map(str::to_string);
+            record.creation_time = now;
+            record.last_updated_time = now;
+            record.external = entity_is_external(&share.owning_account_id, entity);
+            record.owed_move = Some(OwedMove {
+                status: ASSOCIATION_STATUS_ASSOCIATED.to_string(),
+                due_at: now + ASSOCIATION_READY_AFTER_MILLIS,
+            });
+        }
         record.resource_share_name = share.name.clone();
         record.clone()
+    }
+
+    /// Tear the association between the share `arn` and `entity` under
+    /// `association_type` down, returning the record as it now stands, or `None` when
+    /// the share holds no such association.
+    ///
+    /// The record SURVIVES the teardown in a terminal status, so a read still reports
+    /// the association and a caller polling for the teardown sees it complete. Which
+    /// status the call answers with follows from what there was to revoke:
+    ///
+    /// * an association that had reached `ASSOCIATED` was granting access, so
+    ///   revoking it is work the service has to do: the record goes to the
+    ///   non-terminal `DISASSOCIATING` and the clock owes `DISASSOCIATED`
+    ///   [`DISASSOCIATION_READY_AFTER_MILLIS`] later;
+    /// * an association still on the way in (`ASSOCIATING` — a principal that never
+    ///   answered its invitation, say) was granting nothing, so there is nothing to
+    ///   revoke and the record is terminal at once, in `DISASSOCIATED`;
+    /// * a record already torn down, or already tearing down, is left exactly as it
+    ///   is, so repeating the call neither restarts the move nor moves the stamps.
+    ///
+    /// A terminal record reports no `statusMessage`: whatever it was waiting for no
+    /// longer applies.
+    pub fn disassociate(
+        &mut self,
+        arn: &str,
+        association_type: &str,
+        entity: &str,
+        now: i64,
+    ) -> Option<AssociationRecord> {
+        let key = (
+            arn.to_string(),
+            association_type.to_string(),
+            entity.to_string(),
+        );
+        let record = self.associations.get_mut(&key)?;
+        if record.status == ASSOCIATION_STATUS_DISASSOCIATING
+            || record.status == ASSOCIATION_STATUS_DISASSOCIATED
+        {
+            return Some(record.clone());
+        }
+        let granted = record.status == ASSOCIATION_STATUS_ASSOCIATED;
+        record.status_message = None;
+        record.last_updated_time = now;
+        if granted {
+            record.status = ASSOCIATION_STATUS_DISASSOCIATING.to_string();
+            record.owed_move = Some(OwedMove {
+                status: ASSOCIATION_STATUS_DISASSOCIATED.to_string(),
+                due_at: now + DISASSOCIATION_READY_AFTER_MILLIS,
+            });
+        } else {
+            record.status = ASSOCIATION_STATUS_DISASSOCIATED.to_string();
+            record.owed_move = None;
+        }
+        Some(record.clone())
     }
 
     /// Carry a share's new name onto its associations, which each report
@@ -588,6 +716,21 @@ pub fn unknown_share_message(arn: &str) -> String {
 pub fn associating_status_message(association_type: &str) -> Option<&'static str> {
     (association_type == ASSOCIATION_TYPE_PRINCIPAL)
         .then_some(ASSOCIATING_PRINCIPAL_STATUS_MESSAGE)
+}
+
+/// Whether an association status is TERMINAL: one no further move is owed from.
+///
+/// Of the modelled `ResourceShareAssociationStatus` values
+/// (`smithy_query(query="shape",shape="ResourceShareAssociationStatus")`), the ones
+/// that name a settled outcome are `ASSOCIATED`, `DISASSOCIATED` and `FAILED`; the
+/// `-ING` ones (`ASSOCIATING`, `DISASSOCIATING`, `SUSPENDING`, `RESTORING`) each name
+/// a move still under way. This slice only ever stores the first four of those, but
+/// the predicate is written over the enum so it stays right if another is.
+pub fn association_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        ASSOCIATION_STATUS_ASSOCIATED | ASSOCIATION_STATUS_DISASSOCIATED | "FAILED"
+    )
 }
 
 /// Tags as the wire shape wants them, ordered by key.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataAutomationProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataAutomationProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataAutomationProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +164,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataAutomationProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataAutomationProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataAutomationProject"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDataAutomationProjectError::Modeled(
+                CreateDataAutomationProjectErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An `@idempotencyToken` replay returns the project the first call created
+        // rather than creating a second one. The operation is `@idempotent`, so the
+        // answer is built from the stored record — including the status the clock
+        // has made due by now, which is what a second call would report.
+        let (at, created_at) = crate::state::now_pair();
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(arn) = store.project_create_idempotency.get(token).cloned() {
+                if let Some(record) = store.projects.get(&arn) {
+                    return Ok(CreateDataAutomationProjectOutput {
+                        project_arn: record.project_arn.clone(),
+                        project_stage: Some(record.project_stage.clone()),
+                        status: Some(record.status_at(at).to_string()),
+                    });
+                }
+            }
+        }
+
+        // `projectName` is the user-visible identity of a project, so a second
+        // project under a name already taken is a conflict.
+        if store.project_names.contains_key(&input.project_name) {
+            return Err(CreateDataAutomationProjectErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a data automation project named {} already exists in this account",
+                        input.project_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past the quota a create is refused rather than
+        // allowed to grow the state without end. Checked BEFORE any insert, so a
+        // refused call leaves nothing behind.
+        if store.projects.len() >= crate::state::PROJECT_QUOTA {
+            return Err(
+                CreateDataAutomationProjectErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the quota of {} data automation projects per account has been \
+                             reached; delete a project before creating another",
+                            crate::state::PROJECT_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let (kms_key_id, kms_encryption_context) = match input.encryption_configuration {
+            Some(config) => (Some(config.kms_key_id), config.kms_encryption_context),
+            None => (None, None),
+        };
+        let sequence = store.take_arn_sequence();
+        let record = crate::state::DataAutomationProjectRecord {
+            project_arn: crate::state::mint_project_arn(
+                &crate::state::request_region(ctx),
+                created_at,
+                sequence,
+            ),
+            project_name: input.project_name.clone(),
+            project_stage: input
+                .project_stage
+                .unwrap_or_else(|| crate::state::DEFAULT_PROJECT_STAGE.to_string()),
+            project_type: input.project_type,
+            project_description: input.project_description,
+            standard_output_configuration: Some(input.standard_output_configuration),
+            custom_output_configuration: input.custom_output_configuration,
+            override_configuration: input.override_configuration,
+            data_automation_library_configuration: input.data_automation_library_configuration,
+            creation_time: created_at,
+            last_modified_time: created_at,
+            kms_key_id,
+            kms_encryption_context,
+            // The create starts the project's build: it is reported IN_PROGRESS
+            // until this instant and COMPLETED from then on, without anybody
+            // having to call.
+            completes_at: at + crate::state::PROJECT_CREATION_SPAN,
+            tags: input.tags.unwrap_or_default(),
+        };
+        let arn = record.project_arn.clone();
+
+        store.project_names.insert(input.project_name, arn.clone());
+        if let Some(token) = input.client_token {
+            store.project_create_idempotency.insert(token, arn.clone());
+        }
+        store.projects.insert(arn.clone(), record);
+
+        // Build the response from the record that is now PERSISTED, not from the
+        // request: a later GetDataAutomationProject must answer with exactly these
+        // values.
+        let stored = store.projects.get(&arn).ok_or_else(|| {
+            CreateDataAutomationProjectError::Modeled(
+                CreateDataAutomationProjectErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the data automation project could not be read back after it was \
+                             stored"
+                                .to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        Ok(CreateDataAutomationProjectOutput {
+            project_arn: stored.project_arn.clone(),
+            project_stage: Some(stored.project_stage.clone()),
+            status: Some(stored.status_at(at).to_string()),
+        })
     }
 }

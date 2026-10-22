@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHostKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHostKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHostKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the host keys stored for ONE server, in `HostKeyId` order, paged through the
+//! opaque `NextToken` codec every `List*` operation in this service shares. The records
+//! are the ones `ImportHostKey` wrote and `DeleteHostKey` releases — "a list of host
+//! keys for the server that's specified by the ServerId parameter" — each reported from
+//! stored state with the fingerprint and algorithm read off its material at import
+//! time, exactly as `DescribeHostKey` reports the same record. An unknown `ServerId` is
+//! a `ResourceNotFoundException`; a `NextToken` this service did not hand out is an
+//! `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +157,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHostKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHostKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHostKeys"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListHostKeysErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        // The named resource is resolved FIRST: a listing for a server that does not
+        // exist is a not-found, whatever else the request carries.
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(st::not_found(
+                ListHostKeysErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        }
+
+        // A token this service did not hand out resumes nothing, so it is refused
+        // rather than silently restarting the listing.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListHostKeysErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: "The NextToken is not valid".to_string(),
+                })
+            })?),
+            None => None,
+        };
+
+        // ONE range scan over this server's run of the host key map: the records to
+        // render come straight out of it, so no row is looked up a second time.
+        let stored: Vec<&st::HostKey> = guard.host_keys_of(&input.server_id).collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|host_key| host_key.host_key_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+
+        let host_keys = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedHostKey {
+                arn: stored.arn.clone(),
+                host_key_id: Some(stored.host_key_id.clone()),
+                fingerprint: Some(stored.fingerprint.clone()),
+                description: stored.description.clone(),
+                r#type: Some(stored.key_type.clone()),
+                date_imported: Some(::aws_smithy_types::DateTime::from(stored.date_imported)),
+                storage_type: Some(stored.storage_type.clone()),
+                // `SecretId` is "The ARN of the Secrets Manager secret that stores the
+                // host key material": this emulator stores no Secrets Manager secret, so
+                // it reports no id rather than an ARN naming a secret nothing holds —
+                // the same answer `DescribeHostKey` gives for the same record.
+                secret_id: None,
+            })
+            .collect();
+
+        Ok(ListHostKeysOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            server_id: input.server_id,
+            host_keys,
+        })
     }
 }

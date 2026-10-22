@@ -78,3 +78,5 @@ mod transfer_user_with_iam_role;
 // contended region. The suite itself is an ordinary `tests/all/<name>.rs` file.
 #[path = "all/sagemaker_signing_name_routing.rs"]
 mod sagemaker_signing_name_routing;
+#[path = "all/bedrock_signing_name_routing.rs"]
+mod bedrock_signing_name_routing;

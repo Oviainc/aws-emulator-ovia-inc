@@ -139,12 +139,12 @@ pub(crate) fn str_field(body: &Value, member: &str) -> String {
         .to_string()
 }
 
-fn primary_container(image: &str) -> Value {
+pub(crate) fn primary_container(image: &str) -> Value {
     json!({ "Image": image })
 }
 
 /// A minimal one-variant configuration body naming `model`.
-fn one_variant_config(name: &str, model: &str) -> Value {
+pub(crate) fn one_variant_config(name: &str, model: &str) -> Value {
     json!({
         "EndpointConfigName": name,
         "ProductionVariants": [{
@@ -487,6 +487,11 @@ async fn an_absent_resource_is_refused_with_a_400_validation_exception() {
             "DeleteEndpoint",
             json!({ "EndpointName": "absent" }),
             "endpoint",
+        ),
+        (
+            "DeleteEndpointConfig",
+            json!({ "EndpointConfigName": "absent" }),
+            "endpoint-config",
         ),
         (
             "CreateEndpoint",
@@ -1457,7 +1462,7 @@ async fn a_create_past_a_store_quota_is_refused_with_the_modelled_limit_failure(
         let freed = format!("q{:04}", QUOTA - 1);
         let delete_target = match store {
             "models" => "DeleteModel",
-            "endpoint-configs" => continue, // no DeleteEndpointConfig in this slice
+            "endpoint-configs" => "DeleteEndpointConfig",
             _ => "DeleteEndpoint",
         };
         emulator

@@ -186,9 +186,21 @@ pub(crate) fn is_modelled_vpc_endpoint_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "vpce-", 17)
 }
 
+/// `ConnectorId` is modelled `len 19..19`, pattern `^c-([0-9a-f]{17})$`.
+pub(crate) fn is_modelled_connector_id(id: &str) -> bool {
+    id.len() == 19
+        && id.starts_with("c-")
+        && id[2..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
 /// `ProfileId` is modelled `len 19..19`, pattern `^p-([0-9a-f]{17})$`.
 pub(crate) fn is_modelled_profile_id(id: &str) -> bool {
     is_prefixed_lower_hex_id(id, "p-", 17)
+}
+
+/// `HostKeyId` is modelled `len 25..25`, pattern `^hostkey-[0-9a-f]{17}$`.
+pub(crate) fn is_modelled_host_key_id(id: &str) -> bool {
+    is_prefixed_lower_hex_id(id, "hostkey-", 17)
 }
 
 /// Whether `id` is `prefix` followed by exactly `digits` lowercase hex digits — the
@@ -201,13 +213,6 @@ fn is_prefixed_lower_hex_id(id: &str, prefix: &str, digits: usize) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
     })
-}
-
-/// `HostKeyId` is modelled `len 25..25`, pattern `^hostkey-[0-9a-f]{17}$`.
-pub(crate) fn is_modelled_host_key_id(id: &str) -> bool {
-    id.len() == 25
-        && id.starts_with("hostkey-")
-        && id[8..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 /// An OpenSSH Ed25519 private key and the SHA256 fingerprint `ssh-keygen -l` prints

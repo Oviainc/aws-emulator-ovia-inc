@@ -15,6 +15,8 @@
 mod bucket_bundles;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
+#[path = "all/container_service_public_endpoint.rs"]
+mod container_service_public_endpoint;
 #[path = "all/disk_block_storage.rs"]
 mod disk_block_storage;
 #[path = "all/domain_entry_recordset.rs"]

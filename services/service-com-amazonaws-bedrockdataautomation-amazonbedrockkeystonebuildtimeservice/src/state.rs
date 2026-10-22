@@ -4,15 +4,20 @@
 //!
 //! This module owns the Blueprint record the control-plane operations
 //! (`CreateBlueprint`, `GetBlueprint`, `ListBlueprints`, `UpdateBlueprint`,
-//! `DeleteBlueprint`, `CreateBlueprintVersion`) share, plus the few helpers more
-//! than one of those handlers needs: minting a blueprint ARN, resolving the
-//! request's region, and the opaque `nextToken` codec used by the paginated list.
-//! Operation BEHAVIOUR stays in `src/ops/<operation>.rs`; only the shared record
-//! and its projections live here.
+//! `DeleteBlueprint`, `CreateBlueprintVersion`) share and the DataAutomationProject
+//! record `CreateDataAutomationProject` and `GetDataAutomationProject` share, plus
+//! the few helpers more than one of those handlers needs: minting a resource ARN,
+//! resolving the request's region, and the opaque `nextToken` codec used by the
+//! paginated list. Operation BEHAVIOUR stays in `src/ops/<operation>.rs`; only the
+//! shared records and their projections live here.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Blueprint, BlueprintSummary, Tag};
+use crate::ops::types::{
+    Blueprint, BlueprintSummary, CustomOutputConfiguration, DataAutomationLibraryConfiguration,
+    DataAutomationProject, OverrideConfiguration, StandardOutputConfiguration, Tag,
+};
 
 /// The `blueprintStage` a blueprint takes when `CreateBlueprint` names none.
 ///
@@ -66,6 +71,115 @@ pub const BLUEPRINT_QUOTA: usize = 1_000;
 /// on a whole-blueprint delete) releases its token with it, so that map holds at
 /// most one entry per live snapshot.
 pub const BLUEPRINT_VERSION_QUOTA: usize = 100;
+
+/// The `projectStage` a DataAutomationProject takes when the create request names
+/// none.
+///
+/// Source: `smithy_query(shape="DataAutomationProjectStage")` ->
+/// `["DEVELOPMENT", "LIVE"]`, and the member carries NO `@default`, so this value
+/// is the emulator's own choice rather than a modelled one. It is `LIVE` because
+/// that is the stage a project has to be in to be usable without naming one: the
+/// runtime service resolves a project through
+/// `DataAutomationConfiguration$stage` (`smithy_query(shape=
+/// "DataAutomationConfiguration")` on the Bedrock Data Automation Runtime model),
+/// which is optional too, so a project created with no stage named and invoked
+/// with no stage named must be the same project.
+pub const DEFAULT_PROJECT_STAGE: &str = "LIVE";
+
+/// The two non-failed statuses of a DataAutomationProject, as
+/// `smithy_query(shape="DataAutomationProjectStatus")` lists them (`COMPLETED`,
+/// `IN_PROGRESS`, `FAILED`): a create answers `IN_PROGRESS` and the project
+/// settles into `COMPLETED`.
+pub const PROJECT_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// See [`PROJECT_IN_PROGRESS`].
+pub const PROJECT_COMPLETED: &str = "COMPLETED";
+
+/// How long after `CreateDataAutomationProject` the clock owes the created
+/// project's `IN_PROGRESS` -> `COMPLETED` transition.
+///
+/// AWS documents no duration for it — `CreateDataAutomationProjectResponse$status`
+/// is modelled as one of `IN_PROGRESS`/`COMPLETED`/`FAILED` precisely because the
+/// project is not ready when the call returns — so this span is CHOSEN, not
+/// modelled: 500 ms, inside the project's 250-750 ms band. It is deliberately
+/// non-zero, so a caller reading the project straight after the create still
+/// observes `IN_PROGRESS`. Nothing sleeps for it: the due instant is stored on the
+/// record and compared against the clock.
+pub const PROJECT_CREATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How many DataAutomationProjects the store holds before
+/// `CreateDataAutomationProject` refuses with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402). Same reasoning as
+/// [`BLUEPRINT_QUOTA`]: Bedrock Data Automation publishes an adjustable quota on
+/// projects per account per Region and this emulator models neither Service Quotas
+/// nor an account's adjustments, so this is the emulator's OWN bound on the store.
+pub const PROJECT_QUOTA: usize = 1_000;
+
+/// A stored DataAutomationProject: exactly the members the modeled
+/// `DataAutomationProject` shape carries, plus the tag list and the instant the
+/// clock owes this project's `IN_PROGRESS` -> `COMPLETED` transition.
+#[derive(Debug, Clone)]
+pub struct DataAutomationProjectRecord {
+    pub project_arn: String,
+    pub project_name: String,
+    pub project_stage: String,
+    pub project_type: String,
+    pub project_description: Option<String>,
+    pub standard_output_configuration: Option<StandardOutputConfiguration>,
+    pub custom_output_configuration: Option<CustomOutputConfiguration>,
+    pub override_configuration: Option<OverrideConfiguration>,
+    pub data_automation_library_configuration: Option<DataAutomationLibraryConfiguration>,
+    pub creation_time: ::aws_smithy_types::DateTime,
+    pub last_modified_time: ::aws_smithy_types::DateTime,
+    pub kms_key_id: Option<String>,
+    pub kms_encryption_context: Option<HashMap<String, String>>,
+    /// When the create this record came from stops being in progress. Set once, at
+    /// creation; every reader derives [`Self::status_at`] from it rather than
+    /// storing a status that a read would have to write.
+    pub completes_at: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl DataAutomationProjectRecord {
+    /// This project's modeled `status` as of `now`: `IN_PROGRESS` until the
+    /// transition the create owed falls due, `COMPLETED` from then on.
+    ///
+    /// A pure function of the stored due instant, so reporting it writes nothing and
+    /// two readers at the same instant agree.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.completes_at {
+            PROJECT_COMPLETED
+        } else {
+            PROJECT_IN_PROGRESS
+        }
+    }
+
+    /// Project the record onto the modeled `DataAutomationProject` shape, with the
+    /// status the clock has made due at `now`.
+    ///
+    /// INFALLIBLE: every member of the projection is a member of the record, so no
+    /// request can make this fail and no handler needs an unwrap for it.
+    pub fn to_project(&self, now: SystemTime) -> DataAutomationProject {
+        DataAutomationProject {
+            project_arn: self.project_arn.clone(),
+            creation_time: self.creation_time,
+            last_modified_time: self.last_modified_time,
+            project_name: self.project_name.clone(),
+            project_stage: Some(self.project_stage.clone()),
+            project_type: Some(self.project_type.clone()),
+            project_description: self.project_description.clone(),
+            standard_output_configuration: self.standard_output_configuration.clone(),
+            custom_output_configuration: self.custom_output_configuration.clone(),
+            override_configuration: self.override_configuration.clone(),
+            data_automation_library_configuration: self
+                .data_automation_library_configuration
+                .clone(),
+            status: self.status_at(now).to_string(),
+            kms_key_id: self.kms_key_id.clone(),
+            kms_encryption_context: self.kms_encryption_context.clone(),
+        }
+    }
+}
 
 /// One snapshot of a blueprint's schema, taken by `CreateBlueprintVersion`.
 #[derive(Debug, Clone)]
@@ -189,11 +303,20 @@ pub struct ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeservic
     pub create_idempotency: HashMap<String, String>,
     /// `CreateBlueprintVersion` `clientToken` -> (ARN, version) it cut.
     pub version_idempotency: HashMap<String, (String, u64)>,
-    /// The sequence number the next minted blueprint ARN carries. It counts the
-    /// creates this store has served and is never rolled back, so every id it
-    /// mints differs — two creates inside one nanosecond differ in the sequence,
-    /// and deleting a record does not free its id. The whole 64-bit value goes
-    /// into the id, so the counter saturates (at a count no in-memory store can
+    /// Every stored DataAutomationProject, keyed by its ARN.
+    pub projects: HashMap<String, DataAutomationProjectRecord>,
+    /// `projectName` -> `projectArn`; the uniqueness index behind
+    /// `CreateDataAutomationProject`'s `ConflictException`.
+    pub project_names: HashMap<String, String>,
+    /// `CreateDataAutomationProject` `clientToken` -> the ARN that call created, so
+    /// an `@idempotencyToken` replay returns the original project.
+    pub project_create_idempotency: HashMap<String, String>,
+    /// The sequence number the next minted resource ARN carries, for every
+    /// resource this store mints one for (a blueprint, a DataAutomationProject). It
+    /// counts the creates this store has served and is never rolled back, so every
+    /// id it mints differs — two creates inside one nanosecond differ in the
+    /// sequence, and deleting a record does not free its id. The whole 64-bit value
+    /// goes into the id, so the counter saturates (at a count no in-memory store can
     /// reach) rather than wrapping onto an id already handed out.
     pub next_arn_sequence: u64,
 }
@@ -231,6 +354,18 @@ impl ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState
         self.version_idempotency.retain(|_, (stored_arn, stored_version)| {
             stored_arn != arn || *stored_version != version
         });
+    }
+
+    /// Forget a DataAutomationProject entirely: the record, its name reservation
+    /// and any idempotency token that resolves to it. This is what keeps the store
+    /// inside [`PROJECT_QUOTA`] over the life of the process — every record a
+    /// create inserts is releasable through `DeleteDataAutomationProject`.
+    pub fn remove_project(&mut self, arn: &str) -> Option<DataAutomationProjectRecord> {
+        let record = self.projects.remove(arn)?;
+        self.project_names.remove(&record.project_name);
+        self.project_create_idempotency
+            .retain(|_, stored| stored != arn);
+        Some(record)
     }
 }
 
@@ -271,9 +406,35 @@ pub fn mint_blueprint_arn(
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("blueprint/{id}"))
 }
 
+/// Mint a fresh DataAutomationProject ARN for `region`.
+///
+/// `smithy_query(shape="DataAutomationProject")` constrains `projectArn` to
+/// `^arn:aws(|-cn|-us-gov):bedrock:[a-zA-Z0-9-]*:(aws|[0-9]{12}):data-automation-project/[a-zA-Z0-9-]{12,36}$`,
+/// so the resource id is 12..36 characters of `[a-zA-Z0-9-]` — the same id space
+/// [`mint_blueprint_arn`] mints into, under this service's other resource type, so
+/// the two share one id format and one uniqueness argument (the store's sequence
+/// number, never rolled back and never truncated).
+pub fn mint_project_arn(
+    region: &str,
+    created_at: ::aws_smithy_types::DateTime,
+    sequence: u64,
+) -> String {
+    let id = format!("{:08x}-{:016x}", created_at.subsec_nanos(), sequence);
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("data-automation-project/{id}"))
+}
+
 /// The current wall-clock instant as a modeled `date-time` timestamp.
 pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+}
+
+/// The current instant in BOTH forms one call needs: the `SystemTime` a stored due
+/// instant is computed from and compared against, and the same instant as the
+/// modeled `date-time` timestamp a response carries. Read once, so a record's
+/// `creationTime` and its due instant cannot come from two different clock reads.
+pub fn now_pair() -> (SystemTime, ::aws_smithy_types::DateTime) {
+    let at = SystemTime::now();
+    (at, ::aws_smithy_types::DateTime::from(at))
 }
 
 /// A `ListBlueprints` page cursor: the sort key of the last item the previous

@@ -27,27 +27,28 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region of the test requests' SigV4 credential scope. Deliberately not the
 /// emulator's `us-east-1` default, so an ARN built from the request's own region is
 /// distinguishable from one built from the default.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The `maxResults` ceiling `ListScans` models (`ListScansRequest$maxResults` range
 /// 1..100), used as the page size when a request names none.
 const LIST_SCANS_MAX_PAGE: usize = 100;
 
-/// One dispatched request's answer.
-struct Answer {
-    status: u16,
+/// One dispatched request's answer. Shared with the sibling suites of this test target
+/// (`crate::account_configuration`), so every suite reads a response the same way.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The wire error code, from `x-amzn-errortype` or the body's `__type`; empty on a
     /// success.
-    error_type: String,
-    json: Value,
+    pub(crate) error_type: String,
+    pub(crate) json: Value,
 }
 
 impl Answer {
-    fn get(&self, member: &str) -> &Value {
+    pub(crate) fn get(&self, member: &str) -> &Value {
         &self.json[member]
     }
 
-    fn str_of(&self, member: &str) -> String {
+    pub(crate) fn str_of(&self, member: &str) -> String {
         self.json[member]
             .as_str()
             .unwrap_or_else(|| panic!("member {member} is not a string in {}", self.json))
@@ -58,7 +59,7 @@ impl Answer {
 /// The router every test drives: this one service, on a fresh shared engine. The engine
 /// is handed back too, so a test can seed the store with state no request path produces
 /// (findings a real run's analysis would have written, or a store already at its quota).
-fn harness() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
+pub(crate) fn harness() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -67,11 +68,11 @@ fn harness() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
 }
 
 /// This service's store in `engine`.
-fn store_of(engine: &Arc<engine::InMemoryEngine>) -> engine::ServiceState<Store> {
+pub(crate) fn store_of(engine: &Arc<engine::InMemoryEngine>) -> engine::ServiceState<Store> {
     cgs_state::service_state(&**engine).expect("the CodeGuru Security store")
 }
 
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path_and_query: &str,
@@ -115,7 +116,7 @@ async fn call(
     }
 }
 
-async fn create_upload_url(router: &MultiServiceRouter, scan_name: &str) -> Answer {
+pub(crate) async fn create_upload_url(router: &MultiServiceRouter, scan_name: &str) -> Answer {
     call(
         router,
         "POST",
