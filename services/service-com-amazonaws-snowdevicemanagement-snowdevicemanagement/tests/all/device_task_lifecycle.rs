@@ -28,10 +28,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request in this suite signs for. Deliberately NOT the emulator's
 /// default, so an ARN carrying it proves the region came from the SigV4 scope.
-const SIGNED_REGION: &str = "ap-southeast-2";
+pub(crate) const SIGNED_REGION: &str = "ap-southeast-2";
 
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A SigV4 credential scope naming this service, which is what routes the request.
 const SIGNED_SCOPE: &str = "AWS4-HMAC-SHA256 \
@@ -82,7 +82,7 @@ const ACTIVATED_DEVICES: u64 = 3;
 /// state seam that puts a device in the inventory. Without it this account's inventory
 /// is empty and every gated operation answers the account-level device gate, which is
 /// what `account_device_gate.rs` pins.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     service_state(&*engine)
         .expect("the in-memory engine carries this service's state")
@@ -95,19 +95,24 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
     }
 }
 
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let mut builder = ::http::Request::builder()
         .method(method)
@@ -141,7 +146,7 @@ async fn list_devices(router: &MultiServiceRouter, query: &str) -> Answer {
     call(router, "GET", &format!("/managed-devices{query}"), None).await
 }
 
-async fn describe_device(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn describe_device(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "POST",
@@ -151,11 +156,11 @@ async fn describe_device(router: &MultiServiceRouter, id: &str) -> Answer {
     .await
 }
 
-async fn create_task(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn create_task(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "POST", "/task", Some(request)).await
 }
 
-async fn describe_task(router: &MultiServiceRouter, task_id: &str) -> Answer {
+pub(crate) async fn describe_task(router: &MultiServiceRouter, task_id: &str) -> Answer {
     call(router, "POST", &format!("/task/{task_id}"), None).await
 }
 
@@ -182,7 +187,7 @@ async fn describe_execution(
 }
 
 /// Assert a call succeeded and hand back its body.
-fn ok(answer: &Answer, case: &str) -> Value {
+pub(crate) fn ok(answer: &Answer, case: &str) -> Value {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected HTTP 200, got {} with {}",
@@ -192,7 +197,7 @@ fn ok(answer: &Answer, case: &str) -> Value {
 }
 
 /// Assert a call was refused with HTTP 404 `ResourceNotFoundException`.
-fn assert_not_found(answer: &Answer, case: &str) {
+pub(crate) fn assert_not_found(answer: &Answer, case: &str) {
     assert_eq!(
         answer.status, 404,
         "case {case:?}: expected HTTP 404, got {} with {}",
@@ -206,7 +211,7 @@ fn assert_not_found(answer: &Answer, case: &str) {
 }
 
 /// Assert a call was refused with HTTP 400 `ValidationException`.
-fn assert_validation(answer: &Answer, case: &str) {
+pub(crate) fn assert_validation(answer: &Answer, case: &str) {
     assert_eq!(
         answer.status, 400,
         "case {case:?}: expected HTTP 400, got {} with {}",
@@ -220,7 +225,7 @@ fn assert_validation(answer: &Answer, case: &str) {
 }
 
 /// A required string member of a JSON object.
-fn string(body: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
@@ -244,7 +249,7 @@ fn executions_of(body: &Value, case: &str) -> Vec<Value> {
 }
 
 /// Every activated device, in the order `ListDevices` serves them.
-async fn whole_inventory(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+pub(crate) async fn whole_inventory(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
     let answer = list_devices(router, "").await;
     let body = ok(&answer, case);
     let devices = devices_of(&body, case);
@@ -260,7 +265,7 @@ async fn whole_inventory(router: &MultiServiceRouter, case: &str) -> Vec<Value> 
 }
 
 /// The `managedDeviceId`s of a device list, in order.
-fn ids_of(devices: &[Value], case: &str) -> Vec<String> {
+pub(crate) fn ids_of(devices: &[Value], case: &str) -> Vec<String> {
     devices
         .iter()
         .map(|device| string(device, "managedDeviceId", case))

@@ -178,7 +178,8 @@ pub struct Device {
 }
 
 impl Device {
-    fn tag_map(&self) -> HashMap<String, String> {
+    /// This device's tags, as the modelled `TagMap` carries them.
+    pub fn tag_map(&self) -> HashMap<String, String> {
         self.tags
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -553,6 +554,19 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
         format!("{:032x}", self.execution_id_seq)
     }
 
+    /// The tags held on the device or task a tagging operation's `resourceArn`
+    /// resolved to ([`parse_tagged_resource_arn`]), or `None` when this account holds
+    /// no such record.
+    ///
+    /// The lookup is by the id the ARN carries — the key each record is stored under —
+    /// so a tag read and `UntagResource` address exactly the same record.
+    pub fn tags_of(&self, resource: &TaggedResource) -> Option<HashMap<String, String>> {
+        match resource.kind {
+            TaggedResourceKind::Device => self.devices.get(&resource.id).map(Device::tag_map),
+            TaggedResourceKind::Task => self.tasks.get(&resource.id).map(Task::tag_map),
+        }
+    }
+
     /// Materialise every state change the clock already owes.
     ///
     /// An execution the span has elapsed on moves `QUEUED` -> `IN_PROGRESS` ->
@@ -879,6 +893,43 @@ pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("{resource_type} {id} not found"),
     }
+}
+
+/// The IAM user name of the identity this emulator's long-term credentials speak
+/// for.
+///
+/// The emulator publishes exactly ONE long-term identity, and STS is what defines
+/// it: `GetCallerIdentity` answers `arn:aws:iam::<account>:user/emulator` for every
+/// request whose access key id names no session (`AMBIENT_USER_NAME` in
+/// `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/src/state.rs`).
+const AMBIENT_USER_NAME: &str = "emulator";
+
+/// The principal that made this request, as an ARN.
+///
+/// Server-derived from the emulator's own identity contract, never from the
+/// request: it is the ARN of the identity a request signed with this emulator's
+/// credentials speaks for, the one [`AMBIENT_USER_NAME`] names. An access key id is
+/// a credential id, not a user name, so it is never rendered into an IAM ARN.
+pub fn request_principal() -> String {
+    ::engine::emulator_arn("iam", "", &format!("user/{AMBIENT_USER_NAME}"))
+}
+
+/// How `ListTagsForResource` words its refusal of an ARN outside the account this
+/// emulator serves.
+///
+/// It names the CALLER's own principal — the identity whose authorization was
+/// evaluated — and names neither the ARN it was asked about, nor its account, nor any
+/// resource: the refusal is decided before anything is looked up, so a caller must not
+/// be able to learn from it whether a resource exists in an account that is not its
+/// own. This is the wording the behavioural corpus recorded for the tag READ
+/// (`snow-device-management.cross-account-tag-arn-notfound-no-leak`); the mutating
+/// tagging operations carry their own recorded wording, which is why this is not one
+/// shared constant.
+pub fn access_denied_message() -> String {
+    format!(
+        "User: {} is not authorized to access this resource",
+        request_principal()
+    )
 }
 
 /// The largest a `ManagedDeviceId` or a `TaskId` may be: both are modelled
