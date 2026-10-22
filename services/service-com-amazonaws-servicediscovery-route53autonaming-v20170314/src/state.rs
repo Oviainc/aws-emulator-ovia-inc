@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance, Namespace,
-    NamespaceProperties, Operation, Service, Tag,
+    NamespaceProperties, Operation, Service, Tag, SOA,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -128,6 +128,12 @@ pub struct NamespaceRecord {
     pub http_name: Option<String>,
     /// `Properties.DnsProperties.HostedZoneId`, set only for a DNS namespace.
     pub hosted_zone_id: Option<String>,
+    /// `Properties.DnsProperties.SOA.TTL` — the TTL "for purposes of negative
+    /// caching" of the hosted zone's Start of Authority record. Held only for a DNS
+    /// namespace whose creator stated it: `SOA` is optional on the reported
+    /// `DnsProperties`, AWS publishes no default value for it, and the emulator
+    /// reports no TTL it was never given rather than inventing one.
+    pub soa_ttl: Option<i64>,
     pub tags: Vec<(String, String)>,
 }
 
@@ -218,6 +224,7 @@ pub enum TaggedResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IdempotencyScope {
     CreateHttpNamespace,
+    CreatePublicDnsNamespace,
     CreateService,
     RegisterInstance,
     UpdateHttpNamespace,
@@ -226,6 +233,7 @@ impl IdempotencyScope {
     fn as_str(self) -> &'static str {
         match self {
             Self::CreateHttpNamespace => "CreateHttpNamespace",
+            Self::CreatePublicDnsNamespace => "CreatePublicDnsNamespace",
             Self::CreateService => "CreateService",
             Self::RegisterInstance => "RegisterInstance",
             Self::UpdateHttpNamespace => "UpdateHttpNamespace",
@@ -288,6 +296,18 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
         } else {
             format!("{prefix}-{body}")
         }
+    }
+
+    /// Mint the id of the Route 53 hosted zone a DNS namespace carries —
+    /// `DnsProperties$HostedZoneId` is "the ID for the Route 53 hosted zone that Cloud
+    /// Map creates when you create a namespace".
+    ///
+    /// Route 53 hosted zone ids are an uppercase alphanumeric string that starts with
+    /// `Z`, so the minted digits of [`Self::next_id`] are upper-cased behind that
+    /// prefix. The id is opaque: it is derived from the store's counter and the clock,
+    /// never from the namespace name.
+    pub fn next_hosted_zone_id(&mut self) -> String {
+        format!("Z{}", self.next_id("", 20).to_uppercase())
     }
 
     /// File an operation record and return its `OperationId`.
@@ -481,6 +501,29 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
             .cloned()
     }
 
+    /// The `OperationId` a previous create of the namespace `name` with this
+    /// `CreatorRequestId` answered with — but ONLY while that namespace is still
+    /// stored.
+    ///
+    /// Every namespace create is idempotent on its `CreatorRequestId`, so a retry of
+    /// the SAME request replays the operation the first call filed instead of creating
+    /// a second namespace. Once `DeleteNamespace` has removed the namespace the token
+    /// is stale: replaying it would answer success for a create this call never made,
+    /// which is a discarded write indistinguishable from a stored one, so the retry is
+    /// served as a fresh create. The rule is the same for every namespace type, so it
+    /// lives here rather than in one handler.
+    pub fn replayed_namespace_create(
+        &self,
+        scope: IdempotencyScope,
+        token: Option<&str>,
+        name: &str,
+    ) -> Option<String> {
+        if !self.namespace_ids_by_name.contains_key(name) {
+            return None;
+        }
+        self.replayed(scope, token?, name)
+    }
+
     /// Remember what a `CreatorRequestId` produced for this request, so a retry of the
     /// SAME request replays it. Keeps the token store within
     /// [`MAX_RETAINED_IDEMPOTENCY_TOKENS`], forgetting the oldest token first.
@@ -588,7 +631,9 @@ pub fn namespace_view(record: &NamespaceRecord, service_count: i32) -> Namespace
             dns_properties: record.hosted_zone_id.as_ref().map(|hosted_zone_id| {
                 crate::ops::types::DnsProperties {
                     hosted_zone_id: Some(hosted_zone_id.clone()),
-                    soa: None,
+                    // The SOA record of that hosted zone, reported only when the
+                    // namespace carries a TTL for it.
+                    soa: record.soa_ttl.map(|ttl| SOA { ttl }),
                 }
             }),
             http_properties: record

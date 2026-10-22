@@ -17,6 +17,8 @@ mod appconfig_signing_name_routing;
 mod aws_marketplace_signing_name_routing;
 #[path = "all/boot_serve.rs"]
 mod boot_serve;
+#[path = "all/cloudfront_key_value_store_handshake.rs"]
+mod cloudfront_key_value_store_handshake;
 #[path = "all/connect_signing_name_routing.rs"]
 mod connect_signing_name_routing;
 #[path = "all/dynamodb_streams_routing.rs"]

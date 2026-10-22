@@ -23,3 +23,5 @@ mod search_facets;
 mod signing_name_claims;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_message_rules.rs"]
+mod validation_message_rules;
