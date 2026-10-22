@@ -30,6 +30,8 @@ mod resource_tags;
 mod rule_group_lifecycle;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
+#[path = "all/rule_predicates.rs"]
+mod rule_predicates;
 #[path = "all/size_constraint_set.rs"]
 mod size_constraint_set;
 #[path = "all/sql_injection_match_set.rs"]
