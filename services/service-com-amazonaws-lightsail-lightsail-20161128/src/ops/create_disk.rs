@@ -212,23 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Of the modelled `AddOnType` members, only `AutoSnapshot` describes a
-        // disk: the other one stops a virtual computer after an idle period
-        // (`StopInstanceOnIdleRequest` — "the amount of idle time in minutes
-        // after which your virtual computer will automatically stop"), which a
-        // block storage disk does not have, so asking for it on a disk is
-        // refused rather than stored as an add-on that can never act.
+        // disk, which is what `disk_add_ons_from_requests` accepts — the one
+        // conversion every operation that creates a disk goes through, so this
+        // operation and `CreateDiskFromSnapshot` admit exactly the same add-ons.
         let add_on_requests = input.add_ons.clone().unwrap_or_default();
-        if let Some(request) = add_on_requests
-            .iter()
-            .find(|request| request.add_on_type != ADD_ON_TYPE_AUTO_SNAPSHOT)
-        {
-            return Err(invalid(format!(
-                "addOns[].addOnType '{}' cannot be enabled on a disk: a disk accepts only \
-                 {ADD_ON_TYPE_AUTO_SNAPSHOT}",
-                request.add_on_type
-            )));
-        }
-        let add_ons = crate::state::add_ons_from_requests(&input.disk_name, &add_on_requests)
+        let add_ons = crate::state::disk_add_ons_from_requests(&input.disk_name, &add_on_requests)
             .map_err(invalid)?;
 
         let name = input.disk_name;
@@ -290,10 +278,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .ok_or_else(unavailable)?
     }
 }
-
-/// The one modelled `AddOnType` member a block storage disk can carry: the
-/// automatic snapshot add-on.
-const ADD_ON_TYPE_AUTO_SNAPSHOT: &str = "AutoSnapshot";
 
 /// This operation's 400 refusal for a request the model admits but the service
 /// does not: the modelled `InvalidInputException`, whose message names the member
