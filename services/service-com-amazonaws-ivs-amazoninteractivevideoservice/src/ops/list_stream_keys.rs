@@ -150,23 +150,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListStreamKeysErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(ListStreamKeysErrorModeled::InternalServerException)
         })?;
 
         let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
             Some(token) => Some(
                 crate::state::decode_page_token(crate::state::STREAM_KEY_PAGE, token).ok_or_else(
                     || {
-                        ListStreamKeysErrorModeled::ValidationException(ValidationException {
-                            exception_message: Some(
-                                "nextToken is not a pagination token this service issued"
-                                    .to_string(),
-                            ),
-                            ..Default::default()
-                        })
+                        crate::state::validation(
+                            ListStreamKeysErrorModeled::ValidationException,
+                            UNISSUED_PAGE_TOKEN.to_string(),
+                        )
                     },
                 )?,
             ),
@@ -178,16 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         if !store.channels.contains_key(&input.channel_arn) {
-            return Err(ListStreamKeysErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    exception_message: Some(format!(
-                        "channel {} does not exist",
-                        input.channel_arn
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::resource_not_found(
+                ListStreamKeysErrorModeled::ResourceNotFoundException,
+                &input.channel_arn,
+            ));
         }
 
         let (window, next_token) = crate::state::page(
@@ -211,6 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`MaxStreamKeyResults`, `range(min: 1, max: 50)`), and so also the page size an
 /// absent `maxResults` means.
 const MAX_STREAM_KEY_RESULTS: i32 = 50;
+
+/// What this operation says about a `nextToken` it did not issue: a bad request, which
+/// is a different answer from a page that happens to be empty.
+const UNISSUED_PAGE_TOKEN: &str = "nextToken is not a pagination token this service issued";
 
 /// The `StreamKeySummary` projection of a persisted stream key. It deliberately
 /// carries no `value`: `StreamKeySummary` declares only `arn`, `channelArn` and

@@ -21,6 +21,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256 for the 128-bit identifier in a created insight's ARN.
+sha2 = { workspace = true }
 # Hex codec for the opaque `NextToken` cursors of the paginated list operations
 # (`GetFindings`, `GetEnabledStandards`).
 hex = { workspace = true }
@@ -29,7 +31,6 @@ hex = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 # The standards tests wait past a PENDING -> READY transition's due instant, which
 # needs tokio's timer on top of the features the workspace dependency enables.
 tokio = { workspace = true, features = ["time"] }

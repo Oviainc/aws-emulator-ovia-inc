@@ -411,6 +411,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `DBClusterIdentifier`: "The identifier of the DB cluster that this DB instance
+        // will belong to." A create resolves every resource it REFERENCES before it
+        // admits a record of its own — the operation models `DBClusterNotFoundFault`
+        // ("DBClusterIdentifier doesn't refer to an existing DB cluster") for exactly
+        // this — because an instance whose cluster does not exist is a record no later
+        // describe, failover or delete could agree with.
+        //
+        // This service holds NO DB cluster records: every operation that could create one
+        // — `CreateDBCluster`, `RestoreDBClusterFromSnapshot`,
+        // `RestoreDBClusterToPointInTime` — is still a scaffolded 501 (their own stub
+        // issues), so nothing can have created a cluster here and no identifier resolves
+        // to one. When one of those operations stores a cluster, this is the lookup that
+        // admits a member of it.
+        if let Some(cluster) = &input.db_cluster_identifier {
+            return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!(
+                        "The source cluster could not be found or cannot be accessed: {cluster}"
+                    )),
+                },
+            )
+            .into());
+        }
         // The region's DB instance quota, and the number of regions this store keeps
         // records for at all: a store that grows without bound is not what the real
         // service does, and the modelled fault says exactly this.

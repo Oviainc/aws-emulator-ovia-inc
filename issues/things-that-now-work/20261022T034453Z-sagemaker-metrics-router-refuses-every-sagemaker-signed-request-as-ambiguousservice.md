@@ -8,6 +8,21 @@ Issue-Commit: 37e4b54b7f2f231778aa0090f22742466dbbad1b
 
 # Router refuses every sagemaker-signed request as AmbiguousService (9-way 'sagemaker' signing-name collision), making SageMaker Metrics entirely unreachable
 
+> _Resolution note (added when this report was moved): the cause above — the
+> `AmbiguousService` refusal — is fixed. Each of the nine services that sign as
+> `sagemaker` now claims only the wire surface its own model publishes (its URI path
+> space, or the service its `X-Amz-Target` names for the awsJson1_1 control plane), so
+> SageMaker Metrics and the SageMaker control plane are reachable and the metrics
+> put/get round trip is pinned end-to-end in
+> `core/router/tests/all/sagemaker_signing_name_routing.rs`._
+>
+> _What is NOT fixed here: the 19 trace ids above each start with the control plane's
+> `CreateTrialComponent`, which now REACHES that service and answers the scaffold's
+> `501 NotImplemented` — it is still one of that crate's `//! SCAFFOLDED, NOT
+> IMPLEMENTED:` stubs. Those checks therefore stay red until that stub is implemented
+> (its own item in the stub census, `grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:'
+> services/*/src/ops/`), for a different reason than the one this report is about._
+
 > _Note: this issue was identified against the code base at commit `37e4b54b7f2f231778aa0090f22742466dbbad1b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

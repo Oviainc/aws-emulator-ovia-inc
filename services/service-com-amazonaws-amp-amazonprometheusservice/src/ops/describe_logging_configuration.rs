@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the workspace's PERSISTED rules-and-alerting logging
+//! configuration. A read: it writes nothing beyond materialising the status transition
+//! the clock already owes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +143,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLoggingConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeLoggingConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            return Err(
+                DescribeLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Workspace not found: {}", input.workspace_id),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `loggingConfiguration` is a REQUIRED member, so a workspace that has no
+        // configuration cannot be described with an empty body: the resource the request
+        // references does not exist, which is the modelled 404.
+        let Some(logging) = workspace.logging_configuration.as_ref() else {
+            return Err(
+                DescribeLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Logging configuration not found for workspace: {}",
+                            input.workspace_id
+                        ),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::LOGGING_CONFIGURATION_RESOURCE_TYPE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member is read back off the persisted record.
+        Ok(DescribeLoggingConfigurationOutput {
+            logging_configuration: LoggingConfigurationMetadata {
+                status: crate::state::logging_configuration_status(logging),
+                workspace: workspace.workspace_id.clone(),
+                log_group_arn: logging.log_group_arn.clone(),
+                created_at: ::aws_smithy_types::DateTime::from(logging.created_at),
+                modified_at: ::aws_smithy_types::DateTime::from(logging.modified_at),
+            },
+        })
     }
 }

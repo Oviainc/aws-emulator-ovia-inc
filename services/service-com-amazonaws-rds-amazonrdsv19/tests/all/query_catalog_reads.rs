@@ -409,6 +409,26 @@ async fn default_only_with_no_resolvable_default_engine_version_is_refused() {
                 ("DBParameterGroupFamily", "docdb9.9"),
             ],
         ),
+        // An engine this front door reports on behalf of ANOTHER control plane publishes
+        // its versions here but no DEFAULT among them: the default-version registry this
+        // report reads is the RDS DB instance engines' own, and the DocumentDB and Neptune
+        // APIs own the version a cluster is created with.
+        (
+            "DefaultOnly for the Amazon DocumentDB engine",
+            vec![("DefaultOnly", "true"), ("Engine", "docdb")],
+        ),
+        (
+            "DefaultOnly for the Amazon Neptune engine",
+            vec![("DefaultOnly", "true"), ("Engine", "neptune")],
+        ),
+        (
+            "DefaultOnly narrowed to one DocumentDB major version",
+            vec![
+                ("DefaultOnly", "true"),
+                ("Engine", "docdb"),
+                ("DBParameterGroupFamily", "docdb5.0"),
+            ],
+        ),
     ];
 
     for (case, params) in refusals {
@@ -431,7 +451,7 @@ async fn default_only_with_no_resolvable_default_engine_version_is_refused() {
     for (case, params) in [
         (
             "DefaultOnly for an engine with a published default",
-            vec![("DefaultOnly", "true"), ("Engine", "docdb")],
+            vec![("DefaultOnly", "true"), ("Engine", "postgres")],
         ),
         (
             "DefaultOnly with the engine named by a filter",

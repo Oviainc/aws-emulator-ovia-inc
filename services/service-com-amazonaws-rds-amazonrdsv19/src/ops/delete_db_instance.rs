@@ -3,7 +3,10 @@
 //! @op DeleteDBInstance
 //! IMPLEMENTED: this operation accepts the delete of the stored DB instance, taking
 //! the requested final snapshot first, moving the instance to `deleting` and leaving
-//! the clock owing its removal from the store. This is the ONLY file to touch for it.
+//! the clock owing its removal from the store. It resolves the instance the request names
+//! BEFORE any rule about how the other members combine, so an instance that does not
+//! exist is answered `DBInstanceNotFoundFault` rather than a refusal about a snapshot
+//! parameter. This is the ONLY file to touch for it.
 //!
 //! Its records and their projection onto the modelled wire shapes live in
 //! [`crate::state`], shared with the other implemented operations.
@@ -206,6 +209,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx)
             .map_err(DeleteDBInstanceError::validation)?;
         let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // The instance this call ADDRESSES is resolved FIRST, before any rule about how
+        // the other members combine. `DBInstanceIdentifier` is what names the resource
+        // the operation acts on — the operation models `DBInstanceNotFoundFault` for
+        // exactly this — and a resource that does not exist has no deletion for a
+        // snapshot parameter to qualify: a caller deleting if-exists branches on
+        // 404/`DBInstanceNotFound`, and a 400 about another member tells it nothing about
+        // whether the instance is there. (This front door also serves the Amazon
+        // DocumentDB and Amazon Neptune control planes, whose `DeleteDBInstance` models
+        // DBInstanceIdentifier as its ONLY member, so for their callers a refusal naming
+        // `SkipFinalSnapshot` or `FinalDBSnapshotIdentifier` names no member of the API
+        // they called at all.)
+        //
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        if !store.db_instances.contains_key(&key) {
+            return Err(DeleteDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!("DBInstance {identifier} not found.")),
+                },
+            )
+            .into());
+        }
         // `SkipFinalSnapshot`: "By default, skip isn't enabled, and the DB snapshot is
         // created" — and "If you don't enable this parameter, you must specify the
         // FinalDBSnapshotIdentifier parameter", while enabling both "results in an
@@ -234,25 +269,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(DeleteDBInstanceError::validation)?;
         }
 
-        // No store means this service was mounted on an engine it has no state in,
-        // so it cannot serve the operation at all. Unreachable with the engine the
-        // router builds; 501 is the honest answer, never a fabricated success.
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
-        };
-        let mut store = state.lock();
-        store.settle_due_transitions(&region);
-
-        // RDS is regional: only the region the request was signed for is in scope.
-        let key = (region.clone(), identifier.clone());
-        if !store.db_instances.contains_key(&key) {
-            return Err(DeleteDBInstanceErrorModeled::DBInstanceNotFoundFault(
-                DBInstanceNotFoundFault {
-                    message: Some(format!("DBInstance {identifier} not found")),
-                },
-            )
-            .into());
-        }
         // "The database can't be deleted when deletion protection is enabled."
         if store.db_instances[&key].deletion_protection {
             return Err(DeleteDBInstanceErrorModeled::InvalidDBInstanceStateFault(

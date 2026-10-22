@@ -402,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.db_instances.contains_key(&key) {
             return Err(ModifyDBInstanceErrorModeled::DBInstanceNotFoundFault(
                 DBInstanceNotFoundFault {
-                    message: Some(format!("DBInstance {identifier} not found")),
+                    message: Some(format!("DBInstance {identifier} not found.")),
                 },
             )
             .into());

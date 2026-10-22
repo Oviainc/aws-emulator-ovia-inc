@@ -173,21 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteChannelErrorModeled::InternalServerException(InternalServerException {
-                exception_message: Some("the IVS store is unavailable".to_string()),
-                ..Default::default()
-            })
+            crate::state::store_unavailable(DeleteChannelErrorModeled::InternalServerException)
         })?;
 
         let mut store = state.lock();
         if store.channels.remove(&input.arn).is_none() {
-            return Err(DeleteChannelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    exception_message: Some(format!("channel {} does not exist", input.arn)),
-                    ..Default::default()
-                },
-            )
-            .into());
+            return Err(crate::state::resource_not_found(
+                DeleteChannelErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            ));
         }
         // "Deletes the specified channel AND its associated stream keys": a key
         // outliving its channel would be listed by nothing and deletable by nothing.

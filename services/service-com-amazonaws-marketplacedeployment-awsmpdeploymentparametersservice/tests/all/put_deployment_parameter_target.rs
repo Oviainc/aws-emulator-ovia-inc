@@ -24,15 +24,18 @@ use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice
 };
 
 use crate::deployment_parameters::{
-    emulator, error_code, is_parameter_id, list_tags, provision, put, tags_of, SECRET_MAX_LEN,
+    emulator, error_code, is_parameter_id, list_tags, message, provision, put, tags_of, CATALOG,
+    SECRET_MAX_LEN,
 };
 
-/// One target row: a catalog, a product and an agreement, in the forms their own
-/// modelled patterns admit (`Catalog` is `^[a-zA-Z_-]+$` len 1..64, `ResourceId`
-/// `^[A-Za-z0-9_/-]+$` len 1..64).
+/// One target row: a product and an agreement, in the forms their own modelled
+/// pattern admits (`ResourceId` is `^[A-Za-z0-9_/-]+$` len 1..64).
+///
+/// The catalog is NOT a row field: the model documents `catalog` as a fixed value,
+/// so every row names [`CATALOG`] and the rule about any other catalog is the
+/// `catalog_allowed_values` suite's.
 struct Target {
     case: &'static str,
-    catalog: &'static str,
     product_id: &'static str,
     agreement_id: &'static str,
 }
@@ -44,33 +47,28 @@ struct Target {
 fn target_table() -> Vec<Target> {
     vec![
         Target {
-            case: "the fixed catalog, plain product and agreement ids",
-            catalog: "AWSMarketplace",
+            case: "plain product and agreement ids",
             product_id: "prod-abc123",
             agreement_id: "agmt-abc123",
         },
         Target {
-            case: "a catalog carrying _ and -, a nested product id",
-            catalog: "AWS_Marketplace-Test",
+            case: "a nested product id, an agreement id carrying _ and -",
             product_id: "prod/nested/id-7",
             agreement_id: "agmt_1/2-3",
         },
         Target {
             case: "single-character identifiers, the modelled minimum",
-            catalog: "a",
             product_id: "b",
             agreement_id: "c",
         },
         Target {
             case: "numeric identifiers",
-            catalog: "Catalog",
             product_id: "0",
             agreement_id: "9",
         },
         Target {
-            // 64 characters is `Catalog`'s and `ResourceId`'s modelled maximum.
+            // 64 characters is `ResourceId`'s modelled maximum.
             case: "identifiers at the modelled 64-character maximum",
-            catalog: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             product_id: "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
             agreement_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         },
@@ -121,15 +119,6 @@ fn request_shapes(agreement_id: &str) -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The `message` of an error body.
-fn message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or("<no message>")
-        .to_string()
-}
-
 #[tokio::test]
 async fn a_put_aimed_at_a_target_the_account_does_not_hold_is_refused_and_stores_nothing() {
     let (router, engine) = emulator();
@@ -138,7 +127,7 @@ async fn a_put_aimed_at_a_target_the_account_does_not_hold_is_refused_and_stores
     for row in target_table() {
         let case = row.case;
         for (shape, body) in request_shapes(row.agreement_id) {
-            let (status, answer) = put(&router, row.catalog, row.product_id, &body).await;
+            let (status, answer) = put(&router, CATALOG, row.product_id, &body).await;
             assert_eq!(
                 status, 404,
                 "case {case:?} with {shape:?}: a target the account does not hold must be 404, \
@@ -167,10 +156,10 @@ async fn a_put_aimed_at_a_target_the_account_does_not_hold_is_refused_and_stores
     // --- the same requests against a target the account holds ----------------
     for row in target_table() {
         let case = row.case;
-        provision(&engine, row.catalog, row.agreement_id, &[row.product_id]);
+        provision(&engine, CATALOG, row.agreement_id, &[row.product_id]);
         let (status, created) = put(
             &router,
-            row.catalog,
+            CATALOG,
             row.product_id,
             &json!({
                 "agreementId": row.agreement_id,
@@ -224,7 +213,10 @@ async fn a_target_the_account_holds_only_partly_is_refused_on_the_member_it_got_
     provision(&engine, "AWSMarketplace", "agmt-live", &["prod-live"]);
     provision(&engine, "AWSMarketplace", "agmt-second", &["prod-second"]);
     // The same identifiers in another catalog name nothing: a catalog is part of
-    // the target.
+    // the target. (Such an agreement is seeded, not reachable through this API: a
+    // request naming another catalog is refused before any lookup — see the
+    // `catalog_allowed_values` suite — so what this proves is that the stored
+    // target is scoped by its catalog.)
     provision(&engine, "PrivateMarketplace", "agmt-private", &["prod-private"]);
 
     // (case, catalog, productId, agreementId, the member the refusal names)
@@ -255,13 +247,6 @@ async fn a_target_the_account_holds_only_partly_is_refused_on_the_member_it_got_
             "AWSMarketplace",
             "prod-private",
             "agmt-private",
-            "ProductId",
-        ),
-        (
-            "the held pair under the other catalog's name",
-            "PrivateMarketplace",
-            "prod-live",
-            "agmt-live",
             "ProductId",
         ),
         (
@@ -330,10 +315,11 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
     let too_many: serde_json::Map<String, Value> = (0..=MAX_TAGS_PER_RESOURCE)
         .map(|i| (format!("key-{i:02}"), json!("v")))
         .collect();
-    let over_long_secret = "s".repeat(SECRET_MAX_LEN + 1);
 
     // Each row breaks one modelled constraint of the input. The pairs cover both
     // sides of the target check: a target the account holds, and one it does not.
+    // An oversized `@sensitive` payload is NOT here: it is refused one layer
+    // earlier, with the front door's 403 (`front_door_forbidden`).
     let rows: Vec<(&str, &str, &str, Value)> = vec![
         (
             "tags one past the modelled cap, target held",
@@ -353,24 +339,6 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
                 "agreementId": "agmt-unknown",
                 "deploymentParameter": { "name": "N", "secretString": "s" },
                 "tags": too_many,
-            }),
-        ),
-        (
-            "secretString one past its maximum, target held",
-            "AWSMarketplace",
-            "prod-held",
-            json!({
-                "agreementId": "agmt-held",
-                "deploymentParameter": { "name": "N", "secretString": over_long_secret.clone() },
-            }),
-        ),
-        (
-            "secretString one past its maximum, target not held",
-            "AWSMarketplace",
-            "prod-unknown",
-            json!({
-                "agreementId": "agmt-unknown",
-                "deploymentParameter": { "name": "N", "secretString": over_long_secret },
             }),
         ),
         (

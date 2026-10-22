@@ -918,6 +918,49 @@ pub fn db_instance_arn(region: &str, identifier: &str) -> String {
     emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("db:{identifier}"))
 }
 
+/// The id one response reports as its own: the value of the `<RequestId>` element an
+/// awsQuery `<ErrorResponse>` envelope carries, the counterpart of the
+/// `ResponseMetadata/RequestId` the framework's success renderer writes.
+///
+/// A correlation id, not a security token, and per-response rather than per-resource: two
+/// responses must be distinguishable, which is what a client logs and an SDK's retry and
+/// telemetry layers read. It needs no state, so it is a free function rather than a method
+/// on the store — a request refused before any store is reached still answers with one.
+///
+/// The form is the 8-4-4-4-12 version-4 UUID every AWS request id carries, the same shape
+/// the framework's own success-path minter produces, so a client cannot tell the two
+/// apart. Unique because a monotone counter goes into the digest; the digest is the
+/// maintained `sha2` crate's, so nothing here is hand-rolled.
+pub fn new_request_id() -> String {
+    use ::sha2::{Digest, Sha256};
+    use ::std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The monotone part of a request id, so two ids minted inside one clock tick still
+    /// differ.
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let counter = MINTED.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    let digest = Sha256::digest(format!("request:{counter}:{nanos}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // The version (4) and variant (RFC 4122) nibbles, so the id is well formed and not
+    // mistaken for a name-based or time-based one.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// The current instant as the modelled timestamp shapes carry it.
 pub fn now_as_wire_timestamp() -> ::aws_smithy_types::DateTime {
     let seconds = SystemTime::now()
@@ -1488,6 +1531,29 @@ pub const CA_CERTIFICATES: &[CaCertificate] = &[
         valid_till: "2121-05-25T00:00:00Z",
     },
 ];
+
+/// The CA certificate identifiers an engine version can be launched with:
+/// `DBEngineVersion$SupportedCACertificateIdentifiers`, "a list of the supported CA
+/// certificate identifiers".
+///
+/// Read from the ONE certificate catalogue this service reports through
+/// `DescribeCertificates` ([`CA_CERTIFICATES`]), so the two reports cannot name different
+/// certificates — minus any entry whose `ValidTill` has passed: a caller picks the
+/// `CACertificateIdentifier` of a new instance out of this list, and an expired
+/// certificate is not something it can be launched with. The catalogue is ordered, so the
+/// list is too.
+pub fn supported_ca_certificate_identifiers() -> Vec<String> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_secs() as i64);
+    CA_CERTIFICATES
+        .iter()
+        .filter(|certificate| {
+            catalog_instant(certificate.valid_till).is_some_and(|till| till.secs() > now)
+        })
+        .map(|certificate| certificate.identifier.to_string())
+        .collect()
+}
 
 /// The certificate a DB instance created without one gets:
 /// `CertificateMessage$DefaultCertificateForNewLaunches` — "The default root CA for new

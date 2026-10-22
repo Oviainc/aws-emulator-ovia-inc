@@ -40,11 +40,17 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! One of those seams is taken here: `override_operation` refuses a request whose Query
-//! envelope asks for an API version this service does not serve — see [`api_version`].
-//! The framework's `awsQuery` routing key reads the `Action` field alone, so without it a
-//! request for `Version=2099-01-01` would be served as though it had asked for
-//! `2014-10-31`.
+//! Two of those seams are taken here.
+//!
+//! `override_operation` refuses a request whose Query envelope asks for an API version
+//! this service does not serve — see [`api_version`]. The framework's `awsQuery` routing
+//! key reads the `Action` field alone, so without it a request for `Version=2099-01-01`
+//! would be served as though it had asked for `2014-10-31`. Every other routable request
+//! is served through the envelope wrapper, and `definition` hands back the wrapped
+//! definition, both for the one reason named in [`query_error_envelope`]: an awsQuery
+//! error response carries a `<RequestId>` element in its `<ErrorResponse>` envelope,
+//! which the framework's error renderers omit. Everything else about those paths —
+//! status, `<Type>`, `<Code>`, `<Message>` — stays with the framework.
 //!
 //! `can_handle` keeps the generated `rds` key. THREE mounted models resolve to it — this
 //! one, the Amazon DocumentDB view and the Amazon Neptune view — because all three
@@ -57,10 +63,12 @@
 //! three control planes, which is why their models share its endpoint prefix.
 
 pub mod api_version;
+pub mod query_error_envelope;
 
 use api_version::UnsupportedApiVersionOperation;
+use query_error_envelope::{RdsDefinition, RequestIdEnvelopeOperation};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -70,10 +78,13 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    entry: RdsDefinition<Eng>,
     /// The refusal served for a Query envelope naming another API version. Held in a
     /// field, built once, because `override_operation` hands back a reference to it.
     unsupported_api_version: UnsupportedApiVersionOperation,
+    /// The envelope wrapper every other routable request is served through. Held in a
+    /// field for the same reason.
+    envelope: RequestIdEnvelopeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -82,14 +93,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RdsDefinition::new(engine),
             unsupported_api_version: UnsupportedApiVersionOperation,
+            envelope: RequestIdEnvelopeOperation,
         }
     }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
-    fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
+    fn definition(&self) -> &dyn ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
@@ -128,12 +140,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // names an action AND the API version it is asked for, and the framework's
         // routing key reads only the action. A request naming a version this service
         // does not serve is refused here rather than served as if it had named this
-        // one; everything else is declined (`None`) and resolved by the generated
-        // routing table.
-        if api_version::serves_requested_version(req) {
-            return None;
+        // one.
+        if !api_version::serves_requested_version(req) {
+            return Some(&self.unsupported_api_version);
         }
-        Some(&self.unsupported_api_version)
+        // Every request the generated routing table can serve is served through the
+        // envelope wrapper, which delegates to that same table entry and then adds the
+        // `<RequestId>` the awsQuery error envelope carries (see
+        // [`query_error_envelope`]). The routing stays the model's: a request whose
+        // `Action` names no modelled operation is declined here, so the framework answers
+        // it as the unroutable request it is — through the wrapped definition, which adds
+        // the same element to that refusal.
+        self.entry.routes(req).then_some(&self.envelope as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

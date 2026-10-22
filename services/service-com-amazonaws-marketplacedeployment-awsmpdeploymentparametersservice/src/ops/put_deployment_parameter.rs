@@ -27,6 +27,16 @@
 //! [`crate::state::seed_agreements`] — this model declares no operation that
 //! creates a product or an agreement.
 //!
+//! `catalog` is checked FIRST, and against the set of catalogs that exist
+//! ([`crate::state::SUPPORTED_CATALOGS`]): the model documents the member as a
+//! fixed value, so a syntactically valid name outside that set names no catalog
+//! to resolve a target inside, and the request is the modelled
+//! `ValidationException` (HTTP 400) rather than the 404.
+//!
+//! The request never reaches this handler at all when the front door refuses it:
+//! a `@sensitive` payload past its modelled maximum length is answered with HTTP
+//! 403 `ForbiddenException` in [`crate::service`], ahead of the modelled walk.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -191,6 +201,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The CATALOG first, before any state is touched: `catalog` is an
+        // allowed-value member — the model documents it as "the catalog related
+        // to the request. Fixed value: AWSMarketplace" — so a value outside
+        // `crate::state::SUPPORTED_CATALOGS` names no catalog at all, however
+        // well-formed it is. `Catalog`'s own `length 1..64` / `^[a-zA-Z_-]+$`
+        // (refused by the centralized validate step ahead of this handler) is the
+        // SYNTAX of a catalog name; this is whether the name denotes one. It is a
+        // modelled `ValidationException` (HTTP 400) rather than the 404 below,
+        // and it is answered BEFORE the product/agreement target is resolved:
+        // there is no catalog to resolve a target inside, so a caller reading the
+        // error code can tell a wrong catalog from a missing entitlement.
+        if !crate::state::is_supported_catalog(&input.catalog) {
+            return Err(PutDeploymentParameterErrorModeled::ValidationException(
+                crate::state::unsupported_catalog(),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutDeploymentParameterErrorModeled::InternalServerException(
                 InternalServerException {
@@ -215,11 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything is minted or rewritten. The agreements themselves are created
         // out of band of this API (`crate::state::seed_agreements`).
         //
-        // The modelled input constraints (`tags` at most 50 entries,
-        // `secretString` `length 1..15000`, every `@pattern`) are already refused
-        // with `ValidationException` (HTTP 400) by the centralized validate step
-        // that runs before this handler, so a malformed request is a 400 and a
-        // well-formed one aimed at nothing is this 404.
+        // The modelled input constraints (`tags` at most 50 entries, every
+        // `@pattern`, every `@length`) are already refused with
+        // `ValidationException` (HTTP 400) by the centralized validate step that
+        // runs before this handler — except an oversized `@sensitive` payload,
+        // which the front door refuses with HTTP 403 `ForbiddenException` ahead of
+        // that step (`crate::service`). So a malformed request is a 400 (or that
+        // 403), and a well-formed one aimed at nothing is this 404.
         if let Some(missing) =
             store.missing_target(&input.catalog, &input.product_id, &input.agreement_id)
         {

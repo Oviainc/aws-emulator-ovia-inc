@@ -441,7 +441,14 @@ fn boolean_filters_match(value: Option<bool>, filters: &[BooleanFilter]) -> bool
 /// when the attribute is not one this slice knows. The attribute names are the
 /// `AwsSecurityFindingFilters` member names, which are also the names
 /// `SortCriterion$Field` uses.
-fn string_attribute<'a>(finding: &'a AwsSecurityFinding, attribute: &str) -> Option<Vec<&'a str>> {
+///
+/// `pub(crate)` because grouping an insight's findings asks the same question of a
+/// finding that filtering and sorting do; these accessors stay the ONE source of
+/// truth for which attribute names resolve to a value.
+pub(crate) fn string_attribute<'a>(
+    finding: &'a AwsSecurityFinding,
+    attribute: &str,
+) -> Option<Vec<&'a str>> {
     let one = |value: Option<&'a str>| Some(value.into_iter().collect::<Vec<&'a str>>());
     match attribute {
         "Id" => one(Some(finding.id.as_str())),
@@ -601,7 +608,13 @@ fn date_filter_bindings(filters: &AwsSecurityFindingFilters) -> Vec<(&'static st
 /// The first `AwsSecurityFindingFilters` member the caller set that this slice does
 /// not evaluate. Reported as a 501 rather than ignored: a response that silently
 /// dropped a filter would claim findings matched a predicate nothing applied.
-fn unsupported_filter_member(filters: &AwsSecurityFindingFilters) -> Option<&'static str> {
+///
+/// `pub(crate)` because every operation that evaluates `AwsSecurityFindingFilters`
+/// — `GetFindings` over a request's filters, `GetInsightResults` over a stored
+/// insight's — owes the caller the same answer for a member nothing evaluates.
+pub(crate) fn unsupported_filter_member(
+    filters: &AwsSecurityFindingFilters,
+) -> Option<&'static str> {
     let set: [(&'static str, bool); 75] = [
         ("ProductFields", filters.product_fields.is_some()),
         ("UserDefinedFields", filters.user_defined_fields.is_some()),
@@ -851,7 +864,11 @@ const MAX_FILTER_VALUES_PER_ATTRIBUTE: usize = 20;
 /// whether a request is valid cannot depend on what happens to be stored, so an
 /// illegal filter combination or an unparseable date bound is a 400 even for a hub
 /// that holds no findings.
-fn validate_filters(filters: &AwsSecurityFindingFilters) -> Result<(), String> {
+///
+/// `pub(crate)` because `Insight$Filters` carries the same documented limits as
+/// `GetFindings$Filters` ("up to ten finding attributes ... up to 20 filter values"),
+/// so `CreateInsight` refuses exactly what `GetFindings` refuses.
+pub(crate) fn validate_filters(filters: &AwsSecurityFindingFilters) -> Result<(), String> {
     // The published breadth and depth limits on `Filters`, counted over the members
     // the caller actually set.
     let mut attributes = 0usize;
@@ -947,7 +964,10 @@ fn validate_filters(filters: &AwsSecurityFindingFilters) -> Result<(), String> {
 
 /// Does this finding satisfy every filter member the caller set? `Err` carries the
 /// text of an `InvalidInputException` for a filter the model's own rules refuse.
-fn finding_matches(
+///
+/// `pub(crate)` so an insight's stored filters select findings by exactly the
+/// predicate `GetFindings` applies to the same filters.
+pub(crate) fn finding_matches(
     finding: &AwsSecurityFinding,
     filters: &AwsSecurityFindingFilters,
     now_nanos: i128,

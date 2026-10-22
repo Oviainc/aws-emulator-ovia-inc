@@ -11,6 +11,10 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+// Declared ahead of the sorted list on purpose: every other securityhub change edits
+// that list, and a suite declared here conflicts with none of them.
+#[path = "all/insight_lifecycle.rs"]
+mod insight_lifecycle;
 #[path = "all/action_targets.rs"]
 mod action_targets;
 #[path = "all/describe_standards.rs"]

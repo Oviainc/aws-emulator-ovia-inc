@@ -184,7 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     channel_arn: session.channel_arn.clone(),
                     viewer_id: session.viewer_id.clone(),
                     code: Some("ResourceNotFoundException".to_string()),
-                    message: Some(format!("channel {} does not exist", session.channel_arn)),
+                    // The same sentence the single-pair form states for a resource this
+                    // service does not hold, from the one rule in `crate::state`.
+                    message: Some(crate::state::resource_not_found_message(
+                        &session.channel_arn,
+                    )),
                 });
                 continue;
             }
@@ -201,9 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     channel_arn: session.channel_arn.clone(),
                     viewer_id: session.viewer_id.clone(),
                     code: Some("ServiceQuotaExceededException".to_string()),
-                    message: Some(format!(
-                        "the number of tracked viewer session revocations would exceed the limit of {}",
-                        reached.cap
+                    // The same sentence the single-pair form states for this refusal,
+                    // from the one rule in `crate::state`, so the two surfaces cannot
+                    // word one failure two ways.
+                    message: Some(crate::state::quota_exceeded_message(
+                        crate::state::VIEWER_SESSION_REVOCATION_QUOTA_RESOURCE,
+                        reached.cap,
                     )),
                 });
             }

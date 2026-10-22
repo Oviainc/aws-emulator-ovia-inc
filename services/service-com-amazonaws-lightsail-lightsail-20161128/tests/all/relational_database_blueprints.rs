@@ -16,8 +16,10 @@
 //!   underscores (`mysql` + `8.0` -> `mysql_8_0`), its `engineVersion` is the full
 //!   version within that major version, and its `engineVersionDescription` names
 //!   the engine beside that version;
-//! * `engine` is a value of the modelled `RelationalDatabaseEngine` enum, and
-//!   exactly one blueprint per engine is the engine default;
+//! * `engine` is an engine the service serves managed databases for — MySQL and
+//!   PostgreSQL, the engines the recorded catalog carries, though the modelled
+//!   `RelationalDatabaseEngine` enum still names only `mysql` — and exactly one
+//!   blueprint per engine is that engine's default;
 //! * a page is the catalog from the entry `pageToken` names onward, bounded by the
 //!   page size, with `nextPageToken` present only while entries remain — so the
 //!   walk reports the catalog in order, exactly once each;
@@ -43,20 +45,29 @@ const OPERATION: &str = "GetRelationalDatabaseBlueprints";
 const PAGE_SIZE: usize =
     service_com_amazonaws_lightsail_lightsail_20161128::state::RELATIONAL_DATABASE_BLUEPRINT_PAGE_SIZE;
 
-/// The only value of the modelled `RelationalDatabaseEngine` enum
-/// (`smithy_query(query="shape",shape="RelationalDatabaseEngine")`), so the only
-/// `engine` any blueprint may report.
-const MODELLED_ENGINES: &[&str] = &["mysql"];
+/// The database engines Lightsail serves managed databases for, and so the
+/// `engine` values a blueprint may report.
+///
+/// The modelled `RelationalDatabaseEngine` enum
+/// (`smithy_query(query="shape",shape="RelationalDatabaseEngine")`) still names
+/// only `mysql`, which the service has outgrown: Lightsail also serves
+/// PostgreSQL managed databases, and the recorded
+/// `GetRelationalDatabaseBlueprints` answer carries `postgres` blueprints beside
+/// the MySQL one.
+const SERVED_ENGINES: &[&str] = &["mysql", "postgres"];
 
 /// One expected catalog entry.
 ///
-/// Source: the MySQL major versions the Lightsail user guide's "Database engines
-/// in Amazon Lightsail" lists for a managed database, each at the MySQL Community
-/// Edition patch release the service serves that series at. `mysql_5_6` and
-/// `mysql_8_4` are entries the issue cited nothing about.
+/// Source: the engines and major versions the Lightsail user guide's "Database
+/// engines in Amazon Lightsail" lists for a managed database — MySQL 8.4 and
+/// PostgreSQL 13 through 18 — each at the patch release the service serves that
+/// series at, with `mysql_8_4` the recorded first entry and MySQL's default
+/// version. `postgres_14`, `postgres_15` and `postgres_18` are entries the issue
+/// cited nothing about.
 struct Expected {
     blueprint_id: &'static str,
     engine: &'static str,
+    major_version: &'static str,
     engine_version: &'static str,
     engine_version_description: &'static str,
     is_engine_default: bool,
@@ -64,31 +75,59 @@ struct Expected {
 
 const EXPECTED_CATALOG: &[Expected] = &[
     Expected {
-        blueprint_id: "mysql_5_6",
+        blueprint_id: "mysql_8_4",
         engine: "mysql",
-        engine_version: "5.6.51",
-        engine_version_description: "MySQL 5.6.51",
-        is_engine_default: false,
-    },
-    Expected {
-        blueprint_id: "mysql_5_7",
-        engine: "mysql",
-        engine_version: "5.7.44",
-        engine_version_description: "MySQL 5.7.44",
-        is_engine_default: false,
-    },
-    Expected {
-        blueprint_id: "mysql_8_0",
-        engine: "mysql",
-        engine_version: "8.0.41",
-        engine_version_description: "MySQL 8.0.41",
+        major_version: "8.4",
+        engine_version: "8.4.11",
+        engine_version_description: "MySQL 8.4.11",
         is_engine_default: true,
     },
     Expected {
-        blueprint_id: "mysql_8_4",
-        engine: "mysql",
-        engine_version: "8.4.4",
-        engine_version_description: "MySQL 8.4.4",
+        blueprint_id: "postgres_13",
+        engine: "postgres",
+        major_version: "13",
+        engine_version: "13.21",
+        engine_version_description: "PostgreSQL 13.21",
+        is_engine_default: false,
+    },
+    Expected {
+        blueprint_id: "postgres_14",
+        engine: "postgres",
+        major_version: "14",
+        engine_version: "14.18",
+        engine_version_description: "PostgreSQL 14.18",
+        is_engine_default: false,
+    },
+    Expected {
+        blueprint_id: "postgres_15",
+        engine: "postgres",
+        major_version: "15",
+        engine_version: "15.13",
+        engine_version_description: "PostgreSQL 15.13",
+        is_engine_default: false,
+    },
+    Expected {
+        blueprint_id: "postgres_16",
+        engine: "postgres",
+        major_version: "16",
+        engine_version: "16.9",
+        engine_version_description: "PostgreSQL 16.9",
+        is_engine_default: false,
+    },
+    Expected {
+        blueprint_id: "postgres_17",
+        engine: "postgres",
+        major_version: "17",
+        engine_version: "17.5",
+        engine_version_description: "PostgreSQL 17.5",
+        is_engine_default: true,
+    },
+    Expected {
+        blueprint_id: "postgres_18",
+        engine: "postgres",
+        major_version: "18",
+        engine_version: "18.1",
+        engine_version_description: "PostgreSQL 18.1",
         is_engine_default: false,
     },
 ];
@@ -216,23 +255,25 @@ async fn every_blueprint_derives_its_id_and_descriptions_from_its_engine_and_ver
         let engine_version_description = member(blueprint, "engineVersionDescription");
 
         assert!(
-            MODELLED_ENGINES.contains(&engine.as_str()),
-            "case {case:?}: engine must be a modelled RelationalDatabaseEngine value \
-             ({MODELLED_ENGINES:?}), got {engine:?}"
+            SERVED_ENGINES.contains(&engine.as_str()),
+            "case {case:?}: engine must be an engine this service serves \
+             ({SERVED_ENGINES:?}), got {engine:?}"
         );
 
         // The id names the engine and the MAJOR version, dots written as
-        // underscores; `engineVersion` is the full version inside it.
-        let major_version = engine_version
-            .split('.')
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(".");
-        let want_id = format!("{engine}_{}", major_version.replace('.', "_"));
-        assert_eq!(
-            case, want_id,
-            "case {case:?}: blueprintId must be the engine and major version of \
-             {engine_version:?}, expected {want_id:?}, got {case:?}"
+        // underscores; `engineVersion` is the full version inside that major
+        // version. How many components the major version has is the engine's
+        // business — MySQL's is `8.4`, PostgreSQL's is `17` — so the major
+        // version is read off the id rather than assumed.
+        let major_version = case
+            .strip_prefix(&format!("{engine}_"))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: blueprintId must begin with its engine {engine:?}")
+            })
+            .replace('_', ".");
+        assert!(
+            !major_version.is_empty(),
+            "case {case:?}: blueprintId must name a major version after its engine"
         );
         assert!(
             engine_version.starts_with(&format!("{major_version}.")),
@@ -262,7 +303,7 @@ async fn exactly_one_blueprint_per_engine_is_the_engine_default() {
     let emulator = Emulator::new();
     let (blueprints, _) = emulator.walk(json!({})).await;
 
-    for engine in MODELLED_ENGINES {
+    for engine in SERVED_ENGINES {
         let defaults: Vec<String> = blueprints
             .iter()
             .filter(|blueprint| member(blueprint, "engine") == *engine)
@@ -293,6 +334,18 @@ async fn the_catalog_reports_every_published_blueprint_once() {
         "case whole catalog: the walk reported a blueprint twice: {reported:?} over pages {page_sizes:?}"
     );
 
+    // The catalog is exactly the published entries, in the order AWS reports
+    // them: the MySQL blueprint first, then PostgreSQL by ascending major
+    // version.
+    let expected_ids: Vec<&str> = EXPECTED_CATALOG
+        .iter()
+        .map(|want| want.blueprint_id)
+        .collect();
+    assert_eq!(
+        reported, expected_ids,
+        "case whole catalog: expected the published catalog in report order, got {reported:?}"
+    );
+
     for want in EXPECTED_CATALOG {
         let found = blueprints
             .iter()
@@ -304,6 +357,15 @@ async fn the_catalog_reports_every_published_blueprint_once() {
                 )
             });
         let case = want.blueprint_id;
+
+        // The id derivation itself, asserted from the row's own (engine, major
+        // version) rather than read back off the id: `mysql` + `8.4` ->
+        // `mysql_8_4`, `postgres` + `13` -> `postgres_13`.
+        let want_id = format!("{}_{}", want.engine, want.major_version.replace('.', "_"));
+        assert_eq!(
+            case, want_id,
+            "case {case:?}: the id must be the engine and major version joined with underscores"
+        );
         assert_eq!(
             member(found, "engine"),
             want.engine,
@@ -395,10 +457,11 @@ async fn a_page_token_that_names_no_blueprint_is_refused() {
     // engine that is not served, a major version that is not, a full version where
     // a major one belongs, a dotted id, and an opaque cursor from elsewhere.
     for token in [
-        "postgres_15",
+        "mariadb_11",
         "mysql_9_9",
-        "mysql_8_0_41",
-        "mysql.8.0",
+        "postgres_9_6",
+        "mysql_8_4_11",
+        "mysql.8.4",
         "AAAAAAAA",
         " ",
     ] {

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartViewerSessionRevocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartViewerSessionRevocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartViewerSessionRevocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts revoking the sessions a viewer's PLAYBACK tokens carry on one channel, up to
+//! and including a version. It addresses playback, not ingest, so it is answered the
+//! same whether or not the channel is broadcasting: the channel must exist (else
+//! `ResourceNotFoundException`), the revocation is recorded for that
+//! `(channelArn, viewerId)` pair, and the channel's broadcast state is left exactly as
+//! it was.
+//!
+//! The record it writes is the one `crate::state::start_viewer_session_revocation`
+//! owns, which the batch form of this operation writes too — so the two surfaces keep
+//! one record of one form, with the stored threshold the maximum over the calls (a
+//! later call naming a lower version cannot un-revoke what an earlier one revoked) and
+//! one cap on how many pairs are tracked.
 //!
 //! ## Shape of an operation
 //!
@@ -92,13 +96,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `StartViewerSessionRevocationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#StartViewerSessionRevocation")]
+// `extra_errors`: `ServiceQuotaExceededException` is a shape this SERVICE models (and
+// the code the batch form of this operation reports for the same failure) that this
+// operation's model does not list; the handler needs it for the one refusal the store's
+// revocation cap can produce. `InternalServerException` the model does list.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#StartViewerSessionRevocation",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum StartViewerSessionRevocationErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -154,18 +166,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartViewerSessionRevocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartViewerSessionRevocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartViewerSessionRevocation"))
+        // `channelArn`, `viewerId` and `viewerSessionVersionsLessThanOrEqualTo` all
+        // carry modelled constraints the framework's walk has already enforced, so
+        // reaching here means the request is well formed.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                StartViewerSessionRevocationErrorModeled::InternalServerException,
+            )
+        })?;
+
+        let mut store = state.lock();
+        if !crate::state::channel_exists(&store, &input.channel_arn) {
+            return Err(crate::state::resource_not_found(
+                StartViewerSessionRevocationErrorModeled::ResourceNotFoundException,
+                &input.channel_arn,
+            ));
+        }
+
+        // The revocation is recorded through the writer the batch form shares, so both
+        // surfaces leave one record of one form for the pair. Past the store's cap a
+        // pair it does not already track is refused rather than recorded — the same
+        // failure the batch form reports per pair, answered here as the service's own
+        // quota error.
+        crate::state::start_viewer_session_revocation(
+            &mut store,
+            &input.channel_arn,
+            &input.viewer_id,
+            input.viewer_session_versions_less_than_or_equal_to,
+        )
+        .map_err(|reached| {
+            crate::state::quota_exceeded(
+                StartViewerSessionRevocationErrorModeled::ServiceQuotaExceededException,
+                crate::state::VIEWER_SESSION_REVOCATION_QUOTA_RESOURCE,
+                reached.cap,
+            )
+        })?;
+
+        // The revocation acts on playback tokens, so the channel's broadcast state is
+        // deliberately neither read nor changed here.
+        Ok(StartViewerSessionRevocationOutput {})
     }
 }

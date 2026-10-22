@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists the workspace's rules-and-alerting logging configuration and
+//! answers from the PERSISTED record. The configuration starts in `CREATING` and the
+//! clock owes its move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken`
+//! makes the call idempotent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoggingConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateLoggingConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The configuration belongs to a workspace (`/workspaces/{workspaceId}/logging`),
+        // so an id naming no stored workspace is the modelled 404 — and the store stays
+        // bounded by the workspace quota, since a workspace holds at most one of these.
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(
+                CreateLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Workspace not found: {}", input.workspace_id),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if let Some(existing) = workspace.logging_configuration.as_ref() {
+            // `CreateLoggingConfiguration` carries `@idempotent` and its `clientToken`
+            // carries `@idempotencyToken`: re-sending the call that created the stored
+            // configuration — the same token, or the same `logGroupArn`, which leaves
+            // the same state — answers with that configuration rather than creating a
+            // second one.
+            let replays_create = (input.client_token.is_some()
+                && existing.client_token == input.client_token)
+                || existing.log_group_arn == input.log_group_arn;
+            if replays_create {
+                return Ok(CreateLoggingConfigurationOutput {
+                    status: crate::state::logging_configuration_status(existing),
+                });
+            }
+            // A workspace holds at most ONE rules-and-alerting logging configuration, so
+            // a create naming a different log group is not a state this resource can
+            // reach; `UpdateLoggingConfiguration` is what changes where it publishes.
+            // This operation models no `ConflictException`, so the refusal is the
+            // modelled `ValidationException` (400).
+            return Err(CreateLoggingConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Workspace {} already has a logging configuration; \
+                         use UpdateLoggingConfiguration to change it",
+                        input.workspace_id,
+                    ),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "logGroupArn".to_string(),
+                        message: "a workspace holds one rules and alerting logging configuration"
+                            .to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let logging = crate::state::LoggingConfiguration {
+            log_group_arn: input.log_group_arn,
+            // Newly created, so the clock owes the move to ACTIVE at `transition_due`.
+            status_code: crate::state::LOGGING_STATUS_CREATING.to_string(),
+            status_reason: None,
+            created_at: now,
+            modified_at: now,
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            client_token: input.client_token,
+        };
+        let status = crate::state::logging_configuration_status(&logging);
+        workspace.logging_configuration = Some(logging);
+        Ok(CreateLoggingConfigurationOutput { status })
     }
 }

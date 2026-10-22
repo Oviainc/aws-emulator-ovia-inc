@@ -108,11 +108,12 @@ async fn every_published_plan_is_reported_with_its_own_price_and_quotas() {
             "case {bundle_id}: expected price {price}, got {:?}",
             bundle["price"]
         );
-        // `name` is the plan's label, which for object storage is its storage size.
+        // `name` is the plan's label: the product and the plan's storage size,
+        // as Lightsail reports it (`Object Storage 5GB`).
         assert_eq!(
             bundle["name"].as_str(),
-            Some(format!("{storage} GB").as_str()),
-            "case {bundle_id}: expected the plan's storage size as its name, got {:?}",
+            Some(format!("Object Storage {storage}GB").as_str()),
+            "case {bundle_id}: expected the plan's published label as its name, got {:?}",
             bundle["name"]
         );
         assert_eq!(
@@ -284,6 +285,46 @@ fn the_slice_rule_reports_an_inactive_plan_only_when_asked_for_it() {
                  in the catalog's own order, got {reported:?}"
             );
         }
+    }
+}
+
+/// The plan label is DERIVED from the plan's storage size, never carried per
+/// entry: rows span the published sizes and sizes the published catalog does not
+/// carry.
+///
+/// SOURCE of the labels: the `BucketBundle$name` values Lightsail reports —
+/// `Object Storage 5GB`, `Object Storage 100GB`, `Object Storage 250GB`. The
+/// published rows carry those strings literally; the rest state the same form
+/// for a size the catalog does not publish.
+#[test]
+fn the_plan_label_names_the_product_and_the_plans_storage_size() {
+    // (storage GB, the label the plan must report)
+    let rows: &[(i32, &str)] = &[
+        (5, "Object Storage 5GB"),
+        (100, "Object Storage 100GB"),
+        (250, "Object Storage 250GB"),
+        (1, "Object Storage 1GB"),
+        (50, "Object Storage 50GB"),
+        (1000, "Object Storage 1000GB"),
+    ];
+
+    for (storage, expected) in rows {
+        let catalog = vec![BucketBundleSpec {
+            bundle_id: "small_1_0",
+            storage_per_month_in_gb: *storage,
+            transfer_per_month_in_gb: storage * 5,
+            price_usd_per_month: 1.0,
+            is_active: true,
+        }];
+        let reported = bucket_bundles_from(&catalog, false);
+        let name = reported
+            .first()
+            .and_then(|bundle| bundle.name.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            name, *expected,
+            "case a {storage} GB plan: expected the published label {expected:?}, got {name:?}"
+        );
     }
 }
 
