@@ -508,6 +508,140 @@ pub fn blueprint_name(blueprint_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Relational database blueprints
+// ---------------------------------------------------------------------------
+
+// This section is a PUBLISHED catalog, not per-account state: the data every
+// account sees the same, which the reporting operation over it answers from. Its
+// source is named below, and the modelled view type is referred to by its full
+// path so this section needs nothing from the import list above.
+
+/// One entry of the managed-database blueprint catalog: a database engine and one
+/// MAJOR version of it a database can be created from.
+///
+/// "A blueprint describes the major engine version of a database" (the modelled
+/// `RelationalDatabaseBlueprint` documentation), while
+/// `RelationalDatabaseBlueprint$engineVersion` carries the full version "(for
+/// example, `5.7.23`)" — so a blueprint's id names the major version and its
+/// `engineVersion` names the patch level that major version is served at.
+#[derive(Debug, Clone, Copy)]
+pub struct RelationalDatabaseBlueprintSpec {
+    /// The database software, from the modelled `RelationalDatabaseEngine` enum
+    /// (`smithy_query(query="shape",shape="RelationalDatabaseEngine")`), whose
+    /// only value is `mysql`.
+    pub engine: &'static str,
+    /// How the engine is written in prose, as the engine descriptions show it
+    /// (`MySQL`).
+    pub engine_display: &'static str,
+    /// `RelationalDatabaseBlueprint$engineDescription`: the edition of the engine
+    /// the blueprint installs.
+    pub engine_description: &'static str,
+    /// The major engine version this blueprint describes (`8.0`).
+    pub major_version: &'static str,
+    /// The full engine version the major version is served at (`8.0.41`).
+    pub engine_version: &'static str,
+    /// Whether this is the engine's default version — true for exactly one
+    /// blueprint per engine.
+    pub is_engine_default: bool,
+}
+
+/// The database blueprints this service serves, oldest major version first.
+///
+/// Source: the MySQL major versions the Lightsail user guide's "Database engines
+/// in Amazon Lightsail" lists for a managed database, each pinned to the final (or
+/// current) MySQL Community Edition patch release of that series. The modelled
+/// `RelationalDatabaseEngine` enum has exactly one value, `mysql`, so no other
+/// engine is serveable here; adding one is adding a row.
+pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &[
+    RelationalDatabaseBlueprintSpec {
+        engine: "mysql",
+        engine_display: "MySQL",
+        engine_description: "MySQL Community Edition",
+        major_version: "5.6",
+        engine_version: "5.6.51",
+        is_engine_default: false,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "mysql",
+        engine_display: "MySQL",
+        engine_description: "MySQL Community Edition",
+        major_version: "5.7",
+        engine_version: "5.7.44",
+        is_engine_default: false,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "mysql",
+        engine_display: "MySQL",
+        engine_description: "MySQL Community Edition",
+        major_version: "8.0",
+        engine_version: "8.0.41",
+        is_engine_default: true,
+    },
+    RelationalDatabaseBlueprintSpec {
+        engine: "mysql",
+        engine_display: "MySQL",
+        engine_description: "MySQL Community Edition",
+        major_version: "8.4",
+        engine_version: "8.4.4",
+        is_engine_default: false,
+    },
+];
+
+/// How many blueprints one `GetRelationalDatabaseBlueprints` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more blueprints remain. It is above the
+/// catalog's size, so the whole catalog is answered in one page — as AWS answers
+/// it — and the paging walk still holds for a catalog that outgrows it.
+pub const RELATIONAL_DATABASE_BLUEPRINT_PAGE_SIZE: usize = 10;
+
+impl RelationalDatabaseBlueprintSpec {
+    /// This blueprint's id: the engine and its major version, joined the way every
+    /// Lightsail id token is (`mysql` + `8.0` -> `mysql_8_0`).
+    pub fn blueprint_id(&self) -> String {
+        format!("{}_{}", self.engine, self.major_version.replace('.', "_"))
+    }
+
+    /// This entry as the modelled `RelationalDatabaseBlueprint`.
+    pub fn view(&self) -> crate::ops::types::RelationalDatabaseBlueprint {
+        crate::ops::types::RelationalDatabaseBlueprint {
+            blueprint_id: Some(self.blueprint_id()),
+            engine: Some(self.engine.to_string()),
+            engine_version: Some(self.engine_version.to_string()),
+            engine_description: Some(self.engine_description.to_string()),
+            // `engineVersionDescription` describes the version the way the engine
+            // itself is named beside it: "MySQL 5.7.44".
+            engine_version_description: Some(format!(
+                "{} {}",
+                self.engine_display, self.engine_version
+            )),
+            is_engine_default: Some(self.is_engine_default),
+        }
+    }
+}
+
+/// The blueprint `blueprint_id` names, or `None` when the catalog has no such
+/// blueprint.
+pub fn relational_database_blueprint(
+    blueprint_id: &str,
+) -> Option<RelationalDatabaseBlueprintSpec> {
+    RELATIONAL_DATABASE_BLUEPRINTS
+        .iter()
+        .find(|spec| spec.blueprint_id() == blueprint_id)
+        .copied()
+}
+
+/// The blueprint ids [`relational_database_blueprint`] accepts, for a refusal that
+/// has to tell the caller what to send instead.
+pub fn relational_database_blueprint_ids() -> String {
+    RELATIONAL_DATABASE_BLUEPRINTS
+        .iter()
+        .map(RelationalDatabaseBlueprintSpec::blueprint_id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
 // Locations
 // ---------------------------------------------------------------------------
 
